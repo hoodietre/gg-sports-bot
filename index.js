@@ -127,8 +127,48 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       console.log('Livestream posted');
       return;
-    }
-  } catch (error) {
+
+   if (interaction.commandName === 'assignrole') {
+  const member = interaction.options.getMember('member');
+  const role = interaction.options.getRole('role');
+
+  const isAdmin = interaction.member.permissions.has('Administrator');
+  const hasStaffRole = interaction.member.roles.cache.has(STAFF_ROLE_ID);
+
+  if (!isAdmin && !hasStaffRole) {
+    await interaction.reply({
+      content: 'You do not have permission to use this command.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (!member) {
+    await interaction.reply({
+      content: 'That member could not be found.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (!role) {
+    await interaction.reply({
+      content: 'That role could not be found.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await member.roles.add(role);
+
+  await interaction.reply({
+    content: `Assigned ${role} to ${member}.`,
+    ephemeral: true,
+  });
+
+  console.log(`Assigned role ${role.id} to member ${member.id}`);
+  return;
+}  } catch (error) {
     console.error('Interaction handler error:', error);
 
     try {
