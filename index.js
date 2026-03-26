@@ -63,7 +63,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply(text);
       return;
-    },
+    }
 
     if (interaction.commandName === 'linkstream') {
       const url = interaction.options.getString('url');
