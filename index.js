@@ -161,32 +161,32 @@ if (interaction.commandName === 'assignrole') {
     return;
   }
 
-  await targetMember.roles.add(role);
+    await targetMember.roles.add(role);
 
-  await interaction.reply({
-    content: `Assigned ${role} to ${targetMember}.`,
-    ephemeral: true,
-  });
+    await interaction.reply({
+      content: `Assigned ${role} to ${targetMember}.`,
+      ephemeral: true,
+    });
 
     console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
     return;
   }
 } catch (error) {
-    console.error('Interaction handler error:', error);
+  console.error('Interaction handler error:', error);
 
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply('Something went wrong while handling that command.');
-      } else {
-        await interaction.reply({
-          content: 'Something went wrong while handling that command.',
-          ephemeral: true,
-        });
-      }
-    } catch (followupError) {
-      console.error('Failed to send error reply:', followupError);
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply('Something went wrong while handling that command.');
+    } else {
+      await interaction.reply({
+        content: 'Something went wrong while handling that command.',
+        ephemeral: true,
+      });
     }
+  } catch (followupError) {
+    console.error('Failed to send error reply:', followupError);
   }
+}
 });
 
 client.on('error', (error) => {
