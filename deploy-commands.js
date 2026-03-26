@@ -26,4 +26,4 @@ await rest.put(
   { body: commands }
 );
 
-console.log('Commands deployed.');
+console.log('Ping + whogotnext deployed.');
