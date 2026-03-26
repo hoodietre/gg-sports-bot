@@ -25,7 +25,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === 'whogotnext') {
       const extraMessage = interaction.options.getString('message');
-      const roleMention = `<@&${LEAGUE_ROLE_ID}>`;
+      const roleMention = `<@&${1486787668489797843}>`;
       const userMention = `<@${interaction.user.id}>`;
 
       let text = `${roleMention} ${userMention} is available to play right now.`;
