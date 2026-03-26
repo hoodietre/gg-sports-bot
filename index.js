@@ -9,7 +9,7 @@ const client = new Client({
 
 const LEAGUE_ROLE_ID = '1486787668489797843';
 const LIVE_CHANNEL_ID = '1486546017053573223';
-
+const STAFF_ROLE_ID = '1486850276202778795';
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('railway.app')
