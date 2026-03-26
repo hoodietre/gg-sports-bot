@@ -5,8 +5,7 @@ const client = new Client({
 });
 
 const LEAGUE_ROLE_ID = '1486787668489797843';
-
-client.once(Events.ClientReady, () => {
+const streamLinks = new Map();client.once(Events.ClientReady, () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
 });
 
@@ -36,6 +35,35 @@ if (interaction.commandName === 'whogotnext') {
 
   await interaction.reply(text);
   console.log('whogotnext reply sent');
+  return;
+}
+if (interaction.commandName === 'linkstream') {
+  const url = interaction.options.getString('url');
+
+  streamLinks.set(interaction.user.id, url);
+
+  await interaction.reply({
+    content: 'Your stream link has been saved.',
+    ephemeral: true
+  });
+
+  console.log(`Stream saved for ${interaction.user.id}`);
+  return;
+}
+
+if (interaction.commandName === 'livestream') {
+  const url = streamLinks.get(interaction.user.id);
+
+  if (!url) {
+    await interaction.reply({
+      content: 'You need to set your stream first using /linkstream',
+      ephemeral: true
+    });
+    return;
+  }
+
+  await interaction.reply(`${interaction.user.username} is live! 🔴\n${url}`);
+  console.log('Livestream posted');
   return;
 }
   } catch (error) {
