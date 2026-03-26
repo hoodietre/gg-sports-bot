@@ -60,23 +60,44 @@ if (interaction.commandName === 'linkstream') {
 }
 
 if (interaction.commandName === 'livestream') {
-  const url = streamLinks.get(interaction.user.id);
+  const result = await pool.query(
+    'SELECT stream_url FROM stream_links WHERE user_id = $1',
+    [interaction.user.id]
+  );
 
-  if (!url) {
+  if (result.rows.length === 0) {
     await interaction.reply({
       content: 'You need to set your stream first using /linkstream',
-      ephemeral: true
+      ephemeral: true,
     });
     return;
   }
 
-await interaction.reply({
-  content: `<@&${LEAGUE_ROLE_ID}>  **${interaction.user.username} is LIVE!**\n${url}`,
-  allowedMentions: {
-    roles: [LEAGUE_ROLE_ID],
-    users: []
+  const url = result.rows[0].stream_url;
+
+  const channel = await client.channels.fetch(LIVE_CHANNEL_ID);
+
+  if (!channel || !channel.isTextBased()) {
+    await interaction.reply({
+      content: 'Live channel not found or is not a text channel.',
+      ephemeral: true,
+    });
+    return;
   }
-});
+
+  await channel.send({
+    content: `<@&${LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${url}`,
+    allowedMentions: {
+      roles: [LEAGUE_ROLE_ID],
+      users: [],
+    },
+  });
+
+  await interaction.reply({
+    content: 'Your stream has been posted.',
+    ephemeral: true,
+  });
+
   console.log('Livestream posted');
   return;
 }
