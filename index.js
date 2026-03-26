@@ -168,9 +168,9 @@ if (interaction.commandName === 'assignrole') {
     ephemeral: true,
   });
 
-  console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
-  return;
-}
+    console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
+    return;
+  }
 } catch (error) {
     console.error('Interaction handler error:', error);
 
