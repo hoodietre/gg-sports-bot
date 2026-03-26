@@ -1,12 +1,20 @@
 import { Client, GatewayIntentBits, Events } from 'discord.js';
+import pkg from 'pg';
+
+const { Pool } = pkg;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
 const LEAGUE_ROLE_ID = '1486787668489797843';
-const streamLinks = new Map();client.once(Events.ClientReady, () => {
-  console.log(`GG Sports is online as ${client.user.tag}`);
+const LIVE_CHANNEL_ID = 'PASTE_CHANNEL_ID_HERE'; // ✅ ADD IT HERE
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway.app')
+    ? { rejectUnauthorized: false }
+    : false,
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
