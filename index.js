@@ -4,6 +4,8 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+const LEAGUE_ROLE_ID = '1486787668489797843';
+
 client.once(Events.ClientReady, () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
 });
@@ -21,10 +23,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    if (interaction.commandName === 'testbotreply') {
-      await interaction.deferReply({ ephemeral: true });
-      await interaction.editReply('GG Sports test worked.');
-      console.log('Test reply sent');
+    if (interaction.commandName === 'whogotnext') {
+      const extraMessage = interaction.options.getString('message');
+      const roleMention = `<@&${LEAGUE_ROLE_ID}>`;
+      const userMention = `<@${interaction.user.id}>`;
+
+      let text = `${roleMention} ${userMention} is available to play right now.`;
+
+      if (extraMessage) {
+        text += ` ${extraMessage}`;
+      }
+
+      await interaction.reply(text);
+      console.log('whogotnext reply sent');
       return;
     }
   } catch (error) {
