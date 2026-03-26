@@ -1,24 +1,60 @@
+import { Client, GatewayIntentBits, Events } from 'discord.js';
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+});
+
+client.once(Events.ClientReady, () => {
+  console.log(`GG Sports is online as ${client.user.tag}`);
+});
+
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
+  console.log(`Interaction received: ${interaction.commandName}`);
+
   try {
     if (interaction.commandName === 'ping') {
-      await interaction.reply({
-        content: 'GG Sports is live.',
-        ephemeral: true
-      });
+      await interaction.deferReply({ ephemeral: true });
+      await interaction.editReply('GG Sports is live.');
       console.log('Ping reply sent');
+      return;
     }
 
     if (interaction.commandName === 'testbotreply') {
-      await interaction.reply({
-        content: 'GG Sports test worked.',
-        ephemeral: true
-      });
+      await interaction.deferReply({ ephemeral: true });
+      await interaction.editReply('GG Sports test worked.');
       console.log('Test reply sent');
+      return;
     }
-
   } catch (error) {
-    console.error('Reply failed:', error);
+    console.error('Interaction handler error:', error);
+
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('Something went wrong while handling that command.');
+      } else {
+        await interaction.reply({
+          content: 'Something went wrong while handling that command.',
+          ephemeral: true,
+        });
+      }
+    } catch (followupError) {
+      console.error('Failed to send error reply:', followupError);
+    }
   }
 });
+
+client.on('error', (error) => {
+  console.error('Client error:', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+});
+
+client.login(process.env.DISCORD_TOKEN);
