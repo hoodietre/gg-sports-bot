@@ -63,7 +63,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply(text);
       return;
-    }
+    },
 
     if (interaction.commandName === 'linkstream') {
       const url = interaction.options.getString('url');
@@ -128,24 +128,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.log('Livestream posted');
       return;
 
-   if (interaction.commandName === 'assignrole') {
-  const member = interaction.options.getMember('member');
+if (interaction.commandName === 'assignrole') {
+  const targetUser = interaction.options.getUser('member');
   const role = interaction.options.getRole('role');
 
-  const isAdmin = interaction.member.permissions.has('Administrator');
-  const hasStaffRole = interaction.member.roles.cache.has(STAFF_ROLE_ID);
-
-  if (!isAdmin && !hasStaffRole) {
+  if (!interaction.guild) {
     await interaction.reply({
-      content: 'You do not have permission to use this command.',
+      content: 'This command can only be used in a server.',
       ephemeral: true,
     });
     return;
   }
 
-  if (!member) {
+  const targetMember = await interaction.guild.members.fetch(targetUser.id);
+
+  const isAdmin = interaction.memberPermissions?.has('Administrator');
+  const hasStaffRole = interaction.member?.roles?.cache?.has?.(STAFF_ROLE_ID);
+
+  if (!isAdmin && !hasStaffRole) {
     await interaction.reply({
-      content: 'That member could not be found.',
+      content: 'You do not have permission to use this command.',
       ephemeral: true,
     });
     return;
@@ -159,15 +161,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  await member.roles.add(role);
+  await targetMember.roles.add(role);
 
   await interaction.reply({
-    content: `Assigned ${role} to ${member}.`,
+    content: `Assigned ${role} to ${targetMember}.`,
     ephemeral: true,
   });
 
-  console.log(`Assigned role ${role.id} to member ${member.id}`);
+  console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
   return;
+}
 }  } catch (error) {
     console.error('Interaction handler error:', error);
 
