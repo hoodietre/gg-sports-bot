@@ -5,8 +5,8 @@ const GUILD_ID = '1486545386649686068';
 
 const commands = [
   new SlashCommandBuilder()
-    .setName('testbotreply')
-    .setDescription('Fresh test command')
+    .setName('ping')
+    .setDescription('Check if bot is working')
     .toJSON(),
 ];
 
@@ -17,4 +17,4 @@ await rest.put(
   { body: commands }
 );
 
-console.log('Fresh guild command deployed.');
+console.log('Ping command deployed.');
