@@ -63,7 +63,7 @@ if (interaction.commandName === 'livestream') {
   }
 
 await interaction.reply({
-  content: `<@&${LEAGUE_ROLE_ID}> 🔴 **${interaction.user.username} is LIVE!**\n${url}`
+  content: `<@&${LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${url}`
 });
   console.log('Livestream posted');
   return;
