@@ -16,7 +16,22 @@ const commands = [
         .setName('message')
         .setDescription('Optional extra message')
         .setRequired(false)
-    ),
+
+new SlashCommandBuilder()
+  .setName('assignrole')
+  .setDescription('Assign a role to a member')
+  .addUserOption(option =>
+    option
+      .setName('member')
+      .setDescription('The member to give the role to')
+      .setRequired(true)
+  )
+  .addRoleOption(option =>
+    option
+      .setName('role')
+      .setDescription('The role to assign')
+      .setRequired(true)
+  ),
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
