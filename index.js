@@ -4,7 +4,7 @@ import pkg from 'pg';
 const { Pool } = pkg;
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
 const LEAGUE_ROLE_ID = '1486787668489797843';
