@@ -8,13 +8,34 @@ const client = new Client({
 });
 
 const LEAGUE_ROLE_ID = '1486787668489797843';
-const LIVE_CHANNEL_ID = '1486546017053573223'; 
+const LIVE_CHANNEL_ID = '1486546017053573223';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('railway.app')
     ? { rejectUnauthorized: false }
     : false,
+});
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stream_links (
+      user_id TEXT PRIMARY KEY,
+      stream_url TEXT NOT NULL
+    )
+  `);
+
+  console.log('Database ready.');
+}
+
+client.once(Events.ClientReady, async () => {
+  console.log(`GG Sports is online as ${client.user.tag}`);
+
+  try {
+    await initDatabase();
+  } catch (error) {
+    console.error('Database init failed:', error);
+  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -26,81 +47,87 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'ping') {
       await interaction.deferReply({ ephemeral: true });
       await interaction.editReply('GG Sports is live.');
-      console.log('Ping reply sent');
       return;
     }
 
-if (interaction.commandName === 'whogotnext') {
-  const extraMessage = interaction.options.getString('message');
-  const roleMention = `<@&${LEAGUE_ROLE_ID}>`;
-  const userMention = `<@${interaction.user.id}>`;
+    if (interaction.commandName === 'whogotnext') {
+      const extraMessage = interaction.options.getString('message');
+      const roleMention = `<@&${LEAGUE_ROLE_ID}>`;
+      const userMention = `<@${interaction.user.id}>`;
 
-  let text = `${roleMention} ${userMention} is available to play right now.`;
+      let text = `${roleMention} ${userMention} is available to play right now.`;
 
-  if (extraMessage) {
-    text += ` ${extraMessage}`;
-  }
+      if (extraMessage) {
+        text += ` ${extraMessage}`;
+      }
 
-  await interaction.reply(text);
-  console.log('whogotnext reply sent');
-  return;
-}
-if (interaction.commandName === 'linkstream') {
-  const url = interaction.options.getString('url');
+      await interaction.reply(text);
+      return;
+    }
 
-  streamLinks.set(interaction.user.id, url);
+    if (interaction.commandName === 'linkstream') {
+      const url = interaction.options.getString('url');
 
-  await interaction.reply({
-    content: 'Your stream link has been saved.',
-    ephemeral: true
-  });
+      await pool.query(
+        `
+        INSERT INTO stream_links (user_id, stream_url)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id)
+        DO UPDATE SET stream_url = EXCLUDED.stream_url
+        `,
+        [interaction.user.id, url]
+      );
 
-  console.log(`Stream saved for ${interaction.user.id}`);
-  return;
-}
+      await interaction.reply({
+        content: 'Your stream link has been saved permanently.',
+        ephemeral: true,
+      });
 
-if (interaction.commandName === 'livestream') {
-  const result = await pool.query(
-    'SELECT stream_url FROM stream_links WHERE user_id = $1',
-    [interaction.user.id]
-  );
+      console.log(`Stream saved for ${interaction.user.id}`);
+      return;
+    }
 
-  if (result.rows.length === 0) {
-    await interaction.reply({
-      content: 'You need to set your stream first using /linkstream',
-      ephemeral: true,
-    });
-    return;
-  }
+    if (interaction.commandName === 'livestream') {
+      const result = await pool.query(
+        'SELECT stream_url FROM stream_links WHERE user_id = $1',
+        [interaction.user.id]
+      );
 
-  const url = result.rows[0].stream_url;
+      if (result.rows.length === 0) {
+        await interaction.reply({
+          content: 'You need to set your stream first using /linkstream',
+          ephemeral: true,
+        });
+        return;
+      }
 
-  const channel = await client.channels.fetch(LIVE_CHANNEL_ID);
+      const url = result.rows[0].stream_url;
+      const channel = await client.channels.fetch(LIVE_CHANNEL_ID);
 
-  if (!channel || !channel.isTextBased()) {
-    await interaction.reply({
-      content: 'Live channel not found or is not a text channel.',
-      ephemeral: true,
-    });
-    return;
-  }
+      if (!channel || !channel.isTextBased()) {
+        await interaction.reply({
+          content: 'Live channel not found or is not a text channel.',
+          ephemeral: true,
+        });
+        return;
+      }
 
-  await channel.send({
-    content: `<@&${LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${url}`,
-    allowedMentions: {
-      roles: [LEAGUE_ROLE_ID],
-      users: [],
-    },
-  });
+      await channel.send({
+        content: `<@&${LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${url}`,
+        allowedMentions: {
+          roles: [LEAGUE_ROLE_ID],
+          users: [],
+        },
+      });
 
-  await interaction.reply({
-    content: 'Your stream has been posted.',
-    ephemeral: true,
-  });
+      await interaction.reply({
+        content: 'Your stream has been posted.',
+        ephemeral: true,
+      });
 
-  console.log('Livestream posted');
-  return;
-}
+      console.log('Livestream posted');
+      return;
+    }
   } catch (error) {
     console.error('Interaction handler error:', error);
 
