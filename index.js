@@ -128,65 +128,66 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.log('Livestream posted');
       return;
 
-if (interaction.commandName === 'assignrole') {
-  const targetUser = interaction.options.getUser('member');
-  const role = interaction.options.getRole('role');
+    if (interaction.commandName === 'assignrole') {
+      const targetUser = interaction.options.getUser('member');
+      const role = interaction.options.getRole('role');
 
-  if (!interaction.guild) {
-    await interaction.reply({
-      content: 'This command can only be used in a server.',
-      ephemeral: true,
-    });
-    return;
-  }
+      if (!interaction.guild) {
+        await interaction.reply({
+          content: 'This command can only be used in a server.',
+          ephemeral: true,
+        });
+        return;
+      }
 
-  const targetMember = await interaction.guild.members.fetch(targetUser.id);
+      const targetMember = await interaction.guild.members.fetch(targetUser.id);
 
-  const isAdmin = interaction.memberPermissions?.has('Administrator');
-  const hasStaffRole = interaction.member?.roles?.cache?.has?.(STAFF_ROLE_ID);
+      const isAdmin = interaction.memberPermissions?.has('Administrator');
+      const hasStaffRole = interaction.member?.roles?.cache?.has?.(STAFF_ROLE_ID);
 
-  if (!isAdmin && !hasStaffRole) {
-    await interaction.reply({
-      content: 'You do not have permission to use this command.',
-      ephemeral: true,
-    });
-    return;
-  }
+      if (!isAdmin && !hasStaffRole) {
+        await interaction.reply({
+          content: 'You do not have permission to use this command.',
+          ephemeral: true,
+        });
+        return;
+      }
 
-  if (!role) {
-    await interaction.reply({
-      content: 'That role could not be found.',
-      ephemeral: true,
-    });
-    return;
-  }
+      if (!role) {
+        await interaction.reply({
+          content: 'That role could not be found.',
+          ephemeral: true,
+        });
+        return;
+      }
 
-       await targetMember.roles.add(role);
+      await targetMember.roles.add(role);
 
-    await interaction.reply({
-      content: `Assigned ${role} to ${targetMember}.`,
-      ephemeral: true,
-    });
-
-    console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
-    return;
-  }
-} catch (error) {
-  console.error('Interaction handler error:', error);
-
-  try {
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply('Something went wrong while handling that command.');
-    } else {
       await interaction.reply({
-        content: 'Something went wrong while handling that command.',
+        content: `Assigned ${role} to ${targetMember}.`,
         ephemeral: true,
       });
+
+      console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
+      return;
     }
-  } catch (followupError) {
-    console.error('Failed to send error reply:', followupError);
+
+  } catch (error) {
+    console.error('Interaction handler error:', error);
+
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('Something went wrong while handling that command.');
+      } else {
+        await interaction.reply({
+          content: 'Something went wrong while handling that command.',
+          ephemeral: true,
+        });
+      }
+    } catch (followupError) {
+      console.error('Failed to send error reply:', followupError);
+    }
   }
-}
 
 client.on('error', (error) => {
   console.error('Client error:', error);
