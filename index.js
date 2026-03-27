@@ -35,28 +35,47 @@ const LEAGUE_ROLE_ID = '1486787668489797843';
 const LIVE_CHANNEL_ID = '1486546017053573223';
 const STAFF_ROLE_ID = '1486850276202778795';
 
-const TEAM_OWNERS_CHANNEL_ID = 'PASTE_TEAM_OWNERS_CHANNEL_ID_HERE';
-const TRADE_COUNT_CHANNEL_ID = 'PASTE_TRADE_COUNT_CHANNEL_ID_HERE';
-const TRADE_BLOCK_CHANNEL_ID = 'PASTE_TRADE_BLOCK_CHANNEL_ID_HERE';
+const TEAM_OWNERS_CHANNEL_ID = '1486545641537671198';
+const TRADE_COUNT_CHANNEL_ID = '1486546310059262042';
+const TRADE_BLOCK_CHANNEL_ID = '1486546070077964360';
 const OFFER_A_TRADE_CHANNEL_ID = '1486546108179284148';
 
-const COMMITTEE_CHANNEL_ID = 'PASTE_COMMITTEE_CHANNEL_ID_HERE';
-const TRADE_APPROVED_CHANNEL_ID = 'PASTE_TRADE_APPROVED_CHANNEL_ID_HERE';
-const TRADE_DENIED_CHANNEL_ID = 'PASTE_TRADE_DENIED_CHANNEL_ID_HERE';
-const COMMITTEE_ROLE_ID = 'PASTE_COMMITTEE_ROLE_ID_HERE';
+const COMMITTEE_CHANNEL_ID = '1486546187111628891';
+const TRADE_APPROVED_CHANNEL_ID = '1486546234029379714';
+const TRADE_DENIED_CHANNEL_ID = '1486546264404263065';
+const COMMITTEE_ROLE_ID = '1487214037266727003';
 
 // === TEAM ROLE NAMES ===
 const TEAM_ROLE_NAMES = [
-  'Lakers',
-  'Celtics',
-  'Bulls',
-  'Heat',
-  'Knicks',
-  'Nets',
-  'Sixers',
+  '76ers',
   'Bucks',
-  'Cavaliers',
+  'Bulls',
+  'Celtics',
+  'Clippers',
+  'Grizzlies',
+  'Hawks',
+  'Heat',
+  'Cavs',
+  'Hornets',
+  'Jazz',
+  'Kings',
+  'Knicks',
+  'Lakers',
+  'Magic',
+  'Mavs',
+  'Nets',
+  'Nuggets',
   'Pacers',
+  'Pistons',
+  'Raptors',
+  'Rockets',
+  'Spurs',
+  'Suns',
+  'Sonics',
+  'Wolves',
+  'Blazers',
+  'Warriors',
+  'Wizards'
 ];
 
 // user_id => { targetTeam, createdAt }
