@@ -161,7 +161,7 @@ if (interaction.commandName === 'assignrole') {
     return;
   }
 
-    await targetMember.roles.add(role);
+       await targetMember.roles.add(role);
 
     await interaction.reply({
       content: `Assigned ${role} to ${targetMember}.`,
@@ -170,6 +170,7 @@ if (interaction.commandName === 'assignrole') {
 
     console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
     return;
+  }
 } catch (error) {
   console.error('Interaction handler error:', error);
 
@@ -186,7 +187,6 @@ if (interaction.commandName === 'assignrole') {
     console.error('Failed to send error reply:', followupError);
   }
 }
-});
 
 client.on('error', (error) => {
   console.error('Client error:', error);
