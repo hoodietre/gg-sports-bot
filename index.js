@@ -747,20 +747,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       const teamRole = member.roles.cache.find(role => TEAM_ROLE_NAMES.includes(role.name));
 
-      const modal = new ModalBuilder()
-        .setCustomId('tradeblock_modal')
-        .setTitle('Trade Block Submission');
-
-      const teamInput = new TextInputBuilder()
-        .setCustomId('tradeblock_team')
-        .setLabel('Team')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMaxLength(50);
-
-      if (teamRole) {
-        teamInput.setValue(teamRole.name);
+      if (!teamRole) {
+        await interaction.reply({
+          content: 'You do not have a team role assigned, so the bot could not determine your team.',
+          ephemeral: true,
+        });
+        return;
       }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`tradeblock_modal:${teamRole.name}`)
+        .setTitle('Trade Block Submission');
 
       const playerNameInput = new TextInputBuilder()
         .setCustomId('tradeblock_player_name')
@@ -791,7 +788,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setMaxLength(25);
 
       modal.addComponents(
-        new ActionRowBuilder().addComponents(teamInput),
         new ActionRowBuilder().addComponents(playerNameInput),
         new ActionRowBuilder().addComponents(positionInput),
         new ActionRowBuilder().addComponents(ageInput),
