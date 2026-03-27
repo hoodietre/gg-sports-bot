@@ -2,6 +2,9 @@ import {
   Client,
   GatewayIntentBits,
   Events,
+  REST,
+  Routes,
+  SlashCommandBuilder,
   PermissionFlagsBits,
 } from 'discord.js';
 import pkg from 'pg';
@@ -12,10 +15,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
+// === IDs ===
+const CLIENT_ID = '1407760487151833200';
+const GUILD_ID = '1486545386649686068';
 const LEAGUE_ROLE_ID = '1486787668489797843';
 const LIVE_CHANNEL_ID = '1486546017053573223';
 const STAFF_ROLE_ID = '1486850276202778795';
 
+// === DATABASE ===
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('railway.app')
@@ -30,32 +37,96 @@ async function initDatabase() {
       stream_url TEXT NOT NULL
     )
   `);
-
   console.log('Database ready.');
 }
 
+// === COMMAND REGISTRATION ===
+async function registerCommands() {
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('ping')
+      .setDescription('Check if bot is working'),
+
+    new SlashCommandBuilder()
+      .setName('whogotnext')
+      .setDescription('Notify the league you are ready to play')
+      .addStringOption(option =>
+        option
+          .setName('message')
+          .setDescription('Optional extra message')
+          .setRequired(false)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('linkstream')
+      .setDescription('Save your stream link')
+      .addStringOption(option =>
+        option
+          .setName('url')
+          .setDescription('Your stream link (Twitch, YouTube, etc)')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('livestream')
+      .setDescription('Post your saved stream link'),
+
+    new SlashCommandBuilder()
+      .setName('assignrole')
+      .setDescription('Assign a role to a member')
+      .addUserOption(option =>
+        option
+          .setName('member')
+          .setDescription('The member to give the role to')
+          .setRequired(true)
+      )
+      .addRoleOption(option =>
+        option
+          .setName('role')
+          .setDescription('The role to assign')
+          .setRequired(true)
+      ),
+  ].map(cmd => cmd.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+  await rest.put(
+    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+    { body: commands }
+  );
+
+  console.log('Commands synced.');
+}
+
+// === READY ===
 client.once(Events.ClientReady, async () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
 
   try {
     await initDatabase();
+    await registerCommands();
   } catch (error) {
-    console.error('Database init failed:', error);
+    console.error('Startup failed:', error);
   }
 });
 
+// === COMMAND HANDLER ===
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   console.log(`Interaction received: ${interaction.commandName}`);
 
   try {
+    // === PING ===
     if (interaction.commandName === 'ping') {
-      await interaction.deferReply({ ephemeral: true });
-      await interaction.editReply('GG Sports is live.');
+      await interaction.reply({
+        content: 'GG Sports is live.',
+        ephemeral: true,
+      });
       return;
     }
 
+    // === WHOGOTNEXT ===
     if (interaction.commandName === 'whogotnext') {
       const extraMessage = interaction.options.getString('message');
       const roleMention = `<@&${LEAGUE_ROLE_ID}>`;
@@ -71,6 +142,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    // === LINKSTREAM ===
     if (interaction.commandName === 'linkstream') {
       const url = interaction.options.getString('url');
 
@@ -89,10 +161,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true,
       });
 
-      console.log(`Stream saved for ${interaction.user.id}`);
       return;
     }
 
+    // === LIVESTREAM ===
     if (interaction.commandName === 'livestream') {
       const result = await pool.query(
         'SELECT stream_url FROM stream_links WHERE user_id = $1',
@@ -112,7 +184,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (!channel || !channel.isTextBased()) {
         await interaction.reply({
-          content: 'Live channel not found or is not a text channel.',
+          content: 'Live channel not found.',
           ephemeral: true,
         });
         return;
@@ -131,10 +203,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true,
       });
 
-      console.log('Livestream posted');
       return;
     }
 
+    // === ASSIGN ROLE ===
     if (interaction.commandName === 'assignrole') {
       if (!interaction.guild) {
         await interaction.reply({
@@ -147,25 +219,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const targetUser = interaction.options.getUser('member');
       const role = interaction.options.getRole('role');
 
-      if (!targetUser) {
-        await interaction.reply({
-          content: 'That member could not be found.',
-          ephemeral: true,
-        });
-        return;
-      }
-
-      if (!role) {
-        await interaction.reply({
-          content: 'That role could not be found.',
-          ephemeral: true,
-        });
-        return;
-      }
-
       const isAdmin = interaction.memberPermissions?.has(
         PermissionFlagsBits.Administrator
       );
+
       const invokerMember = await interaction.guild.members.fetch(interaction.user.id);
       const hasStaffRole = invokerMember.roles.cache.has(STAFF_ROLE_ID);
 
@@ -185,37 +242,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true,
       });
 
-      console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
       return;
     }
-  } catch (error) {
-    console.error('Interaction handler error:', error);
 
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply('Something went wrong while handling that command.');
-      } else {
-        await interaction.reply({
-          content: 'Something went wrong while handling that command.',
-          ephemeral: true,
-        });
-      }
-    } catch (followupError) {
-      console.error('Failed to send error reply:', followupError);
+  } catch (error) {
+    console.error('Interaction error:', error);
+
+    if (!interaction.replied) {
+      await interaction.reply({
+        content: 'Something went wrong.',
+        ephemeral: true,
+      });
     }
   }
 });
 
-client.on('error', (error) => {
-  console.error('Client error:', error);
-});
+// === ERRORS ===
+client.on('error', console.error);
+process.on('unhandledRejection', console.error);
+process.on('uncaughtException', console.error);
 
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled rejection:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error);
-});
-
+// === LOGIN ===
 client.login(process.env.DISCORD_TOKEN);
