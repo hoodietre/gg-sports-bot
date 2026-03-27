@@ -11,8 +11,12 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  StringSelectMenuBuilder,
 } from 'discord.js';
 import pkg from 'pg';
+import { randomUUID } from 'crypto';
 
 const { Pool } = pkg;
 
@@ -29,6 +33,7 @@ const STAFF_ROLE_ID = '1486850276202778795';
 const TEAM_OWNERS_CHANNEL_ID = '1486545641537671198';
 const TRADE_COUNT_CHANNEL_ID = '1486546310059262042';
 const TRADE_BLOCK_CHANNEL_ID = '1486546070077964360';
+const OFFER_A_TRADE_CHANNEL_ID = '1486546108179284148';
 
 // === TEAM ROLE NAMES ===
 const TEAM_ROLE_NAMES = [
@@ -63,6 +68,9 @@ const TEAM_ROLE_NAMES = [
   'Wizards'
 ];
 
+// Used between the team dropdown and the offer modal submit
+const pendingOfferTargets = new Map();
+
 // === DATABASE ===
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -91,6 +99,31 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS trade_counts (
       team_name TEXT PRIMARY KEY,
       trade_count INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trade_block_posts (
+      id TEXT PRIMARY KEY,
+      posted_team TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      position TEXT NOT NULL,
+      age TEXT NOT NULL,
+      salary TEXT NOT NULL,
+      submitted_by TEXT NOT NULL
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trade_offers (
+      id TEXT PRIMARY KEY,
+      sender_user_id TEXT NOT NULL,
+      sender_team TEXT,
+      target_team TEXT NOT NULL,
+      target_owner_user_id TEXT NOT NULL,
+      offer_details TEXT NOT NULL,
+      screenshot_link TEXT,
+      status TEXT NOT NULL DEFAULT 'pending'
     )
   `);
 
@@ -124,6 +157,56 @@ async function userCanManage(interaction) {
   const hasStaffRole = invokerMember.roles.cache.has(STAFF_ROLE_ID);
 
   return Boolean(isAdmin || hasStaffRole);
+}
+
+async function findTeamOwnerByRoleName(guild, teamRoleName) {
+  const role = guild.roles.cache.find(r => r.name === teamRoleName);
+
+  if (!role) return null;
+
+  const owners = role.members.filter(member => !member.user.bot);
+
+  if (owners.size === 0) return null;
+
+  return owners.first();
+}
+
+function buildOfferDecisionButtons(offerId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`trade_offer_accept:${offerId}`)
+      .setLabel('Accept')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId(`trade_offer_decline:${offerId}`)
+      .setLabel('Decline')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled)
+  );
+}
+
+function buildOfferTradePanelButton() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('offer_trade_panel_button')
+      .setLabel('Offer Trade')
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
+function buildTeamSelectMenu() {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('offer_trade_select')
+      .setPlaceholder('Choose the team you are sending the offer to')
+      .addOptions(
+        TEAM_ROLE_NAMES.map(teamName => ({
+          label: teamName,
+          value: teamName,
+        }))
+      )
+  );
 }
 
 async function buildTeamOwnersEmbed(guild) {
@@ -172,7 +255,18 @@ async function buildTradeCountEmbed() {
     .setTimestamp();
 }
 
-async function updatePanelByKey(guild, panelKey, embedBuilder) {
+function buildOfferTradePanelEmbed() {
+  return new EmbedBuilder()
+    .setTitle('Offer a Trade')
+    .setDescription(
+      'Press the button below to send a trade offer.\n\nYou will need to provide your trade details and a screenshot link of the in-game trade proposal screen.'
+    )
+    .setColor(0xED4245)
+    .setFooter({ text: 'GG Sports • Offer a Trade' })
+    .setTimestamp();
+}
+
+async function updatePanelByKey(guild, panelKey, embedBuilder, components = []) {
   const result = await pool.query(
     'SELECT channel_id, message_id FROM bot_panels WHERE panel_key = $1',
     [panelKey]
@@ -192,7 +286,7 @@ async function updatePanelByKey(guild, panelKey, embedBuilder) {
   }
 
   const message = await channel.messages.fetch(message_id);
-  await message.edit({ embeds: [embedBuilder] });
+  await message.edit({ embeds: [embedBuilder], components });
 
   console.log(`${panelKey} panel updated.`);
 }
@@ -263,6 +357,10 @@ async function registerCommands() {
       .setDescription('Create or refresh the Trade Count embed'),
 
     new SlashCommandBuilder()
+      .setName('setupoffertrade')
+      .setDescription('Create or refresh the Offer a Trade panel'),
+
+    new SlashCommandBuilder()
       .setName('addtrade')
       .setDescription('Add 1 trade to a team')
       .addRoleOption(option =>
@@ -314,6 +412,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     // === MODAL SUBMITS ===
     if (interaction.isModalSubmit()) {
+      // TRADE BLOCK SUBMIT
       if (interaction.customId.startsWith('tradeblock_modal:')) {
         if (!interaction.guild) {
           await interaction.reply({
@@ -323,7 +422,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const team = interaction.customId.split(':')[1];
+        const team = decodeURIComponent(interaction.customId.split(':')[1]);
         const playerName = interaction.fields.getTextInputValue('tradeblock_player_name');
         const position = interaction.fields.getTextInputValue('tradeblock_position');
         const age = interaction.fields.getTextInputValue('tradeblock_age');
@@ -338,6 +437,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
           });
           return;
         }
+
+        const postId = randomUUID();
+
+        await pool.query(
+          `
+          INSERT INTO trade_block_posts (
+            id, posted_team, player_name, position, age, salary, submitted_by
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          `,
+          [postId, team, playerName, position, age, salary, interaction.user.id]
+        );
 
         const embed = new EmbedBuilder()
           .setTitle('Trade Block Listing')
@@ -369,8 +480,254 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         return;
       }
+
+      // OFFER TRADE SUBMIT
+      if (interaction.customId === 'offer_trade_modal') {
+        if (!interaction.guild) {
+          await interaction.reply({
+            content: 'This can only be used in a server.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const pendingTarget = pendingOfferTargets.get(interaction.user.id);
+
+        if (!pendingTarget) {
+          await interaction.reply({
+            content: 'Your team selection expired. Please click Offer Trade again.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        pendingOfferTargets.delete(interaction.user.id);
+
+        const offerDetails = interaction.fields.getTextInputValue('offer_trade_details');
+        const screenshotLink = interaction.fields.getTextInputValue('offer_trade_screenshot') || 'None provided';
+
+        const senderMember = await interaction.guild.members.fetch(interaction.user.id);
+        const senderTeamRole = senderMember.roles.cache.find(role => TEAM_ROLE_NAMES.includes(role.name));
+        const senderTeam = senderTeamRole ? senderTeamRole.name : 'Unknown Team';
+
+        const targetOwner = await findTeamOwnerByRoleName(interaction.guild, pendingTarget);
+
+        if (!targetOwner) {
+          await interaction.reply({
+            content: 'That team does not currently have an owner assigned.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const offerId = randomUUID();
+
+        await pool.query(
+          `
+          INSERT INTO trade_offers (
+            id, sender_user_id, sender_team, target_team,
+            target_owner_user_id, offer_details, screenshot_link, status
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+          `,
+          [
+            offerId,
+            interaction.user.id,
+            senderTeam,
+            pendingTarget,
+            targetOwner.id,
+            offerDetails,
+            screenshotLink,
+          ]
+        );
+
+        const dmEmbed = new EmbedBuilder()
+          .setTitle('New Trade Offer')
+          .setColor(0x5865F2)
+          .addFields(
+            { name: 'Offering Team', value: senderTeam, inline: true },
+            { name: 'Receiving Team', value: pendingTarget, inline: true },
+            { name: 'Sent By', value: `<@${interaction.user.id}>`, inline: true },
+            { name: 'Offer Details', value: offerDetails, inline: false },
+            { name: 'Screenshot Link', value: screenshotLink, inline: false }
+          )
+          .setFooter({ text: 'GG Sports • Trade Offer' })
+          .setTimestamp();
+
+        try {
+          await targetOwner.send({
+            embeds: [dmEmbed],
+            components: [buildOfferDecisionButtons(offerId)],
+          });
+        } catch (dmError) {
+          console.error('Failed to DM target owner:', dmError);
+
+          await interaction.reply({
+            content: 'I could not DM that team owner. They may have DMs closed.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await interaction.reply({
+          content: `Your trade offer was sent to the ${pendingTarget} owner.`,
+          ephemeral: true,
+        });
+
+        return;
+      }
     }
 
+    // === BUTTONS ===
+    if (interaction.isButton()) {
+      // OFFER TRADE PANEL BUTTON
+      if (interaction.customId === 'offer_trade_panel_button') {
+        await interaction.reply({
+          content: 'Choose the team you are sending the offer to.',
+          components: [buildTeamSelectMenu()],
+          ephemeral: true,
+        });
+
+        return;
+      }
+
+      // ACCEPT OFFER
+      if (interaction.customId.startsWith('trade_offer_accept:')) {
+        const offerId = interaction.customId.split(':')[1];
+
+        const result = await pool.query(
+          'SELECT * FROM trade_offers WHERE id = $1',
+          [offerId]
+        );
+
+        if (result.rows.length === 0) {
+          await interaction.reply({
+            content: 'That trade offer could not be found.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const offer = result.rows[0];
+
+        if (interaction.user.id !== offer.target_owner_user_id) {
+          await interaction.reply({
+            content: 'Only the targeted team owner can accept this offer.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await pool.query(
+          'UPDATE trade_offers SET status = $1 WHERE id = $2',
+          ['accepted_by_owner', offerId]
+        );
+
+        try {
+          const senderUser = await client.users.fetch(offer.sender_user_id);
+          await senderUser.send(
+            `Your trade offer to the ${offer.target_team} owner was accepted.`
+          );
+        } catch (notifyError) {
+          console.error('Failed to notify sender of accepted offer:', notifyError);
+        }
+
+        await interaction.update({
+          content: 'Trade offer accepted.',
+          components: [buildOfferDecisionButtons(offerId, true)],
+        });
+
+        return;
+      }
+
+      // DECLINE OFFER
+      if (interaction.customId.startsWith('trade_offer_decline:')) {
+        const offerId = interaction.customId.split(':')[1];
+
+        const result = await pool.query(
+          'SELECT * FROM trade_offers WHERE id = $1',
+          [offerId]
+        );
+
+        if (result.rows.length === 0) {
+          await interaction.reply({
+            content: 'That trade offer could not be found.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const offer = result.rows[0];
+
+        if (interaction.user.id !== offer.target_owner_user_id) {
+          await interaction.reply({
+            content: 'Only the targeted team owner can decline this offer.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await pool.query(
+          'UPDATE trade_offers SET status = $1 WHERE id = $2',
+          ['declined_by_owner', offerId]
+        );
+
+        try {
+          const senderUser = await client.users.fetch(offer.sender_user_id);
+          await senderUser.send(
+            `Your trade offer to the ${offer.target_team} owner was declined.`
+          );
+        } catch (notifyError) {
+          console.error('Failed to notify sender of declined offer:', notifyError);
+        }
+
+        await interaction.update({
+          content: 'Trade offer declined.',
+          components: [buildOfferDecisionButtons(offerId, true)],
+        });
+
+        return;
+      }
+    }
+
+    // === STRING SELECT MENUS ===
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === 'offer_trade_select') {
+        const targetTeam = interaction.values[0];
+
+        pendingOfferTargets.set(interaction.user.id, targetTeam);
+
+        const modal = new ModalBuilder()
+          .setCustomId('offer_trade_modal')
+          .setTitle('Trade Offer');
+
+        const detailsInput = new TextInputBuilder()
+          .setCustomId('offer_trade_details')
+          .setLabel('Offer Details')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(1000)
+          .setPlaceholder('List the players, picks, or assets in your offer.');
+
+        const screenshotInput = new TextInputBuilder()
+          .setCustomId('offer_trade_screenshot')
+          .setLabel('Screenshot Link')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setMaxLength(300)
+          .setPlaceholder('Paste a Discord image link or another screenshot URL.');
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(detailsInput),
+          new ActionRowBuilder().addComponents(screenshotInput)
+        );
+
+        await interaction.showModal(modal);
+        return;
+      }
+    }
+
+    // === CHAT INPUT COMMANDS ===
     if (!interaction.isChatInputCommand()) return;
 
     console.log(`Interaction received: ${interaction.commandName}`);
@@ -624,6 +981,60 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    // === SETUPOFFERTRADE ===
+    if (interaction.commandName === 'setupoffertrade') {
+      if (!interaction.guild) {
+        await interaction.reply({
+          content: 'This command can only be used in a server.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const allowed = await userCanManage(interaction);
+
+      if (!allowed) {
+        await interaction.reply({
+          content: 'You do not have permission to use this command.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const channel = await interaction.guild.channels.fetch(OFFER_A_TRADE_CHANNEL_ID);
+
+      if (!channel || !channel.isTextBased()) {
+        await interaction.reply({
+          content: 'Offer-a-trade channel not found.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const embed = buildOfferTradePanelEmbed();
+      const message = await channel.send({
+        embeds: [embed],
+        components: [buildOfferTradePanelButton()],
+      });
+
+      await pool.query(
+        `
+        INSERT INTO bot_panels (panel_key, channel_id, message_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (panel_key)
+        DO UPDATE SET channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id
+        `,
+        ['offer_trade', channel.id, message.id]
+      );
+
+      await interaction.reply({
+        content: 'Offer a Trade panel has been created.',
+        ephemeral: true,
+      });
+
+      return;
+    }
+
     // === ADDTRADE ===
     if (interaction.commandName === 'addtrade') {
       if (!interaction.guild) {
@@ -756,7 +1167,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       const modal = new ModalBuilder()
-        .setCustomId(`tradeblock_modal:${teamRole.name}`)
+        .setCustomId(`tradeblock_modal:${encodeURIComponent(teamRole.name)}`)
         .setTitle('Trade Block Submission');
 
       const playerNameInput = new TextInputBuilder()
