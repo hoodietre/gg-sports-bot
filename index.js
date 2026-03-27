@@ -1,4 +1,9 @@
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  PermissionFlagsBits,
+} from 'discord.js';
 import pkg from 'pg';
 
 const { Pool } = pkg;
@@ -10,6 +15,7 @@ const client = new Client({
 const LEAGUE_ROLE_ID = '1486787668489797843';
 const LIVE_CHANNEL_ID = '1486546017053573223';
 const STAFF_ROLE_ID = '1486850276202778795';
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('railway.app')
@@ -127,11 +133,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       console.log('Livestream posted');
       return;
+    }
 
     if (interaction.commandName === 'assignrole') {
-      const targetUser = interaction.options.getUser('member');
-      const role = interaction.options.getRole('role');
-
       if (!interaction.guild) {
         await interaction.reply({
           content: 'This command can only be used in a server.',
@@ -140,14 +144,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const targetMember = await interaction.guild.members.fetch(targetUser.id);
+      const targetUser = interaction.options.getUser('member');
+      const role = interaction.options.getRole('role');
 
-      const isAdmin = interaction.memberPermissions?.has('Administrator');
-      const hasStaffRole = interaction.member?.roles?.cache?.has?.(STAFF_ROLE_ID);
-
-      if (!isAdmin && !hasStaffRole) {
+      if (!targetUser) {
         await interaction.reply({
-          content: 'You do not have permission to use this command.',
+          content: 'That member could not be found.',
           ephemeral: true,
         });
         return;
@@ -161,6 +163,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      const isAdmin = interaction.memberPermissions?.has(
+        PermissionFlagsBits.Administrator
+      );
+      const invokerMember = await interaction.guild.members.fetch(interaction.user.id);
+      const hasStaffRole = invokerMember.roles.cache.has(STAFF_ROLE_ID);
+
+      if (!isAdmin && !hasStaffRole) {
+        await interaction.reply({
+          content: 'You do not have permission to use this command.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const targetMember = await interaction.guild.members.fetch(targetUser.id);
       await targetMember.roles.add(role);
 
       await interaction.reply({
@@ -171,7 +188,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.log(`Assigned role ${role.id} to member ${targetMember.id}`);
       return;
     }
-
   } catch (error) {
     console.error('Interaction handler error:', error);
 
@@ -188,6 +204,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error('Failed to send error reply:', followupError);
     }
   }
+});
 
 client.on('error', (error) => {
   console.error('Client error:', error);
