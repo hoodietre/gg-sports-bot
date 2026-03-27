@@ -314,7 +314,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     // === MODAL SUBMITS ===
     if (interaction.isModalSubmit()) {
-      if (interaction.customId === 'tradeblock_modal') {
+      if (interaction.customId.startsWith('tradeblock_modal:')) {
         if (!interaction.guild) {
           await interaction.reply({
             content: 'This can only be used in a server.',
@@ -323,7 +323,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const team = interaction.fields.getTextInputValue('tradeblock_team');
+        const team = interaction.customId.split(':')[1];
         const playerName = interaction.fields.getTextInputValue('tradeblock_player_name');
         const position = interaction.fields.getTextInputValue('tradeblock_position');
         const age = interaction.fields.getTextInputValue('tradeblock_age');
