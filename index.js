@@ -36,6 +36,7 @@ const TRADE_BLOCK_CHANNEL_ID = '1486546070077964360';
 const OFFER_A_TRADE_CHANNEL_ID = '1486546108179284148';
 
 // === TEAM ROLE NAMES ===
+// Replace these with your exact team role names from Discord
 const TEAM_ROLE_NAMES = [
   '76ers',
   'Bucks',
@@ -195,18 +196,43 @@ function buildOfferTradePanelButton() {
   );
 }
 
-function buildTeamSelectMenu() {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('offer_trade_select')
-      .setPlaceholder('Choose the team you are sending the offer to')
-      .addOptions(
-        TEAM_ROLE_NAMES.map(teamName => ({
-          label: teamName,
-          value: teamName,
-        }))
-      )
+function buildTeamSelectMenus() {
+  const firstHalf = TEAM_ROLE_NAMES.slice(0, 25);
+  const secondHalf = TEAM_ROLE_NAMES.slice(25);
+
+  const rows = [];
+
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('offer_trade_select_1')
+        .setPlaceholder('Choose a team (1)')
+        .addOptions(
+          firstHalf.map(teamName => ({
+            label: teamName,
+            value: teamName,
+          }))
+        )
+    )
   );
+
+  if (secondHalf.length > 0) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId('offer_trade_select_2')
+          .setPlaceholder('Choose a team (2)')
+          .addOptions(
+            secondHalf.map(teamName => ({
+              label: teamName,
+              value: teamName,
+            }))
+          )
+      )
+    );
+  }
+
+  return rows;
 }
 
 async function buildTeamOwnersEmbed(guild) {
@@ -584,7 +610,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === 'offer_trade_panel_button') {
         await interaction.reply({
           content: 'Choose the team you are sending the offer to.',
-          components: [buildTeamSelectMenu()],
+          components: buildTeamSelectMenus(),
           ephemeral: true,
         });
 
@@ -692,7 +718,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // === STRING SELECT MENUS ===
     if (interaction.isStringSelectMenu()) {
-      if (interaction.customId === 'offer_trade_select') {
+      if (
+        interaction.customId === 'offer_trade_select_1' ||
+        interaction.customId === 'offer_trade_select_2'
+      ) {
         const targetTeam = interaction.values[0];
 
         pendingOfferTargets.set(interaction.user.id, targetTeam);
