@@ -24,14 +24,14 @@ const commands = [
     .addStringOption(option =>
       option
         .setName('url')
-        .setDescription('Your stream link')
+        .setDescription('Your stream link (Twitch, YouTube, etc)')
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName('livestream')
     .setDescription('Post your saved stream link'),
-].map(command => command.toJSON());
+].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
@@ -40,4 +40,4 @@ await rest.put(
   { body: commands }
 );
 
-console.log('Ping + whogotnext + linkstream + livestream deployed.');
+console.log('ALL commands deployed.');
