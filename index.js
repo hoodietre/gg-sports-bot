@@ -7,6 +7,10 @@ import {
   SlashCommandBuilder,
   PermissionFlagsBits,
   EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ActionRowBuilder,
 } from 'discord.js';
 import pkg from 'pg';
 
@@ -24,9 +28,9 @@ const LIVE_CHANNEL_ID = '1486546017053573223';
 const STAFF_ROLE_ID = '1486850276202778795';
 const TEAM_OWNERS_CHANNEL_ID = '1486545641537671198';
 const TRADE_COUNT_CHANNEL_ID = '1486546310059262042';
+const TRADE_BLOCK_CHANNEL_ID = '1486546070077964360';
 
 // === TEAM ROLE NAMES ===
-// Replace these with your exact team role names from Discord
 const TEAM_ROLE_NAMES = [
   '76ers',
   'Bucks',
@@ -277,6 +281,10 @@ async function registerCommands() {
           .setDescription('The team role')
           .setRequired(true)
       ),
+
+    new SlashCommandBuilder()
+      .setName('tradeblock')
+      .setDescription('Add a player to the trade block'),
   ].map(cmd => cmd.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -301,13 +309,72 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
-// === COMMAND HANDLER ===
+// === INTERACTION HANDLER ===
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  console.log(`Interaction received: ${interaction.commandName}`);
-
   try {
+    // === MODAL SUBMITS ===
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === 'tradeblock_modal') {
+        if (!interaction.guild) {
+          await interaction.reply({
+            content: 'This can only be used in a server.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const team = interaction.fields.getTextInputValue('tradeblock_team');
+        const playerName = interaction.fields.getTextInputValue('tradeblock_player_name');
+        const position = interaction.fields.getTextInputValue('tradeblock_position');
+        const age = interaction.fields.getTextInputValue('tradeblock_age');
+        const salary = interaction.fields.getTextInputValue('tradeblock_salary');
+
+        const channel = await interaction.guild.channels.fetch(TRADE_BLOCK_CHANNEL_ID);
+
+        if (!channel || !channel.isTextBased()) {
+          await interaction.reply({
+            content: 'Trade block channel not found.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const embed = new EmbedBuilder()
+          .setTitle('Trade Block Listing')
+          .setColor(0xFEE75C)
+          .addFields(
+            { name: 'Team', value: team, inline: true },
+            { name: 'Player Name', value: playerName, inline: true },
+            { name: 'Position', value: position, inline: true },
+            { name: 'Age', value: age, inline: true },
+            { name: 'Current Year Salary', value: salary, inline: true },
+            { name: 'Submitted By', value: `<@${interaction.user.id}>`, inline: true }
+          )
+          .setFooter({ text: 'GG Sports • Trade Block' })
+          .setTimestamp();
+
+        await channel.send({
+          content: `<@&${LEAGUE_ROLE_ID}>`,
+          embeds: [embed],
+          allowedMentions: {
+            roles: [LEAGUE_ROLE_ID],
+            users: [],
+          },
+        });
+
+        await interaction.reply({
+          content: 'Your trade block listing has been posted.',
+          ephemeral: true,
+        });
+
+        return;
+      }
+    }
+
+    if (!interaction.isChatInputCommand()) return;
+
+    console.log(`Interaction received: ${interaction.commandName}`);
+
     // === PING ===
     if (interaction.commandName === 'ping') {
       await interaction.reply({
@@ -658,10 +725,79 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       return;
     }
+
+    // === TRADEBLOCK ===
+    if (interaction.commandName === 'tradeblock') {
+      if (!interaction.guild) {
+        await interaction.reply({
+          content: 'This command can only be used in a server.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (interaction.channelId !== TRADE_BLOCK_CHANNEL_ID) {
+        await interaction.reply({
+          content: 'This command can only be used in the trade block channel.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId('tradeblock_modal')
+        .setTitle('Trade Block Submission');
+
+      const teamInput = new TextInputBuilder()
+        .setCustomId('tradeblock_team')
+        .setLabel('Team')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(50);
+
+      const playerNameInput = new TextInputBuilder()
+        .setCustomId('tradeblock_player_name')
+        .setLabel('Player Name')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100);
+
+      const positionInput = new TextInputBuilder()
+        .setCustomId('tradeblock_position')
+        .setLabel('Position')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(20);
+
+      const ageInput = new TextInputBuilder()
+        .setCustomId('tradeblock_age')
+        .setLabel('Age')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(10);
+
+      const salaryInput = new TextInputBuilder()
+        .setCustomId('tradeblock_salary')
+        .setLabel('Current Year Salary')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(25);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(teamInput),
+        new ActionRowBuilder().addComponents(playerNameInput),
+        new ActionRowBuilder().addComponents(positionInput),
+        new ActionRowBuilder().addComponents(ageInput),
+        new ActionRowBuilder().addComponents(salaryInput)
+      );
+
+      await interaction.showModal(modal);
+      return;
+    }
   } catch (error) {
     console.error('Interaction error:', error);
 
-    if (!interaction.replied) {
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction.reply({
         content: 'Something went wrong.',
         ephemeral: true,
