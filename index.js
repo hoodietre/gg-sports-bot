@@ -744,6 +744,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      const teamRole = member.roles.cache.find(role => TEAM_ROLE_NAMES.includes(role.name));
+
       const modal = new ModalBuilder()
         .setCustomId('tradeblock_modal')
         .setTitle('Trade Block Submission');
@@ -754,6 +757,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setMaxLength(50);
+
+      if (teamRole) {
+        teamInput.setValue(teamRole.name);
+      }
 
       const playerNameInput = new TextInputBuilder()
         .setCustomId('tradeblock_player_name')
