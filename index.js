@@ -23,6 +23,7 @@ const LEAGUE_ROLE_ID = '1486787668489797843';
 const LIVE_CHANNEL_ID = '1486546017053573223';
 const STAFF_ROLE_ID = '1486850276202778795';
 const TEAM_OWNERS_CHANNEL_ID = '1486545641537671198';
+const TRADE_COUNT_CHANNEL_ID = '1486546310059262042';
 
 // === TEAM ROLE NAMES ===
 // Replace these with your exact team role names from Discord
@@ -82,6 +83,24 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trade_counts (
+      team_name TEXT PRIMARY KEY,
+      trade_count INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+
+  for (const teamName of TEAM_ROLE_NAMES) {
+    await pool.query(
+      `
+      INSERT INTO trade_counts (team_name, trade_count)
+      VALUES ($1, 0)
+      ON CONFLICT (team_name) DO NOTHING
+      `,
+      [teamName]
+    );
+  }
+
   console.log('Database ready.');
 }
 
@@ -132,14 +151,31 @@ async function buildTeamOwnersEmbed(guild) {
     .setTimestamp();
 }
 
-async function updateTeamOwnersPanel(guild) {
+async function buildTradeCountEmbed() {
+  const result = await pool.query(
+    'SELECT team_name, trade_count FROM trade_counts ORDER BY team_name ASC'
+  );
+
+  const lines = result.rows.map(
+    row => `**${row.team_name}** — ${row.trade_count}`
+  );
+
+  return new EmbedBuilder()
+    .setTitle('Trade Counts')
+    .setDescription(lines.join('\n'))
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • Trade Count Board' })
+    .setTimestamp();
+}
+
+async function updatePanelByKey(guild, panelKey, embedBuilder) {
   const result = await pool.query(
     'SELECT channel_id, message_id FROM bot_panels WHERE panel_key = $1',
-    ['team_owners']
+    [panelKey]
   );
 
   if (result.rows.length === 0) {
-    console.log('No saved team owners panel found yet.');
+    console.log(`No saved ${panelKey} panel found yet.`);
     return;
   }
 
@@ -147,16 +183,24 @@ async function updateTeamOwnersPanel(guild) {
   const channel = await guild.channels.fetch(channel_id);
 
   if (!channel || !channel.isTextBased()) {
-    console.log('Saved team owners channel was not found or is not text-based.');
+    console.log(`Saved ${panelKey} channel was not found or is not text-based.`);
     return;
   }
 
   const message = await channel.messages.fetch(message_id);
+  await message.edit({ embeds: [embedBuilder] });
+
+  console.log(`${panelKey} panel updated.`);
+}
+
+async function updateTeamOwnersPanel(guild) {
   const embed = await buildTeamOwnersEmbed(guild);
+  await updatePanelByKey(guild, 'team_owners', embed);
+}
 
-  await message.edit({ embeds: [embed] });
-
-  console.log('Team owners panel updated.');
+async function updateTradeCountPanel(guild) {
+  const embed = await buildTradeCountEmbed();
+  await updatePanelByKey(guild, 'trade_count', embed);
 }
 
 // === COMMAND REGISTRATION ===
@@ -209,6 +253,30 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('setupteamowners')
       .setDescription('Create or refresh the Team Owners embed'),
+
+    new SlashCommandBuilder()
+      .setName('setuptradecount')
+      .setDescription('Create or refresh the Trade Count embed'),
+
+    new SlashCommandBuilder()
+      .setName('addtrade')
+      .setDescription('Add 1 trade to a team')
+      .addRoleOption(option =>
+        option
+          .setName('team')
+          .setDescription('The team role')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('removetrade')
+      .setDescription('Remove 1 trade from a team')
+      .addRoleOption(option =>
+        option
+          .setName('team')
+          .setDescription('The team role')
+          .setRequired(true)
+      ),
   ].map(cmd => cmd.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -432,6 +500,159 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply({
         content: 'Team Owners panel has been created.',
+        ephemeral: true,
+      });
+
+      return;
+    }
+
+    // === SETUPTRADECOUNT ===
+    if (interaction.commandName === 'setuptradecount') {
+      if (!interaction.guild) {
+        await interaction.reply({
+          content: 'This command can only be used in a server.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const allowed = await userCanManage(interaction);
+
+      if (!allowed) {
+        await interaction.reply({
+          content: 'You do not have permission to use this command.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const channel = await interaction.guild.channels.fetch(TRADE_COUNT_CHANNEL_ID);
+
+      if (!channel || !channel.isTextBased()) {
+        await interaction.reply({
+          content: 'Trade count channel not found.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const embed = await buildTradeCountEmbed();
+      const message = await channel.send({ embeds: [embed] });
+
+      await pool.query(
+        `
+        INSERT INTO bot_panels (panel_key, channel_id, message_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (panel_key)
+        DO UPDATE SET channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id
+        `,
+        ['trade_count', channel.id, message.id]
+      );
+
+      await interaction.reply({
+        content: 'Trade Count panel has been created.',
+        ephemeral: true,
+      });
+
+      return;
+    }
+
+    // === ADDTRADE ===
+    if (interaction.commandName === 'addtrade') {
+      if (!interaction.guild) {
+        await interaction.reply({
+          content: 'This command can only be used in a server.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const allowed = await userCanManage(interaction);
+
+      if (!allowed) {
+        await interaction.reply({
+          content: 'You do not have permission to use this command.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const teamRole = interaction.options.getRole('team');
+
+      if (!teamRole || !isTeamRole(teamRole.name)) {
+        await interaction.reply({
+          content: 'That is not a tracked team role.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await pool.query(
+        'UPDATE trade_counts SET trade_count = trade_count + 1 WHERE team_name = $1',
+        [teamRole.name]
+      );
+
+      try {
+        await updateTradeCountPanel(interaction.guild);
+      } catch (panelError) {
+        console.error('Failed to update trade count panel:', panelError);
+      }
+
+      await interaction.reply({
+        content: `Added 1 trade to ${teamRole}.`,
+        ephemeral: true,
+      });
+
+      return;
+    }
+
+    // === REMOVETRADE ===
+    if (interaction.commandName === 'removetrade') {
+      if (!interaction.guild) {
+        await interaction.reply({
+          content: 'This command can only be used in a server.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const allowed = await userCanManage(interaction);
+
+      if (!allowed) {
+        await interaction.reply({
+          content: 'You do not have permission to use this command.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const teamRole = interaction.options.getRole('team');
+
+      if (!teamRole || !isTeamRole(teamRole.name)) {
+        await interaction.reply({
+          content: 'That is not a tracked team role.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await pool.query(
+        `
+        UPDATE trade_counts
+        SET trade_count = GREATEST(trade_count - 1, 0)
+        WHERE team_name = $1
+        `,
+        [teamRole.name]
+      );
+
+      try {
+        await updateTradeCountPanel(interaction.guild);
+      } catch (panelError) {
+        console.error('Failed to update trade count panel:', panelError);
+      }
+
+      await interaction.reply({
+        content: `Removed 1 trade from ${teamRole}.`,
         ephemeral: true,
       });
 
