@@ -16,22 +16,21 @@ const commands = [
         .setName('message')
         .setDescription('Optional extra message')
         .setRequired(false)
+    ),
 
-new SlashCommandBuilder()
-  .setName('assignrole')
-  .setDescription('Assign a role to a member')
-  .addUserOption(option =>
-    option
-      .setName('member')
-      .setDescription('The member to give the role to')
-      .setRequired(true)
-  )
-  .addRoleOption(option =>
-    option
-      .setName('role')
-      .setDescription('The role to assign')
-      .setRequired(true)
-  ),
+  new SlashCommandBuilder()
+    .setName('linkstream')
+    .setDescription('Save your stream link')
+    .addStringOption(option =>
+      option
+        .setName('url')
+        .setDescription('Your stream link')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('livestream')
+    .setDescription('Post your saved stream link'),
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -41,4 +40,4 @@ await rest.put(
   { body: commands }
 );
 
-console.log('Ping + whogotnext deployed.');
+console.log('Ping + whogotnext + linkstream + livestream deployed.');
