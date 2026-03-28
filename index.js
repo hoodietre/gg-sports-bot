@@ -51,12 +51,12 @@ const TEAM_ROLE_NAMES = [
   '76ers',
   'Bucks',
   'Bulls',
+  'Cavs',
   'Celtics',
   'Clippers',
   'Grizzlies',
   'Hawks',
   'Heat',
-  'Cavs',
   'Hornets',
   'Jazz',
   'Kings',
@@ -159,7 +159,23 @@ async function initDatabase() {
     ALTER TABLE trade_offers
     ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending_owner'
   `);
+  
+    await pool.query(`
+    ALTER TABLE trade_offers
+    ADD COLUMN IF NOT EXISTS offer_details TEXT
+  `);
 
+  await pool.query(`
+    UPDATE trade_offers
+    SET offer_details = ''
+    WHERE offer_details IS NULL
+  `);
+
+  await pool.query(`
+    ALTER TABLE trade_offers
+    ALTER COLUMN offer_details DROP NOT NULL
+  `);
+  
   // If old screenshot_link exists, copy values into screenshot_url
   await pool.query(`
     DO $$
@@ -696,9 +712,9 @@ client.on(Events.MessageCreate, async (message) => {
       `
       INSERT INTO trade_offers (
         id, sender_user_id, sender_team, target_team,
-        target_owner_user_id, screenshot_url, status
+        target_owner_user_id, offer_details, screenshot_url, status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, 'pending_owner')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending_owner')
       `,
       [
         offerId,
@@ -706,6 +722,7 @@ client.on(Events.MessageCreate, async (message) => {
         senderTeam,
         targetTeam,
         targetOwner.id,
+        '',
         attachment.url,
       ]
     );
