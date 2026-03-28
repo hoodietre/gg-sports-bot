@@ -631,17 +631,21 @@ client.on(Events.MessageCreate, async (message) => {
     if (!message.guild) return;
     if (message.channel.id !== OFFER_A_TRADE_CHANNEL_ID) return;
 
-    const pendingTarget = pendingOfferTargets.get(message.author.id);
-    if (!pendingTarget) return;
+    const pendingData = pendingOfferTargets.get(message.author.id);
+    if (!pendingData) return;
+
+    const { targetTeam } = pendingData;
 
     const attachment = message.attachments.first();
     if (!attachment) return;
 
     const senderMember = await message.guild.members.fetch(message.author.id);
-    const senderTeamRole = senderMember.roles.cache.find(role => TEAM_ROLE_NAMES.includes(role.name));
+    const senderTeamRole = senderMember.roles.cache.find(role =>
+      TEAM_ROLE_NAMES.includes(role.name)
+    );
     const senderTeam = senderTeamRole ? senderTeamRole.name : 'Unknown Team';
 
-    const targetOwner = await findTeamOwnerByRoleName(message.guild, pendingTarget);
+    const targetOwner = await findTeamOwnerByRoleName(message.guild, targetTeam);
 
     if (!targetOwner) {
       pendingOfferTargets.delete(message.author.id);
@@ -663,7 +667,7 @@ client.on(Events.MessageCreate, async (message) => {
         offerId,
         message.author.id,
         senderTeam,
-        pendingTarget,
+        targetTeam,
         targetOwner.id,
         attachment.url,
       ]
@@ -674,7 +678,7 @@ client.on(Events.MessageCreate, async (message) => {
       .setColor(0x5865F2)
       .addFields(
         { name: 'Offering Team', value: senderTeam, inline: true },
-        { name: 'Receiving Team', value: pendingTarget, inline: true },
+        { name: 'Receiving Team', value: targetTeam, inline: true },
         { name: 'Sent By', value: `<@${message.author.id}>`, inline: true },
         { name: 'Trade Proposal Screenshot', value: attachment.url, inline: false }
       )
@@ -696,7 +700,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     pendingOfferTargets.delete(message.author.id);
 
-    await message.reply(`Your trade offer was sent to the ${pendingTarget} owner.`);
+    await message.reply(`Your trade offer was sent to the ${targetTeam} owner.`);
   } catch (error) {
     console.error('MessageCreate error:', error);
   }
