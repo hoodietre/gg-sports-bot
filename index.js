@@ -21,11 +21,12 @@ import { randomUUID } from 'crypto';
 const { Pool } = pkg;
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-  ],
+intents: [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMembers,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.MessageContent,
+],
 });
 
 // === IDs ===
