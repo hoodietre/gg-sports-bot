@@ -132,20 +132,56 @@ async function initDatabase() {
       sender_team TEXT,
       target_team TEXT NOT NULL,
       target_owner_user_id TEXT NOT NULL,
-      screenshot_url TEXT NOT NULL,
+      screenshot_url TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'pending_owner',
       committee_message_id TEXT,
       owner_decision_by TEXT
     )
   `);
 
+  // Migration for older versions of trade_offers
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS trade_offer_votes (
-      offer_id TEXT NOT NULL,
-      voter_user_id TEXT NOT NULL,
-      vote TEXT NOT NULL,
-      PRIMARY KEY (offer_id, voter_user_id)
-    )
+    ALTER TABLE trade_offers
+    ADD COLUMN IF NOT EXISTS screenshot_url TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE trade_offers
+    ADD COLUMN IF NOT EXISTS committee_message_id TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE trade_offers
+    ADD COLUMN IF NOT EXISTS owner_decision_by TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE trade_offers
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending_owner'
+  `);
+
+  // If old screenshot_link exists, copy values into screenshot_url
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'trade_offers'
+          AND column_name = 'screenshot_link'
+      ) THEN
+        UPDATE trade_offers
+        SET screenshot_url = screenshot_link
+        WHERE (screenshot_url IS NULL OR screenshot_url = '')
+          AND screenshot_link IS NOT NULL;
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    UPDATE trade_offers
+    SET screenshot_url = ''
+    WHERE screenshot_url IS NULL
   `);
 
   for (const teamName of TEAM_ROLE_NAMES) {
