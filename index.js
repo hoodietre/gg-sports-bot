@@ -21,12 +21,12 @@ import { randomUUID } from 'crypto';
 const { Pool } = pkg;
 
 const client = new Client({
-intents: [
-  GatewayIntentBits.Guilds,
-  GatewayIntentBits.GuildMembers,
-  GatewayIntentBits.GuildMessages,
-  GatewayIntentBits.MessageContent,
-],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 // === IDs ===
@@ -120,9 +120,15 @@ async function initDatabase() {
       player_name TEXT NOT NULL,
       position TEXT NOT NULL,
       age TEXT NOT NULL,
+      ovr TEXT,
       salary TEXT NOT NULL,
       submitted_by TEXT NOT NULL
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE trade_block_posts
+    ADD COLUMN IF NOT EXISTS ovr TEXT
   `);
 
   await pool.query(`
@@ -135,11 +141,11 @@ async function initDatabase() {
       screenshot_url TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'pending_owner',
       committee_message_id TEXT,
-      owner_decision_by TEXT
+      owner_decision_by TEXT,
+      offer_details TEXT
     )
   `);
 
-  // Migration for older versions of trade_offers
   await pool.query(`
     ALTER TABLE trade_offers
     ADD COLUMN IF NOT EXISTS screenshot_url TEXT
@@ -159,24 +165,12 @@ async function initDatabase() {
     ALTER TABLE trade_offers
     ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending_owner'
   `);
-  
-    await pool.query(`
+
+  await pool.query(`
     ALTER TABLE trade_offers
     ADD COLUMN IF NOT EXISTS offer_details TEXT
   `);
 
-  await pool.query(`
-    UPDATE trade_offers
-    SET offer_details = ''
-    WHERE offer_details IS NULL
-  `);
-
-  await pool.query(`
-    ALTER TABLE trade_offers
-    ALTER COLUMN offer_details DROP NOT NULL
-  `);
-  
-  // If old screenshot_link exists, copy values into screenshot_url
   await pool.query(`
     DO $$
     BEGIN
@@ -198,6 +192,26 @@ async function initDatabase() {
     UPDATE trade_offers
     SET screenshot_url = ''
     WHERE screenshot_url IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE trade_offers
+    SET offer_details = ''
+    WHERE offer_details IS NULL
+  `);
+
+  await pool.query(`
+    ALTER TABLE trade_offers
+    ALTER COLUMN offer_details DROP NOT NULL
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trade_offer_votes (
+      offer_id TEXT NOT NULL,
+      voter_user_id TEXT NOT NULL,
+      vote TEXT NOT NULL,
+      PRIMARY KEY (offer_id, voter_user_id)
+    )
   `);
 
   for (const teamName of TEAM_ROLE_NAMES) {
@@ -778,6 +792,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const playerName = interaction.fields.getTextInputValue('tradeblock_player_name');
         const position = interaction.fields.getTextInputValue('tradeblock_position');
         const age = interaction.fields.getTextInputValue('tradeblock_age');
+        const ovr = interaction.fields.getTextInputValue('tradeblock_ovr');
         const salary = interaction.fields.getTextInputValue('tradeblock_salary');
 
         const channel = await interaction.guild.channels.fetch(TRADE_BLOCK_CHANNEL_ID);
@@ -795,11 +810,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await pool.query(
           `
           INSERT INTO trade_block_posts (
-            id, posted_team, player_name, position, age, salary, submitted_by
+            id, posted_team, player_name, position, age, ovr, salary, submitted_by
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
           `,
-          [postId, team, playerName, position, age, salary, interaction.user.id]
+          [postId, team, playerName, position, age, ovr, salary, interaction.user.id]
         );
 
         const embed = new EmbedBuilder()
@@ -809,6 +824,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             { name: 'Team', value: team, inline: true },
             { name: 'Player Name', value: playerName, inline: true },
             { name: 'Position', value: position, inline: true },
+            { name: 'Overall Rating', value: ovr, inline: true },
             { name: 'Age', value: age, inline: true },
             { name: 'Current Year Salary', value: salary, inline: true },
             { name: 'Submitted By', value: `<@${interaction.user.id}>`, inline: true }
@@ -1596,6 +1612,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setRequired(true)
         .setMaxLength(10);
 
+      const ovrInput = new TextInputBuilder()
+        .setCustomId('tradeblock_ovr')
+        .setLabel('Overall Rating')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(10);
+
       const salaryInput = new TextInputBuilder()
         .setCustomId('tradeblock_salary')
         .setLabel('Current Year Salary')
@@ -1607,6 +1630,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         new ActionRowBuilder().addComponents(playerNameInput),
         new ActionRowBuilder().addComponents(positionInput),
         new ActionRowBuilder().addComponents(ageInput),
+        new ActionRowBuilder().addComponents(ovrInput),
         new ActionRowBuilder().addComponents(salaryInput)
       );
 
