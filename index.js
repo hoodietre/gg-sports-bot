@@ -791,27 +791,48 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId.startsWith('offer_trade_select_')) {
-        const [, , leagueId = 'legacy'] = interaction.customId.split(':');
+        const customIdParts = interaction.customId.split(':');
+        const leagueId = customIdParts[1] || 'legacy';
+
         let targetTeamName = interaction.values[0];
         let targetTeamRoleId = null;
         let league = null;
 
         if (leagueId !== 'legacy') {
           const result = await pool.query(
-            `SELECT l.*, s.* FROM leagues l LEFT JOIN league_settings s ON s.league_id = l.league_id WHERE l.league_id = $1`,
+            `SELECT l.league_id, l.guild_id, l.league_name, l.game_key, l.is_active,
+                    s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
+                    s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
+                    s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
+             FROM leagues l
+             LEFT JOIN league_settings s ON s.league_id = l.league_id
+             WHERE l.league_id = $1`,
             [leagueId]
           );
+
           league = result.rows[0] || null;
+
           const teamRoles = await getLeagueTeamRoles(leagueId);
           const selected = teamRoles.find(t => t.role_id === interaction.values[0]);
+
           if (selected) {
             targetTeamName = selected.role_name;
             targetTeamRoleId = selected.role_id;
           }
         }
 
-        pendingOfferTargets.set(interaction.user.id, { targetTeamName, targetTeamRoleId, leagueId: league?.league_id || null, leagueName: league?.league_name || null, createdAt: Date.now() });
-        await interaction.reply({ content: `You selected **${targetTeamName}**. Now upload your trade proposal screenshot as your next message in <#${league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID}>.`, ephemeral: true });
+        pendingOfferTargets.set(interaction.user.id, {
+          targetTeamName,
+          targetTeamRoleId,
+          leagueId: league?.league_id || null,
+          leagueName: league?.league_name || null,
+          createdAt: Date.now(),
+        });
+
+        await interaction.reply({
+          content: `You selected **${targetTeamName}**. Now upload your trade proposal screenshot as your next message in <#${league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID}>.`,
+          ephemeral: true,
+        });
         return;
       }
     }
