@@ -303,16 +303,28 @@ async function memberHasCommittee(member, league) {
 }
 
 async function findTeamOwnerByRoleId(guild, roleId) {
+  await guild.members.fetch();
+
   const role = await guild.roles.fetch(roleId).catch(() => null);
   if (!role) return null;
-  const owners = role.members.filter(member => !member.user.bot);
+
+  const owners = guild.members.cache.filter(member =>
+    !member.user.bot && member.roles.cache.has(roleId)
+  );
+
   return owners.first() || null;
 }
 
 async function findTeamOwnerByRoleName(guild, teamRoleName) {
+  await guild.members.fetch();
+
   const role = guild.roles.cache.find(r => r.name === teamRoleName);
   if (!role) return null;
-  const owners = role.members.filter(member => !member.user.bot);
+
+  const owners = guild.members.cache.filter(member =>
+    !member.user.bot && member.roles.cache.has(role.id)
+  );
+
   return owners.first() || null;
 }
 
