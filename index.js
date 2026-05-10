@@ -323,6 +323,34 @@ async function memberHasCommittee(member, league) {
   return member.permissions.has(PermissionFlagsBits.Administrator) || (league.committee_role_id ? member.roles.cache.has(league.committee_role_id) : false);
 }
 
+async function userCanUseLeagueSetup(interaction, league = null) {
+  if (!interaction.guild) return false;
+
+  const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+  const canManageServer = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+
+  if (isAdmin || canManageServer) return true;
+
+  const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  if (!member) return false;
+
+  if (league?.staff_role_id && member.roles.cache.has(league.staff_role_id)) {
+    return true;
+  }
+
+  const result = await pool.query(
+    `SELECT DISTINCT s.staff_role_id
+     FROM leagues l
+     JOIN league_settings s ON s.league_id = l.league_id
+     WHERE l.guild_id = $1
+       AND l.is_active = TRUE
+       AND s.staff_role_id IS NOT NULL`,
+    [interaction.guild.id]
+  );
+
+  return result.rows.some(row => member.roles.cache.has(row.staff_role_id));
+}
+
 async function findTeamOwnerByRoleId(guild, roleId) {
   await guild.members.fetch();
 
@@ -838,7 +866,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
- if (interaction.customId.startsWith('committee_vote_approve:') || interaction.customId.startsWith('committee_vote_deny:')) {
+      if (interaction.customId.startsWith('committee_vote_approve:') || interaction.customId.startsWith('committee_vote_deny:')) {
         const isApprove = interaction.customId.startsWith('committee_vote_approve:');
         const offerId = interaction.customId.split(':')[1];
         const league = await resolveLeague(interaction) || await getDefaultLeague(interaction.guild.id);
@@ -930,8 +958,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
         return;
       }
-      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-        await interaction.reply({ content: 'Only server admins can use league setup commands.', ephemeral: true });
+      if (!(await userCanUseLeagueSetup(interaction))) {
+        await interaction.reply({ content: 'You need server admin, Manage Server, or a configured league staff role to use league setup commands.', ephemeral: true });
         return;
       }
 
