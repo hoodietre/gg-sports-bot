@@ -101,6 +101,10 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS owner_decision_by TEXT`);
   await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending_owner'`);
   await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS offer_details TEXT`);
+  await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS guild_id TEXT`);
+  await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS league_id UUID`);
+  await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS sender_team_role_id TEXT`);
+  await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS target_team_role_id TEXT`);
   await pool.query(`UPDATE trade_offers SET offer_details = '' WHERE offer_details IS NULL`);
   await pool.query(`ALTER TABLE trade_offers ALTER COLUMN offer_details DROP NOT NULL`);
   await pool.query(`UPDATE trade_offers SET screenshot_url = '' WHERE screenshot_url IS NULL`);
@@ -244,6 +248,22 @@ async function getLeagueByName(guildId, leagueName) {
   return result.rows[0] || null;
 }
 
+async function getLeagueById(leagueId) {
+  if (!leagueId) return null;
+
+  const result = await pool.query(
+    `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
+            s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
+            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
+     FROM leagues l
+     LEFT JOIN league_settings s ON s.league_id = l.league_id
+     WHERE l.league_id = $1 AND l.is_active = TRUE`,
+    [leagueId]
+  );
+
+  return result.rows[0] || null;
+}
+
 async function getLeagueByChannel(guildId, channelId) {
   const result = await pool.query(
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
@@ -280,6 +300,7 @@ async function resolveLeague(interactionOrMessage) {
   const guild = interactionOrMessage.guild;
   if (!guild) return null;
   const channelId = interactionOrMessage.channelId || interactionOrMessage.channel?.id;
+  if (!channelId) return await getDefaultLeague(guild.id);
   return (await getLeagueByChannel(guild.id, channelId)) || (await getDefaultLeague(guild.id));
 }
 
@@ -544,14 +565,19 @@ async function getVoteCounts(offerId) {
 async function finalizeApprovedTrade(guild, offerId) {
   const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
   if (result.rows.length === 0) return;
+
   const offer = result.rows[0];
-  const league = offer.league_id ? await getLeagueByName(guild.id, offer.league_name || '') : await resolveLeague({ guild, channelId: null });
+  const league = offer.league_id ? await getLeagueById(offer.league_id) : await getDefaultLeague(guild.id);
 
   await pool.query(`UPDATE trade_offers SET status = 'committee_approved' WHERE id = $1`, [offerId]);
+
   const approvedChannelId = league?.approved_channel_id || TRADE_APPROVED_CHANNEL_ID;
   const approvedChannel = await guild.channels.fetch(approvedChannelId).catch(() => null);
+
   if (approvedChannel && approvedChannel.isTextBased()) {
-    await approvedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Approved', 0x57F287, { ...offer, status: 'committee_approved' })] });
+    await approvedChannel.send({
+      embeds: [buildFinalTradeEmbed('Trade Approved', 0x57F287, { ...offer, status: 'committee_approved' })],
+    });
   }
 
   if (league?.league_id && offer.sender_team_role_id && offer.target_team_role_id) {
@@ -562,6 +588,7 @@ async function finalizeApprovedTrade(guild, offerId) {
        DO UPDATE SET trade_count = league_trade_counts.trade_count + 1`,
       [league.league_id, offer.sender_team_role_id, offer.sender_team]
     );
+
     await pool.query(
       `INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count)
        VALUES ($1, $2, $3, 1)
@@ -580,13 +607,19 @@ async function finalizeApprovedTrade(guild, offerId) {
 async function finalizeDeniedTrade(guild, offerId) {
   const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
   if (result.rows.length === 0) return;
+
   const offer = result.rows[0];
-  const league = await resolveLeague({ guild, channelId: null });
+  const league = offer.league_id ? await getLeagueById(offer.league_id) : await getDefaultLeague(guild.id);
+
   await pool.query(`UPDATE trade_offers SET status = 'committee_denied' WHERE id = $1`, [offerId]);
+
   const deniedChannelId = league?.denied_channel_id || TRADE_DENIED_CHANNEL_ID;
   const deniedChannel = await guild.channels.fetch(deniedChannelId).catch(() => null);
+
   if (deniedChannel && deniedChannel.isTextBased()) {
-    await deniedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Denied', 0xED4245, { ...offer, status: 'committee_denied' })] });
+    await deniedChannel.send({
+      embeds: [buildFinalTradeEmbed('Trade Denied', 0xED4245, { ...offer, status: 'committee_denied' })],
+    });
   }
 }
 
@@ -632,9 +665,24 @@ client.on(Events.MessageCreate, async (message) => {
 
     const offerId = randomUUID();
     await pool.query(
-      `INSERT INTO trade_offers (id, sender_user_id, sender_team, target_team, target_owner_user_id, offer_details, screenshot_url, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending_owner')`,
-      [offerId, message.author.id, senderTeam.name, pendingData.targetTeamName, targetOwner.id, '', attachment.url]
+      `INSERT INTO trade_offers (
+         id, guild_id, league_id, sender_user_id, sender_team, sender_team_role_id,
+         target_team, target_team_role_id, target_owner_user_id, offer_details, screenshot_url, status
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending_owner')`,
+      [
+        offerId,
+        message.guild.id,
+        league?.league_id || null,
+        message.author.id,
+        senderTeam.name,
+        senderTeam.roleId || null,
+        pendingData.targetTeamName,
+        pendingData.targetTeamRoleId || null,
+        targetOwner.id,
+        '',
+        attachment.url,
+      ]
     );
 
     const dmEmbed = new EmbedBuilder()
@@ -717,42 +765,80 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.customId.startsWith('trade_offer_accept:')) {
         const offerId = interaction.customId.split(':')[1];
+
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
-        if (result.rows.length === 0) return;
+        if (result.rows.length === 0) {
+          await interaction.reply({ content: 'That trade offer could not be found.', ephemeral: true });
+          return;
+        }
+
         const offer = result.rows[0];
+
         if (interaction.user.id !== offer.target_owner_user_id) {
           await interaction.reply({ content: 'Only the targeted team owner can accept this offer.', ephemeral: true });
           return;
         }
-        const league = await resolveLeague({ guild: interaction.guild, channelId: null }) || await getDefaultLeague(interaction.guild.id);
-        await pool.query(`UPDATE trade_offers SET status = 'owner_accepted', owner_decision_by = $1 WHERE id = $2`, [interaction.user.id, offerId]);
+
+        const guild = await client.guilds.fetch(offer.guild_id || DEV_GUILD_ID);
+        const league = offer.league_id ? await getLeagueById(offer.league_id) : await getDefaultLeague(guild.id);
+
+        await pool.query(
+          `UPDATE trade_offers SET status = 'owner_accepted', owner_decision_by = $1 WHERE id = $2`,
+          [interaction.user.id, offerId]
+        );
+
         const committeeChannel = await client.channels.fetch(league?.committee_channel_id || COMMITTEE_CHANNEL_ID);
+
+        if (!committeeChannel || !committeeChannel.isTextBased()) {
+          await interaction.reply({ content: 'Committee channel not found.', ephemeral: true });
+          return;
+        }
+
         const committeeMessage = await committeeChannel.send({
           content: `<@&${league?.committee_role_id || COMMITTEE_ROLE_ID}>`,
           embeds: [buildCommitteeEmbed({ ...offer, status: 'owner_accepted' }, 0, 0)],
           components: [buildCommitteeVoteButtons(offerId)],
           allowedMentions: { roles: [league?.committee_role_id || COMMITTEE_ROLE_ID], users: [] },
         });
+
         await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
-        await interaction.update({ content: 'Trade offer accepted and sent to committee.', components: [buildOfferDecisionButtons(offerId, true)] });
+
+        await interaction.update({
+          content: 'Trade offer accepted and sent to committee.',
+          components: [buildOfferDecisionButtons(offerId, true)],
+        });
         return;
       }
 
       if (interaction.customId.startsWith('trade_offer_decline:')) {
         const offerId = interaction.customId.split(':')[1];
+
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
-        if (result.rows.length === 0) return;
+        if (result.rows.length === 0) {
+          await interaction.reply({ content: 'That trade offer could not be found.', ephemeral: true });
+          return;
+        }
+
         const offer = result.rows[0];
+
         if (interaction.user.id !== offer.target_owner_user_id) {
           await interaction.reply({ content: 'Only the targeted team owner can decline this offer.', ephemeral: true });
           return;
         }
-        await pool.query(`UPDATE trade_offers SET status = 'owner_declined', owner_decision_by = $1 WHERE id = $2`, [interaction.user.id, offerId]);
-        await interaction.update({ content: 'Trade offer declined.', components: [buildOfferDecisionButtons(offerId, true)] });
+
+        await pool.query(
+          `UPDATE trade_offers SET status = 'owner_declined', owner_decision_by = $1 WHERE id = $2`,
+          [interaction.user.id, offerId]
+        );
+
+        await interaction.update({
+          content: 'Trade offer declined.',
+          components: [buildOfferDecisionButtons(offerId, true)],
+        });
         return;
       }
 
-      if (interaction.customId.startsWith('committee_vote_approve:') || interaction.customId.startsWith('committee_vote_deny:')) {
+      if (interaction.customId.startsWith('committee_vote_approve:' || interaction.customId.startsWith('committee_vote_deny:')) {
         const isApprove = interaction.customId.startsWith('committee_vote_approve:');
         const offerId = interaction.customId.split(':')[1];
         const league = await resolveLeague(interaction) || await getDefaultLeague(interaction.guild.id);
