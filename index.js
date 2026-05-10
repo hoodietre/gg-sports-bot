@@ -838,7 +838,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (interaction.customId.startsWith('committee_vote_approve:' || interaction.customId.startsWith('committee_vote_deny:')) {
+ if (interaction.customId.startsWith('committee_vote_approve:') || interaction.customId.startsWith('committee_vote_deny:')) {
         const isApprove = interaction.customId.startsWith('committee_vote_approve:');
         const offerId = interaction.customId.split(':')[1];
         const league = await resolveLeague(interaction) || await getDefaultLeague(interaction.guild.id);
