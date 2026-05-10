@@ -1045,20 +1045,58 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.commandName === 'league-setup-panels') {
-        const teamOwnersChannel = await interaction.guild.channels.fetch(league.team_owners_channel_id);
-        const tradeCountChannel = await interaction.guild.channels.fetch(league.trade_count_channel_id);
-        const offerTradeChannel = await interaction.guild.channels.fetch(league.offer_a_trade_channel_id);
+        const missing = [];
 
-        const teamOwnersMessage = await teamOwnersChannel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
+        if (!league.team_owners_channel_id) missing.push('team owners channel');
+        if (!league.trade_count_channel_id) missing.push('trade count channel');
+        if (!league.offer_a_trade_channel_id) missing.push('offer-a-trade channel');
+
+        if (missing.length > 0) {
+          await interaction.reply({
+            content: `This league is missing: ${missing.join(', ')}. Run /league-setchannels for **${league.league_name}** first.`,
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const teamOwnersChannel = await interaction.guild.channels.fetch(league.team_owners_channel_id).catch(() => null);
+        const tradeCountChannel = await interaction.guild.channels.fetch(league.trade_count_channel_id).catch(() => null);
+        const offerTradeChannel = await interaction.guild.channels.fetch(league.offer_a_trade_channel_id).catch(() => null);
+
+        const inaccessible = [];
+
+        if (!teamOwnersChannel || !teamOwnersChannel.isTextBased()) inaccessible.push('team owners channel');
+        if (!tradeCountChannel || !tradeCountChannel.isTextBased()) inaccessible.push('trade count channel');
+        if (!offerTradeChannel || !offerTradeChannel.isTextBased()) inaccessible.push('offer-a-trade channel');
+
+        if (inaccessible.length > 0) {
+          await interaction.reply({
+            content: `I could not access or post in: ${inaccessible.join(', ')}. Make sure the bot can View Channel and Send Messages there.`,
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const teamOwnersMessage = await teamOwnersChannel.send({
+          embeds: [await buildTeamOwnersEmbed(interaction.guild, league)],
+        });
         await savePanel(league, 'team_owners', teamOwnersChannel.id, teamOwnersMessage.id);
 
-        const tradeCountMessage = await tradeCountChannel.send({ embeds: [await buildTradeCountEmbed(league)] });
+        const tradeCountMessage = await tradeCountChannel.send({
+          embeds: [await buildTradeCountEmbed(league)],
+        });
         await savePanel(league, 'trade_count', tradeCountChannel.id, tradeCountMessage.id);
 
-        const offerTradeMessage = await offerTradeChannel.send({ embeds: [buildOfferTradePanelEmbed(league.league_name)], components: [buildOfferTradePanelButton(league.league_id)] });
+        const offerTradeMessage = await offerTradeChannel.send({
+          embeds: [buildOfferTradePanelEmbed(league.league_name)],
+          components: [buildOfferTradePanelButton(league.league_id)],
+        });
         await savePanel(league, 'offer_trade', offerTradeChannel.id, offerTradeMessage.id);
 
-        await interaction.reply({ content: `Panels created for **${league.league_name}**.`, ephemeral: true });
+        await interaction.reply({
+          content: `Panels created for **${league.league_name}**.`,
+          ephemeral: true,
+        });
         return;
       }
     }
