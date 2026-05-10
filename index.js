@@ -1065,13 +1065,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const inaccessible = [];
 
-        if (!teamOwnersChannel || !teamOwnersChannel.isTextBased()) inaccessible.push('team owners channel');
-        if (!tradeCountChannel || !tradeCountChannel.isTextBased()) inaccessible.push('trade count channel');
-        if (!offerTradeChannel || !offerTradeChannel.isTextBased()) inaccessible.push('offer-a-trade channel');
+        const botMember = await interaction.guild.members.fetchMe();
+
+        function canPostIn(channel) {
+          if (!channel || !channel.isTextBased()) return false;
+
+          const permissions = channel.permissionsFor(botMember);
+          if (!permissions) return false;
+
+          return permissions.has(PermissionFlagsBits.ViewChannel) &&
+            permissions.has(PermissionFlagsBits.SendMessages) &&
+            permissions.has(PermissionFlagsBits.EmbedLinks);
+        }
+
+        if (!canPostIn(teamOwnersChannel)) inaccessible.push(`team owners channel (<#${league.team_owners_channel_id}>)`);
+        if (!canPostIn(tradeCountChannel)) inaccessible.push(`trade count channel (<#${league.trade_count_channel_id}>)`);
+        if (!canPostIn(offerTradeChannel)) inaccessible.push(`offer-a-trade channel (<#${league.offer_a_trade_channel_id}>)`);
 
         if (inaccessible.length > 0) {
           await interaction.reply({
-            content: `I could not access or post in: ${inaccessible.join(', ')}. Make sure the bot can View Channel and Send Messages there.`,
+            content: `I cannot post in: ${inaccessible.join(', ')}. Give the bot View Channel, Send Messages, and Embed Links permissions there.`,
             ephemeral: true,
           });
           return;
