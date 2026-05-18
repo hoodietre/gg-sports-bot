@@ -163,9 +163,12 @@ async function initDatabase() {
       committee_channel_id TEXT,
       approved_channel_id TEXT,
       denied_channel_id TEXT,
+      history_channel_id TEXT,
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS history_channel_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_team_roles (
@@ -207,6 +210,24 @@ async function initDatabase() {
       team_name TEXT NOT NULL,
       trade_count INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (league_id, role_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS season_history (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE SET NULL,
+      season_label TEXT NOT NULL,
+      champion TEXT NOT NULL,
+      runner_up TEXT,
+      mvp TEXT,
+      awards TEXT,
+      notes TEXT,
+      posted_channel_id TEXT,
+      posted_message_id TEXT,
+      created_by_user_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 
@@ -349,6 +370,23 @@ function buildCommands() {
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
 
     new SlashCommandBuilder()
+      .setName('league-sethistorychannel')
+      .setDescription('Set the league history channel')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addChannelOption(o => o.setName('channel').setDescription('League history channel').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('addseasonhistory')
+      .setDescription('Post a completed season history embed')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addStringOption(o => o.setName('season').setDescription('Season label, ex: Season 1 or 2026 Spring').setRequired(true))
+      .addStringOption(o => o.setName('champion').setDescription('Champion team/user').setRequired(true))
+      .addStringOption(o => o.setName('runner_up').setDescription('Runner-up team/user').setRequired(false))
+      .addStringOption(o => o.setName('mvp').setDescription('MVP or top player').setRequired(false))
+      .addStringOption(o => o.setName('awards').setDescription('Awards summary').setRequired(false))
+      .addStringOption(o => o.setName('notes').setDescription('Season notes or storylines').setRequired(false)),
+
+    new SlashCommandBuilder()
       .setName('editleaguename')
       .setDescription('Rename a configured league')
       .addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true))
@@ -375,7 +413,7 @@ async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
+            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -391,7 +429,7 @@ async function getLeagueById(leagueId) {
   const result = await pool.query(
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
+            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -405,12 +443,12 @@ async function getLeagueByChannel(guildId, channelId) {
   const result = await pool.query(
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
+            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
        s.live_channel_id, s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
+       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id
      )
      LIMIT 1`,
     [guildId, channelId]
@@ -423,7 +461,7 @@ async function getDefaultLeague(guildId) {
   const result = await pool.query(
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
+            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -729,10 +767,43 @@ function buildTradeHistoryEmbed(league, rows, title = 'Trade History') {
     const date = row.approved_by_committee_at
       ? new Date(row.approved_by_committee_at).toLocaleDateString('en-US')
       : 'Unknown date';
-    return `**${index + 1}. ${row.sender_team} ⇄ ${row.target_team}**\nSent by <@${row.sender_user_id}> • ${date}${row.screenshot_url ? `\n[View Screenshot](${row.screenshot_url})` : ''}`;
+    return `**${index + 1}. ${row.sender_team} ⇄ ${row.target_team}**
+Sent by <@${row.sender_user_id}> • ${date}${row.screenshot_url ? `
+[View Screenshot](${row.screenshot_url})` : ''}`;
   });
 
-  embed.setDescription(lines.join('\n\n'));
+  embed.setDescription(lines.join('
+
+'));
+  return embed;
+}
+
+function buildSeasonHistoryEmbed(league, data) {
+  const embed = new EmbedBuilder()
+    .setTitle(`${league.league_name} • ${data.seasonLabel} History`)
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Champion', value: data.champion, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • League History' })
+    .setTimestamp();
+
+  if (data.runnerUp) {
+    embed.addFields({ name: 'Runner-Up', value: data.runnerUp, inline: true });
+  }
+
+  if (data.mvp) {
+    embed.addFields({ name: 'MVP / Top Player', value: data.mvp, inline: false });
+  }
+
+  if (data.awards) {
+    embed.addFields({ name: 'Awards', value: data.awards, inline: false });
+  }
+
+  if (data.notes) {
+    embed.addFields({ name: 'Season Notes', value: data.notes, inline: false });
+  }
+
   return embed;
 }
 
@@ -1413,6 +1484,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: `Panels created for **${league.league_name}**.`, ephemeral: true });
         return;
       }
+
+      if (interaction.commandName === 'league-sethistorychannel') {
+        const channel = interaction.options.getChannel('channel');
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({
+            content: 'I need View Channel, Send Messages, and Embed Links permissions in that history channel.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await pool.query(
+          `UPDATE league_settings SET history_channel_id = $1, updated_at = NOW() WHERE league_id = $2`,
+          [channel.id, league.league_id]
+        );
+
+        await interaction.reply({ content: `History channel for **${league.league_name}** set to ${channel}.`, ephemeral: true });
+        return;
+      }
     }
 
     // NON-LEAGUE-PREFIX COMMANDS
@@ -1488,6 +1581,77 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp();
 
       await interaction.reply({ embeds: [embed], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'addseasonhistory') {
+      if (!interaction.guild) {
+        await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+        return;
+      }
+
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+      if (!activeLeague) {
+        await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+        await interaction.reply({ content: 'You do not have permission to add season history for this league.', ephemeral: true });
+        return;
+      }
+
+      if (!activeLeague.history_channel_id) {
+        await interaction.reply({ content: `No history channel is set for **${activeLeague.league_name}**. Use /league-sethistorychannel first.`, ephemeral: true });
+        return;
+      }
+
+      const historyChannel = await interaction.guild.channels.fetch(activeLeague.history_channel_id).catch(() => null);
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = historyChannel?.permissionsFor(botMember);
+
+      if (!historyChannel || !historyChannel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I cannot post in the configured history channel. Check my permissions there.', ephemeral: true });
+        return;
+      }
+
+      const data = {
+        seasonLabel: interaction.options.getString('season'),
+        champion: interaction.options.getString('champion'),
+        runnerUp: interaction.options.getString('runner_up'),
+        mvp: interaction.options.getString('mvp'),
+        awards: interaction.options.getString('awards'),
+        notes: interaction.options.getString('notes'),
+      };
+
+      const embed = buildSeasonHistoryEmbed(activeLeague, data);
+      const postedMessage = await historyChannel.send({ embeds: [embed] });
+
+      await pool.query(
+        `INSERT INTO season_history (
+          id, guild_id, league_id, season_label, champion, runner_up, mvp, awards, notes,
+          posted_channel_id, posted_message_id, created_by_user_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [
+          randomUUID(),
+          interaction.guild.id,
+          activeLeague.league_id,
+          data.seasonLabel,
+          data.champion,
+          data.runnerUp,
+          data.mvp,
+          data.awards,
+          data.notes,
+          historyChannel.id,
+          postedMessage.id,
+          interaction.user.id,
+        ]
+      );
+
+      await interaction.reply({ content: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.`, ephemeral: true });
       return;
     }
 
