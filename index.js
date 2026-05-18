@@ -921,14 +921,20 @@ function buildAwardHistoryEmbed(league, rows, awardFilter = null) {
 }
 
 function buildHallOfFameEmbed(league, franchiseRows, awardRows) {
+  const NL = String.fromCharCode(10);
+
   const titleLeaders = franchiseRows.length
-    ? franchiseRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.franchise_name}** — ${row.championships} titles`).join('
-')
+    ? franchiseRows
+        .slice(0, 10)
+        .map((row, index) => `**${index + 1}. ${row.franchise_name}** — ${row.championships} titles`)
+        .join(NL)
     : 'No championship records yet.';
 
   const awardLeaders = awardRows.length
-    ? awardRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.winner}** — ${row.award_count} awards`).join('
-')
+    ? awardRows
+        .slice(0, 10)
+        .map((row, index) => `**${index + 1}. ${row.winner}** — ${row.award_count} awards`)
+        .join(NL)
     : 'No award records yet.';
 
   return new EmbedBuilder()
@@ -940,58 +946,6 @@ function buildHallOfFameEmbed(league, franchiseRows, awardRows) {
     )
     .setFooter({ text: 'GG Sports • Hall of Fame' })
     .setTimestamp();
-}
-
-function shortGameId(gameId) {
-  return gameId.split('-')[0];
-}
-
-function buildScheduleEmbed(league, rows) {
-  const embed = new EmbedBuilder()
-    .setTitle(`${league?.league_name || 'League'} • Schedule`)
-    .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • Schedule' })
-    .setTimestamp();
-
-  if (!rows.length) {
-    embed.setDescription('No games have been scheduled yet.');
-    return embed;
-  }
-
-  const lines = rows.map(row => {
-    const score = row.status === 'final' ? ` • Final: ${row.away_score}-${row.home_score}` : '';
-    const date = row.scheduled_for ? ` • ${row.scheduled_for}` : '';
-    const week = row.week_label ? ` • ${row.week_label}` : '';
-    return `**${shortGameId(row.id)}** — ${row.away_team_name} @ ${row.home_team_name}${week}${date} • ${row.status}${score}`;
-  });
-
-  embed.setDescription(lines.join('
-'));
-  return embed;
-}
-
-function buildStandingsEmbed(league, rows) {
-  const embed = new EmbedBuilder()
-    .setTitle(`${league?.league_name || 'League'} • Standings`)
-    .setColor(0x57F287)
-    .setFooter({ text: 'GG Sports • Standings' })
-    .setTimestamp();
-
-  if (!rows.length) {
-    embed.setDescription('No standings records yet. Report a game or adjust standings to begin.');
-    return embed;
-  }
-
-  const lines = rows.map((row, index) => {
-    const games = Number(row.wins) + Number(row.losses);
-    const winPct = games > 0 ? (Number(row.wins) / games).toFixed(3).replace(/^0/, '') : '.000';
-    const diff = Number(row.points_for) - Number(row.points_against);
-    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct}) • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
-  });
-
-  embed.setDescription(lines.join('
-'));
-  return embed;
 }
 
 async function savePanel(league, panelKey, channelId, messageId) {
