@@ -767,14 +767,17 @@ function buildTradeHistoryEmbed(league, rows, title = 'Trade History') {
     const date = row.approved_by_committee_at
       ? new Date(row.approved_by_committee_at).toLocaleDateString('en-US')
       : 'Unknown date';
+
     return `**${index + 1}. ${row.sender_team} ⇄ ${row.target_team}**
-Sent by <@${row.sender_user_id}> • ${date}${row.screenshot_url ? `
-[View Screenshot](${row.screenshot_url})` : ''}`;
+Sent by <@${row.sender_user_id}> • ${date}${
+      row.screenshot_url
+        ? `\n[View Screenshot](${row.screenshot_url})`
+        : ''
+    }`;
   });
 
-  embed.setDescription(lines.join('
+  embed.setDescription(lines.join('\n\n'));
 
-'));
   return embed;
 }
 
