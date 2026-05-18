@@ -474,6 +474,24 @@ function buildCommands() {
       .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
 
     new SlashCommandBuilder()
+      .setName('profile')
+      .setDescription('Show a user profile for a league')
+      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('stats')
+      .setDescription('Show your league stats or another user’s stats')
+      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('teamprofile')
+      .setDescription('Show a team/franchise profile for a league')
+      .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
+      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -1000,6 +1018,46 @@ function buildStandingsEmbed(league, rows) {
 
   embed.setDescription(lines.join(NL));
   return embed;
+}
+
+function buildUserProfileEmbed(league, user, data) {
+  return new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • ${user.username} Profile`)
+    .setColor(0x5865F2)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'Team', value: data.teamName || 'No team assigned', inline: true },
+      { name: 'Record', value: `${data.wins}-${data.losses}`, inline: true },
+      { name: 'Games Played', value: String(data.gamesPlayed), inline: true },
+      { name: 'Championships', value: String(data.championships), inline: true },
+      { name: 'Finals Appearances', value: String(data.finalsAppearances), inline: true },
+      { name: 'Awards', value: String(data.awardsWon), inline: true },
+      { name: 'Approved Trades Involving Team', value: String(data.trades), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • User Profile' })
+    .setTimestamp();
+}
+
+function buildTeamProfileEmbed(league, teamRole, data) {
+  const NL = String.fromCharCode(10);
+  const recentAwards = data.awards.length
+    ? data.awards.map(row => `**${row.season_label}** — ${row.award_name}: ${row.winner}`).join(NL)
+    : 'No awards recorded.';
+
+  return new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • ${teamRole.name} Profile`)
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Record', value: `${data.wins}-${data.losses}`, inline: true },
+      { name: 'Games Played', value: String(data.gamesPlayed), inline: true },
+      { name: 'Point Differential', value: String(data.pointDiff), inline: true },
+      { name: 'Championships', value: String(data.championships), inline: true },
+      { name: 'Finals Appearances', value: String(data.finalsAppearances), inline: true },
+      { name: 'Trades', value: String(data.trades), inline: true },
+      { name: 'Recent Awards', value: recentAwards, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Team Profile' })
+    .setTimestamp();
 }
 
 async function savePanel(league, panelKey, channelId, messageId) {
@@ -1953,6 +2011,140 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await updateStandingsPanel(interaction.guild, activeLeague);
       await interaction.reply({ content: `Standings adjusted: **${team.name}** is now **${wins}-${losses}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'profile' || interaction.commandName === 'stats') {
+      if (!interaction.guild) return;
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      const requestedLeagueName = interaction.options.getString('league');
+      const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        return;
+      }
+
+      const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+      if (!targetMember) {
+        await interaction.reply({ content: 'Could not find that member in this server.', ephemeral: true });
+        return;
+      }
+
+      const team = await getMemberTeamForLeague(targetMember, activeLeague);
+      let wins = 0;
+      let losses = 0;
+      let gamesPlayed = 0;
+      let championships = 0;
+      let finalsAppearances = 0;
+      let awardsWon = 0;
+      let trades = 0;
+
+      if (team) {
+        const standingsResult = await pool.query(
+          `SELECT wins, losses FROM league_standings WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3`,
+          [interaction.guild.id, activeLeague.league_id, team.roleId]
+        );
+        if (standingsResult.rows.length) {
+          wins = Number(standingsResult.rows[0].wins);
+          losses = Number(standingsResult.rows[0].losses);
+          gamesPlayed = wins + losses;
+        }
+
+        const legacyResult = await pool.query(
+          `SELECT championships, finals_appearances FROM franchise_legacy WHERE guild_id = $1 AND league_id = $2 AND LOWER(franchise_name) = LOWER($3)`,
+          [interaction.guild.id, activeLeague.league_id, team.name]
+        );
+        if (legacyResult.rows.length) {
+          championships = Number(legacyResult.rows[0].championships);
+          finalsAppearances = Number(legacyResult.rows[0].finals_appearances);
+        }
+
+        const tradeResult = await pool.query(
+          `SELECT COUNT(*)::int AS count FROM trade_history
+           WHERE guild_id = $1 AND league_id = $2
+           AND (sender_team_role_id = $3 OR target_team_role_id = $3 OR LOWER(sender_team) = LOWER($4) OR LOWER(target_team) = LOWER($4))`,
+          [interaction.guild.id, activeLeague.league_id, team.roleId, team.name]
+        );
+        trades = tradeResult.rows[0]?.count || 0;
+      }
+
+      const awardResult = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM award_history
+         WHERE guild_id = $1 AND league_id = $2 AND (winner ILIKE $3 OR winner ILIKE $4)`,
+        [interaction.guild.id, activeLeague.league_id, `%${targetUser.username}%`, `%${targetMember.displayName}%`]
+      );
+      awardsWon = awardResult.rows[0]?.count || 0;
+
+      await interaction.reply({
+        embeds: [buildUserProfileEmbed(activeLeague, targetUser, {
+          teamName: team?.name || null,
+          wins,
+          losses,
+          gamesPlayed,
+          championships,
+          finalsAppearances,
+          awardsWon,
+          trades,
+        })],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'teamprofile') {
+      if (!interaction.guild) return;
+      const teamRole = interaction.options.getRole('team');
+      const requestedLeagueName = interaction.options.getString('league');
+      const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        return;
+      }
+
+      const standingsResult = await pool.query(
+        `SELECT wins, losses, points_for, points_against FROM league_standings WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3`,
+        [interaction.guild.id, activeLeague.league_id, teamRole.id]
+      );
+      const standings = standingsResult.rows[0] || { wins: 0, losses: 0, points_for: 0, points_against: 0 };
+      const wins = Number(standings.wins);
+      const losses = Number(standings.losses);
+      const gamesPlayed = wins + losses;
+      const pointDiff = Number(standings.points_for) - Number(standings.points_against);
+
+      const legacyResult = await pool.query(
+        `SELECT championships, finals_appearances FROM franchise_legacy WHERE guild_id = $1 AND league_id = $2 AND LOWER(franchise_name) = LOWER($3)`,
+        [interaction.guild.id, activeLeague.league_id, teamRole.name]
+      );
+      const legacy = legacyResult.rows[0] || { championships: 0, finals_appearances: 0 };
+
+      const tradeResult = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM trade_history
+         WHERE guild_id = $1 AND league_id = $2
+         AND (sender_team_role_id = $3 OR target_team_role_id = $3 OR LOWER(sender_team) = LOWER($4) OR LOWER(target_team) = LOWER($4))`,
+        [interaction.guild.id, activeLeague.league_id, teamRole.id, teamRole.name]
+      );
+
+      const awardsResult = await pool.query(
+        `SELECT season_label, award_name, winner FROM award_history
+         WHERE guild_id = $1 AND league_id = $2 AND winner ILIKE $3
+         ORDER BY created_at DESC
+         LIMIT 8`,
+        [interaction.guild.id, activeLeague.league_id, `%${teamRole.name}%`]
+      );
+
+      await interaction.reply({
+        embeds: [buildTeamProfileEmbed(activeLeague, teamRole, {
+          wins,
+          losses,
+          gamesPlayed,
+          pointDiff,
+          championships: Number(legacy.championships),
+          finalsAppearances: Number(legacy.finals_appearances),
+          trades: tradeResult.rows[0]?.count || 0,
+          awards: awardsResult.rows,
+        })],
+        ephemeral: true,
+      });
       return;
     }
 
