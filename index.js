@@ -157,10 +157,12 @@ async function initDatabase() {
       approved_channel_id TEXT,
       denied_channel_id TEXT,
       history_channel_id TEXT,
+      standings_channel_id TEXT,
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS history_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS standings_channel_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_team_roles (
@@ -270,6 +272,43 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_standings (
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      team_role_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      points_for INTEGER NOT NULL DEFAULT 0,
+      points_against INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, team_role_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_games (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      home_team_role_id TEXT NOT NULL,
+      home_team_name TEXT NOT NULL,
+      away_team_role_id TEXT NOT NULL,
+      away_team_name TEXT NOT NULL,
+      scheduled_for TEXT,
+      week_label TEXT,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      home_score INTEGER,
+      away_score INTEGER,
+      winner_team_role_id TEXT,
+      reported_by_user_id TEXT,
+      created_by_user_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   for (const teamName of TEAM_ROLE_NAMES) {
     await pool.query(
       `INSERT INTO trade_counts (team_name, trade_count) VALUES ($1, 0) ON CONFLICT (team_name) DO NOTHING`,
@@ -375,6 +414,17 @@ function buildCommands() {
       .addChannelOption(o => o.setName('channel').setDescription('League history channel').setRequired(true)),
 
     new SlashCommandBuilder()
+      .setName('league-setstandingschannel')
+      .setDescription('Set the league standings channel')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addChannelOption(o => o.setName('channel').setDescription('League standings channel').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('setupstandings')
+      .setDescription('Create or refresh the permanent standings panel')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
+
+    new SlashCommandBuilder()
       .setName('league-addteamrole')
       .setDescription('Add a team role to a league')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -422,6 +472,40 @@ function buildCommands() {
       .setName('halloffame')
       .setDescription('Show the league Hall of Fame leaderboard')
       .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('addgame')
+      .setDescription('Add a scheduled league game')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true))
+      .addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true))
+      .addStringOption(o => o.setName('date').setDescription('Game date/time, ex: Week 1 or May 20 8PM').setRequired(false))
+      .addStringOption(o => o.setName('week').setDescription('Week/series label, ex: Week 1').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('reportgame')
+      .setDescription('Report a completed league game')
+      .addStringOption(o => o.setName('game_id').setDescription('Game ID from /schedule').setRequired(true))
+      .addIntegerOption(o => o.setName('home_score').setDescription('Home team score').setRequired(true))
+      .addIntegerOption(o => o.setName('away_score').setDescription('Away team score').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('schedule')
+      .setDescription('Show scheduled/recent games for a league')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('standings')
+      .setDescription('Show league standings')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('adjuststandings')
+      .setDescription('Admin adjustment for team standings')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
+      .addIntegerOption(o => o.setName('wins').setDescription('Set wins').setRequired(true))
+      .addIntegerOption(o => o.setName('losses').setDescription('Set losses').setRequired(true)),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -442,7 +526,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id
+            s.history_channel_id, s.standings_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -457,7 +541,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id
+            s.history_channel_id, s.standings_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -471,12 +555,12 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id
+            s.history_channel_id, s.standings_channel_id
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
        s.live_channel_id, s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id
+       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id, s.standings_channel_id
      )
      LIMIT 1`,
     [guildId, channelId]
@@ -489,7 +573,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id
+            s.history_channel_id, s.standings_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -838,11 +922,13 @@ function buildAwardHistoryEmbed(league, rows, awardFilter = null) {
 
 function buildHallOfFameEmbed(league, franchiseRows, awardRows) {
   const titleLeaders = franchiseRows.length
-    ? franchiseRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.franchise_name}** — ${row.championships} titles`).join('\n')
+    ? franchiseRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.franchise_name}** — ${row.championships} titles`).join('
+')
     : 'No championship records yet.';
 
   const awardLeaders = awardRows.length
-    ? awardRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.winner}** — ${row.award_count} awards`).join('\n')
+    ? awardRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.winner}** — ${row.award_count} awards`).join('
+')
     : 'No award records yet.';
 
   return new EmbedBuilder()
@@ -854,6 +940,58 @@ function buildHallOfFameEmbed(league, franchiseRows, awardRows) {
     )
     .setFooter({ text: 'GG Sports • Hall of Fame' })
     .setTimestamp();
+}
+
+function shortGameId(gameId) {
+  return gameId.split('-')[0];
+}
+
+function buildScheduleEmbed(league, rows) {
+  const embed = new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • Schedule`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Schedule' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No games have been scheduled yet.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const score = row.status === 'final' ? ` • Final: ${row.away_score}-${row.home_score}` : '';
+    const date = row.scheduled_for ? ` • ${row.scheduled_for}` : '';
+    const week = row.week_label ? ` • ${row.week_label}` : '';
+    return `**${shortGameId(row.id)}** — ${row.away_team_name} @ ${row.home_team_name}${week}${date} • ${row.status}${score}`;
+  });
+
+  embed.setDescription(lines.join('
+'));
+  return embed;
+}
+
+function buildStandingsEmbed(league, rows) {
+  const embed = new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • Standings`)
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • Standings' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No standings records yet. Report a game or adjust standings to begin.');
+    return embed;
+  }
+
+  const lines = rows.map((row, index) => {
+    const games = Number(row.wins) + Number(row.losses);
+    const winPct = games > 0 ? (Number(row.wins) / games).toFixed(3).replace(/^0/, '') : '.000';
+    const diff = Number(row.points_for) - Number(row.points_against);
+    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct}) • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
+  });
+
+  embed.setDescription(lines.join('
+'));
+  return embed;
 }
 
 async function savePanel(league, panelKey, channelId, messageId) {
@@ -894,6 +1032,22 @@ async function updateTeamOwnersPanel(guild, league = null) {
 
 async function updateTradeCountPanel(guild, league = null) {
   await updatePanel(guild, league, 'trade_count', await buildTradeCountEmbed(league));
+}
+
+async function getStandingsRows(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT * FROM league_standings
+     WHERE guild_id = $1 AND league_id = $2
+     ORDER BY wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC`,
+    [guildId, leagueId]
+  );
+  return result.rows;
+}
+
+async function updateStandingsPanel(guild, league) {
+  if (!guild || !league?.league_id) return;
+  const rows = await getStandingsRows(guild.id, league.league_id);
+  await updatePanel(guild, league, 'standings', buildStandingsEmbed(league, rows));
 }
 
 async function getVoteCounts(offerId) {
@@ -1306,6 +1460,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (interaction.commandName === 'league-setstandingschannel') {
+        const channel = interaction.options.getChannel('channel');
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that standings channel.', ephemeral: true });
+          return;
+        }
+        await pool.query(`UPDATE league_settings SET standings_channel_id = $1, updated_at = NOW() WHERE league_id = $2`, [channel.id, league.league_id]);
+        await interaction.reply({ content: `Standings channel for **${league.league_name}** set to ${channel}.`, ephemeral: true });
+        return;
+      }
+
       if (interaction.commandName === 'league-addteamrole') {
         const role = interaction.options.getRole('role');
         await pool.query(`INSERT INTO league_team_roles (league_id, role_id, role_name) VALUES ($1, $2, $3) ON CONFLICT (league_id, role_id) DO UPDATE SET role_name = EXCLUDED.role_name`, [league.league_id, role.id, role.name]);
@@ -1351,6 +1518,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await savePanel(league, 'team_owners', teamOwnersChannel.id, teamOwnersMessage.id);
         const tradeCountMessage = await tradeCountChannel.send({ embeds: [await buildTradeCountEmbed(league)] });
         await savePanel(league, 'trade_count', tradeCountChannel.id, tradeCountMessage.id);
+        if (league.standings_channel_id) {
+          const standingsChannel = await interaction.guild.channels.fetch(league.standings_channel_id).catch(() => null);
+          if (standingsChannel && standingsChannel.isTextBased()) {
+            const standingsRows = await getStandingsRows(interaction.guild.id, league.league_id);
+            const standingsMessage = await standingsChannel.send({ embeds: [buildStandingsEmbed(league, standingsRows)] });
+            await savePanel(league, 'standings', standingsChannel.id, standingsMessage.id);
+          }
+        }
         const offerTradeMessage = await offerTradeChannel.send({ embeds: [buildOfferTradePanelEmbed(league.league_name)], components: [buildOfferTradePanelButton(league.league_id)] });
         await savePanel(league, 'offer_trade', offerTradeChannel.id, offerTradeMessage.id);
         await interaction.reply({ content: `Panels created for **${league.league_name}**.`, ephemeral: true });
@@ -1558,6 +1733,218 @@ client.on(Events.InteractionCreate, async (interaction) => {
         [interaction.guild.id, activeLeague.league_id]
       );
       await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'setupstandings') {
+      if (!interaction.guild) return;
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+      if (!activeLeague) {
+        await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
+        return;
+      }
+      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+        await interaction.reply({ content: 'You do not have permission to set up standings for this league.', ephemeral: true });
+        return;
+      }
+      if (!activeLeague.standings_channel_id) {
+        await interaction.reply({ content: `No standings channel is set for **${activeLeague.league_name}**. Use /league-setstandingschannel first.`, ephemeral: true });
+        return;
+      }
+      const channel = await interaction.guild.channels.fetch(activeLeague.standings_channel_id).catch(() => null);
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I cannot post in the configured standings channel. Check my permissions there.', ephemeral: true });
+        return;
+      }
+      const rows = await getStandingsRows(interaction.guild.id, activeLeague.league_id);
+      const message = await channel.send({ embeds: [buildStandingsEmbed(activeLeague, rows)] });
+      await savePanel(activeLeague, 'standings', channel.id, message.id);
+      await interaction.reply({ content: `Permanent standings panel created for **${activeLeague.league_name}** in ${channel}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'addgame') {
+      if (!interaction.guild) return;
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+      if (!activeLeague) {
+        await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
+        return;
+      }
+      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+        await interaction.reply({ content: 'You do not have permission to add games for this league.', ephemeral: true });
+        return;
+      }
+
+      const home = interaction.options.getRole('home');
+      const away = interaction.options.getRole('away');
+      const scheduledFor = interaction.options.getString('date');
+      const weekLabel = interaction.options.getString('week');
+      const gameId = randomUUID();
+
+      if (home.id === away.id) {
+        await interaction.reply({ content: 'Home and away teams must be different.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO league_games (id, guild_id, league_id, home_team_role_id, home_team_name, away_team_role_id, away_team_name, scheduled_for, week_label, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [gameId, interaction.guild.id, activeLeague.league_id, home.id, home.name, away.id, away.name, scheduledFor, weekLabel, interaction.user.id]
+      );
+
+      await pool.query(
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (guild_id, league_id, team_role_id) DO NOTHING`,
+        [interaction.guild.id, activeLeague.league_id, home.id, home.name]
+      );
+      await pool.query(
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (guild_id, league_id, team_role_id) DO NOTHING`,
+        [interaction.guild.id, activeLeague.league_id, away.id, away.name]
+      );
+
+      await interaction.reply({ content: `Game added: **${away.name} @ ${home.name}**. Game ID: **${shortGameId(gameId)}**`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'reportgame') {
+      if (!interaction.guild) return;
+      const gameIdInput = interaction.options.getString('game_id');
+      const homeScore = interaction.options.getInteger('home_score');
+      const awayScore = interaction.options.getInteger('away_score');
+
+      const gameResult = await pool.query(
+        `SELECT g.*, l.league_name, l.league_id
+         FROM league_games g
+         JOIN leagues l ON l.league_id = g.league_id
+         WHERE g.guild_id = $1 AND g.id::text LIKE $2
+         ORDER BY g.created_at DESC
+         LIMIT 1`,
+        [interaction.guild.id, `${gameIdInput}%`]
+      );
+
+      if (gameResult.rows.length === 0) {
+        await interaction.reply({ content: 'Could not find that game ID. Use /schedule to see game IDs.', ephemeral: true });
+        return;
+      }
+
+      const game = gameResult.rows[0];
+      const activeLeague = await getLeagueById(game.league_id);
+      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+        await interaction.reply({ content: 'You do not have permission to report games for this league.', ephemeral: true });
+        return;
+      }
+
+      if (homeScore === awayScore) {
+        await interaction.reply({ content: 'Tie scores are not currently supported. Please enter a winner.', ephemeral: true });
+        return;
+      }
+
+      const homeWon = homeScore > awayScore;
+      const winnerRoleId = homeWon ? game.home_team_role_id : game.away_team_role_id;
+      const loserRoleId = homeWon ? game.away_team_role_id : game.home_team_role_id;
+      const winnerName = homeWon ? game.home_team_name : game.away_team_name;
+      const loserName = homeWon ? game.away_team_name : game.home_team_name;
+      const winnerPf = homeWon ? homeScore : awayScore;
+      const winnerPa = homeWon ? awayScore : homeScore;
+      const loserPf = homeWon ? awayScore : homeScore;
+      const loserPa = homeWon ? homeScore : awayScore;
+
+      await pool.query(
+        `UPDATE league_games
+         SET status = 'final', home_score = $1, away_score = $2, winner_team_role_id = $3, reported_by_user_id = $4, updated_at = NOW()
+         WHERE id = $5`,
+        [homeScore, awayScore, winnerRoleId, interaction.user.id, game.id]
+      );
+
+      await pool.query(
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
+         VALUES ($1, $2, $3, $4, 1, 0, $5, $6)
+         ON CONFLICT (guild_id, league_id, team_role_id)
+         DO UPDATE SET wins = league_standings.wins + 1, points_for = league_standings.points_for + $5, points_against = league_standings.points_against + $6, updated_at = NOW()`,
+        [interaction.guild.id, activeLeague.league_id, winnerRoleId, winnerName, winnerPf, winnerPa]
+      );
+
+      await pool.query(
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
+         VALUES ($1, $2, $3, $4, 0, 1, $5, $6)
+         ON CONFLICT (guild_id, league_id, team_role_id)
+         DO UPDATE SET losses = league_standings.losses + 1, points_for = league_standings.points_for + $5, points_against = league_standings.points_against + $6, updated_at = NOW()`,
+        [interaction.guild.id, activeLeague.league_id, loserRoleId, loserName, loserPf, loserPa]
+      );
+
+      await updateStandingsPanel(interaction.guild, activeLeague);
+      await interaction.reply({ content: `Final recorded: **${game.away_team_name} ${awayScore} @ ${game.home_team_name} ${homeScore}**. Winner: **${winnerName}**`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'schedule') {
+      if (!interaction.guild) return;
+      const requestedLeagueName = interaction.options.getString('league');
+      const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        return;
+      }
+      const result = await pool.query(
+        `SELECT * FROM league_games
+         WHERE guild_id = $1 AND league_id = $2
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [interaction.guild.id, activeLeague.league_id]
+      );
+      await interaction.reply({ embeds: [buildScheduleEmbed(activeLeague, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'standings') {
+      if (!interaction.guild) return;
+      const requestedLeagueName = interaction.options.getString('league');
+      const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        return;
+      }
+      const result = await pool.query(
+        `SELECT * FROM league_standings
+         WHERE guild_id = $1 AND league_id = $2
+         ORDER BY wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC`,
+        [interaction.guild.id, activeLeague.league_id]
+      );
+      await interaction.reply({ embeds: [buildStandingsEmbed(activeLeague, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'adjuststandings') {
+      if (!interaction.guild) return;
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+      if (!activeLeague) {
+        await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
+        return;
+      }
+      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+        await interaction.reply({ content: 'You do not have permission to adjust standings for this league.', ephemeral: true });
+        return;
+      }
+      const team = interaction.options.getRole('team');
+      const wins = interaction.options.getInteger('wins');
+      const losses = interaction.options.getInteger('losses');
+      await pool.query(
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (guild_id, league_id, team_role_id)
+         DO UPDATE SET wins = $5, losses = $6, team_name = $4, updated_at = NOW()`,
+        [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses]
+      );
+      await updateStandingsPanel(interaction.guild, activeLeague);
+      await interaction.reply({ content: `Standings adjusted: **${team.name}** is now **${wins}-${losses}**.`, ephemeral: true });
       return;
     }
 
