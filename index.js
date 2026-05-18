@@ -948,6 +948,60 @@ function buildHallOfFameEmbed(league, franchiseRows, awardRows) {
     .setTimestamp();
 }
 
+function shortGameId(gameId) {
+  return String(gameId || '').split('-')[0];
+}
+
+function buildScheduleEmbed(league, rows) {
+  const NL = String.fromCharCode(10);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • Schedule`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Schedule' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No games have been scheduled yet.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const score = row.status === 'final' ? ` • Final: ${row.away_score}-${row.home_score}` : '';
+    const date = row.scheduled_for ? ` • ${row.scheduled_for}` : '';
+    const week = row.week_label ? ` • ${row.week_label}` : '';
+    return `**${shortGameId(row.id)}** — ${row.away_team_name} @ ${row.home_team_name}${week}${date} • ${row.status}${score}`;
+  });
+
+  embed.setDescription(lines.join(NL));
+  return embed;
+}
+
+function buildStandingsEmbed(league, rows) {
+  const NL = String.fromCharCode(10);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • Standings`)
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • Standings' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No standings records yet. Report a game or adjust standings to begin.');
+    return embed;
+  }
+
+  const lines = rows.map((row, index) => {
+    const games = Number(row.wins) + Number(row.losses);
+    const winPct = games > 0 ? (Number(row.wins) / games).toFixed(3).replace(/^0/, '') : '.000';
+    const diff = Number(row.points_for) - Number(row.points_against);
+    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct}) • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
+  });
+
+  embed.setDescription(lines.join(NL));
+  return embed;
+}
+
 async function savePanel(league, panelKey, channelId, messageId) {
   if (league?.league_id) {
     await pool.query(
