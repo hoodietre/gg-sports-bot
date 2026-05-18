@@ -775,7 +775,7 @@ function buildTradeHistoryEmbed(league, rows, title = 'Trade History') {
 Sent by <@${row.sender_user_id}> • ${date}${screenshotLine}`;
   });
 
-  embed.setDescription(lines.join('
+embed.setDescription(lines.join('\\n\\n'));
 
 '));
   return embed;
