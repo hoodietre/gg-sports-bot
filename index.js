@@ -232,6 +232,32 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS franchise_legacy (
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      franchise_name TEXT NOT NULL,
+      championships INTEGER NOT NULL DEFAULT 0,
+      finals_appearances INTEGER NOT NULL DEFAULT 0,
+      last_championship TEXT,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, franchise_name)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS award_history (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      season_label TEXT NOT NULL,
+      award_name TEXT NOT NULL,
+      winner TEXT NOT NULL,
+      created_by_user_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS trade_history (
       id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL,
@@ -385,6 +411,22 @@ function buildCommands() {
       .addStringOption(o => o.setName('mvp').setDescription('MVP or top player').setRequired(false))
       .addStringOption(o => o.setName('awards').setDescription('Custom awards. Format: MVP: Name | 6th Man: Name | Sportsmanship: Name').setRequired(false))
       .addStringOption(o => o.setName('notes').setDescription('Season notes or storylines').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('franchiselegacy')
+      .setDescription('Show franchise championship and finals history')
+      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('awardhistory')
+      .setDescription('Show award history for a league')
+      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))
+      .addStringOption(o => o.setName('award').setDescription('Filter by award name, ex: MVP or Cy Young').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('halloffame')
+      .setDescription('Show the league Hall of Fame leaderboard')
+      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('editleaguename')
@@ -775,8 +817,9 @@ function buildTradeHistoryEmbed(league, rows, title = 'Trade History') {
 Sent by <@${row.sender_user_id}> • ${date}${screenshotLine}`;
   });
 
-embed.setDescription(lines.join('\\n\\n'));
+  embed.setDescription(lines.join('
 
+'));
   return embed;
 }
 
@@ -804,13 +847,32 @@ function parseCustomAwards(awardsText) {
     });
 }
 
+function parseCustomAwards(awardsText) {
+  if (!awardsText) return [];
+
+  return awardsText
+    .split('|')
+    .map(item => item.trim())
+    .filter(Boolean)
+    .map(item => {
+      const separatorIndex = item.indexOf(':');
+
+      if (separatorIndex === -1) {
+        return { name: 'Award', value: item };
+      }
+
+      return {
+        name: item.slice(0, separatorIndex).trim() || 'Award',
+        value: item.slice(separatorIndex + 1).trim() || 'Not listed',
+      };
+    });
+}
+
 function buildSeasonHistoryEmbed(league, data) {
   const embed = new EmbedBuilder()
     .setTitle(`${league.league_name} • ${data.seasonLabel} History`)
     .setColor(0xFEE75C)
-    .addFields(
-      { name: 'Champion', value: data.champion, inline: true }
-    )
+    .addFields({ name: 'Champion', value: data.champion, inline: true })
     .setFooter({ text: 'GG Sports • League History' })
     .setTimestamp();
 
@@ -828,17 +890,78 @@ function buildSeasonHistoryEmbed(league, data) {
     embed.addFields({ name: 'Award Winners', value: '━━━━━━━━━━━━━━', inline: false });
 
     for (const award of customAwards.slice(0, 20)) {
-      embed.addFields({
-        name: award.name,
-        value: award.value,
-        inline: true,
-      });
+      embed.addFields({ name: award.name, value: award.value, inline: true });
     }
   }
 
   if (data.notes) {
     embed.addFields({ name: 'Season Notes', value: data.notes, inline: false });
   }
+
+  return embed;
+}
+
+function buildFranchiseLegacyEmbed(league, rows) {
+  const embed = new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • Franchise Legacy`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Franchise Legacy' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No franchise legacy records have been added yet.');
+    return embed;
+  }
+
+  const lines = rows.map((row, index) => {
+    const lastTitle = row.last_championship ? ` • Last Title: ${row.last_championship}` : '';
+    return `**${index + 1}. ${row.franchise_name}** — ${row.championships} titles, ${row.finals_appearances} finals${lastTitle}`;
+  });
+
+  embed.setDescription(lines.join('
+'));
+  return embed;
+}
+
+function buildAwardHistoryEmbed(league, rows, awardFilter = null) {
+  const embed = new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • ${awardFilter ? `${awardFilter} History` : 'Award History'}`)
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • Award History' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No award history has been added yet.');
+    return embed;
+  }
+
+  const lines = rows.map(row => `**${row.season_label}** — ${row.award_name}: ${row.winner}`);
+  embed.setDescription(lines.join('
+'));
+  return embed;
+}
+
+function buildHallOfFameEmbed(league, franchiseRows, awardRows) {
+  const embed = new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • Hall of Fame`)
+    .setColor(0xB8860B)
+    .setFooter({ text: 'GG Sports • Hall of Fame' })
+    .setTimestamp();
+
+  const titleLeaders = franchiseRows.length
+    ? franchiseRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.franchise_name}** — ${row.championships} titles`).join('
+')
+    : 'No championship records yet.';
+
+  const awardLeaders = awardRows.length
+    ? awardRows.slice(0, 10).map((row, index) => `**${index + 1}. ${row.winner}** — ${row.award_count} awards`).join('
+')
+    : 'No award records yet.';
+
+  embed.addFields(
+    { name: 'Championship Leaders', value: titleLeaders, inline: false },
+    { name: 'Award Leaders', value: awardLeaders, inline: false }
+  );
 
   return embed;
 }
@@ -1666,6 +1789,48 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const postedMessage = await historyChannel.send({ embeds: [embed] });
 
       await pool.query(
+        `INSERT INTO franchise_legacy (guild_id, league_id, franchise_name, championships, finals_appearances, last_championship, updated_at)
+         VALUES ($1, $2, $3, 1, 1, $4, NOW())
+         ON CONFLICT (guild_id, league_id, franchise_name)
+         DO UPDATE SET
+           championships = franchise_legacy.championships + 1,
+           finals_appearances = franchise_legacy.finals_appearances + 1,
+           last_championship = EXCLUDED.last_championship,
+           updated_at = NOW()`,
+        [interaction.guild.id, activeLeague.league_id, data.champion, data.seasonLabel]
+      );
+
+      if (data.runnerUp) {
+        await pool.query(
+          `INSERT INTO franchise_legacy (guild_id, league_id, franchise_name, championships, finals_appearances, updated_at)
+           VALUES ($1, $2, $3, 0, 1, NOW())
+           ON CONFLICT (guild_id, league_id, franchise_name)
+           DO UPDATE SET
+             finals_appearances = franchise_legacy.finals_appearances + 1,
+             updated_at = NOW()`,
+          [interaction.guild.id, activeLeague.league_id, data.runnerUp]
+        );
+      }
+
+      const awardRows = [];
+
+      if (data.mvp) {
+        awardRows.push({ name: 'MVP / Top Player', value: data.mvp });
+      }
+
+      for (const award of parseCustomAwards(data.awards)) {
+        awardRows.push(award);
+      }
+
+      for (const award of awardRows) {
+        await pool.query(
+          `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, award.name, award.value, interaction.user.id]
+        );
+      }
+
+      await pool.query(
         `INSERT INTO season_history (
           id, guild_id, league_id, season_label, champion, runner_up, mvp, awards, notes,
           posted_channel_id, posted_message_id, created_by_user_id
@@ -1688,6 +1853,107 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.reply({ content: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'franchiselegacy') {
+      if (!interaction.guild) {
+        await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+        return;
+      }
+
+      const requestedLeagueName = interaction.options.getString('league');
+      const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
+
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        return;
+      }
+
+      const result = await pool.query(
+        `SELECT franchise_name, championships, finals_appearances, last_championship
+         FROM franchise_legacy
+         WHERE guild_id = $1 AND league_id = $2
+         ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+         LIMIT 25`,
+        [interaction.guild.id, activeLeague.league_id]
+      );
+
+      await interaction.reply({ embeds: [buildFranchiseLegacyEmbed(activeLeague, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'awardhistory') {
+      if (!interaction.guild) {
+        await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+        return;
+      }
+
+      const requestedLeagueName = interaction.options.getString('league');
+      const awardFilter = interaction.options.getString('award');
+      const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
+
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        return;
+      }
+
+      const result = awardFilter
+        ? await pool.query(
+            `SELECT season_label, award_name, winner
+             FROM award_history
+             WHERE guild_id = $1 AND league_id = $2 AND LOWER(award_name) = LOWER($3)
+             ORDER BY created_at DESC
+             LIMIT 25`,
+            [interaction.guild.id, activeLeague.league_id, awardFilter]
+          )
+        : await pool.query(
+            `SELECT season_label, award_name, winner
+             FROM award_history
+             WHERE guild_id = $1 AND league_id = $2
+             ORDER BY created_at DESC
+             LIMIT 25`,
+            [interaction.guild.id, activeLeague.league_id]
+          );
+
+      await interaction.reply({ embeds: [buildAwardHistoryEmbed(activeLeague, result.rows, awardFilter)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'halloffame') {
+      if (!interaction.guild) {
+        await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+        return;
+      }
+
+      const requestedLeagueName = interaction.options.getString('league');
+      const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
+
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        return;
+      }
+
+      const franchiseResult = await pool.query(
+        `SELECT franchise_name, championships
+         FROM franchise_legacy
+         WHERE guild_id = $1 AND league_id = $2
+         ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+         LIMIT 10`,
+        [interaction.guild.id, activeLeague.league_id]
+      );
+
+      const awardResult = await pool.query(
+        `SELECT winner, COUNT(*)::int AS award_count
+         FROM award_history
+         WHERE guild_id = $1 AND league_id = $2
+         GROUP BY winner
+         ORDER BY award_count DESC, winner ASC
+         LIMIT 10`,
+        [interaction.guild.id, activeLeague.league_id]
+      );
+
+      await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
       return;
     }
 
