@@ -383,7 +383,7 @@ function buildCommands() {
       .addStringOption(o => o.setName('champion').setDescription('Champion team/user').setRequired(true))
       .addStringOption(o => o.setName('runner_up').setDescription('Runner-up team/user').setRequired(false))
       .addStringOption(o => o.setName('mvp').setDescription('MVP or top player').setRequired(false))
-      .addStringOption(o => o.setName('awards').setDescription('Awards summary').setRequired(false))
+      .addStringOption(o => o.setName('awards').setDescription('Custom awards. Format: MVP: Name | 6th Man: Name | Sportsmanship: Name').setRequired(false))
       .addStringOption(o => o.setName('notes').setDescription('Season notes or storylines').setRequired(false)),
 
     new SlashCommandBuilder()
@@ -767,18 +767,39 @@ function buildTradeHistoryEmbed(league, rows, title = 'Trade History') {
     const date = row.approved_by_committee_at
       ? new Date(row.approved_by_committee_at).toLocaleDateString('en-US')
       : 'Unknown date';
-
     return `**${index + 1}. ${row.sender_team} ⇄ ${row.target_team}**
-Sent by <@${row.sender_user_id}> • ${date}${
-      row.screenshot_url
-        ? `\n[View Screenshot](${row.screenshot_url})`
-        : ''
-    }`;
+Sent by <@${row.sender_user_id}> • ${date}${row.screenshot_url ? `
+[View Screenshot](${row.screenshot_url})` : ''}`;
   });
 
-  embed.setDescription(lines.join('\n\n'));
+  embed.setDescription(lines.join('
 
+'));
   return embed;
+}
+
+function parseCustomAwards(awardsText) {
+  if (!awardsText) return [];
+
+  return awardsText
+    .split('|')
+    .map(item => item.trim())
+    .filter(Boolean)
+    .map(item => {
+      const separatorIndex = item.indexOf(':');
+
+      if (separatorIndex === -1) {
+        return {
+          name: 'Award',
+          value: item,
+        };
+      }
+
+      return {
+        name: item.slice(0, separatorIndex).trim() || 'Award',
+        value: item.slice(separatorIndex + 1).trim() || 'Not listed',
+      };
+    });
 }
 
 function buildSeasonHistoryEmbed(league, data) {
@@ -799,8 +820,18 @@ function buildSeasonHistoryEmbed(league, data) {
     embed.addFields({ name: 'MVP / Top Player', value: data.mvp, inline: false });
   }
 
-  if (data.awards) {
-    embed.addFields({ name: 'Awards', value: data.awards, inline: false });
+  const customAwards = parseCustomAwards(data.awards);
+
+  if (customAwards.length > 0) {
+    embed.addFields({ name: 'Award Winners', value: '━━━━━━━━━━━━━━', inline: false });
+
+    for (const award of customAwards.slice(0, 20)) {
+      embed.addFields({
+        name: award.name,
+        value: award.value,
+        inline: true,
+      });
+    }
   }
 
   if (data.notes) {
