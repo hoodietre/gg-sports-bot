@@ -777,7 +777,6 @@ Sent by <@${row.sender_user_id}> • ${date}${screenshotLine}`;
 
 embed.setDescription(lines.join('\\n\\n'));
 
-'));
   return embed;
 }
 
