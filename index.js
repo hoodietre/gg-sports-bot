@@ -1038,6 +1038,39 @@ function buildUserProfileEmbed(league, user, data) {
     .setTimestamp();
 }
 
+function buildUserStatsEmbed(league, user, data) {
+  const NL = String.fromCharCode(10);
+  const recentGames = data.recentGames.length
+    ? data.recentGames.map(game => {
+        const isHome = game.home_team_role_id === data.teamRoleId;
+        const teamScore = isHome ? game.home_score : game.away_score;
+        const oppScore = isHome ? game.away_score : game.home_score;
+        const opponent = isHome ? game.away_team_name : game.home_team_name;
+        const result = game.winner_team_role_id === data.teamRoleId ? 'W' : 'L';
+        return `**${result}** vs ${opponent} • ${teamScore}-${oppScore}`;
+      }).join(NL)
+    : 'No recent games found.';
+
+  return new EmbedBuilder()
+    .setTitle(`${league?.league_name || 'League'} • ${user.username} Stats`)
+    .setColor(0x57F287)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'Team', value: data.teamName || 'No team assigned', inline: true },
+      { name: 'Record', value: `${data.wins}-${data.losses}`, inline: true },
+      { name: 'Win %', value: data.winPct, inline: true },
+      { name: 'Points For', value: String(data.pointsFor), inline: true },
+      { name: 'Points Against', value: String(data.pointsAgainst), inline: true },
+      { name: 'Point Differential', value: `${data.pointDiff >= 0 ? '+' : ''}${data.pointDiff}`, inline: true },
+      { name: 'Avg Points For', value: data.avgFor, inline: true },
+      { name: 'Avg Points Against', value: data.avgAgainst, inline: true },
+      { name: 'Games Played', value: String(data.gamesPlayed), inline: true },
+      { name: 'Recent Games', value: recentGames, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Competitive Stats' })
+    .setTimestamp();
+}
+
 function buildTeamProfileEmbed(league, teamRole, data) {
   const NL = String.fromCharCode(10);
   const recentAwards = data.awards.length
@@ -2038,15 +2071,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       let finalsAppearances = 0;
       let awardsWon = 0;
       let trades = 0;
+      let pointsFor = 0;
+      let pointsAgainst = 0;
+      let pointDiff = 0;
+      let recentGames = [];
 
       if (team) {
         const standingsResult = await pool.query(
-          `SELECT wins, losses FROM league_standings WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3`,
+          `SELECT wins, losses, points_for, points_against FROM league_standings WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3`,
           [interaction.guild.id, activeLeague.league_id, team.roleId]
         );
         if (standingsResult.rows.length) {
           wins = Number(standingsResult.rows[0].wins);
           losses = Number(standingsResult.rows[0].losses);
+          pointsFor = Number(standingsResult.rows[0].points_for || 0);
+          pointsAgainst = Number(standingsResult.rows[0].points_against || 0);
+          pointDiff = pointsFor - pointsAgainst;
           gamesPlayed = wins + losses;
         }
 
@@ -2066,6 +2106,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [interaction.guild.id, activeLeague.league_id, team.roleId, team.name]
         );
         trades = tradeResult.rows[0]?.count || 0;
+
+        const recentResult = await pool.query(
+          `SELECT * FROM league_games
+           WHERE guild_id = $1 AND league_id = $2 AND status = 'final'
+           AND (home_team_role_id = $3 OR away_team_role_id = $3)
+           ORDER BY updated_at DESC
+           LIMIT 5`,
+          [interaction.guild.id, activeLeague.league_id, team.roleId]
+        );
+        recentGames = recentResult.rows;
       }
 
       const awardResult = await pool.query(
@@ -2074,6 +2124,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
         [interaction.guild.id, activeLeague.league_id, `%${targetUser.username}%`, `%${targetMember.displayName}%`]
       );
       awardsWon = awardResult.rows[0]?.count || 0;
+
+      if (interaction.commandName === 'stats') {
+        const winPct = gamesPlayed > 0 ? (wins / gamesPlayed).toFixed(3).replace(/^0/, '') : '.000';
+        const avgFor = gamesPlayed > 0 ? (pointsFor / gamesPlayed).toFixed(1) : '0.0';
+        const avgAgainst = gamesPlayed > 0 ? (pointsAgainst / gamesPlayed).toFixed(1) : '0.0';
+        await interaction.reply({
+          embeds: [buildUserStatsEmbed(activeLeague, targetUser, {
+            teamName: team?.name || null,
+            teamRoleId: team?.roleId || null,
+            wins,
+            losses,
+            gamesPlayed,
+            pointsFor,
+            pointsAgainst,
+            pointDiff,
+            winPct,
+            avgFor,
+            avgAgainst,
+            recentGames,
+          })],
+          ephemeral: true,
+        });
+        return;
+      }
 
       await interaction.reply({
         embeds: [buildUserProfileEmbed(activeLeague, targetUser, {
