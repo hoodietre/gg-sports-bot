@@ -29,11 +29,12 @@ const client = new Client({
   ],
 });
 
-// Keep these for now as your working NBA 2K fallback while V2 migration happens.
+// Environment variables recommended for public/global use.
 const CLIENT_ID = process.env.CLIENT_ID || '1407760487151833200';
 const DEV_GUILD_ID = process.env.GUILD_ID || '1486545386649686068';
 const USE_GLOBAL_COMMANDS = process.env.USE_GLOBAL_COMMANDS === 'true';
 
+// Legacy NBA 2K fallback IDs. These keep your original server working while V3 grows.
 const LEAGUE_ROLE_ID = '1486787668489797843';
 const LIVE_CHANNEL_ID = '1486546017053573223';
 const STAFF_ROLE_ID = '1486850276202778795';
@@ -53,7 +54,7 @@ const TEAM_ROLE_NAMES = [
   'Spurs', 'Suns', 'Sonics', 'Wolves', 'Blazers', 'Warriors', 'Wizards',
 ];
 
-// user_id => { targetTeamName, targetTeamRoleId, leagueId, createdAt }
+// user_id => { targetTeamName, targetTeamRoleId, leagueId, leagueName, createdAt }
 const pendingOfferTargets = new Map();
 
 const pool = new Pool({
@@ -63,11 +64,15 @@ const pool = new Pool({
     : false,
 });
 
+// =========================
+// DATABASE
+// =========================
 async function initDatabase() {
   // Legacy/current working tables.
   await pool.query(`CREATE TABLE IF NOT EXISTS stream_links (user_id TEXT PRIMARY KEY, stream_url TEXT NOT NULL)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS bot_panels (panel_key TEXT PRIMARY KEY, channel_id TEXT NOT NULL, message_id TEXT NOT NULL)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS trade_counts (team_name TEXT PRIMARY KEY, trade_count INTEGER NOT NULL DEFAULT 0)`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trade_block_posts (
       id TEXT PRIMARY KEY,
@@ -93,7 +98,11 @@ async function initDatabase() {
       status TEXT NOT NULL DEFAULT 'pending_owner',
       committee_message_id TEXT,
       owner_decision_by TEXT,
-      offer_details TEXT
+      offer_details TEXT,
+      guild_id TEXT,
+      league_id UUID,
+      sender_team_role_id TEXT,
+      target_team_role_id TEXT
     )
   `);
   await pool.query(`ALTER TABLE trade_offers ADD COLUMN IF NOT EXISTS screenshot_url TEXT`);
@@ -108,6 +117,7 @@ async function initDatabase() {
   await pool.query(`UPDATE trade_offers SET offer_details = '' WHERE offer_details IS NULL`);
   await pool.query(`ALTER TABLE trade_offers ALTER COLUMN offer_details DROP NOT NULL`);
   await pool.query(`UPDATE trade_offers SET screenshot_url = '' WHERE screenshot_url IS NULL`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trade_offer_votes (
       offer_id TEXT NOT NULL,
@@ -117,7 +127,7 @@ async function initDatabase() {
     )
   `);
 
-  // V2 configurable tables.
+  // V3 configurable tables.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guilds (
       guild_id TEXT PRIMARY KEY,
@@ -125,17 +135,21 @@ async function initDatabase() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leagues (
       league_id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
       league_name TEXT NOT NULL,
       game_key TEXT NOT NULL,
+      season_length INTEGER,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       UNIQUE (guild_id, league_name)
     )
   `);
+  await pool.query(`ALTER TABLE leagues ADD COLUMN IF NOT EXISTS season_length INTEGER`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_settings (
       league_id UUID PRIMARY KEY REFERENCES leagues(league_id) ON DELETE CASCADE,
@@ -153,6 +167,7 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_team_roles (
       league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
@@ -162,6 +177,7 @@ async function initDatabase() {
       PRIMARY KEY (league_id, role_id)
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_panels (
       league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
@@ -173,6 +189,7 @@ async function initDatabase() {
       PRIMARY KEY (league_id, panel_key)
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guild_stream_links (
       guild_id TEXT NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
@@ -183,6 +200,7 @@ async function initDatabase() {
       PRIMARY KEY (guild_id, user_id)
     )
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_trade_counts (
       league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
@@ -194,38 +212,236 @@ async function initDatabase() {
   `);
 
   for (const teamName of TEAM_ROLE_NAMES) {
-    await pool.query(`INSERT INTO trade_counts (team_name, trade_count) VALUES ($1, 0) ON CONFLICT (team_name) DO NOTHING`, [teamName]);
+    await pool.query(
+      `INSERT INTO trade_counts (team_name, trade_count) VALUES ($1, 0) ON CONFLICT (team_name) DO NOTHING`,
+      [teamName]
+    );
   }
 
   console.log('Database ready.');
 }
 
+// =========================
+// COMMANDS
+// =========================
 function buildCommands() {
   return [
-    new SlashCommandBuilder().setName('ping').setDescription('Check if bot is working'),
-    new SlashCommandBuilder().setName('whogotnext').setDescription('Notify the league you are ready to play').addStringOption(o => o.setName('message').setDescription('Optional extra message').setRequired(false)),
-    new SlashCommandBuilder().setName('linkstream').setDescription('Save your stream link').addStringOption(o => o.setName('url').setDescription('Your stream link').setRequired(true)),
-    new SlashCommandBuilder().setName('livestream').setDescription('Post your saved stream link'),
-    new SlashCommandBuilder().setName('assignrole').setDescription('Assign a role to a member').addUserOption(o => o.setName('member').setDescription('The member to give the role to').setRequired(true)).addRoleOption(o => o.setName('role').setDescription('The role to assign').setRequired(true)),
-    new SlashCommandBuilder().setName('setupteamowners').setDescription('Create or refresh the Team Owners embed'),
-    new SlashCommandBuilder().setName('setuptradecount').setDescription('Create or refresh the Trade Count embed'),
-    new SlashCommandBuilder().setName('setupoffertrade').setDescription('Create or refresh the Offer a Trade panel'),
-    new SlashCommandBuilder().setName('addtrade').setDescription('Add 1 trade to a team').addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)),
-    new SlashCommandBuilder().setName('removetrade').setDescription('Remove 1 trade from a team').addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)),
-    new SlashCommandBuilder().setName('tradeblock').setDescription('Add a player to the trade block'),
+    new SlashCommandBuilder()
+      .setName('ping')
+      .setDescription('Check if bot is working'),
 
-    new SlashCommandBuilder().setName('league-create').setDescription('Create a configurable league profile').addStringOption(o => o.setName('name').setDescription('League name, ex: NBA 2K').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game key, ex: nba2k, mlb, madden').setRequired(true)),
-    new SlashCommandBuilder().setName('league-list').setDescription('List configured leagues in this server'),
-    new SlashCommandBuilder().setName('league-setroles').setDescription('Set league roles').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('league_role').setDescription('League ping role').setRequired(true)).addRoleOption(o => o.setName('staff_role').setDescription('Staff role').setRequired(true)).addRoleOption(o => o.setName('committee_role').setDescription('Committee role').setRequired(true)),
-    new SlashCommandBuilder().setName('league-setchannels').setDescription('Set league channels').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('live').setDescription('Live stream channel').setRequired(true)).addChannelOption(o => o.setName('team_owners').setDescription('Team owners channel').setRequired(true)).addChannelOption(o => o.setName('trade_count').setDescription('Trade count channel').setRequired(true)).addChannelOption(o => o.setName('trade_block').setDescription('Trade block channel').setRequired(true)).addChannelOption(o => o.setName('offer_trade').setDescription('Offer a trade channel').setRequired(true)).addChannelOption(o => o.setName('committee').setDescription('Committee channel').setRequired(true)).addChannelOption(o => o.setName('approved').setDescription('Approved trades channel').setRequired(true)).addChannelOption(o => o.setName('denied').setDescription('Denied trades channel').setRequired(true)),
-    new SlashCommandBuilder().setName('league-addteamrole').setDescription('Add a team role to a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)),
-    new SlashCommandBuilder().setName('league-listteamroles').setDescription('List team roles for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
-    new SlashCommandBuilder().setName('league-setup-panels').setDescription('Create V2 panels for a configured league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('help')
+      .setDescription('Show the GG Sports setup guide'),
+
+    new SlashCommandBuilder()
+      .setName('commands')
+      .setDescription('Show available GG Sports commands'),
+
+    new SlashCommandBuilder()
+      .setName('whogotnext')
+      .setDescription('Notify a league that you are ready to play')
+      .addStringOption(o =>
+        o.setName('league')
+          .setDescription('League name, ex: NBA 2K or MLB')
+          .setRequired(false)
+      )
+      .addStringOption(o =>
+        o.setName('message')
+          .setDescription('Optional extra message')
+          .setRequired(false)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('linkstream')
+      .setDescription('Save your stream link')
+      .addStringOption(o =>
+        o.setName('url')
+          .setDescription('Your stream link')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('livestream')
+      .setDescription('Post your saved stream link'),
+
+    new SlashCommandBuilder()
+      .setName('assignrole')
+      .setDescription('Assign a role to a member')
+      .addUserOption(o =>
+        o.setName('member')
+          .setDescription('The member to give the role to')
+          .setRequired(true)
+      )
+      .addRoleOption(o =>
+        o.setName('role')
+          .setDescription('The role to assign')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('unassignrole')
+      .setDescription('Remove a role from a member')
+      .addUserOption(o =>
+        o.setName('member')
+          .setDescription('The member to remove the role from')
+          .setRequired(true)
+      )
+      .addRoleOption(o =>
+        o.setName('role')
+          .setDescription('The role to remove')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('setupteamowners')
+      .setDescription('Create or refresh the Team Owners embed'),
+
+    new SlashCommandBuilder()
+      .setName('setuptradecount')
+      .setDescription('Create or refresh the Trade Count embed'),
+
+    new SlashCommandBuilder()
+      .setName('setupoffertrade')
+      .setDescription('Create or refresh the Offer a Trade panel'),
+
+    new SlashCommandBuilder()
+      .setName('addtrade')
+      .setDescription('Add 1 trade to a team')
+      .addRoleOption(o =>
+        o.setName('team')
+          .setDescription('The team role')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('removetrade')
+      .setDescription('Remove 1 trade from a team')
+      .addRoleOption(o =>
+        o.setName('team')
+          .setDescription('The team role')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('tradeblock')
+      .setDescription('Add a player to the trade block'),
+
+    new SlashCommandBuilder()
+      .setName('league-create')
+      .setDescription('Create a configurable league profile')
+      .addStringOption(o =>
+        o.setName('name')
+          .setDescription('League name, ex: NBA 2K')
+          .setRequired(true)
+      )
+      .addStringOption(o =>
+        o.setName('game')
+          .setDescription('Game key, ex: nba2k, mlb, madden')
+          .setRequired(true)
+      )
+      .addIntegerOption(o =>
+        o.setName('season_length')
+          .setDescription('Season length in games, ex: 82')
+          .setRequired(false)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('league-list')
+      .setDescription('List configured leagues in this server'),
+
+    new SlashCommandBuilder()
+      .setName('league-setroles')
+      .setDescription('Set league roles')
+      .addStringOption(o =>
+        o.setName('league')
+          .setDescription('League name')
+          .setRequired(true)
+      )
+      .addRoleOption(o =>
+        o.setName('league_role')
+          .setDescription('League ping role')
+          .setRequired(true)
+      )
+      .addRoleOption(o =>
+        o.setName('staff_role')
+          .setDescription('Staff role')
+          .setRequired(true)
+      )
+      .addRoleOption(o =>
+        o.setName('committee_role')
+          .setDescription('Committee role')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('league-setchannels')
+      .setDescription('Set league channels')
+      .addStringOption(o =>
+        o.setName('league')
+          .setDescription('League name')
+          .setRequired(true)
+      )
+      .addChannelOption(o => o.setName('live').setDescription('Live stream channel').setRequired(true))
+      .addChannelOption(o => o.setName('team_owners').setDescription('Team owners channel').setRequired(true))
+      .addChannelOption(o => o.setName('trade_count').setDescription('Trade count channel').setRequired(true))
+      .addChannelOption(o => o.setName('trade_block').setDescription('Trade block channel').setRequired(true))
+      .addChannelOption(o => o.setName('offer_trade').setDescription('Offer a trade channel').setRequired(true))
+      .addChannelOption(o => o.setName('committee').setDescription('Committee channel').setRequired(true))
+      .addChannelOption(o => o.setName('approved').setDescription('Approved trades channel').setRequired(true))
+      .addChannelOption(o => o.setName('denied').setDescription('Denied trades channel').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('league-addteamrole')
+      .setDescription('Add a team role to a league')
+      .addStringOption(o =>
+        o.setName('league')
+          .setDescription('League name')
+          .setRequired(true)
+      )
+      .addRoleOption(o =>
+        o.setName('role')
+          .setDescription('Team role')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('league-listteamroles')
+      .setDescription('List team roles for a league')
+      .addStringOption(o =>
+        o.setName('league')
+          .setDescription('League name')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('league-setup-panels')
+      .setDescription('Create V3 panels for a configured league')
+      .addStringOption(o =>
+        o.setName('league')
+          .setDescription('League name')
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
+      .setName('editleaguename')
+      .setDescription('Rename a configured league')
+      .addStringOption(o =>
+        o.setName('league')
+          .setDescription('Current league name')
+          .setRequired(true)
+      )
+      .addStringOption(o =>
+        o.setName('new_name')
+          .setDescription('New league name')
+          .setRequired(true)
+      ),
   ].map(cmd => cmd.toJSON());
 }
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
   if (USE_GLOBAL_COMMANDS) {
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: buildCommands() });
     console.log('Global commands synced.');
@@ -235,6 +451,9 @@ async function registerCommands() {
   }
 }
 
+// =========================
+// LEAGUE HELPERS
+// =========================
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
@@ -245,6 +464,7 @@ async function getLeagueByName(guildId, leagueName) {
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
     [guildId, leagueName]
   );
+
   return result.rows[0] || null;
 }
 
@@ -278,6 +498,7 @@ async function getLeagueByChannel(guildId, channelId) {
      LIMIT 1`,
     [guildId, channelId]
   );
+
   return result.rows[0] || null;
 }
 
@@ -293,19 +514,29 @@ async function getDefaultLeague(guildId) {
      LIMIT 1`,
     [guildId]
   );
+
   return result.rows[0] || null;
 }
 
 async function resolveLeague(interactionOrMessage) {
   const guild = interactionOrMessage.guild;
   if (!guild) return null;
+
   const channelId = interactionOrMessage.channelId || interactionOrMessage.channel?.id;
-  if (!channelId) return await getDefaultLeague(guild.id);
+
+  if (!channelId) {
+    return await getDefaultLeague(guild.id);
+  }
+
   return (await getLeagueByChannel(guild.id, channelId)) || (await getDefaultLeague(guild.id));
 }
 
 async function getLeagueTeamRoles(leagueId) {
-  const result = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC`, [leagueId]);
+  const result = await pool.query(
+    `SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC`,
+    [leagueId]
+  );
+
   return result.rows;
 }
 
@@ -314,13 +545,22 @@ function isLegacyTeamRole(roleName) {
 }
 
 async function memberHasStaff(member, league) {
-  if (!member || !league) return false;
-  return member.permissions.has(PermissionFlagsBits.Administrator) || (league.staff_role_id ? member.roles.cache.has(league.staff_role_id) : false);
+  if (!member) return false;
+
+  const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
+  const canManageServer = member.permissions.has(PermissionFlagsBits.ManageGuild);
+  const hasStaffRole = league?.staff_role_id ? member.roles.cache.has(league.staff_role_id) : false;
+
+  return Boolean(isAdmin || canManageServer || hasStaffRole);
 }
 
 async function memberHasCommittee(member, league) {
-  if (!member || !league) return false;
-  return member.permissions.has(PermissionFlagsBits.Administrator) || (league.committee_role_id ? member.roles.cache.has(league.committee_role_id) : false);
+  if (!member) return false;
+
+  const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
+  const hasCommitteeRole = league?.committee_role_id ? member.roles.cache.has(league.committee_role_id) : false;
+
+  return Boolean(isAdmin || hasCommitteeRole);
 }
 
 async function userCanUseLeagueSetup(interaction, league = null) {
@@ -381,36 +621,61 @@ async function getMemberTeamForLeague(member, league) {
   if (league?.league_id) {
     const teamRoles = await getLeagueTeamRoles(league.league_id);
     const match = teamRoles.find(team => member.roles.cache.has(team.role_id));
-    if (match) return { roleId: match.role_id, name: match.role_name };
+
+    if (match) {
+      return { roleId: match.role_id, name: match.role_name };
+    }
   }
 
   const legacyRole = member.roles.cache.find(role => isLegacyTeamRole(role.name));
   return legacyRole ? { roleId: legacyRole.id, name: legacyRole.name } : null;
 }
 
+// =========================
+// UI BUILDERS
+// =========================
 function buildOfferDecisionButtons(offerId, disabled = false) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`trade_offer_accept:${offerId}`).setLabel('Accept').setStyle(ButtonStyle.Success).setDisabled(disabled),
-    new ButtonBuilder().setCustomId(`trade_offer_decline:${offerId}`).setLabel('Decline').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+    new ButtonBuilder()
+      .setCustomId(`trade_offer_accept:${offerId}`)
+      .setLabel('Accept')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId(`trade_offer_decline:${offerId}`)
+      .setLabel('Decline')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled)
   );
 }
 
 function buildCommitteeVoteButtons(offerId, disabled = false) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`committee_vote_approve:${offerId}`).setLabel('Approve').setStyle(ButtonStyle.Success).setDisabled(disabled),
-    new ButtonBuilder().setCustomId(`committee_vote_deny:${offerId}`).setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+    new ButtonBuilder()
+      .setCustomId(`committee_vote_approve:${offerId}`)
+      .setLabel('Approve')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId(`committee_vote_deny:${offerId}`)
+      .setLabel('Deny')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled)
   );
 }
 
 function buildOfferTradePanelButton(leagueId = 'legacy') {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`offer_trade_panel_button:${leagueId}`).setLabel('Offer Trade').setStyle(ButtonStyle.Primary)
+    new ButtonBuilder()
+      .setCustomId(`offer_trade_panel_button:${leagueId}`)
+      .setLabel('Offer Trade')
+      .setStyle(ButtonStyle.Primary)
   );
 }
 
 function buildTeamSelectMenus(teamRoles, leagueId = 'legacy') {
   const source = teamRoles?.length
-    ? teamRoles.map(t => ({ label: t.role_name, value: t.role_id }))
+    ? teamRoles.map(team => ({ label: team.role_name, value: team.role_id }))
     : TEAM_ROLE_NAMES.map(name => ({ label: name, value: name }));
 
   const firstHalf = source.slice(0, 25);
@@ -454,24 +719,46 @@ async function buildTeamOwnersEmbed(guild, league = null) {
   const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : null;
 
   if (teamRoles?.length) {
+    await guild.members.fetch();
+
     for (const team of teamRoles) {
       const role = await guild.roles.fetch(team.role_id).catch(() => null);
+
       if (!role) {
         lines.push(`**${team.role_name}** — Role not found`);
         continue;
       }
-      const owners = role.members.filter(member => !member.user.bot);
-      lines.push(owners.size === 0 ? `**${team.role_name}** — Unassigned` : `**${team.role_name}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
+
+      const owners = guild.members.cache.filter(member =>
+        !member.user.bot && member.roles.cache.has(role.id)
+      );
+
+      lines.push(
+        owners.size === 0
+          ? `**${team.role_name}** — Unassigned`
+          : `**${team.role_name}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`
+      );
     }
   } else {
+    await guild.members.fetch();
+
     for (const teamName of TEAM_ROLE_NAMES) {
       const role = guild.roles.cache.find(r => r.name === teamName);
+
       if (!role) {
         lines.push(`**${teamName}** — Role not found`);
         continue;
       }
-      const owners = role.members.filter(member => !member.user.bot);
-      lines.push(owners.size === 0 ? `**${teamName}** — Unassigned` : `**${teamName}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
+
+      const owners = guild.members.cache.filter(member =>
+        !member.user.bot && member.roles.cache.has(role.id)
+      );
+
+      lines.push(
+        owners.size === 0
+          ? `**${teamName}** — Unassigned`
+          : `**${teamName}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`
+      );
     }
   }
 
@@ -485,6 +772,7 @@ async function buildTeamOwnersEmbed(guild, league = null) {
 
 async function buildTradeCountEmbed(league = null) {
   let rows;
+
   if (league?.league_id) {
     const result = await pool.query(
       `SELECT t.role_name AS team_name, COALESCE(c.trade_count, 0) AS trade_count
@@ -501,6 +789,7 @@ async function buildTradeCountEmbed(league = null) {
   }
 
   const lines = rows.map(row => `**${row.team_name}** — ${row.trade_count}`);
+
   return new EmbedBuilder()
     .setTitle(`${league?.league_name || 'League'} Trade Counts`)
     .setDescription(lines.join('\n') || 'No trade counts yet.')
@@ -542,6 +831,9 @@ function buildFinalTradeEmbed(title, color, offer) {
     .setTimestamp();
 }
 
+// =========================
+// PANEL HELPERS
+// =========================
 async function savePanel(league, panelKey, channelId, messageId) {
   if (league?.league_id) {
     await pool.query(
@@ -563,17 +855,25 @@ async function savePanel(league, panelKey, channelId, messageId) {
 }
 
 async function updatePanel(guild, league, panelKey, embed, components = []) {
-  let result;
-  if (league?.league_id) {
-    result = await pool.query('SELECT channel_id, message_id FROM league_panels WHERE league_id = $1 AND panel_key = $2', [league.league_id, panelKey]);
-  } else {
-    result = await pool.query('SELECT channel_id, message_id FROM bot_panels WHERE panel_key = $1', [panelKey]);
-  }
+  const result = league?.league_id
+    ? await pool.query(
+        'SELECT channel_id, message_id FROM league_panels WHERE league_id = $1 AND panel_key = $2',
+        [league.league_id, panelKey]
+      )
+    : await pool.query(
+        'SELECT channel_id, message_id FROM bot_panels WHERE panel_key = $1',
+        [panelKey]
+      );
+
   if (result.rows.length === 0) return;
+
   const channel = await guild.channels.fetch(result.rows[0].channel_id).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
+
   const message = await channel.messages.fetch(result.rows[0].message_id).catch(() => null);
-  if (message) await message.edit({ embeds: [embed], components });
+  if (message) {
+    await message.edit({ embeds: [embed], components });
+  }
 }
 
 async function updateTeamOwnersPanel(guild, league = null) {
@@ -584,10 +884,24 @@ async function updateTradeCountPanel(guild, league = null) {
   await updatePanel(guild, league, 'trade_count', await buildTradeCountEmbed(league));
 }
 
+// =========================
+// TRADE HELPERS
+// =========================
 async function getVoteCounts(offerId) {
-  const approveResult = await pool.query(`SELECT COUNT(*)::int AS count FROM trade_offer_votes WHERE offer_id = $1 AND vote = 'approve'`, [offerId]);
-  const denyResult = await pool.query(`SELECT COUNT(*)::int AS count FROM trade_offer_votes WHERE offer_id = $1 AND vote = 'deny'`, [offerId]);
-  return { approve: approveResult.rows[0].count, deny: denyResult.rows[0].count };
+  const approveResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM trade_offer_votes WHERE offer_id = $1 AND vote = 'approve'`,
+    [offerId]
+  );
+
+  const denyResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM trade_offer_votes WHERE offer_id = $1 AND vote = 'deny'`,
+    [offerId]
+  );
+
+  return {
+    approve: approveResult.rows[0].count,
+    deny: denyResult.rows[0].count,
+  };
 }
 
 async function finalizeApprovedTrade(guild, offerId) {
@@ -651,8 +965,12 @@ async function finalizeDeniedTrade(guild, offerId) {
   }
 }
 
+// =========================
+// READY
+// =========================
 client.once(Events.ClientReady, async () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
+
   try {
     await initDatabase();
     await registerCommands();
@@ -661,12 +979,20 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
+// =========================
+// SCREENSHOT TRADE FLOW
+// =========================
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot || !message.guild) return;
+
     const pendingData = pendingOfferTargets.get(message.author.id);
     if (!pendingData) return;
-    const league = pendingData.leagueId ? await getLeagueByName(message.guild.id, pendingData.leagueName || '') : await resolveLeague(message);
+
+    const league = pendingData.leagueId
+      ? await getLeagueById(pendingData.leagueId)
+      : await resolveLeague(message);
+
     const offerChannelId = league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID;
     if (message.channel.id !== offerChannelId) return;
 
@@ -675,6 +1001,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     const senderMember = await message.guild.members.fetch(message.author.id);
     const senderTeam = await getMemberTeamForLeague(senderMember, league);
+
     if (!senderTeam) {
       pendingOfferTargets.delete(message.author.id);
       await message.reply('The bot could not determine your team role for this league.');
@@ -692,6 +1019,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     const offerId = randomUUID();
+
     await pool.query(
       `INSERT INTO trade_offers (
          id, guild_id, league_id, sender_user_id, sender_team, sender_team_role_id,
@@ -726,7 +1054,11 @@ client.on(Events.MessageCreate, async (message) => {
       .setFooter({ text: 'GG Sports • Trade Offer' })
       .setTimestamp();
 
-    await targetOwner.send({ embeds: [dmEmbed], components: [buildOfferDecisionButtons(offerId)] });
+    await targetOwner.send({
+      embeds: [dmEmbed],
+      components: [buildOfferDecisionButtons(offerId)],
+    });
+
     pendingOfferTargets.delete(message.author.id);
     await message.reply(`Your trade offer was sent to the ${pendingData.targetTeamName} owner.`);
   } catch (error) {
@@ -734,21 +1066,28 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
+// =========================
+// INTERACTIONS
+// =========================
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    // MODALS
     if (interaction.isModalSubmit()) {
       if (interaction.customId.startsWith('tradeblock_modal:')) {
         if (!interaction.guild) return;
+
         const [, encodedTeam, leagueId = 'legacy'] = interaction.customId.split(':');
         const team = decodeURIComponent(encodedTeam);
-        const league = leagueId !== 'legacy' ? await resolveLeague(interaction) : null;
+        const league = leagueId !== 'legacy' ? await getLeagueById(leagueId) : await resolveLeague(interaction);
+
         const playerName = interaction.fields.getTextInputValue('tradeblock_player_name');
         const position = interaction.fields.getTextInputValue('tradeblock_position');
         const age = interaction.fields.getTextInputValue('tradeblock_age');
         const ovr = interaction.fields.getTextInputValue('tradeblock_ovr');
         const salary = interaction.fields.getTextInputValue('tradeblock_salary');
+
         const channelId = league?.trade_block_channel_id || TRADE_BLOCK_CHANNEL_ID;
-        const channel = await interaction.guild.channels.fetch(channelId);
+        const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
 
         if (!channel || !channel.isTextBased()) {
           await interaction.reply({ content: 'Trade block channel not found.', ephemeral: true });
@@ -756,6 +1095,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const postId = randomUUID();
+
         await pool.query(
           `INSERT INTO trade_block_posts (id, posted_team, player_name, position, age, ovr, salary, submitted_by)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
@@ -777,24 +1117,40 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setFooter({ text: 'GG Sports • Trade Block' })
           .setTimestamp();
 
-        await channel.send({ content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}>`, embeds: [embed], allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] } });
+        await channel.send({
+          content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}>`,
+          embeds: [embed],
+          allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] },
+        });
+
         await interaction.reply({ content: 'Your trade block listing has been posted.', ephemeral: true });
         return;
       }
     }
 
+    // BUTTONS
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('offer_trade_panel_button')) {
-        const league = await resolveLeague(interaction);
+        const customIdParts = interaction.customId.split(':');
+        const leagueId = customIdParts[1] || null;
+        const league = leagueId && leagueId !== 'legacy'
+          ? await getLeagueById(leagueId)
+          : await resolveLeague(interaction);
+
         const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
-        await interaction.reply({ content: 'Choose the team you are sending the offer to.', components: buildTeamSelectMenus(teamRoles, league?.league_id || 'legacy'), ephemeral: true });
+
+        await interaction.reply({
+          content: 'Choose the team you are sending the offer to.',
+          components: buildTeamSelectMenus(teamRoles, league?.league_id || 'legacy'),
+          ephemeral: true,
+        });
         return;
       }
 
       if (interaction.customId.startsWith('trade_offer_accept:')) {
         const offerId = interaction.customId.split(':')[1];
-
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
+
         if (result.rows.length === 0) {
           await interaction.reply({ content: 'That trade offer could not be found.', ephemeral: true });
           return;
@@ -829,7 +1185,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           allowedMentions: { roles: [league?.committee_role_id || COMMITTEE_ROLE_ID], users: [] },
         });
 
-        await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
+        await pool.query(
+          `UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`,
+          [committeeMessage.id, offerId]
+        );
 
         await interaction.update({
           content: 'Trade offer accepted and sent to committee.',
@@ -840,8 +1199,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.customId.startsWith('trade_offer_decline:')) {
         const offerId = interaction.customId.split(':')[1];
-
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
+
         if (result.rows.length === 0) {
           await interaction.reply({ content: 'That trade offer could not be found.', ephemeral: true });
           return;
@@ -867,42 +1226,71 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId.startsWith('committee_vote_approve:') || interaction.customId.startsWith('committee_vote_deny:')) {
+        if (!interaction.guild) {
+          await interaction.reply({ content: 'Committee voting must happen inside the server.', ephemeral: true });
+          return;
+        }
+
         const isApprove = interaction.customId.startsWith('committee_vote_approve:');
         const offerId = interaction.customId.split(':')[1];
-        const league = await resolveLeague(interaction) || await getDefaultLeague(interaction.guild.id);
+        const offerResult = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
+
+        if (offerResult.rows.length === 0) {
+          await interaction.reply({ content: 'Trade offer not found.', ephemeral: true });
+          return;
+        }
+
+        const offer = offerResult.rows[0];
+        const league = offer.league_id ? await getLeagueById(offer.league_id) : await resolveLeague(interaction);
         const member = await interaction.guild.members.fetch(interaction.user.id);
+
         if (!(await memberHasCommittee(member, league))) {
           await interaction.reply({ content: 'You do not have permission to vote on trades.', ephemeral: true });
           return;
         }
-        const offerResult = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
-        if (offerResult.rows.length === 0) return;
-        const offer = offerResult.rows[0];
+
         if (offer.status === 'committee_approved' || offer.status === 'committee_denied') {
           await interaction.reply({ content: 'This trade has already been finalized.', ephemeral: true });
           return;
         }
+
         await pool.query(
-          `INSERT INTO trade_offer_votes (offer_id, voter_user_id, vote) VALUES ($1, $2, $3)
-           ON CONFLICT (offer_id, voter_user_id) DO UPDATE SET vote = $3`,
+          `INSERT INTO trade_offer_votes (offer_id, voter_user_id, vote)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (offer_id, voter_user_id)
+           DO UPDATE SET vote = $3`,
           [offerId, interaction.user.id, isApprove ? 'approve' : 'deny']
         );
+
         const counts = await getVoteCounts(offerId);
+
         if (counts.approve >= 3) {
           await finalizeApprovedTrade(interaction.guild, offerId);
-          await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_approved' }, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId, true)] });
+          await interaction.update({
+            embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_approved' }, counts.approve, counts.deny)],
+            components: [buildCommitteeVoteButtons(offerId, true)],
+          });
           return;
         }
+
         if (counts.deny >= 3) {
           await finalizeDeniedTrade(interaction.guild, offerId);
-          await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_denied' }, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId, true)] });
+          await interaction.update({
+            embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_denied' }, counts.approve, counts.deny)],
+            components: [buildCommitteeVoteButtons(offerId, true)],
+          });
           return;
         }
-        await interaction.update({ embeds: [buildCommitteeEmbed(offer, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId)] });
+
+        await interaction.update({
+          embeds: [buildCommitteeEmbed(offer, counts.approve, counts.deny)],
+          components: [buildCommitteeVoteButtons(offerId)],
+        });
         return;
       }
     }
 
+    // SELECT MENUS
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId.startsWith('offer_trade_select_')) {
         const customIdParts = interaction.customId.split(':');
@@ -913,21 +1301,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         let league = null;
 
         if (leagueId !== 'legacy') {
-          const result = await pool.query(
-            `SELECT l.league_id, l.guild_id, l.league_name, l.game_key, l.is_active,
-                    s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
-                    s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-                    s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id
-             FROM leagues l
-             LEFT JOIN league_settings s ON s.league_id = l.league_id
-             WHERE l.league_id = $1`,
-            [leagueId]
-          );
-
-          league = result.rows[0] || null;
-
+          league = await getLeagueById(leagueId);
           const teamRoles = await getLeagueTeamRoles(leagueId);
-          const selected = teamRoles.find(t => t.role_id === interaction.values[0]);
+          const selected = teamRoles.find(team => team.role_id === interaction.values[0]);
 
           if (selected) {
             targetTeamName = selected.role_name;
@@ -953,36 +1329,76 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (!interaction.isChatInputCommand()) return;
 
+    // LEAGUE SETUP COMMANDS
     if (interaction.commandName.startsWith('league-')) {
       if (!interaction.guild) {
         await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
         return;
       }
+
       if (!(await userCanUseLeagueSetup(interaction))) {
-        await interaction.reply({ content: 'You need server admin, Manage Server, or a configured league staff role to use league setup commands.', ephemeral: true });
+        await interaction.reply({
+          content: 'You need server admin, Manage Server, or a configured league staff role to use league setup commands.',
+          ephemeral: true,
+        });
         return;
       }
 
       if (interaction.commandName === 'league-create') {
         const name = interaction.options.getString('name');
         const game = interaction.options.getString('game').toLowerCase();
+        const seasonLength = interaction.options.getInteger('season_length');
         const leagueId = randomUUID();
-        await pool.query(`INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`, [interaction.guild.id, interaction.guild.name]);
-        await pool.query(`INSERT INTO leagues (league_id, guild_id, league_name, game_key) VALUES ($1, $2, $3, $4)`, [leagueId, interaction.guild.id, name, game]);
-        await pool.query(`INSERT INTO league_settings (league_id) VALUES ($1) ON CONFLICT (league_id) DO NOTHING`, [leagueId]);
-        await interaction.reply({ content: `Created league **${name}** for **${game}**.`, ephemeral: true });
+
+        await pool.query(
+          `INSERT INTO guilds (guild_id, guild_name)
+           VALUES ($1, $2)
+           ON CONFLICT (guild_id)
+           DO UPDATE SET guild_name = EXCLUDED.guild_name`,
+          [interaction.guild.id, interaction.guild.name]
+        );
+
+        await pool.query(
+          `INSERT INTO leagues (league_id, guild_id, league_name, game_key, season_length)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [leagueId, interaction.guild.id, name, game, seasonLength]
+        );
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id)
+           VALUES ($1)
+           ON CONFLICT (league_id)
+           DO NOTHING`,
+          [leagueId]
+        );
+
+        await interaction.reply({
+          content: `Created league **${name}** for **${game}**${seasonLength ? ` with a ${seasonLength}-game season` : ''}.`,
+          ephemeral: true,
+        });
         return;
       }
 
       if (interaction.commandName === 'league-list') {
-        const result = await pool.query(`SELECT league_name, game_key FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY league_name ASC`, [interaction.guild.id]);
-        const text = result.rows.length ? result.rows.map(row => `• **${row.league_name}** (${row.game_key})`).join('\n') : 'No leagues configured yet.';
+        const result = await pool.query(
+          `SELECT league_name, game_key, season_length
+           FROM leagues
+           WHERE guild_id = $1 AND is_active = TRUE
+           ORDER BY league_name ASC`,
+          [interaction.guild.id]
+        );
+
+        const text = result.rows.length
+          ? result.rows.map(row => `• **${row.league_name}** (${row.game_key}${row.season_length ? ` • ${row.season_length} games` : ''})`).join('\n')
+          : 'No leagues configured yet.';
+
         await interaction.reply({ content: text, ephemeral: true });
         return;
       }
 
       const leagueName = interaction.options.getString('league');
       const league = await getLeagueByName(interaction.guild.id, leagueName);
+
       if (!league) {
         await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
         return;
@@ -992,10 +1408,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const leagueRole = interaction.options.getRole('league_role');
         const staffRole = interaction.options.getRole('staff_role');
         const committeeRole = interaction.options.getRole('committee_role');
+
         await pool.query(
-          `UPDATE league_settings SET league_role_id = $1, staff_role_id = $2, committee_role_id = $3, updated_at = NOW() WHERE league_id = $4`,
+          `UPDATE league_settings
+           SET league_role_id = $1, staff_role_id = $2, committee_role_id = $3, updated_at = NOW()
+           WHERE league_id = $4`,
           [leagueRole.id, staffRole.id, committeeRole.id, league.league_id]
         );
+
         await interaction.reply({ content: `Roles saved for **${league.league_name}**.`, ephemeral: true });
         return;
       }
@@ -1009,37 +1429,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const committee = interaction.options.getChannel('committee');
         const approved = interaction.options.getChannel('approved');
         const denied = interaction.options.getChannel('denied');
+
         await pool.query(
           `UPDATE league_settings
-           SET live_channel_id = $1, team_owners_channel_id = $2, trade_count_channel_id = $3, trade_block_channel_id = $4,
-               offer_a_trade_channel_id = $5, committee_channel_id = $6, approved_channel_id = $7, denied_channel_id = $8, updated_at = NOW()
+           SET live_channel_id = $1,
+               team_owners_channel_id = $2,
+               trade_count_channel_id = $3,
+               trade_block_channel_id = $4,
+               offer_a_trade_channel_id = $5,
+               committee_channel_id = $6,
+               approved_channel_id = $7,
+               denied_channel_id = $8,
+               updated_at = NOW()
            WHERE league_id = $9`,
           [live.id, teamOwners.id, tradeCount.id, tradeBlock.id, offerTrade.id, committee.id, approved.id, denied.id, league.league_id]
         );
+
         await interaction.reply({ content: `Channels saved for **${league.league_name}**.`, ephemeral: true });
         return;
       }
 
       if (interaction.commandName === 'league-addteamrole') {
         const role = interaction.options.getRole('role');
+
         await pool.query(
-          `INSERT INTO league_team_roles (league_id, role_id, role_name) VALUES ($1, $2, $3)
-           ON CONFLICT (league_id, role_id) DO UPDATE SET role_name = EXCLUDED.role_name`,
+          `INSERT INTO league_team_roles (league_id, role_id, role_name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (league_id, role_id)
+           DO UPDATE SET role_name = EXCLUDED.role_name`,
           [league.league_id, role.id, role.name]
         );
+
         await pool.query(
           `INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count)
            VALUES ($1, $2, $3, 0)
-           ON CONFLICT (league_id, role_id) DO NOTHING`,
+           ON CONFLICT (league_id, role_id)
+           DO NOTHING`,
           [league.league_id, role.id, role.name]
         );
+
         await interaction.reply({ content: `Added team role **${role.name}** to **${league.league_name}**.`, ephemeral: true });
         return;
       }
 
       if (interaction.commandName === 'league-listteamroles') {
         const roles = await getLeagueTeamRoles(league.league_id);
-        const text = roles.length ? roles.map(role => `• <@&${role.role_id}>`).join('\n') : 'No team roles configured yet.';
+        const text = roles.length
+          ? roles.map(role => `• <@&${role.role_id}>`).join('\n')
+          : 'No team roles configured yet.';
+
         await interaction.reply({ content: text, ephemeral: true });
         return;
       }
@@ -1062,14 +1500,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const teamOwnersChannel = await interaction.guild.channels.fetch(league.team_owners_channel_id).catch(() => null);
         const tradeCountChannel = await interaction.guild.channels.fetch(league.trade_count_channel_id).catch(() => null);
         const offerTradeChannel = await interaction.guild.channels.fetch(league.offer_a_trade_channel_id).catch(() => null);
-
-        const inaccessible = [];
-
         const botMember = await interaction.guild.members.fetchMe();
 
         function canPostIn(channel) {
           if (!channel || !channel.isTextBased()) return false;
-
           const permissions = channel.permissionsFor(botMember);
           if (!permissions) return false;
 
@@ -1077,6 +1511,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             permissions.has(PermissionFlagsBits.SendMessages) &&
             permissions.has(PermissionFlagsBits.EmbedLinks);
         }
+
+        const inaccessible = [];
 
         if (!canPostIn(teamOwnersChannel)) inaccessible.push(`team owners channel (<#${league.team_owners_channel_id}>)`);
         if (!canPostIn(tradeCountChannel)) inaccessible.push(`trade count channel (<#${league.trade_count_channel_id}>)`);
@@ -1106,45 +1542,185 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
         await savePanel(league, 'offer_trade', offerTradeChannel.id, offerTradeMessage.id);
 
-        await interaction.reply({
-          content: `Panels created for **${league.league_name}**.`,
-          ephemeral: true,
-        });
+        await interaction.reply({ content: `Panels created for **${league.league_name}**.`, ephemeral: true });
         return;
       }
     }
 
-    // Current working commands, now with V2 league resolution where possible.
+    // NON-LEAGUE-PREFIX COMMANDS
     const league = await resolveLeague(interaction);
-    const member = interaction.guild ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null) : null;
+    const member = interaction.guild
+      ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null)
+      : null;
 
     if (interaction.commandName === 'ping') {
       await interaction.reply({ content: 'GG Sports is live.', ephemeral: true });
       return;
     }
 
+    if (interaction.commandName === 'help') {
+      const embed = new EmbedBuilder()
+        .setTitle('GG Sports Setup Guide')
+        .setColor(0x5865F2)
+        .setDescription('Use this guide to set up GG Sports in your server.')
+        .addFields(
+          { name: '1. Create League', value: '`/league-create` — create a league and optionally set season length.', inline: false },
+          { name: '2. Set Roles', value: '`/league-setroles` — set league ping, staff, and committee roles.', inline: false },
+          { name: '3. Set Channels', value: '`/league-setchannels` — connect live, trade, committee, approved/denied, team owners, and trade count channels.', inline: false },
+          { name: '4. Add Teams', value: '`/league-addteamrole` — run once for each team role.', inline: false },
+          { name: '5. Create Panels', value: '`/league-setup-panels` — posts Team Owners, Trade Count, and Offer Trade panels.', inline: false },
+          { name: 'Tip', value: '`/commands` shows commands available to your permission level.', inline: false }
+        )
+        .setFooter({ text: 'GG Sports • Setup Guide' })
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [embed], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'commands') {
+      const isStaff = member && league ? await memberHasStaff(member, league) : false;
+      const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+
+      const memberCommands = [
+        '`/ping` — check if the bot is live',
+        '`/help` — setup guide',
+        '`/commands` — command list',
+        '`/whogotnext` — ping your league that you are ready to play',
+        '`/linkstream` — save your stream link',
+        '`/livestream` — post your stream link',
+        '`/tradeblock` — post a player to the trade block',
+      ];
+
+      const staffCommands = [
+        '`/assignrole` — assign a role',
+        '`/unassignrole` — remove a role',
+        '`/setupteamowners` — create team owners panel',
+        '`/setuptradecount` — create trade count panel',
+        '`/setupoffertrade` — create offer trade panel',
+        '`/addtrade` — add a trade count',
+        '`/removetrade` — remove a trade count',
+        '`/league-create` — create league',
+        '`/league-setroles` — set roles',
+        '`/league-setchannels` — set channels',
+        '`/league-addteamrole` — add team role',
+        '`/league-listteamroles` — list team roles',
+        '`/league-setup-panels` — create panels',
+        '`/editleaguename` — rename league',
+      ];
+
+      const embed = new EmbedBuilder()
+        .setTitle('GG Sports Commands')
+        .setColor(0x57F287)
+        .addFields(
+          { name: 'Member Commands', value: memberCommands.join('\n'), inline: false },
+          { name: 'Staff/Admin Commands', value: (isStaff || isAdmin) ? staffCommands.join('\n') : 'You do not currently have access to staff/admin commands.', inline: false }
+        )
+        .setFooter({ text: 'GG Sports • Commands' })
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [embed], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'editleaguename') {
+      if (!interaction.guild) {
+        await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+        return;
+      }
+
+      const currentName = interaction.options.getString('league');
+      const newName = interaction.options.getString('new_name');
+      const leagueToRename = await getLeagueByName(interaction.guild.id, currentName);
+
+      if (!leagueToRename) {
+        await interaction.reply({ content: `Could not find league **${currentName}**.`, ephemeral: true });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, leagueToRename))) {
+        await interaction.reply({ content: 'You do not have permission to rename this league.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE leagues SET league_name = $1 WHERE league_id = $2`,
+        [newName, leagueToRename.league_id]
+      );
+
+      const updatedLeague = await getLeagueByName(interaction.guild.id, newName);
+
+      await updateTeamOwnersPanel(interaction.guild, updatedLeague);
+      await updateTradeCountPanel(interaction.guild, updatedLeague);
+      await updatePanel(
+        interaction.guild,
+        updatedLeague,
+        'offer_trade',
+        buildOfferTradePanelEmbed(updatedLeague.league_name),
+        [buildOfferTradePanelButton(updatedLeague.league_id)]
+      );
+
+      await interaction.reply({
+        content: `League renamed from **${currentName}** to **${newName}**. Panels updated.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
     if (interaction.commandName === 'whogotnext') {
+      const requestedLeagueName = interaction.options.getString('league');
+      const activeLeague = requestedLeagueName && interaction.guild
+        ? await getLeagueByName(interaction.guild.id, requestedLeagueName)
+        : league;
+
+      if (requestedLeagueName && !activeLeague) {
+        await interaction.reply({ content: `Could not find league **${requestedLeagueName}**.`, ephemeral: true });
+        return;
+      }
+
       const extraMessage = interaction.options.getString('message');
-      let text = `<@&${league?.league_role_id || LEAGUE_ROLE_ID}> <@${interaction.user.id}> is available to play right now.`;
-      if (extraMessage) text += ` ${extraMessage}`;
-      await interaction.reply({ content: text, allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [interaction.user.id] } });
+      let text = `<@&${activeLeague?.league_role_id || LEAGUE_ROLE_ID}> <@${interaction.user.id}> is available to play right now.`;
+
+      if (extraMessage) {
+        text += ` ${extraMessage}`;
+      }
+
+      await interaction.reply({
+        content: text,
+        allowedMentions: { roles: [activeLeague?.league_role_id || LEAGUE_ROLE_ID], users: [interaction.user.id] },
+      });
       return;
     }
 
     if (interaction.commandName === 'linkstream') {
       const url = interaction.options.getString('url');
+
       if (interaction.guild) {
         await pool.query(
-          `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`,
+          `INSERT INTO guilds (guild_id, guild_name)
+           VALUES ($1, $2)
+           ON CONFLICT (guild_id)
+           DO UPDATE SET guild_name = EXCLUDED.guild_name`,
           [interaction.guild.id, interaction.guild.name]
         );
+
         await pool.query(
-          `INSERT INTO guild_stream_links (guild_id, user_id, stream_url, updated_at) VALUES ($1, $2, $3, NOW())
-           ON CONFLICT (guild_id, user_id) DO UPDATE SET stream_url = EXCLUDED.stream_url, updated_at = NOW()`,
+          `INSERT INTO guild_stream_links (guild_id, user_id, stream_url, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (guild_id, user_id)
+           DO UPDATE SET stream_url = EXCLUDED.stream_url, updated_at = NOW()`,
           [interaction.guild.id, interaction.user.id, url]
         );
       }
-      await pool.query(`INSERT INTO stream_links (user_id, stream_url) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET stream_url = EXCLUDED.stream_url`, [interaction.user.id, url]);
+
+      await pool.query(
+        `INSERT INTO stream_links (user_id, stream_url)
+         VALUES ($1, $2)
+         ON CONFLICT (user_id)
+         DO UPDATE SET stream_url = EXCLUDED.stream_url`,
+        [interaction.user.id, url]
+      );
+
       await interaction.reply({ content: 'Your stream link has been saved permanently.', ephemeral: true });
       return;
     }
@@ -1153,37 +1729,60 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const result = interaction.guild
         ? await pool.query('SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2', [interaction.guild.id, interaction.user.id])
         : await pool.query('SELECT stream_url FROM stream_links WHERE user_id = $1', [interaction.user.id]);
-      const fallback = result.rows.length ? result : await pool.query('SELECT stream_url FROM stream_links WHERE user_id = $1', [interaction.user.id]);
+
+      const fallback = result.rows.length
+        ? result
+        : await pool.query('SELECT stream_url FROM stream_links WHERE user_id = $1', [interaction.user.id]);
+
       if (fallback.rows.length === 0) {
         await interaction.reply({ content: 'You need to set your stream first using /linkstream', ephemeral: true });
         return;
       }
+
       const channel = await client.channels.fetch(league?.live_channel_id || LIVE_CHANNEL_ID);
-      await channel.send({ content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${fallback.rows[0].stream_url}`, allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] } });
+
+      await channel.send({
+        content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${fallback.rows[0].stream_url}`,
+        allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] },
+      });
+
       await interaction.reply({ content: 'Your stream has been posted.', ephemeral: true });
       return;
     }
 
-    if (interaction.commandName === 'assignrole') {
+    if (interaction.commandName === 'assignrole' || interaction.commandName === 'unassignrole') {
       if (!interaction.guild || !(member && (await memberHasStaff(member, league)))) {
         await interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
         return;
       }
+
       const targetUser = interaction.options.getUser('member');
       const role = interaction.options.getRole('role');
       const targetMember = await interaction.guild.members.fetch(targetUser.id);
-      await targetMember.roles.add(role);
+
+      if (interaction.commandName === 'assignrole') {
+        await targetMember.roles.add(role);
+      } else {
+        await targetMember.roles.remove(role);
+      }
+
       const configuredTeamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
+
       if (configuredTeamRoles.some(team => team.role_id === role.id) || isLegacyTeamRole(role.name)) {
         await updateTeamOwnersPanel(interaction.guild, league);
       }
-      await interaction.reply({ content: `Assigned ${role} to ${targetMember}.`, ephemeral: true });
+
+      await interaction.reply({
+        content: `${interaction.commandName === 'assignrole' ? 'Assigned' : 'Removed'} ${role} ${interaction.commandName === 'assignrole' ? 'to' : 'from'} ${targetMember}.`,
+        ephemeral: true,
+      });
       return;
     }
 
     if (interaction.commandName === 'setupteamowners') {
       const channel = await interaction.guild.channels.fetch(league?.team_owners_channel_id || TEAM_OWNERS_CHANNEL_ID);
       const message = await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
+
       await savePanel(league, 'team_owners', channel.id, message.id);
       await interaction.reply({ content: 'Team Owners panel has been created.', ephemeral: true });
       return;
@@ -1192,6 +1791,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'setuptradecount') {
       const channel = await interaction.guild.channels.fetch(league?.trade_count_channel_id || TRADE_COUNT_CHANNEL_ID);
       const message = await channel.send({ embeds: [await buildTradeCountEmbed(league)] });
+
       await savePanel(league, 'trade_count', channel.id, message.id);
       await interaction.reply({ content: 'Trade Count panel has been created.', ephemeral: true });
       return;
@@ -1199,7 +1799,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === 'setupoffertrade') {
       const channel = await interaction.guild.channels.fetch(league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID);
-      const message = await channel.send({ embeds: [buildOfferTradePanelEmbed(league?.league_name || 'League')], components: [buildOfferTradePanelButton(league?.league_id || 'legacy')] });
+      const message = await channel.send({
+        embeds: [buildOfferTradePanelEmbed(league?.league_name || 'League')],
+        components: [buildOfferTradePanelButton(league?.league_id || 'legacy')],
+      });
+
       await savePanel(league, 'offer_trade', channel.id, message.id);
       await interaction.reply({ content: 'Offer a Trade panel has been created.', ephemeral: true });
       return;
@@ -1208,6 +1812,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'addtrade' || interaction.commandName === 'removetrade') {
       const teamRole = interaction.options.getRole('team');
       const increment = interaction.commandName === 'addtrade' ? 1 : -1;
+
       if (league?.league_id) {
         await pool.query(
           `INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count)
@@ -1217,37 +1822,89 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [league.league_id, teamRole.id, teamRole.name, increment]
         );
       } else {
-        await pool.query(`UPDATE trade_counts SET trade_count = GREATEST(trade_count + $1, 0) WHERE team_name = $2`, [increment, teamRole.name]);
+        await pool.query(
+          `UPDATE trade_counts SET trade_count = GREATEST(trade_count + $1, 0) WHERE team_name = $2`,
+          [increment, teamRole.name]
+        );
       }
+
       await updateTradeCountPanel(interaction.guild, league);
-      await interaction.reply({ content: `${increment > 0 ? 'Added' : 'Removed'} 1 trade ${increment > 0 ? 'to' : 'from'} ${teamRole}.`, ephemeral: true });
+
+      await interaction.reply({
+        content: `${increment > 0 ? 'Added' : 'Removed'} 1 trade ${increment > 0 ? 'to' : 'from'} ${teamRole}.`,
+        ephemeral: true,
+      });
       return;
     }
 
     if (interaction.commandName === 'tradeblock') {
       const tradeBlockChannelId = league?.trade_block_channel_id || TRADE_BLOCK_CHANNEL_ID;
+
       if (interaction.channelId !== tradeBlockChannelId) {
         await interaction.reply({ content: 'This command can only be used in the trade block channel.', ephemeral: true });
         return;
       }
+
       const teamRole = await getMemberTeamForLeague(member, league);
+
       if (!teamRole) {
         await interaction.reply({ content: 'You do not have a team role assigned, so the bot could not determine your team.', ephemeral: true });
         return;
       }
-      const modal = new ModalBuilder().setCustomId(`tradeblock_modal:${encodeURIComponent(teamRole.name)}:${league?.league_id || 'legacy'}`).setTitle('Trade Block Submission');
+
+      const modal = new ModalBuilder()
+        .setCustomId(`tradeblock_modal:${encodeURIComponent(teamRole.name)}:${league?.league_id || 'legacy'}`)
+        .setTitle('Trade Block Submission');
+
       modal.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tradeblock_player_name').setLabel('Player Name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tradeblock_position').setLabel('Position').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(20)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tradeblock_age').setLabel('Age').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tradeblock_ovr').setLabel('Overall Rating').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tradeblock_salary').setLabel('Current Year Salary').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(25))
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('tradeblock_player_name')
+            .setLabel('Player Name')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(100)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('tradeblock_position')
+            .setLabel('Position')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(20)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('tradeblock_age')
+            .setLabel('Age')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(10)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('tradeblock_ovr')
+            .setLabel('Overall Rating')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(10)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('tradeblock_salary')
+            .setLabel('Current Year Salary')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(25)
+        )
       );
+
       await interaction.showModal(modal);
       return;
     }
   } catch (error) {
     console.error('Interaction error:', error);
+
     if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: 'Something went wrong.', ephemeral: true });
     }
