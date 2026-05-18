@@ -309,6 +309,42 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guild_currency_settings (
+      guild_id TEXT PRIMARY KEY,
+      currency_name TEXT NOT NULL DEFAULT 'GG Coins',
+      currency_icon TEXT NOT NULL DEFAULT '🪙',
+      win_payout INTEGER NOT NULL DEFAULT 100,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guild_currency_balances (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      balance INTEGER NOT NULL DEFAULT 0,
+      lifetime_earned INTEGER NOT NULL DEFAULT 0,
+      lifetime_spent INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS currency_transactions (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      transaction_type TEXT NOT NULL,
+      reason TEXT,
+      issued_by_user_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   for (const teamName of TEAM_ROLE_NAMES) {
     await pool.query(
       `INSERT INTO trade_counts (team_name, trade_count) VALUES ($1, 0) ON CONFLICT (team_name) DO NOTHING`,
@@ -490,6 +526,39 @@ function buildCommands() {
       .setDescription('Show a team/franchise profile for a league')
       .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
       .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('setcurrency')
+      .setDescription('Configure this server’s currency')
+      .addStringOption(o => o.setName('name').setDescription('Currency name, ex: Ghost Gold').setRequired(true))
+      .addStringOption(o => o.setName('icon').setDescription('Currency icon/emoji, ex: 🪙').setRequired(false))
+      .addIntegerOption(o => o.setName('win_payout').setDescription('Amount earned for a reported win').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('balance')
+      .setDescription('Check your balance or another user’s balance')
+      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('transfer')
+      .setDescription('Transfer currency to another user')
+      .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount to transfer').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Optional reason').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('givecurrency')
+      .setDescription('Admin/staff: give currency to a user')
+      .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount to give').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('takecurrency')
+      .setDescription('Admin/staff: remove currency from a user')
+      .addUserOption(o => o.setName('user').setDescription('User losing currency').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount to remove').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -1147,6 +1216,97 @@ async function updateStandingsPanel(guild, league) {
   if (!guild || !league?.league_id) return;
   const rows = await getStandingsRows(guild.id, league.league_id);
   await updatePanel(guild, league, 'standings', buildStandingsEmbed(league, rows));
+}
+
+async function getCurrencySettings(guildId) {
+  await pool.query(
+    `INSERT INTO guild_currency_settings (guild_id)
+     VALUES ($1)
+     ON CONFLICT (guild_id) DO NOTHING`,
+    [guildId]
+  );
+
+  const result = await pool.query(
+    `SELECT currency_name, currency_icon, win_payout FROM guild_currency_settings WHERE guild_id = $1`,
+    [guildId]
+  );
+
+  return result.rows[0] || { currency_name: 'GG Coins', currency_icon: '🪙', win_payout: 100 };
+}
+
+async function getBalance(guildId, userId) {
+  await pool.query(
+    `INSERT INTO guild_currency_balances (guild_id, user_id)
+     VALUES ($1, $2)
+     ON CONFLICT (guild_id, user_id) DO NOTHING`,
+    [guildId, userId]
+  );
+
+  const result = await pool.query(
+    `SELECT balance, lifetime_earned, lifetime_spent FROM guild_currency_balances WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId]
+  );
+
+  return result.rows[0] || { balance: 0, lifetime_earned: 0, lifetime_spent: 0 };
+}
+
+async function addCurrency(guildId, userId, amount, transactionType, reason, issuedByUserId = null) {
+  if (!Number.isInteger(amount) || amount <= 0) return;
+
+  await pool.query(
+    `INSERT INTO guild_currency_balances (guild_id, user_id, balance, lifetime_earned)
+     VALUES ($1, $2, $3, $3)
+     ON CONFLICT (guild_id, user_id)
+     DO UPDATE SET
+       balance = guild_currency_balances.balance + $3,
+       lifetime_earned = guild_currency_balances.lifetime_earned + $3,
+       updated_at = NOW()`,
+    [guildId, userId, amount]
+  );
+
+  await pool.query(
+    `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [randomUUID(), guildId, userId, amount, transactionType, reason || null, issuedByUserId]
+  );
+}
+
+async function removeCurrency(guildId, userId, amount, transactionType, reason, issuedByUserId = null) {
+  if (!Number.isInteger(amount) || amount <= 0) return false;
+
+  const balance = await getBalance(guildId, userId);
+  if (Number(balance.balance) < amount) return false;
+
+  await pool.query(
+    `UPDATE guild_currency_balances
+     SET balance = balance - $3,
+         lifetime_spent = lifetime_spent + $3,
+         updated_at = NOW()
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId, amount]
+  );
+
+  await pool.query(
+    `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [randomUUID(), guildId, userId, -amount, transactionType, reason || null, issuedByUserId]
+  );
+
+  return true;
+}
+
+function buildBalanceEmbed(settings, user, balanceRow) {
+  return new EmbedBuilder()
+    .setTitle(`${settings.currency_icon} ${user.username}'s Balance`)
+    .setColor(0xFEE75C)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'Balance', value: `${settings.currency_icon} ${balanceRow.balance} ${settings.currency_name}`, inline: false },
+      { name: 'Lifetime Earned', value: `${settings.currency_icon} ${balanceRow.lifetime_earned}`, inline: true },
+      { name: 'Lifetime Spent', value: `${settings.currency_icon} ${balanceRow.lifetime_spent}`, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Server Economy' })
+    .setTimestamp();
 }
 
 async function getVoteCounts(offerId) {
@@ -1979,7 +2139,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await updateStandingsPanel(interaction.guild, activeLeague);
-      await interaction.reply({ content: `Final recorded: **${game.away_team_name} ${awayScore} @ ${game.home_team_name} ${homeScore}**. Winner: **${winnerName}**`, ephemeral: true });
+
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const winnerOwner = await findTeamOwnerByRoleId(interaction.guild, winnerRoleId);
+      let payoutText = '';
+
+      if (winnerOwner && Number(settings.win_payout) > 0) {
+        await addCurrency(
+          interaction.guild.id,
+          winnerOwner.id,
+          Number(settings.win_payout),
+          'game_win',
+          `Game win: ${winnerName}`,
+          interaction.user.id
+        );
+        payoutText = `
+${settings.currency_icon} <@${winnerOwner.id}> earned **${settings.win_payout} ${settings.currency_name}**.`;
+      }
+
+      await interaction.reply({ content: `Final recorded: **${game.away_team_name} ${awayScore} @ ${game.home_team_name} ${homeScore}**. Winner: **${winnerName}**${payoutText}`, ephemeral: true });
       return;
     }
 
@@ -2044,6 +2222,109 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await updateStandingsPanel(interaction.guild, activeLeague);
       await interaction.reply({ content: `Standings adjusted: **${team.name}** is now **${wins}-${losses}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'setcurrency') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to configure server currency.', ephemeral: true });
+        return;
+      }
+
+      const name = interaction.options.getString('name');
+      const icon = interaction.options.getString('icon') || '🪙';
+      const winPayout = interaction.options.getInteger('win_payout') ?? 100;
+
+      if (winPayout < 0) {
+        await interaction.reply({ content: 'Win payout cannot be negative.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO guild_currency_settings (guild_id, currency_name, currency_icon, win_payout, updated_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (guild_id)
+         DO UPDATE SET currency_name = $2, currency_icon = $3, win_payout = $4, updated_at = NOW()`,
+        [interaction.guild.id, name, icon, winPayout]
+      );
+
+      await interaction.reply({ content: `Server currency set to **${icon} ${name}**. Win payout: **${winPayout}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'balance') {
+      if (!interaction.guild) return;
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const balanceRow = await getBalance(interaction.guild.id, targetUser.id);
+      await interaction.reply({ embeds: [buildBalanceEmbed(settings, targetUser, balanceRow)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'transfer') {
+      if (!interaction.guild) return;
+      const targetUser = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+      const reason = interaction.options.getString('reason') || 'User transfer';
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (targetUser.bot || targetUser.id === interaction.user.id) {
+        await interaction.reply({ content: 'You cannot transfer currency to yourself or a bot.', ephemeral: true });
+        return;
+      }
+
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.reply({ content: 'Transfer amount must be greater than 0.', ephemeral: true });
+        return;
+      }
+
+      const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'transfer_out', reason, interaction.user.id);
+      if (!removed) {
+        await interaction.reply({ content: `You do not have enough ${settings.currency_name}.`, ephemeral: true });
+        return;
+      }
+
+      await addCurrency(interaction.guild.id, targetUser.id, amount, 'transfer_in', reason, interaction.user.id);
+      await interaction.reply({ content: `Transferred **${settings.currency_icon} ${amount} ${settings.currency_name}** to ${targetUser}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'givecurrency' || interaction.commandName === 'takecurrency') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use bank controls.', ephemeral: true });
+        return;
+      }
+
+      const targetUser = interaction.options.getUser('user');
+      const amount = interaction.options.getInteger('amount');
+      const reason = interaction.options.getString('reason') || 'Admin bank adjustment';
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (targetUser.bot) {
+        await interaction.reply({ content: 'You cannot adjust currency for bots.', ephemeral: true });
+        return;
+      }
+
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.reply({ content: 'Amount must be greater than 0.', ephemeral: true });
+        return;
+      }
+
+      if (interaction.commandName === 'givecurrency') {
+        await addCurrency(interaction.guild.id, targetUser.id, amount, 'admin_give', reason, interaction.user.id);
+        await interaction.reply({ content: `Gave **${settings.currency_icon} ${amount} ${settings.currency_name}** to ${targetUser}.`, ephemeral: true });
+        return;
+      }
+
+      const removed = await removeCurrency(interaction.guild.id, targetUser.id, amount, 'admin_take', reason, interaction.user.id);
+      if (!removed) {
+        await interaction.reply({ content: `${targetUser} does not have enough ${settings.currency_name}.`, ephemeral: true });
+        return;
+      }
+
+      await interaction.reply({ content: `Removed **${settings.currency_icon} ${amount} ${settings.currency_name}** from ${targetUser}.`, ephemeral: true });
       return;
     }
 
