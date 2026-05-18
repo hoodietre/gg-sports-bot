@@ -913,8 +913,7 @@ function buildAwardHistoryEmbed(league, rows, awardFilter = null) {
   }
 
   const lines = rows.map(row => `**${row.season_label}** — ${row.award_name}: ${row.winner}`);
-  embed.setDescription(lines.join('
-'));
+  embed.setDescription(lines.join('\\n'));
   return embed;
 }
 
