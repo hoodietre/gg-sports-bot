@@ -845,27 +845,6 @@ function parseCustomAwards(awardsText) {
     });
 }
 
-function parseCustomAwards(awardsText) {
-  if (!awardsText) return [];
-
-  return awardsText
-    .split('|')
-    .map(item => item.trim())
-    .filter(Boolean)
-    .map(item => {
-      const separatorIndex = item.indexOf(':');
-
-      if (separatorIndex === -1) {
-        return { name: 'Award', value: item };
-      }
-
-      return {
-        name: item.slice(0, separatorIndex).trim() || 'Award',
-        value: item.slice(separatorIndex + 1).trim() || 'Not listed',
-      };
-    });
-}
-
 function buildSeasonHistoryEmbed(league, data) {
   const embed = new EmbedBuilder()
     .setTitle(`${league.league_name} • ${data.seasonLabel} History`)
