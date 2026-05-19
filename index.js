@@ -411,6 +411,25 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournament_matches (
+      id UUID PRIMARY KEY,
+      tournament_id UUID REFERENCES tournaments(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      round_number INTEGER NOT NULL,
+      match_number INTEGER NOT NULL,
+      player1_user_id TEXT,
+      player1_entry_name TEXT,
+      player2_user_id TEXT,
+      player2_entry_name TEXT,
+      winner_user_id TEXT,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      reported_by_user_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
@@ -721,6 +740,22 @@ function buildCommands() {
       .setName('closetournament')
       .setDescription('Admin/staff: close tournament registration')
       .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('starttournament')
+      .setDescription('Admin/staff: start a single-elimination tournament bracket')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('tournamentmatches')
+      .setDescription('Show tournament matches')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('reportmatch')
+      .setDescription('Admin/staff: report a tournament match winner')
+      .addStringOption(o => o.setName('match_id').setDescription('Match short ID from /tournamentmatches').setRequired(true))
+      .addUserOption(o => o.setName('winner').setDescription('Winning user').setRequired(true)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -1682,6 +1717,95 @@ function buildTournamentInfoEmbed(settings, tournament, entries) {
     )
     .setFooter({ text: 'GG Sports • Tournament Info' })
     .setTimestamp();
+}
+
+function shortMatchId(matchId) {
+  return String(matchId || '').split('-')[0];
+}
+
+function buildTournamentMatchesEmbed(tournament, matches) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle(`${tournament.tournament_name} • Matches`)
+    .setColor(0xED4245)
+    .setFooter({ text: 'GG Sports • Tournament Matches' })
+    .setTimestamp();
+
+  if (!matches.length) {
+    embed.setDescription('No matches have been generated yet.');
+    return embed;
+  }
+
+  const lines = matches.map(match => {
+    const p1 = match.player1_user_id ? `<@${match.player1_user_id}>${match.player1_entry_name ? ` (${match.player1_entry_name})` : ''}` : 'BYE';
+    const p2 = match.player2_user_id ? `<@${match.player2_user_id}>${match.player2_entry_name ? ` (${match.player2_entry_name})` : ''}` : 'BYE';
+    const winner = match.winner_user_id ? ` • Winner: <@${match.winner_user_id}>` : '';
+    return `**${shortMatchId(match.id)}** • Round ${match.round_number}, Match ${match.match_number}${NL}${p1} vs ${p2} • ${match.status}${winner}`;
+  });
+
+  embed.setDescription(lines.join(`${NL}${NL}`));
+  return embed;
+}
+
+async function getTournamentMatches(tournamentId) {
+  const result = await pool.query(
+    `SELECT * FROM tournament_matches WHERE tournament_id = $1 ORDER BY round_number ASC, match_number ASC`,
+    [tournamentId]
+  );
+  return result.rows;
+}
+
+async function findTournamentMatch(guildId, matchInput) {
+  const result = await pool.query(
+    `SELECT m.*, t.tournament_name, t.prize_pool
+     FROM tournament_matches m
+     JOIN tournaments t ON t.id = m.tournament_id
+     WHERE m.guild_id = $1 AND m.id::text LIKE $2
+     ORDER BY m.created_at DESC
+     LIMIT 1`,
+    [guildId, `${matchInput}%`]
+  );
+  return result.rows[0] || null;
+}
+
+async function createTournamentRound(tournament, entries, roundNumber) {
+  const matches = [];
+  let matchNumber = 1;
+
+  for (let i = 0; i < entries.length; i += 2) {
+    const p1 = entries[i] || null;
+    const p2 = entries[i + 1] || null;
+    const matchId = randomUUID();
+
+    await pool.query(
+      `INSERT INTO tournament_matches (id, tournament_id, guild_id, round_number, match_number, player1_user_id, player1_entry_name, player2_user_id, player2_entry_name, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        matchId,
+        tournament.id,
+        tournament.guild_id,
+        roundNumber,
+        matchNumber,
+        p1?.user_id || null,
+        p1?.entry_name || null,
+        p2?.user_id || null,
+        p2?.entry_name || null,
+        p1 && p2 ? 'scheduled' : 'bye',
+      ]
+    );
+
+    if (p1 && !p2) {
+      await pool.query(
+        `UPDATE tournament_matches SET winner_user_id = $1, status = 'final', updated_at = NOW() WHERE id = $2`,
+        [p1.user_id, matchId]
+      );
+    }
+
+    matches.push(matchId);
+    matchNumber += 1;
+  }
+
+  return matches;
 }
 
 async function getVoteCounts(offerId) {
@@ -3056,6 +3180,128 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await pool.query(`UPDATE tournaments SET status = 'closed', updated_at = NOW() WHERE id = $1`, [tournament.id]);
       await interaction.reply({ content: `Registration closed for **${tournament.tournament_name}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'starttournament') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to start tournaments.', ephemeral: true });
+        return;
+      }
+
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+
+      if (tournament.format !== 'single_elim') {
+        await interaction.reply({ content: 'Bracket generation currently supports single_elim first. Other formats will be added next.', ephemeral: true });
+        return;
+      }
+
+      if (!['open', 'closed'].includes(tournament.status)) {
+        await interaction.reply({ content: 'That tournament has already been started or completed.', ephemeral: true });
+        return;
+      }
+
+      const existingMatches = await getTournamentMatches(tournament.id);
+      if (existingMatches.length > 0) {
+        await interaction.reply({ content: 'This tournament already has generated matches.', ephemeral: true });
+        return;
+      }
+
+      const entries = await getTournamentEntries(tournament.id);
+      if (entries.length < 2) {
+        await interaction.reply({ content: 'A tournament needs at least 2 entries to start.', ephemeral: true });
+        return;
+      }
+
+      await createTournamentRound(tournament, entries, 1);
+      await pool.query(`UPDATE tournaments SET status = 'active', updated_at = NOW() WHERE id = $1`, [tournament.id]);
+
+      const matches = await getTournamentMatches(tournament.id);
+      await interaction.reply({ embeds: [buildTournamentMatchesEmbed({ ...tournament, status: 'active' }, matches)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'tournamentmatches') {
+      if (!interaction.guild) return;
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+      const matches = await getTournamentMatches(tournament.id);
+      await interaction.reply({ embeds: [buildTournamentMatchesEmbed(tournament, matches)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'reportmatch') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to report tournament matches.', ephemeral: true });
+        return;
+      }
+
+      const matchInput = interaction.options.getString('match_id');
+      const winner = interaction.options.getUser('winner');
+      const match = await findTournamentMatch(interaction.guild.id, matchInput);
+
+      if (!match) {
+        await interaction.reply({ content: 'Could not find that match ID. Use /tournamentmatches.', ephemeral: true });
+        return;
+      }
+
+      if (match.status === 'final') {
+        await interaction.reply({ content: 'That match is already final.', ephemeral: true });
+        return;
+      }
+
+      const validWinner = winner.id === match.player1_user_id || winner.id === match.player2_user_id;
+      if (!validWinner) {
+        await interaction.reply({ content: 'Winner must be one of the two users in that match.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE tournament_matches SET winner_user_id = $1, status = 'final', reported_by_user_id = $2, updated_at = NOW() WHERE id = $3`,
+        [winner.id, interaction.user.id, match.id]
+      );
+
+      const tournament = await findTournament(interaction.guild.id, match.tournament_name);
+      const allMatches = await getTournamentMatches(match.tournament_id);
+      const currentRoundMatches = allMatches.filter(m => Number(m.round_number) === Number(match.round_number));
+      const currentRoundComplete = currentRoundMatches.every(m => m.status === 'final' || m.status === 'bye' || m.winner_user_id);
+
+      if (!currentRoundComplete) {
+        await interaction.reply({ content: `Match reported. Winner: ${winner}.`, ephemeral: true });
+        return;
+      }
+
+      const winners = currentRoundMatches
+        .map(m => ({ user_id: m.winner_user_id, entry_name: m.winner_user_id === m.player1_user_id ? m.player1_entry_name : m.player2_entry_name }))
+        .filter(w => w.user_id);
+
+      if (winners.length === 1) {
+        await pool.query(`UPDATE tournaments SET status = 'completed', updated_at = NOW() WHERE id = $1`, [match.tournament_id]);
+        const settings = await getCurrencySettings(interaction.guild.id);
+        let payoutText = '';
+
+        if (Number(match.prize_pool) > 0) {
+          await addCurrency(interaction.guild.id, winners[0].user_id, Number(match.prize_pool), 'tournament_prize', `Won ${match.tournament_name}`, interaction.user.id);
+          payoutText = ` ${settings.currency_icon} <@${winners[0].user_id}> earned the prize pool of **${match.prize_pool} ${settings.currency_name}**.`;
+        }
+
+        await interaction.reply({ content: `Tournament complete. Champion: <@${winners[0].user_id}>.${payoutText}`, ephemeral: true });
+        return;
+      }
+
+      await createTournamentRound({ id: match.tournament_id, guild_id: interaction.guild.id }, winners, Number(match.round_number) + 1);
+      await interaction.reply({ content: `Round ${match.round_number} complete. Round ${Number(match.round_number) + 1} has been generated.`, ephemeral: true });
       return;
     }
 
