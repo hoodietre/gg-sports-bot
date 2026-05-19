@@ -379,6 +379,38 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournaments (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE SET NULL,
+      tournament_name TEXT NOT NULL,
+      game TEXT,
+      format TEXT NOT NULL DEFAULT 'single_elim',
+      max_entries INTEGER,
+      buy_in INTEGER NOT NULL DEFAULT 0,
+      prize TEXT,
+      prize_pool INTEGER NOT NULL DEFAULT 0,
+      starts_at TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_by_user_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournament_entries (
+      tournament_id UUID REFERENCES tournaments(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      entry_name TEXT,
+      paid_buy_in INTEGER NOT NULL DEFAULT 0,
+      joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (tournament_id, user_id)
+    )
+  `);
+
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
@@ -657,6 +689,38 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('banklog')
       .setDescription('Admin/staff: view recent server economy transactions'),
+
+    new SlashCommandBuilder()
+      .setName('createtournament')
+      .setDescription('Admin/staff: create a tournament')
+      .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
+      .addStringOption(o => o.setName('game').setDescription('Game, ex: NBA 2K or MLB The Show').setRequired(true))
+      .addStringOption(o => o.setName('format').setDescription('single_elim, double_elim, round_robin').setRequired(false))
+      .addIntegerOption(o => o.setName('max_entries').setDescription('Maximum number of entries').setRequired(false))
+      .addIntegerOption(o => o.setName('buy_in').setDescription('Currency buy-in amount').setRequired(false))
+      .addStringOption(o => o.setName('prize').setDescription('Prize description').setRequired(false))
+      .addStringOption(o => o.setName('date').setDescription('Start date/time').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('jointournament')
+      .setDescription('Join an open tournament')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+      .addStringOption(o => o.setName('entry_name').setDescription('Optional team/entry name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('tournaments')
+      .setDescription('List active tournaments'),
+
+    new SlashCommandBuilder()
+      .setName('tournamentinfo')
+      .setDescription('Show tournament info')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('closetournament')
+      .setDescription('Admin/staff: close tournament registration')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -1540,6 +1604,84 @@ async function findInventoryItem(guildId, userId, itemInput) {
     [guildId, userId, itemInput, `${itemInput}%`]
   );
   return result.rows[0] || null;
+}
+
+function shortTournamentId(tournamentId) {
+  return String(tournamentId || '').split('-')[0];
+}
+
+async function findTournament(guildId, input) {
+  const result = await pool.query(
+    `SELECT t.*, l.league_name
+     FROM tournaments t
+     LEFT JOIN leagues l ON l.league_id = t.league_id
+     WHERE t.guild_id = $1
+       AND (LOWER(t.tournament_name) = LOWER($2) OR t.id::text LIKE $3)
+     ORDER BY t.created_at DESC
+     LIMIT 1`,
+    [guildId, input, `${input}%`]
+  );
+  return result.rows[0] || null;
+}
+
+async function getTournamentEntries(tournamentId) {
+  const result = await pool.query(
+    `SELECT * FROM tournament_entries WHERE tournament_id = $1 ORDER BY joined_at ASC`,
+    [tournamentId]
+  );
+  return result.rows;
+}
+
+function buildTournamentsEmbed(settings, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Active Tournaments')
+    .setColor(0xED4245)
+    .setFooter({ text: 'GG Sports • Tournaments' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No open or active tournaments found.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const buyIn = Number(row.buy_in) > 0 ? `${settings.currency_icon} ${row.buy_in} ${settings.currency_name}` : 'Free Entry';
+    const maxEntries = row.max_entries ? `${row.entry_count}/${row.max_entries}` : `${row.entry_count}`;
+    const leagueText = row.league_name ? ` • ${row.league_name}` : '';
+    return `**${shortTournamentId(row.id)} • ${row.tournament_name}**${leagueText}${NL}${row.game || 'Game TBD'} • ${row.format} • ${row.status} • Entries: ${maxEntries} • Buy-in: ${buyIn}`;
+  });
+
+  embed.setDescription(lines.join(`${NL}${NL}`));
+  return embed;
+}
+
+function buildTournamentInfoEmbed(settings, tournament, entries) {
+  const NL = String.fromCharCode(10);
+  const buyIn = Number(tournament.buy_in) > 0 ? `${settings.currency_icon} ${tournament.buy_in} ${settings.currency_name}` : 'Free Entry';
+  const prizePool = `${settings.currency_icon} ${tournament.prize_pool || 0} ${settings.currency_name}`;
+  const maxEntries = tournament.max_entries ? `${entries.length}/${tournament.max_entries}` : `${entries.length}`;
+  const entryLines = entries.length
+    ? entries.map((entry, index) => `**${index + 1}.** <@${entry.user_id}>${entry.entry_name ? ` — ${entry.entry_name}` : ''}`).join(NL)
+    : 'No entries yet.';
+
+  return new EmbedBuilder()
+    .setTitle(`${tournament.tournament_name}`)
+    .setColor(0xED4245)
+    .addFields(
+      { name: 'Tournament ID', value: shortTournamentId(tournament.id), inline: true },
+      { name: 'Game', value: tournament.game || 'TBD', inline: true },
+      { name: 'Format', value: tournament.format, inline: true },
+      { name: 'Status', value: tournament.status, inline: true },
+      { name: 'Entries', value: maxEntries, inline: true },
+      { name: 'Buy-in', value: buyIn, inline: true },
+      { name: 'Prize Pool', value: prizePool, inline: true },
+      { name: 'Prize', value: tournament.prize || 'Not listed', inline: true },
+      { name: 'Start Date', value: tournament.starts_at || 'TBD', inline: true },
+      { name: 'Entries', value: entryLines, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Tournament Info' })
+    .setTimestamp();
 }
 
 async function getVoteCounts(offerId) {
@@ -2764,6 +2906,156 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.reply({ content: `Inventory item **${item.item_name}** for ${targetUser} marked as **${status}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'createtournament') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to create tournaments.', ephemeral: true });
+        return;
+      }
+
+      const name = interaction.options.getString('name');
+      const game = interaction.options.getString('game');
+      const format = interaction.options.getString('format') || 'single_elim';
+      const maxEntries = interaction.options.getInteger('max_entries');
+      const buyIn = interaction.options.getInteger('buy_in') ?? 0;
+      const prize = interaction.options.getString('prize');
+      const startsAt = interaction.options.getString('date');
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+
+      const allowedFormats = ['single_elim', 'double_elim', 'round_robin'];
+      if (!allowedFormats.includes(format)) {
+        await interaction.reply({ content: 'Format must be one of: single_elim, double_elim, round_robin.', ephemeral: true });
+        return;
+      }
+
+      if (maxEntries !== null && maxEntries <= 0) {
+        await interaction.reply({ content: 'Max entries must be greater than 0.', ephemeral: true });
+        return;
+      }
+
+      if (buyIn < 0) {
+        await interaction.reply({ content: 'Buy-in cannot be negative.', ephemeral: true });
+        return;
+      }
+
+      if (leagueName && !activeLeague) {
+        await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
+        return;
+      }
+
+      const tournamentId = randomUUID();
+      await pool.query(
+        `INSERT INTO tournaments (id, guild_id, league_id, tournament_name, game, format, max_entries, buy_in, prize, starts_at, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [tournamentId, interaction.guild.id, activeLeague?.league_id || null, name, game, format, maxEntries, buyIn, prize, startsAt, interaction.user.id]
+      );
+
+      await interaction.reply({ content: `Tournament created: **${shortTournamentId(tournamentId)} • ${name}**. Members can join with /jointournament.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'tournaments') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT t.*, l.league_name, COUNT(e.user_id)::int AS entry_count
+         FROM tournaments t
+         LEFT JOIN leagues l ON l.league_id = t.league_id
+         LEFT JOIN tournament_entries e ON e.tournament_id = t.id
+         WHERE t.guild_id = $1 AND t.status IN ('open', 'active')
+         GROUP BY t.id, l.league_name
+         ORDER BY t.created_at DESC
+         LIMIT 15`,
+        [interaction.guild.id]
+      );
+      await interaction.reply({ embeds: [buildTournamentsEmbed(settings, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'tournamentinfo') {
+      if (!interaction.guild) return;
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament. Use /tournaments to see active tournament IDs.', ephemeral: true });
+        return;
+      }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const entries = await getTournamentEntries(tournament.id);
+      await interaction.reply({ embeds: [buildTournamentInfoEmbed(settings, tournament, entries)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'jointournament') {
+      if (!interaction.guild) return;
+      const input = interaction.options.getString('tournament');
+      const entryName = interaction.options.getString('entry_name');
+      const tournament = await findTournament(interaction.guild.id, input);
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament. Use /tournaments to see active tournament IDs.', ephemeral: true });
+        return;
+      }
+
+      if (tournament.status !== 'open') {
+        await interaction.reply({ content: 'That tournament is not open for registration.', ephemeral: true });
+        return;
+      }
+
+      const entries = await getTournamentEntries(tournament.id);
+      if (tournament.max_entries && entries.length >= Number(tournament.max_entries)) {
+        await interaction.reply({ content: 'That tournament is full.', ephemeral: true });
+        return;
+      }
+
+      const existingEntry = entries.find(entry => entry.user_id === interaction.user.id);
+      if (existingEntry) {
+        await interaction.reply({ content: 'You are already registered for that tournament.', ephemeral: true });
+        return;
+      }
+
+      const buyIn = Number(tournament.buy_in || 0);
+      if (buyIn > 0) {
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, buyIn, 'tournament_buy_in', `Buy-in: ${tournament.tournament_name}`, interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: `You need **${settings.currency_icon} ${buyIn} ${settings.currency_name}** to join this tournament.`, ephemeral: true });
+          return;
+        }
+      }
+
+      await pool.query(
+        `INSERT INTO tournament_entries (tournament_id, guild_id, user_id, entry_name, paid_buy_in)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [tournament.id, interaction.guild.id, interaction.user.id, entryName, buyIn]
+      );
+
+      if (buyIn > 0) {
+        await pool.query(`UPDATE tournaments SET prize_pool = prize_pool + $1, updated_at = NOW() WHERE id = $2`, [buyIn, tournament.id]);
+      }
+
+      await interaction.reply({ content: `You joined **${tournament.tournament_name}**${buyIn > 0 ? ` for **${settings.currency_icon} ${buyIn} ${settings.currency_name}**` : ''}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'closetournament') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to close tournaments.', ephemeral: true });
+        return;
+      }
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE tournaments SET status = 'closed', updated_at = NOW() WHERE id = $1`, [tournament.id]);
+      await interaction.reply({ content: `Registration closed for **${tournament.tournament_name}**.`, ephemeral: true });
       return;
     }
 
