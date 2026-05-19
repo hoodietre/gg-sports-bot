@@ -372,9 +372,17 @@ async function initDatabase() {
       item_name TEXT NOT NULL,
       price_paid INTEGER NOT NULL,
       status TEXT NOT NULL DEFAULT 'owned',
-      purchased_at TIMESTAMP NOT NULL DEFAULT NOW()
+      request_note TEXT,
+      fulfillment_note TEXT,
+      fulfilled_by_user_id TEXT,
+      purchased_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
 
   for (const teamName of TEAM_ROLE_NAMES) {
     await pool.query(
@@ -618,6 +626,20 @@ function buildCommands() {
       .setName('removeshopitem')
       .setDescription('Admin/staff: remove/deactivate a shop item')
       .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('useitem')
+      .setDescription('Request to use/redeem an inventory item')
+      .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
+      .addStringOption(o => o.setName('note').setDescription('Optional note for staff').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('redeemitem')
+      .setDescription('Admin/staff: mark a user inventory item as redeemed/fulfilled')
+      .addUserOption(o => o.setName('user').setDescription('User who owns the item').setRequired(true))
+      .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
+      .addStringOption(o => o.setName('status').setDescription('New status: redeemed, used, owned, requested').setRequired(false))
+      .addStringOption(o => o.setName('note').setDescription('Optional fulfillment note').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -1423,11 +1445,24 @@ function buildInventoryEmbed(settings, user, rows) {
 
   const lines = rows.map(row => {
     const date = row.purchased_at ? new Date(row.purchased_at).toLocaleDateString('en-US') : 'Unknown date';
-    return `**${row.item_name}** — ${settings.currency_icon} ${row.price_paid} • ${date}`;
+    const note = row.request_note ? `${NL}Note: ${row.request_note}` : '';
+    return `**${shortItemId(row.id)} • ${row.item_name}** — ${settings.currency_icon} ${row.price_paid} • ${date}${NL}Status: **${row.status}**${note}`;
   });
 
-  embed.setDescription(lines.join(NL));
+  embed.setDescription(lines.join(`${NL}${NL}`));
   return embed;
+}
+
+async function findInventoryItem(guildId, userId, itemInput) {
+  const result = await pool.query(
+    `SELECT * FROM user_inventory
+     WHERE guild_id = $1 AND user_id = $2
+       AND (LOWER(item_name) = LOWER($3) OR id::text LIKE $4)
+     ORDER BY purchased_at DESC
+     LIMIT 1`,
+    [guildId, userId, itemInput, `${itemInput}%`]
+  );
+  return result.rows[0] || null;
 }
 
 async function getVoteCounts(offerId) {
@@ -2582,6 +2617,76 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
       await interaction.reply({ content: `Removed shop item **${item.item_name}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'useitem') {
+      if (!interaction.guild) return;
+      const itemInput = interaction.options.getString('item');
+      const note = interaction.options.getString('note');
+      const item = await findInventoryItem(interaction.guild.id, interaction.user.id, itemInput);
+
+      if (!item) {
+        await interaction.reply({ content: 'Could not find that item in your inventory. Use /inventory to see item IDs.', ephemeral: true });
+        return;
+      }
+
+      if (item.status === 'requested') {
+        await interaction.reply({ content: 'That item is already marked as requested.', ephemeral: true });
+        return;
+      }
+
+      if (item.status === 'redeemed' || item.status === 'used') {
+        await interaction.reply({ content: `That item has already been marked as ${item.status}.`, ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE user_inventory
+         SET status = 'requested', request_note = $1, updated_at = NOW()
+         WHERE id = $2`,
+        [note || null, item.id]
+      );
+
+      await interaction.reply({ content: `Redemption requested for **${item.item_name}**. Staff can fulfill it with /redeemitem.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'redeemitem') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to redeem shop items.', ephemeral: true });
+        return;
+      }
+
+      const targetUser = interaction.options.getUser('user');
+      const itemInput = interaction.options.getString('item');
+      const status = interaction.options.getString('status') || 'redeemed';
+      const note = interaction.options.getString('note');
+
+      const allowedStatuses = ['owned', 'requested', 'redeemed', 'used'];
+      if (!allowedStatuses.includes(status)) {
+        await interaction.reply({ content: 'Status must be one of: owned, requested, redeemed, used.', ephemeral: true });
+        return;
+      }
+
+      const item = await findInventoryItem(interaction.guild.id, targetUser.id, itemInput);
+      if (!item) {
+        await interaction.reply({ content: 'Could not find that item in the user inventory.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE user_inventory
+         SET status = $1,
+             fulfillment_note = $2,
+             fulfilled_by_user_id = $3,
+             updated_at = NOW()
+         WHERE id = $4`,
+        [status, note || null, interaction.user.id, item.id]
+      );
+
+      await interaction.reply({ content: `Inventory item **${item.item_name}** for ${targetUser} marked as **${status}**.`, ephemeral: true });
       return;
     }
 
