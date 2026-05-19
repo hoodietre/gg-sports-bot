@@ -2146,7 +2146,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const settings = await getCurrencySettings(interaction.guild.id);
       const winnerOwner = await findTeamOwnerByRoleId(interaction.guild, winnerRoleId);
-      let payoutText = '';
+      const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+      const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+      const payoutLines = [];
+
+      if (Number(settings.game_played_payout) > 0) {
+        const paidOwners = new Set();
+
+        for (const owner of [homeOwner, awayOwner]) {
+          if (owner && !paidOwners.has(owner.id)) {
+            paidOwners.add(owner.id);
+            await addCurrency(
+              interaction.guild.id,
+              owner.id,
+              Number(settings.game_played_payout),
+              'game_played',
+              `Game played: ${game.away_team_name} @ ${game.home_team_name}`,
+              interaction.user.id
+            );
+            payoutLines.push(`${settings.currency_icon} <@${owner.id}> earned **${settings.game_played_payout} ${settings.currency_name}** for playing.`);
+          }
+        }
+      }
 
       if (winnerOwner && Number(settings.win_payout) > 0) {
         await addCurrency(
@@ -2157,9 +2178,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `Game win: ${winnerName}`,
           interaction.user.id
         );
-        payoutText = `
-${settings.currency_icon} <@${winnerOwner.id}> earned **${settings.win_payout} ${settings.currency_name}**.`;
+        payoutLines.push(`${settings.currency_icon} <@${winnerOwner.id}> earned **${settings.win_payout} ${settings.currency_name}** win bonus.`);
       }
+
+      const payoutText = payoutLines.length ? `${String.fromCharCode(10)}${payoutLines.join(String.fromCharCode(10))}` : '';
 
       await interaction.reply({ content: `Final recorded: **${game.away_team_name} ${awayScore} @ ${game.home_team_name} ${homeScore}**. Winner: **${winnerName}**${payoutText}`, ephemeral: true });
       return;
