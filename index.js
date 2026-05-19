@@ -642,6 +642,23 @@ function buildCommands() {
       .addStringOption(o => o.setName('note').setDescription('Optional fulfillment note').setRequired(false)),
 
     new SlashCommandBuilder()
+      .setName('economy')
+      .setDescription('Show this server’s economy settings and activity'),
+
+    new SlashCommandBuilder()
+      .setName('richest')
+      .setDescription('Show the richest users in the server'),
+
+    new SlashCommandBuilder()
+      .setName('transactions')
+      .setDescription('Show your recent currency transactions or another user’s')
+      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('banklog')
+      .setDescription('Admin/staff: view recent server economy transactions'),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -1450,6 +1467,66 @@ function buildInventoryEmbed(settings, user, rows) {
   });
 
   embed.setDescription(lines.join(`${NL}${NL}`));
+  return embed;
+}
+
+function buildEconomyEmbed(settings, stats) {
+  return new EmbedBuilder()
+    .setTitle(`${settings.currency_icon} Server Economy`)
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Currency', value: `${settings.currency_icon} ${settings.currency_name}`, inline: true },
+      { name: 'Win Bonus', value: `${settings.win_payout}`, inline: true },
+      { name: 'Game Played Payout', value: `${settings.game_played_payout}`, inline: true },
+      { name: 'Total Circulating', value: `${settings.currency_icon} ${stats.totalBalance}`, inline: true },
+      { name: 'Users With Balance', value: `${stats.usersWithBalance}`, inline: true },
+      { name: 'Transactions', value: `${stats.transactionCount}`, inline: true },
+      { name: 'Shop Items Active', value: `${stats.activeShopItems}`, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Economy' })
+    .setTimestamp();
+}
+
+function buildRichestEmbed(settings, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle(`${settings.currency_icon} Richest Users`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Economy Leaderboard' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No balances found yet.');
+    return embed;
+  }
+
+  const lines = rows.map((row, index) => `**${index + 1}.** <@${row.user_id}> — ${settings.currency_icon} ${row.balance} ${settings.currency_name}`);
+  embed.setDescription(lines.join(NL));
+  return embed;
+}
+
+function buildTransactionsEmbed(settings, title, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Transactions' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No transactions found.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const sign = Number(row.amount) >= 0 ? '+' : '';
+    const date = row.created_at ? new Date(row.created_at).toLocaleDateString('en-US') : 'Unknown date';
+    const issuer = row.issued_by_user_id ? ` • By <@${row.issued_by_user_id}>` : '';
+    const reason = row.reason ? ` • ${row.reason}` : '';
+    return `**${sign}${row.amount} ${settings.currency_name}** — ${row.transaction_type}${reason}${issuer} • ${date}`;
+  });
+
+  embed.setDescription(lines.join(NL));
   return embed;
 }
 
@@ -2687,6 +2764,83 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.reply({ content: `Inventory item **${item.item_name}** for ${targetUser} marked as **${status}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'economy') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const totalResult = await pool.query(
+        `SELECT COALESCE(SUM(balance), 0)::int AS total_balance, COUNT(*)::int AS users_with_balance
+         FROM guild_currency_balances
+         WHERE guild_id = $1 AND balance > 0`,
+        [interaction.guild.id]
+      );
+      const txResult = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM currency_transactions WHERE guild_id = $1`,
+        [interaction.guild.id]
+      );
+      const shopResult = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_active = TRUE`,
+        [interaction.guild.id]
+      );
+      await interaction.reply({
+        embeds: [buildEconomyEmbed(settings, {
+          totalBalance: totalResult.rows[0]?.total_balance || 0,
+          usersWithBalance: totalResult.rows[0]?.users_with_balance || 0,
+          transactionCount: txResult.rows[0]?.count || 0,
+          activeShopItems: shopResult.rows[0]?.count || 0,
+        })],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'richest') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT user_id, balance
+         FROM guild_currency_balances
+         WHERE guild_id = $1 AND balance > 0
+         ORDER BY balance DESC, lifetime_earned DESC
+         LIMIT 10`,
+        [interaction.guild.id]
+      );
+      await interaction.reply({ embeds: [buildRichestEmbed(settings, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'transactions') {
+      if (!interaction.guild) return;
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT * FROM currency_transactions
+         WHERE guild_id = $1 AND user_id = $2
+         ORDER BY created_at DESC
+         LIMIT 15`,
+        [interaction.guild.id, targetUser.id]
+      );
+      await interaction.reply({ embeds: [buildTransactionsEmbed(settings, `${targetUser.username}'s Transactions`, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'banklog') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to view the bank log.', ephemeral: true });
+        return;
+      }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT * FROM currency_transactions
+         WHERE guild_id = $1
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [interaction.guild.id]
+      );
+      await interaction.reply({ embeds: [buildTransactionsEmbed(settings, 'Server Bank Log', result.rows)], ephemeral: true });
       return;
     }
 
