@@ -315,6 +315,7 @@ async function initDatabase() {
       currency_name TEXT NOT NULL DEFAULT 'GG Coins',
       currency_icon TEXT NOT NULL DEFAULT '🪙',
       win_payout INTEGER NOT NULL DEFAULT 100,
+      game_played_payout INTEGER NOT NULL DEFAULT 25,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
@@ -331,6 +332,8 @@ async function initDatabase() {
       PRIMARY KEY (guild_id, user_id)
     )
   `);
+
+  await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS game_played_payout INTEGER NOT NULL DEFAULT 25`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS currency_transactions (
@@ -532,7 +535,8 @@ function buildCommands() {
       .setDescription('Configure this server’s currency')
       .addStringOption(o => o.setName('name').setDescription('Currency name, ex: Ghost Gold').setRequired(true))
       .addStringOption(o => o.setName('icon').setDescription('Currency icon/emoji, ex: 🪙').setRequired(false))
-      .addIntegerOption(o => o.setName('win_payout').setDescription('Amount earned for a reported win').setRequired(false)),
+      .addIntegerOption(o => o.setName('win_payout').setDescription('Bonus amount earned for a reported win').setRequired(false))
+      .addIntegerOption(o => o.setName('game_played_payout').setDescription('Amount each owner earns for playing a completed game').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('balance')
@@ -1227,11 +1231,11 @@ async function getCurrencySettings(guildId) {
   );
 
   const result = await pool.query(
-    `SELECT currency_name, currency_icon, win_payout FROM guild_currency_settings WHERE guild_id = $1`,
+    `SELECT currency_name, currency_icon, win_payout, game_played_payout FROM guild_currency_settings WHERE guild_id = $1`,
     [guildId]
   );
 
-  return result.rows[0] || { currency_name: 'GG Coins', currency_icon: '🪙', win_payout: 100 };
+  return result.rows[0] || { currency_name: 'GG Coins', currency_icon: '🪙', win_payout: 100, game_played_payout: 25 };
 }
 
 async function getBalance(guildId, userId) {
@@ -2235,21 +2239,22 @@ ${settings.currency_icon} <@${winnerOwner.id}> earned **${settings.win_payout} $
       const name = interaction.options.getString('name');
       const icon = interaction.options.getString('icon') || '🪙';
       const winPayout = interaction.options.getInteger('win_payout') ?? 100;
+      const gamePlayedPayout = interaction.options.getInteger('game_played_payout') ?? 25;
 
-      if (winPayout < 0) {
-        await interaction.reply({ content: 'Win payout cannot be negative.', ephemeral: true });
+      if (winPayout < 0 || gamePlayedPayout < 0) {
+        await interaction.reply({ content: 'Payout amounts cannot be negative.', ephemeral: true });
         return;
       }
 
       await pool.query(
-        `INSERT INTO guild_currency_settings (guild_id, currency_name, currency_icon, win_payout, updated_at)
-         VALUES ($1, $2, $3, $4, NOW())
+        `INSERT INTO guild_currency_settings (guild_id, currency_name, currency_icon, win_payout, game_played_payout, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
          ON CONFLICT (guild_id)
-         DO UPDATE SET currency_name = $2, currency_icon = $3, win_payout = $4, updated_at = NOW()`,
-        [interaction.guild.id, name, icon, winPayout]
+         DO UPDATE SET currency_name = $2, currency_icon = $3, win_payout = $4, game_played_payout = $5, updated_at = NOW()`,
+        [interaction.guild.id, name, icon, winPayout, gamePlayedPayout]
       );
 
-      await interaction.reply({ content: `Server currency set to **${icon} ${name}**. Win payout: **${winPayout}**.`, ephemeral: true });
+      await interaction.reply({ content: `Server currency set to **${icon} ${name}**. Win bonus: **${winPayout}**. Game played payout: **${gamePlayedPayout}**.`, ephemeral: true });
       return;
     }
 
