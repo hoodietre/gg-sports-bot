@@ -158,11 +158,13 @@ async function initDatabase() {
       denied_channel_id TEXT,
       history_channel_id TEXT,
       standings_channel_id TEXT,
+      tournament_channel_id TEXT,
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS history_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS standings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS tournament_channel_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_team_roles (
@@ -430,6 +432,32 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournament_panels (
+      tournament_id UUID PRIMARY KEY REFERENCES tournaments(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tournament_history (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE SET NULL,
+      tournament_id UUID REFERENCES tournaments(id) ON DELETE SET NULL,
+      tournament_name TEXT NOT NULL,
+      game TEXT,
+      format TEXT,
+      champion_user_id TEXT NOT NULL,
+      prize_paid INTEGER NOT NULL DEFAULT 0,
+      completed_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
@@ -544,6 +572,12 @@ function buildCommands() {
       .setDescription('Set the league standings channel')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
       .addChannelOption(o => o.setName('channel').setDescription('League standings channel').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('league-settournamentchannel')
+      .setDescription('Set the league tournament/bracket channel')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addChannelOption(o => o.setName('channel').setDescription('League tournament channel').setRequired(true)),
 
     new SlashCommandBuilder()
       .setName('setupstandings')
@@ -752,6 +786,11 @@ function buildCommands() {
       .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
 
     new SlashCommandBuilder()
+      .setName('setuptournamentpanel')
+      .setDescription('Create or refresh a permanent tournament bracket panel')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
       .setName('reportmatch')
       .setDescription('Admin/staff: report a tournament match winner')
       .addStringOption(o => o.setName('match_id').setDescription('Match short ID from /tournamentmatches').setRequired(true))
@@ -810,7 +849,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -825,7 +864,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -839,12 +878,12 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
        s.live_channel_id, s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id, s.standings_channel_id
+       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id, s.standings_channel_id, s.tournament_channel_id
      )
      LIMIT 1`,
     [guildId, channelId]
@@ -857,7 +896,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -1747,6 +1786,74 @@ function buildTournamentMatchesEmbed(tournament, matches) {
   return embed;
 }
 
+function buildTournamentPanelEmbed(tournament, matches) {
+  const NL = String.fromCharCode(10);
+  const rounds = new Map();
+
+  for (const match of matches) {
+    const round = Number(match.round_number);
+    if (!rounds.has(round)) rounds.set(round, []);
+    rounds.get(round).push(match);
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${tournament.tournament_name} • Bracket Panel`)
+    .setColor(0xED4245)
+    .addFields(
+      { name: 'Status', value: tournament.status || 'unknown', inline: true },
+      { name: 'Format', value: tournament.format || 'single_elim', inline: true },
+      { name: 'Game', value: tournament.game || 'TBD', inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Live Tournament Bracket' })
+    .setTimestamp();
+
+  if (!matches.length) {
+    embed.setDescription('Bracket has not been generated yet. Use /starttournament when registration is ready.');
+    return embed;
+  }
+
+  for (const [round, roundMatches] of [...rounds.entries()].sort((a, b) => a[0] - b[0])) {
+    const value = roundMatches.map(match => {
+      const p1 = match.player1_user_id ? `<@${match.player1_user_id}>` : 'BYE';
+      const p2 = match.player2_user_id ? `<@${match.player2_user_id}>` : 'BYE';
+      const winner = match.winner_user_id ? ` → <@${match.winner_user_id}>` : '';
+      return `**${shortMatchId(match.id)}** ${p1} vs ${p2} • ${match.status}${winner}`;
+    }).join(NL);
+
+    embed.addFields({ name: `Round ${round}`, value: value || 'No matches', inline: false });
+  }
+
+  return embed;
+}
+
+async function saveTournamentPanel(tournamentId, guildId, channelId, messageId) {
+  await pool.query(
+    `INSERT INTO tournament_panels (tournament_id, guild_id, channel_id, message_id, updated_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (tournament_id)
+     DO UPDATE SET channel_id = $3, message_id = $4, updated_at = NOW()`,
+    [tournamentId, guildId, channelId, messageId]
+  );
+}
+
+async function updateTournamentPanel(guild, tournament) {
+  const panelResult = await pool.query(
+    `SELECT channel_id, message_id FROM tournament_panels WHERE tournament_id = $1`,
+    [tournament.id]
+  );
+
+  if (!panelResult.rows.length) return;
+
+  const channel = await guild.channels.fetch(panelResult.rows[0].channel_id).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+
+  const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
+  if (!message) return;
+
+  const matches = await getTournamentMatches(tournament.id);
+  await message.edit({ embeds: [buildTournamentPanelEmbed(tournament, matches)] });
+}
+
 async function getTournamentMatches(tournamentId) {
   const result = await pool.query(
     `SELECT * FROM tournament_matches WHERE tournament_id = $1 ORDER BY round_number ASC, match_number ASC`,
@@ -2228,6 +2335,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         await pool.query(`UPDATE league_settings SET standings_channel_id = $1, updated_at = NOW() WHERE league_id = $2`, [channel.id, league.league_id]);
         await interaction.reply({ content: `Standings channel for **${league.league_name}** set to ${channel}.`, ephemeral: true });
+        return;
+      }
+
+      if (interaction.commandName === 'league-settournamentchannel') {
+        const channel = interaction.options.getChannel('channel');
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that tournament channel.', ephemeral: true });
+          return;
+        }
+        await pool.query(`UPDATE league_settings SET tournament_channel_id = $1, updated_at = NOW() WHERE league_id = $2`, [channel.id, league.league_id]);
+        await interaction.reply({ content: `Tournament channel for **${league.league_name}** set to ${channel}.`, ephemeral: true });
         return;
       }
 
@@ -3223,6 +3343,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await pool.query(`UPDATE tournaments SET status = 'active', updated_at = NOW() WHERE id = $1`, [tournament.id]);
 
       const matches = await getTournamentMatches(tournament.id);
+      await updateTournamentPanel(interaction.guild, { ...tournament, status: 'active' });
       await interaction.reply({ embeds: [buildTournamentMatchesEmbed({ ...tournament, status: 'active' }, matches)], ephemeral: true });
       return;
     }
@@ -3237,6 +3358,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const matches = await getTournamentMatches(tournament.id);
       await interaction.reply({ embeds: [buildTournamentMatchesEmbed(tournament, matches)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'setuptournamentpanel') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set up tournament panels.', ephemeral: true });
+        return;
+      }
+
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+
+      let channel = null;
+      if (tournament.league_id) {
+        const activeLeague = await getLeagueById(tournament.league_id);
+        if (activeLeague?.tournament_channel_id) {
+          channel = await interaction.guild.channels.fetch(activeLeague.tournament_channel_id).catch(() => null);
+        }
+      }
+
+      if (!channel) {
+        channel = interaction.channel;
+      }
+
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I cannot post in the selected tournament channel. Check my permissions.', ephemeral: true });
+        return;
+      }
+
+      const matches = await getTournamentMatches(tournament.id);
+      const message = await channel.send({ embeds: [buildTournamentPanelEmbed(tournament, matches)] });
+      await saveTournamentPanel(tournament.id, interaction.guild.id, channel.id, message.id);
+
+      await interaction.reply({ content: `Tournament panel created for **${tournament.tournament_name}** in ${channel}.`, ephemeral: true });
       return;
     }
 
@@ -3278,6 +3440,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const currentRoundComplete = currentRoundMatches.every(m => m.status === 'final' || m.status === 'bye' || m.winner_user_id);
 
       if (!currentRoundComplete) {
+        const refreshedTournament = await findTournament(interaction.guild.id, match.tournament_name);
+        if (refreshedTournament) await updateTournamentPanel(interaction.guild, refreshedTournament);
         await interaction.reply({ content: `Match reported. Winner: ${winner}.`, ephemeral: true });
         return;
       }
@@ -3296,11 +3460,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
           payoutText = ` ${settings.currency_icon} <@${winners[0].user_id}> earned the prize pool of **${match.prize_pool} ${settings.currency_name}**.`;
         }
 
+        const completedTournament = await findTournament(interaction.guild.id, match.tournament_name);
+        if (completedTournament) {
+          await pool.query(
+            `INSERT INTO tournament_history (id, guild_id, league_id, tournament_id, tournament_name, game, format, champion_user_id, prize_paid)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [randomUUID(), interaction.guild.id, completedTournament.league_id || null, match.tournament_id, match.tournament_name, completedTournament.game, completedTournament.format, winners[0].user_id, Number(match.prize_pool || 0)]
+          );
+          await updateTournamentPanel(interaction.guild, { ...completedTournament, status: 'completed' });
+        }
+
         await interaction.reply({ content: `Tournament complete. Champion: <@${winners[0].user_id}>.${payoutText}`, ephemeral: true });
         return;
       }
 
       await createTournamentRound({ id: match.tournament_id, guild_id: interaction.guild.id }, winners, Number(match.round_number) + 1);
+      const refreshedTournament = await findTournament(interaction.guild.id, match.tournament_name);
+      if (refreshedTournament) await updateTournamentPanel(interaction.guild, refreshedTournament);
       await interaction.reply({ content: `Round ${match.round_number} complete. Round ${Number(match.round_number) + 1} has been generated.`, ephemeral: true });
       return;
     }
