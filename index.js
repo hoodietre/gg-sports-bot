@@ -382,6 +382,14 @@ async function initDatabase() {
     )
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS guild_tournament_settings (
+      guild_id TEXT PRIMARY KEY,
+      tournament_channel_id TEXT,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS tournaments (
       id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL,
@@ -578,6 +586,11 @@ function buildCommands() {
       .setDescription('Set the league tournament/bracket channel')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
       .addChannelOption(o => o.setName('channel').setDescription('League tournament channel').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('settournamentchannel')
+      .setDescription('Set the default server tournament/bracket channel')
+      .addChannelOption(o => o.setName('channel').setDescription('Server tournament channel').setRequired(true)),
 
     new SlashCommandBuilder()
       .setName('setupstandings')
@@ -1915,6 +1928,14 @@ async function createTournamentRound(tournament, entries, roundNumber) {
   return matches;
 }
 
+async function getGuildTournamentChannelId(guildId) {
+  const result = await pool.query(
+    `SELECT tournament_channel_id FROM guild_tournament_settings WHERE guild_id = $1`,
+    [guildId]
+  );
+  return result.rows[0]?.tournament_channel_id || null;
+}
+
 async function getVoteCounts(offerId) {
   const approveResult = await pool.query(`SELECT COUNT(*)::int AS count FROM trade_offer_votes WHERE offer_id = $1 AND vote = 'approve'`, [offerId]);
   const denyResult = await pool.query(`SELECT COUNT(*)::int AS count FROM trade_offer_votes WHERE offer_id = $1 AND vote = 'deny'`, [offerId]);
@@ -3153,6 +3174,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'settournamentchannel') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set the server tournament channel.', ephemeral: true });
+        return;
+      }
+
+      const channel = interaction.options.getChannel('channel');
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that tournament channel.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO guild_tournament_settings (guild_id, tournament_channel_id, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (guild_id)
+         DO UPDATE SET tournament_channel_id = $2, updated_at = NOW()`,
+        [interaction.guild.id, channel.id]
+      );
+
+      await interaction.reply({ content: `Default server tournament channel set to ${channel}.`, ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'createtournament') {
       if (!interaction.guild) return;
       if (!(await userCanUseLeagueSetup(interaction, league))) {
@@ -3380,6 +3429,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const activeLeague = await getLeagueById(tournament.league_id);
         if (activeLeague?.tournament_channel_id) {
           channel = await interaction.guild.channels.fetch(activeLeague.tournament_channel_id).catch(() => null);
+        }
+      }
+
+      if (!channel) {
+        const guildTournamentChannelId = await getGuildTournamentChannelId(interaction.guild.id);
+        if (guildTournamentChannelId) {
+          channel = await interaction.guild.channels.fetch(guildTournamentChannelId).catch(() => null);
         }
       }
 
