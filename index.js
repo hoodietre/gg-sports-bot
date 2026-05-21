@@ -606,6 +606,31 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sportsbook_parlays (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      combined_decimal NUMERIC NOT NULL,
+      potential_payout INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      settled_at TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sportsbook_parlay_legs (
+      id UUID PRIMARY KEY,
+      parlay_id UUID REFERENCES sportsbook_parlays(id) ON DELETE CASCADE,
+      sportsbook_game_id UUID REFERENCES sportsbook_games(id) ON DELETE CASCADE,
+      side TEXT NOT NULL,
+      odds INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open'
+    )
+  `);
+
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS assigned_staff_user_id TEXT`);
 
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
@@ -1155,6 +1180,19 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('bettingleaderboard')
       .setDescription('View sportsbook leaderboard and profit leaders'),
+
+    new SlashCommandBuilder()
+      .setName('createparlay')
+      .setDescription('Create a 2-4 leg sportsbook parlay')
+      .addIntegerOption(o => o.setName('amount').setDescription('Stake amount').setRequired(true))
+      .addStringOption(o => o.setName('leg1_game').setDescription('Leg 1 sportsbook game ID').setRequired(true))
+      .addStringOption(o => o.setName('leg1_side').setDescription('home or away').setRequired(true))
+      .addStringOption(o => o.setName('leg2_game').setDescription('Leg 2 sportsbook game ID').setRequired(true))
+      .addStringOption(o => o.setName('leg2_side').setDescription('home or away').setRequired(true))
+      .addStringOption(o => o.setName('leg3_game').setDescription('Optional leg 3 sportsbook game ID').setRequired(false))
+      .addStringOption(o => o.setName('leg3_side').setDescription('home or away').setRequired(false))
+      .addStringOption(o => o.setName('leg4_game').setDescription('Optional leg 4 sportsbook game ID').setRequired(false))
+      .addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -4152,6 +4190,87 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'createparlay') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const amount = interaction.options.getInteger('amount');
+
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.reply({ content: 'Parlay amount must be greater than 0.', ephemeral: true });
+        return;
+      }
+
+      const legInputs = [
+        { game: interaction.options.getString('leg1_game'), side: interaction.options.getString('leg1_side') },
+        { game: interaction.options.getString('leg2_game'), side: interaction.options.getString('leg2_side') },
+        { game: interaction.options.getString('leg3_game'), side: interaction.options.getString('leg3_side') },
+        { game: interaction.options.getString('leg4_game'), side: interaction.options.getString('leg4_side') },
+      ].filter(leg => leg.game || leg.side);
+
+      if (legInputs.length < 2 || legInputs.length > 4) {
+        await interaction.reply({ content: 'Parlays must have 2 to 4 legs.', ephemeral: true });
+        return;
+      }
+
+      if (legInputs.some(leg => !leg.game || !['home', 'away'].includes(leg.side))) {
+        await interaction.reply({ content: 'Each parlay leg needs a game ID and side must be home or away.', ephemeral: true });
+        return;
+      }
+
+      const usedGameIds = new Set();
+      const legs = [];
+      for (const legInput of legInputs) {
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, legInput.game);
+        if (!sportsbookGame) {
+          await interaction.reply({ content: 'Could not find sportsbook game **' + legInput.game + '**.', ephemeral: true });
+          return;
+        }
+        if (sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'Sportsbook game **' + sportsbookGame.game_label + '** is not open for betting.', ephemeral: true });
+          return;
+        }
+        if (usedGameIds.has(sportsbookGame.id)) {
+          await interaction.reply({ content: 'You cannot use the same game twice in one parlay.', ephemeral: true });
+          return;
+        }
+        usedGameIds.add(sportsbookGame.id);
+        const odds = legInput.side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
+        legs.push({ sportsbookGame, side: legInput.side, odds });
+      }
+
+      const payoutData = calculateParlayPayout(amount, legs.map(leg => leg.odds));
+      const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_parlay_bet', 'Parlay bet', interaction.user.id);
+      if (!removed) {
+        await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to create that parlay.', ephemeral: true });
+        return;
+      }
+
+      const parlayId = randomUUID();
+      await pool.query(
+        `INSERT INTO sportsbook_parlays (id, guild_id, user_id, amount, combined_decimal, potential_payout)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [parlayId, interaction.guild.id, interaction.user.id, amount, payoutData.combinedDecimal, payoutData.payout]
+      );
+
+      for (const leg of legs) {
+        await pool.query(
+          `INSERT INTO sportsbook_parlay_legs (id, parlay_id, sportsbook_game_id, side, odds)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [randomUUID(), parlayId, leg.sportsbookGame.id, leg.side, leg.odds]
+        );
+      }
+
+      const NL = String.fromCharCode(10);
+      const legText = legs.map((leg, index) => {
+        const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
+        return (index + 1) + '. ' + sideLabel + ' ML ' + leg.odds + ' — ' + leg.sportsbookGame.game_label;
+      }).join(NL);
+
+      await updateSportsbookPanel(interaction.guild);
+      await interaction.reply({ content: 'Parlay created: **' + shortSportsbookId(parlayId) + '**' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**', ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'createsportsbookgame') {
       if (!interaction.guild) return;
       if (!(await userCanUseLeagueSetup(interaction, league))) {
@@ -4315,9 +4434,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         [winner, sportsbookGame.id]
       );
 
+      const parlayResult = await settleParlaysForSportsbookGame(interaction.guild.id, sportsbookGame.id, winner, interaction.user.id);
+
       const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
       await updateSportsbookPanel(interaction.guild);
-      await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**.', ephemeral: true });
+      await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**. Parlays settled: **' + parlayResult.settledCount + '**. Parlay paid: **' + parlayResult.parlayPaid + '**.', ephemeral: true });
       return;
     }
 
@@ -6443,6 +6564,57 @@ function calculateAmericanOddsPayout(amount, odds) {
   if (!Number.isInteger(stake) || stake <= 0 || !Number.isInteger(americanOdds) || americanOdds === 0) return 0;
   if (americanOdds > 0) return stake + Math.floor((stake * americanOdds) / 100);
   return stake + Math.floor((stake * 100) / Math.abs(americanOdds));
+}
+
+function americanOddsToDecimal(odds) {
+  const americanOdds = Number(odds);
+  if (americanOdds > 0) return 1 + americanOdds / 100;
+  return 1 + 100 / Math.abs(americanOdds);
+}
+
+function calculateParlayPayout(amount, oddsList) {
+  const stake = Number(amount);
+  if (!Number.isInteger(stake) || stake <= 0 || !oddsList.length) return { combinedDecimal: 0, payout: 0 };
+  const combinedDecimal = oddsList.reduce((total, odds) => total * americanOddsToDecimal(odds), 1);
+  return { combinedDecimal, payout: Math.floor(stake * combinedDecimal) };
+}
+
+async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerSide, issuedByUserId) {
+  const parlayResult = await pool.query(
+    `SELECT DISTINCT p.*
+     FROM sportsbook_parlays p
+     JOIN sportsbook_parlay_legs l ON l.parlay_id = p.id
+     WHERE p.guild_id = $1 AND l.sportsbook_game_id = $2 AND p.status = 'open'`,
+    [guildId, sportsbookGameId]
+  );
+
+  let settledCount = 0;
+  let parlayPaid = 0;
+
+  for (const parlay of parlayResult.rows) {
+    await pool.query(
+      `UPDATE sportsbook_parlay_legs
+       SET status = CASE WHEN side = $1 THEN 'won' ELSE 'lost' END
+       WHERE parlay_id = $2 AND sportsbook_game_id = $3`,
+      [winnerSide, parlay.id, sportsbookGameId]
+    );
+
+    const legs = await pool.query(`SELECT * FROM sportsbook_parlay_legs WHERE parlay_id = $1`, [parlay.id]);
+    const anyLost = legs.rows.some(leg => leg.status === 'lost');
+    const allSettled = legs.rows.every(leg => leg.status === 'won' || leg.status === 'lost');
+
+    if (anyLost) {
+      await pool.query(`UPDATE sportsbook_parlays SET status = 'lost', settled_at = NOW() WHERE id = $1`, [parlay.id]);
+      settledCount += 1;
+    } else if (allSettled) {
+      await pool.query(`UPDATE sportsbook_parlays SET status = 'won', settled_at = NOW() WHERE id = $1`, [parlay.id]);
+      await addCurrency(guildId, parlay.user_id, Number(parlay.potential_payout), 'sportsbook_parlay_win', 'Won parlay', issuedByUserId);
+      settledCount += 1;
+      parlayPaid += Number(parlay.potential_payout);
+    }
+  }
+
+  return { settledCount, parlayPaid };
 }
 
 function buildSportsbookBetBoardButtons(rows) {
