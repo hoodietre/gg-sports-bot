@@ -569,11 +569,16 @@ async function initDatabase() {
       away_odds INTEGER NOT NULL DEFAULT -110,
       status TEXT NOT NULL DEFAULT 'open',
       winner_side TEXT,
+      max_bet INTEGER,
+      max_payout INTEGER,
       created_by_user_id TEXT NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       settled_at TIMESTAMP
     )
   `);
+
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS max_bet INTEGER`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS max_payout INTEGER`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sportsbook_bets (
@@ -1100,6 +1105,8 @@ function buildCommands() {
       .addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true))
       .addIntegerOption(o => o.setName('home_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
       .addIntegerOption(o => o.setName('away_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
+      .addIntegerOption(o => o.setName('max_bet').setDescription('Optional max bet amount').setRequired(false))
+      .addIntegerOption(o => o.setName('max_payout').setDescription('Optional max payout per bet').setRequired(false))
       .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
 
     new SlashCommandBuilder()
@@ -1122,6 +1129,18 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('mybets')
       .setDescription('View your recent sportsbook bets'),
+
+    new SlashCommandBuilder()
+      .setName('sportsbookline')
+      .setDescription('Staff: open, close, or reopen a sportsbook line')
+      .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+      .addStringOption(o => o.setName('action').setDescription('open or closed').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('cancelsportsbookgame')
+      .setDescription('Staff: cancel a sportsbook game and refund open bets')
+      .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Optional cancellation reason').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('setupsportsbookpanel')
