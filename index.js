@@ -1011,6 +1011,11 @@ function buildCommands() {
       .addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)),
 
     new SlashCommandBuilder()
+      .setName('setupsupportpanel')
+      .setDescription('Staff: create a user-facing support ticket panel')
+      .addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false)),
+
+    new SlashCommandBuilder()
       .setName('lagoutrequest')
       .setDescription('Open a lag-out review ticket')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -2841,6 +2846,37 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (interaction.customId.startsWith('support_panel_open:')) {
+        if (!interaction.guild) return;
+
+        const panelType = interaction.customId.split(':')[1] || 'support';
+        const ticketType = panelType === 'dispute' ? 'dispute' : 'support';
+        const subjectMap = {
+          support: 'Support Request',
+          dispute: 'Dispute Review',
+          game: 'Game Issue Request',
+          shop: 'Shop / Redemption Help',
+        };
+        const descriptionMap = {
+          support: 'Opened from the support panel. Please explain what you need help with in this thread.',
+          dispute: 'Opened from the support panel. Please explain the dispute and upload any proof/screenshots in this thread.',
+          game: 'Opened from the support panel. Please include league, teams, game ID if available, score/time remaining, and upload proof/screenshots.',
+          shop: 'Opened from the support panel. Please explain the shop, inventory, redemption, or reward issue.',
+        };
+
+        interaction.options = {
+          getString(name) {
+            if (name === 'subject') return subjectMap[panelType] || 'Support Request';
+            if (name === 'description') return descriptionMap[panelType] || 'Opened from the support panel.';
+            if (name === 'league') return null;
+            return null;
+          }
+        };
+
+        await openSupportTicket(interaction, panelType === 'game' ? 'gamerequest' : ticketType);
+        return;
+      }
+
       if (interaction.customId.startsWith('ticket_dashboard_filter:')) {
         if (!interaction.guild) return;
         if (!(await userCanUseLeagueSetup(interaction, await resolveLeague(interaction)))) {
@@ -3446,6 +3482,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await updateTicketPanel(interaction.guild);
       await interaction.reply({ content: 'Ticket closed. Transcript saved. This thread will be archived.' + (closeReason ? ' Reason: ' + closeReason : ''), ephemeral: false });
       await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
+      return;
+    }
+
+    if (interaction.commandName === 'setupsupportpanel') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set up the support panel.', ephemeral: true });
+        return;
+      }
+
+      const channel = interaction.options.getChannel('channel') || interaction.channel;
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that support panel channel.', ephemeral: true });
+        return;
+      }
+
+      await channel.send({ embeds: [buildSupportPanelEmbed()], components: [buildSupportPanelButtons()] });
+      await interaction.reply({ content: 'Support panel created in ' + channel.toString() + '.', ephemeral: true });
       return;
     }
 
@@ -5655,6 +5712,42 @@ async function buildGameIssueLogEmbed(rows, leagueName = null, decision = null) 
 
   embed.setDescription(lines.join(NL).slice(0, 4000));
   return embed;
+}
+
+function buildSupportPanelEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🎫 GG Sports Support Center')
+    .setColor(0xffcc00)
+    .setDescription('Need help? Choose the button that best matches your issue. A ticket thread will be created for you and staff will be notified.')
+    .addFields(
+      { name: 'Support Ticket', value: 'General help, questions, or setup issues.', inline: false },
+      { name: 'Dispute', value: 'Rule issues, trade concerns, league conflicts, or staff review needs.', inline: false },
+      { name: 'Game Issue', value: 'Lag out, quit, disconnect, reset, or game result review.', inline: false },
+      { name: 'Shop Help', value: 'Currency shop, inventory, redemption, or reward fulfillment help.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Support Center' })
+    .setTimestamp();
+}
+
+function buildSupportPanelButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('support_panel_open:support')
+      .setLabel('Support Ticket')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('support_panel_open:dispute')
+      .setLabel('Dispute')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId('support_panel_open:game')
+      .setLabel('Game Issue')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId('support_panel_open:shop')
+      .setLabel('Shop Help')
+      .setStyle(ButtonStyle.Secondary)
+  );
 }
 
 function buildTicketDashboardButtons() {
