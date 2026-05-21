@@ -2841,6 +2841,59 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (interaction.customId.startsWith('ticket_dashboard_filter:')) {
+        if (!interaction.guild) return;
+        if (!(await userCanUseLeagueSetup(interaction, await resolveLeague(interaction)))) {
+          await interaction.reply({ content: 'Only staff/admins can use the ticket dashboard filters.', ephemeral: true });
+          return;
+        }
+
+        const filter = interaction.customId.split(':')[1] || 'open';
+        await interaction.update({
+          embeds: [await buildTicketDashboardEmbed(interaction.guild.id, filter)],
+          components: [buildTicketDashboardButtons()],
+        });
+        return;
+      }
+
+      if (interaction.customId.startsWith('ticket_quick_claim:') || interaction.customId.startsWith('ticket_quick_reviewing:') || interaction.customId.startsWith('ticket_quick_resolved:')) {
+        if (!interaction.guild) return;
+
+        const [action, ticketId] = interaction.customId.split(':');
+        const ticketResult = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id = $2 LIMIT 1`,
+          [interaction.guild.id, ticketId]
+        );
+
+        if (!ticketResult.rows.length) {
+          await interaction.reply({ content: 'Could not find that ticket.', ephemeral: true });
+          return;
+        }
+
+        const ticket = ticketResult.rows[0];
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        const staffMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const isStaff = staffMember ? await memberHasStaff(staffMember, activeLeague) : false;
+
+        if (!isStaff) {
+          await interaction.reply({ content: 'Only staff/admins can use quick ticket actions.', ephemeral: true });
+          return;
+        }
+
+        if (action === 'ticket_quick_claim') {
+          await pool.query(`UPDATE support_tickets SET assigned_staff_user_id = $1 WHERE id = $2`, [interaction.user.id, ticket.id]);
+          await updateTicketPanel(interaction.guild);
+          await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** claimed by <@' + interaction.user.id + '>.', ephemeral: true });
+          return;
+        }
+
+        const newStatus = action === 'ticket_quick_reviewing' ? 'reviewing' : 'resolved';
+        await pool.query(`UPDATE support_tickets SET status = $1 WHERE id = $2`, [newStatus, ticket.id]);
+        await updateTicketPanel(interaction.guild);
+        await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** marked **' + newStatus + '**.', ephemeral: true });
+        return;
+      }
+
       if (interaction.customId.startsWith('offer_trade_panel_button')) {
         const [, leagueId] = interaction.customId.split(':');
         const league = leagueId && leagueId !== 'legacy' ? await getLeagueById(leagueId) : await resolveLeague(interaction);
@@ -3412,7 +3465,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const message = await channel.send({ embeds: [await buildTicketDashboardEmbed(interaction.guild.id)] });
+      const message = await channel.send({ embeds: [await buildTicketDashboardEmbed(interaction.guild.id)], components: [buildTicketDashboardButtons()] });
       await saveTicketPanel(interaction.guild.id, channel.id, message.id);
       await interaction.reply({ content: 'Ticket dashboard panel created in ' + channel.toString() + '.', ephemeral: true });
       return;
@@ -5604,7 +5657,56 @@ async function buildGameIssueLogEmbed(rows, leagueName = null, decision = null) 
   return embed;
 }
 
-async function buildTicketDashboardEmbed(guildId) {
+function buildTicketDashboardButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_dashboard_filter:open')
+      .setLabel('Open')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('ticket_dashboard_filter:urgent')
+      .setLabel('Urgent/High')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId('ticket_dashboard_filter:unclaimed')
+      .setLabel('Unclaimed')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('ticket_dashboard_filter:reviewing')
+      .setLabel('Reviewing')
+      .setStyle(ButtonStyle.Success)
+  );
+}
+
+function buildTicketInfoButtons(ticket) {
+  const row = new ActionRowBuilder();
+
+  if (ticket.status !== 'closed' && !ticket.assigned_staff_user_id) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('ticket_quick_claim:' + ticket.id)
+        .setLabel('Claim Ticket')
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+
+  if (ticket.status !== 'closed') {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('ticket_quick_reviewing:' + ticket.id)
+        .setLabel('Mark Reviewing')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ticket_quick_resolved:' + ticket.id)
+        .setLabel('Mark Resolved')
+        .setStyle(ButtonStyle.Success)
+    );
+  }
+
+  return row.components.length ? row : null;
+}
+
+async function buildTicketDashboardEmbed(guildId, filter = 'open') {
   const summary = await pool.query(
     `SELECT
        COUNT(*) FILTER (WHERE status != 'closed')::int AS active_count,
@@ -5617,13 +5719,40 @@ async function buildTicketDashboardEmbed(guildId) {
     [guildId]
   );
 
-  const latest = await pool.query(
-    `SELECT * FROM support_tickets
-     WHERE guild_id = $1 AND status != 'closed'
-     ORDER BY created_at DESC
-     LIMIT 8`,
-    [guildId]
-  );
+  let latest;
+  if (filter === 'urgent') {
+    latest = await pool.query(
+      `SELECT * FROM support_tickets
+       WHERE guild_id = $1 AND status != 'closed' AND priority IN ('high', 'urgent')
+       ORDER BY created_at DESC
+       LIMIT 8`,
+      [guildId]
+    );
+  } else if (filter === 'unclaimed') {
+    latest = await pool.query(
+      `SELECT * FROM support_tickets
+       WHERE guild_id = $1 AND status != 'closed' AND assigned_staff_user_id IS NULL
+       ORDER BY created_at DESC
+       LIMIT 8`,
+      [guildId]
+    );
+  } else if (filter === 'reviewing') {
+    latest = await pool.query(
+      `SELECT * FROM support_tickets
+       WHERE guild_id = $1 AND status = 'reviewing'
+       ORDER BY created_at DESC
+       LIMIT 8`,
+      [guildId]
+    );
+  } else {
+    latest = await pool.query(
+      `SELECT * FROM support_tickets
+       WHERE guild_id = $1 AND status != 'closed'
+       ORDER BY created_at DESC
+       LIMIT 8`,
+      [guildId]
+    );
+  }
 
   const row = summary.rows[0] || {};
   const NL = String.fromCharCode(10);
@@ -5643,6 +5772,7 @@ async function buildTicketDashboardEmbed(guildId) {
       { name: 'High/Urgent', value: String(row.high_priority_count || 0), inline: true },
       { name: 'Claimed', value: String(row.claimed_count || 0), inline: true },
       { name: 'Unclaimed', value: String(row.unclaimed_count || 0), inline: true },
+      { name: 'Current View', value: filter, inline: true },
       { name: 'Latest Active Tickets', value: latestText, inline: false }
     )
     .setFooter({ text: 'GG Sports • Live Ticket Dashboard' })
@@ -5670,7 +5800,7 @@ async function updateTicketPanel(guild) {
   if (!channel || !channel.isTextBased()) return;
   const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
   if (!message) return;
-  await message.edit({ embeds: [await buildTicketDashboardEmbed(guild.id)] }).catch(() => null);
+  await message.edit({ embeds: [await buildTicketDashboardEmbed(guild.id)], components: [buildTicketDashboardButtons()] }).catch(() => null);
 }
 
 async function applyApprovedGameIssue(ticket, reviewerUserId) {
