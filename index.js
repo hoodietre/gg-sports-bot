@@ -2715,6 +2715,44 @@ client.on(Events.MessageCreate, async (message) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isModalSubmit()) {
+      if (interaction.customId.startsWith('sportsbook_bet_modal:')) {
+        if (!interaction.guild) return;
+        const [, gameId, side] = interaction.customId.split(':');
+        const amountText = interaction.fields.getTextInputValue('sportsbook_bet_amount');
+        const amount = Number.parseInt(amountText, 10);
+        const settings = await getCurrencySettings(interaction.guild.id);
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'That sportsbook game is no longer open.', ephemeral: true });
+          return;
+        }
+
+        if (!Number.isInteger(amount) || amount <= 0) {
+          await interaction.reply({ content: 'Bet amount must be a whole number greater than 0.', ephemeral: true });
+          return;
+        }
+
+        const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
+        const payout = calculateAmericanOddsPayout(amount, odds);
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
+
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to place that bet.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO sportsbook_bets (id, guild_id, sportsbook_game_id, user_id, side, amount, odds, potential_payout)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
+        );
+
+        await updateSportsbookPanel(interaction.guild);
+        const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+        await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
+        return;
+      }
       if (interaction.customId.startsWith('tradeblock_modal:')) {
         if (!interaction.guild) return;
         const [, encodedTeam, leagueId = 'legacy'] = interaction.customId.split(':');
@@ -2932,6 +2970,61 @@ client.on(Events.InteractionCreate, async (interaction) => {
             allowedMentions: { users: [interaction.user.id], roles: [] },
           }).catch(() => null);
         }
+        return;
+      }
+
+      if (interaction.customId.startsWith('sportsbook_pick_game:')) {
+        if (!interaction.guild) return;
+        const gameId = interaction.customId.split(':')[1];
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'That sportsbook game is no longer open.', ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({
+          content: 'Choose your side for **' + sportsbookGame.game_label + '**.',
+          components: [buildSportsbookSideButtons(sportsbookGame)],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (interaction.customId.startsWith('sportsbook_pick_side:')) {
+        if (!interaction.guild) return;
+        const [, gameId, side] = interaction.customId.split(':');
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'That sportsbook game is no longer open.', ephemeral: true });
+          return;
+        }
+
+        if (!['home', 'away'].includes(side)) {
+          await interaction.reply({ content: 'Invalid bet side.', ephemeral: true });
+          return;
+        }
+
+        const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+        const odds = side === 'home' ? sportsbookGame.home_odds : sportsbookGame.away_odds;
+        const modal = new ModalBuilder()
+          .setCustomId('sportsbook_bet_modal:' + sportsbookGame.id + ':' + side)
+          .setTitle('Bet ' + sideLabel + ' ML ' + odds);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('sportsbook_bet_amount')
+              .setLabel('Bet amount')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+              .setPlaceholder('Example: 100')
+              .setMaxLength(10)
+          )
+        );
+
+        await interaction.showModal(modal);
         return;
       }
 
@@ -3978,7 +4071,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const message = await channel.send({ embeds: [await buildSportsbookPanelEmbed(interaction.guild.id)] });
+      const openSportsbookResult = await pool.query(
+        `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
+        [interaction.guild.id]
+      );
+      const message = await channel.send({ embeds: [await buildSportsbookPanelEmbed(interaction.guild.id)], components: buildSportsbookBetBoardButtons(openSportsbookResult.rows) });
       await saveSportsbookPanel(interaction.guild.id, channel.id, message.id);
       await interaction.reply({ content: 'Sportsbook board created in ' + channel.toString() + '.', ephemeral: true });
       return;
@@ -6244,6 +6341,35 @@ function calculateAmericanOddsPayout(amount, odds) {
   return stake + Math.floor((stake * 100) / Math.abs(americanOdds));
 }
 
+function buildSportsbookBetBoardButtons(rows) {
+  const openRows = rows.slice(0, 5);
+  if (!openRows.length) return [];
+
+  const row = new ActionRowBuilder();
+  for (const game of openRows) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('sportsbook_pick_game:' + game.id)
+        .setLabel(shortSportsbookId(game.id))
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+  return [row];
+}
+
+function buildSportsbookSideButtons(game) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('sportsbook_pick_side:' + game.id + ':away')
+      .setLabel(game.away_label + ' ML ' + game.away_odds)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('sportsbook_pick_side:' + game.id + ':home')
+      .setLabel(game.home_label + ' ML ' + game.home_odds)
+      .setStyle(ButtonStyle.Success)
+  );
+}
+
 function buildSportsbookEmbed(settings, rows) {
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
@@ -6337,7 +6463,11 @@ async function updateSportsbookPanel(guild) {
   if (!channel || !channel.isTextBased()) return;
   const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
   if (!message) return;
-  await message.edit({ embeds: [await buildSportsbookPanelEmbed(guild.id)] }).catch(() => null);
+  const openResult = await pool.query(
+    `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
+    [guild.id]
+  );
+  await message.edit({ embeds: [await buildSportsbookPanelEmbed(guild.id)], components: buildSportsbookBetBoardButtons(openResult.rows) }).catch(() => null);
 }
 
 function buildMyBetsEmbed(settings, rows) {
