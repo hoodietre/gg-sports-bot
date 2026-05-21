@@ -619,7 +619,7 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS user_recognition (
       guild_id TEXT NOT NULL,
       user_id TEXT NOT NULL,
-      recognition_points INTEGER NOT NULL DEFAULT 0,
+      activity_points INTEGER NOT NULL DEFAULT 0,
       legacy_score INTEGER NOT NULL DEFAULT 0,
       championships INTEGER NOT NULL DEFAULT 0,
       tournament_titles INTEGER NOT NULL DEFAULT 0,
@@ -634,6 +634,9 @@ async function initDatabase() {
       PRIMARY KEY (guild_id, user_id)
     )
   `);
+
+  await pool.query(`ALTER TABLE user_recognition ADD COLUMN IF NOT EXISTS activity_points INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`UPDATE user_recognition SET activity_points = recognition_points WHERE activity_points = 0 AND recognition_points IS NOT NULL`).catch(() => null);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_awards (
@@ -1242,9 +1245,13 @@ function buildCommands() {
       .setDescription('View sportsbook leaderboard and profit leaders'),
 
     new SlashCommandBuilder()
-      .setName('recognition')
-      .setDescription('View recognition profile')
+      .setName('activity')
+      .setDescription('View activity and legacy profile')
       .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('activityleaderboard')
+      .setDescription('View the activity leaderboard'),
 
     new SlashCommandBuilder()
       .setName('legacy')
@@ -4370,7 +4377,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    if (interaction.commandName === 'recognition') {
+    if (interaction.commandName === 'activity') {
       if (!interaction.guild) return;
       const targetUser = interaction.options.getUser('user') || interaction.user;
       await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
@@ -4380,7 +4387,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
         [interaction.guild.id, targetUser.id]
       );
 
-      await interaction.reply({ embeds: [buildRecognitionEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+      await interaction.reply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'activityleaderboard') {
+      if (!interaction.guild) return;
+
+      const result = await pool.query(
+        `SELECT * FROM user_recognition
+         WHERE guild_id = $1
+         ORDER BY activity_points DESC, activity_streak DESC, legacy_score DESC
+         LIMIT 15`,
+        [interaction.guild.id]
+      );
+
+      await interaction.reply({ embeds: [buildActivityLeaderboardEmbed(result.rows)], ephemeral: true });
       return;
     }
 
@@ -4390,7 +4412,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const result = await pool.query(
         `SELECT * FROM user_recognition
          WHERE guild_id = $1
-         ORDER BY legacy_score DESC, recognition_points DESC
+         ORDER BY legacy_score DESC, activity_points DESC
          LIMIT 15`,
         [interaction.guild.id]
       );
@@ -7068,18 +7090,22 @@ async function ensureRecognitionProfile(guildId, userId) {
   );
 }
 
-async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0) {
+async function addActivityPoints(guildId, userId, points, legacyPoints = 0) {
   await ensureRecognitionProfile(guildId, userId);
 
   await pool.query(
     `UPDATE user_recognition
-     SET recognition_points = recognition_points + $3,
+     SET activity_points = activity_points + $3,
          legacy_score = legacy_score + $4,
          updated_at = NOW(),
          last_activity_at = NOW()
      WHERE guild_id = $1 AND user_id = $2`,
     [guildId, userId, Number(points || 0), Number(legacyPoints || 0)]
   );
+}
+
+async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0) {
+  return addActivityPoints(guildId, userId, points, legacyPoints);
 }
 
 async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
@@ -7106,7 +7132,7 @@ async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
   );
 }
 
-function getRecognitionTier(score) {
+function getLegacyTier(score) {
   const legacyScore = Number(score || 0);
   if (legacyScore >= 5000) return 'GOAT';
   if (legacyScore >= 2500) return 'Legend';
@@ -7116,27 +7142,48 @@ function getRecognitionTier(score) {
   return 'Rookie';
 }
 
-function buildRecognitionEmbed(user, row) {
-  const recognition = row || {};
-  const tier = getRecognitionTier(recognition.legacy_score || 0);
+function getActivityTier(score) {
+  const activityScore = Number(score || 0);
+  if (activityScore >= 5000) return 'Icon';
+  if (activityScore >= 2500) return 'Elite';
+  if (activityScore >= 1000) return 'Grinder';
+  if (activityScore >= 500) return 'Veteran';
+  if (activityScore >= 100) return 'Active';
+  return 'Rookie';
+}
+
+function getRecognitionTier(score) {
+  return getLegacyTier(score);
+}
+
+function buildActivityEmbed(user, row) {
+  const profile = row || {};
+  const activityPoints = Number(profile.activity_points || profile.recognition_points || 0);
+  const legacyScore = Number(profile.legacy_score || 0);
 
   return new EmbedBuilder()
-    .setTitle(user.username + ' • Recognition Profile')
+    .setTitle(user.username + ' • Activity & Legacy Profile')
     .setColor(0xFEE75C)
     .setThumbnail(user.displayAvatarURL({ dynamic: true }))
     .addFields(
-      { name: 'Tier', value: tier, inline: true },
-      { name: 'Recognition', value: String(recognition.recognition_points || 0), inline: true },
-      { name: 'Legacy Score', value: String(recognition.legacy_score || 0), inline: true },
-      { name: 'Championships', value: String(recognition.championships || 0), inline: true },
-      { name: 'Tournament Titles', value: String(recognition.tournament_titles || 0), inline: true },
-      { name: 'Sportsbook Wins', value: String(recognition.sportsbook_wins || 0), inline: true },
-      { name: 'Sportsbook Profit', value: String(recognition.sportsbook_profit || 0), inline: true },
-      { name: 'Tickets Resolved', value: String(recognition.tickets_resolved || 0), inline: true },
-      { name: 'Games Played', value: String(recognition.games_played || 0), inline: true }
+      { name: 'Activity Tier', value: getActivityTier(activityPoints), inline: true },
+      { name: 'Activity Points', value: String(activityPoints), inline: true },
+      { name: 'Activity Streak', value: String(profile.activity_streak || 0), inline: true },
+      { name: 'Legacy Tier', value: getLegacyTier(legacyScore), inline: true },
+      { name: 'Legacy Score', value: String(legacyScore), inline: true },
+      { name: 'Championships', value: String(profile.championships || 0), inline: true },
+      { name: 'Tournament Titles', value: String(profile.tournament_titles || 0), inline: true },
+      { name: 'Sportsbook Wins', value: String(profile.sportsbook_wins || 0), inline: true },
+      { name: 'Sportsbook Profit', value: String(profile.sportsbook_profit || 0), inline: true },
+      { name: 'Tickets Resolved', value: String(profile.tickets_resolved || 0), inline: true },
+      { name: 'Games Played', value: String(profile.games_played || 0), inline: true }
     )
-    .setFooter({ text: 'GG Sports • Recognition System' })
+    .setFooter({ text: 'GG Sports • Activity & Legacy System' })
     .setTimestamp();
+}
+
+function buildRecognitionEmbed(user, row) {
+  return buildActivityEmbed(user, row);
 }
 
 function buildLegacyLeaderboardEmbed(rows) {
@@ -7154,7 +7201,31 @@ function buildLegacyLeaderboardEmbed(rows) {
 
   embed.setDescription(
     rows.map((row, index) => {
-      return '**' + (index + 1) + '. <@' + row.user_id + '>** — Legacy: ' + row.legacy_score + ' • Recognition: ' + row.recognition_points + ' • Tier: ' + getRecognitionTier(row.legacy_score);
+      const activityPoints = Number(row.activity_points || row.recognition_points || 0);
+      return '**' + (index + 1) + '. <@' + row.user_id + '>** — Legacy: ' + row.legacy_score + ' • Activity: ' + activityPoints + ' • Tier: ' + getLegacyTier(row.legacy_score);
+    }).join(NL)
+  );
+
+  return embed;
+}
+
+function buildActivityLeaderboardEmbed(rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('⚡ Activity Leaderboard')
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • Activity Rankings' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No activity profiles found yet.');
+    return embed;
+  }
+
+  embed.setDescription(
+    rows.map((row, index) => {
+      const activityPoints = Number(row.activity_points || row.recognition_points || 0);
+      return '**' + (index + 1) + '. <@' + row.user_id + '>** — Activity: ' + activityPoints + ' • Streak: ' + (row.activity_streak || 0) + ' • Tier: ' + getActivityTier(activityPoints);
     }).join(NL)
   );
 
