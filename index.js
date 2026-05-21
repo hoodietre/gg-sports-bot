@@ -997,6 +997,33 @@ function buildCommands() {
       .addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)),
 
     new SlashCommandBuilder()
+      .setName('lagoutrequest')
+      .setDescription('Open a lag-out review ticket')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addStringOption(o => o.setName('game_id').setDescription('Game ID, if available').setRequired(false))
+      .addUserOption(o => o.setName('opponent').setDescription('Opponent involved').setRequired(false))
+      .addRoleOption(o => o.setName('team').setDescription('Your team role').setRequired(false))
+      .addStringOption(o => o.setName('details').setDescription('What happened? Include score/time remaining if possible.').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('quitrequest')
+      .setDescription('Open a quit/forfeit review ticket')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addStringOption(o => o.setName('game_id').setDescription('Game ID, if available').setRequired(false))
+      .addUserOption(o => o.setName('opponent').setDescription('Opponent involved').setRequired(false))
+      .addRoleOption(o => o.setName('team').setDescription('Your team role').setRequired(false))
+      .addStringOption(o => o.setName('details').setDescription('What happened? Include score/time remaining if possible.').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('resetrequest')
+      .setDescription('Open a game reset review ticket')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+      .addStringOption(o => o.setName('game_id').setDescription('Game ID, if available').setRequired(false))
+      .addUserOption(o => o.setName('opponent').setDescription('Opponent involved').setRequired(false))
+      .addRoleOption(o => o.setName('team').setDescription('Your team role').setRequired(false))
+      .addStringOption(o => o.setName('details').setDescription('Why should this game be reset?').setRequired(false)),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -3558,6 +3585,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'lagoutrequest') {
+      await openGameIssueTicket(interaction, 'lagout');
+      return;
+    }
+
+    if (interaction.commandName === 'quitrequest') {
+      await openGameIssueTicket(interaction, 'quit');
+      return;
+    }
+
+    if (interaction.commandName === 'resetrequest') {
+      await openGameIssueTicket(interaction, 'reset');
+      return;
+    }
+
     if (interaction.commandName === 'setupstandings') {
       if (!interaction.guild) return;
       const leagueName = interaction.options.getString('league');
@@ -5421,6 +5463,42 @@ async function updateTicketPanel(guild) {
   const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
   if (!message) return;
   await message.edit({ embeds: [await buildTicketDashboardEmbed(guild.id)] }).catch(() => null);
+}
+
+async function openGameIssueTicket(interaction, ticketType) {
+  if (!interaction.guild) return;
+
+  const leagueName = interaction.options.getString('league');
+  const gameId = interaction.options.getString('game_id');
+  const opponent = interaction.options.getUser('opponent');
+  const team = interaction.options.getRole('team');
+  const details = interaction.options.getString('details');
+  const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+  if (!activeLeague) {
+    await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+    return;
+  }
+
+  const subject = ticketType + ' review' + (gameId ? ' • Game ' + gameId : '');
+  const NL = String.fromCharCode(10);
+  let description = '**League:** ' + activeLeague.league_name;
+  if (gameId) description += NL + '**Game ID:** ' + gameId;
+  if (team) description += NL + '**Requesting Team:** ' + team.toString();
+  if (opponent) description += NL + '**Opponent:** ' + opponent.toString();
+  description += NL + '**Request Type:** ' + ticketType;
+  description += NL + '**Details:** ' + (details || 'No details provided yet.');
+  description += NL + NL + 'Please upload proof/screenshots in this ticket thread. Attachments will be saved automatically as evidence.';
+
+  const originalGetString = interaction.options.getString.bind(interaction.options);
+  interaction.options.getString = function(name) {
+    if (name === 'subject') return subject;
+    if (name === 'description') return description;
+    if (name === 'league') return activeLeague.league_name;
+    return originalGetString(name);
+  };
+
+  await openSupportTicket(interaction, 'gamerequest');
 }
 
 async function openSupportTicket(interaction, ticketType) {
