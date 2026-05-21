@@ -482,6 +482,24 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS support_tickets (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE SET NULL,
+      user_id TEXT NOT NULL,
+      ticket_type TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      channel_id TEXT,
+      thread_id TEXT,
+      closed_by_user_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      closed_at TIMESTAMP
+    )
+  `);
+
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
@@ -4666,3 +4684,65 @@ process.on('unhandledRejection', console.error);
 process.on('uncaughtException', console.error);
 
 client.login(process.env.DISCORD_TOKEN);
+
+// =========================
+// PHASE 5A - TICKET SYSTEM
+// =========================
+
+const ACTIVE_TICKET_TYPES = ['support', 'dispute', 'gamerequest'];
+
+async function createTicketRecord({ guildId, leagueId, userId, ticketType, subject, description, channelId, threadId }) {
+  const id = crypto.randomUUID();
+
+  await pool.query(
+    `INSERT INTO support_tickets (
+      id,
+      guild_id,
+      league_id,
+      user_id,
+      ticket_type,
+      subject,
+      description,
+      channel_id,
+      thread_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [
+      id,
+      guildId,
+      leagueId,
+      userId,
+      ticketType,
+      subject,
+      description || null,
+      channelId || null,
+      threadId || null
+    ]
+  );
+
+  return id;
+}
+
+async function closeTicketRecord(threadId, closedByUserId) {
+  await pool.query(
+    `UPDATE support_tickets
+     SET status = 'closed',
+         closed_by_user_id = $1,
+         closed_at = NOW()
+     WHERE thread_id = $2`,
+    [closedByUserId, threadId]
+  );
+}
+
+function buildTicketEmbed({ type, subject, description, creator }) {
+  return new EmbedBuilder()
+    .setColor(0xffcc00)
+    .setTitle(`🎫 ${type.toUpperCase()} TICKET`)
+    .addFields(
+      { name: 'Subject', value: subject },
+      { name: 'Opened By', value: `<@${creator.id}>` }
+    )
+    .setDescription(description || 'No additional description provided.')
+    .setFooter({ text: 'GG Sports Ticket System' })
+    .setTimestamp();
+}
+
