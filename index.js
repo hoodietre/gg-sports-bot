@@ -884,6 +884,31 @@ function buildCommands() {
       .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
 
     new SlashCommandBuilder()
+      .setName('ticket')
+      .setDescription('Open a support ticket')
+      .addStringOption(o => o.setName('subject').setDescription('Short ticket subject').setRequired(true))
+      .addStringOption(o => o.setName('description').setDescription('Explain what you need help with').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('dispute')
+      .setDescription('Open a league dispute ticket')
+      .addStringOption(o => o.setName('subject').setDescription('Short dispute subject').setRequired(true))
+      .addStringOption(o => o.setName('description').setDescription('Explain the dispute').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('gamerequest')
+      .setDescription('Open a game/reset/lag-out request ticket')
+      .addStringOption(o => o.setName('subject').setDescription('Short request subject').setRequired(true))
+      .addStringOption(o => o.setName('description').setDescription('Explain what happened').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('closeticket')
+      .setDescription('Staff: close the current ticket thread'),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -4692,7 +4717,7 @@ client.login(process.env.DISCORD_TOKEN);
 const ACTIVE_TICKET_TYPES = ['support', 'dispute', 'gamerequest'];
 
 async function createTicketRecord({ guildId, leagueId, userId, ticketType, subject, description, channelId, threadId }) {
-  const id = crypto.randomUUID();
+  const id = randomUUID();
 
   await pool.query(
     `INSERT INTO support_tickets (
