@@ -616,6 +616,51 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_recognition (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      recognition_points INTEGER NOT NULL DEFAULT 0,
+      legacy_score INTEGER NOT NULL DEFAULT 0,
+      championships INTEGER NOT NULL DEFAULT 0,
+      tournament_titles INTEGER NOT NULL DEFAULT 0,
+      sportsbook_wins INTEGER NOT NULL DEFAULT 0,
+      sportsbook_profit INTEGER NOT NULL DEFAULT 0,
+      tickets_resolved INTEGER NOT NULL DEFAULT 0,
+      games_played INTEGER NOT NULL DEFAULT 0,
+      activity_streak INTEGER NOT NULL DEFAULT 0,
+      last_activity_at TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_awards (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE SET NULL,
+      season_label TEXT,
+      award_name TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_by_user_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS championship_history (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE SET NULL,
+      season_label TEXT,
+      team_name TEXT,
+      winner_user_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS sportsbook_parlays (
       id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL,
@@ -1195,6 +1240,33 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('bettingleaderboard')
       .setDescription('View sportsbook leaderboard and profit leaders'),
+
+    new SlashCommandBuilder()
+      .setName('recognition')
+      .setDescription('View recognition profile')
+      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('legacy')
+      .setDescription('View legacy rankings'),
+
+    new SlashCommandBuilder()
+      .setName('halloffame')
+      .setDescription('View the GG Sports Hall of Fame'),
+
+    new SlashCommandBuilder()
+      .setName('awards')
+      .setDescription('View league awards or add one')
+      .addStringOption(o => o.setName('action').setDescription('view or add').setRequired(true))
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+      .addStringOption(o => o.setName('season').setDescription('Season label').setRequired(false))
+      .addStringOption(o => o.setName('award').setDescription('Award name').setRequired(false))
+      .addUserOption(o => o.setName('user').setDescription('Award recipient').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('seasonhistory')
+      .setDescription('View championship history')
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('createparlay')
@@ -3242,6 +3314,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const newStatus = action === 'ticket_quick_reviewing' ? 'reviewing' : 'resolved';
         await pool.query(`UPDATE support_tickets SET status = $1 WHERE id = $2`, [newStatus, ticket.id]);
+        if (newStatus === 'resolved') {
+          await incrementRecognitionStat(interaction.guild.id, interaction.user.id, 'tickets_resolved', 1);
+          await addRecognitionPoints(interaction.guild.id, interaction.user.id, 5, 2);
+        }
         await updateTicketPanel(interaction.guild);
         await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** marked **' + newStatus + '**.', ephemeral: true });
         return;
@@ -4294,6 +4370,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'recognition') {
+      if (!interaction.guild) return;
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
+
+      const result = await pool.query(
+        `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+        [interaction.guild.id, targetUser.id]
+      );
+
+      await interaction.reply({ embeds: [buildRecognitionEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'legacy') {
+      if (!interaction.guild) return;
+
+      const result = await pool.query(
+        `SELECT * FROM user_recognition
+         WHERE guild_id = $1
+         ORDER BY legacy_score DESC, recognition_points DESC
+         LIMIT 15`,
+        [interaction.guild.id]
+      );
+
+      await interaction.reply({ embeds: [buildLegacyLeaderboardEmbed(result.rows)], ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'createparlay') {
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
@@ -4530,6 +4635,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       for (const bet of bets.rows) {
         if (bet.side === winner) {
           await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, interaction.user.id);
+          await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_wins', 1);
+          await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', Number(bet.potential_payout) - Number(bet.amount));
+          await addRecognitionPoints(interaction.guild.id, bet.user_id, 10, 5);
           await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
           winners += 1;
           totalPaid += Number(bet.potential_payout);
@@ -6720,6 +6828,9 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
     } else if (allSettled) {
       await pool.query(`UPDATE sportsbook_parlays SET status = 'won', settled_at = NOW() WHERE id = $1`, [parlay.id]);
       await addCurrency(guildId, parlay.user_id, Number(parlay.potential_payout), 'sportsbook_parlay_win', 'Won parlay', issuedByUserId);
+      await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_wins', 1);
+      await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_profit', Number(parlay.potential_payout) - Number(parlay.amount));
+      await addRecognitionPoints(guildId, parlay.user_id, 50, 25);
       settledCount += 1;
       parlayPaid += Number(parlay.potential_payout);
     }
@@ -6945,6 +7056,108 @@ function buildBettingLeaderboardEmbed(settings, rows) {
   });
 
   embed.setDescription(lines.join(NL));
+  return embed;
+}
+
+async function ensureRecognitionProfile(guildId, userId) {
+  await pool.query(
+    `INSERT INTO user_recognition (guild_id, user_id)
+     VALUES ($1, $2)
+     ON CONFLICT (guild_id, user_id) DO NOTHING`,
+    [guildId, userId]
+  );
+}
+
+async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0) {
+  await ensureRecognitionProfile(guildId, userId);
+
+  await pool.query(
+    `UPDATE user_recognition
+     SET recognition_points = recognition_points + $3,
+         legacy_score = legacy_score + $4,
+         updated_at = NOW(),
+         last_activity_at = NOW()
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId, Number(points || 0), Number(legacyPoints || 0)]
+  );
+}
+
+async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
+  const allowedFields = [
+    'championships',
+    'tournament_titles',
+    'sportsbook_wins',
+    'sportsbook_profit',
+    'tickets_resolved',
+    'games_played',
+    'activity_streak'
+  ];
+
+  if (!allowedFields.includes(field)) return;
+
+  await ensureRecognitionProfile(guildId, userId);
+  await pool.query(
+    `UPDATE user_recognition
+     SET ${field} = ${field} + $3,
+         updated_at = NOW(),
+         last_activity_at = NOW()
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId, Number(amount || 1)]
+  );
+}
+
+function getRecognitionTier(score) {
+  const legacyScore = Number(score || 0);
+  if (legacyScore >= 5000) return 'GOAT';
+  if (legacyScore >= 2500) return 'Legend';
+  if (legacyScore >= 1000) return 'Elite';
+  if (legacyScore >= 500) return 'Veteran';
+  if (legacyScore >= 100) return 'Rising Star';
+  return 'Rookie';
+}
+
+function buildRecognitionEmbed(user, row) {
+  const recognition = row || {};
+  const tier = getRecognitionTier(recognition.legacy_score || 0);
+
+  return new EmbedBuilder()
+    .setTitle(user.username + ' • Recognition Profile')
+    .setColor(0xFEE75C)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'Tier', value: tier, inline: true },
+      { name: 'Recognition', value: String(recognition.recognition_points || 0), inline: true },
+      { name: 'Legacy Score', value: String(recognition.legacy_score || 0), inline: true },
+      { name: 'Championships', value: String(recognition.championships || 0), inline: true },
+      { name: 'Tournament Titles', value: String(recognition.tournament_titles || 0), inline: true },
+      { name: 'Sportsbook Wins', value: String(recognition.sportsbook_wins || 0), inline: true },
+      { name: 'Sportsbook Profit', value: String(recognition.sportsbook_profit || 0), inline: true },
+      { name: 'Tickets Resolved', value: String(recognition.tickets_resolved || 0), inline: true },
+      { name: 'Games Played', value: String(recognition.games_played || 0), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Recognition System' })
+    .setTimestamp();
+}
+
+function buildLegacyLeaderboardEmbed(rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('🏆 Legacy Leaderboard')
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Legacy Rankings' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No legacy profiles found yet.');
+    return embed;
+  }
+
+  embed.setDescription(
+    rows.map((row, index) => {
+      return '**' + (index + 1) + '. <@' + row.user_id + '>** — Legacy: ' + row.legacy_score + ' • Recognition: ' + row.recognition_points + ' • Tier: ' + getRecognitionTier(row.legacy_score);
+    }).join(NL)
+  );
+
   return embed;
 }
 
