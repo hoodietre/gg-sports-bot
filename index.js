@@ -416,10 +416,13 @@ async function initDatabase() {
       user_id TEXT NOT NULL,
       entry_name TEXT,
       paid_buy_in INTEGER NOT NULL DEFAULT 0,
+      seed INTEGER,
       joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
       PRIMARY KEY (tournament_id, user_id)
     )
   `);
+
+  await pool.query(`ALTER TABLE tournament_entries ADD COLUMN IF NOT EXISTS seed INTEGER`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_matches (
@@ -811,6 +814,23 @@ function buildCommands() {
       .setDescription('Admin/staff: report a tournament match winner')
       .addStringOption(o => o.setName('match_id').setDescription('Match short ID from /tournamentmatches').setRequired(true))
       .addUserOption(o => o.setName('winner').setDescription('Winning user').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('shuffletournament')
+      .setDescription('Admin/staff: randomly seed a tournament before it starts')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('settournamentseed')
+      .setDescription('Admin/staff: manually set a user seed before tournament starts')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+      .addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true))
+      .addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('tournamentseeds')
+      .setDescription('Show tournament seeds')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -1716,7 +1736,7 @@ async function findTournament(guildId, input) {
 
 async function getTournamentEntries(tournamentId) {
   const result = await pool.query(
-    `SELECT * FROM tournament_entries WHERE tournament_id = $1 ORDER BY joined_at ASC`,
+    `SELECT * FROM tournament_entries WHERE tournament_id = $1 ORDER BY seed ASC NULLS LAST, joined_at ASC`,
     [tournamentId]
   );
   return result.rows;
@@ -1752,7 +1772,10 @@ function buildTournamentInfoEmbed(settings, tournament, entries) {
   const prizePool = `${settings.currency_icon} ${tournament.prize_pool || 0} ${settings.currency_name}`;
   const maxEntries = tournament.max_entries ? `${entries.length}/${tournament.max_entries}` : `${entries.length}`;
   const entryLines = entries.length
-    ? entries.map((entry, index) => `**${index + 1}.** <@${entry.user_id}>${entry.entry_name ? ` — ${entry.entry_name}` : ''}`).join(NL)
+    ? entries.map((entry, index) => {
+        const seedLabel = entry.seed ? `Seed ${entry.seed}` : `Entry ${index + 1}`;
+        return `**${seedLabel}.** <@${entry.user_id}>${entry.entry_name ? ` — ${entry.entry_name}` : ''}`;
+      }).join(NL)
     : 'No entries yet.';
 
   return new EmbedBuilder()
@@ -3556,6 +3579,132 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await pool.query(`UPDATE tournaments SET status = 'closed', updated_at = NOW() WHERE id = $1`, [tournament.id]);
       await interaction.reply({ content: `Registration closed for **${tournament.tournament_name}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'tournamentseeds') {
+      if (!interaction.guild) return;
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+
+      const entries = await getTournamentEntries(tournament.id);
+      const NL = String.fromCharCode(10);
+      const seedText = entries.length
+        ? entries.map((entry, index) => `**${entry.seed || index + 1}.** <@${entry.user_id}>${entry.entry_name ? ` — ${entry.entry_name}` : ''}`).join(NL)
+        : 'No entries yet.';
+
+      const embed = new EmbedBuilder()
+        .setTitle(`${tournament.tournament_name} • Seeds`)
+        .setColor(0xED4245)
+        .setDescription(seedText)
+        .setFooter({ text: 'GG Sports • Tournament Seeding' })
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [embed], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'shuffletournament') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to seed tournaments.', ephemeral: true });
+        return;
+      }
+
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+
+      if (!['open', 'closed'].includes(tournament.status)) {
+        await interaction.reply({ content: 'You can only shuffle seeds before a tournament starts.', ephemeral: true });
+        return;
+      }
+
+      const matches = await getTournamentMatches(tournament.id);
+      if (matches.length > 0) {
+        await interaction.reply({ content: 'This tournament already has matches generated, so seeds can no longer be changed.', ephemeral: true });
+        return;
+      }
+
+      const entries = await getTournamentEntries(tournament.id);
+      if (entries.length < 2) {
+        await interaction.reply({ content: 'Need at least 2 entries to seed a tournament.', ephemeral: true });
+        return;
+      }
+
+      const shuffled = [...entries].sort(() => Math.random() - 0.5);
+      for (let i = 0; i < shuffled.length; i++) {
+        await pool.query(
+          `UPDATE tournament_entries SET seed = $1 WHERE tournament_id = $2 AND user_id = $3`,
+          [i + 1, tournament.id, shuffled[i].user_id]
+        );
+      }
+
+      await interaction.reply({ content: `Random seeds assigned for **${tournament.tournament_name}**. Use /tournamentseeds to review.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'settournamentseed') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to seed tournaments.', ephemeral: true });
+        return;
+      }
+
+      const input = interaction.options.getString('tournament');
+      const targetUser = interaction.options.getUser('user');
+      const seed = interaction.options.getInteger('seed');
+      const tournament = await findTournament(interaction.guild.id, input);
+
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+
+      if (!['open', 'closed'].includes(tournament.status)) {
+        await interaction.reply({ content: 'You can only set seeds before a tournament starts.', ephemeral: true });
+        return;
+      }
+
+      const matches = await getTournamentMatches(tournament.id);
+      if (matches.length > 0) {
+        await interaction.reply({ content: 'This tournament already has matches generated, so seeds can no longer be changed.', ephemeral: true });
+        return;
+      }
+
+      if (seed <= 0) {
+        await interaction.reply({ content: 'Seed must be greater than 0.', ephemeral: true });
+        return;
+      }
+
+      const entries = await getTournamentEntries(tournament.id);
+      const targetEntry = entries.find(entry => entry.user_id === targetUser.id);
+      if (!targetEntry) {
+        await interaction.reply({ content: 'That user is not entered in this tournament.', ephemeral: true });
+        return;
+      }
+
+      const existingSeed = entries.find(entry => entry.seed === seed && entry.user_id !== targetUser.id);
+      if (existingSeed) {
+        await pool.query(
+          `UPDATE tournament_entries SET seed = NULL WHERE tournament_id = $1 AND user_id = $2`,
+          [tournament.id, existingSeed.user_id]
+        );
+      }
+
+      await pool.query(
+        `UPDATE tournament_entries SET seed = $1 WHERE tournament_id = $2 AND user_id = $3`,
+        [seed, tournament.id, targetUser.id]
+      );
+
+      await interaction.reply({ content: `${targetUser} is now seed **${seed}** for **${tournament.tournament_name}**.`, ephemeral: true });
       return;
     }
 
