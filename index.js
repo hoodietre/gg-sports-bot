@@ -501,6 +501,22 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS close_reason TEXT`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_transcripts (
+      id UUID PRIMARY KEY,
+      ticket_id UUID REFERENCES support_tickets(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      message_author_id TEXT,
+      message_author_tag TEXT,
+      message_content TEXT,
+      attachment_urls TEXT,
+      message_created_at TIMESTAMP,
+      saved_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ticket_evidence (
       id UUID PRIMARY KEY,
@@ -923,7 +939,8 @@ function buildCommands() {
 
     new SlashCommandBuilder()
       .setName('closeticket')
-      .setDescription('Staff: close the current ticket thread'),
+      .setDescription('Staff: close the current ticket thread')
+      .addStringOption(o => o.setName('reason').setDescription('Optional close reason').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('tickets')
@@ -943,6 +960,11 @@ function buildCommands() {
       .setName('ticketevidence')
       .setDescription('Show evidence uploaded to a ticket')
       .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('tickettranscript')
+      .setDescription('Show saved transcript for a closed ticket')
+      .addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -3212,8 +3234,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      const closeReason = interaction.options.getString('reason');
+      await saveTicketTranscript(interaction.channel, ticket);
       await closeTicketRecord(interaction.channel.id, interaction.user.id);
-      await interaction.reply({ content: 'Ticket closed. This thread will be archived.', ephemeral: false });
+      if (closeReason) {
+        await pool.query(`UPDATE support_tickets SET close_reason = $1 WHERE id = $2`, [closeReason, ticket.id]);
+      }
+      await interaction.reply({ content: 'Ticket closed. Transcript saved. This thread will be archived.' + (closeReason ? ' Reason: ' + closeReason : ''), ephemeral: false });
       await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
       return;
     }
@@ -3301,6 +3328,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.reply({ content: '<@' + interaction.user.id + '> has claimed this ticket.', ephemeral: false });
+      return;
+    }
+
+    if (interaction.commandName === 'tickettranscript') {
+      if (!interaction.guild) return;
+      const ticketInput = interaction.options.getString('ticket_id');
+      const ticketResult = await pool.query(
+        `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+        [interaction.guild.id, ticketInput + '%']
+      );
+
+      if (!ticketResult.rows.length) {
+        await interaction.reply({ content: 'Could not find that ticket ID.', ephemeral: true });
+        return;
+      }
+
+      const ticket = ticketResult.rows[0];
+      const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+      const viewer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const isTicketOwner = ticket.user_id === interaction.user.id;
+      const isStaff = viewer ? await memberHasStaff(viewer, activeLeague) : false;
+
+      if (!isTicketOwner && !isStaff) {
+        await interaction.reply({ content: 'Only the ticket owner or staff can view this transcript.', ephemeral: true });
+        return;
+      }
+
+      const transcriptResult = await pool.query(
+        `SELECT * FROM ticket_transcripts WHERE guild_id = $1 AND ticket_id = $2 ORDER BY message_created_at ASC LIMIT 40`,
+        [interaction.guild.id, ticket.id]
+      );
+
+      await interaction.reply({ embeds: [buildTicketTranscriptEmbed(ticket, transcriptResult.rows)], ephemeral: true });
       return;
     }
 
@@ -5085,6 +5145,57 @@ async function saveTicketEvidence({ ticketId, guildId, userId, attachmentUrl, fi
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [randomUUID(), ticketId, guildId, userId, attachmentUrl, fileName || null, contentType || null, messageId || null]
   );
+}
+
+async function saveTicketTranscript(thread, ticket) {
+  const messages = await thread.messages.fetch({ limit: 100 }).catch(() => null);
+  if (!messages) return;
+
+  const ordered = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+  for (const msg of ordered) {
+    if (msg.author?.bot && !msg.content && msg.attachments.size === 0) continue;
+    const attachmentUrls = msg.attachments.size > 0 ? [...msg.attachments.values()].map(a => a.url).join(String.fromCharCode(10)) : null;
+    await pool.query(
+      `INSERT INTO ticket_transcripts (id, ticket_id, guild_id, message_author_id, message_author_tag, message_content, attachment_urls, message_created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8 / 1000.0))`,
+      [
+        randomUUID(),
+        ticket.id,
+        ticket.guild_id,
+        msg.author?.id || null,
+        msg.author?.tag || null,
+        msg.content || null,
+        attachmentUrls,
+        msg.createdTimestamp,
+      ]
+    );
+  }
+}
+
+function buildTicketTranscriptEmbed(ticket, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Ticket Transcript • ' + shortTicketId(ticket.id))
+    .setColor(0x57f287)
+    .setFooter({ text: 'GG Sports • Ticket Transcript' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No transcript messages were saved for this ticket.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const author = row.message_author_id ? '<@' + row.message_author_id + '>' : (row.message_author_tag || 'Unknown');
+    const content = row.message_content || '[no text]';
+    const attachments = row.attachment_urls ? NL + 'Attachments: ' + row.attachment_urls : '';
+    return '**' + author + ':** ' + content + attachments;
+  });
+
+  embed.setDescription(lines.join(NL + NL).slice(0, 4000));
+  if (ticket.close_reason) embed.addFields({ name: 'Close Reason', value: ticket.close_reason, inline: false });
+  return embed;
 }
 
 async function openSupportTicket(interaction, ticketType) {
