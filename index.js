@@ -1390,28 +1390,15 @@ function getRegisteredCommands() {
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-
-  console.log('Clearing ALL guild commands...');
-  await rest.put(
-    Routes.applicationGuildCommands(CLIENT_ID, DEV_GUILD_ID),
-    { body: [] }
-  );
-
-  console.log('Clearing ALL global commands...');
-  await rest.put(
-    Routes.applicationCommands(CLIENT_ID),
-    { body: [] }
-  );
-
-  console.log('Registering fresh global commands...');
   const commands = getRegisteredCommands();
 
+  console.log('Registering global commands...');
   await rest.put(
     Routes.applicationCommands(CLIENT_ID),
     { body: commands }
   );
 
-  console.log('Fresh global commands synced:', commands.length);
+  console.log('Global commands synced:', commands.length);
 }
 
 async function getLeagueByName(guildId, leagueName) {
