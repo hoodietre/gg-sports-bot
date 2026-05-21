@@ -3115,6 +3115,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'ticket') {
+      await openSupportTicket(interaction, 'support');
+      return;
+    }
+
+    if (interaction.commandName === 'dispute') {
+      await openSupportTicket(interaction, 'dispute');
+      return;
+    }
+
+    if (interaction.commandName === 'gamerequest') {
+      await openSupportTicket(interaction, 'gamerequest');
+      return;
+    }
+
+    if (interaction.commandName === 'closeticket') {
+      if (!interaction.guild) return;
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: 'Use this command inside a ticket thread.', ephemeral: true });
+        return;
+      }
+
+      const ticketResult = await pool.query(
+        `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+        [interaction.guild.id, interaction.channel.id]
+      );
+
+      if (!ticketResult.rows.length) {
+        await interaction.reply({ content: 'This does not appear to be an open ticket thread.', ephemeral: true });
+        return;
+      }
+
+      const ticket = ticketResult.rows[0];
+      const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+      const closer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const isTicketOwner = ticket.user_id === interaction.user.id;
+      const isStaff = closer ? await memberHasStaff(closer, activeLeague) : false;
+
+      if (!isTicketOwner && !isStaff) {
+        await interaction.reply({ content: 'Only the ticket owner or staff can close this ticket.', ephemeral: true });
+        return;
+      }
+
+      await closeTicketRecord(interaction.channel.id, interaction.user.id);
+      await interaction.reply({ content: 'Ticket closed. This thread will be archived.', ephemeral: false });
+      await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
+      return;
+    }
+
     if (interaction.commandName === 'setupstandings') {
       if (!interaction.guild) return;
       const leagueName = interaction.options.getString('league');
@@ -4769,5 +4818,78 @@ function buildTicketEmbed({ type, subject, description, creator }) {
     .setDescription(description || 'No additional description provided.')
     .setFooter({ text: 'GG Sports Ticket System' })
     .setTimestamp();
+}
+
+async function openSupportTicket(interaction, ticketType) {
+  if (!interaction.guild) return;
+
+  const subject = interaction.options.getString('subject');
+  const description = interaction.options.getString('description');
+  const leagueName = interaction.options.getString('league');
+  const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await resolveLeague(interaction);
+
+  if (leagueName && !activeLeague) {
+    await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+    return;
+  }
+
+  const baseChannel = interaction.channel;
+  if (!baseChannel || !baseChannel.isTextBased()) {
+    await interaction.reply({ content: 'Tickets can only be opened from a text channel.', ephemeral: true });
+    return;
+  }
+
+  const botMember = await interaction.guild.members.fetchMe();
+  const permissions = baseChannel.permissionsFor(botMember);
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.CreatePublicThreads)) {
+    await interaction.reply({ content: 'I need View Channel, Send Messages, and Create Public Threads permissions here to open tickets.', ephemeral: true });
+    return;
+  }
+
+  const safeSubject = subject.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 40) || ticketType;
+  const threadName = (ticketType + '-' + interaction.user.username + '-' + safeSubject).slice(0, 90);
+  const staffRoleId = activeLeague?.staff_role_id || null;
+
+  const starter = await baseChannel.send({
+    content: '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (staffRoleId ? ' <@&' + staffRoleId + '>' : ''),
+    embeds: [buildTicketEmbed({ type: ticketType, subject, description, creator: interaction.user })],
+    allowedMentions: {
+      users: [interaction.user.id],
+      roles: staffRoleId ? [staffRoleId] : [],
+    },
+  });
+
+  const thread = await starter.startThread({
+    name: threadName,
+    autoArchiveDuration: 1440,
+    reason: 'GG Sports ' + ticketType + ' ticket',
+  }).catch(() => null);
+
+  if (!thread) {
+    await interaction.reply({ content: 'I could not create the ticket thread. Make sure I have Create Public Threads permission.', ephemeral: true });
+    return;
+  }
+
+  const NL = String.fromCharCode(10);
+  await thread.send({
+    content: '<@' + interaction.user.id + '> your ticket is open here.' + (staffRoleId ? ' Staff: <@&' + staffRoleId + '>' : '') + NL + NL + 'Use **/closeticket** in this thread when it is resolved.',
+    allowedMentions: {
+      users: [interaction.user.id],
+      roles: staffRoleId ? [staffRoleId] : [],
+    },
+  }).catch(() => null);
+
+  const ticketId = await createTicketRecord({
+    guildId: interaction.guild.id,
+    leagueId: activeLeague?.league_id || null,
+    userId: interaction.user.id,
+    ticketType,
+    subject,
+    description,
+    channelId: baseChannel.id,
+    threadId: thread.id,
+  });
+
+  await interaction.reply({ content: 'Ticket opened: ' + thread.toString() + '. Ticket ID: **' + ticketId.split('-')[0] + '**', ephemeral: true });
 }
 
