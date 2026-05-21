@@ -1129,6 +1129,15 @@ function buildCommands() {
       .addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)),
 
     new SlashCommandBuilder()
+      .setName('bettinghistory')
+      .setDescription('View your sportsbook betting history or another user’s')
+      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('bettingleaderboard')
+      .setDescription('View sportsbook leaderboard and profit leaders'),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -3975,6 +3984,61 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'bettinghistory') {
+      if (!interaction.guild) return;
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      const summaryResult = await pool.query(
+        `SELECT
+           COUNT(*)::int AS total_bets,
+           COUNT(*) FILTER (WHERE status = 'won')::int AS wins,
+           COUNT(*) FILTER (WHERE status = 'lost')::int AS losses,
+           COUNT(*) FILTER (WHERE status = 'open')::int AS open_bets,
+           COALESCE(SUM(amount), 0)::int AS total_wagered,
+           COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END), 0)::int AS total_won
+         FROM sportsbook_bets
+         WHERE guild_id = $1 AND user_id = $2`,
+        [interaction.guild.id, targetUser.id]
+      );
+
+      const recentResult = await pool.query(
+        `SELECT b.*, g.game_label, g.home_label, g.away_label
+         FROM sportsbook_bets b
+         JOIN sportsbook_games g ON g.id = b.sportsbook_game_id
+         WHERE b.guild_id = $1 AND b.user_id = $2
+         ORDER BY b.created_at DESC
+         LIMIT 10`,
+        [interaction.guild.id, targetUser.id]
+      );
+
+      await interaction.reply({ embeds: [buildBettingHistoryEmbed(settings, targetUser, summaryResult.rows[0] || {}, recentResult.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'bettingleaderboard') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT
+           user_id,
+           COUNT(*) FILTER (WHERE status = 'won')::int AS wins,
+           COUNT(*) FILTER (WHERE status = 'lost')::int AS losses,
+           COALESCE(SUM(amount), 0)::int AS total_wagered,
+           COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END), 0)::int AS total_won,
+           (COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END), 0) - COALESCE(SUM(amount), 0))::int AS net_profit
+         FROM sportsbook_bets
+         WHERE guild_id = $1 AND status IN ('won', 'lost')
+         GROUP BY user_id
+         ORDER BY net_profit DESC, wins DESC, total_wagered DESC
+         LIMIT 10`,
+        [interaction.guild.id]
+      );
+
+      await interaction.reply({ embeds: [buildBettingLeaderboardEmbed(settings, result.rows)], ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'createsportsbookgame') {
       if (!interaction.guild) return;
       if (!(await userCanUseLeagueSetup(interaction, league))) {
@@ -6296,6 +6360,74 @@ function buildMyBetsEmbed(settings, rows) {
   });
 
   embed.setDescription(lines.join(NL + NL));
+  return embed;
+}
+
+function buildBettingHistoryEmbed(settings, user, summary, rows) {
+  const NL = String.fromCharCode(10);
+  const totalBets = Number(summary.total_bets || 0);
+  const wins = Number(summary.wins || 0);
+  const losses = Number(summary.losses || 0);
+  const open = Number(summary.open_bets || 0);
+  const totalWagered = Number(summary.total_wagered || 0);
+  const totalWon = Number(summary.total_won || 0);
+  const netProfit = totalWon - totalWagered;
+
+  const embed = new EmbedBuilder()
+    .setTitle(user.username + ' • Betting History')
+    .setColor(0x5865F2)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'Bets', value: String(totalBets), inline: true },
+      { name: 'Record', value: wins + '-' + losses, inline: true },
+      { name: 'Open Bets', value: String(open), inline: true },
+      { name: 'Total Wagered', value: settings.currency_icon + ' ' + totalWagered, inline: true },
+      { name: 'Total Won', value: settings.currency_icon + ' ' + totalWon, inline: true },
+      { name: 'Net Profit', value: settings.currency_icon + ' ' + netProfit, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Betting History' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.addFields({ name: 'Recent Bets', value: 'No recent bets found.', inline: false });
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const sideLabel = row.side === 'home' ? row.home_label : row.away_label;
+    const wonText = row.status === 'won' ? ' • Paid: ' + settings.currency_icon + ' ' + row.potential_payout : '';
+    return '**' + shortSportsbookId(row.id) + '** — ' + row.game_label + ' • ' + sideLabel + ' ML ' + row.odds + NL +
+      'Stake: ' + settings.currency_icon + ' ' + row.amount + ' • ' + row.status + wonText;
+  });
+
+  embed.addFields({ name: 'Recent Bets', value: lines.join(NL + NL).slice(0, 3000), inline: false });
+  return embed;
+}
+
+function buildBettingLeaderboardEmbed(settings, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Sportsbook Leaderboard')
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Betting Leaderboard' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No settled betting results yet.');
+    return embed;
+  }
+
+  const lines = rows.map((row, index) => {
+    const totalWagered = Number(row.total_wagered || 0);
+    const totalWon = Number(row.total_won || 0);
+    const netProfit = totalWon - totalWagered;
+    const wins = Number(row.wins || 0);
+    const losses = Number(row.losses || 0);
+    return '**' + (index + 1) + '. <@' + row.user_id + '>** — Net: ' + settings.currency_icon + ' ' + netProfit +
+      ' • Record: ' + wins + '-' + losses + ' • Wagered: ' + settings.currency_icon + ' ' + totalWagered + ' • Won: ' + settings.currency_icon + ' ' + totalWon;
+  });
+
+  embed.setDescription(lines.join(NL));
   return embed;
 }
 
