@@ -435,10 +435,13 @@ async function initDatabase() {
       winner_user_id TEXT,
       status TEXT NOT NULL DEFAULT 'scheduled',
       reported_by_user_id TEXT,
+      thread_id TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
+  await pool.query(`ALTER TABLE tournament_matches ADD COLUMN IF NOT EXISTS thread_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_panels (
@@ -1797,6 +1800,72 @@ function buildTournamentMatchesEmbed(tournament, matches) {
 
   embed.setDescription(lines.join(`${NL}${NL}`));
   return embed;
+}
+
+function buildTournamentMatchThreadEmbed(tournament, match) {
+  const p1 = match.player1_user_id ? `<@${match.player1_user_id}>${match.player1_entry_name ? ` (${match.player1_entry_name})` : ''}` : 'BYE';
+  const p2 = match.player2_user_id ? `<@${match.player2_user_id}>${match.player2_entry_name ? ` (${match.player2_entry_name})` : ''}` : 'BYE';
+
+  return new EmbedBuilder()
+    .setTitle(`${tournament.tournament_name} • Match ${shortMatchId(match.id)}`)
+    .setColor(0xED4245)
+    .addFields(
+      { name: 'Round', value: String(match.round_number), inline: true },
+      { name: 'Match', value: String(match.match_number), inline: true },
+      { name: 'Match ID', value: shortMatchId(match.id), inline: true },
+      { name: 'Player 1', value: p1, inline: false },
+      { name: 'Player 2', value: p2, inline: false },
+      { name: 'How to Report', value: 'Staff can use `/reportmatch` with this Match ID after the game is completed.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Tournament Match Thread' })
+    .setTimestamp();
+}
+
+async function createMatchThreads(guild, tournament, matches) {
+  let channel = null;
+
+  if (tournament.league_id) {
+    const activeLeague = await getLeagueById(tournament.league_id);
+    if (activeLeague?.tournament_channel_id) {
+      channel = await guild.channels.fetch(activeLeague.tournament_channel_id).catch(() => null);
+    }
+  }
+
+  if (!channel) {
+    const guildTournamentChannelId = await getGuildTournamentChannelId(guild.id);
+    if (guildTournamentChannelId) {
+      channel = await guild.channels.fetch(guildTournamentChannelId).catch(() => null);
+    }
+  }
+
+  if (!channel || !channel.isTextBased()) return;
+
+  for (const match of matches) {
+    if (!match.player1_user_id || !match.player2_user_id || match.status === 'final' || match.status === 'bye') continue;
+    if (match.thread_id) continue;
+
+    const starter = await channel.send({
+      content: `<@${match.player1_user_id}> vs <@${match.player2_user_id}> — Tournament match created.`,
+      embeds: [buildTournamentMatchThreadEmbed(tournament, match)],
+      allowedMentions: { users: [match.player1_user_id, match.player2_user_id], roles: [] },
+    });
+
+    const threadName = `${tournament.tournament_name} R${match.round_number} M${match.match_number}`.slice(0, 90);
+    const thread = await starter.startThread({
+      name: threadName,
+      autoArchiveDuration: 1440,
+      reason: 'Tournament match thread',
+    }).catch(() => null);
+
+    if (thread) {
+      await thread.send({
+        content: `<@${match.player1_user_id}> <@${match.player2_user_id}> schedule/play your match here. Match ID: **${shortMatchId(match.id)}**`,
+        allowedMentions: { users: [match.player1_user_id, match.player2_user_id], roles: [] },
+      }).catch(() => null);
+
+      await pool.query(`UPDATE tournament_matches SET thread_id = $1, updated_at = NOW() WHERE id = $2`, [thread.id, match.id]);
+    }
+  }
 }
 
 function buildTournamentPanelEmbed(tournament, matches) {
@@ -3392,6 +3461,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await pool.query(`UPDATE tournaments SET status = 'active', updated_at = NOW() WHERE id = $1`, [tournament.id]);
 
       const matches = await getTournamentMatches(tournament.id);
+      await createMatchThreads(interaction.guild, { ...tournament, status: 'active' }, matches);
       await updateTournamentPanel(interaction.guild, { ...tournament, status: 'active' });
       await interaction.reply({ embeds: [buildTournamentMatchesEmbed({ ...tournament, status: 'active' }, matches)], ephemeral: true });
       return;
@@ -3532,7 +3602,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await createTournamentRound({ id: match.tournament_id, guild_id: interaction.guild.id }, winners, Number(match.round_number) + 1);
       const refreshedTournament = await findTournament(interaction.guild.id, match.tournament_name);
-      if (refreshedTournament) await updateTournamentPanel(interaction.guild, refreshedTournament);
+      if (refreshedTournament) {
+        const refreshedMatches = await getTournamentMatches(match.tournament_id);
+        await createMatchThreads(interaction.guild, refreshedTournament, refreshedMatches);
+        await updateTournamentPanel(interaction.guild, refreshedTournament);
+      }
       await interaction.reply({ content: `Round ${match.round_number} complete. Round ${Number(match.round_number) + 1} has been generated.`, ephemeral: true });
       return;
     }
