@@ -31,6 +31,10 @@ const client = new Client({
 
 const CLIENT_ID = process.env.CLIENT_ID || '1407760487151833200';
 const DEV_GUILD_ID = process.env.GUILD_ID || '1486545386649686068';
+const COMMAND_GUILD_IDS = (process.env.GUILD_IDS || process.env.GUILD_ID || DEV_GUILD_ID)
+  .split(',')
+  .map(id => id.trim())
+  .filter(Boolean);
 const USE_GLOBAL_COMMANDS = true;
 
 // Legacy fallback IDs for your original server.
@@ -1397,8 +1401,16 @@ async function registerCommands() {
     Routes.applicationCommands(CLIENT_ID),
     { body: commands }
   );
-
   console.log('Global commands synced:', commands.length);
+
+  for (const guildId of COMMAND_GUILD_IDS) {
+    console.log('Registering guild commands for:', guildId);
+    await rest.put(
+      Routes.applicationGuildCommands(CLIENT_ID, guildId),
+      { body: commands }
+    );
+    console.log('Guild commands synced for', guildId + ':', commands.length);
+  }
 }
 
 async function getLeagueByName(guildId, leagueName) {
