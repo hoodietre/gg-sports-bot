@@ -591,6 +591,16 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sportsbook_panels (
+      guild_id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS assigned_staff_user_id TEXT`);
 
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
@@ -1112,6 +1122,11 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('mybets')
       .setDescription('View your recent sportsbook bets'),
+
+    new SlashCommandBuilder()
+      .setName('setupsportsbookpanel')
+      .setDescription('Staff: create or refresh the live sportsbook board')
+      .addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -3938,6 +3953,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'setupsportsbookpanel') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set up the sportsbook board.', ephemeral: true });
+        return;
+      }
+
+      const channel = interaction.options.getChannel('channel') || interaction.channel;
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that sportsbook channel.', ephemeral: true });
+        return;
+      }
+
+      const message = await channel.send({ embeds: [await buildSportsbookPanelEmbed(interaction.guild.id)] });
+      await saveSportsbookPanel(interaction.guild.id, channel.id, message.id);
+      await interaction.reply({ content: 'Sportsbook board created in ' + channel.toString() + '.', ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'createsportsbookgame') {
       if (!interaction.guild) return;
       if (!(await userCanUseLeagueSetup(interaction, league))) {
@@ -3970,6 +4007,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id]
       );
 
+      await updateSportsbookPanel(interaction.guild);
       await interaction.reply({ content: 'Sportsbook game created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**.', ephemeral: true });
       return;
     }
@@ -4030,6 +4068,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+      await updateSportsbookPanel(interaction.guild);
       await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
       return;
     }
@@ -4085,6 +4124,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+      await updateSportsbookPanel(interaction.guild);
       await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**.', ephemeral: true });
       return;
     }
@@ -6161,6 +6201,79 @@ function buildSportsbookEmbed(settings, rows) {
 
   embed.setDescription(lines.join(NL + NL));
   return embed;
+}
+
+async function buildSportsbookPanelEmbed(guildId) {
+  const NL = String.fromCharCode(10);
+  const openResult = await pool.query(
+    `SELECT g.*,
+       COALESCE(SUM(b.amount), 0)::int AS total_handle,
+       COUNT(b.id)::int AS bet_count
+     FROM sportsbook_games g
+     LEFT JOIN sportsbook_bets b ON b.sportsbook_game_id = g.id
+     WHERE g.guild_id = $1 AND g.status = 'open'
+     GROUP BY g.id
+     ORDER BY g.created_at DESC
+     LIMIT 10`,
+    [guildId]
+  );
+
+  const recentResult = await pool.query(
+    `SELECT * FROM sportsbook_games
+     WHERE guild_id = $1 AND status = 'settled'
+     ORDER BY settled_at DESC NULLS LAST
+     LIMIT 5`,
+    [guildId]
+  );
+
+  const openLines = openResult.rows.length
+    ? openResult.rows.map(row => {
+        return '**' + shortSportsbookId(row.id) + ' • ' + row.game_label + '**' + NL +
+          row.away_label + ' ML ' + row.away_odds + ' vs ' + row.home_label + ' ML ' + row.home_odds + NL +
+          'Bets: ' + row.bet_count + ' • Handle: ' + row.total_handle;
+      }).join(NL + NL)
+    : 'No open sportsbook lines.';
+
+  const recentLines = recentResult.rows.length
+    ? recentResult.rows.map(row => {
+        const winnerLabel = row.winner_side === 'home' ? row.home_label : row.away_label;
+        return '**' + row.game_label + '** — Winner: ' + winnerLabel;
+      }).join(NL)
+    : 'No settled results yet.';
+
+  return new EmbedBuilder()
+    .setTitle('📈 Live Sportsbook Board')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Open Lines', value: openLines.slice(0, 3000), inline: false },
+      { name: 'Recent Results', value: recentLines.slice(0, 1000), inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Live Sportsbook Board' })
+    .setTimestamp();
+}
+
+async function saveSportsbookPanel(guildId, channelId, messageId) {
+  await pool.query(
+    `INSERT INTO sportsbook_panels (guild_id, channel_id, message_id, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (guild_id)
+     DO UPDATE SET channel_id = $2, message_id = $3, updated_at = NOW()`,
+    [guildId, channelId, messageId]
+  );
+}
+
+async function updateSportsbookPanel(guild) {
+  const panelResult = await pool.query(
+    `SELECT channel_id, message_id FROM sportsbook_panels WHERE guild_id = $1`,
+    [guild.id]
+  );
+
+  if (!panelResult.rows.length) return;
+  const channel = await guild.channels.fetch(panelResult.rows[0].channel_id).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+  const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
+  if (!message) return;
+  await message.edit({ embeds: [await buildSportsbookPanelEmbed(guild.id)] }).catch(() => null);
 }
 
 function buildMyBetsEmbed(settings, rows) {
