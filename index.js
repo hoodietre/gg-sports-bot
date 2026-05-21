@@ -1038,6 +1038,12 @@ function buildCommands() {
       .addStringOption(o => o.setName('details').setDescription('Why should this game be reset?').setRequired(false)),
 
     new SlashCommandBuilder()
+      .setName('gameissuelog')
+      .setDescription('Staff: view lagout/quit/reset review decisions')
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false))
+      .addStringOption(o => o.setName('decision').setDescription('approved or denied').setRequired(false)),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -3672,6 +3678,76 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'gameissuelog') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to view the game issue log.', ephemeral: true });
+        return;
+      }
+
+      const requestedLeagueName = interaction.options.getString('league');
+      const decision = interaction.options.getString('decision');
+      const allowedDecisions = ['approved', 'denied'];
+
+      if (decision && !allowedDecisions.includes(decision)) {
+        await interaction.reply({ content: 'Decision must be approved or denied.', ephemeral: true });
+        return;
+      }
+
+      let activeLeague = null;
+      if (requestedLeagueName) {
+        activeLeague = await getLeagueByName(interaction.guild.id, requestedLeagueName);
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + requestedLeagueName + '**.', ephemeral: true });
+          return;
+        }
+      }
+
+      let result;
+      if (activeLeague && decision) {
+        result = await pool.query(
+          `SELECT * FROM support_tickets
+           WHERE guild_id = $1 AND league_id = $2 AND ticket_type = 'gamerequest'
+             AND request_action IN ('lagout', 'quit', 'reset')
+             AND review_decision = $3
+           ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
+           LIMIT 25`,
+          [interaction.guild.id, activeLeague.league_id, decision]
+        );
+      } else if (activeLeague) {
+        result = await pool.query(
+          `SELECT * FROM support_tickets
+           WHERE guild_id = $1 AND league_id = $2 AND ticket_type = 'gamerequest'
+             AND request_action IN ('lagout', 'quit', 'reset')
+           ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
+           LIMIT 25`,
+          [interaction.guild.id, activeLeague.league_id]
+        );
+      } else if (decision) {
+        result = await pool.query(
+          `SELECT * FROM support_tickets
+           WHERE guild_id = $1 AND ticket_type = 'gamerequest'
+             AND request_action IN ('lagout', 'quit', 'reset')
+             AND review_decision = $2
+           ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
+           LIMIT 25`,
+          [interaction.guild.id, decision]
+        );
+      } else {
+        result = await pool.query(
+          `SELECT * FROM support_tickets
+           WHERE guild_id = $1 AND ticket_type = 'gamerequest'
+             AND request_action IN ('lagout', 'quit', 'reset')
+           ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
+           LIMIT 25`,
+          [interaction.guild.id]
+        );
+      }
+
+      await interaction.reply({ embeds: [buildGameIssueLogEmbed(result.rows, activeLeague?.league_name || null, decision || null)], ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'lagoutrequest') {
       await openGameIssueTicket(interaction, 'lagout');
       return;
@@ -5495,6 +5571,36 @@ function buildTicketTranscriptEmbed(ticket, rows) {
 
   embed.setDescription(lines.join(NL + NL).slice(0, 4000));
   if (ticket.close_reason) embed.addFields({ name: 'Close Reason', value: ticket.close_reason, inline: false });
+  return embed;
+}
+
+async function buildGameIssueLogEmbed(rows, leagueName = null, decision = null) {
+  const NL = String.fromCharCode(10);
+  const titleParts = ['Game Issue Review Log'];
+  if (leagueName) titleParts.push(leagueName);
+  if (decision) titleParts.push(decision);
+
+  const embed = new EmbedBuilder()
+    .setTitle(titleParts.join(' • '))
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Game Issue Review Log' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No game issue rulings found.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const gameText = row.game_id ? 'Game ' + row.game_id : 'No game ID';
+    const teamText = row.requested_team_role_id ? ' • Team <@&' + row.requested_team_role_id + '>' : '';
+    const opponentText = row.opponent_user_id ? ' • Opponent <@' + row.opponent_user_id + '>' : '';
+    const reviewerText = row.review_decision_by_user_id ? ' • Reviewed by <@' + row.review_decision_by_user_id + '>' : '';
+    const threadText = row.thread_id ? ' • <#' + row.thread_id + '>' : '';
+    return '**' + shortTicketId(row.id) + '** — ' + (row.request_action || row.ticket_type) + ' • **' + (row.review_decision || 'pending') + '** • ' + gameText + teamText + opponentText + reviewerText + threadText;
+  });
+
+  embed.setDescription(lines.join(NL).slice(0, 4000));
   return embed;
 }
 
