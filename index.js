@@ -1815,10 +1815,96 @@ function buildTournamentMatchThreadEmbed(tournament, match) {
       { name: 'Match ID', value: shortMatchId(match.id), inline: true },
       { name: 'Player 1', value: p1, inline: false },
       { name: 'Player 2', value: p2, inline: false },
-      { name: 'How to Report', value: 'Staff can use `/reportmatch` with this Match ID after the game is completed.', inline: false }
+      { name: 'How to Report', value: 'Staff can click the winner button below, or use `/reportmatch` with this Match ID.', inline: false }
     )
     .setFooter({ text: 'GG Sports • Tournament Match Thread' })
     .setTimestamp();
+}
+
+function buildMatchWinnerButtons(match, disabled = false) {
+  const row = new ActionRowBuilder();
+
+  if (match.player1_user_id) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`tourney_match_winner:${match.id}:${match.player1_user_id}`)
+        .setLabel('Player 1 Won')
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(disabled)
+    );
+  }
+
+  if (match.player2_user_id) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`tourney_match_winner:${match.id}:${match.player2_user_id}`)
+        .setLabel('Player 2 Won')
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(disabled)
+    );
+  }
+
+  return row;
+}
+
+async function finalizeTournamentMatch(guild, match, winnerUserId, reportedByUserId) {
+  await pool.query(
+    `UPDATE tournament_matches SET winner_user_id = $1, status = 'final', reported_by_user_id = $2, updated_at = NOW() WHERE id = $3`,
+    [winnerUserId, reportedByUserId, match.id]
+  );
+
+  const allMatches = await getTournamentMatches(match.tournament_id);
+  const currentRoundMatches = allMatches.filter(m => Number(m.round_number) === Number(match.round_number));
+  const currentRoundComplete = currentRoundMatches.every(m => m.status === 'final' || m.status === 'bye' || m.winner_user_id);
+
+  if (!currentRoundComplete) {
+    const refreshedTournament = await findTournament(guild.id, match.tournament_name);
+    if (refreshedTournament) await updateTournamentPanel(guild, refreshedTournament);
+    return { complete: false, message: `Match reported. Winner: <@${winnerUserId}>.` };
+  }
+
+  const winners = currentRoundMatches
+    .map(m => ({
+      user_id: m.winner_user_id,
+      entry_name: m.winner_user_id === m.player1_user_id ? m.player1_entry_name : m.player2_entry_name,
+    }))
+    .filter(w => w.user_id);
+
+  if (winners.length === 1) {
+    await pool.query(`UPDATE tournaments SET status = 'completed', updated_at = NOW() WHERE id = $1`, [match.tournament_id]);
+    const settings = await getCurrencySettings(guild.id);
+    let payoutText = '';
+
+    if (Number(match.prize_pool) > 0) {
+      await addCurrency(guild.id, winners[0].user_id, Number(match.prize_pool), 'tournament_prize', `Won ${match.tournament_name}`, reportedByUserId);
+      payoutText = ` ${settings.currency_icon} <@${winners[0].user_id}> earned the prize pool of **${match.prize_pool} ${settings.currency_name}**.`;
+    }
+
+    const completedTournament = await findTournament(guild.id, match.tournament_name);
+    if (completedTournament) {
+      await pool.query(
+        `INSERT INTO tournament_history (id, guild_id, league_id, tournament_id, tournament_name, game, format, champion_user_id, prize_paid)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [randomUUID(), guild.id, completedTournament.league_id || null, match.tournament_id, match.tournament_name, completedTournament.game, completedTournament.format, winners[0].user_id, Number(match.prize_pool || 0)]
+      );
+      await updateTournamentPanel(guild, { ...completedTournament, status: 'completed' });
+    }
+
+    return { complete: true, message: `Tournament complete. Champion: <@${winners[0].user_id}>.${payoutText}` };
+  }
+
+  await createTournamentRound({ id: match.tournament_id, guild_id: guild.id }, winners, Number(match.round_number) + 1);
+  const refreshedTournament = await findTournament(guild.id, match.tournament_name);
+  if (refreshedTournament) {
+    const refreshedMatches = await getTournamentMatches(match.tournament_id);
+    await createMatchThreads(guild, refreshedTournament, refreshedMatches);
+    await updateTournamentPanel(guild, refreshedTournament);
+  }
+
+  return {
+    complete: true,
+    message: `Round ${match.round_number} complete. Round ${Number(match.round_number) + 1} has been generated.`,
+  };
 }
 
 async function createMatchThreads(guild, tournament, matches) {
@@ -1847,6 +1933,7 @@ async function createMatchThreads(guild, tournament, matches) {
     const starter = await channel.send({
       content: `<@${match.player1_user_id}> vs <@${match.player2_user_id}> — Tournament match created.`,
       embeds: [buildTournamentMatchThreadEmbed(tournament, match)],
+      components: [buildMatchWinnerButtons(match)],
       allowedMentions: { users: [match.player1_user_id, match.player2_user_id], roles: [] },
     });
 
@@ -1859,7 +1946,7 @@ async function createMatchThreads(guild, tournament, matches) {
 
     if (thread) {
       await thread.send({
-        content: `<@${match.player1_user_id}> <@${match.player2_user_id}> schedule/play your match here. Match ID: **${shortMatchId(match.id)}**`,
+        content: `<@${match.player1_user_id}> <@${match.player2_user_id}> schedule/play your match here. Staff can click the winner button on the match post, or use Match ID: **${shortMatchId(match.id)}**`,
         allowedMentions: { users: [match.player1_user_id, match.player2_user_id], roles: [] },
       }).catch(() => null);
 
@@ -2215,6 +2302,57 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('tourney_match_winner:')) {
+        if (!interaction.guild) {
+          await interaction.reply({ content: 'Tournament buttons must be used inside the server.', ephemeral: true });
+          return;
+        }
+
+        const [, matchId, winnerUserId] = interaction.customId.split(':');
+        const matchResult = await pool.query(
+          `SELECT m.*, t.tournament_name, t.prize_pool
+           FROM tournament_matches m
+           JOIN tournaments t ON t.id = m.tournament_id
+           WHERE m.id = $1`,
+          [matchId]
+        );
+
+        if (!matchResult.rows.length) {
+          await interaction.reply({ content: 'Could not find that tournament match.', ephemeral: true });
+          return;
+        }
+
+        const match = matchResult.rows[0];
+        const tournament = await findTournament(interaction.guild.id, match.tournament_name);
+        const activeLeague = tournament?.league_id ? await getLeagueById(tournament.league_id) : await resolveLeague(interaction);
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+
+        if (!(await memberHasStaff(member, activeLeague))) {
+          await interaction.reply({ content: 'Only staff/admins can confirm tournament match winners.', ephemeral: true });
+          return;
+        }
+
+        if (match.status === 'final') {
+          await interaction.reply({ content: 'That match is already final.', ephemeral: true });
+          return;
+        }
+
+        const validWinner = winnerUserId === match.player1_user_id || winnerUserId === match.player2_user_id;
+        if (!validWinner) {
+          await interaction.reply({ content: 'Winner must be one of the two users in that match.', ephemeral: true });
+          return;
+        }
+
+        const result = await finalizeTournamentMatch(interaction.guild, match, winnerUserId, interaction.user.id);
+
+        await interaction.update({
+          embeds: [buildTournamentMatchThreadEmbed(tournament || { tournament_name: match.tournament_name }, { ...match, winner_user_id: winnerUserId, status: 'final' })],
+          components: [buildMatchWinnerButtons(match, true)],
+        });
+
+        await interaction.followUp({ content: result.message, ephemeral: true });
+        return;
+      }
       if (interaction.customId.startsWith('offer_trade_panel_button')) {
         const [, leagueId] = interaction.customId.split(':');
         const league = leagueId && leagueId !== 'legacy' ? await getLeagueById(leagueId) : await resolveLeague(interaction);
@@ -3555,59 +3693,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      await pool.query(
-        `UPDATE tournament_matches SET winner_user_id = $1, status = 'final', reported_by_user_id = $2, updated_at = NOW() WHERE id = $3`,
-        [winner.id, interaction.user.id, match.id]
-      );
-
-      const tournament = await findTournament(interaction.guild.id, match.tournament_name);
-      const allMatches = await getTournamentMatches(match.tournament_id);
-      const currentRoundMatches = allMatches.filter(m => Number(m.round_number) === Number(match.round_number));
-      const currentRoundComplete = currentRoundMatches.every(m => m.status === 'final' || m.status === 'bye' || m.winner_user_id);
-
-      if (!currentRoundComplete) {
-        const refreshedTournament = await findTournament(interaction.guild.id, match.tournament_name);
-        if (refreshedTournament) await updateTournamentPanel(interaction.guild, refreshedTournament);
-        await interaction.reply({ content: `Match reported. Winner: ${winner}.`, ephemeral: true });
-        return;
-      }
-
-      const winners = currentRoundMatches
-        .map(m => ({ user_id: m.winner_user_id, entry_name: m.winner_user_id === m.player1_user_id ? m.player1_entry_name : m.player2_entry_name }))
-        .filter(w => w.user_id);
-
-      if (winners.length === 1) {
-        await pool.query(`UPDATE tournaments SET status = 'completed', updated_at = NOW() WHERE id = $1`, [match.tournament_id]);
-        const settings = await getCurrencySettings(interaction.guild.id);
-        let payoutText = '';
-
-        if (Number(match.prize_pool) > 0) {
-          await addCurrency(interaction.guild.id, winners[0].user_id, Number(match.prize_pool), 'tournament_prize', `Won ${match.tournament_name}`, interaction.user.id);
-          payoutText = ` ${settings.currency_icon} <@${winners[0].user_id}> earned the prize pool of **${match.prize_pool} ${settings.currency_name}**.`;
-        }
-
-        const completedTournament = await findTournament(interaction.guild.id, match.tournament_name);
-        if (completedTournament) {
-          await pool.query(
-            `INSERT INTO tournament_history (id, guild_id, league_id, tournament_id, tournament_name, game, format, champion_user_id, prize_paid)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [randomUUID(), interaction.guild.id, completedTournament.league_id || null, match.tournament_id, match.tournament_name, completedTournament.game, completedTournament.format, winners[0].user_id, Number(match.prize_pool || 0)]
-          );
-          await updateTournamentPanel(interaction.guild, { ...completedTournament, status: 'completed' });
-        }
-
-        await interaction.reply({ content: `Tournament complete. Champion: <@${winners[0].user_id}>.${payoutText}`, ephemeral: true });
-        return;
-      }
-
-      await createTournamentRound({ id: match.tournament_id, guild_id: interaction.guild.id }, winners, Number(match.round_number) + 1);
-      const refreshedTournament = await findTournament(interaction.guild.id, match.tournament_name);
-      if (refreshedTournament) {
-        const refreshedMatches = await getTournamentMatches(match.tournament_id);
-        await createMatchThreads(interaction.guild, refreshedTournament, refreshedMatches);
-        await updateTournamentPanel(interaction.guild, refreshedTournament);
-      }
-      await interaction.reply({ content: `Round ${match.round_number} complete. Round ${Number(match.round_number) + 1} has been generated.`, ephemeral: true });
+      const result = await finalizeTournamentMatch(interaction.guild, match, winner.id, interaction.user.id);
+      await interaction.reply({ content: result.message, ephemeral: true });
       return;
     }
 
