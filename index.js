@@ -2765,6 +2765,63 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.followUp({ content: result.message, ephemeral: true });
         return;
       }
+      if (interaction.customId.startsWith('ticket_review_approve:') || interaction.customId.startsWith('ticket_review_deny:')) {
+        if (!interaction.guild) return;
+
+        const isApproved = interaction.customId.startsWith('ticket_review_approve:');
+        const ticketId = interaction.customId.split(':')[1];
+        const ticketResult = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id = $2 LIMIT 1`,
+          [interaction.guild.id, ticketId]
+        );
+
+        if (!ticketResult.rows.length) {
+          await interaction.reply({ content: 'Could not find that ticket.', ephemeral: true });
+          return;
+        }
+
+        const ticket = ticketResult.rows[0];
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        const reviewer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const isStaff = reviewer ? await memberHasStaff(reviewer, activeLeague) : false;
+
+        if (!isStaff) {
+          await interaction.reply({ content: 'Only staff/admins can approve or deny game issue requests.', ephemeral: true });
+          return;
+        }
+
+        if (ticket.review_decision) {
+          await interaction.reply({ content: 'This request already has a decision: **' + ticket.review_decision + '**.', ephemeral: true });
+          return;
+        }
+
+        const decision = isApproved ? 'approved' : 'denied';
+        await pool.query(
+          `UPDATE support_tickets
+           SET review_decision = $1,
+               review_decision_by_user_id = $2,
+               review_decision_at = NOW(),
+               status = 'resolved'
+           WHERE id = $3`,
+          [decision, interaction.user.id, ticket.id]
+        );
+
+        await updateTicketPanel(interaction.guild);
+
+        await interaction.update({
+          content: 'Request **' + decision + '** by <@' + interaction.user.id + '>.',
+          components: [buildTicketReviewButtons(ticket.id, true)],
+        });
+
+        if (interaction.channel?.isTextBased()) {
+          await interaction.channel.send({
+            content: 'Decision recorded: **' + decision + '** by <@' + interaction.user.id + '>. Use `/closeticket` when the review is fully complete.',
+            allowedMentions: { users: [interaction.user.id], roles: [] },
+          }).catch(() => null);
+        }
+        return;
+      }
+
       if (interaction.customId.startsWith('offer_trade_panel_button')) {
         const [, leagueId] = interaction.customId.split(':');
         const league = leagueId && leagueId !== 'legacy' ? await getLeagueById(leagueId) : await resolveLeague(interaction);
@@ -3265,7 +3322,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'gamerequest') {
-      await openSupportTicket(interaction, 'gamerequest');
+      interaction.ggSportsReviewButtons = true;
+  await openSupportTicket(interaction, 'gamerequest');
+  delete interaction.ggSportsReviewButtons;
       return;
     }
 
@@ -5262,6 +5321,21 @@ function buildTicketEmbed({ type, subject, description, creator }) {
     .setTimestamp();
 }
 
+function buildTicketReviewButtons(ticketId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('ticket_review_approve:' + ticketId)
+      .setLabel('Approve Request')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+    new ButtonBuilder()
+      .setCustomId('ticket_review_deny:' + ticketId)
+      .setLabel('Deny Request')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled)
+  );
+}
+
 function shortTicketId(ticketId) {
   return String(ticketId || '').split('-')[0];
 }
@@ -5510,6 +5584,8 @@ async function openGameIssueTicket(interaction, ticketType) {
 async function openSupportTicket(interaction, ticketType) {
   if (!interaction.guild) return;
 
+  const shouldAddReviewButtons = interaction.ggSportsReviewButtons === true;
+
   const subject = interaction.options.getString('subject');
   const description = interaction.options.getString('description');
   const leagueName = interaction.options.getString('league');
@@ -5537,14 +5613,16 @@ async function openSupportTicket(interaction, ticketType) {
   const threadName = (ticketType + '-' + interaction.user.username + '-' + safeSubject).slice(0, 90);
   const staffRoleId = activeLeague?.staff_role_id || null;
 
-  const starter = await baseChannel.send({
+  const starterPayload = {
     content: '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (staffRoleId ? ' <@&' + staffRoleId + '>' : ''),
     embeds: [buildTicketEmbed({ type: ticketType, subject, description, creator: interaction.user })],
     allowedMentions: {
       users: [interaction.user.id],
       roles: staffRoleId ? [staffRoleId] : [],
     },
-  });
+  };
+
+  const starter = await baseChannel.send(starterPayload);
 
   const thread = await starter.startThread({
     name: threadName,
@@ -5576,6 +5654,13 @@ async function openSupportTicket(interaction, ticketType) {
     channelId: baseChannel.id,
     threadId: thread.id,
   });
+
+  if (shouldAddReviewButtons) {
+    await thread.send({
+      content: 'Staff review action required for this game issue request.',
+      components: [buildTicketReviewButtons(ticketId)],
+    }).catch(() => null);
+  }
 
   await updateTicketPanel(interaction.guild);
   await interaction.reply({ content: 'Ticket opened: ' + thread.toString() + '. Ticket ID: **' + ticketId.split('-')[0] + '**', ephemeral: true });
