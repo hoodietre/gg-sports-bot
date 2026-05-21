@@ -557,6 +557,40 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sportsbook_games (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE SET NULL,
+      game_label TEXT NOT NULL,
+      home_label TEXT NOT NULL,
+      away_label TEXT NOT NULL,
+      home_odds INTEGER NOT NULL DEFAULT -110,
+      away_odds INTEGER NOT NULL DEFAULT -110,
+      status TEXT NOT NULL DEFAULT 'open',
+      winner_side TEXT,
+      created_by_user_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      settled_at TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sportsbook_bets (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      sportsbook_game_id UUID REFERENCES sportsbook_games(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      side TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      odds INTEGER NOT NULL,
+      potential_payout INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      settled_at TIMESTAMP
+    )
+  `);
+
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS assigned_staff_user_id TEXT`);
 
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
@@ -1047,6 +1081,37 @@ function buildCommands() {
       .setDescription('Staff: view lagout/quit/reset review decisions')
       .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false))
       .addStringOption(o => o.setName('decision').setDescription('approved or denied').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('createsportsbookgame')
+      .setDescription('Staff: create a sportsbook moneyline game')
+      .addStringOption(o => o.setName('label').setDescription('Game label, ex: Lakers vs Celtics').setRequired(true))
+      .addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true))
+      .addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true))
+      .addIntegerOption(o => o.setName('home_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
+      .addIntegerOption(o => o.setName('away_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('sportsbook')
+      .setDescription('View open sportsbook games'),
+
+    new SlashCommandBuilder()
+      .setName('placebet')
+      .setDescription('Place a moneyline bet')
+      .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+      .addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true))
+      .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('settlebet')
+      .setDescription('Staff: settle a sportsbook game')
+      .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+      .addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('mybets')
+      .setDescription('View your recent sportsbook bets'),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -3873,6 +3938,173 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'createsportsbookgame') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to create sportsbook games.', ephemeral: true });
+        return;
+      }
+
+      const label = interaction.options.getString('label');
+      const home = interaction.options.getString('home');
+      const away = interaction.options.getString('away');
+      const homeOdds = interaction.options.getInteger('home_odds') ?? -110;
+      const awayOdds = interaction.options.getInteger('away_odds') ?? -110;
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+
+      if (leagueName && !activeLeague) {
+        await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+        return;
+      }
+
+      if (homeOdds === 0 || awayOdds === 0) {
+        await interaction.reply({ content: 'Odds cannot be 0. Use American odds like -110, -150, +120, or 120.', ephemeral: true });
+        return;
+      }
+
+      const sportsbookGameId = randomUUID();
+      await pool.query(
+        `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id]
+      );
+
+      await interaction.reply({ content: 'Sportsbook game created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**.', ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'sportsbook') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 20`,
+        [interaction.guild.id]
+      );
+      await interaction.reply({ embeds: [buildSportsbookEmbed(settings, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'placebet') {
+      if (!interaction.guild) return;
+      const gameInput = interaction.options.getString('game_id');
+      const side = interaction.options.getString('side');
+      const amount = interaction.options.getInteger('amount');
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (!['home', 'away'].includes(side)) {
+        await interaction.reply({ content: 'Side must be home or away.', ephemeral: true });
+        return;
+      }
+
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.reply({ content: 'Bet amount must be greater than 0.', ephemeral: true });
+        return;
+      }
+
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+      if (!sportsbookGame) {
+        await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true });
+        return;
+      }
+
+      if (sportsbookGame.status !== 'open') {
+        await interaction.reply({ content: 'That sportsbook game is not open for betting.', ephemeral: true });
+        return;
+      }
+
+      const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
+      const payout = calculateAmericanOddsPayout(amount, odds);
+      const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
+
+      if (!removed) {
+        await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to place that bet.', ephemeral: true });
+        return;
+      }
+
+      const betId = randomUUID();
+      await pool.query(
+        `INSERT INTO sportsbook_bets (id, guild_id, sportsbook_game_id, user_id, side, amount, odds, potential_payout)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [betId, interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
+      );
+
+      const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+      await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'settlebet') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to settle sportsbook games.', ephemeral: true });
+        return;
+      }
+
+      const gameInput = interaction.options.getString('game_id');
+      const winner = interaction.options.getString('winner');
+      if (!['home', 'away'].includes(winner)) {
+        await interaction.reply({ content: 'Winner must be home or away.', ephemeral: true });
+        return;
+      }
+
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+      if (!sportsbookGame) {
+        await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true });
+        return;
+      }
+
+      if (sportsbookGame.status !== 'open') {
+        await interaction.reply({ content: 'That sportsbook game has already been settled or closed.', ephemeral: true });
+        return;
+      }
+
+      const bets = await pool.query(
+        `SELECT * FROM sportsbook_bets WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+        [interaction.guild.id, sportsbookGame.id]
+      );
+
+      let winners = 0;
+      let losers = 0;
+      let totalPaid = 0;
+      for (const bet of bets.rows) {
+        if (bet.side === winner) {
+          await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, interaction.user.id);
+          await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
+          winners += 1;
+          totalPaid += Number(bet.potential_payout);
+        } else {
+          await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
+          losers += 1;
+        }
+      }
+
+      await pool.query(
+        `UPDATE sportsbook_games SET status = 'settled', winner_side = $1, settled_at = NOW() WHERE id = $2`,
+        [winner, sportsbookGame.id]
+      );
+
+      const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+      await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**.', ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'mybets') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT b.*, g.game_label, g.home_label, g.away_label
+         FROM sportsbook_bets b
+         JOIN sportsbook_games g ON g.id = b.sportsbook_game_id
+         WHERE b.guild_id = $1 AND b.user_id = $2
+         ORDER BY b.created_at DESC
+         LIMIT 15`,
+        [interaction.guild.id, interaction.user.id]
+      );
+      await interaction.reply({ embeds: [buildMyBetsEmbed(settings, result.rows)], ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'setupstandings') {
       if (!interaction.guild) return;
       const leagueName = interaction.options.getString('league');
@@ -5894,6 +6126,75 @@ async function updateTicketPanel(guild) {
   const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
   if (!message) return;
   await message.edit({ embeds: [await buildTicketDashboardEmbed(guild.id)], components: [buildTicketDashboardButtons()] }).catch(() => null);
+}
+
+function shortSportsbookId(gameId) {
+  return String(gameId || '').split('-')[0];
+}
+
+function calculateAmericanOddsPayout(amount, odds) {
+  const stake = Number(amount);
+  const americanOdds = Number(odds);
+  if (!Number.isInteger(stake) || stake <= 0 || !Number.isInteger(americanOdds) || americanOdds === 0) return 0;
+  if (americanOdds > 0) return stake + Math.floor((stake * americanOdds) / 100);
+  return stake + Math.floor((stake * 100) / Math.abs(americanOdds));
+}
+
+function buildSportsbookEmbed(settings, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Sportsbook')
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • Sportsbook' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No open sportsbook games right now.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    return '**' + shortSportsbookId(row.id) + ' • ' + row.game_label + '**' + NL +
+      row.away_label + ' ML ' + row.away_odds + ' vs ' + row.home_label + ' ML ' + row.home_odds + NL +
+      'Status: **' + row.status + '** • Bet with `/placebet`';
+  });
+
+  embed.setDescription(lines.join(NL + NL));
+  return embed;
+}
+
+function buildMyBetsEmbed(settings, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('My Sportsbook Bets')
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • My Bets' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No recent bets found.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const sideLabel = row.side === 'home' ? row.home_label : row.away_label;
+    return '**' + shortSportsbookId(row.id) + '** — ' + row.game_label + ' • ' + sideLabel + ' ML ' + row.odds + NL +
+      'Stake: ' + settings.currency_icon + ' ' + row.amount + ' • Potential payout: ' + settings.currency_icon + ' ' + row.potential_payout + ' • ' + row.status;
+  });
+
+  embed.setDescription(lines.join(NL + NL));
+  return embed;
+}
+
+async function findSportsbookGame(guildId, input) {
+  const result = await pool.query(
+    `SELECT * FROM sportsbook_games
+     WHERE guild_id = $1 AND (id::text LIKE $2 OR LOWER(game_label) = LOWER($3))
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [guildId, input + '%', input]
+  );
+  return result.rows[0] || null;
 }
 
 async function applyApprovedGameIssue(ticket, reviewerUserId) {
