@@ -520,6 +520,16 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_panels (
+      guild_id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS ticket_evidence (
       id UUID PRIMARY KEY,
       ticket_id UUID REFERENCES support_tickets(id) ON DELETE CASCADE,
@@ -980,6 +990,11 @@ function buildCommands() {
       .setDescription('Staff: update a ticket priority')
       .addStringOption(o => o.setName('priority').setDescription('low, normal, high, urgent').setRequired(true))
       .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('setupticketpanel')
+      .setDescription('Staff: create or refresh the live ticket dashboard panel')
+      .addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -3255,8 +3270,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (closeReason) {
         await pool.query(`UPDATE support_tickets SET close_reason = $1 WHERE id = $2`, [closeReason, ticket.id]);
       }
+      await updateTicketPanel(interaction.guild);
       await interaction.reply({ content: 'Ticket closed. Transcript saved. This thread will be archived.' + (closeReason ? ' Reason: ' + closeReason : ''), ephemeral: false });
       await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
+      return;
+    }
+
+    if (interaction.commandName === 'setupticketpanel') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set up the ticket dashboard.', ephemeral: true });
+        return;
+      }
+
+      const channel = interaction.options.getChannel('channel') || interaction.channel;
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that dashboard channel.', ephemeral: true });
+        return;
+      }
+
+      const message = await channel.send({ embeds: [await buildTicketDashboardEmbed(interaction.guild.id)] });
+      await saveTicketPanel(interaction.guild.id, channel.id, message.id);
+      await interaction.reply({ content: 'Ticket dashboard panel created in ' + channel.toString() + '.', ephemeral: true });
       return;
     }
 
@@ -3359,6 +3397,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         [interaction.user.id, ticket.id]
       );
 
+      await updateTicketPanel(interaction.guild);
       await interaction.reply({ content: '<@' + interaction.user.id + '> has claimed this ticket.', ephemeral: false });
       return;
     }
@@ -3433,6 +3472,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       await pool.query(`UPDATE support_tickets SET status = $1 WHERE id = $2`, [status, ticket.id]);
+      await updateTicketPanel(interaction.guild);
       await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** status set to **' + status + '**.', ephemeral: false });
       return;
     }
@@ -3474,6 +3514,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       await pool.query(`UPDATE support_tickets SET priority = $1 WHERE id = $2`, [priority, ticket.id]);
+      await updateTicketPanel(interaction.guild);
       await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** priority set to **' + priority + '**.', ephemeral: false });
       return;
     }
@@ -5313,6 +5354,75 @@ function buildTicketTranscriptEmbed(ticket, rows) {
   return embed;
 }
 
+async function buildTicketDashboardEmbed(guildId) {
+  const summary = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status != 'closed')::int AS active_count,
+       COUNT(*) FILTER (WHERE status = 'open')::int AS open_count,
+       COUNT(*) FILTER (WHERE priority IN ('high', 'urgent') AND status != 'closed')::int AS high_priority_count,
+       COUNT(*) FILTER (WHERE assigned_staff_user_id IS NULL AND status != 'closed')::int AS unclaimed_count,
+       COUNT(*) FILTER (WHERE assigned_staff_user_id IS NOT NULL AND status != 'closed')::int AS claimed_count
+     FROM support_tickets
+     WHERE guild_id = $1`,
+    [guildId]
+  );
+
+  const latest = await pool.query(
+    `SELECT * FROM support_tickets
+     WHERE guild_id = $1 AND status != 'closed'
+     ORDER BY created_at DESC
+     LIMIT 8`,
+    [guildId]
+  );
+
+  const row = summary.rows[0] || {};
+  const NL = String.fromCharCode(10);
+  const latestText = latest.rows.length
+    ? latest.rows.map(ticket => {
+        const assigned = ticket.assigned_staff_user_id ? ' • <@' + ticket.assigned_staff_user_id + '>' : ' • Unclaimed';
+        return '**' + shortTicketId(ticket.id) + '** — ' + ticket.ticket_type + ' • ' + ticket.priority + ' • ' + ticket.status + assigned;
+      }).join(NL)
+    : 'No active tickets.';
+
+  return new EmbedBuilder()
+    .setTitle('🎫 Ticket Dashboard')
+    .setColor(0xffcc00)
+    .addFields(
+      { name: 'Active', value: String(row.active_count || 0), inline: true },
+      { name: 'Open', value: String(row.open_count || 0), inline: true },
+      { name: 'High/Urgent', value: String(row.high_priority_count || 0), inline: true },
+      { name: 'Claimed', value: String(row.claimed_count || 0), inline: true },
+      { name: 'Unclaimed', value: String(row.unclaimed_count || 0), inline: true },
+      { name: 'Latest Active Tickets', value: latestText, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Live Ticket Dashboard' })
+    .setTimestamp();
+}
+
+async function saveTicketPanel(guildId, channelId, messageId) {
+  await pool.query(
+    `INSERT INTO ticket_panels (guild_id, channel_id, message_id, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (guild_id)
+     DO UPDATE SET channel_id = $2, message_id = $3, updated_at = NOW()`,
+    [guildId, channelId, messageId]
+  );
+}
+
+async function updateTicketPanel(guild) {
+  const panelResult = await pool.query(
+    `SELECT channel_id, message_id FROM ticket_panels WHERE guild_id = $1`,
+    [guild.id]
+  );
+
+  if (!panelResult.rows.length) return;
+  const channel = await guild.channels.fetch(panelResult.rows[0].channel_id).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+  const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
+  if (!message) return;
+  await message.edit({ embeds: [await buildTicketDashboardEmbed(guild.id)] }).catch(() => null);
+}
+
 async function openSupportTicket(interaction, ticketType) {
   if (!interaction.guild) return;
 
@@ -5383,6 +5493,7 @@ async function openSupportTicket(interaction, ticketType) {
     threadId: thread.id,
   });
 
+  await updateTicketPanel(interaction.guild);
   await interaction.reply({ content: 'Ticket opened: ' + thread.toString() + '. Ticket ID: **' + ticketId.split('-')[0] + '**', ephemeral: true });
 }
 
