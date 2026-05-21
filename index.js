@@ -492,6 +492,7 @@ async function initDatabase() {
       subject TEXT NOT NULL,
       description TEXT,
       status TEXT NOT NULL DEFAULT 'open',
+      priority TEXT NOT NULL DEFAULT 'normal',
       channel_id TEXT,
       thread_id TEXT,
       assigned_staff_user_id TEXT,
@@ -502,6 +503,7 @@ async function initDatabase() {
   `);
 
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS close_reason TEXT`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal'`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ticket_transcripts (
@@ -944,8 +946,9 @@ function buildCommands() {
 
     new SlashCommandBuilder()
       .setName('tickets')
-      .setDescription('Staff: list tickets by status')
-      .addStringOption(o => o.setName('status').setDescription('open or closed').setRequired(false)),
+      .setDescription('Staff: list tickets by status/priority')
+      .addStringOption(o => o.setName('status').setDescription('open, pending, reviewing, resolved, closed').setRequired(false))
+      .addStringOption(o => o.setName('priority').setDescription('low, normal, high, urgent').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('ticketinfo')
@@ -965,6 +968,18 @@ function buildCommands() {
       .setName('tickettranscript')
       .setDescription('Show saved transcript for a closed ticket')
       .addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('setticketstatus')
+      .setDescription('Staff: update a ticket status')
+      .addStringOption(o => o.setName('status').setDescription('open, pending, reviewing, resolved, closed').setRequired(true))
+      .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('setticketpriority')
+      .setDescription('Staff: update a ticket priority')
+      .addStringOption(o => o.setName('priority').setDescription('low, normal, high, urgent').setRequired(true))
+      .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -3253,18 +3268,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       const status = interaction.options.getString('status') || 'open';
-      if (!['open', 'closed'].includes(status)) {
-        await interaction.reply({ content: 'Status must be open or closed.', ephemeral: true });
+      const priority = interaction.options.getString('priority');
+      const allowedStatuses = ['open', 'pending', 'reviewing', 'resolved', 'closed'];
+      const allowedPriorities = ['low', 'normal', 'high', 'urgent'];
+
+      if (!allowedStatuses.includes(status)) {
+        await interaction.reply({ content: 'Status must be one of: open, pending, reviewing, resolved, closed.', ephemeral: true });
         return;
       }
 
-      const result = await pool.query(
-        `SELECT * FROM support_tickets
-         WHERE guild_id = $1 AND status = $2
-         ORDER BY created_at DESC
-         LIMIT 20`,
-        [interaction.guild.id, status]
-      );
+      if (priority && !allowedPriorities.includes(priority)) {
+        await interaction.reply({ content: 'Priority must be one of: low, normal, high, urgent.', ephemeral: true });
+        return;
+      }
+
+      const result = priority
+        ? await pool.query(
+            `SELECT * FROM support_tickets
+             WHERE guild_id = $1 AND status = $2 AND priority = $3
+             ORDER BY created_at DESC
+             LIMIT 20`,
+            [interaction.guild.id, status, priority]
+          )
+        : await pool.query(
+            `SELECT * FROM support_tickets
+             WHERE guild_id = $1 AND status = $2
+             ORDER BY created_at DESC
+             LIMIT 20`,
+            [interaction.guild.id, status]
+          );
 
       await interaction.reply({ embeds: [buildTicketsEmbed(result.rows, status)], ephemeral: true });
       return;
@@ -3361,6 +3393,88 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.reply({ embeds: [buildTicketTranscriptEmbed(ticket, transcriptResult.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'setticketstatus') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to update ticket status.', ephemeral: true });
+        return;
+      }
+
+      const status = interaction.options.getString('status');
+      const ticketInput = interaction.options.getString('ticket_id');
+      const allowedStatuses = ['open', 'pending', 'reviewing', 'resolved', 'closed'];
+
+      if (!allowedStatuses.includes(status)) {
+        await interaction.reply({ content: 'Status must be one of: open, pending, reviewing, resolved, closed.', ephemeral: true });
+        return;
+      }
+
+      let ticket = null;
+      if (ticketInput) {
+        const result = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, ticketInput + '%']
+        );
+        ticket = result.rows[0] || null;
+      } else if (interaction.channel?.isThread()) {
+        const result = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, interaction.channel.id]
+        );
+        ticket = result.rows[0] || null;
+      }
+
+      if (!ticket) {
+        await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(`UPDATE support_tickets SET status = $1 WHERE id = $2`, [status, ticket.id]);
+      await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** status set to **' + status + '**.', ephemeral: false });
+      return;
+    }
+
+    if (interaction.commandName === 'setticketpriority') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to update ticket priority.', ephemeral: true });
+        return;
+      }
+
+      const priority = interaction.options.getString('priority');
+      const ticketInput = interaction.options.getString('ticket_id');
+      const allowedPriorities = ['low', 'normal', 'high', 'urgent'];
+
+      if (!allowedPriorities.includes(priority)) {
+        await interaction.reply({ content: 'Priority must be one of: low, normal, high, urgent.', ephemeral: true });
+        return;
+      }
+
+      let ticket = null;
+      if (ticketInput) {
+        const result = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, ticketInput + '%']
+        );
+        ticket = result.rows[0] || null;
+      } else if (interaction.channel?.isThread()) {
+        const result = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, interaction.channel.id]
+        );
+        ticket = result.rows[0] || null;
+      }
+
+      if (!ticket) {
+        await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(`UPDATE support_tickets SET priority = $1 WHERE id = $2`, [priority, ticket.id]);
+      await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** priority set to **' + priority + '**.', ephemeral: false });
       return;
     }
 
@@ -5079,7 +5193,7 @@ function buildTicketsEmbed(rows, status) {
   const lines = rows.map(row => {
     const assigned = row.assigned_staff_user_id ? ' • Claimed by <@' + row.assigned_staff_user_id + '>' : '';
     const thread = row.thread_id ? ' • <#' + row.thread_id + '>' : '';
-    return '**' + shortTicketId(row.id) + '** — ' + row.ticket_type + ' • ' + row.subject + assigned + thread;
+    return '**' + shortTicketId(row.id) + '** — ' + row.ticket_type + ' • ' + row.subject + ' • ' + (row.priority || 'normal') + assigned + thread;
   });
 
   embed.setDescription(lines.join(NL));
@@ -5092,6 +5206,7 @@ function buildTicketInfoEmbed(row) {
     .setColor(row.status === 'open' ? 0xffcc00 : 0x57f287)
     .addFields(
       { name: 'Status', value: row.status || 'unknown', inline: true },
+      { name: 'Priority', value: row.priority || 'normal', inline: true },
       { name: 'Opened By', value: '<@' + row.user_id + '>', inline: true },
       { name: 'Claimed By', value: row.assigned_staff_user_id ? '<@' + row.assigned_staff_user_id + '>' : 'Unclaimed', inline: true },
       { name: 'Subject', value: row.subject || 'No subject', inline: false },
