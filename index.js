@@ -1202,37 +1202,46 @@ function buildCommands() {
       .addStringOption(o => o.setName('decision').setDescription('approved or denied').setRequired(false)),
 
     new SlashCommandBuilder()
-      .setName('createsportsbookgame')
-      .setDescription('Staff: create a sportsbook moneyline game')
-      .addStringOption(o => o.setName('label').setDescription('Game label, ex: Lakers vs Celtics').setRequired(true))
-      .addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true))
-      .addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true))
-      .addIntegerOption(o => o.setName('home_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
-      .addIntegerOption(o => o.setName('away_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
-      .addIntegerOption(o => o.setName('max_bet').setDescription('Optional max bet amount').setRequired(false))
-      .addIntegerOption(o => o.setName('max_payout').setDescription('Optional max payout per bet').setRequired(false))
-      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
-
-    new SlashCommandBuilder()
       .setName('sportsbook')
-      .setDescription('View open sportsbook games'),
-
-    new SlashCommandBuilder()
-      .setName('placebet')
-      .setDescription('Place a moneyline bet')
-      .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
-      .addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true))
-      .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('settlebet')
-      .setDescription('Staff: settle a sportsbook game')
-      .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
-      .addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('mybets')
-      .setDescription('View your recent sportsbook bets'),
+      .setDescription('Sportsbook commands')
+      .addSubcommand(sc => sc
+        .setName('create')
+        .setDescription('Staff: create a sportsbook moneyline game')
+        .addStringOption(o => o.setName('label').setDescription('Game label, ex: Lakers vs Celtics').setRequired(true))
+        .addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true))
+        .addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true))
+        .addIntegerOption(o => o.setName('home_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
+        .addIntegerOption(o => o.setName('away_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('board')
+        .setDescription('View open sportsbook games'))
+      .addSubcommand(sc => sc
+        .setName('place')
+        .setDescription('Place a moneyline bet')
+        .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+        .addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true))
+        .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('settle')
+        .setDescription('Staff: settle a sportsbook game')
+        .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+        .addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('mybets')
+        .setDescription('View your recent sportsbook bets'))
+      .addSubcommand(sc => sc
+        .setName('parlay')
+        .setDescription('Create a 2-4 leg sportsbook parlay')
+        .addIntegerOption(o => o.setName('amount').setDescription('Stake amount').setRequired(true))
+        .addStringOption(o => o.setName('leg1_game').setDescription('Leg 1 sportsbook game ID').setRequired(true))
+        .addStringOption(o => o.setName('leg1_side').setDescription('home or away').setRequired(true))
+        .addStringOption(o => o.setName('leg2_game').setDescription('Leg 2 sportsbook game ID').setRequired(true))
+        .addStringOption(o => o.setName('leg2_side').setDescription('home or away').setRequired(true))
+        .addStringOption(o => o.setName('leg3_game').setDescription('Optional leg 3 sportsbook game ID').setRequired(false))
+        .addStringOption(o => o.setName('leg3_side').setDescription('home or away').setRequired(false))
+        .addStringOption(o => o.setName('leg4_game').setDescription('Optional leg 4 sportsbook game ID').setRequired(false))
+        .addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('sportsbookline')
@@ -1307,20 +1316,7 @@ function buildCommands() {
       .setDescription('View championship history')
       .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
 
-    new SlashCommandBuilder()
-      .setName('createparlay')
-      .setDescription('Create a 2-4 leg sportsbook parlay')
-      .addIntegerOption(o => o.setName('amount').setDescription('Stake amount').setRequired(true))
-      .addStringOption(o => o.setName('leg1_game').setDescription('Leg 1 sportsbook game ID').setRequired(true))
-      .addStringOption(o => o.setName('leg1_side').setDescription('home or away').setRequired(true))
-      .addStringOption(o => o.setName('leg2_game').setDescription('Leg 2 sportsbook game ID').setRequired(true))
-      .addStringOption(o => o.setName('leg2_side').setDescription('home or away').setRequired(true))
-      .addStringOption(o => o.setName('leg3_game').setDescription('Optional leg 3 sportsbook game ID').setRequired(false))
-      .addStringOption(o => o.setName('leg3_side').setDescription('home or away').setRequired(false))
-      .addStringOption(o => o.setName('leg4_game').setDescription('Optional leg 4 sportsbook game ID').setRequired(false))
-      .addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false)),
-
-    new SlashCommandBuilder()
+        new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -4625,13 +4621,228 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === 'sportsbook') {
       if (!interaction.guild) return;
+      const subcommand = interaction.options.getSubcommand();
       const settings = await getCurrencySettings(interaction.guild.id);
-      const result = await pool.query(
-        `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 20`,
-        [interaction.guild.id]
-      );
-      await interaction.reply({ embeds: [buildSportsbookEmbed(settings, result.rows)], ephemeral: true });
-      return;
+
+      if (subcommand === 'board') {
+        const result = await pool.query(
+          `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 20`,
+          [interaction.guild.id]
+        );
+        await interaction.reply({ embeds: [buildSportsbookEmbed(settings, result.rows)], ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'create') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to create sportsbook games.', ephemeral: true });
+          return;
+        }
+
+        const label = interaction.options.getString('label');
+        const home = interaction.options.getString('home');
+        const away = interaction.options.getString('away');
+        const homeOdds = interaction.options.getInteger('home_odds') ?? -110;
+        const awayOdds = interaction.options.getInteger('away_odds') ?? -110;
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+
+        if (leagueName && !activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (homeOdds === 0 || awayOdds === 0) {
+          await interaction.reply({ content: 'Odds cannot be 0. Use American odds like -110, -150, +120, or 120.', ephemeral: true });
+          return;
+        }
+
+        const sportsbookGameId = randomUUID();
+        await pool.query(
+          `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id]
+        );
+
+        await interaction.reply({ content: 'Sportsbook game created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**.', ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'place') {
+        const gameInput = interaction.options.getString('game_id');
+        const side = interaction.options.getString('side');
+        const amount = interaction.options.getInteger('amount');
+
+        if (!['home', 'away'].includes(side)) {
+          await interaction.reply({ content: 'Side must be home or away.', ephemeral: true });
+          return;
+        }
+
+        if (!Number.isInteger(amount) || amount <= 0) {
+          await interaction.reply({ content: 'Bet amount must be greater than 0.', ephemeral: true });
+          return;
+        }
+
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'Could not find an open sportsbook game with that ID.', ephemeral: true });
+          return;
+        }
+
+        const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
+        const payout = calculateAmericanOddsPayout(amount, odds);
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
+
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to place that bet.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO sportsbook_bets (id, guild_id, sportsbook_game_id, user_id, side, amount, odds, potential_payout)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
+        );
+
+        const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+        await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'settle') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to settle sportsbook games.', ephemeral: true });
+          return;
+        }
+
+        const gameInput = interaction.options.getString('game_id');
+        const winner = interaction.options.getString('winner');
+        if (!['home', 'away'].includes(winner)) {
+          await interaction.reply({ content: 'Winner must be home or away.', ephemeral: true });
+          return;
+        }
+
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'Could not find an open sportsbook game with that ID.', ephemeral: true });
+          return;
+        }
+
+        const bets = await pool.query(
+          `SELECT * FROM sportsbook_bets WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+          [interaction.guild.id, sportsbookGame.id]
+        );
+
+        let winners = 0;
+        let losers = 0;
+        let totalPaid = 0;
+        for (const bet of bets.rows) {
+          if (bet.side === winner) {
+            await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, interaction.user.id);
+            await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
+            winners += 1;
+            totalPaid += Number(bet.potential_payout);
+          } else {
+            await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
+            losers += 1;
+          }
+        }
+
+        await pool.query(
+          `UPDATE sportsbook_games SET status = 'settled', winner_side = $1, settled_at = NOW() WHERE id = $2`,
+          [winner, sportsbookGame.id]
+        );
+
+        const parlayResult = typeof settleParlaysForSportsbookGame === 'function'
+          ? await settleParlaysForSportsbookGame(interaction.guild.id, sportsbookGame.id, winner, interaction.user.id)
+          : { settledCount: 0, parlayPaid: 0 };
+
+        const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+        await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**. Parlays settled: **' + parlayResult.settledCount + '**. Parlay paid: **' + parlayResult.parlayPaid + '**.', ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'mybets') {
+        const result = await pool.query(
+          `SELECT b.*, g.game_label, g.home_label, g.away_label
+           FROM sportsbook_bets b
+           JOIN sportsbook_games g ON g.id = b.sportsbook_game_id
+           WHERE b.guild_id = $1 AND b.user_id = $2
+           ORDER BY b.created_at DESC
+           LIMIT 15`,
+          [interaction.guild.id, interaction.user.id]
+        );
+        await interaction.reply({ embeds: [buildMyBetsEmbed(settings, result.rows)], ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'parlay') {
+        const amount = interaction.options.getInteger('amount');
+        if (!Number.isInteger(amount) || amount <= 0) {
+          await interaction.reply({ content: 'Parlay amount must be greater than 0.', ephemeral: true });
+          return;
+        }
+
+        const legInputs = [
+          { game: interaction.options.getString('leg1_game'), side: interaction.options.getString('leg1_side') },
+          { game: interaction.options.getString('leg2_game'), side: interaction.options.getString('leg2_side') },
+          { game: interaction.options.getString('leg3_game'), side: interaction.options.getString('leg3_side') },
+          { game: interaction.options.getString('leg4_game'), side: interaction.options.getString('leg4_side') },
+        ].filter(leg => leg.game || leg.side);
+
+        if (legInputs.length < 2 || legInputs.length > 4 || legInputs.some(leg => !leg.game || !['home', 'away'].includes(leg.side))) {
+          await interaction.reply({ content: 'Parlays need 2 to 4 complete legs. Each side must be home or away.', ephemeral: true });
+          return;
+        }
+
+        const usedGameIds = new Set();
+        const legs = [];
+        for (const legInput of legInputs) {
+          const sportsbookGame = await findSportsbookGame(interaction.guild.id, legInput.game);
+          if (!sportsbookGame || sportsbookGame.status !== 'open') {
+            await interaction.reply({ content: 'Could not find open sportsbook game **' + legInput.game + '**.', ephemeral: true });
+            return;
+          }
+          if (usedGameIds.has(sportsbookGame.id)) {
+            await interaction.reply({ content: 'You cannot use the same game twice in one parlay.', ephemeral: true });
+            return;
+          }
+          usedGameIds.add(sportsbookGame.id);
+          const odds = legInput.side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
+          legs.push({ sportsbookGame, side: legInput.side, odds });
+        }
+
+        const payoutData = calculateParlayPayout(amount, legs.map(leg => leg.odds));
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_parlay_bet', 'Parlay bet', interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to create that parlay.', ephemeral: true });
+          return;
+        }
+
+        const parlayId = randomUUID();
+        await pool.query(
+          `INSERT INTO sportsbook_parlays (id, guild_id, user_id, amount, combined_decimal, potential_payout)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [parlayId, interaction.guild.id, interaction.user.id, amount, payoutData.combinedDecimal, payoutData.payout]
+        );
+
+        for (const leg of legs) {
+          await pool.query(
+            `INSERT INTO sportsbook_parlay_legs (id, parlay_id, sportsbook_game_id, side, odds)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [randomUUID(), parlayId, leg.sportsbookGame.id, leg.side, leg.odds]
+          );
+        }
+
+        const NL = String.fromCharCode(10);
+        const legText = legs.map((leg, index) => {
+          const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
+          return (index + 1) + '. ' + sideLabel + ' ML ' + leg.odds + ' — ' + leg.sportsbookGame.game_label;
+        }).join(NL);
+
+        await interaction.reply({ content: 'Parlay created: **' + shortSportsbookId(parlayId) + '**' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**', ephemeral: true });
+        return;
+      }
     }
 
     if (interaction.commandName === 'placebet') {
