@@ -1230,15 +1230,52 @@ function buildCommands() {
   ].map(cmd => cmd.toJSON());
 }
 
+function getRegisteredCommands() {
+  const commands = buildCommands();
+  const MAX_COMMANDS = 100;
+
+  if (commands.length <= MAX_COMMANDS) return commands;
+
+  const dropIfNeeded = new Set([
+    'ping',
+    'help',
+    'commands',
+    'setupteamowners',
+    'setuptradecount',
+    'setupoffertrade',
+    'franchiselegacy',
+    'awardhistory',
+    'halloffame',
+    'teamtrades',
+    'teamprofile',
+    'transactions',
+    'banklog',
+    'mybets',
+    'bettinghistory',
+    'bettingleaderboard',
+  ]);
+
+  const trimmed = commands.filter(command => !dropIfNeeded.has(command.name));
+
+  if (trimmed.length > MAX_COMMANDS) {
+    console.warn('Command list still over Discord limit after trimming:', trimmed.length);
+    return trimmed.slice(0, MAX_COMMANDS);
+  }
+
+  console.warn('Discord command limit reached. Registered', trimmed.length, 'of', commands.length, 'commands. Some non-critical commands were skipped.');
+  return trimmed;
+}
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const commands = getRegisteredCommands();
 
   if (USE_GLOBAL_COMMANDS) {
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: buildCommands() });
-    console.log('Global commands synced.');
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log('Global commands synced:', commands.length);
   } else {
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, DEV_GUILD_ID), { body: buildCommands() });
-    console.log('Guild commands synced.');
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, DEV_GUILD_ID), { body: commands });
+    console.log('Guild commands synced:', commands.length);
   }
 }
 
