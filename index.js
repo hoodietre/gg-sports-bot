@@ -664,6 +664,24 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS activity_milestones_claimed (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      milestone_key TEXT NOT NULL,
+      claimed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id, milestone_key)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS activity_settings (
+      guild_id TEXT PRIMARY KEY,
+      milestone_channel_id TEXT,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS sportsbook_parlays (
       id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL,
@@ -1252,6 +1270,16 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('activityleaderboard')
       .setDescription('View the activity leaderboard'),
+
+    new SlashCommandBuilder()
+      .setName('milestones')
+      .setDescription('View your activity milestones or another user’s')
+      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('setactivitychannel')
+      .setDescription('Staff: set the activity milestone announcement channel')
+      .addChannelOption(o => o.setName('channel').setDescription('Activity milestone channel').setRequired(true)),
 
     new SlashCommandBuilder()
       .setName('legacy')
@@ -4406,6 +4434,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'milestones') {
+      if (!interaction.guild) return;
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
+
+      const profileResult = await pool.query(
+        `SELECT activity_points FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+        [interaction.guild.id, targetUser.id]
+      );
+      const claimedResult = await pool.query(
+        `SELECT milestone_key FROM activity_milestones_claimed WHERE guild_id = $1 AND user_id = $2`,
+        [interaction.guild.id, targetUser.id]
+      );
+
+      await interaction.reply({
+        embeds: [buildMilestonesEmbed(targetUser, profileResult.rows[0]?.activity_points || 0, claimedResult.rows.map(row => row.milestone_key))],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'setactivitychannel') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set the activity channel.', ephemeral: true });
+        return;
+      }
+
+      const channel = interaction.options.getChannel('channel');
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that activity channel.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO activity_settings (guild_id, milestone_channel_id, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (guild_id)
+         DO UPDATE SET milestone_channel_id = $2, updated_at = NOW()`,
+        [interaction.guild.id, channel.id]
+      );
+
+      await interaction.reply({ content: 'Activity milestone channel set to ' + channel.toString() + '.', ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'legacy') {
       if (!interaction.guild) return;
 
@@ -7081,6 +7158,95 @@ function buildBettingLeaderboardEmbed(settings, rows) {
   return embed;
 }
 
+const ACTIVITY_MILESTONES = [
+  { key: 'activity_100', points: 100, title: 'Active Member', reward: 50 },
+  { key: 'activity_500', points: 500, title: 'Veteran Grinder', reward: 150 },
+  { key: 'activity_1000', points: 1000, title: 'Certified Grinder', reward: 300 },
+  { key: 'activity_2500', points: 2500, title: 'Elite Contributor', reward: 750 },
+  { key: 'activity_5000', points: 5000, title: 'Community Icon', reward: 1500 },
+];
+
+async function getActivitySettings(guildId) {
+  await pool.query(
+    `INSERT INTO activity_settings (guild_id)
+     VALUES ($1)
+     ON CONFLICT (guild_id) DO NOTHING`,
+    [guildId]
+  );
+
+  const result = await pool.query(`SELECT * FROM activity_settings WHERE guild_id = $1`, [guildId]);
+  return result.rows[0] || { guild_id: guildId, milestone_channel_id: null };
+}
+
+function buildMilestonesEmbed(user, activityPoints, claimedKeys) {
+  const NL = String.fromCharCode(10);
+  const claimed = new Set(claimedKeys || []);
+  const lines = ACTIVITY_MILESTONES.map(milestone => {
+    const unlocked = Number(activityPoints || 0) >= milestone.points;
+    const claimedText = claimed.has(milestone.key) ? '✅ Claimed' : unlocked ? '🎁 Unlocked' : '🔒 Locked';
+    return '**' + milestone.title + '** — ' + milestone.points + ' Activity Points • Reward: ' + milestone.reward + ' • ' + claimedText;
+  });
+
+  return new EmbedBuilder()
+    .setTitle(user.username + ' • Activity Milestones')
+    .setColor(0x57F287)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .setDescription(lines.join(NL))
+    .setFooter({ text: 'GG Sports • Activity Milestones' })
+    .setTimestamp();
+}
+
+function buildMilestoneAnnouncementEmbed(userId, milestone, settings) {
+  return new EmbedBuilder()
+    .setTitle('⚡ Activity Milestone Unlocked')
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Member', value: '<@' + userId + '>', inline: true },
+      { name: 'Milestone', value: milestone.title, inline: true },
+      { name: 'Activity Required', value: String(milestone.points), inline: true },
+      { name: 'Reward', value: settings.currency_icon + ' ' + milestone.reward + ' ' + settings.currency_name, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Activity Rewards' })
+    .setTimestamp();
+}
+
+async function checkActivityMilestones(guildId, userId) {
+  const profileResult = await pool.query(
+    `SELECT activity_points FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guildId, userId]
+  );
+
+  const activityPoints = Number(profileResult.rows[0]?.activity_points || 0);
+  const settings = await getCurrencySettings(guildId);
+  const activitySettings = await getActivitySettings(guildId);
+
+  for (const milestone of ACTIVITY_MILESTONES) {
+    if (activityPoints < milestone.points) continue;
+
+    const claimedResult = await pool.query(
+      `INSERT INTO activity_milestones_claimed (guild_id, user_id, milestone_key)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (guild_id, user_id, milestone_key) DO NOTHING
+       RETURNING milestone_key`,
+      [guildId, userId, milestone.key]
+    );
+
+    if (!claimedResult.rows.length) continue;
+
+    if (milestone.reward > 0) {
+      await addCurrency(guildId, userId, milestone.reward, 'activity_milestone', milestone.title, null);
+    }
+
+    if (activitySettings.milestone_channel_id) {
+      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      const channel = guild ? await guild.channels.fetch(activitySettings.milestone_channel_id).catch(() => null) : null;
+      if (channel && channel.isTextBased()) {
+        await channel.send({ embeds: [buildMilestoneAnnouncementEmbed(userId, milestone, settings)] }).catch(() => null);
+      }
+    }
+  }
+}
+
 async function ensureRecognitionProfile(guildId, userId) {
   await pool.query(
     `INSERT INTO user_recognition (guild_id, user_id)
@@ -7102,6 +7268,8 @@ async function addActivityPoints(guildId, userId, points, legacyPoints = 0) {
      WHERE guild_id = $1 AND user_id = $2`,
     [guildId, userId, Number(points || 0), Number(legacyPoints || 0)]
   );
+
+  await checkActivityMilestones(guildId, userId).catch(() => null);
 }
 
 async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0) {
