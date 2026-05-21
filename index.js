@@ -496,6 +496,9 @@ async function initDatabase() {
       channel_id TEXT,
       thread_id TEXT,
       assigned_staff_user_id TEXT,
+      review_decision TEXT,
+      review_decision_by_user_id TEXT,
+      review_decision_at TIMESTAMP,
       closed_by_user_id TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       closed_at TIMESTAMP
@@ -504,6 +507,9 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS close_reason TEXT`);
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal'`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS review_decision TEXT`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS review_decision_by_user_id TEXT`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS review_decision_at TIMESTAMP`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ticket_transcripts (
