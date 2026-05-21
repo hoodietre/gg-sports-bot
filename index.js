@@ -607,6 +607,15 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS sportsbook_settings (
+      guild_id TEXT PRIMARY KEY,
+      feed_channel_id TEXT,
+      big_bet_threshold INTEGER NOT NULL DEFAULT 500,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS sportsbook_parlays (
       id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL,
@@ -1171,6 +1180,12 @@ function buildCommands() {
       .setName('setupsportsbookpanel')
       .setDescription('Staff: create or refresh the live sportsbook board')
       .addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('setsportsbookfeed')
+      .setDescription('Staff: set sportsbook feed channel and big bet threshold')
+      .addChannelOption(o => o.setName('channel').setDescription('Sportsbook feed channel').setRequired(true))
+      .addIntegerOption(o => o.setName('big_bet_threshold').setDescription('Amount that triggers big bet alerts').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('bettinghistory')
@@ -2846,6 +2861,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
         await updateSportsbookPanel(interaction.guild);
+        const feedSettings = await getSportsbookSettings(interaction.guild.id);
+        await postSportsbookFeed(
+          interaction.guild,
+          buildSportsbookBetAlertEmbed(settings, interaction.user, sportsbookGame, side, amount, odds, payout, amount >= Number(feedSettings.big_bet_threshold || 500))
+        );
         const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
         await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
         return;
@@ -4141,6 +4161,40 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'setsportsbookfeed') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set the sportsbook feed.', ephemeral: true });
+        return;
+      }
+
+      const channel = interaction.options.getChannel('channel');
+      const threshold = interaction.options.getInteger('big_bet_threshold') ?? 500;
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that sportsbook feed channel.', ephemeral: true });
+        return;
+      }
+
+      if (threshold <= 0) {
+        await interaction.reply({ content: 'Big bet threshold must be greater than 0.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO sportsbook_settings (guild_id, feed_channel_id, big_bet_threshold, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (guild_id)
+         DO UPDATE SET feed_channel_id = $2, big_bet_threshold = $3, updated_at = NOW()`,
+        [interaction.guild.id, channel.id, threshold]
+      );
+
+      await interaction.reply({ content: 'Sportsbook feed set to ' + channel.toString() + '. Big bet threshold: **' + threshold + '**.', ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'setupsportsbookpanel') {
       if (!interaction.guild) return;
       if (!(await userCanUseLeagueSetup(interaction, league))) {
@@ -4299,6 +4353,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }).join(NL);
 
       await updateSportsbookPanel(interaction.guild);
+      await postSportsbookFeed(interaction.guild, buildParlayCreatedAlertEmbed(settings, interaction.user, parlayId, amount, payoutData.payout, legs.length));
       await interaction.reply({ content: 'Parlay created: **' + shortSportsbookId(parlayId) + '**' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**', ephemeral: true });
       return;
     }
@@ -4412,6 +4467,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
       await updateSportsbookPanel(interaction.guild);
+      const feedSettings = await getSportsbookSettings(interaction.guild.id);
+      await postSportsbookFeed(
+        interaction.guild,
+        buildSportsbookBetAlertEmbed(settings, interaction.user, sportsbookGame, side, amount, odds, payout, amount >= Number(feedSettings.big_bet_threshold || 500))
+      );
       await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
       return;
     }
@@ -4470,6 +4530,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
       await updateSportsbookPanel(interaction.guild);
+      await postSportsbookFeed(interaction.guild, buildSportsbookSettlementAlertEmbed(sportsbookGame, winnerLabel, winners, losers, totalPaid, parlayResult));
       await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**. Parlays settled: **' + parlayResult.settledCount + '**. Parlay paid: **' + parlayResult.parlayPaid + '**.', ephemeral: true });
       return;
     }
@@ -6867,6 +6928,75 @@ function buildBettingLeaderboardEmbed(settings, rows) {
 
   embed.setDescription(lines.join(NL));
   return embed;
+}
+
+async function getSportsbookSettings(guildId) {
+  await pool.query(
+    `INSERT INTO sportsbook_settings (guild_id)
+     VALUES ($1)
+     ON CONFLICT (guild_id) DO NOTHING`,
+    [guildId]
+  );
+
+  const result = await pool.query(`SELECT * FROM sportsbook_settings WHERE guild_id = $1`, [guildId]);
+  return result.rows[0] || { guild_id: guildId, feed_channel_id: null, big_bet_threshold: 500 };
+}
+
+async function postSportsbookFeed(guild, embed) {
+  const settings = await getSportsbookSettings(guild.id);
+  if (!settings.feed_channel_id) return;
+
+  const channel = await guild.channels.fetch(settings.feed_channel_id).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+  await channel.send({ embeds: [embed] }).catch(() => null);
+}
+
+function buildSportsbookBetAlertEmbed(settings, user, game, side, amount, odds, payout, isBigBet = false) {
+  const sideLabel = side === 'home' ? game.home_label : game.away_label;
+  return new EmbedBuilder()
+    .setTitle(isBigBet ? '🚨 Big Bet Alert' : '🎟️ Bet Placed')
+    .setColor(isBigBet ? 0xED4245 : 0x5865F2)
+    .addFields(
+      { name: 'User', value: '<@' + user.id + '>', inline: true },
+      { name: 'Pick', value: sideLabel + ' ML ' + odds, inline: true },
+      { name: 'Stake', value: settings.currency_icon + ' ' + amount, inline: true },
+      { name: 'Game', value: game.game_label, inline: false },
+      { name: 'Potential Payout', value: settings.currency_icon + ' ' + payout, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Sportsbook Feed' })
+    .setTimestamp();
+}
+
+function buildSportsbookSettlementAlertEmbed(game, winnerLabel, winners, losers, totalPaid, parlayResult) {
+  return new EmbedBuilder()
+    .setTitle('✅ Sportsbook Result Settled')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Game', value: game.game_label, inline: false },
+      { name: 'Winner', value: winnerLabel, inline: true },
+      { name: 'Winning Bets', value: String(winners), inline: true },
+      { name: 'Losing Bets', value: String(losers), inline: true },
+      { name: 'Straight Bet Payouts', value: String(totalPaid), inline: true },
+      { name: 'Parlays Settled', value: String(parlayResult?.settledCount || 0), inline: true },
+      { name: 'Parlay Payouts', value: String(parlayResult?.parlayPaid || 0), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Sportsbook Feed' })
+    .setTimestamp();
+}
+
+function buildParlayCreatedAlertEmbed(settings, user, parlayId, amount, payout, legCount) {
+  return new EmbedBuilder()
+    .setTitle(legCount >= 4 ? '🔥 Monster Parlay Placed' : '🎲 Parlay Placed')
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'User', value: '<@' + user.id + '>', inline: true },
+      { name: 'Parlay ID', value: shortSportsbookId(parlayId), inline: true },
+      { name: 'Legs', value: String(legCount), inline: true },
+      { name: 'Stake', value: settings.currency_icon + ' ' + amount, inline: true },
+      { name: 'Potential Payout', value: settings.currency_icon + ' ' + payout, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Sportsbook Feed' })
+    .setTimestamp();
 }
 
 async function findSportsbookGame(guildId, input) {
