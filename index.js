@@ -2754,6 +2754,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
         const payout = calculateAmericanOddsPayout(amount, odds);
+        if (sportsbookGame.max_bet && amount > Number(sportsbookGame.max_bet)) {
+          await interaction.reply({ content: 'Max bet for this line is **' + sportsbookGame.max_bet + '**.', ephemeral: true });
+          return;
+        }
+        if (sportsbookGame.max_payout && payout > Number(sportsbookGame.max_payout)) {
+          await interaction.reply({ content: 'That bet would exceed the max payout of **' + sportsbookGame.max_payout + '** for this line.', ephemeral: true });
+          return;
+        }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
 
         if (!removed) {
@@ -3494,8 +3502,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const leagueName = interaction.options.getString('league');
       const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
-  const requestedTeamRoleId = team?.id || null;
-  const opponentUserId = opponent?.id || null;
       if (!activeLeague) {
         await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
         return;
@@ -3633,16 +3639,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'gamerequest') {
-      interaction.ggSportsReviewButtons = true;
-  interaction.ggSportsGameIssueMeta = {
-    gameId,
-    requestAction: ticketType,
-    requestedTeamRoleId,
-    opponentUserId,
-  };
-  await openSupportTicket(interaction, 'gamerequest');
-  delete interaction.ggSportsReviewButtons;
-  delete interaction.ggSportsGameIssueMeta;
+      await openSupportTicket(interaction, 'gamerequest');
       return;
     }
 
@@ -4167,6 +4164,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const away = interaction.options.getString('away');
       const homeOdds = interaction.options.getInteger('home_odds') ?? -110;
       const awayOdds = interaction.options.getInteger('away_odds') ?? -110;
+      const maxBet = interaction.options.getInteger('max_bet');
+      const maxPayout = interaction.options.getInteger('max_payout');
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
 
@@ -4180,11 +4179,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if ((maxBet !== null && maxBet <= 0) || (maxPayout !== null && maxPayout <= 0)) {
+        await interaction.reply({ content: 'Max bet and max payout must be greater than 0 when provided.', ephemeral: true });
+        return;
+      }
+
       const sportsbookGameId = randomUUID();
       await pool.query(
-        `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id]
+        `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, max_bet, max_payout, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, maxBet, maxPayout, interaction.user.id]
       );
 
       await updateSportsbookPanel(interaction.guild);
@@ -4233,6 +4237,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
       const payout = calculateAmericanOddsPayout(amount, odds);
+      if (sportsbookGame.max_bet && amount > Number(sportsbookGame.max_bet)) {
+        await interaction.reply({ content: 'Max bet for this line is **' + sportsbookGame.max_bet + '**.', ephemeral: true });
+        return;
+      }
+      if (sportsbookGame.max_payout && payout > Number(sportsbookGame.max_payout)) {
+        await interaction.reply({ content: 'That bet would exceed the max payout of **' + sportsbookGame.max_payout + '** for this line.', ephemeral: true });
+        return;
+      }
       const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
 
       if (!removed) {
@@ -4306,6 +4318,79 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
       await updateSportsbookPanel(interaction.guild);
       await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**.', ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'sportsbookline') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to control sportsbook lines.', ephemeral: true });
+        return;
+      }
+
+      const gameInput = interaction.options.getString('game_id');
+      const action = interaction.options.getString('action');
+
+      if (!['open', 'closed'].includes(action)) {
+        await interaction.reply({ content: 'Action must be open or closed.', ephemeral: true });
+        return;
+      }
+
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+      if (!sportsbookGame) {
+        await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true });
+        return;
+      }
+
+      if (sportsbookGame.status === 'settled' || sportsbookGame.status === 'cancelled') {
+        await interaction.reply({ content: 'Settled or cancelled sportsbook games cannot be reopened/closed.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(`UPDATE sportsbook_games SET status = $1 WHERE id = $2`, [action, sportsbookGame.id]);
+      await updateSportsbookPanel(interaction.guild);
+      await interaction.reply({ content: 'Sportsbook line **' + shortSportsbookId(sportsbookGame.id) + ' • ' + sportsbookGame.game_label + '** is now **' + action + '**.', ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'cancelsportsbookgame') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to cancel sportsbook games.', ephemeral: true });
+        return;
+      }
+
+      const gameInput = interaction.options.getString('game_id');
+      const reason = interaction.options.getString('reason') || 'Sportsbook game cancelled';
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+
+      if (!sportsbookGame) {
+        await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true });
+        return;
+      }
+
+      if (sportsbookGame.status === 'settled' || sportsbookGame.status === 'cancelled') {
+        await interaction.reply({ content: 'That sportsbook game is already settled or cancelled.', ephemeral: true });
+        return;
+      }
+
+      const openBets = await pool.query(
+        `SELECT * FROM sportsbook_bets WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+        [interaction.guild.id, sportsbookGame.id]
+      );
+
+      let refunded = 0;
+      let refundCount = 0;
+      for (const bet of openBets.rows) {
+        await addCurrency(interaction.guild.id, bet.user_id, Number(bet.amount), 'sportsbook_refund', reason + ': ' + sportsbookGame.game_label, interaction.user.id);
+        await pool.query(`UPDATE sportsbook_bets SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [bet.id]);
+        refunded += Number(bet.amount);
+        refundCount += 1;
+      }
+
+      await pool.query(`UPDATE sportsbook_games SET status = 'cancelled', settled_at = NOW() WHERE id = $1`, [sportsbookGame.id]);
+      await updateSportsbookPanel(interaction.guild);
+      await interaction.reply({ content: 'Sportsbook game cancelled: **' + sportsbookGame.game_label + '**. Refunded **' + refundCount + '** bets totaling **' + refunded + '**.', ephemeral: true });
       return;
     }
 
@@ -6704,7 +6789,20 @@ async function openGameIssueTicket(interaction, ticketType) {
     return originalGetString(name);
   };
 
+  const requestedTeamRoleId = team?.id || null;
+  const opponentUserId = opponent?.id || null;
+
+  interaction.ggSportsReviewButtons = true;
+  interaction.ggSportsGameIssueMeta = {
+    gameId,
+    requestAction: ticketType,
+    requestedTeamRoleId,
+    opponentUserId,
+  };
+
   await openSupportTicket(interaction, 'gamerequest');
+  delete interaction.ggSportsReviewButtons;
+  delete interaction.ggSportsGameIssueMeta;
 }
 
 async function openSupportTicket(interaction, ticketType) {
