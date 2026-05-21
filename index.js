@@ -501,6 +501,20 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ticket_evidence (
+      id UUID PRIMARY KEY,
+      ticket_id UUID REFERENCES support_tickets(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      attachment_url TEXT NOT NULL,
+      file_name TEXT,
+      content_type TEXT,
+      message_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS assigned_staff_user_id TEXT`);
 
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
@@ -924,6 +938,11 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('claimticket')
       .setDescription('Staff: claim the current ticket thread'),
+
+    new SlashCommandBuilder()
+      .setName('ticketevidence')
+      .setDescription('Show evidence uploaded to a ticket')
+      .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -2423,6 +2442,24 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot || !message.guild) return;
 
+    if (message.channel?.isThread() && message.attachments.size > 0) {
+      const ticket = await getOpenTicketByThread(message.guild.id, message.channel.id);
+      if (ticket) {
+        for (const attachment of message.attachments.values()) {
+          await saveTicketEvidence({
+            ticketId: ticket.id,
+            guildId: message.guild.id,
+            userId: message.author.id,
+            attachmentUrl: attachment.url,
+            fileName: attachment.name,
+            contentType: attachment.contentType,
+            messageId: message.id,
+          });
+        }
+        await message.react('📎').catch(() => null);
+      }
+    }
+
     const pendingData = pendingOfferTargets.get(message.author.id);
     if (!pendingData) return;
 
@@ -3264,6 +3301,45 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.reply({ content: '<@' + interaction.user.id + '> has claimed this ticket.', ephemeral: false });
+      return;
+    }
+
+    if (interaction.commandName === 'ticketevidence') {
+      if (!interaction.guild) return;
+      const ticketInput = interaction.options.getString('ticket_id');
+      let ticket = null;
+
+      if (ticketInput) {
+        const ticketResult = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, ticketInput + '%']
+        );
+        ticket = ticketResult.rows[0] || null;
+      } else if (interaction.channel?.isThread()) {
+        ticket = await getOpenTicketByThread(interaction.guild.id, interaction.channel.id);
+      }
+
+      if (!ticket) {
+        await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+        return;
+      }
+
+      const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+      const viewer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const isTicketOwner = ticket.user_id === interaction.user.id;
+      const isStaff = viewer ? await memberHasStaff(viewer, activeLeague) : false;
+
+      if (!isTicketOwner && !isStaff) {
+        await interaction.reply({ content: 'Only the ticket owner or staff can view this ticket evidence.', ephemeral: true });
+        return;
+      }
+
+      const evidenceResult = await pool.query(
+        `SELECT * FROM ticket_evidence WHERE guild_id = $1 AND ticket_id = $2 ORDER BY created_at ASC LIMIT 20`,
+        [interaction.guild.id, ticket.id]
+      );
+
+      await interaction.reply({ embeds: [buildTicketEvidenceEmbed(ticket, evidenceResult.rows)], ephemeral: true });
       return;
     }
 
@@ -4970,6 +5046,45 @@ function buildTicketInfoEmbed(row) {
   }
 
   return embed;
+}
+
+function buildTicketEvidenceEmbed(ticket, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Ticket Evidence • ' + shortTicketId(ticket.id))
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Ticket Evidence' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No evidence has been uploaded to this ticket yet.');
+    return embed;
+  }
+
+  const lines = rows.map((row, index) => {
+    const date = row.created_at ? new Date(row.created_at).toLocaleDateString('en-US') : 'Unknown date';
+    const fileName = row.file_name || 'Attachment';
+    return '**' + (index + 1) + '. ' + fileName + '** — uploaded by <@' + row.user_id + '> • ' + date + NL + row.attachment_url;
+  });
+
+  embed.setDescription(lines.join(NL + NL).slice(0, 4000));
+  return embed;
+}
+
+async function getOpenTicketByThread(guildId, threadId) {
+  const result = await pool.query(
+    `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+    [guildId, threadId]
+  );
+  return result.rows[0] || null;
+}
+
+async function saveTicketEvidence({ ticketId, guildId, userId, attachmentUrl, fileName, contentType, messageId }) {
+  await pool.query(
+    `INSERT INTO ticket_evidence (id, ticket_id, guild_id, user_id, attachment_url, file_name, content_type, message_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [randomUUID(), ticketId, guildId, userId, attachmentUrl, fileName || null, contentType || null, messageId || null]
+  );
 }
 
 async function openSupportTicket(interaction, ticketType) {
