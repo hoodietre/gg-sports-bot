@@ -462,6 +462,9 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE tournament_panels ADD COLUMN IF NOT EXISTS announcement_channel_id TEXT`);
   await pool.query(`ALTER TABLE tournament_panels ADD COLUMN IF NOT EXISTS announcement_message_id TEXT`);
 
+  await pool.query(`ALTER TABLE tournament_history ADD COLUMN IF NOT EXISTS mvp_user_id TEXT`);
+  await pool.query(`ALTER TABLE tournament_history ADD COLUMN IF NOT EXISTS mvp_payout INTEGER NOT NULL DEFAULT 0`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_history (
       id UUID PRIMARY KEY,
@@ -473,6 +476,8 @@ async function initDatabase() {
       format TEXT,
       champion_user_id TEXT NOT NULL,
       prize_paid INTEGER NOT NULL DEFAULT 0,
+      mvp_user_id TEXT,
+      mvp_payout INTEGER NOT NULL DEFAULT 0,
       completed_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
@@ -846,6 +851,18 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('tournamenthistory')
       .setDescription('Show completed tournament champions')
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('settournamentmvp')
+      .setDescription('Admin/staff: set a tournament MVP and optional payout')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+      .addUserOption(o => o.setName('user').setDescription('Tournament MVP').setRequired(true))
+      .addIntegerOption(o => o.setName('payout').setDescription('Optional MVP currency payout').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('tournamentrewards')
+      .setDescription('Show tournament champion/MVP reward records')
       .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
 
     new SlashCommandBuilder()
@@ -1389,7 +1406,9 @@ function buildUserProfileEmbed(league, user, data) {
       { name: 'Championships', value: String(data.championships), inline: true },
       { name: 'Finals Appearances', value: String(data.finalsAppearances), inline: true },
       { name: 'Awards', value: String(data.awardsWon), inline: true },
-      { name: 'Approved Trades Involving Team', value: String(data.trades), inline: true }
+      { name: 'Approved Trades Involving Team', value: String(data.trades), inline: true },
+      { name: 'Tournament Wins', value: String(data.tournamentWins || 0), inline: true },
+      { name: 'Tournament MVPs', value: String(data.tournamentMvps || 0), inline: true }
     )
     .setFooter({ text: 'GG Sports • User Profile' })
     .setTimestamp();
@@ -1877,7 +1896,32 @@ function buildTournamentHistoryEmbed(rows) {
 
   const lines = rows.map(row => {
     const date = row.completed_at ? new Date(row.completed_at).toLocaleDateString('en-US') : 'Unknown date';
-    return `**${row.tournament_name}** — Champion: <@${row.champion_user_id}> • ${row.game || 'Game TBD'} • ${date}`;
+    const mvp = row.mvp_user_id ? ` • MVP: <@${row.mvp_user_id}>` : '';
+    return `**${row.tournament_name}** — Champion: <@${row.champion_user_id}>${mvp} • ${row.game || 'Game TBD'} • ${date}`;
+  });
+
+  embed.setDescription(lines.join(NL));
+  return embed;
+}
+
+function buildTournamentRewardsEmbed(settings, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Tournament Rewards')
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Tournament Rewards' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No tournament reward records found.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const championPrize = Number(row.prize_paid || 0) > 0 ? ` • Champion Prize: ${settings.currency_icon} ${row.prize_paid}` : '';
+    const mvp = row.mvp_user_id ? ` • MVP: <@${row.mvp_user_id}>` : '';
+    const mvpPrize = Number(row.mvp_payout || 0) > 0 ? ` (${settings.currency_icon} ${row.mvp_payout})` : '';
+    return `**${row.tournament_name}** — Champion: <@${row.champion_user_id}>${championPrize}${mvp}${mvpPrize}`;
   });
 
   embed.setDescription(lines.join(NL));
@@ -3820,6 +3864,78 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'settournamentmvp') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to set tournament MVPs.', ephemeral: true });
+        return;
+      }
+
+      const input = interaction.options.getString('tournament');
+      const mvpUser = interaction.options.getUser('user');
+      const payout = interaction.options.getInteger('payout') ?? 0;
+      const tournament = await findTournament(interaction.guild.id, input);
+
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+
+      if (payout < 0) {
+        await interaction.reply({ content: 'MVP payout cannot be negative.', ephemeral: true });
+        return;
+      }
+
+      const historyResult = await pool.query(
+        `SELECT * FROM tournament_history WHERE guild_id = $1 AND tournament_id = $2 ORDER BY completed_at DESC LIMIT 1`,
+        [interaction.guild.id, tournament.id]
+      );
+
+      if (!historyResult.rows.length) {
+        await interaction.reply({ content: 'This tournament has not been completed yet, so an MVP cannot be recorded.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE tournament_history SET mvp_user_id = $1, mvp_payout = $2 WHERE id = $3`,
+        [mvpUser.id, payout, historyResult.rows[0].id]
+      );
+
+      if (payout > 0) {
+        await addCurrency(interaction.guild.id, mvpUser.id, payout, 'tournament_mvp', `Tournament MVP: ${tournament.tournament_name}`, interaction.user.id);
+      }
+
+      await interaction.reply({ content: `${mvpUser} set as MVP for **${tournament.tournament_name}**${payout > 0 ? ` and awarded **${payout}** currency.` : '.'}`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'tournamentrewards') {
+      if (!interaction.guild) return;
+      const requestedLeagueName = interaction.options.getString('league');
+      let activeLeague = null;
+      if (requestedLeagueName) {
+        activeLeague = await getLeagueByName(interaction.guild.id, requestedLeagueName);
+        if (!activeLeague) {
+          await interaction.reply({ content: `Could not find league **${requestedLeagueName}**.`, ephemeral: true });
+          return;
+        }
+      }
+
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = activeLeague
+        ? await pool.query(
+            `SELECT * FROM tournament_history WHERE guild_id = $1 AND league_id = $2 ORDER BY completed_at DESC LIMIT 20`,
+            [interaction.guild.id, activeLeague.league_id]
+          )
+        : await pool.query(
+            `SELECT * FROM tournament_history WHERE guild_id = $1 ORDER BY completed_at DESC LIMIT 20`,
+            [interaction.guild.id]
+          );
+
+      await interaction.reply({ embeds: [buildTournamentRewardsEmbed(settings, result.rows)], ephemeral: true });
+      return;
+    }
+
     if (interaction.commandName === 'tournamentseeds') {
       if (!interaction.guild) return;
       const input = interaction.options.getString('tournament');
@@ -4186,6 +4302,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       let finalsAppearances = 0;
       let awardsWon = 0;
       let trades = 0;
+      let tournamentWins = 0;
+      let tournamentMvps = 0;
       let pointsFor = 0;
       let pointsAgainst = 0;
       let pointDiff = 0;
@@ -4240,6 +4358,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       awardsWon = awardResult.rows[0]?.count || 0;
 
+      const tournamentWinsResult = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM tournament_history WHERE guild_id = $1 AND champion_user_id = $2`,
+        [interaction.guild.id, targetUser.id]
+      );
+      tournamentWins = tournamentWinsResult.rows[0]?.count || 0;
+
+      const tournamentMvpResult = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM tournament_history WHERE guild_id = $1 AND mvp_user_id = $2`,
+        [interaction.guild.id, targetUser.id]
+      );
+      tournamentMvps = tournamentMvpResult.rows[0]?.count || 0;
+
       if (interaction.commandName === 'stats') {
         const winPct = gamesPlayed > 0 ? (wins / gamesPlayed).toFixed(3).replace(/^0/, '') : '.000';
         const avgFor = gamesPlayed > 0 ? (pointsFor / gamesPlayed).toFixed(1) : '0.0';
@@ -4274,6 +4404,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           finalsAppearances,
           awardsWon,
           trades,
+          tournamentWins,
+          tournamentMvps,
         })],
         ephemeral: true,
       });
