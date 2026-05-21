@@ -494,11 +494,14 @@ async function initDatabase() {
       status TEXT NOT NULL DEFAULT 'open',
       channel_id TEXT,
       thread_id TEXT,
+      assigned_staff_user_id TEXT,
       closed_by_user_id TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       closed_at TIMESTAMP
     )
   `);
+
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS assigned_staff_user_id TEXT`);
 
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS request_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
@@ -907,6 +910,20 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('closeticket')
       .setDescription('Staff: close the current ticket thread'),
+
+    new SlashCommandBuilder()
+      .setName('tickets')
+      .setDescription('Staff: list tickets by status')
+      .addStringOption(o => o.setName('status').setDescription('open or closed').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('ticketinfo')
+      .setDescription('Staff: view ticket details')
+      .addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('claimticket')
+      .setDescription('Staff: claim the current ticket thread'),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -3164,6 +3181,92 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'tickets') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to view ticket logs.', ephemeral: true });
+        return;
+      }
+
+      const status = interaction.options.getString('status') || 'open';
+      if (!['open', 'closed'].includes(status)) {
+        await interaction.reply({ content: 'Status must be open or closed.', ephemeral: true });
+        return;
+      }
+
+      const result = await pool.query(
+        `SELECT * FROM support_tickets
+         WHERE guild_id = $1 AND status = $2
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        [interaction.guild.id, status]
+      );
+
+      await interaction.reply({ embeds: [buildTicketsEmbed(result.rows, status)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'ticketinfo') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to view ticket info.', ephemeral: true });
+        return;
+      }
+
+      const ticketInput = interaction.options.getString('ticket_id');
+      const result = await pool.query(
+        `SELECT * FROM support_tickets
+         WHERE guild_id = $1 AND id::text LIKE $2
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [interaction.guild.id, ticketInput + '%']
+      );
+
+      if (!result.rows.length) {
+        await interaction.reply({ content: 'Could not find that ticket ID.', ephemeral: true });
+        return;
+      }
+
+      await interaction.reply({ embeds: [buildTicketInfoEmbed(result.rows[0])], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'claimticket') {
+      if (!interaction.guild) return;
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: 'Use this command inside an open ticket thread.', ephemeral: true });
+        return;
+      }
+
+      const ticketResult = await pool.query(
+        `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+        [interaction.guild.id, interaction.channel.id]
+      );
+
+      if (!ticketResult.rows.length) {
+        await interaction.reply({ content: 'This does not appear to be an open ticket thread.', ephemeral: true });
+        return;
+      }
+
+      const ticket = ticketResult.rows[0];
+      const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+      const staffMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const isStaff = staffMember ? await memberHasStaff(staffMember, activeLeague) : false;
+
+      if (!isStaff) {
+        await interaction.reply({ content: 'Only staff/admins can claim tickets.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE support_tickets SET assigned_staff_user_id = $1 WHERE id = $2`,
+        [interaction.user.id, ticket.id]
+      );
+
+      await interaction.reply({ content: '<@' + interaction.user.id + '> has claimed this ticket.', ephemeral: false });
+      return;
+    }
+
     if (interaction.commandName === 'setupstandings') {
       if (!interaction.guild) return;
       const leagueName = interaction.options.getString('league');
@@ -4818,6 +4921,55 @@ function buildTicketEmbed({ type, subject, description, creator }) {
     .setDescription(description || 'No additional description provided.')
     .setFooter({ text: 'GG Sports Ticket System' })
     .setTimestamp();
+}
+
+function shortTicketId(ticketId) {
+  return String(ticketId || '').split('-')[0];
+}
+
+function buildTicketsEmbed(rows, status) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Tickets • ' + status)
+    .setColor(0xffcc00)
+    .setFooter({ text: 'GG Sports • Ticket Log' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No tickets found.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const assigned = row.assigned_staff_user_id ? ' • Claimed by <@' + row.assigned_staff_user_id + '>' : '';
+    const thread = row.thread_id ? ' • <#' + row.thread_id + '>' : '';
+    return '**' + shortTicketId(row.id) + '** — ' + row.ticket_type + ' • ' + row.subject + assigned + thread;
+  });
+
+  embed.setDescription(lines.join(NL));
+  return embed;
+}
+
+function buildTicketInfoEmbed(row) {
+  const embed = new EmbedBuilder()
+    .setTitle('Ticket ' + shortTicketId(row.id) + ' • ' + row.ticket_type)
+    .setColor(row.status === 'open' ? 0xffcc00 : 0x57f287)
+    .addFields(
+      { name: 'Status', value: row.status || 'unknown', inline: true },
+      { name: 'Opened By', value: '<@' + row.user_id + '>', inline: true },
+      { name: 'Claimed By', value: row.assigned_staff_user_id ? '<@' + row.assigned_staff_user_id + '>' : 'Unclaimed', inline: true },
+      { name: 'Subject', value: row.subject || 'No subject', inline: false },
+      { name: 'Description', value: row.description || 'No description', inline: false },
+      { name: 'Thread', value: row.thread_id ? '<#' + row.thread_id + '>' : 'No thread saved', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Ticket Info' })
+    .setTimestamp();
+
+  if (row.closed_by_user_id) {
+    embed.addFields({ name: 'Closed By', value: '<@' + row.closed_by_user_id + '>', inline: true });
+  }
+
+  return embed;
 }
 
 async function openSupportTicket(interaction, ticketType) {
