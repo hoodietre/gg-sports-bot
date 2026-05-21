@@ -182,6 +182,8 @@ async function initDatabase() {
       panel_key TEXT NOT NULL,
       channel_id TEXT NOT NULL,
       message_id TEXT NOT NULL,
+      announcement_channel_id TEXT,
+      announcement_message_id TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
       PRIMARY KEY (league_id, panel_key)
@@ -456,6 +458,9 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
+  await pool.query(`ALTER TABLE tournament_panels ADD COLUMN IF NOT EXISTS announcement_channel_id TEXT`);
+  await pool.query(`ALTER TABLE tournament_panels ADD COLUMN IF NOT EXISTS announcement_message_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_history (
@@ -831,6 +836,17 @@ function buildCommands() {
       .setName('tournamentseeds')
       .setDescription('Show tournament seeds')
       .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName('announcetournament')
+      .setDescription('Post a public tournament registration announcement')
+      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+      .addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('tournamenthistory')
+      .setDescription('Show completed tournament champions')
+      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('addgame')
@@ -1797,6 +1813,77 @@ function buildTournamentInfoEmbed(settings, tournament, entries) {
     .setTimestamp();
 }
 
+function buildTournamentJoinButton(tournamentId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`tournament_join:${tournamentId}`)
+      .setLabel('Join Tournament')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled)
+  );
+}
+
+function buildTournamentAnnouncementEmbed(settings, tournament, entries) {
+  const buyIn = Number(tournament.buy_in) > 0 ? `${settings.currency_icon} ${tournament.buy_in} ${settings.currency_name}` : 'Free Entry';
+  const maxEntries = tournament.max_entries ? `${entries.length}/${tournament.max_entries}` : `${entries.length}`;
+
+  return new EmbedBuilder()
+    .setTitle(`🏆 ${tournament.tournament_name}`)
+    .setDescription('Registration is now open. Press the button below to join.')
+    .setColor(0xED4245)
+    .addFields(
+      { name: 'Game', value: tournament.game || 'TBD', inline: true },
+      { name: 'Format', value: tournament.format || 'single_elim', inline: true },
+      { name: 'Entries', value: maxEntries, inline: true },
+      { name: 'Buy-in', value: buyIn, inline: true },
+      { name: 'Prize', value: tournament.prize || 'Not listed', inline: true },
+      { name: 'Start Date', value: tournament.starts_at || 'TBD', inline: true },
+      { name: 'Tournament ID', value: shortTournamentId(tournament.id), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Tournament Registration' })
+    .setTimestamp();
+}
+
+function buildTournamentChampionEmbed(settings, tournament, championUserId, prizePaid = 0) {
+  const prizeText = Number(prizePaid) > 0
+    ? `${settings.currency_icon} ${prizePaid} ${settings.currency_name}`
+    : tournament.prize || 'No prize listed';
+
+  return new EmbedBuilder()
+    .setTitle(`🏆 ${tournament.tournament_name} Champion`)
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Champion', value: `<@${championUserId}>`, inline: false },
+      { name: 'Game', value: tournament.game || 'TBD', inline: true },
+      { name: 'Format', value: tournament.format || 'single_elim', inline: true },
+      { name: 'Prize', value: prizeText, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Tournament Champion' })
+    .setTimestamp();
+}
+
+function buildTournamentHistoryEmbed(rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Tournament History')
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Tournament History' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No completed tournaments have been recorded yet.');
+    return embed;
+  }
+
+  const lines = rows.map(row => {
+    const date = row.completed_at ? new Date(row.completed_at).toLocaleDateString('en-US') : 'Unknown date';
+    return `**${row.tournament_name}** — Champion: <@${row.champion_user_id}> • ${row.game || 'Game TBD'} • ${date}`;
+  });
+
+  embed.setDescription(lines.join(NL));
+  return embed;
+}
+
 function shortMatchId(matchId) {
   return String(matchId || '').split('-')[0];
 }
@@ -1911,6 +1998,26 @@ async function finalizeTournamentMatch(guild, match, winnerUserId, reportedByUse
         [randomUUID(), guild.id, completedTournament.league_id || null, match.tournament_id, match.tournament_name, completedTournament.game, completedTournament.format, winners[0].user_id, Number(match.prize_pool || 0)]
       );
       await updateTournamentPanel(guild, { ...completedTournament, status: 'completed' });
+
+      let announceChannel = null;
+      if (completedTournament.league_id) {
+        const activeLeague = await getLeagueById(completedTournament.league_id);
+        if (activeLeague?.tournament_channel_id) {
+          announceChannel = await guild.channels.fetch(activeLeague.tournament_channel_id).catch(() => null);
+        }
+      }
+      if (!announceChannel) {
+        const guildTournamentChannelId = await getGuildTournamentChannelId(guild.id);
+        if (guildTournamentChannelId) {
+          announceChannel = await guild.channels.fetch(guildTournamentChannelId).catch(() => null);
+        }
+      }
+      if (announceChannel && announceChannel.isTextBased()) {
+        const championSettings = await getCurrencySettings(guild.id);
+        await announceChannel.send({
+          embeds: [buildTournamentChampionEmbed(championSettings, completedTournament, winners[0].user_id, Number(match.prize_pool || 0))],
+        }).catch(() => null);
+      }
     }
 
     return { complete: true, message: `Tournament complete. Champion: <@${winners[0].user_id}>.${payoutText}` };
@@ -2325,6 +2432,62 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('tournament_join:')) {
+        if (!interaction.guild) return;
+        const tournamentId = interaction.customId.split(':')[1];
+        const tournament = await findTournament(interaction.guild.id, tournamentId);
+        const settings = await getCurrencySettings(interaction.guild.id);
+
+        if (!tournament) {
+          await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+          return;
+        }
+
+        if (tournament.status !== 'open') {
+          await interaction.reply({ content: 'That tournament is not open for registration.', ephemeral: true });
+          return;
+        }
+
+        const entries = await getTournamentEntries(tournament.id);
+        if (tournament.max_entries && entries.length >= Number(tournament.max_entries)) {
+          await interaction.reply({ content: 'That tournament is full.', ephemeral: true });
+          return;
+        }
+
+        if (entries.some(entry => entry.user_id === interaction.user.id)) {
+          await interaction.reply({ content: 'You are already registered for that tournament.', ephemeral: true });
+          return;
+        }
+
+        const buyIn = Number(tournament.buy_in || 0);
+        if (buyIn > 0) {
+          const removed = await removeCurrency(interaction.guild.id, interaction.user.id, buyIn, 'tournament_buy_in', `Buy-in: ${tournament.tournament_name}`, interaction.user.id);
+          if (!removed) {
+            await interaction.reply({ content: `You need **${settings.currency_icon} ${buyIn} ${settings.currency_name}** to join this tournament.`, ephemeral: true });
+            return;
+          }
+        }
+
+        await pool.query(
+          `INSERT INTO tournament_entries (tournament_id, guild_id, user_id, paid_buy_in)
+           VALUES ($1, $2, $3, $4)`,
+          [tournament.id, interaction.guild.id, interaction.user.id, buyIn]
+        );
+
+        if (buyIn > 0) {
+          await pool.query(`UPDATE tournaments SET prize_pool = prize_pool + $1, updated_at = NOW() WHERE id = $2`, [buyIn, tournament.id]);
+        }
+
+        const updatedTournament = await findTournament(interaction.guild.id, tournament.id);
+        const updatedEntries = await getTournamentEntries(tournament.id);
+        await interaction.update({
+          embeds: [buildTournamentAnnouncementEmbed(settings, updatedTournament || tournament, updatedEntries)],
+          components: [buildTournamentJoinButton(tournament.id, tournament.max_entries && updatedEntries.length >= Number(tournament.max_entries))],
+        });
+        await interaction.followUp({ content: `You joined **${tournament.tournament_name}**.`, ephemeral: true });
+        return;
+      }
+
       if (interaction.customId.startsWith('tourney_match_winner:')) {
         if (!interaction.guild) {
           await interaction.reply({ content: 'Tournament buttons must be used inside the server.', ephemeral: true });
@@ -3579,6 +3742,81 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await pool.query(`UPDATE tournaments SET status = 'closed', updated_at = NOW() WHERE id = $1`, [tournament.id]);
       await interaction.reply({ content: `Registration closed for **${tournament.tournament_name}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'announcetournament') {
+      if (!interaction.guild) return;
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to announce tournaments.', ephemeral: true });
+        return;
+      }
+
+      const input = interaction.options.getString('tournament');
+      const tournament = await findTournament(interaction.guild.id, input);
+      const channelOption = interaction.options.getChannel('channel');
+
+      if (!tournament) {
+        await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+        return;
+      }
+
+      let channel = channelOption || null;
+      if (!channel) {
+        const guildTournamentChannelId = await getGuildTournamentChannelId(interaction.guild.id);
+        if (guildTournamentChannelId) channel = await interaction.guild.channels.fetch(guildTournamentChannelId).catch(() => null);
+      }
+      if (!channel) channel = interaction.channel;
+
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I cannot post in that announcement channel. Check permissions.', ephemeral: true });
+        return;
+      }
+
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const entries = await getTournamentEntries(tournament.id);
+      const message = await channel.send({
+        embeds: [buildTournamentAnnouncementEmbed(settings, tournament, entries)],
+        components: [buildTournamentJoinButton(tournament.id, tournament.max_entries && entries.length >= Number(tournament.max_entries))],
+      });
+
+      await pool.query(
+        `INSERT INTO tournament_panels (tournament_id, guild_id, channel_id, message_id, announcement_channel_id, announcement_message_id, updated_at)
+         VALUES ($1, $2, $3, $4, $3, $4, NOW())
+         ON CONFLICT (tournament_id)
+         DO UPDATE SET announcement_channel_id = $3, announcement_message_id = $4, updated_at = NOW()`,
+        [tournament.id, interaction.guild.id, channel.id, message.id]
+      );
+
+      await interaction.reply({ content: `Tournament announcement posted for **${tournament.tournament_name}** in ${channel}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'tournamenthistory') {
+      if (!interaction.guild) return;
+      const requestedLeagueName = interaction.options.getString('league');
+      let activeLeague = null;
+      if (requestedLeagueName) {
+        activeLeague = await getLeagueByName(interaction.guild.id, requestedLeagueName);
+        if (!activeLeague) {
+          await interaction.reply({ content: `Could not find league **${requestedLeagueName}**.`, ephemeral: true });
+          return;
+        }
+      }
+
+      const result = activeLeague
+        ? await pool.query(
+            `SELECT * FROM tournament_history WHERE guild_id = $1 AND league_id = $2 ORDER BY completed_at DESC LIMIT 20`,
+            [interaction.guild.id, activeLeague.league_id]
+          )
+        : await pool.query(
+            `SELECT * FROM tournament_history WHERE guild_id = $1 ORDER BY completed_at DESC LIMIT 20`,
+            [interaction.guild.id]
+          );
+
+      await interaction.reply({ embeds: [buildTournamentHistoryEmbed(result.rows)], ephemeral: true });
       return;
     }
 
