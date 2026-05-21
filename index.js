@@ -499,6 +499,10 @@ async function initDatabase() {
       review_decision TEXT,
       review_decision_by_user_id TEXT,
       review_decision_at TIMESTAMP,
+      game_id TEXT,
+      request_action TEXT,
+      requested_team_role_id TEXT,
+      opponent_user_id TEXT,
       closed_by_user_id TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       closed_at TIMESTAMP
@@ -510,6 +514,10 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS review_decision TEXT`);
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS review_decision_by_user_id TEXT`);
   await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS review_decision_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS game_id TEXT`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS request_action TEXT`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS requested_team_role_id TEXT`);
+  await pool.query(`ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS opponent_user_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ticket_transcripts (
@@ -2806,16 +2814,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [decision, interaction.user.id, ticket.id]
         );
 
+        let applyMessage = '';
+        if (isApproved) {
+          applyMessage = await applyApprovedGameIssue(ticket, interaction.user.id);
+        }
+
         await updateTicketPanel(interaction.guild);
 
         await interaction.update({
-          content: 'Request **' + decision + '** by <@' + interaction.user.id + '>.',
+          content: 'Request **' + decision + '** by <@' + interaction.user.id + '>.' + (applyMessage ? ' ' + applyMessage : ''),
           components: [buildTicketReviewButtons(ticket.id, true)],
         });
 
         if (interaction.channel?.isTextBased()) {
           await interaction.channel.send({
-            content: 'Decision recorded: **' + decision + '** by <@' + interaction.user.id + '>. Use `/closeticket` when the review is fully complete.',
+            content: 'Decision recorded: **' + decision + '** by <@' + interaction.user.id + '>.' + (applyMessage ? String.fromCharCode(10) + applyMessage : '') + String.fromCharCode(10) + 'Use `/closeticket` when the review is fully complete.',
             allowedMentions: { users: [interaction.user.id], roles: [] },
           }).catch(() => null);
         }
@@ -3185,6 +3198,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const leagueName = interaction.options.getString('league');
       const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+  const requestedTeamRoleId = team?.id || null;
+  const opponentUserId = opponent?.id || null;
       if (!activeLeague) {
         await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
         return;
@@ -3323,8 +3338,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === 'gamerequest') {
       interaction.ggSportsReviewButtons = true;
+  interaction.ggSportsGameIssueMeta = {
+    gameId,
+    requestAction: ticketType,
+    requestedTeamRoleId,
+    opponentUserId,
+  };
   await openSupportTicket(interaction, 'gamerequest');
   delete interaction.ggSportsReviewButtons;
+  delete interaction.ggSportsGameIssueMeta;
       return;
     }
 
@@ -5545,6 +5567,86 @@ async function updateTicketPanel(guild) {
   await message.edit({ embeds: [await buildTicketDashboardEmbed(guild.id)] }).catch(() => null);
 }
 
+async function applyApprovedGameIssue(ticket, reviewerUserId) {
+  if (!ticket.game_id || !ticket.league_id || !ticket.request_action) {
+    return 'Decision saved. No game update was applied because this ticket is missing game metadata.';
+  }
+
+  const gameResult = await pool.query(
+    `SELECT * FROM league_games
+     WHERE guild_id = $1 AND league_id = $2 AND id::text LIKE $3
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [ticket.guild_id, ticket.league_id, ticket.game_id + '%']
+  );
+
+  if (!gameResult.rows.length) {
+    return 'Decision saved, but no matching game was found for Game ID **' + ticket.game_id + '**.';
+  }
+
+  const game = gameResult.rows[0];
+  const league = await getLeagueById(ticket.league_id);
+
+  if (ticket.request_action === 'reset') {
+    await pool.query(
+      `UPDATE league_games
+       SET status = 'scheduled', home_score = NULL, away_score = NULL, winner_team_role_id = NULL, reported_by_user_id = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [reviewerUserId, game.id]
+    );
+    return 'Game **' + shortGameId(game.id) + '** has been reset/reopened.';
+  }
+
+  const requestedTeamRoleId = ticket.requested_team_role_id;
+  if (!requestedTeamRoleId) {
+    return 'Decision saved. No force win was applied because no requesting team role was saved.';
+  }
+
+  if (![game.home_team_role_id, game.away_team_role_id].includes(requestedTeamRoleId)) {
+    return 'Decision saved. No force win was applied because the requesting team is not part of this game.';
+  }
+
+  const homeWins = requestedTeamRoleId === game.home_team_role_id;
+  const homeScore = homeWins ? 1 : 0;
+  const awayScore = homeWins ? 0 : 1;
+  const winnerRoleId = requestedTeamRoleId;
+  const loserRoleId = homeWins ? game.away_team_role_id : game.home_team_role_id;
+  const winnerName = homeWins ? game.home_team_name : game.away_team_name;
+  const loserName = homeWins ? game.away_team_name : game.home_team_name;
+
+  if (game.status === 'final') {
+    return 'Decision saved. Game **' + shortGameId(game.id) + '** was already final, so standings were not changed automatically.';
+  }
+
+  await pool.query(
+    `UPDATE league_games
+     SET status = 'final', home_score = $1, away_score = $2, winner_team_role_id = $3, reported_by_user_id = $4, updated_at = NOW()
+     WHERE id = $5`,
+    [homeScore, awayScore, winnerRoleId, reviewerUserId, game.id]
+  );
+
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses)
+     VALUES ($1, $2, $3, $4, 1, 0)
+     ON CONFLICT (guild_id, league_id, team_role_id)
+     DO UPDATE SET wins = league_standings.wins + 1, updated_at = NOW()`,
+    [ticket.guild_id, ticket.league_id, winnerRoleId, winnerName]
+  );
+
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses)
+     VALUES ($1, $2, $3, $4, 0, 1)
+     ON CONFLICT (guild_id, league_id, team_role_id)
+     DO UPDATE SET losses = league_standings.losses + 1, updated_at = NOW()`,
+    [ticket.guild_id, ticket.league_id, loserRoleId, loserName]
+  );
+
+  const guild = await client.guilds.fetch(ticket.guild_id).catch(() => null);
+  if (guild && league) await updateStandingsPanel(guild, league);
+
+  return 'Approved ruling applied: **' + winnerName + '** receives a force win over **' + loserName + '** for Game **' + shortGameId(game.id) + '**.';
+}
+
 async function openGameIssueTicket(interaction, ticketType) {
   if (!interaction.guild) return;
 
@@ -5585,6 +5687,7 @@ async function openSupportTicket(interaction, ticketType) {
   if (!interaction.guild) return;
 
   const shouldAddReviewButtons = interaction.ggSportsReviewButtons === true;
+  const gameIssueMeta = interaction.ggSportsGameIssueMeta || null;
 
   const subject = interaction.options.getString('subject');
   const description = interaction.options.getString('description');
@@ -5654,6 +5757,18 @@ async function openSupportTicket(interaction, ticketType) {
     channelId: baseChannel.id,
     threadId: thread.id,
   });
+
+  if (gameIssueMeta) {
+    await pool.query(
+      `UPDATE support_tickets
+       SET game_id = $1,
+           request_action = $2,
+           requested_team_role_id = $3,
+           opponent_user_id = $4
+       WHERE id = $5`,
+      [gameIssueMeta.gameId || null, gameIssueMeta.requestAction || null, gameIssueMeta.requestedTeamRoleId || null, gameIssueMeta.opponentUserId || null, ticketId]
+    );
+  }
 
   if (shouldAddReviewButtons) {
     await thread.send({
