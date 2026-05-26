@@ -3555,26 +3555,120 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'league') {
+      if (!interaction.guild) return;
       const leagueSubcommand = interaction.options.getSubcommand();
 
       if (leagueSubcommand === 'create') {
-        interaction.commandName = 'league-create';
-      } else if (leagueSubcommand === 'list') {
-        interaction.commandName = 'league-list';
-      } else if (leagueSubcommand === 'info' || leagueSubcommand === 'settings') {
-        interaction.commandName = 'league-list';
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('name');
+        const leagueId = randomUUID();
+
+        await pool.query(
+          `INSERT INTO guilds (guild_id, guild_name)
+           VALUES ($1, $2)
+           ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`,
+          [interaction.guild.id, interaction.guild.name]
+        );
+
+        await pool.query(
+          `INSERT INTO leagues (league_id, guild_id, league_name, game_key)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (guild_id, league_name)
+           DO UPDATE SET is_active = TRUE`,
+          [leagueId, interaction.guild.id, leagueName, 'general']
+        );
+
+        const savedLeague = await getLeagueByName(interaction.guild.id, leagueName);
+        await pool.query(
+          `INSERT INTO league_settings (league_id)
+           VALUES ($1)
+           ON CONFLICT (league_id) DO NOTHING`,
+          [savedLeague.league_id]
+        );
+
+        await interaction.reply({ content: 'League created/configured: **' + leagueName + '**.', ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'list') {
+        const result = await pool.query(
+          `SELECT league_name, game_key, season_length
+           FROM leagues
+           WHERE guild_id = $1 AND is_active = TRUE
+           ORDER BY league_name ASC`,
+          [interaction.guild.id]
+        );
+
+        const text = result.rows.length
+          ? result.rows.map(row => '• **' + row.league_name + '** (' + row.game_key + (row.season_length ? ' • ' + row.season_length + ' games' : '') + ')').join(String.fromCharCode(10))
+          : 'No leagues configured yet.';
+
+        await interaction.reply({ content: text, ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'info' || leagueSubcommand === 'settings') {
+        const leagueName = interaction.options.getString('name');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with `/league create`.', ephemeral: true });
+          return;
+        }
+
+        const embed = new EmbedBuilder()
+          .setTitle('League Settings • ' + activeLeague.league_name)
+          .setColor(0x5865F2)
+          .addFields(
+            { name: 'Game', value: activeLeague.game_key || 'general', inline: true },
+            { name: 'League Role', value: activeLeague.league_role_id ? '<@&' + activeLeague.league_role_id + '>' : 'Not set', inline: true },
+            { name: 'Staff Role', value: activeLeague.staff_role_id ? '<@&' + activeLeague.staff_role_id + '>' : 'Not set', inline: true },
+            { name: 'Standings Channel', value: activeLeague.standings_channel_id ? '<#' + activeLeague.standings_channel_id + '>' : 'Not set', inline: true },
+            { name: 'Tournament Channel', value: activeLeague.tournament_channel_id ? '<#' + activeLeague.tournament_channel_id + '>' : 'Not set', inline: true },
+            { name: 'History Channel', value: activeLeague.history_channel_id ? '<#' + activeLeague.history_channel_id + '>' : 'Not set', inline: true }
+          )
+          .setFooter({ text: 'GG Sports • League Hub' })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'staff') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update league staff.', ephemeral: true });
+          return;
+        }
+
+        const staffRole = interaction.options.getRole('role');
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id, staff_role_id, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (league_id)
+           DO UPDATE SET staff_role_id = $2, updated_at = NOW()`,
+          [activeLeague.league_id, staffRole.id]
+        );
+
+        await interaction.reply({ content: 'Staff role for **' + activeLeague.league_name + '** set to ' + staffRole.toString() + '.', ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'seasonhistory') {
+        interaction.commandName = 'addseasonhistory';
       } else if (leagueSubcommand === 'edit') {
         interaction.commandName = 'editleaguename';
-      } else if (leagueSubcommand === 'staff') {
-        interaction.commandName = 'league-setroles';
-      } else if (leagueSubcommand === 'standingschannel') {
-        interaction.commandName = 'league-setstandingschannel';
-      } else if (leagueSubcommand === 'standingspanel') {
-        interaction.commandName = 'setupstandings';
-      } else if (leagueSubcommand === 'tournamentchannel') {
-        interaction.commandName = 'settournamentchannel';
-      } else if (leagueSubcommand === 'tournamentpanel') {
-        interaction.commandName = 'setuptournamentpanel';
       } else if (leagueSubcommand === 'ticketpanel') {
         interaction.commandName = 'setupticketpanel';
       } else if (leagueSubcommand === 'supportpanel') {
@@ -3583,10 +3677,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         interaction.commandName = 'setupsportsbookpanel';
       } else if (leagueSubcommand === 'teamownerspanel') {
         interaction.commandName = 'setupteamowners';
+      } else if (leagueSubcommand === 'standingspanel') {
+        interaction.commandName = 'setupstandings';
+      } else if (leagueSubcommand === 'tournamentpanel') {
+        interaction.commandName = 'setuptournamentpanel';
+      } else if (leagueSubcommand === 'standingschannel') {
+        interaction.commandName = 'league-setstandingschannel';
+      } else if (leagueSubcommand === 'tournamentchannel') {
+        interaction.commandName = 'settournamentchannel';
       } else if (leagueSubcommand === 'currency') {
         interaction.commandName = 'setcurrency';
-      } else if (leagueSubcommand === 'seasonhistory') {
-        interaction.commandName = 'addseasonhistory';
       }
     }
 
