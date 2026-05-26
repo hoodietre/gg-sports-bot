@@ -1392,20 +1392,44 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const commands = getRegisteredCommands();
 
-  console.log('Registering global commands...');
-  await rest.put(
-    Routes.applicationCommands(CLIENT_ID),
-    { body: commands }
-  );
-  console.log('Global commands synced:', commands.length);
+  console.log('Prepared command count:', commands.length);
 
-  for (const guildId of COMMAND_GUILD_IDS) {
-    console.log('Registering guild commands for:', guildId);
+  try {
+    console.log('Registering global commands...');
     await rest.put(
-      Routes.applicationGuildCommands(CLIENT_ID, guildId),
+      Routes.applicationCommands(CLIENT_ID),
       { body: commands }
     );
-    console.log('Guild commands synced for', guildId + ':', commands.length);
+    console.log('Global commands synced:', commands.length);
+  } catch (error) {
+    console.error('Global command sync failed:', error);
+  }
+
+  const guildIds = new Set();
+
+  if (process.env.GUILD_IDS) {
+    for (const id of process.env.GUILD_IDS.split(',')) {
+      if (id.trim()) guildIds.add(id.trim());
+    }
+  }
+
+  if (process.env.GUILD_ID) guildIds.add(process.env.GUILD_ID.trim());
+
+  for (const guild of client.guilds.cache.values()) {
+    guildIds.add(guild.id);
+  }
+
+  for (const guildId of guildIds) {
+    try {
+      console.log('Registering guild commands for:', guildId);
+      await rest.put(
+        Routes.applicationGuildCommands(CLIENT_ID, guildId),
+        { body: commands }
+      );
+      console.log('Guild commands synced for ' + guildId + ':', commands.length);
+    } catch (error) {
+      console.error('Guild command sync failed for ' + guildId + ':', error);
+    }
   }
 }
 
