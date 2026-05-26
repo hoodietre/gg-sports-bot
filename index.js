@@ -939,100 +939,88 @@ function buildCommands() {
       .setDescription('Admin/staff: view recent server economy transactions'),
 
     new SlashCommandBuilder()
-      .setName('createtournament')
-      .setDescription('Admin/staff: create a tournament')
-      .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
-      .addStringOption(o => o.setName('game').setDescription('Game, ex: NBA 2K or MLB The Show').setRequired(true))
-      .addStringOption(o => o.setName('format').setDescription('single_elim, double_elim, round_robin').setRequired(false))
-      .addIntegerOption(o => o.setName('max_entries').setDescription('Maximum number of entries').setRequired(false))
-      .addIntegerOption(o => o.setName('buy_in').setDescription('Currency buy-in amount').setRequired(false))
-      .addStringOption(o => o.setName('prize').setDescription('Prize description').setRequired(false))
-      .addStringOption(o => o.setName('date').setDescription('Start date/time').setRequired(false))
-      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
+      .setName('tournament')
+      .setDescription('Tournament commands')
+      .addSubcommand(sc => sc
+        .setName('create')
+        .setDescription('Admin/staff: create a tournament')
+        .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
+        .addStringOption(o => o.setName('game').setDescription('Game, ex: NBA 2K or MLB The Show').setRequired(true))
+        .addStringOption(o => o.setName('format').setDescription('single_elim, double_elim, round_robin').setRequired(false))
+        .addIntegerOption(o => o.setName('max_entries').setDescription('Maximum number of entries').setRequired(false))
+        .addIntegerOption(o => o.setName('buy_in').setDescription('Currency buy-in amount').setRequired(false))
+        .addStringOption(o => o.setName('prize').setDescription('Prize description').setRequired(false))
+        .addStringOption(o => o.setName('date').setDescription('Start date/time').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('join')
+        .setDescription('Join an open tournament')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+        .addStringOption(o => o.setName('entry_name').setDescription('Optional team/entry name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('list')
+        .setDescription('List active tournaments'))
+      .addSubcommand(sc => sc
+        .setName('info')
+        .setDescription('Show tournament info')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('close')
+        .setDescription('Admin/staff: close tournament registration')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('start')
+        .setDescription('Admin/staff: start a single-elimination tournament bracket')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('matches')
+        .setDescription('Show tournament matches')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('panel')
+        .setDescription('Create or refresh a permanent tournament bracket panel')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('report')
+        .setDescription('Admin/staff: report a tournament match winner')
+        .addStringOption(o => o.setName('match_id').setDescription('Match short ID from tournament matches').setRequired(true))
+        .addUserOption(o => o.setName('winner').setDescription('Winning user').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('shuffle')
+        .setDescription('Admin/staff: randomly seed a tournament before it starts')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('seed')
+        .setDescription('Admin/staff: manually set a user seed')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+        .addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true))
+        .addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('seeds')
+        .setDescription('Show tournament seeds')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('announce')
+        .setDescription('Post a public tournament registration announcement')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+        .addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('history')
+        .setDescription('Show completed tournament champions')
+        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('mvp')
+        .setDescription('Admin/staff: set tournament MVP and optional payout')
+        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
+        .addUserOption(o => o.setName('user').setDescription('Tournament MVP').setRequired(true))
+        .addIntegerOption(o => o.setName('payout').setDescription('Optional MVP currency payout').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('rewards')
+        .setDescription('Show tournament champion/MVP reward records')
+        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false))),
 
     new SlashCommandBuilder()
-      .setName('jointournament')
-      .setDescription('Join an open tournament')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-      .addStringOption(o => o.setName('entry_name').setDescription('Optional team/entry name').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('tournaments')
-      .setDescription('List active tournaments'),
-
-    new SlashCommandBuilder()
-      .setName('tournamentinfo')
-      .setDescription('Show tournament info')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('closetournament')
-      .setDescription('Admin/staff: close tournament registration')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('starttournament')
-      .setDescription('Admin/staff: start a single-elimination tournament bracket')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('tournamentmatches')
-      .setDescription('Show tournament matches')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('setuptournamentpanel')
-      .setDescription('Create or refresh a permanent tournament bracket panel')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('reportmatch')
-      .setDescription('Admin/staff: report a tournament match winner')
-      .addStringOption(o => o.setName('match_id').setDescription('Match short ID from /tournamentmatches').setRequired(true))
-      .addUserOption(o => o.setName('winner').setDescription('Winning user').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('shuffletournament')
-      .setDescription('Admin/staff: randomly seed a tournament before it starts')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('settournamentseed')
-      .setDescription('Admin/staff: manually set a user seed before tournament starts')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-      .addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true))
-      .addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('tournamentseeds')
-      .setDescription('Show tournament seeds')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('announcetournament')
-      .setDescription('Post a public tournament registration announcement')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-      .addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('tournamenthistory')
-      .setDescription('Show completed tournament champions')
-      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('settournamentmvp')
-      .setDescription('Admin/staff: set a tournament MVP and optional payout')
-      .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-      .addUserOption(o => o.setName('user').setDescription('Tournament MVP').setRequired(true))
-      .addIntegerOption(o => o.setName('payout').setDescription('Optional MVP currency payout').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('tournamentrewards')
-      .setDescription('Show tournament champion/MVP reward records')
-      .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('ticket')
+      .setName('ticket'
       .setDescription('Ticket and support commands')
       .addSubcommand(sc => sc
         .setName('open')
@@ -1238,6 +1226,22 @@ function getRegisteredCommands() {
   if (commands.length <= MAX_COMMANDS) return commands;
 
   const dropIfNeeded = new Set([
+    'createtournament',
+    'jointournament',
+    'tournaments',
+    'tournamentinfo',
+    'closetournament',
+    'starttournament',
+    'tournamentmatches',
+    'setuptournamentpanel',
+    'reportmatch',
+    'shuffletournament',
+    'settournamentseed',
+    'tournamentseeds',
+    'announcetournament',
+    'tournamenthistory',
+    'settournamentmvp',
+    'tournamentrewards',
     'setupleague',
     'leagues',
     'leagueinfo',
@@ -3757,6 +3761,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
       return;
+    }
+
+    if (interaction.commandName === 'tournament') {
+      const tournamentSubcommand = interaction.options.getSubcommand();
+
+      const tournamentCommandMap = {
+        create: 'createtournament',
+        join: 'jointournament',
+        list: 'tournaments',
+        info: 'tournamentinfo',
+        close: 'closetournament',
+        start: 'starttournament',
+        matches: 'tournamentmatches',
+        panel: 'setuptournamentpanel',
+        report: 'reportmatch',
+        shuffle: 'shuffletournament',
+        seed: 'settournamentseed',
+        seeds: 'tournamentseeds',
+        announce: 'announcetournament',
+        history: 'tournamenthistory',
+        mvp: 'settournamentmvp',
+        rewards: 'tournamentrewards',
+      };
+
+      interaction.commandName = tournamentCommandMap[tournamentSubcommand] || interaction.commandName;
     }
 
     if (interaction.commandName === 'ticket') {
