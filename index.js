@@ -3704,7 +3704,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (economySubcommand === 'balance') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
-        const balance = await getCurrencyBalance(interaction.guild.id, targetUser.id);
+        const balanceResult = await pool.query(
+          `SELECT balance, lifetime_earned, lifetime_spent
+           FROM guild_currency_balances
+           WHERE guild_id = $1 AND user_id = $2`,
+          [interaction.guild.id, targetUser.id]
+        );
+
+        const balance = balanceResult.rows[0] || {
+          balance: 0,
+          lifetime_earned: 0,
+          lifetime_spent: 0,
+        };
         await interaction.reply({
           content: '**' + targetUser.username + '** has **' + settings.currency_icon + ' ' + balance.balance + ' ' + settings.currency_name + '**. Lifetime earned: **' + balance.lifetime_earned + '**. Lifetime spent: **' + balance.lifetime_spent + '**.',
           ephemeral: true,
