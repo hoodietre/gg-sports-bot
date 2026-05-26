@@ -1313,6 +1313,8 @@ function getRegisteredCommands() {
     'setupstandings',
     'refreshstandings',
     'league-settournamentchannel',
+    'league-setstandingschannel',
+    'league-setup-panels',
     'league-addteamrole',
     'league-create',
     'league-list',
