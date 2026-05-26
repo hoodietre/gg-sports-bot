@@ -3557,7 +3557,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'league') {
       const leagueSubcommand = interaction.options.getSubcommand();
 
-      if (leagueSubcommand === 'ticketpanel') {
+      if (leagueSubcommand === 'create') {
+        interaction.commandName = 'league-create';
+      } else if (leagueSubcommand === 'list') {
+        interaction.commandName = 'league-list';
+      } else if (leagueSubcommand === 'info' || leagueSubcommand === 'settings') {
+        interaction.commandName = 'league-list';
+      } else if (leagueSubcommand === 'edit') {
+        interaction.commandName = 'editleaguename';
+      } else if (leagueSubcommand === 'staff') {
+        interaction.commandName = 'league-setroles';
+      } else if (leagueSubcommand === 'standingschannel') {
+        interaction.commandName = 'league-setstandingschannel';
+      } else if (leagueSubcommand === 'standingspanel') {
+        interaction.commandName = 'setupstandings';
+      } else if (leagueSubcommand === 'tournamentchannel') {
+        interaction.commandName = 'settournamentchannel';
+      } else if (leagueSubcommand === 'tournamentpanel') {
+        interaction.commandName = 'setuptournamentpanel';
+      } else if (leagueSubcommand === 'ticketpanel') {
         interaction.commandName = 'setupticketpanel';
       } else if (leagueSubcommand === 'supportpanel') {
         interaction.commandName = 'setupsupportpanel';
@@ -3565,28 +3583,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         interaction.commandName = 'setupsportsbookpanel';
       } else if (leagueSubcommand === 'teamownerspanel') {
         interaction.commandName = 'setupteamowners';
-      } else if (leagueSubcommand === 'standingspanel') {
-        interaction.commandName = 'setupstandings';
-      } else if (leagueSubcommand === 'tournamentchannel') {
-        interaction.commandName = 'league-settournamentchannel';
-      } else if (leagueSubcommand === 'tournamentpanel') {
-        interaction.commandName = 'setuptournamentpanel';
-      } else if (leagueSubcommand === 'standingschannel') {
-        interaction.commandName = 'setstandingschannel';
-      } else if (leagueSubcommand === 'staff') {
-        interaction.commandName = 'setstaffrole';
       } else if (leagueSubcommand === 'currency') {
         interaction.commandName = 'setcurrency';
-      } else if (leagueSubcommand === 'list') {
-        interaction.commandName = 'leagues';
-      } else if (leagueSubcommand === 'info' || leagueSubcommand === 'settings') {
-        interaction.commandName = 'leagueinfo';
-      } else if (leagueSubcommand === 'edit') {
-        interaction.commandName = 'editleaguename';
       } else if (leagueSubcommand === 'seasonhistory') {
         interaction.commandName = 'addseasonhistory';
-      } else if (leagueSubcommand === 'create') {
-        interaction.commandName = 'setupleague';
       }
     }
 
