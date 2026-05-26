@@ -1288,38 +1288,37 @@ function buildCommands() {
         .setDescription('View league/server setup settings')),
 
     new SlashCommandBuilder()
-      .setName('addgame')
-      .setDescription('Add a scheduled league game')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true))
-      .addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true))
-      .addStringOption(o => o.setName('date').setDescription('Game date/time, ex: Week 1 or May 20 8PM').setRequired(false))
-      .addStringOption(o => o.setName('week').setDescription('Week/series label, ex: Week 1').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('reportgame')
-      .setDescription('Report a completed league game')
-      .addStringOption(o => o.setName('game_id').setDescription('Game ID from /schedule').setRequired(true))
-      .addIntegerOption(o => o.setName('home_score').setDescription('Home team score').setRequired(true))
-      .addIntegerOption(o => o.setName('away_score').setDescription('Away team score').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('schedule')
-      .setDescription('Show scheduled/recent games for a league')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('standings')
-      .setDescription('Show league standings')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('adjuststandings')
-      .setDescription('Admin adjustment for team standings')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
-      .addIntegerOption(o => o.setName('wins').setDescription('Set wins').setRequired(true))
-      .addIntegerOption(o => o.setName('losses').setDescription('Set losses').setRequired(true)),
+      .setName('game')
+      .setDescription('League game and standings commands')
+      .addSubcommand(sc => sc
+        .setName('add')
+        .setDescription('Add a scheduled league game')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+        .addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true))
+        .addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true))
+        .addStringOption(o => o.setName('date').setDescription('Game date/time, ex: Week 1 or May 20 8PM').setRequired(false))
+        .addStringOption(o => o.setName('week').setDescription('Week/series label, ex: Week 1').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('report')
+        .setDescription('Report a completed league game')
+        .addStringOption(o => o.setName('game_id').setDescription('Game ID from schedule').setRequired(true))
+        .addIntegerOption(o => o.setName('home_score').setDescription('Home team score').setRequired(true))
+        .addIntegerOption(o => o.setName('away_score').setDescription('Away team score').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('schedule')
+        .setDescription('Show scheduled/recent games for a league')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('standings')
+        .setDescription('Show league standings')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('adjuststandings')
+        .setDescription('Admin adjustment for team standings')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+        .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
+        .addIntegerOption(o => o.setName('wins').setDescription('Set wins').setRequired(true))
+        .addIntegerOption(o => o.setName('losses').setDescription('Set losses').setRequired(true))),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -1347,6 +1346,11 @@ function getRegisteredCommands() {
     'setupteamowners',
     'setuptradecount',
     'setupoffertrade',
+    'addgame',
+    'reportgame',
+    'schedule',
+    'standings',
+    'adjuststandings',
     'stats',
     'teamprofile',
     'franchiselegacy',
@@ -3921,6 +3925,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
       return;
+    }
+
+    if (interaction.commandName === 'game') {
+      const gameSubcommand = interaction.options.getSubcommand();
+      const gameCommandMap = {
+        add: 'addgame',
+        report: 'reportgame',
+        schedule: 'schedule',
+        standings: 'standings',
+        adjuststandings: 'adjuststandings',
+      };
+      interaction.commandName = gameCommandMap[gameSubcommand] || interaction.commandName;
     }
 
     if (interaction.commandName === 'profile') {
