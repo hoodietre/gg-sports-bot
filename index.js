@@ -1308,19 +1308,6 @@ function getRegisteredCommands() {
   if (commands.length <= MAX_COMMANDS) return commands;
 
   const dropIfNeeded = new Set([
-    'balance',
-    'transfer',
-    'givecurrency',
-    'takecurrency',
-    'createshopitem',
-    'buy',
-    'inventory',
-    'removeshopitem',
-    'useitem',
-    'redeemitem',
-    'richest',
-    'transactions',
-    'banklog',
     'createtournament',
     'jointournament',
     'tournaments',
