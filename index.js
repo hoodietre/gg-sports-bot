@@ -4053,13 +4053,113 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'tournament') {
+      if (!interaction.guild) return;
       const tournamentSubcommand = interaction.options.getSubcommand();
+
+      if (tournamentSubcommand === 'list') {
+        const result = await pool.query(
+          `SELECT * FROM tournaments
+           WHERE guild_id = $1 AND status IN ('open', 'closed', 'active')
+           ORDER BY created_at DESC
+           LIMIT 15`,
+          [interaction.guild.id]
+        );
+
+        await interaction.reply({ embeds: [buildTournamentListEmbed(result.rows)], ephemeral: true });
+        return;
+      }
+
+      if (tournamentSubcommand === 'info') {
+        const tournamentInput = interaction.options.getString('tournament');
+        const tournament = await findTournament(interaction.guild.id, tournamentInput);
+
+        if (!tournament) {
+          await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+          return;
+        }
+
+        const entries = await pool.query(
+          `SELECT * FROM tournament_entries WHERE guild_id = $1 AND tournament_id = $2 ORDER BY seed ASC NULLS LAST, joined_at ASC`,
+          [interaction.guild.id, tournament.id]
+        );
+
+        await interaction.reply({ embeds: [buildTournamentInfoEmbed(tournament, entries.rows)], ephemeral: true });
+        return;
+      }
+
+      if (tournamentSubcommand === 'history') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+
+        const result = activeLeague
+          ? await pool.query(
+              `SELECT * FROM tournament_history
+               WHERE guild_id = $1 AND league_id = $2
+               ORDER BY completed_at DESC
+               LIMIT 15`,
+              [interaction.guild.id, activeLeague.league_id]
+            )
+          : await pool.query(
+              `SELECT * FROM tournament_history
+               WHERE guild_id = $1
+               ORDER BY completed_at DESC
+               LIMIT 15`,
+              [interaction.guild.id]
+            );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Tournament History' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+          .setColor(0xFEE75C)
+          .setFooter({ text: 'GG Sports • Tournament History' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '**' + row.tournament_name + '** — Champion: <@' + row.champion_user_id + '> • Prize: ' + row.prize_paid + (row.mvp_user_id ? ' • MVP: <@' + row.mvp_user_id + '>' : '')).join(NL)
+          : 'No completed tournament history found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (tournamentSubcommand === 'rewards') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+
+        const result = activeLeague
+          ? await pool.query(
+              `SELECT * FROM tournament_history
+               WHERE guild_id = $1 AND league_id = $2
+               ORDER BY completed_at DESC
+               LIMIT 15`,
+              [interaction.guild.id, activeLeague.league_id]
+            )
+          : await pool.query(
+              `SELECT * FROM tournament_history
+               WHERE guild_id = $1
+               ORDER BY completed_at DESC
+               LIMIT 15`,
+              [interaction.guild.id]
+            );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Tournament Rewards' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+          .setColor(0x57F287)
+          .setFooter({ text: 'GG Sports • Tournament Rewards' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '**' + row.tournament_name + '** — Champion <@' + row.champion_user_id + '> paid ' + row.prize_paid + (row.mvp_user_id ? ' • MVP <@' + row.mvp_user_id + '> paid ' + row.mvp_payout : '')).join(NL)
+          : 'No tournament reward records found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
 
       const tournamentCommandMap = {
         create: 'createtournament',
         join: 'jointournament',
-        list: 'tournaments',
-        info: 'tournamentinfo',
         close: 'closetournament',
         start: 'starttournament',
         matches: 'tournamentmatches',
@@ -4069,9 +4169,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         seed: 'settournamentseed',
         seeds: 'tournamentseeds',
         announce: 'announcetournament',
-        history: 'tournamenthistory',
         mvp: 'settournamentmvp',
-        rewards: 'tournamentrewards',
       };
 
       interaction.commandName = tournamentCommandMap[tournamentSubcommand] || interaction.commandName;
