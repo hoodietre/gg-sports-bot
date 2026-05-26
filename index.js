@@ -1297,8 +1297,21 @@ function buildCommands() {
 }
 
 function getRegisteredCommands() {
-  const commands = buildCommands();
+  const builtCommands = buildCommands();
+  const byName = new Map();
+
+  // Keep the newest command definition when duplicate names exist.
+  // This lets consolidated hubs like /shop, /economy, /ticket, /league replace older standalone commands safely.
+  for (const command of builtCommands) {
+    byName.set(command.name, command);
+  }
+
+  const commands = [...byName.values()];
   const MAX_COMMANDS = 100;
+
+  if (builtCommands.length !== commands.length) {
+    console.warn('Removed duplicate command definitions:', builtCommands.length - commands.length);
+  }
 
   if (commands.length <= MAX_COMMANDS) return commands;
 
