@@ -3842,17 +3842,214 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'shop') {
+      if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
-      const shopCommandMap = {
-        view: 'shop',
-        buy: 'buy',
-        inventory: 'inventory',
-        createitem: 'createshopitem',
-        removeitem: 'removeshopitem',
-        useitem: 'useitem',
-        redeemitem: 'redeemitem',
-      };
-      interaction.commandName = shopCommandMap[shopSubcommand] || interaction.commandName;
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (shopSubcommand === 'view') {
+        const result = await pool.query(
+          `SELECT * FROM shop_items
+           WHERE guild_id = $1 AND is_active = TRUE
+           ORDER BY price ASC, item_name ASC
+           LIMIT 25`,
+          [interaction.guild.id]
+        );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Server Shop')
+          .setColor(0xFEE75C)
+          .setFooter({ text: 'GG Sports • Shop' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(item => '**' + shortShopItemId(item.id) + ' • ' + item.item_name + '** — ' + settings.currency_icon + ' ' + item.price + (item.stock === null ? '' : ' • Stock: ' + item.stock) + (item.description ? NL + item.description : '')).join(NL + NL)
+          : 'No active shop items yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'createitem') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to create shop items.', ephemeral: true });
+          return;
+        }
+
+        const name = interaction.options.getString('name');
+        const price = interaction.options.getInteger('price');
+        const description = interaction.options.getString('description') || null;
+        const stock = interaction.options.getInteger('stock');
+
+        if (!Number.isInteger(price) || price <= 0) {
+          await interaction.reply({ content: 'Price must be greater than 0.', ephemeral: true });
+          return;
+        }
+
+        if (stock !== null && stock < 0) {
+          await interaction.reply({ content: 'Stock cannot be negative.', ephemeral: true });
+          return;
+        }
+
+        const itemId = randomUUID();
+        await pool.query(
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [itemId, interaction.guild.id, name, description, price, stock, interaction.user.id]
+        );
+
+        await interaction.reply({ content: 'Shop item created: **' + shortShopItemId(itemId) + ' • ' + name + '** for **' + settings.currency_icon + ' ' + price + '**.', ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'buy') {
+        const itemInput = interaction.options.getString('item');
+        const item = await findShopItem(interaction.guild.id, itemInput);
+
+        if (!item || !item.is_active) {
+          await interaction.reply({ content: 'Could not find that active shop item.', ephemeral: true });
+          return;
+        }
+
+        if (item.stock !== null && Number(item.stock) <= 0) {
+          await interaction.reply({ content: 'That item is out of stock.', ephemeral: true });
+          return;
+        }
+
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, Number(item.price), 'shop_purchase', 'Bought ' + item.item_name, interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to buy that item.', ephemeral: true });
+          return;
+        }
+
+        const inventoryId = randomUUID();
+        await pool.query(
+          `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+        );
+
+        if (item.stock !== null) {
+          await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - 1), updated_at = NOW() WHERE id = $1`, [item.id]);
+        }
+
+        await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'inventory') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const result = await pool.query(
+          `SELECT * FROM user_inventory
+           WHERE guild_id = $1 AND user_id = $2
+           ORDER BY purchased_at DESC
+           LIMIT 25`,
+          [interaction.guild.id, targetUser.id]
+        );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle(targetUser.username + ' • Inventory')
+          .setColor(0x5865F2)
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .setFooter({ text: 'GG Sports • Inventory' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '**' + shortInventoryItemId(row.id) + ' • ' + row.item_name + '** — ' + row.status + ' • Paid: ' + settings.currency_icon + ' ' + row.price_paid).join(NL)
+          : 'No inventory items found.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'removeitem') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to remove shop items.', ephemeral: true });
+          return;
+        }
+
+        const itemInput = interaction.options.getString('item');
+        const item = await findShopItem(interaction.guild.id, itemInput);
+        if (!item) {
+          await interaction.reply({ content: 'Could not find that shop item.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
+        await interaction.reply({ content: 'Removed/deactivated shop item **' + item.item_name + '**.', ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'useitem') {
+        const itemInput = interaction.options.getString('item');
+        const note = interaction.options.getString('note') || null;
+        const result = await pool.query(
+          `SELECT * FROM user_inventory
+           WHERE guild_id = $1 AND user_id = $2 AND (id::text LIKE $3 OR LOWER(item_name) = LOWER($4))
+           ORDER BY purchased_at DESC
+           LIMIT 1`,
+          [interaction.guild.id, interaction.user.id, itemInput + '%', itemInput]
+        );
+
+        if (!result.rows.length) {
+          await interaction.reply({ content: 'Could not find that inventory item.', ephemeral: true });
+          return;
+        }
+
+        const inventoryItem = result.rows[0];
+        await pool.query(
+          `UPDATE user_inventory
+           SET status = 'requested', request_note = $1, updated_at = NOW()
+           WHERE id = $2`,
+          [note, inventoryItem.id]
+        );
+
+        await interaction.reply({ content: 'Use request submitted for **' + inventoryItem.item_name + '**.', ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'redeemitem') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to redeem inventory items.', ephemeral: true });
+          return;
+        }
+
+        const targetUser = interaction.options.getUser('user');
+        const itemInput = interaction.options.getString('item');
+        const status = interaction.options.getString('status') || 'redeemed';
+        const note = interaction.options.getString('note') || null;
+        const allowedStatuses = ['redeemed', 'used', 'owned', 'requested'];
+
+        if (!allowedStatuses.includes(status)) {
+          await interaction.reply({ content: 'Status must be redeemed, used, owned, or requested.', ephemeral: true });
+          return;
+        }
+
+        const result = await pool.query(
+          `SELECT * FROM user_inventory
+           WHERE guild_id = $1 AND user_id = $2 AND (id::text LIKE $3 OR LOWER(item_name) = LOWER($4))
+           ORDER BY purchased_at DESC
+           LIMIT 1`,
+          [interaction.guild.id, targetUser.id, itemInput + '%', itemInput]
+        );
+
+        if (!result.rows.length) {
+          await interaction.reply({ content: 'Could not find that user inventory item.', ephemeral: true });
+          return;
+        }
+
+        const inventoryItem = result.rows[0];
+        await pool.query(
+          `UPDATE user_inventory
+           SET status = $1, fulfillment_note = $2, fulfilled_by_user_id = $3, updated_at = NOW()
+           WHERE id = $4`,
+          [status, note, interaction.user.id, inventoryItem.id]
+        );
+
+        await interaction.reply({ content: 'Updated **' + inventoryItem.item_name + '** for ' + targetUser.toString() + ' to **' + status + '**.', ephemeral: true });
+        return;
+      }
     }
 
     if (interaction.commandName === 'tournament') {
