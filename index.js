@@ -3370,10 +3370,87 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'game') {
+      if (!interaction.guild) return;
       const gameSubcommand = interaction.options.getSubcommand();
+
+      if (gameSubcommand === 'report') {
+        const gameInput = interaction.options.getString('game_id');
+        const homeScore = interaction.options.getInteger('home_score');
+        const awayScore = interaction.options.getInteger('away_score');
+
+        const gameResult = await pool.query(
+          `SELECT * FROM league_games
+           WHERE guild_id = $1 AND id::text LIKE $2
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [interaction.guild.id, gameInput + '%']
+        );
+
+        if (!gameResult.rows.length) {
+          await interaction.reply({ content: 'Could not find that game ID.', ephemeral: true });
+          return;
+        }
+
+        const game = gameResult.rows[0];
+        const activeLeague = await getLeagueById(game.league_id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find the league for that game.', ephemeral: true });
+          return;
+        }
+
+        const homeWins = homeScore > awayScore;
+        const awayWins = awayScore > homeScore;
+
+        if (!homeWins && !awayWins) {
+          await interaction.reply({ content: 'Ties are not supported for standings. Please enter a winning score.', ephemeral: true });
+          return;
+        }
+
+        const winnerRoleId = homeWins ? game.home_team_role_id : game.away_team_role_id;
+        const loserRoleId = homeWins ? game.away_team_role_id : game.home_team_role_id;
+        const winnerName = homeWins ? game.home_team_name : game.away_team_name;
+        const loserName = homeWins ? game.away_team_name : game.home_team_name;
+
+        await pool.query(
+          `UPDATE league_games
+           SET status = 'final', home_score = $1, away_score = $2, winner_team_role_id = $3, reported_by_user_id = $4, updated_at = NOW()
+           WHERE id = $5`,
+          [homeScore, awayScore, winnerRoleId, interaction.user.id, game.id]
+        );
+
+        await pool.query(
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
+           VALUES ($1, $2, $3, $4, 1, 0, $5, $6)
+           ON CONFLICT (guild_id, league_id, team_role_id)
+           DO UPDATE SET wins = league_standings.wins + 1,
+                         points_for = league_standings.points_for + $5,
+                         points_against = league_standings.points_against + $6,
+                         updated_at = NOW()`,
+          [interaction.guild.id, game.league_id, winnerRoleId, winnerName, Math.max(homeScore, awayScore), Math.min(homeScore, awayScore)]
+        );
+
+        await pool.query(
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
+           VALUES ($1, $2, $3, $4, 0, 1, $5, $6)
+           ON CONFLICT (guild_id, league_id, team_role_id)
+           DO UPDATE SET losses = league_standings.losses + 1,
+                         points_for = league_standings.points_for + $5,
+                         points_against = league_standings.points_against + $6,
+                         updated_at = NOW()`,
+          [interaction.guild.id, game.league_id, loserRoleId, loserName, Math.min(homeScore, awayScore), Math.max(homeScore, awayScore)]
+        );
+
+        if (typeof updateStandingsPanel === 'function') {
+          await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
+        }
+
+        await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. Winner: **' + winnerName + '**.', ephemeral: false });
+        return;
+      }
+
       const gameCommandMap = {
         add: 'addgame',
-        report: 'reportgame',
         schedule: 'schedule',
         standings: 'standings',
         adjuststandings: 'adjuststandings',
@@ -3382,14 +3459,121 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'profile') {
+      if (!interaction.guild) return;
       const profileSubcommand = interaction.options.getSubcommand();
+
+      if (profileSubcommand === 'legacy') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        const result = activeLeague
+          ? await pool.query(
+              `SELECT * FROM franchise_legacy
+               WHERE guild_id = $1 AND league_id = $2
+               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+               LIMIT 15`,
+              [interaction.guild.id, activeLeague.league_id]
+            )
+          : await pool.query(
+              `SELECT * FROM franchise_legacy
+               WHERE guild_id = $1
+               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+               LIMIT 15`,
+              [interaction.guild.id]
+            );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Franchise Legacy' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+          .setColor(0xFEE75C)
+          .setFooter({ text: 'GG Sports • Franchise Legacy' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — Titles: ' + row.championships + ' • Finals: ' + row.finals_appearances + (row.last_championship ? ' • Last: ' + row.last_championship : '')).join(NL)
+          : 'No franchise legacy records found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (profileSubcommand === 'awards') {
+        const leagueName = interaction.options.getString('league');
+        const awardFilter = interaction.options.getString('award');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        let result;
+        if (activeLeague && awardFilter) {
+          result = await pool.query(
+            `SELECT * FROM award_history WHERE guild_id = $1 AND league_id = $2 AND LOWER(award_name) LIKE LOWER($3) ORDER BY created_at DESC LIMIT 20`,
+            [interaction.guild.id, activeLeague.league_id, '%' + awardFilter + '%']
+          );
+        } else if (activeLeague) {
+          result = await pool.query(
+            `SELECT * FROM award_history WHERE guild_id = $1 AND league_id = $2 ORDER BY created_at DESC LIMIT 20`,
+            [interaction.guild.id, activeLeague.league_id]
+          );
+        } else {
+          result = await pool.query(
+            `SELECT * FROM award_history WHERE guild_id = $1 ORDER BY created_at DESC LIMIT 20`,
+            [interaction.guild.id]
+          );
+        }
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Award History' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+          .setColor(0x5865F2)
+          .setFooter({ text: 'GG Sports • Awards' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '**' + row.season_label + '** — ' + row.award_name + ': ' + row.winner).join(NL)
+          : 'No award history found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (profileSubcommand === 'halloffame') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        const result = activeLeague
+          ? await pool.query(
+              `SELECT * FROM franchise_legacy
+               WHERE guild_id = $1 AND league_id = $2
+               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+               LIMIT 10`,
+              [interaction.guild.id, activeLeague.league_id]
+            )
+          : await pool.query(
+              `SELECT * FROM franchise_legacy
+               WHERE guild_id = $1
+               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+               LIMIT 10`,
+              [interaction.guild.id]
+            );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('🏛️ Hall of Fame' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+          .setColor(0xFEE75C)
+          .setFooter({ text: 'GG Sports • Hall of Fame' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — ' + row.championships + ' championships, ' + row.finals_appearances + ' finals').join(NL)
+          : 'No Hall of Fame records found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
       const profileCommandMap = {
         user: 'profile',
         stats: 'stats',
         team: 'teamprofile',
-        legacy: 'franchiselegacy',
-        awards: 'awardhistory',
-        halloffame: 'halloffame',
       };
       interaction.commandName = profileCommandMap[profileSubcommand] || interaction.commandName;
     }
