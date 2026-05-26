@@ -1394,7 +1394,7 @@ function getRegisteredCommands() {
   const MAX_COMMANDS = 100;
 
   if (builtCommands.length !== commands.length) {
-    console.warn('Removed duplicate command definitions:', builtCommands.length - commands.length);
+    console.warn('Removed duplicate command definitions:', activeBuiltCommands.length - commands.length);
   }
 
   if (commands.length <= MAX_COMMANDS) return commands;
@@ -1478,6 +1478,10 @@ async function registerCommands() {
 
   console.log('Prepared command count:', commands.length);
   console.log('Registered command names:', commands.map(command => command.name).join(', '));
+  const duplicateNames = [...activeBuiltCommands.reduce((map, command) => map.set(command.name, (map.get(command.name) || 0) + 1), new Map()).entries()]
+    .filter(([, count]) => count > 1)
+    .map(([name, count]) => name + ' x' + count);
+  if (duplicateNames.length) console.warn('Duplicate command definitions still present:', duplicateNames.join(', '));
   console.log('Registering guild commands only for fast/stable testing...');
 
   const guildIds = new Set();
