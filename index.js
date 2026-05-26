@@ -786,54 +786,6 @@ function buildCommands() {
       .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
 
     new SlashCommandBuilder()
-      .setName('league-create')
-      .setDescription('Create a configurable league profile')
-      .addStringOption(o => o.setName('name').setDescription('League name, ex: NBA 2K').setRequired(true))
-      .addStringOption(o => o.setName('game').setDescription('Game key, ex: nba2k, mlb, madden').setRequired(true))
-      .addIntegerOption(o => o.setName('season_length').setDescription('Season length in games, ex: 82').setRequired(false)),
-
-    new SlashCommandBuilder().setName('league-list').setDescription('List configured leagues in this server'),
-
-    new SlashCommandBuilder()
-      .setName('league-setroles')
-      .setDescription('Set league roles')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addRoleOption(o => o.setName('league_role').setDescription('League ping role').setRequired(true))
-      .addRoleOption(o => o.setName('staff_role').setDescription('Staff role').setRequired(true))
-      .addRoleOption(o => o.setName('committee_role').setDescription('Committee role').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('league-setchannels')
-      .setDescription('Set league channels')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addChannelOption(o => o.setName('live').setDescription('Live stream channel').setRequired(true))
-      .addChannelOption(o => o.setName('team_owners').setDescription('Team owners channel').setRequired(true))
-      .addChannelOption(o => o.setName('trade_count').setDescription('Trade count channel').setRequired(true))
-      .addChannelOption(o => o.setName('trade_block').setDescription('Trade block channel').setRequired(true))
-      .addChannelOption(o => o.setName('offer_trade').setDescription('Offer a trade channel').setRequired(true))
-      .addChannelOption(o => o.setName('committee').setDescription('Committee channel').setRequired(true))
-      .addChannelOption(o => o.setName('approved').setDescription('Approved trades channel').setRequired(true))
-      .addChannelOption(o => o.setName('denied').setDescription('Denied trades channel').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('league-sethistorychannel')
-      .setDescription('Set the league history channel')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addChannelOption(o => o.setName('channel').setDescription('League history channel').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('league-setstandingschannel')
-      .setDescription('Set the league standings channel')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addChannelOption(o => o.setName('channel').setDescription('League standings channel').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('league-settournamentchannel')
-      .setDescription('Set the league tournament/bracket channel')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addChannelOption(o => o.setName('channel').setDescription('League tournament channel').setRequired(true)),
-
-    new SlashCommandBuilder()
       .setName('settournamentchannel')
       .setDescription('Set the default server tournament/bracket channel')
       .addChannelOption(o => o.setName('channel').setDescription('Server tournament channel').setRequired(true)),
@@ -841,22 +793,6 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('setupstandings')
       .setDescription('Create or refresh the permanent standings panel')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('league-addteamrole')
-      .setDescription('Add a team role to a league')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('league-listteamroles')
-      .setDescription('List team roles for a league')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('league-setup-panels')
-      .setDescription('Create V3 panels for a configured league')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
 
     new SlashCommandBuilder()
@@ -1312,16 +1248,6 @@ function getRegisteredCommands() {
     'setstandingschannel',
     'setupstandings',
     'refreshstandings',
-    'league-settournamentchannel',
-    'league-setstandingschannel',
-    'league-setup-panels',
-    'league-addteamrole',
-    'league-create',
-    'league-list',
-    'league-listteamroles',
-    'league-setchannels',
-    'league-sethistorychannel',
-    'league-setroles',
     'setuptournamentpanel',
     'setupticketpanel',
     'setupsupportpanel',
