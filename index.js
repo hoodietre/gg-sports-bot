@@ -885,13 +885,6 @@ function buildCommands() {
         .setDescription('Show the league Hall of Fame leaderboard')
         .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))),
 
-    new SlashCommandBuilder()
-      .setName('setcurrency'
-      .setDescription('Configure this server’s currency')
-      .addStringOption(o => o.setName('name').setDescription('Currency name, ex: Ghost Gold').setRequired(true))
-      .addStringOption(o => o.setName('icon').setDescription('Currency icon/emoji, ex: 🪙').setRequired(false))
-      .addIntegerOption(o => o.setName('win_payout').setDescription('Bonus amount earned for a reported win').setRequired(false))
-      .addIntegerOption(o => o.setName('game_played_payout').setDescription('Amount each owner earns for playing a completed game').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('balance')
