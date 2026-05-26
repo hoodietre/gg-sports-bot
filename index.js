@@ -736,7 +736,7 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('whogotnext')
       .setDescription('Notify a league that you are ready to play')
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
       .addStringOption(o => o.setName('message').setDescription('Optional extra message').setRequired(false)),
 
     new SlashCommandBuilder()
@@ -761,437 +761,122 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('trade')
       .setDescription('Trade system commands')
-      .addSubcommand(sc => sc
-        .setName('block')
-        .setDescription('Add a player to the trade block'))
-      .addSubcommand(sc => sc
-        .setName('history')
-        .setDescription('Show recent approved trades')
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('team')
-        .setDescription('Show approved trades involving a team')
-        .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('addcount')
-        .setDescription('Add 1 trade to a team')
-        .addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('removecount')
-        .setDescription('Remove 1 trade from a team')
-        .addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('tradecountpanel')
-        .setDescription('Create or refresh the Trade Count embed'))
-      .addSubcommand(sc => sc
-        .setName('offerpanel')
-        .setDescription('Create or refresh the Offer a Trade panel')),
+      .addSubcommand(sc => sc.setName('block').setDescription('Add a player to the trade block'))
+      .addSubcommand(sc => sc.setName('history').setDescription('Show recent approved trades').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('team').setDescription('Show approved trades involving a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('addcount').setDescription('Add 1 trade to a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)))
+      .addSubcommand(sc => sc.setName('removecount').setDescription('Remove 1 trade from a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)))
+      .addSubcommand(sc => sc.setName('tradecountpanel').setDescription('Create or refresh the Trade Count embed'))
+      .addSubcommand(sc => sc.setName('offerpanel').setDescription('Create or refresh the Offer a Trade panel')),
 
     new SlashCommandBuilder()
       .setName('profile')
       .setDescription('Profile, stats, activity, and history commands')
-      .addSubcommand(sc => sc
-        .setName('user')
-        .setDescription('Show a user profile for a league')
-        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('stats')
-        .setDescription('Show league stats for a user')
-        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('team')
-        .setDescription('Show a team/franchise profile')
-        .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('legacy')
-        .setDescription('Show franchise championship and finals history')
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('awards')
-        .setDescription('Show award history for a league')
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))
-        .addStringOption(o => o.setName('award').setDescription('Filter by award name, ex: MVP or Cy Young').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('halloffame')
-        .setDescription('Show the league Hall of Fame leaderboard')
-        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))),
+      .addSubcommand(sc => sc.setName('user').setDescription('Show a user profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('stats').setDescription('Show league stats').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('team').setDescription('Show a team profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('awards').setDescription('Show award history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
+      .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('economy')
       .setDescription('Currency and economy commands')
-      .addSubcommand(sc => sc
-        .setName('balance')
-        .setDescription('Check your balance or another user’s balance')
-        .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('transfer')
-        .setDescription('Transfer currency to another user')
-        .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
-        .addIntegerOption(o => o.setName('amount').setDescription('Amount to transfer').setRequired(true))
-        .addStringOption(o => o.setName('reason').setDescription('Optional reason').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('give')
-        .setDescription('Admin/staff: give currency to a user')
-        .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
-        .addIntegerOption(o => o.setName('amount').setDescription('Amount to give').setRequired(true))
-        .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('take')
-        .setDescription('Admin/staff: remove currency from a user')
-        .addUserOption(o => o.setName('user').setDescription('User losing currency').setRequired(true))
-        .addIntegerOption(o => o.setName('amount').setDescription('Amount to remove').setRequired(true))
-        .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('settings')
-        .setDescription('Show this server’s economy settings and activity'))
-      .addSubcommand(sc => sc
-        .setName('richest')
-        .setDescription('Show the richest users in the server'))
-      .addSubcommand(sc => sc
-        .setName('transactions')
-        .setDescription('Show recent currency transactions')
-        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('banklog')
-        .setDescription('Admin/staff: view recent server economy transactions')),
+      .addSubcommand(sc => sc.setName('balance').setDescription('Check a balance').addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)))
+      .addSubcommand(sc => sc.setName('transfer').setDescription('Transfer currency').addUserOption(o => o.setName('user').setDescription('Receiving user').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Optional reason').setRequired(false)))
+      .addSubcommand(sc => sc.setName('give').setDescription('Staff: give currency').addUserOption(o => o.setName('user').setDescription('Receiving user').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
+      .addSubcommand(sc => sc.setName('take').setDescription('Staff: remove currency').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('Show economy settings'))
+      .addSubcommand(sc => sc.setName('richest').setDescription('Show richest users'))
+      .addSubcommand(sc => sc.setName('transactions').setDescription('Show recent transactions').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('banklog').setDescription('Staff: view economy log')),
 
     new SlashCommandBuilder()
       .setName('shop')
       .setDescription('Shop and inventory commands')
-      .addSubcommand(sc => sc
-        .setName('view')
-        .setDescription('View the server shop'))
-      .addSubcommand(sc => sc
-        .setName('buy')
-        .setDescription('Buy an item from the shop')
-        .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('inventory')
-        .setDescription('View your inventory or another user’s inventory')
-        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('createitem')
-        .setDescription('Admin/staff: create a shop item')
-        .addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true))
-        .addIntegerOption(o => o.setName('price').setDescription('Item price').setRequired(true))
-        .addStringOption(o => o.setName('description').setDescription('Item description').setRequired(false))
-        .addIntegerOption(o => o.setName('stock').setDescription('Optional limited stock').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('removeitem')
-        .setDescription('Admin/staff: remove/deactivate a shop item')
-        .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('useitem')
-        .setDescription('Request to use/redeem an inventory item')
-        .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
-        .addStringOption(o => o.setName('note').setDescription('Optional note for staff').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('redeemitem')
-        .setDescription('Admin/staff: mark an inventory item as redeemed/fulfilled')
-        .addUserOption(o => o.setName('user').setDescription('User who owns the item').setRequired(true))
-        .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
-        .addStringOption(o => o.setName('status').setDescription('New status: redeemed, used, owned, requested').setRequired(false))
-        .addStringOption(o => o.setName('note').setDescription('Optional fulfillment note').setRequired(false))),
+      .addSubcommand(sc => sc.setName('view').setDescription('View the server shop'))
+      .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
+      .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
+      .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('tournament')
       .setDescription('Tournament commands')
-      .addSubcommand(sc => sc
-        .setName('create')
-        .setDescription('Admin/staff: create a tournament')
-        .addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true))
-        .addStringOption(o => o.setName('game').setDescription('Game, ex: NBA 2K or MLB The Show').setRequired(true))
-        .addStringOption(o => o.setName('format').setDescription('single_elim, double_elim, round_robin').setRequired(false))
-        .addIntegerOption(o => o.setName('max_entries').setDescription('Maximum number of entries').setRequired(false))
-        .addIntegerOption(o => o.setName('buy_in').setDescription('Currency buy-in amount').setRequired(false))
-        .addStringOption(o => o.setName('prize').setDescription('Prize description').setRequired(false))
-        .addStringOption(o => o.setName('date').setDescription('Start date/time').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('join')
-        .setDescription('Join an open tournament')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-        .addStringOption(o => o.setName('entry_name').setDescription('Optional team/entry name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('list')
-        .setDescription('List active tournaments'))
-      .addSubcommand(sc => sc
-        .setName('info')
-        .setDescription('Show tournament info')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('close')
-        .setDescription('Admin/staff: close tournament registration')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('start')
-        .setDescription('Admin/staff: start a single-elimination tournament bracket')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('matches')
-        .setDescription('Show tournament matches')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('panel')
-        .setDescription('Create or refresh a permanent tournament bracket panel')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('report')
-        .setDescription('Admin/staff: report a tournament match winner')
-        .addStringOption(o => o.setName('match_id').setDescription('Match short ID from tournament matches').setRequired(true))
-        .addUserOption(o => o.setName('winner').setDescription('Winning user').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('shuffle')
-        .setDescription('Admin/staff: randomly seed a tournament before it starts')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('seed')
-        .setDescription('Admin/staff: manually set a user seed')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-        .addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true))
-        .addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('seeds')
-        .setDescription('Show tournament seeds')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('announce')
-        .setDescription('Post a public tournament registration announcement')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-        .addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('history')
-        .setDescription('Show completed tournament champions')
-        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('mvp')
-        .setDescription('Admin/staff: set tournament MVP and optional payout')
-        .addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true))
-        .addUserOption(o => o.setName('user').setDescription('Tournament MVP').setRequired(true))
-        .addIntegerOption(o => o.setName('payout').setDescription('Optional MVP currency payout').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('rewards')
-        .setDescription('Show tournament champion/MVP reward records')
-        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false))),
+      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create tournament').addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game').setRequired(true)).addStringOption(o => o.setName('format').setDescription('single_elim, double_elim, round_robin').setRequired(false)).addIntegerOption(o => o.setName('max_entries').setDescription('Max entries').setRequired(false)).addIntegerOption(o => o.setName('buy_in').setDescription('Buy-in amount').setRequired(false)).addStringOption(o => o.setName('prize').setDescription('Prize').setRequired(false)).addStringOption(o => o.setName('date').setDescription('Start date/time').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('join').setDescription('Join tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addStringOption(o => o.setName('entry_name').setDescription('Entry name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('list').setDescription('List active tournaments'))
+      .addSubcommand(sc => sc.setName('info').setDescription('Show tournament info').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('close').setDescription('Staff: close registration').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('start').setDescription('Staff: start tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('matches').setDescription('Show tournament matches').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('panel').setDescription('Create tournament panel').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('report').setDescription('Staff: report match winner').addStringOption(o => o.setName('match_id').setDescription('Match short ID').setRequired(true)).addUserOption(o => o.setName('winner').setDescription('Winner').setRequired(true)))
+      .addSubcommand(sc => sc.setName('shuffle').setDescription('Staff: randomly seed tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('seed').setDescription('Staff: set seed').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true)).addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)))
+      .addSubcommand(sc => sc.setName('seeds').setDescription('Show seeds').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('announce').setDescription('Post tournament announcement').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(false)))
+      .addSubcommand(sc => sc.setName('history').setDescription('Show tournament history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('mvp').setDescription('Staff: set tournament MVP').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addUserOption(o => o.setName('user').setDescription('MVP').setRequired(true)).addIntegerOption(o => o.setName('payout').setDescription('Optional payout').setRequired(false)))
+      .addSubcommand(sc => sc.setName('rewards').setDescription('Show tournament rewards').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('ticket')
       .setDescription('Ticket and support commands')
-      .addSubcommand(sc => sc
-        .setName('open')
-        .setDescription('Open a support ticket')
-        .addStringOption(o => o.setName('subject').setDescription('Short ticket subject').setRequired(true))
-        .addStringOption(o => o.setName('description').setDescription('Explain what you need help with').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('dispute')
-        .setDescription('Open a dispute ticket')
-        .addStringOption(o => o.setName('subject').setDescription('Short dispute subject').setRequired(true))
-        .addStringOption(o => o.setName('description').setDescription('Explain the dispute').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('game')
-        .setDescription('Open a game issue ticket')
-        .addStringOption(o => o.setName('subject').setDescription('Short request subject').setRequired(true))
-        .addStringOption(o => o.setName('description').setDescription('Explain what happened').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('close')
-        .setDescription('Close the current ticket thread')
-        .addStringOption(o => o.setName('reason').setDescription('Optional close reason').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('list')
-        .setDescription('Staff: list tickets by status/priority')
-        .addStringOption(o => o.setName('status').setDescription('open, pending, reviewing, resolved, closed').setRequired(false))
-        .addStringOption(o => o.setName('priority').setDescription('low, normal, high, urgent').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('info')
-        .setDescription('Staff: view ticket details')
-        .addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('claim')
-        .setDescription('Staff: claim the current ticket thread'))
-      .addSubcommand(sc => sc
-        .setName('evidence')
-        .setDescription('Show evidence uploaded to a ticket')
-        .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('transcript')
-        .setDescription('Show saved transcript for a closed ticket')
-        .addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('status')
-        .setDescription('Staff: update a ticket status')
-        .addStringOption(o => o.setName('status').setDescription('open, pending, reviewing, resolved, closed').setRequired(true))
-        .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('priority')
-        .setDescription('Staff: update a ticket priority')
-        .addStringOption(o => o.setName('priority').setDescription('low, normal, high, urgent').setRequired(true))
-        .addStringOption(o => o.setName('ticket_id').setDescription('Optional ticket short ID').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('panel')
-        .setDescription('Staff: create or refresh the live ticket dashboard panel')
-        .addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('supportpanel')
-        .setDescription('Staff: create a user-facing support ticket panel')
-        .addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false))),
+      .addSubcommand(sc => sc.setName('open').setDescription('Open a support ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('dispute').setDescription('Open dispute ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('game').setDescription('Open game issue ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('close').setDescription('Close ticket').addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
+      .addSubcommand(sc => sc.setName('list').setDescription('Staff: list tickets').addStringOption(o => o.setName('status').setDescription('Status').setRequired(false)).addStringOption(o => o.setName('priority').setDescription('Priority').setRequired(false)))
+      .addSubcommand(sc => sc.setName('info').setDescription('Ticket details').addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('claim').setDescription('Staff: claim current ticket'))
+      .addSubcommand(sc => sc.setName('evidence').setDescription('Show ticket evidence').addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(false)))
+      .addSubcommand(sc => sc.setName('transcript').setDescription('Show ticket transcript').addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('status').setDescription('Staff: update ticket status').addStringOption(o => o.setName('status').setDescription('Status').setRequired(true)).addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(false)))
+      .addSubcommand(sc => sc.setName('priority').setDescription('Staff: update ticket priority').addStringOption(o => o.setName('priority').setDescription('Priority').setRequired(true)).addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(false)))
+      .addSubcommand(sc => sc.setName('panel').setDescription('Staff: create ticket dashboard').addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)))
+      .addSubcommand(sc => sc.setName('supportpanel').setDescription('Staff: create support panel').addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('sportsbook')
       .setDescription('Sportsbook commands')
-      .addSubcommand(sc => sc
-        .setName('board')
-        .setDescription('View open sportsbook games'))
-      .addSubcommand(sc => sc
-        .setName('create')
-        .setDescription('Staff: create a sportsbook moneyline game')
-        .addStringOption(o => o.setName('label').setDescription('Game label, ex: Lakers vs Celtics').setRequired(true))
-        .addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true))
-        .addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true))
-        .addIntegerOption(o => o.setName('home_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
-        .addIntegerOption(o => o.setName('away_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('place')
-        .setDescription('Place a moneyline bet')
-        .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
-        .addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true))
-        .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('settle')
-        .setDescription('Staff: settle a sportsbook game')
-        .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
-        .addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('mybets')
-        .setDescription('View your recent sportsbook bets'))
-      .addSubcommand(sc => sc
-        .setName('parlay')
-        .setDescription('Create a 2-4 leg sportsbook parlay')
-        .addIntegerOption(o => o.setName('amount').setDescription('Stake amount').setRequired(true))
-        .addStringOption(o => o.setName('leg1_game').setDescription('Leg 1 sportsbook game ID').setRequired(true))
-        .addStringOption(o => o.setName('leg1_side').setDescription('home or away').setRequired(true))
-        .addStringOption(o => o.setName('leg2_game').setDescription('Leg 2 sportsbook game ID').setRequired(true))
-        .addStringOption(o => o.setName('leg2_side').setDescription('home or away').setRequired(true))
-        .addStringOption(o => o.setName('leg3_game').setDescription('Optional leg 3 sportsbook game ID').setRequired(false))
-        .addStringOption(o => o.setName('leg3_side').setDescription('home or away').setRequired(false))
-        .addStringOption(o => o.setName('leg4_game').setDescription('Optional leg 4 sportsbook game ID').setRequired(false))
-        .addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false))),
+      .addSubcommand(sc => sc.setName('board').setDescription('View open sportsbook games'))
+      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create sportsbook game').addStringOption(o => o.setName('label').setDescription('Game label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('place').setDescription('Place moneyline bet').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)))
+      .addSubcommand(sc => sc.setName('settle').setDescription('Staff: settle sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)))
+      .addSubcommand(sc => sc.setName('mybets').setDescription('View your recent bets'))
+      .addSubcommand(sc => sc.setName('parlay').setDescription('Create parlay').addIntegerOption(o => o.setName('amount').setDescription('Stake amount').setRequired(true)).addStringOption(o => o.setName('leg1_game').setDescription('Leg 1 game ID').setRequired(true)).addStringOption(o => o.setName('leg1_side').setDescription('home or away').setRequired(true)).addStringOption(o => o.setName('leg2_game').setDescription('Leg 2 game ID').setRequired(true)).addStringOption(o => o.setName('leg2_side').setDescription('home or away').setRequired(true)).addStringOption(o => o.setName('leg3_game').setDescription('Optional leg 3 game ID').setRequired(false)).addStringOption(o => o.setName('leg3_side').setDescription('home or away').setRequired(false)).addStringOption(o => o.setName('leg4_game').setDescription('Optional leg 4 game ID').setRequired(false)).addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('league')
       .setDescription('League setup and management commands')
-      .addSubcommand(sc => sc
-        .setName('create')
-        .setDescription('Create or configure a league')
-        .addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('info')
-        .setDescription('View league information')
-        .addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('edit')
-        .setDescription('Rename a configured league')
-        .addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true))
-        .addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('list')
-        .setDescription('List leagues in this server'))
-      .addSubcommand(sc => sc
-        .setName('staff')
-        .setDescription('Set the league staff role')
-        .addRoleOption(o => o.setName('role').setDescription('Staff role').setRequired(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('standingschannel')
-        .setDescription('Set the standings channel')
-        .addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('standingspanel')
-        .setDescription('Create or refresh the standings panel')
-        .addChannelOption(o => o.setName('channel').setDescription('Optional standings channel').setRequired(false))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('tournamentchannel')
-        .setDescription('Set the tournament channel')
-        .addChannelOption(o => o.setName('channel').setDescription('Tournament channel').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('tournamentpanel')
-        .setDescription('Create or refresh the tournament panel')
-        .addChannelOption(o => o.setName('channel').setDescription('Optional tournament channel').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('ticketpanel')
-        .setDescription('Create or refresh the live ticket dashboard')
-        .addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('supportpanel')
-        .setDescription('Create a user-facing support panel')
-        .addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('sportsbookpanel')
-        .setDescription('Create or refresh the sportsbook board')
-        .addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('teamownerspanel')
-        .setDescription('Create or refresh the Team Owners embed'))
-      .addSubcommand(sc => sc
-        .setName('currency')
-        .setDescription('Configure server currency')
-        .addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false))
-        .addStringOption(o => o.setName('icon').setDescription('Currency icon/emoji').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('settings')
-        .setDescription('View league/server setup settings'))
-      .addSubcommand(sc => sc
-        .setName('seasonhistory')
-        .setDescription('Post a completed season history embed')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-        .addStringOption(o => o.setName('season').setDescription('Season label, ex: Season 1 or 2026 Spring').setRequired(true))
-        .addStringOption(o => o.setName('champion').setDescription('Champion team/user').setRequired(true))
-        .addStringOption(o => o.setName('runner_up').setDescription('Runner-up team/user').setRequired(false))
-        .addStringOption(o => o.setName('mvp').setDescription('MVP or top player').setRequired(false))
-        .addStringOption(o => o.setName('awards').setDescription('Format: MVP: Name | Cy Young: Name | Sportsmanship: Name').setRequired(false))
-        .addStringOption(o => o.setName('notes').setDescription('Season notes or storylines').setRequired(false))),
+      .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)))
+      .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
+      .addSubcommand(sc => sc.setName('list').setDescription('List leagues'))
+      .addSubcommand(sc => sc.setName('staff').setDescription('Set staff role').addRoleOption(o => o.setName('role').setDescription('Staff role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('standingschannel').setDescription('Set standings channel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('standingspanel').setDescription('Create standings panel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('tournamentchannel').setDescription('Set tournament channel').addChannelOption(o => o.setName('channel').setDescription('Tournament channel').setRequired(true)))
+      .addSubcommand(sc => sc.setName('tournamentpanel').setDescription('Create tournament panel').addChannelOption(o => o.setName('channel').setDescription('Tournament channel').setRequired(false)))
+      .addSubcommand(sc => sc.setName('ticketpanel').setDescription('Create ticket dashboard').addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)))
+      .addSubcommand(sc => sc.setName('supportpanel').setDescription('Create support panel').addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false)))
+      .addSubcommand(sc => sc.setName('sportsbookpanel').setDescription('Create sportsbook board').addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)))
+      .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
+      .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View league/server setup settings'))
+      .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('game')
       .setDescription('League game and standings commands')
-      .addSubcommand(sc => sc
-        .setName('add')
-        .setDescription('Add a scheduled league game')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-        .addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true))
-        .addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true))
-        .addStringOption(o => o.setName('date').setDescription('Game date/time, ex: Week 1 or May 20 8PM').setRequired(false))
-        .addStringOption(o => o.setName('week').setDescription('Week/series label, ex: Week 1').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('report')
-        .setDescription('Report a completed league game')
-        .addStringOption(o => o.setName('game_id').setDescription('Game ID from schedule').setRequired(true))
-        .addIntegerOption(o => o.setName('home_score').setDescription('Home team score').setRequired(true))
-        .addIntegerOption(o => o.setName('away_score').setDescription('Away team score').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('schedule')
-        .setDescription('Show scheduled/recent games for a league')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('standings')
-        .setDescription('Show league standings')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc
-        .setName('adjuststandings')
-        .setDescription('Admin adjustment for team standings')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-        .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
-        .addIntegerOption(o => o.setName('wins').setDescription('Set wins').setRequired(true))
-        .addIntegerOption(o => o.setName('losses').setDescription('Set losses').setRequired(true))),
+      .addSubcommand(sc => sc.setName('add').setDescription('Add scheduled game').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true)).addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true)).addStringOption(o => o.setName('date').setDescription('Date/time').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
+      .addSubcommand(sc => sc.setName('report').setDescription('Report completed game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true)).addIntegerOption(o => o.setName('home_score').setDescription('Home score').setRequired(true)).addIntegerOption(o => o.setName('away_score').setDescription('Away score').setRequired(true)))
+      .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true))),
   ].map(cmd => cmd.toJSON());
 }
 
