@@ -798,9 +798,6 @@ function buildCommands() {
         .setDescription('Remove 1 trade from a team')
         .addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)))
       .addSubcommand(sc => sc
-        .setName('teamownerspanel')
-        .setDescription('Create or refresh the Team Owners embed'))
-      .addSubcommand(sc => sc
         .setName('tradecountpanel')
         .setDescription('Create or refresh the Trade Count embed'))
       .addSubcommand(sc => sc
@@ -1272,6 +1269,9 @@ function buildCommands() {
         .setDescription('Create or refresh the sportsbook board')
         .addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)))
       .addSubcommand(sc => sc
+        .setName('teamownerspanel')
+        .setDescription('Create or refresh the Team Owners embed'))
+      .addSubcommand(sc => sc
         .setName('currency')
         .setDescription('Configure server currency')
         .addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false))
@@ -1318,15 +1318,44 @@ function buildCommands() {
 
 function getRegisteredCommands() {
   const builtCommands = buildCommands();
+  const retiredCommandNames = new Set([
+    'balance',
+    'transfer',
+    'givecurrency',
+    'takecurrency',
+    'createshopitem',
+    'buy',
+    'inventory',
+    'removeshopitem',
+    'useitem',
+    'redeemitem',
+    'richest',
+    'transactions',
+    'banklog',
+    'tradehistory',
+    'teamtrades',
+    'addtrade',
+    'removetrade',
+    'tradeblock',
+    'setupteamowners',
+    'setuptradecount',
+    'setupoffertrade',
+  ]);
+
+  const activeBuiltCommands = builtCommands.filter(command => !retiredCommandNames.has(command.name));
   const byName = new Map();
 
   // Keep the newest command definition when duplicate names exist.
   // This lets consolidated hubs like /shop, /economy, /ticket, /league replace older standalone commands safely.
-  for (const command of builtCommands) {
+  for (const command of activeBuiltCommands) {
     byName.set(command.name, command);
   }
 
   const commands = [...byName.values()];
+
+  if (activeBuiltCommands.length !== builtCommands.length) {
+    console.warn('Removed retired standalone commands:', builtCommands.length - activeBuiltCommands.length);
+  }
   const MAX_COMMANDS = 100;
 
   if (builtCommands.length !== commands.length) {
@@ -3890,7 +3919,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         team: 'teamtrades',
         addcount: 'addtrade',
         removecount: 'removetrade',
-        teamownerspanel: 'setupteamowners',
+        
         tradecountpanel: 'setuptradecount',
         offerpanel: 'setupoffertrade',
       };
@@ -4051,6 +4080,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         interaction.commandName = 'setupsupportpanel';
       } else if (leagueSubcommand === 'sportsbookpanel') {
         interaction.commandName = 'setupsportsbookpanel';
+      } else if (leagueSubcommand === 'teamownerspanel') {
+        interaction.commandName = 'setupteamowners';
       } else if (leagueSubcommand === 'standingspanel') {
         interaction.commandName = 'setupstandings';
       } else if (leagueSubcommand === 'tournamentchannel') {
