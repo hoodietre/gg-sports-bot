@@ -775,9 +775,37 @@ function buildCommands() {
     new SlashCommandBuilder().setName('tradeblock').setDescription('Add a player to the trade block'),
 
     new SlashCommandBuilder()
-      .setName('tradehistory')
-      .setDescription('Show recent approved trades for a league')
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+      .setName('trade')
+      .setDescription('Trade system commands')
+      .addSubcommand(sc => sc
+        .setName('block')
+        .setDescription('Add a player to the trade block'))
+      .addSubcommand(sc => sc
+        .setName('history')
+        .setDescription('Show recent approved trades')
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('team')
+        .setDescription('Show approved trades involving a team')
+        .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('addcount')
+        .setDescription('Add 1 trade to a team')
+        .addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('removecount')
+        .setDescription('Remove 1 trade from a team')
+        .addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('teamownerspanel')
+        .setDescription('Create or refresh the Team Owners embed'))
+      .addSubcommand(sc => sc
+        .setName('tradecountpanel')
+        .setDescription('Create or refresh the Trade Count embed'))
+      .addSubcommand(sc => sc
+        .setName('offerpanel')
+        .setDescription('Create or refresh the Offer a Trade panel')),
 
     new SlashCommandBuilder()
       .setName('teamtrades')
@@ -1308,6 +1336,14 @@ function getRegisteredCommands() {
   if (commands.length <= MAX_COMMANDS) return commands;
 
   const dropIfNeeded = new Set([
+    'tradehistory',
+    'teamtrades',
+    'addtrade',
+    'removetrade',
+    'tradeblock',
+    'setupteamowners',
+    'setuptradecount',
+    'setupoffertrade',
     'createtournament',
     'jointournament',
     'tournaments',
@@ -1377,6 +1413,7 @@ async function registerCommands() {
   const commands = getRegisteredCommands();
 
   console.log('Prepared command count:', commands.length);
+  console.log('Registered command names:', commands.map(command => command.name).join(', '));
   console.log('Registering guild commands only for fast/stable testing...');
 
   const guildIds = new Set();
@@ -3843,6 +3880,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
       return;
+    }
+
+    if (interaction.commandName === 'trade') {
+      const tradeSubcommand = interaction.options.getSubcommand();
+      const tradeCommandMap = {
+        block: 'tradeblock',
+        history: 'tradehistory',
+        team: 'teamtrades',
+        addcount: 'addtrade',
+        removecount: 'removetrade',
+        teamownerspanel: 'setupteamowners',
+        tradecountpanel: 'setuptradecount',
+        offerpanel: 'setupoffertrade',
+      };
+      interaction.commandName = tradeCommandMap[tradeSubcommand] || interaction.commandName;
     }
 
     if (interaction.commandName === 'economy') {
