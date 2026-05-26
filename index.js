@@ -939,6 +939,83 @@ function buildCommands() {
       .setDescription('Admin/staff: view recent server economy transactions'),
 
     new SlashCommandBuilder()
+      .setName('economy')
+      .setDescription('Currency and economy commands')
+      .addSubcommand(sc => sc
+        .setName('balance')
+        .setDescription('Check your balance or another user’s balance')
+        .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('transfer')
+        .setDescription('Transfer currency to another user')
+        .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
+        .addIntegerOption(o => o.setName('amount').setDescription('Amount to transfer').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Optional reason').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('give')
+        .setDescription('Admin/staff: give currency to a user')
+        .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
+        .addIntegerOption(o => o.setName('amount').setDescription('Amount to give').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('take')
+        .setDescription('Admin/staff: remove currency from a user')
+        .addUserOption(o => o.setName('user').setDescription('User losing currency').setRequired(true))
+        .addIntegerOption(o => o.setName('amount').setDescription('Amount to remove').setRequired(true))
+        .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('settings')
+        .setDescription('Show this server’s economy settings and activity'))
+      .addSubcommand(sc => sc
+        .setName('richest')
+        .setDescription('Show the richest users in the server'))
+      .addSubcommand(sc => sc
+        .setName('transactions')
+        .setDescription('Show recent currency transactions')
+        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('banklog')
+        .setDescription('Admin/staff: view recent server economy transactions')),
+
+    new SlashCommandBuilder()
+      .setName('shop')
+      .setDescription('Shop and inventory commands')
+      .addSubcommand(sc => sc
+        .setName('view')
+        .setDescription('View the server shop'))
+      .addSubcommand(sc => sc
+        .setName('buy')
+        .setDescription('Buy an item from the shop')
+        .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('inventory')
+        .setDescription('View your inventory or another user’s inventory')
+        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('createitem')
+        .setDescription('Admin/staff: create a shop item')
+        .addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true))
+        .addIntegerOption(o => o.setName('price').setDescription('Item price').setRequired(true))
+        .addStringOption(o => o.setName('description').setDescription('Item description').setRequired(false))
+        .addIntegerOption(o => o.setName('stock').setDescription('Optional limited stock').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('removeitem')
+        .setDescription('Admin/staff: remove/deactivate a shop item')
+        .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('useitem')
+        .setDescription('Request to use/redeem an inventory item')
+        .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
+        .addStringOption(o => o.setName('note').setDescription('Optional note for staff').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('redeemitem')
+        .setDescription('Admin/staff: mark an inventory item as redeemed/fulfilled')
+        .addUserOption(o => o.setName('user').setDescription('User who owns the item').setRequired(true))
+        .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
+        .addStringOption(o => o.setName('status').setDescription('New status: redeemed, used, owned, requested').setRequired(false))
+        .addStringOption(o => o.setName('note').setDescription('Optional fulfillment note').setRequired(false))),
+
+    new SlashCommandBuilder()
       .setName('tournament')
       .setDescription('Tournament commands')
       .addSubcommand(sc => sc
@@ -1226,6 +1303,19 @@ function getRegisteredCommands() {
   if (commands.length <= MAX_COMMANDS) return commands;
 
   const dropIfNeeded = new Set([
+    'balance',
+    'transfer',
+    'givecurrency',
+    'takecurrency',
+    'createshopitem',
+    'buy',
+    'inventory',
+    'removeshopitem',
+    'useitem',
+    'redeemitem',
+    'richest',
+    'transactions',
+    'banklog',
     'createtournament',
     'jointournament',
     'tournaments',
@@ -3761,6 +3851,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
       return;
+    }
+
+    if (interaction.commandName === 'economy') {
+      const economySubcommand = interaction.options.getSubcommand();
+      const economyCommandMap = {
+        balance: 'balance',
+        transfer: 'transfer',
+        give: 'givecurrency',
+        take: 'takecurrency',
+        settings: 'economy',
+        richest: 'richest',
+        transactions: 'transactions',
+        banklog: 'banklog',
+      };
+      interaction.commandName = economyCommandMap[economySubcommand] || interaction.commandName;
+    }
+
+    if (interaction.commandName === 'shop') {
+      const shopSubcommand = interaction.options.getSubcommand();
+      const shopCommandMap = {
+        view: 'shop',
+        buy: 'buy',
+        inventory: 'inventory',
+        createitem: 'createshopitem',
+        removeitem: 'removeshopitem',
+        useitem: 'useitem',
+        redeemitem: 'redeemitem',
+      };
+      interaction.commandName = shopCommandMap[shopSubcommand] || interaction.commandName;
     }
 
     if (interaction.commandName === 'tournament') {
