@@ -3579,14 +3579,118 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'trade') {
+      if (!interaction.guild) return;
       const tradeSubcommand = interaction.options.getSubcommand();
+
+      if (tradeSubcommand === 'history') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        const result = activeLeague
+          ? await pool.query(
+              `SELECT * FROM trade_history
+               WHERE guild_id = $1 AND league_id = $2
+               ORDER BY created_at DESC
+               LIMIT 10`,
+              [interaction.guild.id, activeLeague.league_id]
+            )
+          : await pool.query(
+              `SELECT * FROM trade_history
+               WHERE guild_id = $1
+               ORDER BY created_at DESC
+               LIMIT 10`,
+              [interaction.guild.id]
+            );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Trade History' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+          .setColor(0x5865F2)
+          .setFooter({ text: 'GG Sports • Trade History' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '**' + row.sender_team + '** ↔ **' + row.target_team + '**' + (row.screenshot_url ? NL + row.screenshot_url : '')).join(NL + NL)
+          : 'No approved trades found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (tradeSubcommand === 'team') {
+        const team = interaction.options.getRole('team');
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        const result = activeLeague
+          ? await pool.query(
+              `SELECT * FROM trade_history
+               WHERE guild_id = $1 AND league_id = $2 AND (sender_team_role_id = $3 OR target_team_role_id = $3 OR sender_team = $4 OR target_team = $4)
+               ORDER BY created_at DESC
+               LIMIT 10`,
+              [interaction.guild.id, activeLeague.league_id, team.id, team.name]
+            )
+          : await pool.query(
+              `SELECT * FROM trade_history
+               WHERE guild_id = $1 AND (sender_team_role_id = $2 OR target_team_role_id = $2 OR sender_team = $3 OR target_team = $3)
+               ORDER BY created_at DESC
+               LIMIT 10`,
+              [interaction.guild.id, team.id, team.name]
+            );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Team Trades • ' + team.name)
+          .setColor(0x5865F2)
+          .setFooter({ text: 'GG Sports • Team Trades' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '**' + row.sender_team + '** ↔ **' + row.target_team + '**' + (row.screenshot_url ? NL + row.screenshot_url : '')).join(NL + NL)
+          : 'No approved trades found for ' + team.name + '.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (tradeSubcommand === 'addcount' || tradeSubcommand === 'removecount') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update trade counts.', ephemeral: true });
+          return;
+        }
+
+        const team = interaction.options.getRole('team');
+        const activeLeague = await resolveLeague(interaction);
+        const delta = tradeSubcommand === 'addcount' ? 1 : -1;
+
+        if (activeLeague?.league_id) {
+          await pool.query(
+            `INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count)
+             VALUES ($1, $2, $3, GREATEST(0, $4))
+             ON CONFLICT (league_id, role_id)
+             DO UPDATE SET trade_count = GREATEST(0, league_trade_counts.trade_count + $4)`,
+            [activeLeague.league_id, team.id, team.name, delta]
+          );
+        } else {
+          await pool.query(
+            `INSERT INTO trade_counts (team_name, trade_count)
+             VALUES ($1, GREATEST(0, $2))
+             ON CONFLICT (team_name)
+             DO UPDATE SET trade_count = GREATEST(0, trade_counts.trade_count + $2)`,
+            [team.name, delta]
+          );
+        }
+
+        if (typeof updateTradeCountEmbed === 'function') {
+          await updateTradeCountEmbed(interaction.guild, activeLeague).catch(() => null);
+        }
+
+        await interaction.reply({ content: 'Trade count updated for **' + team.name + '**.', ephemeral: true });
+        return;
+      }
+
       const tradeCommandMap = {
         block: 'tradeblock',
-        history: 'tradehistory',
-        team: 'teamtrades',
-        addcount: 'addtrade',
-        removecount: 'removetrade',
-        
         tradecountpanel: 'setuptradecount',
         offerpanel: 'setupoffertrade',
       };
