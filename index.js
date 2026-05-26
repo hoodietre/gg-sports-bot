@@ -4078,6 +4078,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'ticket') {
+      if (!interaction.guild) return;
       const ticketSubcommand = interaction.options.getSubcommand();
 
       if (ticketSubcommand === 'open') {
@@ -4096,25 +4097,332 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (ticketSubcommand === 'close') {
-        interaction.commandName = 'closeticket';
-      } else if (ticketSubcommand === 'list') {
-        interaction.commandName = 'tickets';
-      } else if (ticketSubcommand === 'info') {
-        interaction.commandName = 'ticketinfo';
-      } else if (ticketSubcommand === 'claim') {
-        interaction.commandName = 'claimticket';
-      } else if (ticketSubcommand === 'evidence') {
-        interaction.commandName = 'ticketevidence';
-      } else if (ticketSubcommand === 'transcript') {
-        interaction.commandName = 'tickettranscript';
-      } else if (ticketSubcommand === 'status') {
-        interaction.commandName = 'setticketstatus';
-      } else if (ticketSubcommand === 'priority') {
-        interaction.commandName = 'setticketpriority';
-      } else if (ticketSubcommand === 'panel') {
-        interaction.commandName = 'setupticketpanel';
-      } else if (ticketSubcommand === 'supportpanel') {
-        interaction.commandName = 'setupsupportpanel';
+        if (!interaction.channel?.isThread()) {
+          await interaction.reply({ content: 'Use this command inside a ticket thread.', ephemeral: true });
+          return;
+        }
+
+        const ticketResult = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+          [interaction.guild.id, interaction.channel.id]
+        );
+
+        if (!ticketResult.rows.length) {
+          await interaction.reply({ content: 'This does not appear to be an open ticket thread.', ephemeral: true });
+          return;
+        }
+
+        const ticket = ticketResult.rows[0];
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        const closer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const isTicketOwner = ticket.user_id === interaction.user.id;
+        const isStaff = closer ? await memberHasStaff(closer, activeLeague) : false;
+
+        if (!isTicketOwner && !isStaff) {
+          await interaction.reply({ content: 'Only the ticket owner or staff can close this ticket.', ephemeral: true });
+          return;
+        }
+
+        const closeReason = interaction.options.getString('reason');
+        await saveTicketTranscript(interaction.channel, ticket);
+        await closeTicketRecord(interaction.channel.id, interaction.user.id);
+        if (closeReason) {
+          await pool.query(`UPDATE support_tickets SET close_reason = $1 WHERE id = $2`, [closeReason, ticket.id]);
+        }
+        await updateTicketPanel(interaction.guild);
+        await interaction.reply({ content: 'Ticket closed. Transcript saved. This thread will be archived.' + (closeReason ? ' Reason: ' + closeReason : ''), ephemeral: false });
+        await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
+        return;
+      }
+
+      if (ticketSubcommand === 'list') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to view ticket logs.', ephemeral: true });
+          return;
+        }
+
+        const status = interaction.options.getString('status') || 'open';
+        const priority = interaction.options.getString('priority');
+        const allowedStatuses = ['open', 'pending', 'reviewing', 'resolved', 'closed'];
+        const allowedPriorities = ['low', 'normal', 'high', 'urgent'];
+
+        if (!allowedStatuses.includes(status)) {
+          await interaction.reply({ content: 'Status must be one of: open, pending, reviewing, resolved, closed.', ephemeral: true });
+          return;
+        }
+
+        if (priority && !allowedPriorities.includes(priority)) {
+          await interaction.reply({ content: 'Priority must be one of: low, normal, high, urgent.', ephemeral: true });
+          return;
+        }
+
+        const result = priority
+          ? await pool.query(
+              `SELECT * FROM support_tickets
+               WHERE guild_id = $1 AND status = $2 AND priority = $3
+               ORDER BY created_at DESC
+               LIMIT 20`,
+              [interaction.guild.id, status, priority]
+            )
+          : await pool.query(
+              `SELECT * FROM support_tickets
+               WHERE guild_id = $1 AND status = $2
+               ORDER BY created_at DESC
+               LIMIT 20`,
+              [interaction.guild.id, status]
+            );
+
+        await interaction.reply({ embeds: [buildTicketsEmbed(result.rows, status)], ephemeral: true });
+        return;
+      }
+
+      if (ticketSubcommand === 'info') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to view ticket info.', ephemeral: true });
+          return;
+        }
+
+        const ticketInput = interaction.options.getString('ticket_id');
+        const result = await pool.query(
+          `SELECT * FROM support_tickets
+           WHERE guild_id = $1 AND id::text LIKE $2
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [interaction.guild.id, ticketInput + '%']
+        );
+
+        if (!result.rows.length) {
+          await interaction.reply({ content: 'Could not find that ticket ID.', ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({ embeds: [buildTicketInfoEmbed(result.rows[0])], ephemeral: true });
+        return;
+      }
+
+      if (ticketSubcommand === 'claim') {
+        if (!interaction.channel?.isThread()) {
+          await interaction.reply({ content: 'Use this command inside an open ticket thread.', ephemeral: true });
+          return;
+        }
+
+        const ticketResult = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+          [interaction.guild.id, interaction.channel.id]
+        );
+
+        if (!ticketResult.rows.length) {
+          await interaction.reply({ content: 'This does not appear to be an open ticket thread.', ephemeral: true });
+          return;
+        }
+
+        const ticket = ticketResult.rows[0];
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        const staffMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const isStaff = staffMember ? await memberHasStaff(staffMember, activeLeague) : false;
+
+        if (!isStaff) {
+          await interaction.reply({ content: 'Only staff/admins can claim tickets.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(`UPDATE support_tickets SET assigned_staff_user_id = $1 WHERE id = $2`, [interaction.user.id, ticket.id]);
+        await updateTicketPanel(interaction.guild);
+        await interaction.reply({ content: '<@' + interaction.user.id + '> has claimed this ticket.', ephemeral: false });
+        return;
+      }
+
+      if (ticketSubcommand === 'evidence') {
+        const ticketInput = interaction.options.getString('ticket_id');
+        let ticket = null;
+
+        if (ticketInput) {
+          const ticketResult = await pool.query(
+            `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+            [interaction.guild.id, ticketInput + '%']
+          );
+          ticket = ticketResult.rows[0] || null;
+        } else if (interaction.channel?.isThread()) {
+          ticket = await getOpenTicketByThread(interaction.guild.id, interaction.channel.id);
+        }
+
+        if (!ticket) {
+          await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+          return;
+        }
+
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        const viewer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const isTicketOwner = ticket.user_id === interaction.user.id;
+        const isStaff = viewer ? await memberHasStaff(viewer, activeLeague) : false;
+
+        if (!isTicketOwner && !isStaff) {
+          await interaction.reply({ content: 'Only the ticket owner or staff can view this ticket evidence.', ephemeral: true });
+          return;
+        }
+
+        const evidenceResult = await pool.query(
+          `SELECT * FROM ticket_evidence WHERE guild_id = $1 AND ticket_id = $2 ORDER BY created_at ASC LIMIT 20`,
+          [interaction.guild.id, ticket.id]
+        );
+
+        await interaction.reply({ embeds: [buildTicketEvidenceEmbed(ticket, evidenceResult.rows)], ephemeral: true });
+        return;
+      }
+
+      if (ticketSubcommand === 'transcript') {
+        const ticketInput = interaction.options.getString('ticket_id');
+        const ticketResult = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, ticketInput + '%']
+        );
+
+        if (!ticketResult.rows.length) {
+          await interaction.reply({ content: 'Could not find that ticket ID.', ephemeral: true });
+          return;
+        }
+
+        const ticket = ticketResult.rows[0];
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        const viewer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const isTicketOwner = ticket.user_id === interaction.user.id;
+        const isStaff = viewer ? await memberHasStaff(viewer, activeLeague) : false;
+
+        if (!isTicketOwner && !isStaff) {
+          await interaction.reply({ content: 'Only the ticket owner or staff can view this transcript.', ephemeral: true });
+          return;
+        }
+
+        const transcriptResult = await pool.query(
+          `SELECT * FROM ticket_transcripts WHERE guild_id = $1 AND ticket_id = $2 ORDER BY message_created_at ASC LIMIT 40`,
+          [interaction.guild.id, ticket.id]
+        );
+
+        await interaction.reply({ embeds: [buildTicketTranscriptEmbed(ticket, transcriptResult.rows)], ephemeral: true });
+        return;
+      }
+
+      if (ticketSubcommand === 'status') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update ticket status.', ephemeral: true });
+          return;
+        }
+
+        const status = interaction.options.getString('status');
+        const ticketInput = interaction.options.getString('ticket_id');
+        const allowedStatuses = ['open', 'pending', 'reviewing', 'resolved', 'closed'];
+
+        if (!allowedStatuses.includes(status)) {
+          await interaction.reply({ content: 'Status must be one of: open, pending, reviewing, resolved, closed.', ephemeral: true });
+          return;
+        }
+
+        let ticket = null;
+        if (ticketInput) {
+          const result = await pool.query(
+            `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+            [interaction.guild.id, ticketInput + '%']
+          );
+          ticket = result.rows[0] || null;
+        } else if (interaction.channel?.isThread()) {
+          const result = await pool.query(
+            `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 ORDER BY created_at DESC LIMIT 1`,
+            [interaction.guild.id, interaction.channel.id]
+          );
+          ticket = result.rows[0] || null;
+        }
+
+        if (!ticket) {
+          await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(`UPDATE support_tickets SET status = $1 WHERE id = $2`, [status, ticket.id]);
+        await updateTicketPanel(interaction.guild);
+        await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** status set to **' + status + '**.', ephemeral: false });
+        return;
+      }
+
+      if (ticketSubcommand === 'priority') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update ticket priority.', ephemeral: true });
+          return;
+        }
+
+        const priority = interaction.options.getString('priority');
+        const ticketInput = interaction.options.getString('ticket_id');
+        const allowedPriorities = ['low', 'normal', 'high', 'urgent'];
+
+        if (!allowedPriorities.includes(priority)) {
+          await interaction.reply({ content: 'Priority must be one of: low, normal, high, urgent.', ephemeral: true });
+          return;
+        }
+
+        let ticket = null;
+        if (ticketInput) {
+          const result = await pool.query(
+            `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+            [interaction.guild.id, ticketInput + '%']
+          );
+          ticket = result.rows[0] || null;
+        } else if (interaction.channel?.isThread()) {
+          const result = await pool.query(
+            `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 ORDER BY created_at DESC LIMIT 1`,
+            [interaction.guild.id, interaction.channel.id]
+          );
+          ticket = result.rows[0] || null;
+        }
+
+        if (!ticket) {
+          await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(`UPDATE support_tickets SET priority = $1 WHERE id = $2`, [priority, ticket.id]);
+        await updateTicketPanel(interaction.guild);
+        await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** priority set to **' + priority + '**.', ephemeral: false });
+        return;
+      }
+
+      if (ticketSubcommand === 'panel') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to set up the ticket dashboard.', ephemeral: true });
+          return;
+        }
+
+        const channel = interaction.options.getChannel('channel') || interaction.channel;
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that dashboard channel.', ephemeral: true });
+          return;
+        }
+
+        const message = await channel.send({ embeds: [await buildTicketDashboardEmbed(interaction.guild.id)], components: [buildTicketDashboardButtons()] });
+        await saveTicketPanel(interaction.guild.id, channel.id, message.id);
+        await interaction.reply({ content: 'Ticket dashboard panel created in ' + channel.toString() + '.', ephemeral: true });
+        return;
+      }
+
+      if (ticketSubcommand === 'supportpanel') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to set up the support panel.', ephemeral: true });
+          return;
+        }
+
+        const channel = interaction.options.getChannel('channel') || interaction.channel;
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that support panel channel.', ephemeral: true });
+          return;
+        }
+
+        await channel.send({ embeds: [buildSupportPanelEmbed()], components: [buildSupportPanelButtons()] });
+        await interaction.reply({ content: 'Support panel created in ' + channel.toString() + '.', ephemeral: true });
+        return;
       }
     }
 
