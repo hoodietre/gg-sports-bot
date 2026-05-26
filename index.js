@@ -4065,7 +4065,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [interaction.guild.id]
         );
 
-        await interaction.reply({ embeds: [buildTournamentListEmbed(result.rows)], ephemeral: true });
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Tournament List')
+          .setColor(0x5865F2)
+          .setFooter({ text: 'GG Sports • Tournaments' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '**' + (row.tournament_name || row.name || 'Unnamed Tournament') + '** — ' + row.status + (row.format ? ' • ' + row.format : '') + (row.max_entries ? ' • ' + row.max_entries + ' slots' : '')).join(NL)
+          : 'No tournaments found.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -4083,7 +4094,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [interaction.guild.id, tournament.id]
         );
 
-        await interaction.reply({ embeds: [buildTournamentInfoEmbed(tournament, entries.rows)], ephemeral: true });
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Tournament Info • ' + (tournament.tournament_name || tournament.name || 'Tournament'))
+          .setColor(0xFEE75C)
+          .setFooter({ text: 'GG Sports • Tournament Info' })
+          .setTimestamp();
+
+        embed.addFields(
+          { name: 'Status', value: tournament.status || 'unknown', inline: true },
+          { name: 'Format', value: tournament.format || 'standard', inline: true },
+          { name: 'Players', value: String(entries.rows.length), inline: true }
+        );
+
+        embed.setDescription(entries.rows.length
+          ? entries.rows.map(entry => '• ' + (entry.entry_name || entry.team_name || entry.username || '<@' + entry.user_id + '>')).join(NL)
+          : 'No entries yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
         return;
       }
 
