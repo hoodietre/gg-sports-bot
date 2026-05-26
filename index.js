@@ -758,22 +758,6 @@ function buildCommands() {
       .addUserOption(o => o.setName('member').setDescription('The member to remove the role from').setRequired(true))
       .addRoleOption(o => o.setName('role').setDescription('The role to remove').setRequired(true)),
 
-    new SlashCommandBuilder().setName('setupteamowners').setDescription('Create or refresh the Team Owners embed'),
-    new SlashCommandBuilder().setName('setuptradecount').setDescription('Create or refresh the Trade Count embed'),
-    new SlashCommandBuilder().setName('setupoffertrade').setDescription('Create or refresh the Offer a Trade panel'),
-
-    new SlashCommandBuilder()
-      .setName('addtrade')
-      .setDescription('Add 1 trade to a team')
-      .addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('removetrade')
-      .setDescription('Remove 1 trade from a team')
-      .addRoleOption(o => o.setName('team').setDescription('The team role').setRequired(true)),
-
-    new SlashCommandBuilder().setName('tradeblock').setDescription('Add a player to the trade block'),
-
     new SlashCommandBuilder()
       .setName('trade')
       .setDescription('Trade system commands')
@@ -803,55 +787,6 @@ function buildCommands() {
       .addSubcommand(sc => sc
         .setName('offerpanel')
         .setDescription('Create or refresh the Offer a Trade panel')),
-
-    new SlashCommandBuilder()
-      .setName('teamtrades')
-      .setDescription('Show approved trades involving a team')
-      .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('settournamentchannel')
-      .setDescription('Set the default server tournament/bracket channel')
-      .addChannelOption(o => o.setName('channel').setDescription('Server tournament channel').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('setupstandings')
-      .setDescription('Create or refresh the permanent standings panel')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('editleaguename')
-      .setDescription('Rename a configured league')
-      .addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true))
-      .addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('addseasonhistory')
-      .setDescription('Post a completed season history embed')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
-      .addStringOption(o => o.setName('season').setDescription('Season label, ex: Season 1 or 2026 Spring').setRequired(true))
-      .addStringOption(o => o.setName('champion').setDescription('Champion team/user').setRequired(true))
-      .addStringOption(o => o.setName('runner_up').setDescription('Runner-up team/user').setRequired(false))
-      .addStringOption(o => o.setName('mvp').setDescription('MVP or top player').setRequired(false))
-      .addStringOption(o => o.setName('awards').setDescription('Format: MVP: Name | Cy Young: Name | Sportsmanship: Name').setRequired(false))
-      .addStringOption(o => o.setName('notes').setDescription('Season notes or storylines').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('franchiselegacy')
-      .setDescription('Show franchise championship and finals history')
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('awardhistory')
-      .setDescription('Show award history for a league')
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))
-      .addStringOption(o => o.setName('award').setDescription('Filter by award name, ex: MVP or Cy Young').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('halloffame')
-      .setDescription('Show the league Hall of Fame leaderboard')
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('profile')
@@ -884,83 +819,6 @@ function buildCommands() {
         .setName('halloffame')
         .setDescription('Show the league Hall of Fame leaderboard')
         .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))),
-
-
-    new SlashCommandBuilder()
-      .setName('balance')
-      .setDescription('Check your balance or another user’s balance')
-      .addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('transfer')
-      .setDescription('Transfer currency to another user')
-      .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
-      .addIntegerOption(o => o.setName('amount').setDescription('Amount to transfer').setRequired(true))
-      .addStringOption(o => o.setName('reason').setDescription('Optional reason').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('givecurrency')
-      .setDescription('Admin/staff: give currency to a user')
-      .addUserOption(o => o.setName('user').setDescription('User receiving currency').setRequired(true))
-      .addIntegerOption(o => o.setName('amount').setDescription('Amount to give').setRequired(true))
-      .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('takecurrency')
-      .setDescription('Admin/staff: remove currency from a user')
-      .addUserOption(o => o.setName('user').setDescription('User losing currency').setRequired(true))
-      .addIntegerOption(o => o.setName('amount').setDescription('Amount to remove').setRequired(true))
-      .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('createshopitem')
-      .setDescription('Admin/staff: create a shop item')
-      .addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true))
-      .addIntegerOption(o => o.setName('price').setDescription('Item price').setRequired(true))
-      .addStringOption(o => o.setName('description').setDescription('Item description').setRequired(false))
-      .addIntegerOption(o => o.setName('stock').setDescription('Optional limited stock').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('buy')
-      .setDescription('Buy an item from the shop')
-      .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('inventory')
-      .setDescription('View your inventory or another user’s inventory')
-      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('removeshopitem')
-      .setDescription('Admin/staff: remove/deactivate a shop item')
-      .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)),
-
-    new SlashCommandBuilder()
-      .setName('useitem')
-      .setDescription('Request to use/redeem an inventory item')
-      .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
-      .addStringOption(o => o.setName('note').setDescription('Optional note for staff').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('redeemitem')
-      .setDescription('Admin/staff: mark a user inventory item as redeemed/fulfilled')
-      .addUserOption(o => o.setName('user').setDescription('User who owns the item').setRequired(true))
-      .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
-      .addStringOption(o => o.setName('status').setDescription('New status: redeemed, used, owned, requested').setRequired(false))
-      .addStringOption(o => o.setName('note').setDescription('Optional fulfillment note').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('richest')
-      .setDescription('Show the richest users in the server'),
-
-    new SlashCommandBuilder()
-      .setName('transactions')
-      .setDescription('Show your recent currency transactions or another user’s')
-      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('banklog')
-      .setDescription('Admin/staff: view recent server economy transactions'),
 
     new SlashCommandBuilder()
       .setName('economy')
