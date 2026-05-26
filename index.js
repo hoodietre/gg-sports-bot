@@ -8086,6 +8086,25 @@ function buildParlayCreatedAlertEmbed(settings, user, parlayId, amount, payout, 
     .setTimestamp();
 }
 
+function shortShopItemId(itemId) {
+  return String(itemId || '').split('-')[0];
+}
+
+function shortInventoryItemId(itemId) {
+  return String(itemId || '').split('-')[0];
+}
+
+async function findShopItem(guildId, input) {
+  const result = await pool.query(
+    `SELECT * FROM shop_items
+     WHERE guild_id = $1 AND (id::text LIKE $2 OR LOWER(item_name) = LOWER($3))
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [guildId, input + '%', input]
+  );
+  return result.rows[0] || null;
+}
+
 async function findSportsbookGame(guildId, input) {
   const result = await pool.query(
     `SELECT * FROM sportsbook_games
