@@ -889,10 +889,6 @@ function buildCommands() {
       .addIntegerOption(o => o.setName('stock').setDescription('Optional limited stock').setRequired(false)),
 
     new SlashCommandBuilder()
-      .setName('shop')
-      .setDescription('View the server shop'),
-
-    new SlashCommandBuilder()
       .setName('buy')
       .setDescription('Buy an item from the shop')
       .addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)),
@@ -920,10 +916,6 @@ function buildCommands() {
       .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
       .addStringOption(o => o.setName('status').setDescription('New status: redeemed, used, owned, requested').setRequired(false))
       .addStringOption(o => o.setName('note').setDescription('Optional fulfillment note').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('economy')
-      .setDescription('Show this server’s economy settings and activity'),
 
     new SlashCommandBuilder()
       .setName('richest')
