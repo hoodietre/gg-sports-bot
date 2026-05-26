@@ -1393,17 +1393,7 @@ async function registerCommands() {
   const commands = getRegisteredCommands();
 
   console.log('Prepared command count:', commands.length);
-
-  try {
-    console.log('Registering global commands...');
-    await rest.put(
-      Routes.applicationCommands(CLIENT_ID),
-      { body: commands }
-    );
-    console.log('Global commands synced:', commands.length);
-  } catch (error) {
-    console.error('Global command sync failed:', error);
-  }
+  console.log('Registering guild commands only for fast/stable testing...');
 
   const guildIds = new Set();
 
@@ -1417,6 +1407,11 @@ async function registerCommands() {
 
   for (const guild of client.guilds.cache.values()) {
     guildIds.add(guild.id);
+  }
+
+  if (!guildIds.size) {
+    console.warn('No guild IDs found for command registration. Add GUILD_IDS in Railway.');
+    return;
   }
 
   for (const guildId of guildIds) {
