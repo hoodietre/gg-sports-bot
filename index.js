@@ -855,24 +855,38 @@ function buildCommands() {
 
     new SlashCommandBuilder()
       .setName('profile')
-      .setDescription('Show a user profile for a league')
-      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
+      .setDescription('Profile, stats, activity, and history commands')
+      .addSubcommand(sc => sc
+        .setName('user')
+        .setDescription('Show a user profile for a league')
+        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('stats')
+        .setDescription('Show league stats for a user')
+        .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('team')
+        .setDescription('Show a team/franchise profile')
+        .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('legacy')
+        .setDescription('Show franchise championship and finals history')
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('awards')
+        .setDescription('Show award history for a league')
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))
+        .addStringOption(o => o.setName('award').setDescription('Filter by award name, ex: MVP or Cy Young').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('halloffame')
+        .setDescription('Show the league Hall of Fame leaderboard')
+        .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false))),
 
     new SlashCommandBuilder()
-      .setName('stats')
-      .setDescription('Show your league stats or another user’s stats')
-      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('teamprofile')
-      .setDescription('Show a team/franchise profile for a league')
-      .addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true))
-      .addStringOption(o => o.setName('league').setDescription('League name, ex: NBA 2K or MLB').setRequired(false)),
-
-    new SlashCommandBuilder()
-      .setName('setcurrency')
+      .setName('setcurrency'
       .setDescription('Configure this server’s currency')
       .addStringOption(o => o.setName('name').setDescription('Currency name, ex: Ghost Gold').setRequired(true))
       .addStringOption(o => o.setName('icon').setDescription('Currency icon/emoji, ex: 🪙').setRequired(false))
@@ -1340,6 +1354,11 @@ function getRegisteredCommands() {
     'setupteamowners',
     'setuptradecount',
     'setupoffertrade',
+    'stats',
+    'teamprofile',
+    'franchiselegacy',
+    'awardhistory',
+    'halloffame',
   ]);
 
   const activeBuiltCommands = builtCommands.filter(command => !retiredCommandNames.has(command.name));
@@ -3909,6 +3928,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
       return;
+    }
+
+    if (interaction.commandName === 'profile') {
+      const profileSubcommand = interaction.options.getSubcommand();
+      const profileCommandMap = {
+        user: 'profile',
+        stats: 'stats',
+        team: 'teamprofile',
+        legacy: 'franchiselegacy',
+        awards: 'awardhistory',
+        halloffame: 'halloffame',
+      };
+      interaction.commandName = profileCommandMap[profileSubcommand] || interaction.commandName;
     }
 
     if (interaction.commandName === 'trade') {
