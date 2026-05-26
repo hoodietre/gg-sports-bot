@@ -3698,18 +3698,136 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'economy') {
+      if (!interaction.guild) return;
       const economySubcommand = interaction.options.getSubcommand();
-      const economyCommandMap = {
-        balance: 'balance',
-        transfer: 'transfer',
-        give: 'givecurrency',
-        take: 'takecurrency',
-        settings: 'economy',
-        richest: 'richest',
-        transactions: 'transactions',
-        banklog: 'banklog',
-      };
-      interaction.commandName = economyCommandMap[economySubcommand] || interaction.commandName;
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (economySubcommand === 'balance') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const balance = await getCurrencyBalance(interaction.guild.id, targetUser.id);
+        await interaction.reply({
+          content: '**' + targetUser.username + '** has **' + settings.currency_icon + ' ' + balance.balance + ' ' + settings.currency_name + '**. Lifetime earned: **' + balance.lifetime_earned + '**. Lifetime spent: **' + balance.lifetime_spent + '**.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (economySubcommand === 'transfer') {
+        const targetUser = interaction.options.getUser('user');
+        const amount = interaction.options.getInteger('amount');
+        const reason = interaction.options.getString('reason') || 'User transfer';
+
+        if (targetUser.bot || targetUser.id === interaction.user.id) {
+          await interaction.reply({ content: 'Choose another non-bot user to transfer to.', ephemeral: true });
+          return;
+        }
+
+        if (!Number.isInteger(amount) || amount <= 0) {
+          await interaction.reply({ content: 'Transfer amount must be greater than 0.', ephemeral: true });
+          return;
+        }
+
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'transfer_out', reason, interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' for that transfer.', ephemeral: true });
+          return;
+        }
+
+        await addCurrency(interaction.guild.id, targetUser.id, amount, 'transfer_in', reason, interaction.user.id);
+        await interaction.reply({ content: 'Transferred **' + settings.currency_icon + ' ' + amount + '** to ' + targetUser.toString() + '.', ephemeral: false });
+        return;
+      }
+
+      if (economySubcommand === 'give' || economySubcommand === 'take') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to manage currency.', ephemeral: true });
+          return;
+        }
+
+        const targetUser = interaction.options.getUser('user');
+        const amount = interaction.options.getInteger('amount');
+        const reason = interaction.options.getString('reason') || 'Staff currency adjustment';
+
+        if (!Number.isInteger(amount) || amount <= 0) {
+          await interaction.reply({ content: 'Amount must be greater than 0.', ephemeral: true });
+          return;
+        }
+
+        if (economySubcommand === 'give') {
+          await addCurrency(interaction.guild.id, targetUser.id, amount, 'staff_give', reason, interaction.user.id);
+          await interaction.reply({ content: 'Gave **' + settings.currency_icon + ' ' + amount + '** to ' + targetUser.toString() + '.', ephemeral: true });
+          return;
+        }
+
+        const removed = await removeCurrency(interaction.guild.id, targetUser.id, amount, 'staff_take', reason, interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: targetUser.toString() + ' does not have enough ' + settings.currency_name + ' to remove that amount.', ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({ content: 'Removed **' + settings.currency_icon + ' ' + amount + '** from ' + targetUser.toString() + '.', ephemeral: true });
+        return;
+      }
+
+      if (economySubcommand === 'richest') {
+        const result = await pool.query(
+          `SELECT * FROM guild_currency_balances
+           WHERE guild_id = $1
+           ORDER BY balance DESC, lifetime_earned DESC
+           LIMIT 10`,
+          [interaction.guild.id]
+        );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Richest Users')
+          .setColor(0xFEE75C)
+          .setFooter({ text: 'GG Sports • Economy' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map((row, index) => '**' + (index + 1) + '. <@' + row.user_id + '>** — ' + settings.currency_icon + ' ' + row.balance + ' • Earned: ' + row.lifetime_earned).join(NL)
+          : 'No balances found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (economySubcommand === 'transactions' || economySubcommand === 'banklog') {
+        if (economySubcommand === 'banklog' && !(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to view the bank log.', ephemeral: true });
+          return;
+        }
+
+        const targetUser = economySubcommand === 'transactions' ? interaction.options.getUser('user') : null;
+        const result = targetUser
+          ? await pool.query(
+              `SELECT * FROM currency_transactions WHERE guild_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 15`,
+              [interaction.guild.id, targetUser.id]
+            )
+          : await pool.query(
+              `SELECT * FROM currency_transactions WHERE guild_id = $1 ORDER BY created_at DESC LIMIT 15`,
+              [interaction.guild.id]
+            );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle(economySubcommand === 'banklog' ? 'Bank Log' : 'Recent Transactions')
+          .setColor(0x5865F2)
+          .setFooter({ text: 'GG Sports • Economy' })
+          .setTimestamp();
+
+        embed.setDescription(result.rows.length
+          ? result.rows.map(row => '<@' + row.user_id + '> — **' + row.amount + '** • ' + row.transaction_type + (row.reason ? ' • ' + row.reason : '')).join(NL)
+          : 'No transactions found.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (economySubcommand === 'settings') {
+        interaction.commandName = 'economy';
+      }
     }
 
     if (interaction.commandName === 'shop') {
