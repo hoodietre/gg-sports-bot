@@ -1202,6 +1202,64 @@ function buildCommands() {
         .addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false))),
 
     new SlashCommandBuilder()
+      .setName('league')
+      .setDescription('League setup and management commands')
+      .addSubcommand(sc => sc
+        .setName('create')
+        .setDescription('Create or configure a league')
+        .addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('info')
+        .setDescription('View league information')
+        .addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('list')
+        .setDescription('List leagues in this server'))
+      .addSubcommand(sc => sc
+        .setName('staff')
+        .setDescription('Set the league staff role')
+        .addRoleOption(o => o.setName('role').setDescription('Staff role').setRequired(true))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('standingschannel')
+        .setDescription('Set the standings channel')
+        .addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(true))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('standingspanel')
+        .setDescription('Create or refresh the standings panel')
+        .addChannelOption(o => o.setName('channel').setDescription('Optional standings channel').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('tournamentchannel')
+        .setDescription('Set the tournament channel')
+        .addChannelOption(o => o.setName('channel').setDescription('Tournament channel').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('tournamentpanel')
+        .setDescription('Create or refresh the tournament panel')
+        .addChannelOption(o => o.setName('channel').setDescription('Optional tournament channel').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('ticketpanel')
+        .setDescription('Create or refresh the live ticket dashboard')
+        .addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('supportpanel')
+        .setDescription('Create a user-facing support panel')
+        .addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('sportsbookpanel')
+        .setDescription('Create or refresh the sportsbook board')
+        .addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('currency')
+        .setDescription('Configure server currency')
+        .addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false))
+        .addStringOption(o => o.setName('icon').setDescription('Currency icon/emoji').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('settings')
+        .setDescription('View league/server setup settings')),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
@@ -1244,6 +1302,37 @@ function getRegisteredCommands() {
   if (commands.length <= MAX_COMMANDS) return commands;
 
   const dropIfNeeded = new Set([
+    'setupleague',
+    'leagues',
+    'leagueinfo',
+    'setcurrency',
+    'currencysettings',
+    'setstaffrole',
+    'setcommissionerrole',
+    'setstandingschannel',
+    'setupstandings',
+    'refreshstandings',
+    'league-settournamentchannel',
+    'setuptournamentpanel',
+    'setupticketpanel',
+    'setupsupportpanel',
+    'setupsportsbookpanel',
+    'setsportsbookfeed',
+    'setupsupportpanel',
+    'setupticketpanel',
+    'ticketinfo',
+    'claimticket',
+    'ticketevidence',
+    'tickettranscript',
+    'setticketstatus',
+    'setticketpriority',
+    'closeticket',
+    'tickets',
+    'league-settournamentchannel',
+    'setuptournamentpanel',
+    'setupstandings',
+    'setstandingschannel',
+    'setstaffrole',
     'ping',
     'help',
     'commands',
@@ -3845,6 +3934,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ content: 'Ticket closed. Transcript saved. This thread will be archived.' + (closeReason ? ' Reason: ' + closeReason : ''), ephemeral: false });
       await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
       return;
+    }
+
+    if (interaction.commandName === 'league') {
+      const leagueSubcommand = interaction.options.getSubcommand();
+
+      if (leagueSubcommand === 'ticketpanel') {
+        interaction.commandName = 'setupticketpanel';
+      } else if (leagueSubcommand === 'supportpanel') {
+        interaction.commandName = 'setupsupportpanel';
+      } else if (leagueSubcommand === 'sportsbookpanel') {
+        interaction.commandName = 'setupsportsbookpanel';
+      } else if (leagueSubcommand === 'standingspanel') {
+        interaction.commandName = 'setupstandings';
+      } else if (leagueSubcommand === 'tournamentchannel') {
+        interaction.commandName = 'league-settournamentchannel';
+      } else if (leagueSubcommand === 'tournamentpanel') {
+        interaction.commandName = 'setuptournamentpanel';
+      } else if (leagueSubcommand === 'standingschannel') {
+        interaction.commandName = 'setstandingschannel';
+      } else if (leagueSubcommand === 'staff') {
+        interaction.commandName = 'setstaffrole';
+      } else if (leagueSubcommand === 'currency') {
+        interaction.commandName = 'setcurrency';
+      } else if (leagueSubcommand === 'list') {
+        interaction.commandName = 'leagues';
+      } else if (leagueSubcommand === 'info' || leagueSubcommand === 'settings') {
+        interaction.commandName = 'leagueinfo';
+      } else if (leagueSubcommand === 'create') {
+        interaction.commandName = 'setupleague';
+      }
     }
 
     if (interaction.commandName === 'setupsupportpanel') {
