@@ -1338,138 +1338,18 @@ function buildCommands() {
 }
 
 function getRegisteredCommands() {
-  const builtCommands = buildCommands();
-  const retiredCommandNames = new Set([
-    'balance',
-    'transfer',
-    'givecurrency',
-    'takecurrency',
-    'createshopitem',
-    'buy',
-    'inventory',
-    'removeshopitem',
-    'useitem',
-    'redeemitem',
-    'richest',
-    'transactions',
-    'banklog',
-    'tradehistory',
-    'teamtrades',
-    'addtrade',
-    'removetrade',
-    'tradeblock',
-    'setupteamowners',
-    'setuptradecount',
-    'setupoffertrade',
-    'addgame',
-    'reportgame',
-    'schedule',
-    'standings',
-    'adjuststandings',
-    'settournamentchannel',
-    'setupstandings',
-    'editleaguename',
-    'addseasonhistory',
-    'stats',
-    'teamprofile',
-    'franchiselegacy',
-    'awardhistory',
-    'halloffame',
-  ]);
-
-  const activeBuiltCommands = builtCommands.filter(command => !retiredCommandNames.has(command.name));
-  const byName = new Map();
-
-  // Keep the newest command definition when duplicate names exist.
-  // This lets consolidated hubs like /shop, /economy, /ticket, /league replace older standalone commands safely.
-  for (const command of activeBuiltCommands) {
-    byName.set(command.name, command);
-  }
-
-  const commands = [...byName.values()];
-
-  if (activeBuiltCommands.length !== builtCommands.length) {
-    console.warn('Removed retired standalone commands:', builtCommands.length - activeBuiltCommands.length);
-  }
+  const commands = buildCommands();
   const MAX_COMMANDS = 100;
 
-  if (builtCommands.length !== commands.length) {
-    console.warn('Removed duplicate command definitions:', activeBuiltCommands.length - commands.length);
+  console.log('Prepared command count:', commands.length);
+  console.log('Registered command names:', commands.map(command => command.name).join(', '));
+
+  if (commands.length > MAX_COMMANDS) {
+    console.warn('Command list is over Discord limit:', commands.length);
+    return commands.slice(0, MAX_COMMANDS);
   }
 
-  if (commands.length <= MAX_COMMANDS) return commands;
-
-  const dropIfNeeded = new Set([
-    'tradehistory',
-    'teamtrades',
-    'addtrade',
-    'removetrade',
-    'tradeblock',
-    'setupteamowners',
-    'setuptradecount',
-    'setupoffertrade',
-    'createtournament',
-    'jointournament',
-    'tournaments',
-    'tournamentinfo',
-    'closetournament',
-    'starttournament',
-    'tournamentmatches',
-    'setuptournamentpanel',
-    'reportmatch',
-    'shuffletournament',
-    'settournamentseed',
-    'tournamentseeds',
-    'announcetournament',
-    'tournamenthistory',
-    'settournamentmvp',
-    'tournamentrewards',
-    'setupleague',
-    'leagues',
-    'leagueinfo',
-    'setcurrency',
-    'currencysettings',
-    'setstaffrole',
-    'setcommissionerrole',
-    'setstandingschannel',
-    'setupstandings',
-    'refreshstandings',
-    'setuptournamentpanel',
-    'setupsupportpanel',
-    'setupticketpanel',
-    'league-settournamentchannel',
-    'setuptournamentpanel',
-    'setupstandings',
-    'setstandingschannel',
-    'setstaffrole',
-    'ping',
-    'help',
-    'commands',
-    'setupteamowners',
-    'setuptradecount',
-    'setupoffertrade',
-    'franchiselegacy',
-    'awardhistory',
-    'halloffame',
-    'teamtrades',
-    'teamprofile',
-    'transactions',
-    'banklog',
-    'mybets',
-    'setupsportsbookpanel',
-    'setsportsbookfeed',
-    'bettinghistory',
-  ]);
-
-  const trimmed = commands.filter(command => !dropIfNeeded.has(command.name));
-
-  if (trimmed.length > MAX_COMMANDS) {
-    console.warn('Command list still over Discord limit after trimming:', trimmed.length);
-    return trimmed.slice(0, MAX_COMMANDS);
-  }
-
-  console.warn('Discord command limit reached. Registered', trimmed.length, 'of', commands.length, 'commands. Some non-critical commands were skipped.');
-  return trimmed;
+  return commands;
 }
 
 async function registerCommands() {
