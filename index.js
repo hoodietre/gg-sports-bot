@@ -1020,7 +1020,7 @@ function buildCommands() {
         .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false))),
 
     new SlashCommandBuilder()
-      .setName('ticket'
+      .setName('ticket')
       .setDescription('Ticket and support commands')
       .addSubcommand(sc => sc
         .setName('open')
