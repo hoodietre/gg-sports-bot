@@ -1238,6 +1238,11 @@ function buildCommands() {
         .setDescription('View league information')
         .addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc
+        .setName('edit')
+        .setDescription('Rename a configured league')
+        .addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true))
+        .addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
+      .addSubcommand(sc => sc
         .setName('list')
         .setDescription('List leagues in this server'))
       .addSubcommand(sc => sc
@@ -1285,7 +1290,17 @@ function buildCommands() {
         .addStringOption(o => o.setName('icon').setDescription('Currency icon/emoji').setRequired(false)))
       .addSubcommand(sc => sc
         .setName('settings')
-        .setDescription('View league/server setup settings')),
+        .setDescription('View league/server setup settings'))
+      .addSubcommand(sc => sc
+        .setName('seasonhistory')
+        .setDescription('Post a completed season history embed')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
+        .addStringOption(o => o.setName('season').setDescription('Season label, ex: Season 1 or 2026 Spring').setRequired(true))
+        .addStringOption(o => o.setName('champion').setDescription('Champion team/user').setRequired(true))
+        .addStringOption(o => o.setName('runner_up').setDescription('Runner-up team/user').setRequired(false))
+        .addStringOption(o => o.setName('mvp').setDescription('MVP or top player').setRequired(false))
+        .addStringOption(o => o.setName('awards').setDescription('Format: MVP: Name | Cy Young: Name | Sportsmanship: Name').setRequired(false))
+        .addStringOption(o => o.setName('notes').setDescription('Season notes or storylines').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('game')
@@ -1351,6 +1366,10 @@ function getRegisteredCommands() {
     'schedule',
     'standings',
     'adjuststandings',
+    'settournamentchannel',
+    'setupstandings',
+    'editleaguename',
+    'addseasonhistory',
     'stats',
     'teamprofile',
     'franchiselegacy',
@@ -4139,6 +4158,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         interaction.commandName = 'leagues';
       } else if (leagueSubcommand === 'info' || leagueSubcommand === 'settings') {
         interaction.commandName = 'leagueinfo';
+      } else if (leagueSubcommand === 'edit') {
+        interaction.commandName = 'editleaguename';
+      } else if (leagueSubcommand === 'seasonhistory') {
+        interaction.commandName = 'addseasonhistory';
       } else if (leagueSubcommand === 'create') {
         interaction.commandName = 'setupleague';
       }
