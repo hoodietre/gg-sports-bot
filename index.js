@@ -1218,6 +1218,16 @@ function getRegisteredCommands() {
     'mybets',
     'bettinghistory',
     'bettingleaderboard',
+    'createsportsbookgame',
+    'placebet',
+    'settlebet',
+    'mybets',
+    'createparlay',
+    'setupsportsbookpanel',
+    'setsportsbookfeed',
+    'sportsbookline',
+    'cancelsportsbookgame',
+    'bettinghistory',
   ]);
 
   const trimmed = commands.filter(command => !dropIfNeeded.has(command.name));
