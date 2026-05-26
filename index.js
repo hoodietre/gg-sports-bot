@@ -1160,6 +1160,48 @@ function buildCommands() {
         .addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false))),
 
     new SlashCommandBuilder()
+      .setName('sportsbook')
+      .setDescription('Sportsbook commands')
+      .addSubcommand(sc => sc
+        .setName('board')
+        .setDescription('View open sportsbook games'))
+      .addSubcommand(sc => sc
+        .setName('create')
+        .setDescription('Staff: create a sportsbook moneyline game')
+        .addStringOption(o => o.setName('label').setDescription('Game label, ex: Lakers vs Celtics').setRequired(true))
+        .addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true))
+        .addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true))
+        .addIntegerOption(o => o.setName('home_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
+        .addIntegerOption(o => o.setName('away_odds').setDescription('American odds, ex: -150 or 120').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('Optional league name').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('place')
+        .setDescription('Place a moneyline bet')
+        .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+        .addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true))
+        .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('settle')
+        .setDescription('Staff: settle a sportsbook game')
+        .addStringOption(o => o.setName('game_id').setDescription('Sportsbook game short ID').setRequired(true))
+        .addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('mybets')
+        .setDescription('View your recent sportsbook bets'))
+      .addSubcommand(sc => sc
+        .setName('parlay')
+        .setDescription('Create a 2-4 leg sportsbook parlay')
+        .addIntegerOption(o => o.setName('amount').setDescription('Stake amount').setRequired(true))
+        .addStringOption(o => o.setName('leg1_game').setDescription('Leg 1 sportsbook game ID').setRequired(true))
+        .addStringOption(o => o.setName('leg1_side').setDescription('home or away').setRequired(true))
+        .addStringOption(o => o.setName('leg2_game').setDescription('Leg 2 sportsbook game ID').setRequired(true))
+        .addStringOption(o => o.setName('leg2_side').setDescription('home or away').setRequired(true))
+        .addStringOption(o => o.setName('leg3_game').setDescription('Optional leg 3 sportsbook game ID').setRequired(false))
+        .addStringOption(o => o.setName('leg3_side').setDescription('home or away').setRequired(false))
+        .addStringOption(o => o.setName('leg4_game').setDescription('Optional leg 4 sportsbook game ID').setRequired(false))
+        .addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false))),
+
+    new SlashCommandBuilder()
       .setName('addgame')
       .setDescription('Add a scheduled league game')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true))
