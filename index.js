@@ -784,6 +784,15 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
+      .setName('activity')
+      .setDescription('View activity points, tier, streak, sportsbook stats, games played, and tickets resolved')
+      .addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)),
+
+    new SlashCommandBuilder()
+      .setName('activityleaderboard')
+      .setDescription('Show the top activity users in this server'),
+
+    new SlashCommandBuilder()
       .setName('economy')
       .setDescription('Currency and economy commands')
       .addSubcommand(sc => sc.setName('balance').setDescription('Check a balance').addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)))
@@ -2515,6 +2524,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
         );
 
+        await addRecognitionPoints(interaction.guild.id, interaction.user.id, 2, 0).catch(() => null);
         await updateSportsbookPanel(interaction.guild);
         const feedSettings = await getSportsbookSettings(interaction.guild.id);
         await postSportsbookFeed(
@@ -5682,6 +5692,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
         );
 
+        await addRecognitionPoints(interaction.guild.id, interaction.user.id, 2, 0).catch(() => null);
         const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
         const activeLeague = sportsbookGame.league_id ? await getLeagueById(sportsbookGame.league_id) : await resolveLeague(interaction);
         const sportsbookSettings = await getSportsbookSettings(interaction.guild.id);
@@ -5735,6 +5746,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
             winners += 1;
             totalPaid += Number(bet.potential_payout);
+            const winSideLabel = bet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+            await postSportsbookFeed(interaction.guild, buildSportsbookWinAlertEmbed(settings, bet, sportsbookGame, winSideLabel));
           } else {
             await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', -Number(bet.amount)).catch(() => null);
             lostBets.push(bet);
@@ -8680,6 +8693,23 @@ function buildSportsbookSettlementAlertEmbed(game, winnerLabel, winners, losers,
       { name: 'Straight Bet Payouts', value: String(totalPaid), inline: true },
       { name: 'Parlays Settled', value: String(parlayResult?.settledCount || 0), inline: true },
       { name: 'Parlay Payouts', value: String(parlayResult?.parlayPaid || 0), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Sportsbook Feed' })
+    .setTimestamp();
+}
+
+function buildSportsbookWinAlertEmbed(settings, bet, game, sideLabel) {
+  const profit = Number(bet.potential_payout || 0) - Number(bet.amount || 0);
+  return new EmbedBuilder()
+    .setTitle(profit >= Number(bet.amount || 0) ? '💰 Big Sportsbook Win' : '✅ Sportsbook Win')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'User', value: '<@' + bet.user_id + '>', inline: true },
+      { name: 'Pick', value: sideLabel + ' ML ' + bet.odds, inline: true },
+      { name: 'Stake', value: settings.currency_icon + ' ' + Number(bet.amount || 0), inline: true },
+      { name: 'Paid Out', value: settings.currency_icon + ' ' + Number(bet.potential_payout || 0), inline: true },
+      { name: 'Profit', value: settings.currency_icon + ' ' + profit, inline: true },
+      { name: 'Game', value: game.game_label || 'Unknown game', inline: false }
     )
     .setFooter({ text: 'GG Sports • Sportsbook Feed' })
     .setTimestamp();
