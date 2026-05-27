@@ -982,7 +982,8 @@ async function getLeagueByChannel(guildId, channelId) {
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
        s.live_channel_id, s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id, s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs
+       s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
+       s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id
      )
      LIMIT 1`,
     [guildId, channelId]
