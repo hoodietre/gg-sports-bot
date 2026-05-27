@@ -5639,7 +5639,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
         );
 
+        const activeLeague = sportsbookGame.league_id ? await getLeagueById(sportsbookGame.league_id) : await resolveLeague(interaction);
         const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+        const bigBetThreshold = Number(activeLeague?.sportsbook_big_bet_threshold || 1000);
+
+        await postSportsbookFeed(interaction.guild, activeLeague, amount >= bigBetThreshold ? 'bigBet' : 'betPlaced', {
+          userId: interaction.user.id,
+          gameLabel: sportsbookGame.game_label,
+          pickLabel: sideLabel + ' ML ' + odds,
+          amount,
+          payout,
+        });
+
         await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
         return;
       }
@@ -8860,4 +8871,3 @@ async function openSupportTicket(interaction, ticketType) {
   await updateTicketPanel(interaction.guild);
   await interaction.reply({ content: 'Ticket opened: ' + thread.toString() + '. Ticket ID: **' + ticketId.split('-')[0] + '**', ephemeral: true });
 }
-
