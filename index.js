@@ -8816,12 +8816,11 @@ async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
 
 function getLegacyTier(score) {
   const legacyScore = Number(score || 0);
-  if (legacyScore >= 5000) return 'GOAT';
-  if (legacyScore >= 2500) return 'Legend';
-  if (legacyScore >= 1000) return 'Elite';
-  if (legacyScore >= 500) return 'Veteran';
-  if (legacyScore >= 100) return 'Rising Star';
-  return 'Rookie';
+  if (legacyScore >= 1000) return 'GOAT';
+  if (legacyScore >= 500) return 'Legend';
+  if (legacyScore >= 250) return 'Elite';
+  if (legacyScore >= 100) return 'Veteran';
+  return 'Rising Star';
 }
 
 function getActivityTier(score) {
