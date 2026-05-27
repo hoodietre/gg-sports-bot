@@ -4815,6 +4815,40 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (leagueSubcommand === 'standingschannel') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update league channels.', ephemeral: true });
+          return;
+        }
+
+        const channel = interaction.options.getChannel('channel');
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          return;
+        }
+
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that standings channel.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id, standings_channel_id, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (league_id)
+           DO UPDATE SET standings_channel_id = $2, updated_at = NOW()`,
+          [activeLeague.league_id, channel.id]
+        );
+
+        await interaction.reply({ content: 'Standings channel for **' + activeLeague.league_name + '** set to ' + channel.toString() + '.', ephemeral: true });
+        return;
+      }
+
       if (leagueSubcommand === 'seasonhistory') {
         interaction.commandName = 'addseasonhistory';
       } else if (leagueSubcommand === 'edit') {
@@ -4832,7 +4866,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else if (leagueSubcommand === 'tournamentpanel') {
         interaction.commandName = 'setuptournamentpanel';
       } else if (leagueSubcommand === 'standingschannel') {
-        interaction.commandName = 'league-setstandingschannel';
+        // handled natively above
       } else if (leagueSubcommand === 'tournamentchannel') {
         interaction.commandName = 'settournamentchannel';
       } else if (leagueSubcommand === 'currency') {
@@ -5692,6 +5726,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         for (const bet of bets.rows) {
           if (bet.side === winner) {
             await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, interaction.user.id);
+            await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_wins', 1).catch(() => null);
+            await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', Number(bet.potential_payout) - Number(bet.amount)).catch(() => null);
+            await addRecognitionPoints(interaction.guild.id, bet.user_id, 10, 2).catch(() => null);
             await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
             winners += 1;
             totalPaid += Number(bet.potential_payout);
@@ -5711,6 +5748,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           : { settledCount: 0, parlayPaid: 0 };
 
         const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+        await updateSportsbookPanel(interaction.guild).catch(() => null);
+        await postSportsbookFeed(interaction.guild, buildSportsbookSettlementAlertEmbed(sportsbookGame, winnerLabel, winners, losers, totalPaid, parlayResult));
+
+        for (const wonParlay of parlayResult.wonParlays || []) {
+          await postSportsbookFeed(interaction.guild, buildParlayHitAlertEmbed(settings, wonParlay));
+        }
+
         await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**. Parlays settled: **' + parlayResult.settledCount + '**. Parlay paid: **' + parlayResult.parlayPaid + '**.', ephemeral: true });
         return;
       }
@@ -8071,6 +8115,7 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
 
   let settledCount = 0;
   let parlayPaid = 0;
+  const wonParlays = [];
 
   for (const parlay of parlayResult.rows) {
     await pool.query(
@@ -8095,10 +8140,17 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
       await addRecognitionPoints(guildId, parlay.user_id, 50, 25);
       settledCount += 1;
       parlayPaid += Number(parlay.potential_payout);
+      wonParlays.push({
+        id: parlay.id,
+        user_id: parlay.user_id,
+        amount: Number(parlay.amount),
+        potential_payout: Number(parlay.potential_payout),
+        leg_count: legs.rows.length,
+      });
     }
   }
 
-  return { settledCount, parlayPaid };
+  return { settledCount, parlayPaid, wonParlays };
 }
 
 function buildSportsbookBetBoardButtons(rows) {
@@ -8612,6 +8664,21 @@ function buildSportsbookSettlementAlertEmbed(game, winnerLabel, winners, losers,
       { name: 'Straight Bet Payouts', value: String(totalPaid), inline: true },
       { name: 'Parlays Settled', value: String(parlayResult?.settledCount || 0), inline: true },
       { name: 'Parlay Payouts', value: String(parlayResult?.parlayPaid || 0), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Sportsbook Feed' })
+    .setTimestamp();
+}
+
+function buildParlayHitAlertEmbed(settings, parlay) {
+  return new EmbedBuilder()
+    .setTitle('💰 Parlay Cashed')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'User', value: '<@' + parlay.user_id + '>', inline: true },
+      { name: 'Parlay ID', value: shortSportsbookId(parlay.id), inline: true },
+      { name: 'Legs', value: String(parlay.leg_count || '—'), inline: true },
+      { name: 'Stake', value: settings.currency_icon + ' ' + (parlay.amount || 0), inline: true },
+      { name: 'Paid Out', value: settings.currency_icon + ' ' + (parlay.potential_payout || 0), inline: true }
     )
     .setFooter({ text: 'GG Sports • Sportsbook Feed' })
     .setTimestamp();
