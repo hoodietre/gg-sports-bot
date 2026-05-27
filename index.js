@@ -5723,16 +5723,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
         let winners = 0;
         let losers = 0;
         let totalPaid = 0;
+        const winningUserIds = new Set();
+        const lostBets = [];
         for (const bet of bets.rows) {
           if (bet.side === winner) {
             await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, interaction.user.id);
             await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_wins', 1).catch(() => null);
             await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', Number(bet.potential_payout) - Number(bet.amount)).catch(() => null);
             await addRecognitionPoints(interaction.guild.id, bet.user_id, 10, 2).catch(() => null);
+            winningUserIds.add(bet.user_id);
             await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
             winners += 1;
             totalPaid += Number(bet.potential_payout);
           } else {
+            await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', -Number(bet.amount)).catch(() => null);
+            lostBets.push(bet);
             await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
             losers += 1;
           }
@@ -5753,6 +5758,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         for (const wonParlay of parlayResult.wonParlays || []) {
           await postSportsbookFeed(interaction.guild, buildParlayHitAlertEmbed(settings, wonParlay));
+        }
+
+        const badBeatBet = getBadBeatBet(lostBets);
+        if (badBeatBet) {
+          const badBeatSideLabel = badBeatBet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+          await postSportsbookFeed(interaction.guild, buildBadBeatAlertEmbed(settings, badBeatBet, sportsbookGame, badBeatSideLabel));
+        }
+
+        const leaderboardSpotlight = await getSportsbookLeaderboardSpotlight(interaction.guild.id, [...winningUserIds]);
+        if (leaderboardSpotlight) {
+          await postSportsbookFeed(interaction.guild, buildSportsbookLeaderboardAlertEmbed(settings, leaderboardSpotlight));
         }
 
         await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**. Parlays settled: **' + parlayResult.settledCount + '**. Parlay paid: **' + parlayResult.parlayPaid + '**.', ephemeral: true });
@@ -8696,6 +8712,60 @@ function buildParlayCreatedAlertEmbed(settings, user, parlayId, amount, payout, 
       { name: 'Potential Payout', value: settings.currency_icon + ' ' + payout, inline: true }
     )
     .setFooter({ text: 'GG Sports • Sportsbook Feed' })
+    .setTimestamp();
+}
+
+function getBadBeatBet(lostBets = []) {
+  if (!lostBets.length) return null;
+  const sorted = [...lostBets].sort((a, b) => Number(b.potential_payout || b.amount || 0) - Number(a.potential_payout || a.amount || 0));
+  const biggestLoss = sorted[0];
+  if (!biggestLoss) return null;
+  if (Number(biggestLoss.amount || 0) < 100) return null;
+  return biggestLoss;
+}
+
+function buildBadBeatAlertEmbed(settings, bet, game, sideLabel) {
+  return new EmbedBuilder()
+    .setTitle('💔 Bad Beat Alert')
+    .setColor(0xED4245)
+    .addFields(
+      { name: 'User', value: '<@' + bet.user_id + '>', inline: true },
+      { name: 'Pick', value: sideLabel + ' ML ' + bet.odds, inline: true },
+      { name: 'Stake Lost', value: settings.currency_icon + ' ' + Number(bet.amount || 0), inline: true },
+      { name: 'Potential Payout Missed', value: settings.currency_icon + ' ' + Number(bet.potential_payout || 0), inline: true },
+      { name: 'Game', value: game.game_label || 'Unknown game', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Bad Beat' })
+    .setTimestamp();
+}
+
+async function getSportsbookLeaderboardSpotlight(guildId, candidateUserIds = []) {
+  if (!candidateUserIds.length) return null;
+  const result = await pool.query(
+    `SELECT user_id, sportsbook_profit, sportsbook_wins
+     FROM user_recognition
+     WHERE guild_id = $1
+     ORDER BY sportsbook_profit DESC, sportsbook_wins DESC
+     LIMIT 10`,
+    [guildId]
+  );
+
+  const candidateSet = new Set(candidateUserIds);
+  const ranked = result.rows.map((row, index) => ({ ...row, rank: index + 1 }));
+  return ranked.find(row => candidateSet.has(row.user_id) && row.rank <= 5) || null;
+}
+
+function buildSportsbookLeaderboardAlertEmbed(settings, spotlight) {
+  return new EmbedBuilder()
+    .setTitle('📈 Sportsbook Leaderboard Spotlight')
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'User', value: '<@' + spotlight.user_id + '>', inline: true },
+      { name: 'Current Rank', value: '#' + spotlight.rank, inline: true },
+      { name: 'Profit', value: settings.currency_icon + ' ' + Number(spotlight.sportsbook_profit || 0), inline: true },
+      { name: 'Sportsbook Wins', value: String(spotlight.sportsbook_wins || 0), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Leaderboard Movement' })
     .setTimestamp();
 }
 
