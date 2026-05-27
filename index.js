@@ -781,7 +781,10 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('team').setDescription('Show a team profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('awards').setDescription('Show award history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
-      .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+      .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('Show the full Franchise Hub profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('activity').setDescription('Show profile activity snapshot').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('earnings').setDescription('Show all-time economy and sportsbook earnings').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('activity')
@@ -3583,6 +3586,175 @@ client.on(Events.InteractionCreate, async (interaction) => {
         embed.setDescription(result.rows.length
           ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — ' + row.championships + ' championships, ' + row.finals_appearances + ' finals').join(NL)
           : 'No Hall of Fame records found yet.');
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (profileSubcommand === 'franchise') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
+
+        const recognitionResult = await pool.query(
+          `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+          [interaction.guild.id, targetUser.id]
+        );
+        const recognition = recognitionResult.rows[0] || {};
+
+        const balanceResult = await pool.query(
+          `SELECT balance, lifetime_earned, lifetime_spent
+           FROM guild_currency_balances
+           WHERE guild_id = $1 AND user_id = $2
+           LIMIT 1`,
+          [interaction.guild.id, targetUser.id]
+        );
+        const balance = balanceResult.rows[0] || { balance: 0, lifetime_earned: 0, lifetime_spent: 0 };
+
+        const betResult = await pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE status IN ('won','lost')) AS settled_bets,
+             COUNT(*) FILTER (WHERE status = 'won') AS won_bets,
+             COUNT(*) FILTER (WHERE status = 'lost') AS lost_bets,
+             COALESCE(SUM(amount), 0) AS total_wagered,
+             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS net_profit
+           FROM sportsbook_bets
+           WHERE guild_id = $1 AND user_id = $2`,
+          [interaction.guild.id, targetUser.id]
+        );
+        const bets = betResult.rows[0] || {};
+
+        const parlayResult = await pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE status IN ('won','lost')) AS settled_parlays,
+             COUNT(*) FILTER (WHERE status = 'won') AS won_parlays,
+             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS parlay_profit
+           FROM sportsbook_parlays
+           WHERE guild_id = $1 AND user_id = $2`,
+          [interaction.guild.id, targetUser.id]
+        );
+        const parlays = parlayResult.rows[0] || {};
+
+        const tournamentResult = activeLeague
+          ? await pool.query(
+              `SELECT
+                 COUNT(*) FILTER (WHERE champion_user_id = $3) AS tournament_titles,
+                 COUNT(*) FILTER (WHERE mvp_user_id = $3) AS tournament_mvps,
+                 COALESCE(SUM(CASE WHEN champion_user_id = $3 THEN prize_paid ELSE 0 END), 0) AS tournament_prizes,
+                 COALESCE(SUM(CASE WHEN mvp_user_id = $3 THEN mvp_payout ELSE 0 END), 0) AS mvp_prizes
+               FROM tournament_history
+               WHERE guild_id = $1 AND league_id = $2`,
+              [interaction.guild.id, activeLeague.league_id, targetUser.id]
+            )
+          : await pool.query(
+              `SELECT
+                 COUNT(*) FILTER (WHERE champion_user_id = $2) AS tournament_titles,
+                 COUNT(*) FILTER (WHERE mvp_user_id = $2) AS tournament_mvps,
+                 COALESCE(SUM(CASE WHEN champion_user_id = $2 THEN prize_paid ELSE 0 END), 0) AS tournament_prizes,
+                 COALESCE(SUM(CASE WHEN mvp_user_id = $2 THEN mvp_payout ELSE 0 END), 0) AS mvp_prizes
+               FROM tournament_history
+               WHERE guild_id = $1`,
+              [interaction.guild.id, targetUser.id]
+            );
+        const tournaments = tournamentResult.rows[0] || {};
+
+        const activityTier = getActivityTier(Number(recognition.activity_points || 0));
+        const legacyTier = getLegacyTier(Number(recognition.legacy_score || 0));
+        const settings = await getCurrencySettings(interaction.guild.id);
+
+        const embed = new EmbedBuilder()
+          .setTitle('Franchise Hub • ' + targetUser.username)
+          .setColor(0xFEE75C)
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .addFields(
+            { name: 'League Scope', value: activeLeague ? activeLeague.league_name : 'All Leagues', inline: true },
+            { name: '⚡ Activity', value: String(recognition.activity_points || 0) + ' pts • ' + activityTier.name, inline: true },
+            { name: '🏆 Legacy', value: String(recognition.legacy_score || 0) + ' pts • ' + legacyTier.name, inline: true },
+            { name: 'Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
+            { name: 'All-Time Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
+            { name: 'All-Time Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
+            { name: 'Sportsbook Record', value: String(bets.won_bets || 0) + '-' + String(bets.lost_bets || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(bets.net_profit || 0), inline: false },
+            { name: 'Parlays', value: 'Won: ' + String(parlays.won_parlays || 0) + ' • Settled: ' + String(parlays.settled_parlays || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(parlays.parlay_profit || 0), inline: false },
+            { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • MVPs: ' + String(tournaments.tournament_mvps || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
+            { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false }
+          )
+          .setFooter({ text: 'GG Sports • Franchise Hub Foundation' })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (profileSubcommand === 'activity') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
+        const result = await pool.query(
+          `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+          [interaction.guild.id, targetUser.id]
+        );
+        await interaction.reply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+        return;
+      }
+
+      if (profileSubcommand === 'earnings') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const settings = await getCurrencySettings(interaction.guild.id);
+
+        const balanceResult = await pool.query(
+          `SELECT balance, lifetime_earned, lifetime_spent
+           FROM guild_currency_balances
+           WHERE guild_id = $1 AND user_id = $2
+           LIMIT 1`,
+          [interaction.guild.id, targetUser.id]
+        );
+        const balance = balanceResult.rows[0] || { balance: 0, lifetime_earned: 0, lifetime_spent: 0 };
+
+        const sportsbookResult = await pool.query(
+          `SELECT
+             COALESCE(SUM(amount), 0) AS total_wagered,
+             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END), 0) AS total_paid,
+             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS net_profit
+           FROM sportsbook_bets
+           WHERE guild_id = $1 AND user_id = $2`,
+          [interaction.guild.id, targetUser.id]
+        );
+        const sportsbook = sportsbookResult.rows[0] || {};
+
+        const transactionResult = await pool.query(
+          `SELECT transaction_type, COALESCE(SUM(amount), 0) AS total
+           FROM currency_transactions
+           WHERE guild_id = $1 AND user_id = $2
+           GROUP BY transaction_type
+           ORDER BY total DESC
+           LIMIT 10`,
+          [interaction.guild.id, targetUser.id]
+        );
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle('Earnings Profile • ' + targetUser.username)
+          .setColor(0x57F287)
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .addFields(
+            { name: 'Current Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
+            { name: 'Lifetime Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
+            { name: 'Lifetime Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
+            { name: 'Sportsbook Wagered', value: settings.currency_icon + ' ' + String(sportsbook.total_wagered || 0), inline: true },
+            { name: 'Sportsbook Paid Out', value: settings.currency_icon + ' ' + String(sportsbook.total_paid || 0), inline: true },
+            { name: 'Sportsbook Net', value: settings.currency_icon + ' ' + String(sportsbook.net_profit || 0), inline: true }
+          )
+          .setFooter({ text: 'GG Sports • Earnings Profile' })
+          .setTimestamp();
+
+        if (transactionResult.rows.length) {
+          embed.addFields({
+            name: 'Top Transaction Types',
+            value: transactionResult.rows.map(row => '**' + row.transaction_type + '** — ' + settings.currency_icon + ' ' + row.total).join(NL),
+            inline: false,
+          });
+        }
 
         await interaction.reply({ embeds: [embed], ephemeral: true });
         return;
