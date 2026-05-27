@@ -4644,6 +4644,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [activeLeague.league_id, channel.id]
         );
 
+        await pool.query(
+          `INSERT INTO sportsbook_settings (guild_id, feed_channel_id, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (guild_id)
+           DO UPDATE SET feed_channel_id = $2, updated_at = NOW()`,
+          [interaction.guild.id, channel.id]
+        );
+
         await interaction.reply({ content: 'Sportsbook feed channel for **' + activeLeague.league_name + '** set to ' + channel.toString() + '.', ephemeral: true });
         return;
       }
@@ -5599,6 +5607,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id]
         );
 
+        await updateSportsbookPanel(interaction.guild).catch(() => null);
         await interaction.reply({ content: 'Sportsbook game created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**.', ephemeral: true });
         return;
       }
@@ -5639,17 +5648,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
         );
 
-        const activeLeague = sportsbookGame.league_id ? await getLeagueById(sportsbookGame.league_id) : await resolveLeague(interaction);
         const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-        const bigBetThreshold = Number(activeLeague?.sportsbook_big_bet_threshold || 1000);
-
-        await postSportsbookFeed(interaction.guild, activeLeague, amount >= bigBetThreshold ? 'bigBet' : 'betPlaced', {
-          userId: interaction.user.id,
-          gameLabel: sportsbookGame.game_label,
-          pickLabel: sideLabel + ' ML ' + odds,
-          amount,
-          payout,
-        });
+        const activeLeague = sportsbookGame.league_id ? await getLeagueById(sportsbookGame.league_id) : await resolveLeague(interaction);
+        const sportsbookSettings = await getSportsbookSettings(interaction.guild.id);
+        const bigBetThreshold = Number(activeLeague?.sportsbook_big_bet_threshold || sportsbookSettings.big_bet_threshold || 1000);
+        await updateSportsbookPanel(interaction.guild).catch(() => null);
+        await postSportsbookFeed(
+          interaction.guild,
+          buildSportsbookBetAlertEmbed(settings, interaction.user, sportsbookGame, side, amount, odds, payout, amount >= bigBetThreshold)
+        );
 
         await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
         return;
