@@ -790,6 +790,27 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_carts (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      league_id UUID,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_cart_items (
+      cart_id UUID REFERENCES shop_carts(id) ON DELETE CASCADE,
+      item_id UUID REFERENCES shop_items(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (cart_id, item_id)
+    )
+  `);
+
 
   for (const teamName of TEAM_ROLE_NAMES) {
     await pool.query(
@@ -899,6 +920,8 @@ function buildCommands() {
       .setDescription('Shop and inventory commands')
       .addSubcommand(sc => sc.setName('view').setDescription('View the server shop'))
       .addSubcommand(sc => sc.setName('panel').setDescription('Staff: create or refresh permanent shop panel').addChannelOption(o => o.setName('channel').setDescription('Shop panel channel').setRequired(false)))
+      .addSubcommand(sc => sc.setName('cart').setDescription('View your current shop cart'))
+      .addSubcommand(sc => sc.setName('checkout').setDescription('Checkout your current shop cart'))
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
@@ -2771,6 +2794,12 @@ async function ggBuildPermanentShopPayload(guildId) {
     rows.push(row);
   }
 
+  if (rows.length < 5) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('shop_view_cart').setLabel('View Cart').setStyle(ButtonStyle.Secondary)
+    ));
+  }
+
   return { embeds: [embed], components: rows };
 }
 
@@ -3317,6 +3346,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       
+      
       if (interaction.customId.startsWith('shop_buy_button:')) {
         if (!interaction.guild) return;
 
@@ -3332,35 +3362,96 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const item = result.rows[0];
-        const settings = await getCurrencySettings(interaction.guild.id);
 
         if (item.stock !== null && Number(item.stock) <= 0) {
           await interaction.reply({ content: 'That item is out of stock.', ephemeral: true });
           return;
         }
 
-        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, Number(item.price), 'shop_purchase', 'Bought ' + item.item_name, interaction.user.id);
-        if (!removed) {
-          await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to buy that item.', ephemeral: true });
-          return;
-        }
+        const activeLeague = await resolveLeague(interaction);
+        await ggAddItemToShopCart(interaction.guild.id, interaction.user.id, item, activeLeague?.league_id || null);
+        const cartPayload = await ggBuildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
 
-        await pool.query(
-          `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
-        );
-
-        if (item.stock !== null) {
-          await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - 1), updated_at = NOW() WHERE id = $1`, [item.id]);
-        }
-
-        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
-        await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
+        await interaction.reply({
+          content: 'Added **' + item.item_name + '** to your cart.',
+          embeds: [cartPayload.embed],
+          components: [ggBuildShopCartButtons(false)],
+          ephemeral: true,
+        });
         return;
       }
 
-if (interaction.customId.startsWith('trade_offer_accept:')) {
+      if (interaction.customId === 'shop_view_cart') {
+        if (!interaction.guild) return;
+
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await ggBuildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+
+        await interaction.reply({
+          embeds: [cartPayload.embed],
+          components: [ggBuildShopCartButtons(cartPayload.items.length === 0)],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (interaction.customId === 'shop_cart_clear') {
+        if (!interaction.guild) return;
+
+        const activeLeague = await resolveLeague(interaction);
+        const cart = await ggGetOpenShopCart(interaction.guild.id, interaction.user.id, activeLeague?.league_id || null);
+        await pool.query(`DELETE FROM shop_cart_items WHERE cart_id = $1`, [cart.id]);
+
+        await interaction.reply({ content: 'Your cart has been cleared.', ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId === 'shop_checkout_confirm') {
+        if (!interaction.guild) return;
+
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await ggBuildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+
+        if (!cartPayload.items.length) {
+          await interaction.reply({ content: 'Your cart is empty.', ephemeral: true });
+          return;
+        }
+
+        for (const item of cartPayload.items) {
+          if (item.stock !== null && Number(item.stock) < Number(item.quantity)) {
+            await interaction.reply({ content: '**' + item.item_name + '** does not have enough stock left for your cart.', ephemeral: true });
+            return;
+          }
+        }
+
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, cartPayload.total, 'shop_cart_checkout', 'Shop cart checkout', interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + cartPayload.settings.currency_name + ' to checkout this cart.', ephemeral: true });
+          return;
+        }
+
+        for (const item of cartPayload.items) {
+          for (let i = 0; i < Number(item.quantity); i++) {
+            await pool.query(
+              `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+            );
+          }
+
+          if (item.stock !== null) {
+            await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - $1), updated_at = NOW() WHERE id = $2`, [Number(item.quantity), item.id]);
+          }
+        }
+
+        await pool.query(`UPDATE shop_carts SET status = 'checked_out', updated_at = NOW() WHERE id = $1`, [cartPayload.cart.id]);
+        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+
+        await interaction.reply({ content: 'Checkout complete. Purchased **' + cartPayload.items.length + '** item type(s) for **' + cartPayload.settings.currency_icon + ' ' + cartPayload.total + '**.', ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId.startsWith('trade_offer_accept:')) {
         const offerId = interaction.customId.split(':')[1];
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
         if (result.rows.length === 0) {
@@ -4636,7 +4727,28 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
 
       const settings = await getCurrencySettings(interaction.guild.id);
 
-      if (shopSubcommand === 'view') {
+      
+      if (shopSubcommand === 'cart') {
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await ggBuildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+        await interaction.reply({ embeds: [cartPayload.embed], components: [ggBuildShopCartButtons(cartPayload.items.length === 0)], ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'checkout') {
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await ggBuildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+
+        if (!cartPayload.items.length) {
+          await interaction.reply({ content: 'Your cart is empty.', ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({ content: 'Confirm checkout below.', embeds: [cartPayload.embed], components: [ggBuildShopCartButtons(false)], ephemeral: true });
+        return;
+      }
+
+if (shopSubcommand === 'view') {
         const result = await pool.query(
           `SELECT * FROM shop_items
            WHERE guild_id = $1 AND is_active = TRUE
@@ -10633,3 +10745,81 @@ async function openSupportTicket(interaction, ticketType) {
   await updateTicketPanel(interaction.guild);
   await interaction.reply({ content: 'Ticket opened: ' + thread.toString() + '. Ticket ID: **' + ticketId.split('-')[0] + '**', ephemeral: true });
 }
+async function ggGetOpenShopCart(guildId, userId, leagueId = null) {
+  const existing = await pool.query(
+    `SELECT * FROM shop_carts
+     WHERE guild_id = $1 AND user_id = $2 AND status = 'open'
+       AND (($3::uuid IS NULL AND league_id IS NULL) OR league_id = $3::uuid)
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [guildId, userId, leagueId]
+  );
+
+  if (existing.rows.length) return existing.rows[0];
+
+  const cartId = randomUUID();
+  await pool.query(
+    `INSERT INTO shop_carts (id, guild_id, user_id, league_id)
+     VALUES ($1, $2, $3, $4)`,
+    [cartId, guildId, userId, leagueId]
+  );
+
+  return { id: cartId, guild_id: guildId, user_id: userId, league_id: leagueId, status: 'open' };
+}
+
+async function ggGetShopCartItems(cartId) {
+  const result = await pool.query(
+    `SELECT ci.quantity, i.*
+     FROM shop_cart_items ci
+     JOIN shop_items i ON i.id = ci.item_id
+     WHERE ci.cart_id = $1
+     ORDER BY i.item_name ASC`,
+    [cartId]
+  );
+  return result.rows;
+}
+
+async function ggAddItemToShopCart(guildId, userId, item, leagueId = null) {
+  const cart = await ggGetOpenShopCart(guildId, userId, leagueId);
+  await pool.query(
+    `INSERT INTO shop_cart_items (cart_id, item_id, quantity)
+     VALUES ($1, $2, 1)
+     ON CONFLICT (cart_id, item_id)
+     DO UPDATE SET quantity = shop_cart_items.quantity + 1`,
+    [cart.id, item.id]
+  );
+  await pool.query(`UPDATE shop_carts SET updated_at = NOW() WHERE id = $1`, [cart.id]);
+  return cart;
+}
+
+async function ggBuildShopCartEmbed(guildId, user, leagueId = null) {
+  const settings = await getCurrencySettings(guildId);
+  const cart = await ggGetOpenShopCart(guildId, user.id, leagueId);
+  const items = await ggGetShopCartItems(cart.id);
+  const NL = String.fromCharCode(10);
+  const total = items.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 1), 0);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🛒 ' + user.username + "'s Cart")
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Shop Cart' })
+    .setTimestamp();
+
+  embed.setDescription(items.length
+    ? items.map(item => '• **' + item.item_name + '** x' + item.quantity + ' — ' + settings.currency_icon + ' ' + (Number(item.price) * Number(item.quantity))).join(NL)
+    : 'Your cart is empty.');
+
+  embed.addFields({ name: 'Total', value: settings.currency_icon + ' ' + total, inline: true });
+
+  return { embed, cart, items, total, settings };
+}
+
+function ggBuildShopCartButtons(disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('shop_checkout_confirm').setLabel('Checkout').setStyle(ButtonStyle.Success).setDisabled(disabled),
+    new ButtonBuilder().setCustomId('shop_cart_clear').setLabel('Clear Cart').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+  );
+}
+
+
+
