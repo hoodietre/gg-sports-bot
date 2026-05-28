@@ -954,6 +954,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('sportsbookchannel').setDescription('Set sportsbook live feed channel').addChannelOption(o => o.setName('channel').setDescription('Sportsbook feed channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbookfeed').setDescription('Enable or disable sportsbook live feed').addBooleanOption(o => o.setName('enabled').setDescription('Enable live feed?').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbooksettings').setDescription('View sportsbook live feed settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View league/server setup settings'))
@@ -1544,10 +1545,17 @@ function buildPlayoffBracketEmbed(league, bracket, teams) {
   });
 
   embed.setDescription(lines.join(NL));
+  const formatText = isNbaLeague(league)
+    ? 'NBA: Top 8 from East + Top 8 from West'
+    : isMlbLeague(league)
+      ? 'MLB: Top 8 overall'
+      : 'Custom: Top ' + String(bracket?.team_count || teams.length) + ' overall';
+
   embed.addFields(
     { name: 'Teams', value: String(bracket?.team_count || teams.length), inline: true },
     { name: 'Status', value: bracket?.status || 'generated', inline: true },
-    { name: 'Season', value: bracket?.season_label || 'Current Season', inline: true }
+    { name: 'Season', value: bracket?.season_label || 'Current Season', inline: true },
+    { name: 'Format', value: formatText, inline: false }
   );
   return embed;
 }
@@ -1745,6 +1753,35 @@ async function getStandingsRows(guildId, leagueId) {
     [guildId, leagueId]
   );
   return result.rows;
+}
+
+async function selectPlayoffTeamsForLeague(guildId, league) {
+  const standingsRows = await getStandingsRows(guildId, league.league_id);
+
+  if (isNbaLeague(league)) {
+    const eastern = standingsRows
+      .filter(team => getTeamConference(team.team_name) === 'Eastern Conference')
+      .slice(0, 8)
+      .map((team, index) => ({ ...team, seed: index + 1, conference: 'Eastern Conference' }));
+
+    const western = standingsRows
+      .filter(team => getTeamConference(team.team_name) === 'Western Conference')
+      .slice(0, 8)
+      .map((team, index) => ({ ...team, seed: index + 1, conference: 'Western Conference' }));
+
+    const unassigned = standingsRows
+      .filter(team => !['Eastern Conference', 'Western Conference'].includes(getTeamConference(team.team_name)))
+      .map((team, index) => ({ ...team, seed: eastern.length + western.length + index + 1, conference: 'Unassigned Conference' }));
+
+    return [...eastern, ...western, ...unassigned].slice(0, 16);
+  }
+
+  const teamCount = isMlbLeague(league) ? 8 : Number(league.playoff_team_count || 8);
+  return standingsRows.slice(0, teamCount).map((team, index) => ({
+    ...team,
+    seed: index + 1,
+    conference: isNbaLeague(league) ? getTeamConference(team.team_name) : null,
+  }));
 }
 
 async function updateStandingsPanel(guild, league) {
@@ -3488,14 +3525,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const embed = new EmbedBuilder()
         .setTitle('GG Sports Setup Guide')
         .setColor(0x5865F2)
-        .setDescription('Use this guide to set up GG Sports in your server.')
+        .setDescription('Use this guide to set up a new league with the current hub commands.')
         .addFields(
-          { name: '1. Create League', value: '`/league-create` — create a league and optionally set season length.', inline: false },
-          { name: '2. Set Roles', value: '`/league-setroles` — set league ping, staff, and committee roles.', inline: false },
-          { name: '3. Set Channels', value: '`/league-setchannels` — connect live, trade, committee, approved/denied, team owners, and trade count channels.', inline: false },
-          { name: '4. History Channel', value: '`/league-sethistorychannel` — choose where season history embeds are posted.', inline: false },
-          { name: '5. Add Teams', value: '`/league-addteamrole` — run once for each team role.', inline: false },
-          { name: '6. Create Panels', value: '`/league-setup-panels` — posts Team Owners, Trade Count, and Offer Trade panels.', inline: false }
+          { name: '1. Create the league', value: '`/league create` — create/configure the league. Use `/league game` to set the type: `nba`, `mlb`, `madden`, or `general`.', inline: false },
+          { name: '2. Set staff and team roles', value: '`/league staff` — set the staff role.
+`/league teamrole` — run once for every team role in the league.', inline: false },
+          { name: '3. Set core channels', value: '`/league standingschannel` — standings destination.
+`/league tournamentchannel` — tournament destination.
+`/league sportsbookchannel` — live sportsbook feed.', inline: false },
+          { name: '4. Create permanent panels', value: '`/league teamownerspanel` — team owner board.
+`/league standingspanel` — standings board.
+`/league sportsbookpanel` — sportsbook board.
+`/league ticketpanel` + `/league supportpanel` — support system panels.
+`/league tournamentpanel` — tournament panel.', inline: false },
+          { name: '5. Configure economy and payouts', value: '`/league currency` — currency name/icon, win payout, game played payout, award payout.', inline: false },
+          { name: '6. Configure playoffs', value: '`/league playoffsettings` — custom playoff count for general leagues.
+NBA: top 8 East + top 8 West.
+MLB: top 8 overall.', inline: false },
+          { name: '7. Check setup', value: '`/league settings` — view league configuration.
+`/league sportsbooksettings` — view sportsbook feed setup.
+`/commands` — view available user/staff commands.', inline: false }
         )
         .setFooter({ text: 'GG Sports • Setup Guide' })
         .setTimestamp();
@@ -3513,22 +3562,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
         '`/whogotnext` — ping your league that you are ready to play',
         '`/linkstream` — save your stream link',
         '`/livestream` — post your stream link',
-        '`/tradeblock` — post a player to the trade block',
-        '`/tradehistory` — view approved trades',
-        '`/teamtrades` — view approved trades for a team',
-        '`/franchiselegacy` — view franchise legacy records',
-        '`/awardhistory` — view award history',
-        '`/halloffame` — view Hall of Fame leaders',
+        '`/trade block` — post a player to the trade block',
+        '`/trade history` — view approved trades',
+        '`/trade team` — view approved trades for a team',
+        '`/profile franchise` — view the Franchise Hub',
+        '`/profile awards` — view award history',
+        '`/legacy` — view legacy rank and tier',
       ];
       const staffCommands = [
         '`/assignrole` — assign a role',
         '`/unassignrole` — remove a role',
-        '`/league-create` — create league',
-        '`/league-setroles` — set roles',
-        '`/league-setchannels` — set channels',
-        '`/league-sethistorychannel` — set history channel',
-        '`/league-addteamrole` — add team role',
-        '`/league-listteamroles` — list team roles',
+        '`/league create` — create league',
+        '`/league staff` — set staff role',
+        '`/league teamrole` — add team role',
+        '`/league standingschannel` — set standings channel',
+        '`/league sportsbookchannel` — set sportsbook feed channel',
+        '`/league teamownerspanel` — create team owners panel',
         '`/league-setup-panels` — create panels',
         '`/editleaguename` — rename league',
         '`/addseasonhistory` — post season history and update legacy records',
@@ -5374,7 +5423,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           [activeLeague.league_id, teamCount]
         );
 
-        await interaction.reply({ content: 'Playoff team count for **' + activeLeague.league_name + '** set to **' + teamCount + '**.', ephemeral: true });
+        const playoffNote = isNbaLeague(activeLeague)
+          ? ' NBA leagues use **top 8 East + top 8 West** regardless of this custom value.'
+          : isMlbLeague(activeLeague)
+            ? ' MLB leagues use **top 8 overall** regardless of this custom value.'
+            : '';
+        await interaction.reply({ content: 'Playoff team count for **' + activeLeague.league_name + '** set to **' + teamCount + '**.' + playoffNote, ephemeral: true });
         return;
       }
 
@@ -5393,12 +5447,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const teamCount = Number(activeLeague.playoff_team_count || 8);
-        const standingsRows = await getStandingsRows(interaction.guild.id, activeLeague.league_id);
-        const playoffTeams = standingsRows.slice(0, teamCount);
+        const playoffTeams = await selectPlayoffTeamsForLeague(interaction.guild.id, activeLeague);
+        const requiredTeams = isNbaLeague(activeLeague) ? 16 : isMlbLeague(activeLeague) ? 8 : Number(activeLeague.playoff_team_count || 8);
 
         if (playoffTeams.length < 2) {
           await interaction.reply({ content: 'Not enough teams in the standings to generate a playoff bracket.', ephemeral: true });
+          return;
+        }
+
+        if ((isNbaLeague(activeLeague) || isMlbLeague(activeLeague)) && playoffTeams.length < requiredTeams) {
+          await interaction.reply({ content: 'Only found **' + playoffTeams.length + '** eligible playoff teams. Expected **' + requiredTeams + '** for this league type. Add/adjust standings first.', ephemeral: true });
           return;
         }
 
@@ -5414,12 +5472,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await pool.query(
             `INSERT INTO playoff_bracket_teams (bracket_id, guild_id, league_id, seed, team_role_id, team_name, wins, losses, standings_points, conference)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-            [bracketId, interaction.guild.id, activeLeague.league_id, i + 1, team.team_role_id, team.team_name, team.wins, team.losses, Number(team.standings_points || 0), isNbaLeague(activeLeague) ? getTeamConference(team.team_name) : null]
+            [bracketId, interaction.guild.id, activeLeague.league_id, team.seed || (i + 1), team.team_role_id, team.team_name, team.wins, team.losses, Number(team.standings_points || 0), team.conference || (isNbaLeague(activeLeague) ? getTeamConference(team.team_name) : null)]
           );
         }
 
         const bracket = { id: bracketId, team_count: playoffTeams.length, status: 'generated', season_label: seasonLabel };
-        await interaction.reply({ embeds: [buildPlayoffBracketEmbed(activeLeague, bracket, playoffTeams.map((team, index) => ({ ...team, seed: index + 1, conference: isNbaLeague(activeLeague) ? getTeamConference(team.team_name) : null })))], ephemeral: false });
+        await interaction.reply({ embeds: [buildPlayoffBracketEmbed(activeLeague, bracket, playoffTeams)], ephemeral: false });
         return;
       }
 
@@ -5586,6 +5644,40 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
         await interaction.reply({ content: 'Staff role for **' + activeLeague.league_name + '** set to ' + staffRole.toString() + '.', ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'teamrole') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update league team roles.', ephemeral: true });
+          return;
+        }
+
+        const teamRole = interaction.options.getRole('role');
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO league_team_roles (league_id, role_id, role_name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (league_id, role_id)
+           DO UPDATE SET role_name = EXCLUDED.role_name`,
+          [activeLeague.league_id, teamRole.id, teamRole.name]
+        );
+
+        await pool.query(
+          `INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count)
+           VALUES ($1, $2, $3, 0)
+           ON CONFLICT (league_id, role_id) DO NOTHING`,
+          [activeLeague.league_id, teamRole.id, teamRole.name]
+        );
+
+        await interaction.reply({ content: 'Added team role **' + teamRole.name + '** to **' + activeLeague.league_name + '**.', ephemeral: true });
         return;
       }
 
