@@ -4616,11 +4616,10 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
         const payload = await ggBuildPermanentShopPayload(interaction.guild.id);
         const message = await channel.send(payload);
 
+        await pool.query(`DELETE FROM shop_panels WHERE guild_id = $1`, [interaction.guild.id]);
         await pool.query(
           `INSERT INTO shop_panels (guild_id, channel_id, message_id, updated_at)
-           VALUES ($1, $2, $3, NOW())
-           ON CONFLICT (guild_id)
-           DO UPDATE SET channel_id = $2, message_id = $3, updated_at = NOW()`,
+           VALUES ($1, $2, $3, NOW())`,
           [interaction.guild.id, channel.id, message.id]
         );
 
