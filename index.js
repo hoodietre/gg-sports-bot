@@ -689,6 +689,21 @@ async function initDatabase() {
     )
   `);
 
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS premium_memberships (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      premium_tier TEXT NOT NULL DEFAULT 'Free',
+      status TEXT NOT NULL DEFAULT 'inactive',
+      source TEXT,
+      started_at TIMESTAMP,
+      expires_at TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id)
+    )
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sportsbook_parlays (
       id UUID PRIMARY KEY,
@@ -800,6 +815,12 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('legacy')
       .setDescription('Show the permanent legacy leaderboard'),
+
+    new SlashCommandBuilder()
+      .setName('premium')
+      .setDescription('Premium membership and feature commands')
+      .addSubcommand(sc => sc.setName('status').setDescription('Show premium membership status').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('features').setDescription('Show planned premium GG Sports features')),
 
     new SlashCommandBuilder()
       .setName('economy')
@@ -5735,6 +5756,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'premium') {
+      if (!interaction.guild) return;
+      const premiumSubcommand = interaction.options.getSubcommand();
+
+      if (premiumSubcommand === 'status') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const result = await pool.query(
+          `SELECT * FROM premium_memberships
+           WHERE guild_id = $1 AND user_id = $2
+           LIMIT 1`,
+          [interaction.guild.id, targetUser.id]
+        );
+
+        await interaction.reply({ embeds: [buildPremiumStatusEmbed(targetUser, result.rows[0] || null)], ephemeral: true });
+        return;
+      }
+
+      if (premiumSubcommand === 'features') {
+        await interaction.reply({ embeds: [buildPremiumFeaturesEmbed()], ephemeral: true });
+        return;
+      }
+    }
+
     if (interaction.commandName === 'legacy') {
       if (!interaction.guild) return;
 
@@ -8865,6 +8909,49 @@ function buildActivityEmbed(user, row) {
 
 function buildRecognitionEmbed(user, row) {
   return buildActivityEmbed(user, row);
+}
+
+
+function getPremiumTierDisplay(tier, status) {
+  if (!tier || status !== 'active') return 'Free';
+  return tier;
+}
+
+function buildPremiumStatusEmbed(user, membership) {
+  const isActive = membership?.status === 'active';
+  const tier = getPremiumTierDisplay(membership?.premium_tier, membership?.status);
+  const source = membership?.source || 'Not connected';
+  const expires = membership?.expires_at ? new Date(membership.expires_at).toLocaleDateString('en-US') : 'No expiration set';
+
+  return new EmbedBuilder()
+    .setTitle('Premium Status')
+    .setColor(isActive ? 0xFEE75C : 0x5865F2)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'User', value: '<@' + user.id + '>', inline: true },
+      { name: 'Tier', value: tier, inline: true },
+      { name: 'Status', value: isActive ? 'Active' : 'Free / Inactive', inline: true },
+      { name: 'Source', value: source, inline: true },
+      { name: 'Expires', value: expires, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Premium Foundation' })
+    .setTimestamp();
+}
+
+function buildPremiumFeaturesEmbed() {
+  return new EmbedBuilder()
+    .setTitle('GG Sports Premium Features')
+    .setColor(0xFEE75C)
+    .setDescription('Premium infrastructure is now in place. Payment integrations are planned for a later phase.')
+    .addFields(
+      { name: 'Premium Leagues', value: 'Unlock advanced league tools, richer panels, and deeper server customization.', inline: false },
+      { name: 'Premium Tournaments', value: 'Future support for paid tournaments, premium brackets, enhanced rewards, and featured events.', inline: false },
+      { name: 'Premium Bot Features', value: 'Advanced analytics, automation tools, franchise dashboards, and priority feature modules.', inline: false },
+      { name: 'Cosmetic Perks', value: 'Profile badges, premium icons, prestige visuals, and future custom profile themes.', inline: false },
+      { name: 'Future Integrations', value: 'Prepared for Patreon, Stripe, and Discord monetization without enabling payments yet.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Premium Foundation' })
+    .setTimestamp();
 }
 
 function buildLegacyLeaderboardEmbed(rows) {
