@@ -614,6 +614,10 @@ async function initDatabase() {
       winner_side TEXT,
       max_bet INTEGER,
       max_payout INTEGER,
+      league_game_id UUID,
+      source TEXT NOT NULL DEFAULT 'manual',
+      auto_generated BOOLEAN NOT NULL DEFAULT FALSE,
+      settled_by_game_report BOOLEAN NOT NULL DEFAULT FALSE,
       created_by_user_id TEXT NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       settled_at TIMESTAMP
@@ -622,6 +626,12 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS max_bet INTEGER`);
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS max_payout INTEGER`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS league_game_id UUID`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS settled_by_game_report BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_sportsbook_games_league_game_id ON sportsbook_games(league_game_id)`);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sportsbook_bets (
@@ -3812,7 +3822,10 @@ MLB: top 8 overall.', inline: false },
           await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
         }
 
-        await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. Winner: **' + winnerName + '**.', ephemeral: false });
+        
+        await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => console.error('Auto sportsbook settlement failed:', error));
+
+await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. Winner: **' + winnerName + '**.', ephemeral: false });
         return;
       }
 
@@ -7070,6 +7083,16 @@ MLB: top 8 overall.', inline: false },
         [interaction.guild.id, activeLeague.league_id, away.id, away.name]
       );
 
+      const createdGameResult = await pool.query(
+        `SELECT * FROM league_games WHERE id = $1 LIMIT 1`,
+        [gameId]
+      );
+
+      if (createdGameResult.rows.length) {
+        await createAutoSportsbookForLeagueGame(interaction, createdGameResult.rows[0], activeLeague)
+          .catch(error => console.error('Auto sportsbook creation failed:', error));
+      }
+
       await interaction.reply({ content: `Game added: **${away.name} @ ${home.name}**. Game ID: **${shortGameId(gameId)}**`, ephemeral: true });
       return;
     }
@@ -9764,6 +9787,251 @@ function shortInventoryItemId(itemId) {
   return String(itemId || '').split('-')[0];
 }
 
+
+
+async function getTeamStandingsSnapshot(guildId, leagueId, teamRoleId) {
+  const result = await pool.query(
+    `SELECT wins, losses, points_for, points_against
+     FROM league_standings
+     WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3`,
+    [guildId, leagueId, teamRoleId]
+  );
+
+  const row = result.rows[0] || { wins: 0, losses: 0, points_for: 0, points_against: 0 };
+  const wins = Number(row.wins || 0);
+  const losses = Number(row.losses || 0);
+  const games = wins + losses;
+  const winPct = games ? wins / games : 0.5;
+  const pointDiff = Number(row.points_for || 0) - Number(row.points_against || 0);
+
+  return { wins, losses, games, winPct, pointDiff };
+}
+
+async function getTeamRecentForm(guildId, leagueId, teamRoleId) {
+  const result = await pool.query(
+    `SELECT winner_team_role_id
+     FROM league_games
+     WHERE guild_id = $1
+       AND league_id = $2
+       AND status = 'final'
+       AND (home_team_role_id = $3 OR away_team_role_id = $3)
+     ORDER BY updated_at DESC
+     LIMIT 5`,
+    [guildId, leagueId, teamRoleId]
+  );
+
+  let streak = 0;
+  for (const row of result.rows) {
+    const won = row.winner_team_role_id === teamRoleId;
+    if (streak === 0) {
+      streak = won ? 1 : -1;
+    } else if ((streak > 0 && won) || (streak < 0 && !won)) {
+      streak += won ? 1 : -1;
+    } else {
+      break;
+    }
+  }
+
+  const recentWins = result.rows.filter(row => row.winner_team_role_id === teamRoleId).length;
+  return { recentWins, streak };
+}
+
+async function getHeadToHeadSnapshot(guildId, leagueId, homeRoleId, awayRoleId) {
+  const result = await pool.query(
+    `SELECT winner_team_role_id
+     FROM league_games
+     WHERE guild_id = $1
+       AND league_id = $2
+       AND status = 'final'
+       AND (
+         (home_team_role_id = $3 AND away_team_role_id = $4)
+         OR
+         (home_team_role_id = $4 AND away_team_role_id = $3)
+       )
+     ORDER BY updated_at DESC
+     LIMIT 10`,
+    [guildId, leagueId, homeRoleId, awayRoleId]
+  );
+
+  const homeWins = result.rows.filter(row => row.winner_team_role_id === homeRoleId).length;
+  const awayWins = result.rows.filter(row => row.winner_team_role_id === awayRoleId).length;
+  return { homeWins, awayWins, games: result.rows.length };
+}
+
+function probabilityToAmericanOdds(probability) {
+  const p = Math.max(0.15, Math.min(0.85, Number(probability) || 0.5));
+  if (p >= 0.5) return -Math.round((p / (1 - p)) * 100);
+  return Math.round(((1 - p) / p) * 100);
+}
+
+async function generateAutoSportsbookOdds(guildId, leagueId, homeRoleId, awayRoleId) {
+  const home = await getTeamStandingsSnapshot(guildId, leagueId, homeRoleId);
+  const away = await getTeamStandingsSnapshot(guildId, leagueId, awayRoleId);
+  const homeForm = await getTeamRecentForm(guildId, leagueId, homeRoleId);
+  const awayForm = await getTeamRecentForm(guildId, leagueId, awayRoleId);
+  const h2h = await getHeadToHeadSnapshot(guildId, leagueId, homeRoleId, awayRoleId);
+
+  let homeScore = 50;
+  homeScore += (home.winPct - away.winPct) * 35;
+  homeScore += (home.pointDiff - away.pointDiff) * 0.03;
+  homeScore += (homeForm.recentWins - awayForm.recentWins) * 2.5;
+  homeScore += (homeForm.streak - awayForm.streak) * 1.5;
+  homeScore += (h2h.homeWins - h2h.awayWins) * 2;
+  homeScore += 3; // home-field/home-court advantage
+
+  const homeProbability = Math.max(0.2, Math.min(0.8, homeScore / 100));
+  const awayProbability = 1 - homeProbability;
+
+  return {
+    homeOdds: probabilityToAmericanOdds(homeProbability),
+    awayOdds: probabilityToAmericanOdds(awayProbability),
+    homeProbability,
+    awayProbability,
+  };
+}
+
+async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league) {
+  if (!interaction.guild || !leagueGame || !league?.league_id) return null;
+
+  const existing = await pool.query(
+    `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND league_game_id = $2 LIMIT 1`,
+    [interaction.guild.id, leagueGame.id]
+  );
+  if (existing.rows.length) return existing.rows[0];
+
+  const odds = await generateAutoSportsbookOdds(
+    interaction.guild.id,
+    league.league_id,
+    leagueGame.home_team_role_id,
+    leagueGame.away_team_role_id
+  );
+
+  const sportsbookGameId = randomUUID();
+  const label = leagueGame.home_team_name + ' vs ' + leagueGame.away_team_name;
+
+  await pool.query(
+    `INSERT INTO sportsbook_games
+      (id, guild_id, league_id, league_game_id, game_label, home_label, away_label, home_odds, away_odds, source, auto_generated, created_by_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'game_add', TRUE, $10)`,
+    [
+      sportsbookGameId,
+      interaction.guild.id,
+      league.league_id,
+      leagueGame.id,
+      label,
+      leagueGame.home_team_name,
+      leagueGame.away_team_name,
+      odds.homeOdds,
+      odds.awayOdds,
+      interaction.user.id,
+    ]
+  );
+
+  await updateSportsbookPanel(interaction.guild).catch(() => null);
+
+  const sportsbookGame = {
+    id: sportsbookGameId,
+    guild_id: interaction.guild.id,
+    league_id: league.league_id,
+    league_game_id: leagueGame.id,
+    game_label: label,
+    home_label: leagueGame.home_team_name,
+    away_label: leagueGame.away_team_name,
+    home_odds: odds.homeOdds,
+    away_odds: odds.awayOdds,
+  };
+
+  const feedEmbed = new EmbedBuilder()
+    .setTitle('📈 Sportsbook Line Opened')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Game', value: label, inline: false },
+      { name: leagueGame.home_team_name, value: 'ML ' + odds.homeOdds, inline: true },
+      { name: leagueGame.away_team_name, value: 'ML ' + odds.awayOdds, inline: true },
+      { name: 'Source', value: 'Auto-generated from /game add', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Auto Sportsbook' })
+    .setTimestamp();
+
+  await postSportsbookFeed(interaction.guild, feedEmbed);
+  return sportsbookGame;
+}
+
+async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winnerSide) {
+  if (!interaction.guild || !leagueGame) return null;
+
+  const result = await pool.query(
+    `SELECT * FROM sportsbook_games
+     WHERE guild_id = $1 AND league_game_id = $2 AND status = 'open'
+     LIMIT 1`,
+    [interaction.guild.id, leagueGame.id]
+  );
+
+  if (!result.rows.length) return null;
+
+  const sportsbookGame = result.rows[0];
+  const fakeSettlePayload = {
+    sportsbookGame,
+    winner: winnerSide,
+  };
+
+  const settings = await getCurrencySettings(interaction.guild.id);
+  const bets = await pool.query(
+    `SELECT * FROM sportsbook_bets
+     WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+    [interaction.guild.id, sportsbookGame.id]
+  );
+
+  let winners = 0;
+  let losers = 0;
+  let totalPaid = 0;
+
+  for (const bet of bets.rows) {
+    if (bet.side === winnerSide) {
+      await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Auto-settled bet: ' + sportsbookGame.game_label, interaction.user.id);
+      await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
+      await addActivityPoints(interaction.guild.id, bet.user_id, 5, 'sportsbook_win');
+      await addLegacyScore(interaction.guild.id, bet.user_id, 2, 'sportsbook_win');
+      winners += 1;
+      totalPaid += Number(bet.potential_payout);
+    } else {
+      await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
+      losers += 1;
+    }
+  }
+
+  await pool.query(
+    `UPDATE sportsbook_games
+     SET status = 'settled', winner_side = $1, settled_at = NOW(), settled_by_game_report = TRUE
+     WHERE id = $2`,
+    [winnerSide, sportsbookGame.id]
+  );
+
+  const parlayResult = typeof settleParlaysForSportsbookGame === 'function'
+    ? await settleParlaysForSportsbookGame(interaction.guild.id, sportsbookGame.id, winnerSide, interaction.user.id)
+    : { settledCount: 0, parlayPaid: 0 };
+
+  await updateSportsbookPanel(interaction.guild).catch(() => null);
+
+  const winnerLabel = winnerSide === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+  const feedEmbed = new EmbedBuilder()
+    .setTitle('✅ Sportsbook Auto-Settled')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Game', value: sportsbookGame.game_label, inline: false },
+      { name: 'Winner', value: winnerLabel, inline: true },
+      { name: 'Winning Bets', value: String(winners), inline: true },
+      { name: 'Losing Bets', value: String(losers), inline: true },
+      { name: 'Total Paid', value: settings.currency_icon + ' ' + totalPaid, inline: true },
+      { name: 'Parlays Settled', value: String(parlayResult.settledCount || 0), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Auto Sportsbook' })
+    .setTimestamp();
+
+  await postSportsbookFeed(interaction.guild, feedEmbed);
+
+  return { sportsbookGame, winners, losers, totalPaid, parlayResult };
+}
 
 async function findSportsbookGame(guildId, input) {
   const result = await pool.query(
