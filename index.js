@@ -294,10 +294,13 @@ async function initDatabase() {
       losses INTEGER NOT NULL DEFAULT 0,
       points_for INTEGER NOT NULL DEFAULT 0,
       points_against INTEGER NOT NULL DEFAULT 0,
+      standings_points INTEGER NOT NULL DEFAULT 0,
       updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
       PRIMARY KEY (guild_id, league_id, team_role_id)
     )
   `);
+
+  await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS standings_points INTEGER NOT NULL DEFAULT 0`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_games (
@@ -1464,7 +1467,8 @@ function buildStandingsEmbed(league, rows) {
     const games = Number(row.wins) + Number(row.losses);
     const winPct = games > 0 ? (Number(row.wins) / games).toFixed(3).replace(/^0/, '') : '.000';
     const diff = Number(row.points_for) - Number(row.points_against);
-    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct}) • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
+    const standingsPoints = Number(row.standings_points ?? ((Number(row.wins) * 3) + Number(row.losses)));
+    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct}) • ${standingsPoints} PTS • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
   });
 
   embed.setDescription(lines.join(NL));
@@ -1590,7 +1594,7 @@ async function getStandingsRows(guildId, leagueId) {
   const result = await pool.query(
     `SELECT * FROM league_standings
      WHERE guild_id = $1 AND league_id = $2
-     ORDER BY wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC`,
+     ORDER BY standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC`,
     [guildId, leagueId]
   );
   return result.rows;
@@ -3011,6 +3015,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({ content: 'You do not have permission to vote on trades.', ephemeral: true });
           return;
         }
+        const isVotingOnOwnTeam = Boolean(
+          (offer.sender_team_role_id && member.roles.cache.has(offer.sender_team_role_id)) ||
+          (offer.target_team_role_id && member.roles.cache.has(offer.target_team_role_id)) ||
+          (offer.sender_team && member.roles.cache.some(role => role.name === offer.sender_team)) ||
+          (offer.target_team && member.roles.cache.some(role => role.name === offer.target_team))
+        );
+        if (isVotingOnOwnTeam) {
+          await interaction.reply({ content: 'You cannot vote on a trade involving your own team.', ephemeral: true });
+          return;
+        }
         if (offer.status === 'committee_approved' || offer.status === 'committee_denied') {
           await interaction.reply({ content: 'This trade has already been finalized.', ephemeral: true });
           return;
@@ -3476,10 +3490,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
         await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
-           VALUES ($1, $2, $3, $4, 1, 0, $5, $6)
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points)
+           VALUES ($1, $2, $3, $4, 1, 0, $5, $6, 3)
            ON CONFLICT (guild_id, league_id, team_role_id)
            DO UPDATE SET wins = league_standings.wins + 1,
+                         standings_points = league_standings.standings_points + 3,
                          points_for = league_standings.points_for + $5,
                          points_against = league_standings.points_against + $6,
                          updated_at = NOW()`,
@@ -3487,10 +3502,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
         await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
-           VALUES ($1, $2, $3, $4, 0, 1, $5, $6)
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points)
+           VALUES ($1, $2, $3, $4, 0, 1, $5, $6, 1)
            ON CONFLICT (guild_id, league_id, team_role_id)
            DO UPDATE SET losses = league_standings.losses + 1,
+                         standings_points = league_standings.standings_points + 1,
                          points_for = league_standings.points_for + $5,
                          points_against = league_standings.points_against + $6,
                          updated_at = NOW()`,
@@ -3998,9 +4014,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           );
         }
 
-        if (typeof updateTradeCountEmbed === 'function') {
-          await updateTradeCountEmbed(interaction.guild, activeLeague).catch(() => null);
-        }
+        await updateTradeCountPanel(interaction.guild, activeLeague).catch(() => null);
 
         await interaction.reply({ content: 'Trade count updated for **' + team.name + '**.', ephemeral: true });
         return;
@@ -6527,13 +6541,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
         return;
       }
-      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
-        await interaction.reply({ content: 'You do not have permission to add games for this league.', ephemeral: true });
+      const home = interaction.options.getRole('home');
+      const away = interaction.options.getRole('away');
+      const requestingMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const isStaffAddingGame = await userCanUseLeagueSetup(interaction, activeLeague);
+
+      if (!requestingMember) {
+        await interaction.reply({ content: 'Could not verify your league membership.', ephemeral: true });
         return;
       }
 
-      const home = interaction.options.getRole('home');
-      const away = interaction.options.getRole('away');
+      if (!isStaffAddingGame && !requestingMember.roles.cache.has(home.id)) {
+        await interaction.reply({ content: 'Only staff or the home team can add this game.', ephemeral: true });
+        return;
+      }
       const scheduledFor = interaction.options.getString('date');
       const weekLabel = interaction.options.getString('week');
       const gameId = randomUUID();
@@ -6617,18 +6638,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
-         VALUES ($1, $2, $3, $4, 1, 0, $5, $6)
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points)
+         VALUES ($1, $2, $3, $4, 1, 0, $5, $6, 3)
          ON CONFLICT (guild_id, league_id, team_role_id)
-         DO UPDATE SET wins = league_standings.wins + 1, points_for = league_standings.points_for + $5, points_against = league_standings.points_against + $6, updated_at = NOW()`,
+         DO UPDATE SET wins = league_standings.wins + 1, standings_points = league_standings.standings_points + 3, points_for = league_standings.points_for + $5, points_against = league_standings.points_against + $6, updated_at = NOW()`,
         [interaction.guild.id, activeLeague.league_id, winnerRoleId, winnerName, winnerPf, winnerPa]
       );
 
       await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against)
-         VALUES ($1, $2, $3, $4, 0, 1, $5, $6)
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points)
+         VALUES ($1, $2, $3, $4, 0, 1, $5, $6, 1)
          ON CONFLICT (guild_id, league_id, team_role_id)
-         DO UPDATE SET losses = league_standings.losses + 1, points_for = league_standings.points_for + $5, points_against = league_standings.points_against + $6, updated_at = NOW()`,
+         DO UPDATE SET losses = league_standings.losses + 1, standings_points = league_standings.standings_points + 1, points_for = league_standings.points_for + $5, points_against = league_standings.points_against + $6, updated_at = NOW()`,
         [interaction.guild.id, activeLeague.league_id, loserRoleId, loserName, loserPf, loserPa]
       );
 
@@ -6730,10 +6751,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const wins = interaction.options.getInteger('wins');
       const losses = interaction.options.getInteger('losses');
       await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, standings_points)
+         VALUES ($1, $2, $3, $4, $5, $6, (($5 * 3) + $6))
          ON CONFLICT (guild_id, league_id, team_role_id)
-         DO UPDATE SET wins = $5, losses = $6, team_name = $4, updated_at = NOW()`,
+         DO UPDATE SET wins = $5, losses = $6, standings_points = (($5 * 3) + $6), team_name = $4, updated_at = NOW()`,
         [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses]
       );
       await updateStandingsPanel(interaction.guild, activeLeague);
@@ -9325,18 +9346,18 @@ async function applyApprovedGameIssue(ticket, reviewerUserId) {
   );
 
   await pool.query(
-    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses)
-     VALUES ($1, $2, $3, $4, 1, 0)
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, standings_points)
+     VALUES ($1, $2, $3, $4, 1, 0, 3)
      ON CONFLICT (guild_id, league_id, team_role_id)
-     DO UPDATE SET wins = league_standings.wins + 1, updated_at = NOW()`,
+     DO UPDATE SET wins = league_standings.wins + 1, standings_points = league_standings.standings_points + 3, updated_at = NOW()`,
     [ticket.guild_id, ticket.league_id, winnerRoleId, winnerName]
   );
 
   await pool.query(
-    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses)
-     VALUES ($1, $2, $3, $4, 0, 1)
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, standings_points)
+     VALUES ($1, $2, $3, $4, 0, 1, 1)
      ON CONFLICT (guild_id, league_id, team_role_id)
-     DO UPDATE SET losses = league_standings.losses + 1, updated_at = NOW()`,
+     DO UPDATE SET losses = league_standings.losses + 1, standings_points = league_standings.standings_points + 1, updated_at = NOW()`,
     [ticket.guild_id, ticket.league_id, loserRoleId, loserName]
   );
 
