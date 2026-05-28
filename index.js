@@ -3986,10 +3986,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
         }
 
-        
-        await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => console.error('Auto sportsbook settlement failed:', error));
+        const settings = await getCurrencySettings(interaction.guild.id);
+        const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+        const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+        const winnerOwner = await findTeamOwnerByRoleId(interaction.guild, winnerRoleId);
+        const payoutLines = [];
 
-await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. Winner: **' + winnerName + '**.', ephemeral: false });
+        if (Number(settings.game_played_payout) > 0) {
+          const paidOwners = new Set();
+          for (const owner of [homeOwner, awayOwner]) {
+            if (owner && !paidOwners.has(owner.id)) {
+              paidOwners.add(owner.id);
+              await addCurrency(
+                interaction.guild.id,
+                owner.id,
+                Number(settings.game_played_payout),
+                'game_played',
+                'Game played: ' + game.away_team_name + ' @ ' + game.home_team_name,
+                interaction.user.id
+              );
+              await addActivityPoints(interaction.guild.id, owner.id, 3, 0).catch(() => null);
+              payoutLines.push(settings.currency_icon + ' <@' + owner.id + '> earned **' + settings.game_played_payout + ' ' + settings.currency_name + '** for playing.');
+            }
+          }
+        }
+
+        if (winnerOwner && Number(settings.win_payout) > 0) {
+          await addCurrency(
+            interaction.guild.id,
+            winnerOwner.id,
+            Number(settings.win_payout),
+            'game_win',
+            'Game win: ' + winnerName,
+            interaction.user.id
+          );
+          await addActivityPoints(interaction.guild.id, winnerOwner.id, 5, 1).catch(() => null);
+          payoutLines.push(settings.currency_icon + ' <@' + winnerOwner.id + '> earned **' + settings.win_payout + ' ' + settings.currency_name + '** win bonus.');
+        }
+
+        const sportsbookSettlement = await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => {
+          console.error('Auto sportsbook settlement failed:', error);
+          return null;
+        });
+
+        const sportsbookText = sportsbookSettlement
+          ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets, paid **' + settings.currency_icon + ' ' + sportsbookSettlement.totalPaid + '**.'
+          : '';
+        const payoutText = payoutLines.length ? String.fromCharCode(10) + payoutLines.join(String.fromCharCode(10)) : '';
+
+        await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. Winner: **' + winnerName + '**.' + payoutText + sportsbookText, ephemeral: false });
         return;
       }
 
@@ -10326,12 +10371,25 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
 async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winnerSide) {
   if (!interaction.guild || !leagueGame) return null;
 
-  const result = await pool.query(
+  let result = await pool.query(
     `SELECT * FROM sportsbook_games
      WHERE guild_id = $1 AND league_game_id = $2 AND status = 'open'
      LIMIT 1`,
     [interaction.guild.id, leagueGame.id]
   );
+
+  if (!result.rows.length) {
+    result = await pool.query(
+      `SELECT * FROM sportsbook_games
+       WHERE guild_id = $1
+         AND status = 'open'
+         AND LOWER(home_label) = LOWER($2)
+         AND LOWER(away_label) = LOWER($3)
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [interaction.guild.id, leagueGame.home_team_name, leagueGame.away_team_name]
+    );
+  }
 
   if (!result.rows.length) return null;
 
@@ -10356,8 +10414,7 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
     if (bet.side === winnerSide) {
       await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Auto-settled bet: ' + sportsbookGame.game_label, interaction.user.id);
       await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
-      await addActivityPoints(interaction.guild.id, bet.user_id, 5, 'sportsbook_win');
-      await addLegacyScore(interaction.guild.id, bet.user_id, 2, 'sportsbook_win');
+      await addActivityPoints(interaction.guild.id, bet.user_id, 5, 2).catch(() => null);
       winners += 1;
       totalPaid += Number(bet.potential_payout);
     } else {
