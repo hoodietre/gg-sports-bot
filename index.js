@@ -780,6 +780,16 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_panels (
+      guild_id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
 
   for (const teamName of TEAM_ROLE_NAMES) {
     await pool.query(
@@ -888,6 +898,7 @@ function buildCommands() {
       .setName('shop')
       .setDescription('Shop and inventory commands')
       .addSubcommand(sc => sc.setName('view').setDescription('View the server shop'))
+      .addSubcommand(sc => sc.setName('panel').setDescription('Staff: create or refresh permanent shop panel').addChannelOption(o => o.setName('channel').setDescription('Shop panel channel').setRequired(false)))
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
@@ -3238,7 +3249,51 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (interaction.customId.startsWith('trade_offer_accept:')) {
+      
+      if (interaction.customId.startsWith('shop_buy_button:')) {
+        if (!interaction.guild) return;
+
+        const shortId = interaction.customId.split(':')[1];
+        const result = await pool.query(
+          `SELECT * FROM shop_items WHERE guild_id = $1 AND id::text LIKE $2 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, shortId + '%']
+        );
+
+        if (!result.rows.length) {
+          await interaction.reply({ content: 'That shop item is no longer available.', ephemeral: true });
+          return;
+        }
+
+        const item = result.rows[0];
+        const settings = await getCurrencySettings(interaction.guild.id);
+
+        if (item.stock !== null && Number(item.stock) <= 0) {
+          await interaction.reply({ content: 'That item is out of stock.', ephemeral: true });
+          return;
+        }
+
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, Number(item.price), 'shop_purchase', 'Bought ' + item.item_name, interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + settings.currency_name + ' to buy that item.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+        );
+
+        if (item.stock !== null) {
+          await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - 1), updated_at = NOW() WHERE id = $1`, [item.id]);
+        }
+
+        await updatePermanentShopPanel(interaction.guild).catch(() => null);
+        await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
+        return;
+      }
+
+if (interaction.customId.startsWith('trade_offer_accept:')) {
         const offerId = interaction.customId.split(':')[1];
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
         if (result.rows.length === 0) {
@@ -4475,6 +4530,38 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
     if (interaction.commandName === 'shop') {
       if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
+
+      if (shopSubcommand === 'panel') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to create the shop panel.', ephemeral: true });
+          return;
+        }
+
+        const channel = interaction.options.getChannel('channel') || interaction.channel;
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that shop panel channel.', ephemeral: true });
+          return;
+        }
+
+        const payload = await buildPermanentShopPayload(interaction.guild.id);
+        const message = await channel.send(payload);
+
+        await pool.query(
+          `INSERT INTO shop_panels (guild_id, channel_id, message_id, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (guild_id)
+           DO UPDATE SET channel_id = $2, message_id = $3, updated_at = NOW()`,
+          [interaction.guild.id, channel.id, message.id]
+        );
+
+        await interaction.reply({ content: 'Permanent shop panel created/refreshed in ' + channel.toString() + '.', ephemeral: true });
+        return;
+      }
+
+
       const settings = await getCurrencySettings(interaction.guild.id);
 
       if (shopSubcommand === 'view') {
@@ -4529,6 +4616,7 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
           [itemId, interaction.guild.id, name, description, price, stock, interaction.user.id]
         );
 
+        await updatePermanentShopPanel(interaction.guild).catch(() => null);
         await interaction.reply({ content: 'Shop item created: **' + shortShopItemId(itemId) + ' • ' + name + '** for **' + settings.currency_icon + ' ' + price + '**.', ephemeral: true });
         return;
       }
@@ -4608,6 +4696,7 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
         }
 
         await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
+        await updatePermanentShopPanel(interaction.guild).catch(() => null);
         await interaction.reply({ content: 'Removed/deactivated shop item **' + item.item_name + '**.', ephemeral: true });
         return;
       }
