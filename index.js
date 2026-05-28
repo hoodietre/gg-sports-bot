@@ -923,6 +923,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View league/server setup settings'))
+      .addSubcommand(sc => sc.setName('awards').setDescription('Open a customizable league awards form').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
 
     new SlashCommandBuilder()
@@ -2525,6 +2526,99 @@ client.on(Events.MessageCreate, async (message) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isModalSubmit()) {
+      if (interaction.customId.startsWith('league_awards_modal:')) {
+        if (!interaction.guild) return;
+        const [, leagueId] = interaction.customId.split(':');
+        const activeLeague = leagueId && leagueId !== 'none' ? await getLeagueById(leagueId) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found for these awards.', ephemeral: true });
+          return;
+        }
+
+        const seasonLabel = interaction.fields.getTextInputValue('awards_season_label').trim();
+        const awardsText = interaction.fields.getTextInputValue('awards_entries').trim();
+        const notes = interaction.fields.getTextInputValue('awards_notes')?.trim() || '';
+
+        if (!seasonLabel || !awardsText) {
+          await interaction.reply({ content: 'Season label and at least one award are required.', ephemeral: true });
+          return;
+        }
+
+        const awardLines = awardsText
+          .split(/\n|\|/)
+          .map(line => line.trim())
+          .filter(Boolean)
+          .slice(0, 20);
+
+        if (!awardLines.length) {
+          await interaction.reply({ content: 'Please enter at least one award line, like `MVP: @User`.', ephemeral: true });
+          return;
+        }
+
+        const settings = await getCurrencySettings(interaction.guild.id);
+        const awardPayout = Number(settings.award_payout || 50);
+        const savedAwards = [];
+
+        for (const line of awardLines) {
+          const separatorIndex = line.indexOf(':');
+          const awardName = separatorIndex === -1 ? 'Award' : line.slice(0, separatorIndex).trim();
+          const winnerText = separatorIndex === -1 ? line.trim() : line.slice(separatorIndex + 1).trim();
+
+          if (!awardName || !winnerText) continue;
+
+          await pool.query(
+            `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, created_by_user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [randomUUID(), interaction.guild.id, activeLeague.league_id, seasonLabel, awardName, winnerText, interaction.user.id]
+          );
+
+          const mentionMatch = winnerText.match(/<@!?(\d+)>|^(\d{17,20})$/);
+          const winnerUserId = mentionMatch ? (mentionMatch[1] || mentionMatch[2]) : null;
+
+          if (winnerUserId) {
+            await pool.query(
+              `INSERT INTO league_awards (id, guild_id, league_id, season_label, award_name, user_id, created_by_user_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+              [randomUUID(), interaction.guild.id, activeLeague.league_id, seasonLabel, awardName, winnerUserId, interaction.user.id]
+            );
+
+            if (awardPayout > 0) {
+              await addCurrency(interaction.guild.id, winnerUserId, awardPayout, 'league_award', awardName + ' • ' + seasonLabel, interaction.user.id);
+            }
+
+            await addRecognitionPoints(interaction.guild.id, winnerUserId, 5, 25).catch(() => null);
+          }
+
+          savedAwards.push({ awardName, winnerText });
+        }
+
+        if (!savedAwards.length) {
+          await interaction.reply({ content: 'No valid awards were submitted. Use lines like `MVP: @User`.', ephemeral: true });
+          return;
+        }
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle(activeLeague.league_name + ' • ' + seasonLabel + ' Awards')
+          .setColor(0xFEE75C)
+          .setDescription(savedAwards.map(award => '**' + award.awardName + '** — ' + award.winnerText).join(NL))
+          .setFooter({ text: 'GG Sports • Awards 2.0' })
+          .setTimestamp();
+
+        if (notes) embed.addFields({ name: 'Notes', value: notes.slice(0, 1024), inline: false });
+
+        const historyChannelId = activeLeague.history_channel_id || activeLeague.standings_channel_id;
+        const historyChannel = historyChannelId ? await interaction.guild.channels.fetch(historyChannelId).catch(() => null) : null;
+
+        if (historyChannel && historyChannel.isTextBased()) {
+          await historyChannel.send({ embeds: [embed] }).catch(() => null);
+        }
+
+        await interaction.reply({ content: 'Saved **' + savedAwards.length + '** award(s) for **' + activeLeague.league_name + '**.', embeds: [embed], ephemeral: true });
+        return;
+      }
+
       if (interaction.customId.startsWith('sportsbook_bet_modal:')) {
         if (!interaction.guild) return;
         const [, gameId, side] = interaction.customId.split(':');
@@ -5028,6 +5122,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setTimestamp();
 
         await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'awards') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to submit league awards.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          return;
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId('league_awards_modal:' + activeLeague.league_id)
+          .setTitle('League Awards • ' + activeLeague.league_name.slice(0, 24));
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('awards_season_label')
+              .setLabel('Season / award period')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('Season 1, 2026 Spring, Week 8, etc.')
+              .setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('awards_entries')
+              .setLabel('Awards')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('MVP: @User\nDPOY: @User\nBest Streamer: @User')
+              .setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('awards_notes')
+              .setLabel('Notes / storylines')
+              .setStyle(TextInputStyle.Paragraph)
+              .setPlaceholder('Optional context for the award post')
+              .setRequired(false)
+          )
+        );
+
+        await interaction.showModal(modal);
         return;
       }
 
