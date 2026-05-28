@@ -173,6 +173,41 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_feed_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_big_bet_threshold INTEGER NOT NULL DEFAULT 1000`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_monster_parlay_legs INTEGER NOT NULL DEFAULT 4`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS shop_channel_id TEXT`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_panels (
+      guild_id TEXT NOT NULL,
+      league_id UUID,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_carts (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      league_id UUID,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_cart_items (
+      cart_id UUID REFERENCES shop_carts(id) ON DELETE CASCADE,
+      item_id UUID REFERENCES shop_items(id) ON DELETE CASCADE,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (cart_id, item_id)
+    )
+  `);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_team_roles (
@@ -888,6 +923,9 @@ function buildCommands() {
       .setName('shop')
       .setDescription('Shop and inventory commands')
       .addSubcommand(sc => sc.setName('view').setDescription('View the server shop'))
+      .addSubcommand(sc => sc.setName('panel').setDescription('Staff: create or refresh permanent shop panel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('cart').setDescription('View your current shop cart'))
+      .addSubcommand(sc => sc.setName('checkout').setDescription('Checkout your current shop cart'))
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
@@ -967,6 +1005,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('sportsbookchannel').setDescription('Set sportsbook live feed channel').addChannelOption(o => o.setName('channel').setDescription('Sportsbook feed channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbookfeed').setDescription('Enable or disable sportsbook live feed').addBooleanOption(o => o.setName('enabled').setDescription('Enable live feed?').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbooksettings').setDescription('View sportsbook live feed settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('shopchannel').setDescription('Set league shop channel').addChannelOption(o => o.setName('channel').setDescription('Shop channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
@@ -1046,7 +1085,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.shop_channel_id, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -1061,7 +1100,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.shop_channel_id, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -1075,13 +1114,13 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.shop_channel_id, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
        s.live_channel_id, s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
        s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-       s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id
+       s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.shop_channel_id
      )
      LIMIT 1`,
     [guildId, channelId]
@@ -1094,7 +1133,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.shop_channel_id, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -3238,7 +3277,97 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (interaction.customId.startsWith('trade_offer_accept:')) {
+      
+      if (interaction.customId.startsWith('shop_add_item:')) {
+        if (!interaction.guild) return;
+        const shortId = interaction.customId.split(':')[1];
+        const result = await pool.query(
+          `SELECT * FROM shop_items
+           WHERE guild_id = $1 AND id::text LIKE $2 AND is_active = TRUE
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [interaction.guild.id, shortId + '%']
+        );
+
+        if (!result.rows.length) {
+          await interaction.reply({ content: 'That shop item is no longer available.', ephemeral: true });
+          return;
+        }
+
+        const item = result.rows[0];
+        if (item.stock !== null && Number(item.stock) <= 0) {
+          await interaction.reply({ content: 'That item is out of stock.', ephemeral: true });
+          return;
+        }
+
+        const activeLeague = await resolveLeague(interaction);
+        await addItemToShopCart(interaction.guild.id, interaction.user.id, item, activeLeague?.league_id || null);
+        const cartPayload = await buildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+
+        await interaction.reply({
+          content: 'Added **' + item.item_name + '** to your cart.',
+          embeds: [cartPayload.embed],
+          components: [buildShopCartButtons(false)],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (interaction.customId === 'shop_view_cart') {
+        if (!interaction.guild) return;
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await buildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+        await interaction.reply({ embeds: [cartPayload.embed], components: [buildShopCartButtons(cartPayload.items.length === 0)], ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId === 'shop_cart_clear') {
+        if (!interaction.guild) return;
+        const activeLeague = await resolveLeague(interaction);
+        const cart = await getOpenShopCart(interaction.guild.id, interaction.user.id, activeLeague?.league_id || null);
+        await pool.query(`DELETE FROM shop_cart_items WHERE cart_id = $1`, [cart.id]);
+        await interaction.reply({ content: 'Your cart has been cleared.', ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId === 'shop_checkout_confirm') {
+        if (!interaction.guild) return;
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await buildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+
+        if (!cartPayload.items.length) {
+          await interaction.reply({ content: 'Your cart is empty.', ephemeral: true });
+          return;
+        }
+
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, cartPayload.total, 'shop_cart_checkout', 'Shop cart checkout', interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: 'You do not have enough ' + cartPayload.settings.currency_name + ' to checkout this cart.', ephemeral: true });
+          return;
+        }
+
+        for (const item of cartPayload.items) {
+          for (let i = 0; i < Number(item.quantity); i++) {
+            await pool.query(
+              `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+            );
+          }
+
+          if (item.stock !== null) {
+            await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - $1), updated_at = NOW() WHERE id = $2`, [Number(item.quantity), item.id]);
+          }
+        }
+
+        await pool.query(`UPDATE shop_carts SET status = 'checked_out', updated_at = NOW() WHERE id = $1`, [cartPayload.cart.id]);
+        await updatePermanentShopPanel(interaction.guild, activeLeague).catch(() => null);
+
+        await interaction.reply({ content: 'Checkout complete. Purchased **' + cartPayload.items.length + '** item type(s) for **' + cartPayload.settings.currency_icon + ' ' + cartPayload.total + '**.', ephemeral: true });
+        return;
+      }
+
+if (interaction.customId.startsWith('trade_offer_accept:')) {
         const offerId = interaction.customId.split(':')[1];
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
         if (result.rows.length === 0) {
@@ -4475,6 +4604,59 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
     if (interaction.commandName === 'shop') {
       if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
+
+      if (shopSubcommand === 'panel') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to create the shop panel.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await resolveLeague(interaction);
+        const targetChannelId = activeLeague?.shop_channel_id || interaction.channel.id;
+        const channel = await interaction.guild.channels.fetch(targetChannelId).catch(() => interaction.channel);
+
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in the shop channel.', ephemeral: true });
+          return;
+        }
+
+        const payload = await buildPermanentShopPayload(interaction.guild.id, activeLeague);
+        const message = await channel.send(payload);
+
+        await pool.query(
+          `INSERT INTO shop_panels (guild_id, league_id, channel_id, message_id, updated_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (guild_id, league_id)
+           DO UPDATE SET channel_id = $3, message_id = $4, updated_at = NOW()`,
+          [interaction.guild.id, activeLeague?.league_id || null, channel.id, message.id]
+        );
+
+        await interaction.reply({ content: 'Permanent shop panel created in ' + channel.toString() + '.', ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'cart') {
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await buildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+        await interaction.reply({ embeds: [cartPayload.embed], components: [buildShopCartButtons(cartPayload.items.length === 0)], ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'checkout') {
+        const activeLeague = await resolveLeague(interaction);
+        const cartPayload = await buildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
+        if (!cartPayload.items.length) {
+          await interaction.reply({ content: 'Your cart is empty.', ephemeral: true });
+          return;
+        }
+        await interaction.reply({ content: 'Confirm checkout below.', embeds: [cartPayload.embed], components: [buildShopCartButtons(false)], ephemeral: true });
+        return;
+      }
+
+
       const settings = await getCurrencySettings(interaction.guild.id);
 
       if (shopSubcommand === 'view') {
@@ -4529,6 +4711,7 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
           [itemId, interaction.guild.id, name, description, price, stock, interaction.user.id]
         );
 
+        await updatePermanentShopPanel(interaction.guild, await resolveLeague(interaction)).catch(() => null);
         await interaction.reply({ content: 'Shop item created: **' + shortShopItemId(itemId) + ' • ' + name + '** for **' + settings.currency_icon + ' ' + price + '**.', ephemeral: true });
         return;
       }
@@ -4608,6 +4791,7 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
         }
 
         await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
+        await updatePermanentShopPanel(interaction.guild, await resolveLeague(interaction)).catch(() => null);
         await interaction.reply({ content: 'Removed/deactivated shop item **' + item.item_name + '**.', ephemeral: true });
         return;
       }
@@ -5542,7 +5726,42 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
         return;
       }
 
-      if (leagueSubcommand === 'create') {
+      
+      if (leagueSubcommand === 'shopchannel') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update shop settings.', ephemeral: true });
+          return;
+        }
+
+        const channel = interaction.options.getChannel('channel');
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that shop channel.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id, shop_channel_id, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (league_id)
+           DO UPDATE SET shop_channel_id = $2, updated_at = NOW()`,
+          [activeLeague.league_id, channel.id]
+        );
+
+        await interaction.reply({ content: 'Shop channel for **' + activeLeague.league_name + '** set to ' + channel.toString() + '.', ephemeral: true });
+        return;
+      }
+
+if (leagueSubcommand === 'create') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true });
           return;
