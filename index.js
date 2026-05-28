@@ -301,6 +301,37 @@ async function initDatabase() {
   `);
 
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS standings_points INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS conference TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS playoff_team_count INTEGER NOT NULL DEFAULT 8`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS playoff_brackets (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      season_label TEXT,
+      team_count INTEGER NOT NULL DEFAULT 8,
+      status TEXT NOT NULL DEFAULT 'generated',
+      created_by_user_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS playoff_bracket_teams (
+      bracket_id UUID REFERENCES playoff_brackets(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      seed INTEGER NOT NULL,
+      team_role_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      standings_points INTEGER NOT NULL DEFAULT 0,
+      conference TEXT,
+      PRIMARY KEY (bracket_id, seed)
+    )
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_games (
@@ -904,8 +935,11 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('league')
       .setDescription('League setup and management commands')
-      .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)))
+      .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game type: nba, mlb, madden, general').setRequired(false)))
       .addSubcommand(sc => sc.setName('delete').setDescription('Delete/deactivate a league').addStringOption(o => o.setName('name').setDescription('League name to delete').setRequired(true)))
+      .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('nba, mlb, madden, general').setRequired(true)))
+      .addSubcommand(sc => sc.setName('playoffsettings').setDescription('Set playoff team count for a league').addIntegerOption(o => o.setName('teams').setDescription('Number of teams that make playoffs').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('playoffs').setDescription('Generate/show playoff bracket from current standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(false)))
       .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
       .addSubcommand(sc => sc.setName('list').setDescription('List leagues'))
@@ -998,7 +1032,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -1013,7 +1047,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -1027,7 +1061,7 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
@@ -1046,7 +1080,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -1425,6 +1459,99 @@ function shortGameId(gameId) {
   return String(gameId || '').split('-')[0];
 }
 
+function normalizeLeagueGameKey(gameKey = '') {
+  return String(gameKey || '').trim().toLowerCase();
+}
+
+function isMlbLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return key.includes('mlb') || key.includes('baseball') || key.includes('show');
+}
+
+function isNbaLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return key.includes('nba') || key.includes('2k') || key.includes('basketball');
+}
+
+const NBA_EAST_TEAMS = new Set(['76ers', 'Bucks', 'Bulls', 'Cavs', 'Celtics', 'Hawks', 'Heat', 'Hornets', 'Knicks', 'Magic', 'Nets', 'Pacers', 'Pistons', 'Raptors', 'Wizards']);
+const NBA_WEST_TEAMS = new Set(['Clippers', 'Grizzlies', 'Jazz', 'Kings', 'Lakers', 'Mavs', 'Nuggets', 'Rockets', 'Spurs', 'Suns', 'Sonics', 'Wolves', 'Blazers', 'Warriors']);
+
+function getTeamConference(teamName = '') {
+  const raw = String(teamName || '').trim();
+  const matchEast = [...NBA_EAST_TEAMS].find(name => raw.toLowerCase().includes(name.toLowerCase()));
+  if (matchEast) return 'Eastern Conference';
+  const matchWest = [...NBA_WEST_TEAMS].find(name => raw.toLowerCase().includes(name.toLowerCase()));
+  if (matchWest) return 'Western Conference';
+  return 'Unassigned Conference';
+}
+
+function calculateStandingsPointsForLeague(league, wins, losses) {
+  return isMlbLeague(league) ? (Number(wins || 0) * 3) + Number(losses || 0) : 0;
+}
+
+async function resolveAwardWinnerUserId(guild, winnerText) {
+  const text = String(winnerText || '').trim();
+  if (!guild || !text) return null;
+
+  const mentionMatch = text.match(/<@!?(\d+)>|^(\d{17,20})$/);
+  if (mentionMatch) return mentionMatch[1] || mentionMatch[2];
+
+  const clean = text
+    .replace(/^@/, '')
+    .replace(/[“”"']/g, '')
+    .trim()
+    .toLowerCase();
+
+  if (!clean) return null;
+  await guild.members.fetch().catch(() => null);
+
+  const exact = guild.members.cache.find(member => {
+    const username = member.user.username.toLowerCase();
+    const globalName = (member.user.globalName || '').toLowerCase();
+    const displayName = (member.displayName || '').toLowerCase();
+    return username === clean || globalName === clean || displayName === clean;
+  });
+
+  if (exact) return exact.id;
+
+  const partial = guild.members.cache.find(member => {
+    const username = member.user.username.toLowerCase();
+    const globalName = (member.user.globalName || '').toLowerCase();
+    const displayName = (member.displayName || '').toLowerCase();
+    return username.includes(clean) || globalName.includes(clean) || displayName.includes(clean);
+  });
+
+  return partial?.id || null;
+}
+
+function buildPlayoffBracketEmbed(league, bracket, teams) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle((league?.league_name || 'League') + ' • Playoff Bracket')
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Playoffs' })
+    .setTimestamp();
+
+  if (!teams.length) {
+    embed.setDescription('No playoff teams found yet.');
+    return embed;
+  }
+
+  const lines = teams.map(team => {
+    const pts = isMlbLeague(league) ? ' • ' + team.standings_points + ' PTS' : '';
+    const conference = isNbaLeague(league) && team.conference ? ' • ' + team.conference.replace(' Conference', '') : '';
+    return '**#' + team.seed + ' ' + team.team_name + '** — ' + team.wins + '-' + team.losses + pts + conference;
+  });
+
+  embed.setDescription(lines.join(NL));
+  embed.addFields(
+    { name: 'Teams', value: String(bracket?.team_count || teams.length), inline: true },
+    { name: 'Status', value: bracket?.status || 'generated', inline: true },
+    { name: 'Season', value: bracket?.season_label || 'Current Season', inline: true }
+  );
+  return embed;
+}
+
 function buildScheduleEmbed(league, rows) {
   const NL = String.fromCharCode(10);
 
@@ -1452,11 +1579,13 @@ function buildScheduleEmbed(league, rows) {
 
 function buildStandingsEmbed(league, rows) {
   const NL = String.fromCharCode(10);
+  const showPoints = isMlbLeague(league);
+  const splitConferences = isNbaLeague(league);
 
   const embed = new EmbedBuilder()
     .setTitle(`${league?.league_name || 'League'} • Standings`)
     .setColor(0x57F287)
-    .setFooter({ text: 'GG Sports • Standings' })
+    .setFooter({ text: showPoints ? 'GG Sports • MLB Points Standings' : splitConferences ? 'GG Sports • NBA Conference Standings' : 'GG Sports • Standings' })
     .setTimestamp();
 
   if (!rows.length) {
@@ -1464,15 +1593,27 @@ function buildStandingsEmbed(league, rows) {
     return embed;
   }
 
-  const lines = rows.map((row, index) => {
+  const formatLine = (row, index) => {
     const games = Number(row.wins) + Number(row.losses);
     const winPct = games > 0 ? (Number(row.wins) / games).toFixed(3).replace(/^0/, '') : '.000';
-    const diff = Number(row.points_for) - Number(row.points_against);
-    const standingsPoints = Number(row.standings_points ?? ((Number(row.wins) * 3) + Number(row.losses)));
-    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct}) • ${standingsPoints} PTS • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
-  });
+    const diff = Number(row.points_for || 0) - Number(row.points_against || 0);
+    const standingsPoints = Number(row.standings_points ?? calculateStandingsPointsForLeague(league, row.wins, row.losses));
+    const pointsText = showPoints ? ' • ' + standingsPoints + ' PTS' : '';
+    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct})${pointsText} • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
+  };
 
-  embed.setDescription(lines.join(NL));
+  if (splitConferences) {
+    const eastern = rows.filter(row => getTeamConference(row.team_name) === 'Eastern Conference');
+    const western = rows.filter(row => getTeamConference(row.team_name) === 'Western Conference');
+    const other = rows.filter(row => !['Eastern Conference', 'Western Conference'].includes(getTeamConference(row.team_name)));
+
+    if (eastern.length) embed.addFields({ name: 'Eastern Conference', value: eastern.map(formatLine).join(NL).slice(0, 1024), inline: false });
+    if (western.length) embed.addFields({ name: 'Western Conference', value: western.map(formatLine).join(NL).slice(0, 1024), inline: false });
+    if (other.length) embed.addFields({ name: 'Unassigned', value: other.map(formatLine).join(NL).slice(0, 1024), inline: false });
+    return embed;
+  }
+
+  embed.setDescription(rows.map(formatLine).join(NL));
   return embed;
 }
 
@@ -1592,10 +1733,15 @@ async function updateTradeCountPanel(guild, league = null) {
 }
 
 async function getStandingsRows(guildId, leagueId) {
+  const league = await getLeagueById(leagueId);
+  const orderBy = isMlbLeague(league)
+    ? 'standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC'
+    : 'wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC';
+
   const result = await pool.query(
     `SELECT * FROM league_standings
      WHERE guild_id = $1 AND league_id = $2
-     ORDER BY standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC`,
+     ORDER BY ${orderBy}`,
     [guildId, leagueId]
   );
   return result.rows;
@@ -2561,7 +2707,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const savedAwards = [];
 
         for (const line of awardLines) {
-          const separatorIndex = line.indexOf(':');
+          const separatorMatch = line.match(/[:=—–-]/);
+          const separatorIndex = separatorMatch ? line.indexOf(separatorMatch[0]) : -1;
           const awardName = separatorIndex === -1 ? 'Award' : line.slice(0, separatorIndex).trim();
           const winnerText = separatorIndex === -1 ? line.trim() : line.slice(separatorIndex + 1).trim();
 
@@ -2573,8 +2720,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             [randomUUID(), interaction.guild.id, activeLeague.league_id, seasonLabel, awardName, winnerText, interaction.user.id]
           );
 
-          const mentionMatch = winnerText.match(/<@!?(\d+)>|^(\d{17,20})$/);
-          const winnerUserId = mentionMatch ? (mentionMatch[1] || mentionMatch[2]) : null;
+          const winnerUserId = await resolveAwardWinnerUserId(interaction.guild, winnerText);
 
           if (winnerUserId) {
             await pool.query(
@@ -3575,6 +3721,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const loserRoleId = homeWins ? game.away_team_role_id : game.home_team_role_id;
         const winnerName = homeWins ? game.home_team_name : game.away_team_name;
         const loserName = homeWins ? game.away_team_name : game.home_team_name;
+        const winnerStandingsPoints = isMlbLeague(activeLeague) ? 3 : 0;
+        const loserStandingsPoints = isMlbLeague(activeLeague) ? 1 : 0;
+        const winnerConference = isNbaLeague(activeLeague) ? getTeamConference(winnerName) : null;
+        const loserConference = isNbaLeague(activeLeague) ? getTeamConference(loserName) : null;
 
         await pool.query(
           `UPDATE league_games
@@ -3584,27 +3734,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
         await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points)
-           VALUES ($1, $2, $3, $4, 1, 0, $5, $6, 3)
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points, conference)
+           VALUES ($1, $2, $3, $4, 1, 0, $5, $6, $7, $8)
            ON CONFLICT (guild_id, league_id, team_role_id)
            DO UPDATE SET wins = league_standings.wins + 1,
-                         standings_points = league_standings.standings_points + 3,
+                         standings_points = league_standings.standings_points + $7,
+                         conference = $8,
                          points_for = league_standings.points_for + $5,
                          points_against = league_standings.points_against + $6,
                          updated_at = NOW()`,
-          [interaction.guild.id, game.league_id, winnerRoleId, winnerName, Math.max(homeScore, awayScore), Math.min(homeScore, awayScore)]
+          [interaction.guild.id, game.league_id, winnerRoleId, winnerName, Math.max(homeScore, awayScore), Math.min(homeScore, awayScore), winnerStandingsPoints, winnerConference]
         );
 
         await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points)
-           VALUES ($1, $2, $3, $4, 0, 1, $5, $6, 1)
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points, conference)
+           VALUES ($1, $2, $3, $4, 0, 1, $5, $6, $7, $8)
            ON CONFLICT (guild_id, league_id, team_role_id)
            DO UPDATE SET losses = league_standings.losses + 1,
-                         standings_points = league_standings.standings_points + 1,
+                         standings_points = league_standings.standings_points + $7,
+                         conference = $8,
                          points_for = league_standings.points_for + $5,
                          points_against = league_standings.points_against + $6,
                          updated_at = NOW()`,
-          [interaction.guild.id, game.league_id, loserRoleId, loserName, Math.min(homeScore, awayScore), Math.max(homeScore, awayScore)]
+          [interaction.guild.id, game.league_id, loserRoleId, loserName, Math.min(homeScore, awayScore), Math.max(homeScore, awayScore), loserStandingsPoints, loserConference]
         );
 
         if (typeof updateStandingsPanel === 'function') {
@@ -5174,6 +5326,103 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (leagueSubcommand === 'game') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update league game type.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('league');
+        const gameKey = interaction.options.getString('game').toLowerCase();
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find active league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(`UPDATE leagues SET game_key = $1 WHERE league_id = $2`, [gameKey, activeLeague.league_id]);
+        await interaction.reply({ content: 'Game type for **' + activeLeague.league_name + '** set to **' + gameKey + '**.', ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'playoffsettings') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update playoff settings.', ephemeral: true });
+          return;
+        }
+
+        const teamCount = interaction.options.getInteger('teams');
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found.', ephemeral: true });
+          return;
+        }
+
+        if (!Number.isInteger(teamCount) || teamCount < 2 || teamCount > 32) {
+          await interaction.reply({ content: 'Playoff team count must be between 2 and 32.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id, playoff_team_count, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (league_id)
+           DO UPDATE SET playoff_team_count = $2, updated_at = NOW()`,
+          [activeLeague.league_id, teamCount]
+        );
+
+        await interaction.reply({ content: 'Playoff team count for **' + activeLeague.league_name + '** set to **' + teamCount + '**.', ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'playoffs') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to generate playoff brackets.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('league');
+        const seasonLabel = interaction.options.getString('season') || 'Current Season';
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found.', ephemeral: true });
+          return;
+        }
+
+        const teamCount = Number(activeLeague.playoff_team_count || 8);
+        const standingsRows = await getStandingsRows(interaction.guild.id, activeLeague.league_id);
+        const playoffTeams = standingsRows.slice(0, teamCount);
+
+        if (playoffTeams.length < 2) {
+          await interaction.reply({ content: 'Not enough teams in the standings to generate a playoff bracket.', ephemeral: true });
+          return;
+        }
+
+        const bracketId = randomUUID();
+        await pool.query(
+          `INSERT INTO playoff_brackets (id, guild_id, league_id, season_label, team_count, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [bracketId, interaction.guild.id, activeLeague.league_id, seasonLabel, playoffTeams.length, interaction.user.id]
+        );
+
+        for (let i = 0; i < playoffTeams.length; i += 1) {
+          const team = playoffTeams[i];
+          await pool.query(
+            `INSERT INTO playoff_bracket_teams (bracket_id, guild_id, league_id, seed, team_role_id, team_name, wins, losses, standings_points, conference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [bracketId, interaction.guild.id, activeLeague.league_id, i + 1, team.team_role_id, team.team_name, team.wins, team.losses, Number(team.standings_points || 0), isNbaLeague(activeLeague) ? getTeamConference(team.team_name) : null]
+          );
+        }
+
+        const bracket = { id: bracketId, team_count: playoffTeams.length, status: 'generated', season_label: seasonLabel };
+        await interaction.reply({ embeds: [buildPlayoffBracketEmbed(activeLeague, bracket, playoffTeams.map((team, index) => ({ ...team, seed: index + 1, conference: isNbaLeague(activeLeague) ? getTeamConference(team.team_name) : null })))], ephemeral: false });
+        return;
+      }
+
       if (leagueSubcommand === 'delete') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to delete leagues.', ephemeral: true });
@@ -5237,6 +5486,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const leagueName = interaction.options.getString('name');
+        const gameKey = (interaction.options.getString('game') || 'general').toLowerCase();
         const leagueId = randomUUID();
 
         await pool.query(
@@ -5251,7 +5501,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
            VALUES ($1, $2, $3, $4)
            ON CONFLICT (guild_id, league_name)
            DO UPDATE SET is_active = TRUE`,
-          [leagueId, interaction.guild.id, leagueName, 'general']
+          [leagueId, interaction.guild.id, leagueName, gameKey]
         );
 
         const savedLeague = await getLeagueByName(interaction.guild.id, leagueName);
@@ -5301,7 +5551,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             { name: 'Staff Role', value: activeLeague.staff_role_id ? '<@&' + activeLeague.staff_role_id + '>' : 'Not set', inline: true },
             { name: 'Standings Channel', value: activeLeague.standings_channel_id ? '<#' + activeLeague.standings_channel_id + '>' : 'Not set', inline: true },
             { name: 'Tournament Channel', value: activeLeague.tournament_channel_id ? '<#' + activeLeague.tournament_channel_id + '>' : 'Not set', inline: true },
-            { name: 'History Channel', value: activeLeague.history_channel_id ? '<#' + activeLeague.history_channel_id + '>' : 'Not set', inline: true }
+            { name: 'History Channel', value: activeLeague.history_channel_id ? '<#' + activeLeague.history_channel_id + '>' : 'Not set', inline: true },
+            { name: 'Playoff Teams', value: String(activeLeague.playoff_team_count || 8), inline: true },
+            { name: 'Standings Style', value: isMlbLeague(activeLeague) ? 'MLB Points (3W/1L)' : isNbaLeague(activeLeague) ? 'NBA Conferences' : 'Standard Record', inline: true }
           )
           .setFooter({ text: 'GG Sports • League Hub' })
           .setTimestamp();
@@ -6871,7 +7123,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const result = await pool.query(
         `SELECT * FROM league_standings
          WHERE guild_id = $1 AND league_id = $2
-         ORDER BY wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC`,
+         ORDER BY ${isMlbLeague(activeLeague) ? 'standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC' : 'wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC'}`,
         [interaction.guild.id, activeLeague.league_id]
       );
       await interaction.reply({ embeds: [buildStandingsEmbed(activeLeague, result.rows)], ephemeral: true });
@@ -6893,12 +7145,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const team = interaction.options.getRole('team');
       const wins = interaction.options.getInteger('wins');
       const losses = interaction.options.getInteger('losses');
+      const standingsPoints = calculateStandingsPointsForLeague(activeLeague, wins, losses);
+      const conference = isNbaLeague(activeLeague) ? getTeamConference(team.name) : null;
       await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, standings_points)
-         VALUES ($1, $2, $3, $4, $5, $6, (($5 * 3) + $6))
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, standings_points, conference)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (guild_id, league_id, team_role_id)
-         DO UPDATE SET wins = $5, losses = $6, standings_points = (($5 * 3) + $6), team_name = $4, updated_at = NOW()`,
-        [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses]
+         DO UPDATE SET wins = $5, losses = $6, standings_points = $7, conference = $8, team_name = $4, updated_at = NOW()`,
+        [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses, standingsPoints, conference]
       );
       await updateStandingsPanel(interaction.guild, activeLeague);
       await interaction.reply({ content: `Standings adjusted: **${team.name}** is now **${wins}-${losses}**.`, ephemeral: true });
