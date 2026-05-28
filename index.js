@@ -3288,7 +3288,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - 1), updated_at = NOW() WHERE id = $1`, [item.id]);
         }
 
-        await updatePermanentShopPanel(interaction.guild).catch(() => null);
+        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
         await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
         return;
       }
@@ -4546,7 +4546,7 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
           return;
         }
 
-        const payload = await buildPermanentShopPayload(interaction.guild.id);
+        const payload = await ggBuildPermanentShopPayload(interaction.guild.id);
         const message = await channel.send(payload);
 
         await pool.query(
@@ -4616,7 +4616,7 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
           [itemId, interaction.guild.id, name, description, price, stock, interaction.user.id]
         );
 
-        await updatePermanentShopPanel(interaction.guild).catch(() => null);
+        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
         await interaction.reply({ content: 'Shop item created: **' + shortShopItemId(itemId) + ' • ' + name + '** for **' + settings.currency_icon + ' ' + price + '**.', ephemeral: true });
         return;
       }
@@ -4696,7 +4696,7 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
         }
 
         await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
-        await updatePermanentShopPanel(interaction.guild).catch(() => null);
+        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
         await interaction.reply({ content: 'Removed/deactivated shop item **' + item.item_name + '**.', ephemeral: true });
         return;
       }
