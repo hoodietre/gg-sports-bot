@@ -4604,6 +4604,12 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
           return;
         }
 
+        const activeLeague = await resolveLeague(interaction);
+        if (!activeLeague?.league_id) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
         const channel = interaction.options.getChannel('channel') || interaction.channel;
         const botMember = await interaction.guild.members.fetchMe();
         const permissions = channel?.permissionsFor(botMember);
@@ -4618,9 +4624,9 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
 
         await pool.query(`DELETE FROM shop_panels WHERE guild_id = $1`, [interaction.guild.id]);
         await pool.query(
-          `INSERT INTO shop_panels (guild_id, channel_id, message_id, updated_at)
-           VALUES ($1, $2, $3, NOW())`,
-          [interaction.guild.id, channel.id, message.id]
+          `INSERT INTO shop_panels (guild_id, league_id, channel_id, message_id, updated_at)
+           VALUES ($1, $2, $3, $4, NOW())`,
+          [interaction.guild.id, activeLeague.league_id, channel.id, message.id]
         );
 
         await interaction.reply({ content: 'Permanent shop panel created/refreshed in ' + channel.toString() + '.', ephemeral: true });
