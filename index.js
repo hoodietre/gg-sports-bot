@@ -346,6 +346,7 @@ async function initDatabase() {
   `);
 
   await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS game_played_payout INTEGER NOT NULL DEFAULT 25`);
+  await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS award_payout INTEGER NOT NULL DEFAULT 50`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS currency_transactions (
@@ -823,6 +824,11 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('features').setDescription('Show planned premium GG Sports features')),
 
     new SlashCommandBuilder()
+      .setName('coinflip')
+      .setDescription('Flip a coin')
+      .addStringOption(o => o.setName('call').setDescription('Optional call: heads or tails').setRequired(false)),
+
+    new SlashCommandBuilder()
       .setName('economy')
       .setDescription('Currency and economy commands')
       .addSubcommand(sc => sc.setName('balance').setDescription('Check a balance').addUserOption(o => o.setName('user').setDescription('User to check').setRequired(false)))
@@ -896,6 +902,7 @@ function buildCommands() {
       .setName('league')
       .setDescription('League setup and management commands')
       .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)))
+      .addSubcommand(sc => sc.setName('delete').setDescription('Delete/deactivate a league').addStringOption(o => o.setName('name').setDescription('League name to delete').setRequired(true)))
       .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
       .addSubcommand(sc => sc.setName('list').setDescription('List leagues'))
@@ -911,7 +918,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('sportsbookfeed').setDescription('Enable or disable sportsbook live feed').addBooleanOption(o => o.setName('enabled').setDescription('Enable live feed?').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbooksettings').setDescription('View sportsbook live feed settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
-      .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)))
+      .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View league/server setup settings'))
       .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
 
@@ -1604,11 +1611,11 @@ async function getCurrencySettings(guildId) {
   );
 
   const result = await pool.query(
-    `SELECT currency_name, currency_icon, win_payout, game_played_payout FROM guild_currency_settings WHERE guild_id = $1`,
+    `SELECT currency_name, currency_icon, win_payout, game_played_payout, award_payout FROM guild_currency_settings WHERE guild_id = $1`,
     [guildId]
   );
 
-  return result.rows[0] || { currency_name: 'GG Coins', currency_icon: '🪙', win_payout: 100, game_played_payout: 25 };
+  return result.rows[0] || { currency_name: 'GG Coins', currency_icon: '🪙', win_payout: 100, game_played_payout: 25, award_payout: 50 };
 }
 
 async function getBalance(guildId, userId) {
@@ -1757,6 +1764,7 @@ function buildEconomyEmbed(settings, stats) {
       { name: 'Currency', value: `${settings.currency_icon} ${settings.currency_name}`, inline: true },
       { name: 'Win Bonus', value: `${settings.win_payout}`, inline: true },
       { name: 'Game Played Payout', value: `${settings.game_played_payout}`, inline: true },
+      { name: 'Award Payout', value: `${settings.award_payout || 50}`, inline: true },
       { name: 'Total Circulating', value: `${settings.currency_icon} ${stats.totalBalance}`, inline: true },
       { name: 'Users With Balance', value: `${stats.usersWithBalance}`, inline: true },
       { name: 'Transactions', value: `${stats.transactionCount}`, inline: true },
@@ -5009,6 +5017,62 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (leagueSubcommand === 'delete') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to delete leagues.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('name');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find active league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `UPDATE leagues SET is_active = FALSE WHERE league_id = $1`,
+          [activeLeague.league_id]
+        );
+
+        await interaction.reply({ content: 'League deleted/deactivated: **' + activeLeague.league_name + '**.', ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'currency') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to configure server currency.', ephemeral: true });
+          return;
+        }
+
+        const currentSettings = await getCurrencySettings(interaction.guild.id);
+        const name = interaction.options.getString('name') || currentSettings.currency_name || 'GG Coins';
+        const icon = interaction.options.getString('icon') || currentSettings.currency_icon || '🪙';
+        const winPayout = interaction.options.getInteger('win_payout') ?? Number(currentSettings.win_payout || 100);
+        const gamePlayedPayout = interaction.options.getInteger('game_played_payout') ?? Number(currentSettings.game_played_payout || 25);
+        const awardPayout = interaction.options.getInteger('award_payout') ?? Number(currentSettings.award_payout || 50);
+
+        if (winPayout < 0 || gamePlayedPayout < 0 || awardPayout < 0) {
+          await interaction.reply({ content: 'Payout amounts cannot be negative.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO guild_currency_settings (guild_id, currency_name, currency_icon, win_payout, game_played_payout, award_payout, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW())
+           ON CONFLICT (guild_id)
+           DO UPDATE SET currency_name = $2, currency_icon = $3, win_payout = $4, game_played_payout = $5, award_payout = $6, updated_at = NOW()`,
+          [interaction.guild.id, name, icon, winPayout, gamePlayedPayout, awardPayout]
+        );
+
+        await interaction.reply({
+          content: 'Currency settings updated: **' + icon + ' ' + name + '** • Game played: **' + gamePlayedPayout + '** • Win: **' + winPayout + '** • Award: **' + awardPayout + '**.',
+          ephemeral: true,
+        });
+        return;
+      }
+
       if (leagueSubcommand === 'create') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true });
@@ -5171,7 +5235,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else if (leagueSubcommand === 'tournamentchannel') {
         interaction.commandName = 'settournamentchannel';
       } else if (leagueSubcommand === 'currency') {
-        interaction.commandName = 'setcurrency';
+        // handled natively above
       }
     }
 
@@ -5753,6 +5817,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
 
       await interaction.reply({ content: 'Activity milestone channel set to ' + channel.toString() + '.', ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'coinflip') {
+      const callRaw = interaction.options.getString('call');
+      const call = callRaw ? callRaw.toLowerCase().trim() : null;
+
+      if (call && !['heads', 'tails'].includes(call)) {
+        await interaction.reply({ content: 'Your call must be **heads** or **tails**.', ephemeral: true });
+        return;
+      }
+
+      const result = Math.random() < 0.5 ? 'heads' : 'tails';
+      const won = call ? call === result : null;
+      const embed = new EmbedBuilder()
+        .setTitle('🪙 Coin Flip')
+        .setColor(won === null ? 0x5865F2 : won ? 0x57F287 : 0xED4245)
+        .addFields(
+          { name: 'Result', value: result === 'heads' ? 'Heads' : 'Tails', inline: true },
+          { name: 'Call', value: call ? (call === 'heads' ? 'Heads' : 'Tails') : 'No call made', inline: true },
+          { name: 'Outcome', value: won === null ? 'Just for fun.' : won ? 'You called it!' : 'Better luck next time.', inline: true }
+        )
+        .setFooter({ text: 'GG Sports • Coin Flip' })
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [embed], ephemeral: false });
       return;
     }
 
@@ -6662,21 +6752,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const icon = interaction.options.getString('icon') || '🪙';
       const winPayout = interaction.options.getInteger('win_payout') ?? 100;
       const gamePlayedPayout = interaction.options.getInteger('game_played_payout') ?? 25;
+      const awardPayout = interaction.options.getInteger('award_payout') ?? 50;
 
-      if (winPayout < 0 || gamePlayedPayout < 0) {
+      if (winPayout < 0 || gamePlayedPayout < 0 || awardPayout < 0) {
         await interaction.reply({ content: 'Payout amounts cannot be negative.', ephemeral: true });
         return;
       }
 
       await pool.query(
-        `INSERT INTO guild_currency_settings (guild_id, currency_name, currency_icon, win_payout, game_played_payout, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())
+        `INSERT INTO guild_currency_settings (guild_id, currency_name, currency_icon, win_payout, game_played_payout, award_payout, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
          ON CONFLICT (guild_id)
-         DO UPDATE SET currency_name = $2, currency_icon = $3, win_payout = $4, game_played_payout = $5, updated_at = NOW()`,
-        [interaction.guild.id, name, icon, winPayout, gamePlayedPayout]
+         DO UPDATE SET currency_name = $2, currency_icon = $3, win_payout = $4, game_played_payout = $5, award_payout = $6, updated_at = NOW()`,
+        [interaction.guild.id, name, icon, winPayout, gamePlayedPayout, awardPayout]
       );
 
-      await interaction.reply({ content: `Server currency set to **${icon} ${name}**. Win bonus: **${winPayout}**. Game played payout: **${gamePlayedPayout}**.`, ephemeral: true });
+      await interaction.reply({ content: `Server currency set to **${icon} ${name}**. Win bonus: **${winPayout}**. Game played payout: **${gamePlayedPayout}**. Award payout: **${awardPayout}**.`, ephemeral: true });
       return;
     }
 
