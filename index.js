@@ -939,6 +939,9 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('create').setDescription('Staff: create sportsbook game').addStringOption(o => o.setName('label').setDescription('Game label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('place').setDescription('Place moneyline bet').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)))
       .addSubcommand(sc => sc.setName('settle').setDescription('Staff: settle sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)))
+      .addSubcommand(sc => sc.setName('refund').setDescription('Staff: refund open bets for a sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Refund reason').setRequired(false)))
+      .addSubcommand(sc => sc.setName('limits').setDescription('Staff: set max bet and max payout for a sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addIntegerOption(o => o.setName('max_bet').setDescription('Maximum bet amount').setRequired(false)).addIntegerOption(o => o.setName('max_payout').setDescription('Maximum payout amount').setRequired(false)))
+      .addSubcommand(sc => sc.setName('leaderboards').setDescription('View sportsbook leaderboards').addStringOption(o => o.setName('type').setDescription('profit, winrate, parlays').setRequired(false)))
       .addSubcommand(sc => sc.setName('mybets').setDescription('View your recent bets'))
       .addSubcommand(sc => sc.setName('parlay').setDescription('Create parlay').addIntegerOption(o => o.setName('amount').setDescription('Stake amount').setRequired(true)).addStringOption(o => o.setName('leg1_game').setDescription('Leg 1 game ID').setRequired(true)).addStringOption(o => o.setName('leg1_side').setDescription('home or away').setRequired(true)).addStringOption(o => o.setName('leg2_game').setDescription('Leg 2 game ID').setRequired(true)).addStringOption(o => o.setName('leg2_side').setDescription('home or away').setRequired(true)).addStringOption(o => o.setName('leg3_game').setDescription('Optional leg 3 game ID').setRequired(false)).addStringOption(o => o.setName('leg3_side').setDescription('home or away').setRequired(false)).addStringOption(o => o.setName('leg4_game').setDescription('Optional leg 4 game ID').setRequired(false)).addStringOption(o => o.setName('leg4_side').setDescription('home or away').setRequired(false))),
 
@@ -10020,6 +10023,62 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
   await postSportsbookFeed(interaction.guild, feedEmbed);
 
   return { sportsbookGame, winners, losers, totalPaid, parlayResult };
+}
+
+
+async function userIsInLeagueGame(guild, userId, sportsbookGame) {
+  if (!guild || !userId || !sportsbookGame?.league_game_id) return false;
+
+  const gameResult = await pool.query(
+    `SELECT * FROM league_games WHERE id = $1 LIMIT 1`,
+    [sportsbookGame.league_game_id]
+  );
+  const game = gameResult.rows[0];
+  if (!game) return false;
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return false;
+
+  return member.roles.cache.has(game.home_team_role_id) || member.roles.cache.has(game.away_team_role_id);
+}
+
+async function refundSportsbookGameBets(guild, sportsbookGame, issuedByUserId, reason = 'Sportsbook refund') {
+  if (!guild || !sportsbookGame) return { refundedCount: 0, refundedAmount: 0 };
+
+  const openBets = await pool.query(
+    `SELECT * FROM sportsbook_bets
+     WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+    [guild.id, sportsbookGame.id]
+  );
+
+  let refundedCount = 0;
+  let refundedAmount = 0;
+
+  for (const bet of openBets.rows) {
+    await addCurrency(guild.id, bet.user_id, Number(bet.amount), 'sportsbook_refund', reason, issuedByUserId);
+    await pool.query(`UPDATE sportsbook_bets SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [bet.id]);
+    refundedCount += 1;
+    refundedAmount += Number(bet.amount);
+  }
+
+  await pool.query(`UPDATE sportsbook_games SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [sportsbookGame.id]);
+  await updateSportsbookPanel(guild).catch(() => null);
+
+  const settings = await getCurrencySettings(guild.id);
+  const embed = new EmbedBuilder()
+    .setTitle('↩️ Sportsbook Bets Refunded')
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Game', value: sportsbookGame.game_label || 'Unknown game', inline: false },
+      { name: 'Bets Refunded', value: String(refundedCount), inline: true },
+      { name: 'Amount Returned', value: settings.currency_icon + ' ' + refundedAmount, inline: true },
+      { name: 'Reason', value: reason || 'Sportsbook refund', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Sportsbook Refund' })
+    .setTimestamp();
+
+  await postSportsbookFeed(guild, embed);
+  return { refundedCount, refundedAmount };
 }
 
 async function findSportsbookGame(guildId, input) {
