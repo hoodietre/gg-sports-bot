@@ -6519,6 +6519,135 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
     if (interaction.commandName === 'sportsbook') {
       if (!interaction.guild) return;
       const subcommand = interaction.options.getSubcommand();
+
+      if (subcommand === 'refund') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to refund sportsbook bets.', ephemeral: true });
+          return;
+        }
+
+        const gameInput = interaction.options.getString('game_id');
+        const reason = interaction.options.getString('reason') || 'Sportsbook refund';
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+
+        if (!sportsbookGame) {
+          await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true });
+          return;
+        }
+
+        if (sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'Only open sportsbook games can be refunded.', ephemeral: true });
+          return;
+        }
+
+        const refunded = await refundSportsbookGameBets(interaction.guild, sportsbookGame, interaction.user.id, reason);
+        await interaction.reply({ content: 'Refunded **' + refunded.refundedCount + '** bets for **' + sportsbookGame.game_label + '**.', ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'limits') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update sportsbook limits.', ephemeral: true });
+          return;
+        }
+
+        const gameInput = interaction.options.getString('game_id');
+        const maxBet = interaction.options.getInteger('max_bet');
+        const maxPayout = interaction.options.getInteger('max_payout');
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
+
+        if (!sportsbookGame) {
+          await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true });
+          return;
+        }
+
+        if (maxBet !== null && maxBet <= 0) {
+          await interaction.reply({ content: 'Max bet must be greater than 0.', ephemeral: true });
+          return;
+        }
+
+        if (maxPayout !== null && maxPayout <= 0) {
+          await interaction.reply({ content: 'Max payout must be greater than 0.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `UPDATE sportsbook_games
+           SET max_bet = COALESCE($1, max_bet),
+               max_payout = COALESCE($2, max_payout)
+           WHERE id = $3`,
+          [maxBet, maxPayout, sportsbookGame.id]
+        );
+
+        await updateSportsbookPanel(interaction.guild).catch(() => null);
+
+        await interaction.reply({
+          content: 'Updated limits for **' + sportsbookGame.game_label + '**.' +
+            (maxBet !== null ? ' Max bet: **' + maxBet + '**.' : '') +
+            (maxPayout !== null ? ' Max payout: **' + maxPayout + '**.' : ''),
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (subcommand === 'leaderboards') {
+        const type = interaction.options.getString('type') || 'profit';
+        let rows = [];
+        let title = 'Sportsbook Profit Leaders';
+
+        if (type === 'winrate') {
+          title = 'Sportsbook Win Rate Leaders';
+          const result = await pool.query(
+            `SELECT user_id,
+                    SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN status IN ('won','lost') THEN 1 ELSE 0 END) AS settled
+             FROM sportsbook_bets
+             WHERE guild_id = $1
+             GROUP BY user_id
+             HAVING SUM(CASE WHEN status IN ('won','lost') THEN 1 ELSE 0 END) >= 3
+             ORDER BY (SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END)::numeric / SUM(CASE WHEN status IN ('won','lost') THEN 1 ELSE 0 END)) DESC
+             LIMIT 10`,
+            [interaction.guild.id]
+          );
+          rows = result.rows.map(row => ({ user_id: row.user_id, value: row.wins + '/' + row.settled + ' wins' }));
+        } else if (type === 'parlays') {
+          title = 'Parlay Success Leaders';
+          const result = await pool.query(
+            `SELECT user_id,
+                    SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) AS wins,
+                    COUNT(*) AS total
+             FROM sportsbook_parlays
+             WHERE guild_id = $1
+             GROUP BY user_id
+             ORDER BY SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) DESC, COUNT(*) DESC
+             LIMIT 10`,
+            [interaction.guild.id]
+          );
+          rows = result.rows.map(row => ({ user_id: row.user_id, value: row.wins + '/' + row.total + ' parlays' }));
+        } else {
+          const result = await pool.query(
+            `SELECT user_id, sportsbook_profit
+             FROM user_recognition
+             WHERE guild_id = $1
+             ORDER BY sportsbook_profit DESC
+             LIMIT 10`,
+            [interaction.guild.id]
+          );
+          rows = result.rows.map(row => ({ user_id: row.user_id, value: String(row.sportsbook_profit || 0) }));
+        }
+
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle(title)
+          .setColor(0xFEE75C)
+          .setDescription(rows.length ? rows.map((row, index) => '**' + (index + 1) + '. <@' + row.user_id + '>** — ' + row.value).join(NL) : 'No sportsbook leaderboard data yet.')
+          .setFooter({ text: 'GG Sports • Sportsbook Leaderboards' })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
       const settings = await getCurrencySettings(interaction.guild.id);
 
       if (subcommand === 'board') {
@@ -6587,8 +6716,21 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
           return;
         }
 
+        if (await userIsInLeagueGame(interaction.guild, interaction.user.id, sportsbookGame)) {
+          await interaction.reply({ content: 'You cannot bet on your own game.', ephemeral: true });
+          return;
+        }
+
+        if (sportsbookGame.max_bet !== null && sportsbookGame.max_bet !== undefined && amount > Number(sportsbookGame.max_bet)) {
+          await interaction.reply({ content: 'That bet exceeds the max bet limit for this game: ' + sportsbookGame.max_bet + '.', ephemeral: true });
+          return;
+        }
+
         const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
-        const payout = calculateAmericanOddsPayout(amount, odds);
+        let payout = calculateAmericanOddsPayout(amount, odds);
+        if (sportsbookGame.max_payout !== null && sportsbookGame.max_payout !== undefined && payout > Number(sportsbookGame.max_payout)) {
+          payout = Number(sportsbookGame.max_payout);
+        }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
 
         if (!removed) {
@@ -10026,21 +10168,33 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
 }
 
 
-async function userIsInLeagueGame(guild, userId, sportsbookGame) {
-  if (!guild || !userId || !sportsbookGame?.league_game_id) return false;
 
-  const gameResult = await pool.query(
-    `SELECT * FROM league_games WHERE id = $1 LIMIT 1`,
-    [sportsbookGame.league_game_id]
-  );
-  const game = gameResult.rows[0];
-  if (!game) return false;
+async function userIsInLeagueGame(guild, userId, sportsbookGame) {
+  if (!guild || !userId || !sportsbookGame) return false;
 
   const member = await guild.members.fetch(userId).catch(() => null);
   if (!member) return false;
 
-  return member.roles.cache.has(game.home_team_role_id) || member.roles.cache.has(game.away_team_role_id);
+  if (sportsbookGame.league_game_id) {
+    const gameResult = await pool.query(
+      `SELECT * FROM league_games WHERE id = $1 LIMIT 1`,
+      [sportsbookGame.league_game_id]
+    );
+    const game = gameResult.rows[0];
+    if (game && (member.roles.cache.has(game.home_team_role_id) || member.roles.cache.has(game.away_team_role_id))) {
+      return true;
+    }
+  }
+
+  const homeLabel = String(sportsbookGame.home_label || '').toLowerCase();
+  const awayLabel = String(sportsbookGame.away_label || '').toLowerCase();
+
+  return member.roles.cache.some(role =>
+    role.name.toLowerCase() === homeLabel ||
+    role.name.toLowerCase() === awayLabel
+  );
 }
+
 
 async function refundSportsbookGameBets(guild, sportsbookGame, issuedByUserId, reason = 'Sportsbook refund') {
   if (!guild || !sportsbookGame) return { refundedCount: 0, refundedAmount: 0 };
