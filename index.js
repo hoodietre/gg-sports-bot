@@ -827,6 +827,8 @@ function buildCommands() {
     new SlashCommandBuilder().setName('ping').setDescription('Check if bot is working'),
     new SlashCommandBuilder().setName('help').setDescription('Show the GG Sports setup guide'),
     new SlashCommandBuilder().setName('commands').setDescription('Show available GG Sports commands'),
+    new SlashCommandBuilder().setName('setupguide').setDescription('Show the full GG Sports server owner setup guide'),
+    new SlashCommandBuilder().setName('quicksetup').setDescription('Show the quick GG Sports setup checklist'),
 
     new SlashCommandBuilder()
       .setName('whogotnext')
@@ -3748,65 +3750,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'help') {
-      const embed = new EmbedBuilder()
-        .setTitle('GG Sports Setup Guide')
-        .setColor(0x5865F2)
-        .setDescription('Use this guide to set up a new league with the current hub commands.')
-        .addFields(
-          { name: '1. Create the league', value: '/league create — create/configure the league. Use /league game to set the type: nba, mlb, madden, or general.', inline: false },
-          { name: '2. Set staff and team roles', value: '/league staff — set the staff role.\n/league teamrole — run once for every team role in the league.', inline: false },
-          { name: '3. Set core channels', value: '/league standingschannel — standings destination.\n/league tournamentchannel — tournament destination.\n/league sportsbookchannel — live sportsbook feed.', inline: false },
-          { name: '4. Create permanent panels', value: '/league teamownerspanel — team owner board.\n/league standingspanel — standings board.\n/league sportsbookpanel — sportsbook board.\n/league ticketpanel + /league supportpanel — support system panels.\n/league tournamentpanel — tournament panel.', inline: false },
-          { name: '5. Configure economy and payouts', value: '/league currency — currency name/icon, win payout, game played payout, award payout.', inline: false },
-          { name: '6. Configure playoffs', value: '/league playoffsettings — custom playoff count for general leagues.\nNBA: top 8 East + top 8 West.\nMLB: top 8 overall.', inline: false },
-          { name: '7. Check setup', value: '/league settings — view league configuration.\n/league sportsbooksettings — view sportsbook feed setup.\n/commands — view available user/staff commands.', inline: false }
-        )
-        .setFooter({ text: 'GG Sports • Setup Guide' })
-        .setTimestamp();
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.reply({ embeds: [buildHelpEmbed()], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'setupguide') {
+      await interaction.reply({ embeds: [buildSetupGuideEmbed()], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'quicksetup') {
+      await interaction.reply({ embeds: [buildQuickSetupEmbed()], ephemeral: true });
       return;
     }
 
     if (interaction.commandName === 'commands') {
-      const isStaff = member && league ? await memberHasStaff(member, league) : false;
-      const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-      const memberCommands = [
-        '`/ping` — check if the bot is live',
-        '`/help` — setup guide',
-        '`/commands` — command list',
-        '`/whogotnext` — ping your league that you are ready to play',
-        '`/linkstream` — save your stream link',
-        '`/livestream` — post your stream link',
-        '`/trade block` — post a player to the trade block',
-        '`/trade history` — view approved trades',
-        '`/trade team` — view approved trades for a team',
-        '`/profile franchise` — view the Franchise Hub',
-        '`/profile awards` — view award history',
-        '`/legacy` — view legacy rank and tier',
-      ];
-      const staffCommands = [
-        '`/assignrole` — assign a role',
-        '`/unassignrole` — remove a role',
-        '`/league create` — create league',
-        '/league staff — set staff role',
-        '/league teamrole — add team role',
-        '/league standingschannel — set standings channel',
-        '/league sportsbookchannel — set sportsbook feed channel',
-        '`/league teamownerspanel` — create team owners panel',
-        '`/league-setup-panels` — create panels',
-        '`/editleaguename` — rename league',
-        '`/addseasonhistory` — post season history and update legacy records',
-      ];
-      const embed = new EmbedBuilder()
-        .setTitle('GG Sports Commands')
-        .setColor(0x57F287)
-        .addFields(
-          { name: 'Member Commands', value: memberCommands.join('\n'), inline: false },
-          { name: 'Staff/Admin Commands', value: (isStaff || isAdmin) ? staffCommands.join('\n') : 'You do not currently have access to staff/admin commands.', inline: false }
-        )
-        .setFooter({ text: 'GG Sports • Commands' })
-        .setTimestamp();
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.reply({ embeds: [buildCommandsGuideEmbed()], ephemeral: true });
       return;
     }
 
@@ -10819,6 +10778,226 @@ function ggBuildShopCartButtons(disabled = false) {
     new ButtonBuilder().setCustomId('shop_checkout_confirm').setLabel('Checkout').setStyle(ButtonStyle.Success).setDisabled(disabled),
     new ButtonBuilder().setCustomId('shop_cart_clear').setLabel('Clear Cart').setStyle(ButtonStyle.Danger).setDisabled(disabled)
   );
+}
+
+
+
+function buildSetupGuideEmbed() {
+  return new EmbedBuilder()
+    .setTitle('GG Sports Setup Guide')
+    .setColor(0x5865F2)
+    .setDescription(
+      'Use this guide in order when setting up a new server or new league. GG Sports is built around hubs, so most features live under /league, /game, /shop, /sportsbook, /profile, /activity, and /premium.'
+    )
+    .addFields(
+      {
+        name: '1. Create the League',
+        value:
+          '**/league create** — creates the league record.\\n' +
+          '**/league info** — checks the league setup.\\n' +
+          '**/league settings** — reviews configured league settings.\\n' +
+          '**/league delete** — disables/removes a league when needed.',
+        inline: false,
+      },
+      {
+        name: '2. Set Staff, League Roles, and Team Roles',
+        value:
+          '**/league staff** — sets the staff role that can manage league tools.\\n' +
+          '**/league teamrole** — connects Discord team roles to the league.\\n' +
+          'Team roles are important for owners, standings, trades, game validation, playoffs, and preventing users from betting on their own games.',
+        inline: false,
+      },
+      {
+        name: '3. Configure Core Channels',
+        value:
+          '**/league standingschannel** — sets where standings panels post.\\n' +
+          '**/league sportsbookchannel** — sets live sportsbook feed alerts.\\n' +
+          '**/league sportsbookfeed** — enables/disables live betting feed.\\n' +
+          '**/league tournamentchannel** — sets tournament content channel.\\n' +
+          '**/ticket panel** and **/ticket supportpanel** — create support dashboards.',
+        inline: false,
+      },
+      {
+        name: '4. Configure Economy + Payouts',
+        value:
+          '**/league currency** — sets currency name/icon and payout values.\\n' +
+          'Use this to control game played payout, win payout, and award payout.\\n' +
+          '**/economy balance** — checks balance.\\n' +
+          '**/economy give/take/transfer** — manages currency.',
+        inline: false,
+      },
+      {
+        name: '5. Set Up the Shop',
+        value:
+          '**/shop createitem** — creates an item for sale.\\n' +
+          '**/shop panel** — posts the permanent shop panel with item buttons.\\n' +
+          '**/shop cart** — users view their cart.\\n' +
+          '**/shop checkout** — users confirm purchases.\\n' +
+          '**/shop inventory** — users/staff view owned items.',
+        inline: false,
+      },
+      {
+        name: '6. Set Up Sportsbook',
+        value:
+          '**/league sportsbookchannel** — choose the feed channel.\\n' +
+          '**/league sportsbookfeed** — turn feed alerts on/off.\\n' +
+          '**/sportsbook create** — manually create a betting line.\\n' +
+          '**/sportsbook limits** — set max bet/max payout.\\n' +
+          '**/sportsbook refund** — refund open bets if a game is cancelled or created wrong.\\n' +
+          '**/sportsbook leaderboards** — view sportsbook performance.',
+        inline: false,
+      },
+      {
+        name: '7. Games, Standings, and Playoffs',
+        value:
+          '**/game add** — adds a scheduled league game. Home team/staff validation applies.\\n' +
+          '**/game report** — reports the result, updates standings, payouts, and sportsbook settlement.\\n' +
+          '**/game standings** — shows current standings.\\n' +
+          '**/league playoffsettings** — sets playoff size/rules.\\n' +
+          '**/league playoffs** — generates a playoff bracket from standings.',
+        inline: false,
+      },
+      {
+        name: '8. Awards, Activity, Legacy, and Profiles',
+        value:
+          '**/league awards** — opens the customizable awards form.\\n' +
+          '**/activity** — shows current engagement/activity tier.\\n' +
+          '**/activityleaderboard** — shows top active users.\\n' +
+          '**/legacy** — shows permanent greatness/legacy ranking.\\n' +
+          '**/profile franchise/activity/earnings/milestones/badges** — shows long-term user identity.',
+        inline: false,
+      },
+      {
+        name: '9. Recommended Launch Order',
+        value:
+          'Create league → set roles → set channels → configure currency/payouts → create shop → create panels → configure sportsbook → add games → report games → generate playoffs → post awards.',
+        inline: false,
+      }
+    )
+    .setFooter({ text: 'GG Sports • Owner Setup Guide' })
+    .setTimestamp();
+}
+
+function buildQuickSetupEmbed() {
+  return new EmbedBuilder()
+    .setTitle('GG Sports Quick Setup')
+    .setColor(0x57F287)
+    .setDescription('Fast checklist for setting up a new league.')
+    .addFields(
+      { name: '1. Create league', value: '/league create', inline: true },
+      { name: '2. Set staff', value: '/league staff', inline: true },
+      { name: '3. Add team roles', value: '/league teamrole', inline: true },
+      { name: '4. Set channels', value: '/league standingschannel\\n/league sportsbookchannel', inline: true },
+      { name: '5. Configure currency', value: '/league currency', inline: true },
+      { name: '6. Create panels', value: '/shop panel\\n/sportsbook board\\n/ticket panel', inline: true },
+      { name: '7. Configure playoffs', value: '/league playoffsettings', inline: true },
+      { name: '8. Start season', value: '/game add\\n/game report', inline: true },
+      { name: '9. Track users', value: '/activity\\n/legacy\\n/profile franchise', inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Quick Setup' })
+    .setTimestamp();
+}
+
+function buildCommandsGuideEmbed() {
+  return new EmbedBuilder()
+    .setTitle('GG Sports Commands')
+    .setColor(0x5865F2)
+    .setDescription('Commands are organized by hub. Use /setupguide for full setup instructions.')
+    .addFields(
+      {
+        name: 'League Setup',
+        value:
+          '/league create, /league delete, /league info, /league list, /league settings\\n' +
+          '/league staff, /league teamrole, /league standingschannel, /league tournamentchannel\\n' +
+          '/league sportsbookchannel, /league sportsbookfeed, /league currency, /league awards',
+        inline: false,
+      },
+      {
+        name: 'Games + Standings',
+        value:
+          '/game add, /game report, /game schedule, /game standings, /game adjuststandings\\n' +
+          '/league playoffsettings, /league playoffs',
+        inline: false,
+      },
+      {
+        name: 'Sportsbook',
+        value:
+          '/sportsbook board, /sportsbook create, /sportsbook place, /sportsbook settle\\n' +
+          '/sportsbook refund, /sportsbook limits, /sportsbook leaderboards, /sportsbook mybets, /sportsbook parlay',
+        inline: false,
+      },
+      {
+        name: 'Shop + Economy',
+        value:
+          '/shop view, /shop panel, /shop createitem, /shop removeitem, /shop cart, /shop checkout, /shop inventory\\n' +
+          '/economy balance, /economy transfer, /economy give, /economy take, /economy richest, /economy transactions',
+        inline: false,
+      },
+      {
+        name: 'Trade System',
+        value:
+          '/trade block, /trade history, /trade team, /trade addcount, /trade removecount, /trade tradecountpanel, /trade offerpanel',
+        inline: false,
+      },
+      {
+        name: 'Tickets + Tournaments',
+        value:
+          '/ticket open, /ticket dispute, /ticket game, /ticket list, /ticket panel, /ticket supportpanel\\n' +
+          '/tournament create, /tournament join, /tournament list, /tournament start, /tournament report',
+        inline: false,
+      },
+      {
+        name: 'Profiles, Activity, Legacy',
+        value:
+          '/profile user, /profile franchise, /profile activity, /profile earnings, /profile milestones, /profile badges\\n' +
+          '/activity, /activityleaderboard, /legacy, /premium status, /premium features',
+        inline: false,
+      },
+      {
+        name: 'Utilities',
+        value:
+          '/ping, /coinflip, /whogotnext, /linkstream, /livestream, /assignrole, /unassignrole',
+        inline: false,
+      }
+    )
+    .setFooter({ text: 'GG Sports • Command Directory' })
+    .setTimestamp();
+}
+
+function buildHelpEmbed() {
+  return new EmbedBuilder()
+    .setTitle('GG Sports Help')
+    .setColor(0xFEE75C)
+    .setDescription(
+      'GG Sports is a league management bot built around hubs. Start with /setupguide if you are setting up a server. Use /commands to browse command categories.'
+    )
+    .addFields(
+      {
+        name: 'New Server Owners',
+        value:
+          '**/setupguide** — full step-by-step setup guide.\\n' +
+          '**/quicksetup** — short setup checklist.\\n' +
+          '**/commands** — categorized command directory.',
+        inline: false,
+      },
+      {
+        name: 'Regular League Members',
+        value:
+          '**/game schedule** and **/game standings** — league info.\\n' +
+          '**/shop view**, **/shop cart**, **/shop checkout** — shop system.\\n' +
+          '**/sportsbook board**, **/sportsbook place**, **/sportsbook mybets** — betting.\\n' +
+          '**/activity**, **/legacy**, **/profile user** — progression.',
+        inline: false,
+      },
+      {
+        name: 'Staff / Admins',
+        value:
+          'Use /setupguide for setup order. Most admin tools live in /league, /game, /shop, /sportsbook, /ticket, and /tournament.',
+        inline: false,
+      }
+    )
+    .setFooter({ text: 'GG Sports • Help' })
+    .setTimestamp();
 }
 
 
