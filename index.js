@@ -924,6 +924,7 @@ function buildCommands() {
       .setDescription('Shop and inventory commands')
       .addSubcommand(sc => sc.setName('view').setDescription('View the server shop'))
       .addSubcommand(sc => sc.setName('panel').setDescription('Staff: create or refresh permanent shop panel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('Staff: set/view shop channel settings').addChannelOption(o => o.setName('channel').setDescription('Shop channel').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('cart').setDescription('View your current shop cart'))
       .addSubcommand(sc => sc.setName('checkout').setDescription('Checkout your current shop cart'))
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
@@ -1005,7 +1006,6 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('sportsbookchannel').setDescription('Set sportsbook live feed channel').addChannelOption(o => o.setName('channel').setDescription('Sportsbook feed channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbookfeed').setDescription('Enable or disable sportsbook live feed').addBooleanOption(o => o.setName('enabled').setDescription('Enable live feed?').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbooksettings').setDescription('View sportsbook live feed settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('shopchannel').setDescription('Set league shop channel').addChannelOption(o => o.setName('channel').setDescription('Shop channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
@@ -4605,6 +4605,55 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
       if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
 
+      if (shopSubcommand === 'settings') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to update shop settings.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('league');
+        const channel = interaction.options.getChannel('channel');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        if (!channel) {
+          const embed = new EmbedBuilder()
+            .setTitle('Shop Settings • ' + activeLeague.league_name)
+            .setColor(0xFEE75C)
+            .addFields(
+              { name: 'Shop Channel', value: activeLeague.shop_channel_id ? '<#' + activeLeague.shop_channel_id + '>' : 'Not set', inline: true }
+            )
+            .setFooter({ text: 'GG Sports • Shop Settings' })
+            .setTimestamp();
+
+          await interaction.reply({ embeds: [embed], ephemeral: true });
+          return;
+        }
+
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that shop channel.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id, shop_channel_id, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (league_id)
+           DO UPDATE SET shop_channel_id = $2, updated_at = NOW()`,
+          [activeLeague.league_id, channel.id]
+        );
+
+        await interaction.reply({ content: 'Shop channel for **' + activeLeague.league_name + '** set to ' + channel.toString() + '.', ephemeral: true });
+        return;
+      }
+
+
       if (shopSubcommand === 'panel') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to create the shop panel.', ephemeral: true });
@@ -5725,13 +5774,6 @@ await interaction.reply({ content: 'Game reported: **' + game.home_team_name + '
         });
         return;
       }
-
-      
-      if (leagueSubcommand === 'shopchannel') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
-          await interaction.reply({ content: 'You do not have permission to update shop settings.', ephemeral: true });
-          return;
-        }
 
         const channel = interaction.options.getChannel('channel');
         const leagueName = interaction.options.getString('league');
