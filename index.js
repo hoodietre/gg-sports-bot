@@ -3537,24 +3537,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setColor(0x5865F2)
         .setDescription('Use this guide to set up a new league with the current hub commands.')
         .addFields(
-          { name: '1. Create the league', value: '`/league create` — create/configure the league. Use `/league game` to set the type: `nba`, `mlb`, `madden`, or `general`.', inline: false },
-          { name: '2. Set staff and team roles', value: '/league staff — set the staff role.
-/league teamrole — run once for every team role in the league.', inline: false },
-          { name: '3. Set core channels', value: '/league standingschannel — standings destination.
-/league tournamentchannel — tournament destination.
-/league sportsbookchannel — live sportsbook feed.', inline: false },
-          { name: '4. Create permanent panels', value: '`/league teamownerspanel` — team owner board.
-/league standingspanel — standings board.
-/league sportsbookpanel — sportsbook board.
-/league ticketpanel + /league supportpanel — support system panels.
-/league tournamentpanel — tournament panel.', inline: false },
+          { name: '1. Create the league', value: '/league create — create/configure the league. Use /league game to set the type: nba, mlb, madden, or general.', inline: false },
+          { name: '2. Set staff and team roles', value: '/league staff — set the staff role.\n/league teamrole — run once for every team role in the league.', inline: false },
+          { name: '3. Set core channels', value: '/league standingschannel — standings destination.\n/league tournamentchannel — tournament destination.\n/league sportsbookchannel — live sportsbook feed.', inline: false },
+          { name: '4. Create permanent panels', value: '/league teamownerspanel — team owner board.\n/league standingspanel — standings board.\n/league sportsbookpanel — sportsbook board.\n/league ticketpanel + /league supportpanel — support system panels.\n/league tournamentpanel — tournament panel.', inline: false },
           { name: '5. Configure economy and payouts', value: '/league currency — currency name/icon, win payout, game played payout, award payout.', inline: false },
-          { name: '6. Configure playoffs', value: '/league playoffsettings — custom playoff count for general leagues.
-NBA: top 8 East + top 8 West.
-MLB: top 8 overall.', inline: false },
-          { name: '7. Check setup', value: '`/league settings` — view league configuration.
-`/league sportsbooksettings` — view sportsbook feed setup.
-`/commands` — view available user/staff commands.', inline: false }
+          { name: '6. Configure playoffs', value: '/league playoffsettings — custom playoff count for general leagues.\nNBA: top 8 East + top 8 West.\nMLB: top 8 overall.', inline: false },
+          { name: '7. Check setup', value: '/league settings — view league configuration.\n/league sportsbooksettings — view sportsbook feed setup.\n/commands — view available user/staff commands.', inline: false }
         )
         .setFooter({ text: 'GG Sports • Setup Guide' })
         .setTimestamp();
