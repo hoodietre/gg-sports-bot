@@ -2730,6 +2730,73 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
+
+function ggBuildShopItemButtonId(itemId) {
+  return 'shop_buy_button:' + String(itemId).split('-')[0];
+}
+
+async function ggBuildPermanentShopPayload(guildId) {
+  const settings = await getCurrencySettings(guildId);
+  const result = await pool.query(
+    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY price ASC, item_name ASC LIMIT 10`,
+    [guildId]
+  );
+
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Permanent Shop')
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Shop' })
+    .setTimestamp();
+
+  embed.setDescription(result.rows.length
+    ? result.rows.map((item, index) =>
+        '**' + (index + 1) + '. ' + item.item_name + '** — ' + settings.currency_icon + ' ' + item.price +
+        (item.stock === null ? '' : ' • Stock: ' + item.stock) +
+        (item.description ? NL + item.description : '')
+      ).join(NL + NL)
+    : 'No active shop items yet.');
+
+  const rows = [];
+  for (let i = 0; i < result.rows.length; i += 5) {
+    const row = new ActionRowBuilder();
+    for (const item of result.rows.slice(i, i + 5)) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(ggBuildShopItemButtonId(item.id))
+          .setLabel(String(result.rows.indexOf(item) + 1))
+          .setStyle(ButtonStyle.Primary)
+      );
+    }
+    rows.push(row);
+  }
+
+  return { embeds: [embed], components: rows };
+}
+
+async function ggUpdatePermanentShopPanel(guild) {
+  if (!guild) return null;
+  const panelResult = await pool.query(`SELECT * FROM shop_panels WHERE guild_id = $1 LIMIT 1`, [guild.id]);
+  const panel = panelResult.rows[0];
+  if (!panel) return null;
+
+  const channel = await guild.channels.fetch(panel.channel_id).catch(() => null);
+  if (!channel || !channel.isTextBased()) return null;
+
+  const payload = await ggBuildPermanentShopPayload(guild.id);
+  const message = await channel.messages.fetch(panel.message_id).catch(() => null);
+
+  if (message) {
+    await message.edit(payload).catch(() => null);
+    return message;
+  }
+
+  const newMessage = await channel.send(payload);
+  await pool.query(`UPDATE shop_panels SET message_id = $1, updated_at = NOW() WHERE guild_id = $2`, [newMessage.id, guild.id]);
+  return newMessage;
+}
+
+
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isModalSubmit()) {
