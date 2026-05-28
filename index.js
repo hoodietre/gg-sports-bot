@@ -1198,19 +1198,26 @@ async function userCanUseLeagueSetup(interaction, league = null) {
 }
 
 async function findTeamOwnerByRoleId(guild, roleId) {
-  await guild.members.fetch();
   const role = await guild.roles.fetch(roleId).catch(() => null);
   if (!role) return null;
-  const owners = guild.members.cache.filter(member => !member.user.bot && member.roles.cache.has(roleId));
-  return owners.first() || null;
+
+  const cachedOwner = role.members.find(member => !member.user.bot);
+  if (cachedOwner) return cachedOwner;
+
+  // Avoid guild-wide member fetches here. Discord rate limits opcode 8 heavily.
+  // If the owner is not cached, payouts safely skip instead of breaking /game report.
+  return null;
 }
 
 async function findTeamOwnerByRoleName(guild, teamRoleName) {
-  await guild.members.fetch();
-  const role = guild.roles.cache.find(r => r.name === teamRoleName);
+  const role = guild.roles.cache.find(r => r.name === teamRoleName) || await guild.roles.fetch().then(roles => roles.find(r => r.name === teamRoleName)).catch(() => null);
   if (!role) return null;
-  const owners = guild.members.cache.filter(member => !member.user.bot && member.roles.cache.has(role.id));
-  return owners.first() || null;
+
+  const cachedOwner = role.members.find(member => !member.user.bot);
+  if (cachedOwner) return cachedOwner;
+
+  // Avoid guild-wide member fetches here. Discord rate limits opcode 8 heavily.
+  return null;
 }
 
 async function getMemberTeamForLeague(member, league) {
@@ -1303,7 +1310,6 @@ function buildOfferTradePanelEmbed(leagueName = 'League') {
 async function buildTeamOwnersEmbed(guild, league = null) {
   const lines = [];
   const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : null;
-  await guild.members.fetch();
 
   if (teamRoles?.length) {
     for (const team of teamRoles) {
@@ -1312,8 +1318,8 @@ async function buildTeamOwnersEmbed(guild, league = null) {
         lines.push(`**${team.role_name}** — Role not found`);
         continue;
       }
-      const owners = guild.members.cache.filter(member => !member.user.bot && member.roles.cache.has(role.id));
-      lines.push(owners.size === 0 ? `**${team.role_name}** — Unassigned` : `**${team.role_name}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
+      const owners = role.members.filter(member => !member.user.bot);
+      lines.push(owners.size === 0 ? `**${team.role_name}** — Unassigned or not cached` : `**${team.role_name}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
     }
   } else {
     for (const teamName of TEAM_ROLE_NAMES) {
@@ -1322,8 +1328,8 @@ async function buildTeamOwnersEmbed(guild, league = null) {
         lines.push(`**${teamName}** — Role not found`);
         continue;
       }
-      const owners = guild.members.cache.filter(member => !member.user.bot && member.roles.cache.has(role.id));
-      lines.push(owners.size === 0 ? `**${teamName}** — Unassigned` : `**${teamName}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
+      const owners = role.members.filter(member => !member.user.bot);
+      lines.push(owners.size === 0 ? `**${teamName}** — Unassigned or not cached` : `**${teamName}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
     }
   }
 
@@ -4032,6 +4038,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const sportsbookText = sportsbookSettlement
           ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets, paid **' + settings.currency_icon + ' ' + sportsbookSettlement.totalPaid + '**.'
           : '';
+        if (!homeOwner || !awayOwner) {
+          payoutLines.push('Note: one or more team owners were not cached, so owner payout may be skipped. Have the owner run any command or retry later if needed.');
+        }
+
         const payoutText = payoutLines.length ? String.fromCharCode(10) + payoutLines.join(String.fromCharCode(10)) : '';
 
         await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. Winner: **' + winnerName + '**.' + payoutText + sportsbookText, ephemeral: false });
