@@ -18,6 +18,7 @@ import {
 } from 'discord.js';
 import pkg from 'pg';
 import { randomUUID } from 'crypto';
+import zlib from 'zlib';
 
 const { Pool } = pkg;
 
@@ -11857,16 +11858,259 @@ function buildVisualAvatarSvg(userLabel, avatar, preview = {}) {
 </svg>`;
 }
 
+
+function avatarHexToRgb(hex, fallback = [255, 255, 255]) {
+  const clean = String(hex || '').replace('#', '');
+  if (clean.length !== 6) return fallback;
+  return [
+    parseInt(clean.slice(0, 2), 16),
+    parseInt(clean.slice(2, 4), 16),
+    parseInt(clean.slice(4, 6), 16),
+  ];
+}
+
+function avatarCrc32(buffer) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buffer.length; i++) {
+    crc ^= buffer[i];
+    for (let j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function avatarPngChunk(type, data) {
+  const typeBuffer = Buffer.from(type);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(avatarCrc32(Buffer.concat([typeBuffer, data])), 0);
+  return Buffer.concat([length, typeBuffer, data, crc]);
+}
+
+function avatarEncodePng(width, height, rgba) {
+  const raw = Buffer.alloc((width * 4 + 1) * height);
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * (width * 4 + 1);
+    raw[rowStart] = 0;
+    rgba.copy(raw, rowStart + 1, y * width * 4, (y + 1) * width * 4);
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    avatarPngChunk('IHDR', ihdr),
+    avatarPngChunk('IDAT', zlib.deflateSync(raw)),
+    avatarPngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function avatarCanvas(width, height, color = [24, 24, 27, 255]) {
+  const buffer = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < width * height; i++) {
+    const p = i * 4;
+    buffer[p] = color[0];
+    buffer[p + 1] = color[1];
+    buffer[p + 2] = color[2];
+    buffer[p + 3] = color[3];
+  }
+  return buffer;
+}
+
+function avatarPixel(buffer, width, height, x, y, color) {
+  if (x < 0 || y < 0 || x >= width || y >= height) return;
+  const p = (Math.floor(y) * width + Math.floor(x)) * 4;
+  buffer[p] = color[0];
+  buffer[p + 1] = color[1];
+  buffer[p + 2] = color[2];
+  buffer[p + 3] = color[3] ?? 255;
+}
+
+function avatarRect(buffer, width, height, x, y, w, h, color) {
+  for (let yy = Math.max(0, y); yy < Math.min(height, y + h); yy++) {
+    for (let xx = Math.max(0, x); xx < Math.min(width, x + w); xx++) {
+      avatarPixel(buffer, width, height, xx, yy, color);
+    }
+  }
+}
+
+function avatarEllipse(buffer, width, height, cx, cy, rx, ry, color) {
+  const minX = Math.floor(cx - rx);
+  const maxX = Math.ceil(cx + rx);
+  const minY = Math.floor(cy - ry);
+  const maxY = Math.ceil(cy + ry);
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const dx = (x - cx) / rx;
+      const dy = (y - cy) / ry;
+      if (dx * dx + dy * dy <= 1) avatarPixel(buffer, width, height, x, y, color);
+    }
+  }
+}
+
+function avatarLine(buffer, width, height, x0, y0, x1, y1, thickness, color) {
+  const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+  for (let i = 0; i <= steps; i++) {
+    const t = steps === 0 ? 0 : i / steps;
+    const x = x0 + (x1 - x0) * t;
+    const y = y0 + (y1 - y0) * t;
+    avatarEllipse(buffer, width, height, x, y, thickness, thickness, color);
+  }
+}
+
+function avatarTriangle(buffer, width, height, points, color) {
+  const [p0, p1, p2] = points;
+  const minX = Math.floor(Math.min(p0[0], p1[0], p2[0]));
+  const maxX = Math.ceil(Math.max(p0[0], p1[0], p2[0]));
+  const minY = Math.floor(Math.min(p0[1], p1[1], p2[1]));
+  const maxY = Math.ceil(Math.max(p0[1], p1[1], p2[1]));
+  const area = (p1[1] - p2[1]) * (p0[0] - p2[0]) + (p2[0] - p1[0]) * (p0[1] - p2[1]);
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const a = ((p1[1] - p2[1]) * (x - p2[0]) + (p2[0] - p1[0]) * (y - p2[1])) / area;
+      const b = ((p2[1] - p0[1]) * (x - p2[0]) + (p0[0] - p2[0]) * (y - p2[1])) / area;
+      const c = 1 - a - b;
+      if (a >= 0 && b >= 0 && c >= 0) avatarPixel(buffer, width, height, x, y, color);
+    }
+  }
+}
+
+function buildVisualAvatarPng(userLabel, avatar, preview = {}) {
+  const width = 900;
+  const height = 1200;
+  const top = preview.top || avatar.equipped_top || 'Basic Tee';
+  const bottom = preview.bottom || avatar.equipped_bottom || 'Plain Shorts';
+  const headwear = preview.headwear || avatar.equipped_headwear || 'none';
+  const accessory = preview.accessory || avatar.equipped_accessory || 'Ghost Wristband';
+  const footwear = preview.footwear || avatar.equipped_footwear || 'Basic Sneakers';
+  const pet = preview.pet || avatar.equipped_pet || 'none';
+  const effect = preview.effect || avatar.equipped_effect || 'none';
+  const background = preview.background || avatar.equipped_background || 'Locker Room';
+
+  const bg = String(background).toLowerCase().includes('court')
+    ? [120, 53, 15, 255]
+    : String(background).toLowerCase().includes('tunnel')
+      ? [17, 24, 39, 255]
+      : [24, 24, 27, 255];
+
+  const img = avatarCanvas(width, height, bg);
+  const gold = [250, 204, 21, 255];
+  const white = [255, 255, 255, 255];
+  const black = [15, 23, 42, 255];
+  const skin = [216, 164, 127, 255];
+  const topColor = [...avatarHexToRgb(avatarColorForItem(top, '#ffffff')), 255];
+  const bottomColor = [...avatarHexToRgb(avatarColorForItem(bottom, '#2f3542')), 255];
+  const shoeColor = [...avatarHexToRgb(avatarColorForItem(footwear, '#f8fafc')), 255];
+  const chainColor = [...avatarHexToRgb(avatarColorForItem(accessory, '#f5d742')), 255];
+
+  // panel/background
+  avatarRect(img, width, height, 65, 75, 770, 1050, [0, 0, 0, 55]);
+  avatarRect(img, width, height, 70, 80, 10, 1040, gold);
+
+  // aura/effect
+  if (String(effect).toLowerCase().includes('aura')) {
+    for (let r = 260; r > 0; r -= 8) {
+      avatarEllipse(img, width, height, 450, 570, r, r, [250, 204, 21, Math.max(8, Math.floor(60 * (1 - r / 270)))]);
+    }
+  }
+
+  // shadow
+  avatarEllipse(img, width, height, 450, 1015, 220, 38, [0, 0, 0, 95]);
+
+  // legs and body
+  avatarLine(img, width, height, 385, 675, 380, 960, 40, skin);
+  avatarLine(img, width, height, 515, 675, 520, 960, 40, skin);
+
+  // shorts/bottom
+  avatarRect(img, width, height, 345, 655, 105, 210, bottomColor);
+  avatarRect(img, width, height, 450, 655, 105, 210, bottomColor);
+  avatarRect(img, width, height, 345, 655, 210, 70, bottomColor);
+
+  // shoes
+  avatarEllipse(img, width, height, 375, 995, 70, 35, shoeColor);
+  avatarEllipse(img, width, height, 525, 995, 70, 35, shoeColor);
+  avatarRect(img, width, height, 330, 1000, 95, 8, black);
+  avatarRect(img, width, height, 475, 1000, 95, 8, black);
+
+  // arms
+  avatarLine(img, width, height, 345, 465, 250, 675, 28, skin);
+  avatarLine(img, width, height, 555, 465, 650, 675, 28, skin);
+  avatarEllipse(img, width, height, 245, 685, 30, 30, skin);
+  avatarEllipse(img, width, height, 655, 685, 30, 30, skin);
+
+  // torso/top
+  avatarTriangle(img, width, height, [[320, 455], [580, 455], [545, 690]], topColor);
+  avatarTriangle(img, width, height, [[320, 455], [545, 690], [355, 690]], topColor);
+  avatarLine(img, width, height, 340, 470, 255, 650, 32, topColor);
+  avatarLine(img, width, height, 560, 470, 645, 650, 32, topColor);
+
+  // neck/head/hair
+  avatarRect(img, width, height, 410, 400, 80, 80, skin);
+  avatarEllipse(img, width, height, 450, 330, 90, 95, skin);
+  avatarEllipse(img, width, height, 450, 285, 92, 45, black);
+
+  // face
+  const hasShades = String(headwear).toLowerCase().includes('shades') || String(headwear).toLowerCase().includes('betting');
+  if (hasShades) {
+    avatarRect(img, width, height, 385, 315, 55, 28, black);
+    avatarRect(img, width, height, 460, 315, 55, 28, black);
+    avatarRect(img, width, height, 435, 327, 30, 8, black);
+  } else {
+    avatarEllipse(img, width, height, 420, 330, 7, 7, black);
+    avatarEllipse(img, width, height, 480, 330, 7, 7, black);
+  }
+  avatarLine(img, width, height, 420, 370, 480, 370, 3, [124, 45, 18, 255]);
+
+  // headwear
+  if (String(headwear).toLowerCase().includes('crown')) {
+    avatarTriangle(img, width, height, [[370, 250], [405, 170], [430, 250]], gold);
+    avatarTriangle(img, width, height, [[425, 250], [450, 180], [480, 250]], gold);
+    avatarTriangle(img, width, height, [[475, 250], [510, 170], [535, 250]], gold);
+    avatarRect(img, width, height, 370, 245, 165, 30, gold);
+  }
+
+  // accessory
+  if (String(accessory).toLowerCase().includes('chain')) {
+    avatarLine(img, width, height, 395, 455, 450, 500, 7, chainColor);
+    avatarLine(img, width, height, 505, 455, 450, 500, 7, chainColor);
+  }
+  if (String(accessory).toLowerCase().includes('watch')) avatarRect(img, width, height, 625, 640, 50, 30, gold);
+  if (String(accessory).toLowerCase().includes('wristband')) avatarRect(img, width, height, 220, 640, 55, 30, gold);
+
+  // GG on shirt
+  avatarRect(img, width, height, 405, 530, 90, 55, [0, 0, 0, 70]);
+
+  // pet
+  if (String(pet).toLowerCase() !== 'none') {
+    avatarEllipse(img, width, height, 675, 930, 75, 50, gold);
+    avatarEllipse(img, width, height, 640, 895, 35, 35, gold);
+    avatarEllipse(img, width, height, 630, 888, 5, 5, black);
+    avatarEllipse(img, width, height, 650, 888, 5, 5, black);
+  }
+
+  return avatarEncodePng(width, height, img);
+}
+
+
 function buildAvatarAttachment(user, avatar, preview = {}) {
-  const svg = buildVisualAvatarSvg(user.username, avatar, preview);
-  return new AttachmentBuilder(Buffer.from(svg, 'utf8'), { name: 'avatar.svg' });
+  const png = buildVisualAvatarPng(user.username, avatar, preview);
+  return new AttachmentBuilder(png, { name: 'avatar.png' });
 }
 
 function buildVisualAvatarEmbed(user, avatar, previewLabel = null) {
   const embed = new EmbedBuilder()
     .setTitle((previewLabel ? 'Preview • ' : '') + user.username + ' Avatar')
     .setColor(0xFEE75C)
-    .setImage('attachment://avatar.svg')
+    .setImage('attachment://avatar.png')
     .addFields(
       { name: 'Headwear', value: avatar.equipped_headwear || 'none', inline: true },
       { name: 'Top', value: avatar.equipped_top || 'Basic Tee', inline: true },
