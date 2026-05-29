@@ -830,6 +830,9 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS item_category TEXT`);
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS avatar_slot TEXT`);
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS preview_style TEXT`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS rarity TEXT NOT NULL DEFAULT 'common'`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_cosmetic BOOLEAN NOT NULL DEFAULT FALSE`);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_badges (
@@ -1014,7 +1017,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-      .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Staff: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)))
+.addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false))),
 
@@ -2880,6 +2884,7 @@ async function ggBuildPermanentShopPayload(guildId) {
     ? result.rows.map((item, index) =>
         '**' + (index + 1) + '. ' + item.item_name + '** — ' + settings.currency_icon + ' ' + item.price +
         (item.stock === null ? '' : ' • Stock: ' + item.stock) +
+        (item.is_cosmetic ? ' • ' + rarityIcon(item.rarity) + ' ' + (item.rarity || 'common') + ' • ' + (item.avatar_slot || inferAvatarSlotFromItem(item)) : '') +
         (item.description ? NL + item.description : '')
       ).join(NL + NL)
     : 'No active shop items yet.');
@@ -4948,6 +4953,77 @@ if (interaction.commandName === 'trade') {
     if (interaction.commandName === 'shop') {
       if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
+      if (shopSubcommand === 'createcosmetic') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to create cosmetic shop items.', ephemeral: true });
+          return;
+        }
+
+        const name = interaction.options.getString('name');
+        const rawSlot = interaction.options.getString('slot');
+        const slot = normalizeAvatarSlot(rawSlot);
+        const price = interaction.options.getInteger('price');
+        const rarity = String(interaction.options.getString('rarity') || 'common').toLowerCase();
+        const stock = interaction.options.getInteger('stock');
+        const description = interaction.options.getString('description') || 'Visual avatar cosmetic. Use /shop preview before buying.';
+
+        if (!VISUAL_AVATAR_SLOTS.includes(slot)) {
+          await interaction.reply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', '), ephemeral: true });
+          return;
+        }
+
+        if (!['common', 'uncommon', 'rare', 'epic', 'legendary'].includes(rarity)) {
+          await interaction.reply({ content: 'Invalid rarity. Use common, uncommon, rare, epic, or legendary.', ephemeral: true });
+          return;
+        }
+
+        if (!Number.isInteger(price) || price < 0) {
+          await interaction.reply({ content: 'Price must be 0 or higher.', ephemeral: true });
+          return;
+        }
+
+        const itemId = randomUUID();
+        await pool.query(
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10)`,
+          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id]
+        );
+
+        await pool.query(
+          `INSERT INTO avatar_catalog (id, guild_id, item_name, slot, rarity, source, price, is_active)
+           VALUES ($1, $2, $3, $4, $5, 'shop', $6, TRUE)`,
+          [randomUUID(), interaction.guild.id, name, slot, rarity, price]
+        ).catch(() => null);
+
+        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+
+        const avatar = await ensureVisualAvatar(interaction.guild.id, interaction.user.id);
+        const previewAvatar = { ...avatar };
+        const columnMap = {
+          headwear: 'equipped_headwear',
+          top: 'equipped_top',
+          bottom: 'equipped_bottom',
+          accessory: 'equipped_accessory',
+          footwear: 'equipped_footwear',
+          pet: 'equipped_pet',
+          effect: 'equipped_effect',
+          background: 'equipped_background',
+        };
+        previewAvatar[columnMap[slot]] = name;
+
+        const attachment = buildAvatarAttachment(interaction.user, previewAvatar);
+        const embed = buildVisualAvatarEmbed(interaction.user, previewAvatar, name)
+          .addFields(
+            { name: 'Created Cosmetic', value: rarityIcon(rarity) + ' **' + name + '**', inline: true },
+            { name: 'Slot', value: slot, inline: true },
+            { name: 'Price', value: String(price), inline: true }
+          );
+
+        await interaction.reply({ content: 'Cosmetic shop item created.', embeds: [embed], files: [attachment], ephemeral: true });
+        return;
+      }
+
+
 
       if (shopSubcommand === 'preview') {
         const itemName = interaction.options.getString('item');
@@ -4980,7 +5056,9 @@ if (interaction.commandName === 'trade') {
         const embed = buildVisualAvatarEmbed(interaction.user, previewAvatar, item.item_name)
           .addFields(
             { name: 'Preview Slot', value: slot, inline: true },
-            { name: 'Price', value: item.price !== undefined && item.price !== null ? String(item.price) : 'Unlock/Not for sale', inline: true }
+            { name: 'Rarity', value: rarityIcon(item.rarity) + ' ' + (item.rarity || 'common'), inline: true },
+            { name: 'Price', value: item.price !== undefined && item.price !== null ? String(item.price) : 'Unlock/Not for sale', inline: true },
+            { name: 'How to Buy', value: 'Use the numbered button on /shop panel or add it to your cart, then equip with /avatar equip.', inline: false }
           );
 
         await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
@@ -5137,6 +5215,12 @@ if (shopSubcommand === 'view') {
 
         const avatarSlot = inferAvatarSlotFromItem(item);
         await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_purchase').catch(() => null);
+
+        const avatarSlot = inferAvatarSlotFromItem(item);
+        await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_button_cosmetic').catch(() => null);
+
+        const avatarSlot = inferAvatarSlotFromItem(item);
+        await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_buy_cosmetic_grant').catch(() => null);
 
         await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
         return;
@@ -11337,7 +11421,7 @@ function buildSetupGuideEmbed() {
       {
         name: '5. Set Up the Shop',
         value:
-          '**/shop createitem** — creates an item for sale.\\n' +
+          '**/shop createitem** — creates an item for sale.\n**/shop createcosmetic** — creates a visual avatar cosmetic.\n**/shop preview** — previews cosmetics before purchase.\\n' +
           '**/shop panel** — posts the permanent shop panel with item buttons.\\n' +
           '**/shop cart** — users view their cart.\\n' +
           '**/shop checkout** — users confirm purchases.\\n' +
@@ -11437,7 +11521,7 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Shop + Economy',
         value:
-          '/shop view, /shop panel, /shop createitem, /shop removeitem, /shop cart, /shop checkout, /shop inventory\\n' +
+          '/shop view, /shop panel, /shop createitem, /shop createcosmetic, /shop preview, /shop removeitem, /shop cart, /shop checkout, /shop inventory\\n' +
           '/economy balance, /economy transfer, /economy give, /economy take, /economy richest, /economy transactions',
         inline: false,
       },
@@ -11652,9 +11736,23 @@ function avatarColorForItem(itemName, fallback) {
   if (item.includes('crown')) return '#ffd700';
   if (item.includes('betting') || item.includes('shades')) return '#111827';
   if (item.includes('hoodie')) return '#111111';
+  if (item.includes('jersey')) return '#2563eb';
+  if (item.includes('championship')) return '#7c3aed';
+  if (item.includes('varsity')) return '#dc2626';
   if (item.includes('basic tee')) return '#ffffff';
+  if (item.includes('black')) return '#111111';
+  if (item.includes('white')) return '#ffffff';
+  if (item.includes('red')) return '#dc2626';
+  if (item.includes('blue')) return '#2563eb';
+  if (item.includes('green')) return '#16a34a';
+  if (item.includes('purple')) return '#7c3aed';
+  if (item.includes('pink')) return '#db2777';
+  if (item.includes('orange')) return '#ea580c';
   if (item.includes('shorts')) return '#2f3542';
+  if (item.includes('joggers')) return '#111827';
+  if (item.includes('pants')) return '#374151';
   if (item.includes('sneakers')) return '#f8fafc';
+  if (item.includes('slides')) return '#fde68a';
   return fallback;
 }
 
@@ -12170,6 +12268,29 @@ async function getShopPreviewItem(guildId, itemName) {
   );
 
   return catalog.rows[0] || null;
+}
+
+
+function rarityIcon(rarity) {
+  const r = String(rarity || 'common').toLowerCase();
+  if (r === 'legendary') return '👑';
+  if (r === 'epic') return '💎';
+  if (r === 'rare') return '🔷';
+  if (r === 'uncommon') return '🟢';
+  return '⚪';
+}
+
+function normalizeAvatarSlot(slot) {
+  const s = String(slot || '').toLowerCase();
+  if (s === 'hat' || s === 'glasses' || s === 'hair') return 'headwear';
+  if (s === 'tops' || s === 'shirt' || s === 'hoodie' || s === 'jersey') return 'top';
+  if (s === 'bottoms' || s === 'shorts' || s === 'pants') return 'bottom';
+  if (s === 'accessories') return 'accessory';
+  if (s === 'shoes' || s === 'sneakers') return 'footwear';
+  if (s === 'pets') return 'pet';
+  if (s === 'effects') return 'effect';
+  if (s === 'backgrounds') return 'background';
+  return s;
 }
 
 function inferAvatarSlotFromItem(item) {
