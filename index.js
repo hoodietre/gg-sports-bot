@@ -1021,6 +1021,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
       .addSubcommand(sc => sc.setName('list').setDescription('List leagues'))
       .addSubcommand(sc => sc.setName('staff').setDescription('Set staff role').addRoleOption(o => o.setName('role').setDescription('Staff role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('role').setDescription('Set/view/clear league member role').addStringOption(o => o.setName('action').setDescription('set, view, or clear').setRequired(true)).addRoleOption(o => o.setName('role').setDescription('League member role').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('standingschannel').setDescription('Set standings channel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('standingspanel').setDescription('Create standings panel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('tournamentchannel').setDescription('Set tournament channel').addChannelOption(o => o.setName('channel').setDescription('Tournament channel').setRequired(true)))
@@ -5678,7 +5679,67 @@ if (shopSubcommand === 'view') {
       if (!interaction.guild) return;
       const leagueSubcommand = interaction.options.getSubcommand();
 
-      if (leagueSubcommand === 'sportsbookchannel') {
+      
+      if (leagueSubcommand === 'role') {
+        const action = String(interaction.options.getString('action') || '').toLowerCase();
+        const selectedRole = interaction.options.getRole('role');
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        if (!['set', 'view', 'clear'].includes(action)) {
+          await interaction.reply({ content: 'Action must be **set**, **view**, or **clear**.', ephemeral: true });
+          return;
+        }
+
+        if (action === 'view') {
+          await interaction.reply({
+            content: 'League member role for **' + activeLeague.league_name + '**: ' + (activeLeague.league_role_id ? '<@&' + activeLeague.league_role_id + '>' : 'Not set.'),
+            ephemeral: true,
+          });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to update the league role.', ephemeral: true });
+          return;
+        }
+
+        if (action === 'clear') {
+          await pool.query(
+            `INSERT INTO league_settings (league_id, league_role_id, updated_at)
+             VALUES ($1, NULL, NOW())
+             ON CONFLICT (league_id)
+             DO UPDATE SET league_role_id = NULL, updated_at = NOW()`,
+            [activeLeague.league_id]
+          );
+
+          await interaction.reply({ content: 'League member role cleared for **' + activeLeague.league_name + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!selectedRole) {
+          await interaction.reply({ content: 'Please provide a role when using action **set**.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id, league_role_id, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (league_id)
+           DO UPDATE SET league_role_id = $2, updated_at = NOW()`,
+          [activeLeague.league_id, selectedRole.id]
+        );
+
+        await interaction.reply({ content: 'League member role for **' + activeLeague.league_name + '** set to ' + selectedRole.toString() + '.', ephemeral: true });
+        return;
+      }
+
+if (leagueSubcommand === 'sportsbookchannel') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to update sportsbook settings.', ephemeral: true });
           return;
@@ -6051,6 +6112,7 @@ if (shopSubcommand === 'view') {
           .setColor(0x5865F2)
           .addFields(
             { name: 'Game', value: activeLeague.game_key || 'general', inline: true },
+            { name: 'League Role', value: activeLeague.league_role_id ? '<@&' + activeLeague.league_role_id + '>' : 'Not set', inline: true },
             { name: 'League Role', value: activeLeague.league_role_id ? '<@&' + activeLeague.league_role_id + '>' : 'Not set', inline: true },
             { name: 'Staff Role', value: activeLeague.staff_role_id ? '<@&' + activeLeague.staff_role_id + '>' : 'Not set', inline: true },
             { name: 'Standings Channel', value: activeLeague.standings_channel_id ? '<#' + activeLeague.standings_channel_id + '>' : 'Not set', inline: true },
@@ -11123,7 +11185,7 @@ function buildSetupGuideEmbed() {
       {
         name: '2. Set Staff, League Roles, and Team Roles',
         value:
-          '**/league staff** — sets the staff role that can manage league tools.\\n' +
+          '**/league role** — sets the main league member role.\n**/league staff** — sets the staff role that can manage league tools.\\n' +
           '**/league teamrole** — connects Discord team roles to the league.\\n' +
           'Team roles are important for owners, standings, trades, game validation, playoffs, and preventing users from betting on their own games.',
         inline: false,
@@ -11191,7 +11253,7 @@ function buildSetupGuideEmbed() {
       {
         name: '9. Recommended Launch Order',
         value:
-          'Create league → set roles → set channels → configure currency/payouts → create shop → create panels → configure sportsbook → add games → report games → generate playoffs → post awards.',
+          'Create league → set league role/staff/team roles → set channels → configure currency/payouts → create shop → create panels → configure sportsbook → add games → report games → generate playoffs → post awards.',
         inline: false,
       }
     )
@@ -11206,7 +11268,7 @@ function buildQuickSetupEmbed() {
     .setDescription('Fast checklist for setting up a new league.')
     .addFields(
       { name: '1. Create league', value: '/league create', inline: true },
-      { name: '2. Set staff', value: '/league staff', inline: true },
+      { name: '2. Set roles', value: '/league role\\n/league staff\\n/league teamrole', inline: true },
       { name: '3. Add team roles', value: '/league teamrole', inline: true },
       { name: '4. Set channels', value: '/league standingschannel\\n/league sportsbookchannel', inline: true },
       { name: '5. Configure currency', value: '/league currency', inline: true },
@@ -11229,7 +11291,7 @@ function buildCommandsGuideEmbed() {
         name: 'League Setup',
         value:
           '/league create, /league delete, /league info, /league list, /league settings\\n' +
-          '/league staff, /league teamrole, /league standingschannel, /league tournamentchannel\\n' +
+          '/league role, /league staff, /league teamrole, /league standingschannel, /league tournamentchannel\\n' +
           '/league sportsbookchannel, /league sportsbookfeed, /league currency, /league awards',
         inline: false,
       },
