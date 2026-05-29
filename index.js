@@ -1043,6 +1043,7 @@ function buildCommands() {
       .setDescription('League game and standings commands')
       .addSubcommand(sc => sc.setName('add').setDescription('Add scheduled game').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true)).addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true)).addStringOption(o => o.setName('date').setDescription('Date/time').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('report').setDescription('Report completed game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true)).addIntegerOption(o => o.setName('home_score').setDescription('Home score').setRequired(true)).addIntegerOption(o => o.setName('away_score').setDescription('Away score').setRequired(true)))
+      .addSubcommand(sc => sc.setName('reset').setDescription('Staff: reset a reported game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
       .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true))),
@@ -3948,7 +3949,113 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!interaction.guild) return;
       const gameSubcommand = interaction.options.getSubcommand();
 
-      if (gameSubcommand === 'report') {
+      
+      if (gameSubcommand === 'reset') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to reset games.', ephemeral: true });
+          return;
+        }
+
+        const gameInput = interaction.options.getString('game_id');
+        const reason = interaction.options.getString('reason') || 'Game reset';
+
+        const gameResult = await pool.query(
+          `SELECT * FROM league_games
+           WHERE guild_id = $1 AND id::text LIKE $2
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [interaction.guild.id, gameInput + '%']
+        );
+
+        if (!gameResult.rows.length) {
+          await interaction.reply({ content: 'Could not find that game ID.', ephemeral: true });
+          return;
+        }
+
+        const game = gameResult.rows[0];
+        const activeLeague = await getLeagueById(game.league_id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find the league for that game.', ephemeral: true });
+          return;
+        }
+
+        if (game.status !== 'final') {
+          await interaction.reply({ content: 'Only completed/final games can be reset.', ephemeral: true });
+          return;
+        }
+
+        const homeScore = Number(game.home_score || 0);
+        const awayScore = Number(game.away_score || 0);
+        const homeWon = game.winner_team_role_id === game.home_team_role_id;
+        const awayWon = game.winner_team_role_id === game.away_team_role_id;
+
+        const winnerRoleId = homeWon ? game.home_team_role_id : game.away_team_role_id;
+        const loserRoleId = homeWon ? game.away_team_role_id : game.home_team_role_id;
+        const winnerPointsFor = homeWon ? homeScore : awayScore;
+        const winnerPointsAgainst = homeWon ? awayScore : homeScore;
+        const loserPointsFor = homeWon ? awayScore : homeScore;
+        const loserPointsAgainst = homeWon ? homeScore : awayScore;
+        const winnerStandingsPoints = isMlbLeague(activeLeague) ? 3 : 0;
+        const loserStandingsPoints = isMlbLeague(activeLeague) ? 1 : 0;
+
+        if (homeWon || awayWon) {
+          await pool.query(
+            `UPDATE league_standings
+             SET wins = GREATEST(0, wins - 1),
+                 standings_points = GREATEST(0, standings_points - $1),
+                 points_for = GREATEST(0, points_for - $2),
+                 points_against = GREATEST(0, points_against - $3),
+                 updated_at = NOW()
+             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+            [winnerStandingsPoints, winnerPointsFor, winnerPointsAgainst, interaction.guild.id, game.league_id, winnerRoleId]
+          );
+
+          await pool.query(
+            `UPDATE league_standings
+             SET losses = GREATEST(0, losses - 1),
+                 standings_points = GREATEST(0, standings_points - $1),
+                 points_for = GREATEST(0, points_for - $2),
+                 points_against = GREATEST(0, points_against - $3),
+                 updated_at = NOW()
+             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+            [loserStandingsPoints, loserPointsFor, loserPointsAgainst, interaction.guild.id, game.league_id, loserRoleId]
+          );
+        }
+
+        await pool.query(
+          `UPDATE league_games
+           SET status = 'scheduled',
+               home_score = NULL,
+               away_score = NULL,
+               winner_team_role_id = NULL,
+               reported_by_user_id = NULL,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [game.id]
+        );
+
+        if (typeof updateStandingsPanel === 'function') {
+          await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
+        }
+
+        const sportsbookReset = await resetSportsbookForLeagueGame(interaction.guild, game, interaction.user.id, reason).catch(error => {
+          console.error('Sportsbook reset failed:', error);
+          return null;
+        });
+
+        const resetText = sportsbookReset?.reset
+          ? ' Sportsbook reopened and **' + sportsbookReset.refundedCount + '** bets reset/refunded.'
+          : ' No linked sportsbook game found.';
+
+        await interaction.reply({
+          content: 'Game reset: **' + game.home_team_name + ' vs ' + game.away_team_name + '**. Standings rolled back.' + resetText,
+          ephemeral: false,
+        });
+        return;
+      }
+
+if (gameSubcommand === 'report') {
         const gameInput = interaction.options.getString('game_id');
         const homeScore = interaction.options.getInteger('home_score');
         const awayScore = interaction.options.getInteger('away_score');
@@ -10439,6 +10546,90 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
 
   await postSportsbookFeed(interaction.guild, feedEmbed);
   return sportsbookGame;
+}
+
+
+async function resetSportsbookForLeagueGame(guild, leagueGame, issuedByUserId, reason = 'Game reset') {
+  if (!guild || !leagueGame) return { reset: false, refundedCount: 0, refundedAmount: 0 };
+
+  const result = await pool.query(
+    `SELECT * FROM sportsbook_games
+     WHERE guild_id = $1 AND league_game_id = $2
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [guild.id, leagueGame.id]
+  );
+
+  if (!result.rows.length) return { reset: false, refundedCount: 0, refundedAmount: 0 };
+
+  const sportsbookGame = result.rows[0];
+  const settings = await getCurrencySettings(guild.id);
+
+  const bets = await pool.query(
+    `SELECT * FROM sportsbook_bets
+     WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status IN ('open','won','lost')`,
+    [guild.id, sportsbookGame.id]
+  );
+
+  let refundedCount = 0;
+  let refundedAmount = 0;
+
+  for (const bet of bets.rows) {
+    if (bet.status === 'open') {
+      await addCurrency(guild.id, bet.user_id, Number(bet.amount), 'sportsbook_reset_refund', reason, issuedByUserId);
+      refundedAmount += Number(bet.amount);
+    } else if (bet.status === 'won') {
+      // Best-effort reversal: remove the payout that was previously paid.
+      await removeCurrency(guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_reset_reversal', reason, issuedByUserId).catch(() => null);
+    }
+
+    await pool.query(
+      `UPDATE sportsbook_bets SET status = 'refunded', settled_at = NOW() WHERE id = $1`,
+      [bet.id]
+    );
+    refundedCount += 1;
+  }
+
+  await pool.query(
+    `UPDATE sportsbook_games
+     SET status = 'open', winner_side = NULL, settled_at = NULL, settled_by_game_report = FALSE
+     WHERE id = $1`,
+    [sportsbookGame.id]
+  );
+
+  await pool.query(
+    `UPDATE sportsbook_parlay_legs
+     SET status = 'open'
+     WHERE sportsbook_game_id = $1`,
+    [sportsbookGame.id]
+  ).catch(() => null);
+
+  await pool.query(
+    `UPDATE sportsbook_parlays
+     SET status = 'open', settled_at = NULL
+     WHERE id IN (
+       SELECT parlay_id FROM sportsbook_parlay_legs WHERE sportsbook_game_id = $1
+     )`,
+    [sportsbookGame.id]
+  ).catch(() => null);
+
+  await updateSportsbookPanel(guild).catch(() => null);
+
+  const embed = new EmbedBuilder()
+    .setTitle('♻️ Sportsbook Reopened')
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Game', value: sportsbookGame.game_label || 'Unknown game', inline: false },
+      { name: 'Reason', value: reason || 'Game reset', inline: false },
+      { name: 'Bets Reset/Refunded', value: String(refundedCount), inline: true },
+      { name: 'Amount Refunded', value: settings.currency_icon + ' ' + refundedAmount, inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Game Reset' })
+    .setTimestamp();
+
+  await postSportsbookFeed(guild, embed).catch(() => null);
+
+  return { reset: true, refundedCount, refundedAmount };
 }
 
 async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winnerSide) {
