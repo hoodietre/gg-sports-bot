@@ -7,6 +7,7 @@ import {
   SlashCommandBuilder,
   PermissionFlagsBits,
   EmbedBuilder,
+  AttachmentBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -781,15 +782,19 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS avatar_catalog (
-      id UUID PRIMARY KEY,
-      guild_id TEXT,
-      item_name TEXT NOT NULL,
-      slot TEXT NOT NULL,
-      rarity TEXT NOT NULL DEFAULT 'common',
-      source TEXT,
-      is_active BOOLEAN NOT NULL DEFAULT TRUE,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS user_avatar (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      equipped_top TEXT NOT NULL DEFAULT 'Basic Tee',
+      equipped_bottom TEXT NOT NULL DEFAULT 'Plain Shorts',
+      equipped_headwear TEXT NOT NULL DEFAULT 'none',
+      equipped_accessory TEXT NOT NULL DEFAULT 'Ghost Wristband',
+      equipped_footwear TEXT NOT NULL DEFAULT 'Basic Sneakers',
+      equipped_pet TEXT NOT NULL DEFAULT 'none',
+      equipped_effect TEXT NOT NULL DEFAULT 'none',
+      equipped_background TEXT NOT NULL DEFAULT 'Locker Room',
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id)
     )
   `);
 
@@ -805,7 +810,25 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS avatar_catalog (
+      id UUID PRIMARY KEY,
+      guild_id TEXT,
+      item_name TEXT NOT NULL,
+      slot TEXT NOT NULL,
+      rarity TEXT NOT NULL DEFAULT 'common',
+      source TEXT,
+      price INTEGER,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_effect TEXT NOT NULL DEFAULT 'none'`);
+  await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_background TEXT NOT NULL DEFAULT 'Locker Room'`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS item_category TEXT`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS avatar_slot TEXT`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS preview_style TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_badges (
@@ -886,10 +909,10 @@ function buildCommands() {
     new SlashCommandBuilder().setName('quicksetup').setDescription('Show the quick GG Sports setup checklist'),
     new SlashCommandBuilder()
       .setName('avatar')
-      .setDescription('Avatar and cosmetic commands')
-      .addSubcommand(sc => sc.setName('view').setDescription('View your avatar').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .setDescription('Visual avatar and cosmetic commands')
+      .addSubcommand(sc => sc.setName('view').setDescription('View your full-body avatar').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('wardrobe').setDescription('View your unlocked cosmetics'))
-      .addSubcommand(sc => sc.setName('equip').setDescription('Equip an unlocked cosmetic').addStringOption(o => o.setName('slot').setDescription('Slot: headwear, top, bottom, accessory, footwear, pet, effect').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Cosmetic item name').setRequired(true))),
+      .addSubcommand(sc => sc.setName('equip').setDescription('Equip an unlocked cosmetic').addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Cosmetic item name').setRequired(true))),
 
 
     new SlashCommandBuilder()
@@ -986,6 +1009,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('panel').setDescription('Staff: create or refresh permanent shop panel').addChannelOption(o => o.setName('channel').setDescription('Shop panel channel').setRequired(false)))
       .addSubcommand(sc => sc.setName('cart').setDescription('View your current shop cart'))
       .addSubcommand(sc => sc.setName('checkout').setDescription('Checkout your current shop cart'))
+      .addSubcommand(sc => sc.setName('preview').setDescription('Preview a shop/cosmetic item on your avatar').addStringOption(o => o.setName('item').setDescription('Item name').setRequired(true)))
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
@@ -3518,6 +3542,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
           }
 
+          const avatarSlot = inferAvatarSlotFromItem(item);
+          await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_cart_checkout_cosmetic').catch(() => null);
+
           if (item.stock !== null) {
             await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - $1), updated_at = NOW() WHERE id = $2`, [Number(item.quantity), item.id]);
           }
@@ -4633,22 +4660,24 @@ if (gameSubcommand === 'report') {
 
       if (avatarSubcommand === 'view') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
-        await syncAvatarUnlocks(interaction.guild.id, targetUser.id).catch(() => null);
-        const avatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
-        await interaction.reply({ embeds: [buildAvatarViewEmbed(targetUser, avatar)], ephemeral: true });
+        await syncVisualAvatarUnlocks(interaction.guild.id, targetUser.id).catch(() => null);
+        const avatar = await ensureVisualAvatar(interaction.guild.id, targetUser.id);
+        const attachment = buildAvatarAttachment(targetUser, avatar);
+        const embed = buildVisualAvatarEmbed(targetUser, avatar);
+        await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
         return;
       }
 
       if (avatarSubcommand === 'wardrobe') {
-        const items = await getAvatarInventory(interaction.guild.id, interaction.user.id);
-        await interaction.reply({ embeds: [buildAvatarWardrobeEmbed(interaction.user, items)], ephemeral: true });
+        const items = await getVisualAvatarInventory(interaction.guild.id, interaction.user.id);
+        await interaction.reply({ embeds: [buildVisualWardrobeEmbed(interaction.user, items)], ephemeral: true });
         return;
       }
 
       if (avatarSubcommand === 'equip') {
         const slot = interaction.options.getString('slot');
         const item = interaction.options.getString('item');
-        const result = await equipAvatarItem(interaction.guild.id, interaction.user.id, slot, item);
+        const result = await equipVisualAvatarItem(interaction.guild.id, interaction.user.id, slot, item);
         await interaction.reply({ content: result.message, ephemeral: true });
         return;
       }
@@ -4919,6 +4948,45 @@ if (interaction.commandName === 'trade') {
       if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
 
+      if (shopSubcommand === 'preview') {
+        const itemName = interaction.options.getString('item');
+        const item = await getShopPreviewItem(interaction.guild.id, itemName);
+
+        if (!item) {
+          await interaction.reply({ content: 'Could not find an active shop/cosmetic item named **' + itemName + '**.', ephemeral: true });
+          return;
+        }
+
+        const avatar = await ensureVisualAvatar(interaction.guild.id, interaction.user.id);
+        const slot = inferAvatarSlotFromItem(item);
+        const preview = {};
+        preview[slot] = item.item_name;
+
+        const previewAvatar = { ...avatar };
+        const columnMap = {
+          headwear: 'equipped_headwear',
+          top: 'equipped_top',
+          bottom: 'equipped_bottom',
+          accessory: 'equipped_accessory',
+          footwear: 'equipped_footwear',
+          pet: 'equipped_pet',
+          effect: 'equipped_effect',
+          background: 'equipped_background',
+        };
+        previewAvatar[columnMap[slot]] = item.item_name;
+
+        const attachment = buildAvatarAttachment(interaction.user, previewAvatar);
+        const embed = buildVisualAvatarEmbed(interaction.user, previewAvatar, item.item_name)
+          .addFields(
+            { name: 'Preview Slot', value: slot, inline: true },
+            { name: 'Price', value: item.price !== undefined && item.price !== null ? String(item.price) : 'Unlock/Not for sale', inline: true }
+          );
+
+        await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
+        return;
+      }
+
+
       if (shopSubcommand === 'panel') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to create the shop panel.', ephemeral: true });
@@ -5065,6 +5133,9 @@ if (shopSubcommand === 'view') {
         if (item.stock !== null) {
           await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - 1), updated_at = NOW() WHERE id = $1`, [item.id]);
         }
+
+        const avatarSlot = inferAvatarSlotFromItem(item);
+        await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_purchase').catch(() => null);
 
         await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
         return;
@@ -11386,7 +11457,7 @@ function buildCommandsGuideEmbed() {
         name: 'Profiles, Activity, Legacy',
         value:
           '/profile user, /profile franchise, /profile activity, /profile earnings, /profile milestones, /profile badges\\n' +
-          '/activity, /activityleaderboard, /legacy, /avatar view, /avatar wardrobe, /avatar equip, /premium status, /premium features',
+          '/activity, /activityleaderboard, /legacy, /premium status, /premium features',
         inline: false,
       },
       {
@@ -11422,7 +11493,7 @@ function buildHelpEmbed() {
           '**/game schedule** and **/game standings** — league info.\\n' +
           '**/shop view**, **/shop cart**, **/shop checkout** — shop system.\\n' +
           '**/sportsbook board**, **/sportsbook place**, **/sportsbook mybets** — betting.\\n' +
-          '**/activity**, **/legacy**, **/profile user**, **/avatar view** — progression and identity.',
+          '**/activity**, **/legacy**, **/profile user** — progression.',
         inline: false,
       },
       {
@@ -11556,22 +11627,37 @@ function formatAvatarLoadout(avatar) {
     'Accessory: ' + (avatar.equipped_accessory || 'none'),
     'Footwear: ' + (avatar.equipped_footwear || 'barefoot'),
     'Pet: ' + (avatar.equipped_pet || 'none'),
-    'Effect: ' + (avatar.equipped_effect || 'none'),
   ].join('\n');
 }
 
 
 
-const AVATAR_VALID_SLOTS = ['headwear', 'top', 'bottom', 'accessory', 'footwear', 'pet', 'effect'];
+const VISUAL_AVATAR_SLOTS = ['headwear', 'top', 'bottom', 'accessory', 'footwear', 'pet', 'effect', 'background'];
 
-const AVATAR_STARTER_ITEMS = [
+const VISUAL_AVATAR_STARTERS = [
   { item: 'Plain Shorts', slot: 'bottom', source: 'starter' },
   { item: 'Basic Tee', slot: 'top', source: 'starter' },
   { item: 'Basic Sneakers', slot: 'footwear', source: 'starter' },
   { item: 'Ghost Wristband', slot: 'accessory', source: 'starter' },
+  { item: 'Locker Room', slot: 'background', source: 'starter' },
 ];
 
-async function grantAvatarItem(guildId, userId, itemName, slot, source = 'unlock') {
+function avatarColorForItem(itemName, fallback) {
+  const item = String(itemName || '').toLowerCase();
+  if (item.includes('ghost')) return '#f5d742';
+  if (item.includes('gold')) return '#f6c343';
+  if (item.includes('silver')) return '#cfd8dc';
+  if (item.includes('elite')) return '#00b0ff';
+  if (item.includes('crown')) return '#ffd700';
+  if (item.includes('betting') || item.includes('shades')) return '#111827';
+  if (item.includes('hoodie')) return '#111111';
+  if (item.includes('basic tee')) return '#ffffff';
+  if (item.includes('shorts')) return '#2f3542';
+  if (item.includes('sneakers')) return '#f8fafc';
+  return fallback;
+}
+
+async function grantVisualAvatarItem(guildId, userId, itemName, slot, source = 'unlock') {
   await pool.query(
     `INSERT INTO user_avatar_inventory (guild_id, user_id, item_name, slot, source)
      VALUES ($1, $2, $3, $4, $5)
@@ -11581,65 +11667,67 @@ async function grantAvatarItem(guildId, userId, itemName, slot, source = 'unlock
   );
 }
 
-async function ensureAvatarStarterInventory(guildId, userId) {
-  await ensureUserAvatar(guildId, userId);
-  for (const entry of AVATAR_STARTER_ITEMS) {
-    await grantAvatarItem(guildId, userId, entry.item, entry.slot, entry.source);
+async function ensureVisualAvatar(guildId, userId) {
+  await pool.query(
+    `INSERT INTO user_avatar (guild_id, user_id)
+     VALUES ($1, $2)
+     ON CONFLICT (guild_id, user_id) DO NOTHING`,
+    [guildId, userId]
+  );
+
+  for (const item of VISUAL_AVATAR_STARTERS) {
+    await grantVisualAvatarItem(guildId, userId, item.item, item.slot, item.source);
   }
+
+  const result = await pool.query(
+    `SELECT * FROM user_avatar WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guildId, userId]
+  );
+
+  return result.rows[0] || {
+    equipped_top: 'Basic Tee',
+    equipped_bottom: 'Plain Shorts',
+    equipped_headwear: 'none',
+    equipped_accessory: 'Ghost Wristband',
+    equipped_footwear: 'Basic Sneakers',
+    equipped_pet: 'none',
+    equipped_effect: 'none',
+    equipped_background: 'Locker Room',
+  };
 }
 
-async function syncAvatarUnlocks(guildId, userId, recognition = null) {
-  await ensureAvatarStarterInventory(guildId, userId);
+async function syncVisualAvatarUnlocks(guildId, userId, recognition = null) {
+  await ensureVisualAvatar(guildId, userId);
 
   const row = recognition || (await pool.query(
     `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
     [guildId, userId]
   )).rows[0] || {};
 
-  const activityTier = typeof getActivityTier === 'function'
-    ? getActivityTier(Number(row.activity_points || 0))
-    : { name: 'Inactive' };
-  const legacyTier = typeof getLegacyTier === 'function'
-    ? getLegacyTier(Number(row.legacy_score || 0))
-    : { name: 'Rising Star' };
-
-  const activityName = normalizeActivityTierName(activityTier);
+  const activityTier = typeof getActivityTier === 'function' ? getActivityTier(Number(row.activity_points || 0)) : { name: 'Inactive' };
+  const legacyTier = typeof getLegacyTier === 'function' ? getLegacyTier(Number(row.legacy_score || 0)) : { name: 'Rising Star' };
+  const activityName = typeof normalizeActivityTierName === 'function' ? normalizeActivityTierName(activityTier) : String(activityTier.name || activityTier);
   const legacyName = legacyTier.name || legacyTier;
   const sportsbookWins = Number(row.sportsbook_wins || 0);
 
-  if (['Active', 'Dedicated', 'Grinder'].includes(activityName)) {
-    await grantAvatarItem(guildId, userId, 'Ghost Wristband', 'accessory', 'activity');
-  }
-  if (['Dedicated', 'Grinder'].includes(activityName)) {
-    await grantAvatarItem(guildId, userId, 'Ghost Hoodie', 'top', 'activity');
-  }
-  if (activityName === 'Grinder') {
-    await grantAvatarItem(guildId, userId, 'Elite Sneakers', 'footwear', 'activity');
-  }
+  if (['Active', 'Dedicated', 'Grinder'].includes(activityName)) await grantVisualAvatarItem(guildId, userId, 'Ghost Wristband', 'accessory', 'activity');
+  if (['Dedicated', 'Grinder'].includes(activityName)) await grantVisualAvatarItem(guildId, userId, 'Ghost Hoodie', 'top', 'activity');
+  if (activityName === 'Grinder') await grantVisualAvatarItem(guildId, userId, 'Elite Sneakers', 'footwear', 'activity');
 
-  if (['Veteran', 'Elite', 'Legend', 'GOAT'].includes(legacyName)) {
-    await grantAvatarItem(guildId, userId, 'Silver Chain', 'accessory', 'legacy');
-  }
-  if (['Elite', 'Legend', 'GOAT'].includes(legacyName)) {
-    await grantAvatarItem(guildId, userId, 'Gold Chain', 'accessory', 'legacy');
-  }
-  if (['Legend', 'GOAT'].includes(legacyName)) {
-    await grantAvatarItem(guildId, userId, 'Aura Effect', 'effect', 'legacy');
-  }
-  if (legacyName === 'GOAT') {
-    await grantAvatarItem(guildId, userId, 'Crown', 'headwear', 'legacy');
-  }
+  if (['Veteran', 'Elite', 'Legend', 'GOAT'].includes(legacyName)) await grantVisualAvatarItem(guildId, userId, 'Silver Chain', 'accessory', 'legacy');
+  if (['Elite', 'Legend', 'GOAT'].includes(legacyName)) await grantVisualAvatarItem(guildId, userId, 'Gold Chain', 'accessory', 'legacy');
+  if (['Legend', 'GOAT'].includes(legacyName)) await grantVisualAvatarItem(guildId, userId, 'Aura Effect', 'effect', 'legacy');
+  if (legacyName === 'GOAT') await grantVisualAvatarItem(guildId, userId, 'Crown', 'headwear', 'legacy');
 
-  if (sportsbookWins >= 1) {
-    await grantAvatarItem(guildId, userId, 'Betting Shades', 'headwear', 'sportsbook');
-  }
-  if (sportsbookWins >= 10) {
-    await grantAvatarItem(guildId, userId, 'High Roller Watch', 'accessory', 'sportsbook');
-  }
+  if (sportsbookWins >= 1) await grantVisualAvatarItem(guildId, userId, 'Betting Shades', 'headwear', 'sportsbook');
+  if (sportsbookWins >= 10) await grantVisualAvatarItem(guildId, userId, 'High Roller Watch', 'accessory', 'sportsbook');
+
+  await grantVisualAvatarItem(guildId, userId, 'Arena Tunnel', 'background', 'starter');
+  await grantVisualAvatarItem(guildId, userId, 'Practice Court', 'background', 'starter');
 }
 
-async function getAvatarInventory(guildId, userId) {
-  await syncAvatarUnlocks(guildId, userId).catch(() => null);
+async function getVisualAvatarInventory(guildId, userId) {
+  await syncVisualAvatarUnlocks(guildId, userId).catch(() => null);
   const result = await pool.query(
     `SELECT * FROM user_avatar_inventory
      WHERE guild_id = $1 AND user_id = $2
@@ -11649,13 +11737,13 @@ async function getAvatarInventory(guildId, userId) {
   return result.rows;
 }
 
-async function equipAvatarItem(guildId, userId, slot, itemName) {
+async function equipVisualAvatarItem(guildId, userId, slot, itemName) {
   const cleanSlot = String(slot || '').toLowerCase();
-  if (!AVATAR_VALID_SLOTS.includes(cleanSlot)) {
-    return { ok: false, message: 'Invalid slot. Use: ' + AVATAR_VALID_SLOTS.join(', ') };
+  if (!VISUAL_AVATAR_SLOTS.includes(cleanSlot)) {
+    return { ok: false, message: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', ') };
   }
 
-  await syncAvatarUnlocks(guildId, userId).catch(() => null);
+  await syncVisualAvatarUnlocks(guildId, userId).catch(() => null);
 
   const itemResult = await pool.query(
     `SELECT * FROM user_avatar_inventory
@@ -11664,14 +11752,10 @@ async function equipAvatarItem(guildId, userId, slot, itemName) {
     [guildId, userId, itemName]
   );
 
-  if (!itemResult.rows.length) {
-    return { ok: false, message: 'You have not unlocked that cosmetic yet.' };
-  }
+  if (!itemResult.rows.length) return { ok: false, message: 'You have not unlocked that cosmetic yet.' };
 
   const item = itemResult.rows[0];
-  if (item.slot !== cleanSlot) {
-    return { ok: false, message: '**' + item.item_name + '** belongs in the **' + item.slot + '** slot, not **' + cleanSlot + '**.' };
-  }
+  if (item.slot !== cleanSlot) return { ok: false, message: '**' + item.item_name + '** belongs in **' + item.slot + '**, not **' + cleanSlot + '**.' };
 
   const columnMap = {
     headwear: 'equipped_headwear',
@@ -11681,6 +11765,7 @@ async function equipAvatarItem(guildId, userId, slot, itemName) {
     footwear: 'equipped_footwear',
     pet: 'equipped_pet',
     effect: 'equipped_effect',
+    background: 'equipped_background',
   };
 
   await pool.query(
@@ -11692,29 +11777,112 @@ async function equipAvatarItem(guildId, userId, slot, itemName) {
   return { ok: true, message: 'Equipped **' + item.item_name + '** to **' + cleanSlot + '**.' };
 }
 
-function formatAvatarLoadoutDetailed(avatar) {
-  return [
-    '**Headwear:** ' + (avatar.equipped_headwear || 'none'),
-    '**Top:** ' + (avatar.equipped_top || 'none'),
-    '**Bottom:** ' + (avatar.equipped_bottom || 'plain shorts'),
-    '**Accessory:** ' + (avatar.equipped_accessory || 'none'),
-    '**Footwear:** ' + (avatar.equipped_footwear || 'barefoot'),
-    '**Pet:** ' + (avatar.equipped_pet || 'none'),
-    '**Effect:** ' + (avatar.equipped_effect || 'none'),
-  ].join('\n');
+function buildVisualAvatarSvg(userLabel, avatar, preview = {}) {
+  const top = preview.top || avatar.equipped_top || 'Basic Tee';
+  const bottom = preview.bottom || avatar.equipped_bottom || 'Plain Shorts';
+  const headwear = preview.headwear || avatar.equipped_headwear || 'none';
+  const accessory = preview.accessory || avatar.equipped_accessory || 'Ghost Wristband';
+  const footwear = preview.footwear || avatar.equipped_footwear || 'Basic Sneakers';
+  const pet = preview.pet || avatar.equipped_pet || 'none';
+  const effect = preview.effect || avatar.equipped_effect || 'none';
+  const background = preview.background || avatar.equipped_background || 'Locker Room';
+
+  const bgGrad = String(background).toLowerCase().includes('tunnel')
+    ? ['#111827', '#374151']
+    : String(background).toLowerCase().includes('court')
+      ? ['#78350f', '#f59e0b']
+      : ['#18181b', '#3f3f46'];
+
+  const topColor = avatarColorForItem(top, '#ffffff');
+  const bottomColor = avatarColorForItem(bottom, '#2f3542');
+  const shoeColor = avatarColorForItem(footwear, '#f8fafc');
+  const chainColor = avatarColorForItem(accessory, '#f5d742');
+
+  const hasCrown = String(headwear).toLowerCase().includes('crown');
+  const hasShades = String(headwear).toLowerCase().includes('shades') || String(headwear).toLowerCase().includes('betting');
+  const hasAura = String(effect).toLowerCase().includes('aura');
+  const hasPet = String(pet).toLowerCase() !== 'none';
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="900" height="1200" viewBox="0 0 900 1200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="${bgGrad[0]}"/>
+      <stop offset="100%" stop-color="${bgGrad[1]}"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <radialGradient id="aura" cx="50%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#facc15" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#facc15" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="900" height="1200" fill="url(#bg)"/>
+  <rect x="70" y="80" width="760" height="1040" rx="48" fill="#000000" opacity="0.22" stroke="#facc15" stroke-width="4"/>
+  <text x="450" y="150" text-anchor="middle" font-family="Arial Black, Impact, sans-serif" font-size="54" fill="#ffffff">${String(userLabel).replace(/[<>&]/g, '')}</text>
+  <text x="450" y="198" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" fill="#facc15">GG SPORTS AVATAR</text>
+  ${hasAura ? '<circle cx="450" cy="575" r="310" fill="url(#aura)"/>' : ''}
+  <g filter="url(#shadow)">
+    <ellipse cx="450" cy="1010" rx="220" ry="38" fill="#000000" opacity="0.38"/>
+    <path d="M360 410 C365 350 535 350 540 410 L520 625 L380 625 Z" fill="#d8a47f"/>
+    <circle cx="450" cy="330" r="88" fill="#d8a47f"/>
+    <path d="M370 300 C395 225 505 225 530 300 C495 270 405 270 370 300Z" fill="#111827"/>
+    ${hasCrown ? '<path d="M370 228 L405 170 L450 225 L500 170 L535 228 L520 260 L385 260 Z" fill="#ffd700" stroke="#ffffff" stroke-width="5"/>' : ''}
+    ${hasShades ? '<g><rect x="385" y="315" width="54" height="26" rx="10" fill="#020617"/><rect x="461" y="315" width="54" height="26" rx="10" fill="#020617"/><line x1="439" y1="328" x2="461" y2="328" stroke="#020617" stroke-width="8"/></g>' : '<g><circle cx="420" cy="330" r="7" fill="#111827"/><circle cx="480" cy="330" r="7" fill="#111827"/></g>'}
+    <path d="M418 368 C438 384 464 384 484 368" fill="none" stroke="#7c2d12" stroke-width="6" stroke-linecap="round"/>
+    <path d="M320 455 C360 410 540 410 580 455 L550 690 L350 690 Z" fill="${topColor}" stroke="#111827" stroke-width="8"/>
+    <text x="450" y="550" text-anchor="middle" font-family="Arial Black, sans-serif" font-size="42" fill="${topColor === '#111111' ? '#facc15' : '#111827'}">GG</text>
+    <path d="M333 472 L255 660" stroke="${topColor}" stroke-width="48" stroke-linecap="round"/>
+    <path d="M567 472 L645 660" stroke="${topColor}" stroke-width="48" stroke-linecap="round"/>
+    <circle cx="247" cy="675" r="28" fill="#d8a47f"/>
+    <circle cx="653" cy="675" r="28" fill="#d8a47f"/>
+    ${String(accessory).toLowerCase().includes('chain') ? '<path d="M395 448 C430 490 470 490 505 448" fill="none" stroke="' + chainColor + '" stroke-width="14" stroke-linecap="round"/>' : ''}
+    ${String(accessory).toLowerCase().includes('watch') ? '<rect x="625" y="640" width="48" height="30" rx="8" fill="#facc15" stroke="#111827" stroke-width="5"/>' : ''}
+    ${String(accessory).toLowerCase().includes('wristband') ? '<rect x="222" y="640" width="52" height="28" rx="8" fill="#facc15" stroke="#111827" stroke-width="4"/>' : ''}
+    <path d="M360 682 L442 682 L432 875 L345 875 Z" fill="${bottomColor}" stroke="#111827" stroke-width="8"/>
+    <path d="M458 682 L540 682 L555 875 L468 875 Z" fill="${bottomColor}" stroke="#111827" stroke-width="8"/>
+    <path d="M345 875 L432 875 L418 990 L360 990 Z" fill="#d8a47f"/>
+    <path d="M468 875 L555 875 L540 990 L482 990 Z" fill="#d8a47f"/>
+    <path d="M330 992 C365 960 420 962 445 1005 C405 1020 360 1020 330 992Z" fill="${shoeColor}" stroke="#111827" stroke-width="7"/>
+    <path d="M455 1005 C480 962 535 960 570 992 C540 1020 495 1020 455 1005Z" fill="${shoeColor}" stroke="#111827" stroke-width="7"/>
+    ${hasPet ? '<g><ellipse cx="675" cy="930" rx="70" ry="48" fill="#facc15" stroke="#111827" stroke-width="7"/><circle cx="640" cy="895" r="34" fill="#facc15" stroke="#111827" stroke-width="7"/><circle cx="630" cy="888" r="5" fill="#111827"/><circle cx="650" cy="888" r="5" fill="#111827"/><text x="675" y="1010" text-anchor="middle" font-family="Arial Black" font-size="22" fill="#ffffff">PET</text></g>' : ''}
+  </g>
+  <g font-family="Arial, sans-serif" font-size="22" fill="#e5e7eb">
+    <text x="110" y="1080">TOP: ${top}</text>
+    <text x="110" y="1110">BOTTOM: ${bottom}</text>
+    <text x="460" y="1080">ACCESSORY: ${accessory}</text>
+    <text x="460" y="1110">FOOTWEAR: ${footwear}</text>
+  </g>
+</svg>`;
 }
 
-function buildAvatarViewEmbed(user, avatar) {
-  return new EmbedBuilder()
-    .setTitle(user.username + ' Avatar')
+function buildAvatarAttachment(user, avatar, preview = {}) {
+  const svg = buildVisualAvatarSvg(user.username, avatar, preview);
+  return new AttachmentBuilder(Buffer.from(svg, 'utf8'), { name: 'avatar.svg' });
+}
+
+function buildVisualAvatarEmbed(user, avatar, previewLabel = null) {
+  const embed = new EmbedBuilder()
+    .setTitle((previewLabel ? 'Preview • ' : '') + user.username + ' Avatar')
     .setColor(0xFEE75C)
-    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
-    .setDescription(formatAvatarLoadoutDetailed(avatar))
-    .setFooter({ text: 'GG Sports • Avatar' })
+    .setImage('attachment://avatar.svg')
+    .addFields(
+      { name: 'Headwear', value: avatar.equipped_headwear || 'none', inline: true },
+      { name: 'Top', value: avatar.equipped_top || 'Basic Tee', inline: true },
+      { name: 'Bottom', value: avatar.equipped_bottom || 'Plain Shorts', inline: true },
+      { name: 'Accessory', value: avatar.equipped_accessory || 'Ghost Wristband', inline: true },
+      { name: 'Footwear', value: avatar.equipped_footwear || 'Basic Sneakers', inline: true },
+      { name: 'Background', value: avatar.equipped_background || 'Locker Room', inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Visual Avatar V1' })
     .setTimestamp();
+
+  if (previewLabel) embed.setDescription('Previewing: **' + previewLabel + '**');
+  return embed;
 }
 
-function buildAvatarWardrobeEmbed(user, items) {
+function buildVisualWardrobeEmbed(user, items) {
   const NL = String.fromCharCode(10);
   const grouped = {};
   for (const item of items) {
@@ -11729,7 +11897,7 @@ function buildAvatarWardrobeEmbed(user, items) {
     .setFooter({ text: 'GG Sports • Wardrobe' })
     .setTimestamp();
 
-  for (const slot of AVATAR_VALID_SLOTS) {
+  for (const slot of VISUAL_AVATAR_SLOTS) {
     embed.addFields({
       name: slot.charAt(0).toUpperCase() + slot.slice(1),
       value: grouped[slot]?.length ? grouped[slot].join(NL).slice(0, 1024) : 'None unlocked',
@@ -11738,6 +11906,40 @@ function buildAvatarWardrobeEmbed(user, items) {
   }
 
   return embed;
+}
+
+async function getShopPreviewItem(guildId, itemName) {
+  const result = await pool.query(
+    `SELECT * FROM shop_items
+     WHERE guild_id = $1 AND LOWER(item_name) = LOWER($2) AND is_active = TRUE
+     LIMIT 1`,
+    [guildId, itemName]
+  );
+
+  if (result.rows.length) return result.rows[0];
+
+  const catalog = await pool.query(
+    `SELECT * FROM avatar_catalog
+     WHERE (guild_id = $1 OR guild_id IS NULL) AND LOWER(item_name) = LOWER($2) AND is_active = TRUE
+     LIMIT 1`,
+    [guildId, itemName]
+  );
+
+  return catalog.rows[0] || null;
+}
+
+function inferAvatarSlotFromItem(item) {
+  const explicit = item.avatar_slot || item.slot || item.item_category;
+  if (explicit && VISUAL_AVATAR_SLOTS.includes(String(explicit).toLowerCase())) return String(explicit).toLowerCase();
+
+  const name = String(item.item_name || '').toLowerCase();
+  if (name.includes('hoodie') || name.includes('tee') || name.includes('jersey') || name.includes('shirt')) return 'top';
+  if (name.includes('short') || name.includes('pants') || name.includes('jogger')) return 'bottom';
+  if (name.includes('shoe') || name.includes('sneaker') || name.includes('cleat')) return 'footwear';
+  if (name.includes('hat') || name.includes('crown') || name.includes('shades') || name.includes('glasses')) return 'headwear';
+  if (name.includes('pet') || name.includes('companion')) return 'pet';
+  if (name.includes('aura') || name.includes('effect')) return 'effect';
+  return 'accessory';
 }
 
 
