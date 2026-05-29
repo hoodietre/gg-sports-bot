@@ -5216,12 +5216,6 @@ if (shopSubcommand === 'view') {
         const avatarSlot = inferAvatarSlotFromItem(item);
         await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_purchase').catch(() => null);
 
-        const avatarSlot = inferAvatarSlotFromItem(item);
-        await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_button_cosmetic').catch(() => null);
-
-        const avatarSlot = inferAvatarSlotFromItem(item);
-        await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_buy_cosmetic_grant').catch(() => null);
-
         await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
         return;
       }
