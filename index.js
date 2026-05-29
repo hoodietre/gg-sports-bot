@@ -1034,7 +1034,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
-      .addSubcommand(sc => sc.setName('settings').setDescription('View league/server setup settings'))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('awards').setDescription('Open a customizable league awards form').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
 
@@ -5679,9 +5679,9 @@ if (shopSubcommand === 'view') {
       const leagueSubcommand = interaction.options.getSubcommand();
 
       if (leagueSubcommand === 'settings') {
-        const leagueName = interaction.options.getString('league');
         const selectedLeagueRole = interaction.options.getRole('league_role');
         const clearLeagueRole = interaction.options.getBoolean('clear_league_role') || false;
+        const leagueName = interaction.options.getString('league');
         let activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
@@ -5730,6 +5730,7 @@ if (shopSubcommand === 'view') {
         return;
       }
 
+      
       if (leagueSubcommand === 'sportsbookchannel') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to update sportsbook settings.', ephemeral: true });
