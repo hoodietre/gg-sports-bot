@@ -195,6 +195,87 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sync_source TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS external_franchise_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS external_url TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS api_key TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_sync_status TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_sync_message TEXT`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_sync_runs (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      source TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      message TEXT,
+      week_label TEXT,
+      imported_teams INTEGER NOT NULL DEFAULT 0,
+      imported_games INTEGER NOT NULL DEFAULT 0,
+      imported_players INTEGER NOT NULL DEFAULT 0,
+      started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_imported_games (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      external_game_id TEXT,
+      week_label TEXT,
+      home_team TEXT,
+      away_team TEXT,
+      home_team_role_id TEXT,
+      away_team_role_id TEXT,
+      home_score INTEGER,
+      away_score INTEGER,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      played_at TIMESTAMP,
+      raw_payload JSONB,
+      imported_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (league_id, external_game_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_imported_team_stats (
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      external_team_id TEXT,
+      team_name TEXT NOT NULL,
+      team_role_id TEXT,
+      owner_user_id TEXT,
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      ties INTEGER NOT NULL DEFAULT 0,
+      points_for INTEGER NOT NULL DEFAULT 0,
+      points_against INTEGER NOT NULL DEFAULT 0,
+      raw_payload JSONB,
+      imported_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (league_id, team_name)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_imported_players (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      external_player_id TEXT,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      raw_payload JSONB,
+      imported_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (league_id, external_player_id)
+    )
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_franchises (
       id UUID PRIMARY KEY,
@@ -1036,7 +1117,12 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
+      .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('imported').setDescription('View imported Madden sync status').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+,
 
     new SlashCommandBuilder()
       .setName('setup')
@@ -4894,6 +4980,99 @@ if (gameSubcommand === 'report') {
     if (interaction.commandName === 'madden') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
+
+      if (maddenSubcommand === 'link') {
+        const leagueName = interaction.options.getString('league');
+        const source = interaction.options.getString('source');
+        const franchiseId = interaction.options.getString('franchise_id');
+        const url = interaction.options.getString('url');
+        const apiKey = interaction.options.getString('api_key');
+
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to link Madden sync sources.', ephemeral: true });
+          return;
+        }
+
+        const settings = await linkMaddenExternalSource(activeLeague, { source, franchiseId, url, apiKey });
+        const status = await getMaddenImportedStatus(interaction.guild.id, activeLeague.league_id);
+
+        await interaction.reply({
+          content: 'Madden external sync source linked for **' + activeLeague.league_name + '**.',
+          embeds: [buildMaddenSyncSettingsEmbed(activeLeague, settings, status)],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (maddenSubcommand === 'sync') {
+        const leagueName = interaction.options.getString('league');
+        const week = interaction.options.getString('week');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to run Madden sync.', ephemeral: true });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+        const run = await runMaddenExternalSyncPlaceholder(interaction.guild, activeLeague, { week });
+        await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
+        return;
+      }
+
+      if (maddenSubcommand === 'settings') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const settings = await ensureMaddenLeagueSettings(activeLeague);
+        const status = await getMaddenImportedStatus(interaction.guild.id, activeLeague.league_id);
+
+        await interaction.reply({ embeds: [buildMaddenSyncSettingsEmbed(activeLeague, settings, status)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'imported') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const settings = await ensureMaddenLeagueSettings(activeLeague);
+        const status = await getMaddenImportedStatus(interaction.guild.id, activeLeague.league_id);
+        const embed = buildMaddenSyncSettingsEmbed(activeLeague, settings, status);
+
+        if (status.runs.length) {
+          embed.addFields({
+            name: 'Recent Sync Runs',
+            value: status.runs.map(run => '**' + (run.status || 'unknown') + '** — ' + (run.message || 'No message')).join(String.fromCharCode(10)).slice(0, 1024),
+            inline: false,
+          });
+        }
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+
 
       if (maddenSubcommand === 'setup') {
         const leagueName = interaction.options.getString('league');
@@ -11938,7 +12117,7 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Madden',
         value:
-          '/madden setup, /madden league, /madden teams, /madden franchise',
+          '/madden link, /madden sync, /madden settings, /madden imported, /madden setup, /madden league, /madden teams, /madden franchise',
         inline: false,
       },
       {
@@ -13236,6 +13415,156 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
 
 
 
+
+async function linkMaddenExternalSource(league, options = {}) {
+  await ensureMaddenLeagueSettings(league);
+
+  await pool.query(
+    `UPDATE madden_league_settings
+     SET sync_source = $2,
+         external_franchise_id = COALESCE($3, external_franchise_id),
+         external_url = COALESCE($4, external_url),
+         api_key = COALESCE($5, api_key),
+         updated_at = NOW()
+     WHERE league_id = $1`,
+    [
+      league.league_id,
+      options.source || 'neon_sportz',
+      options.franchiseId || null,
+      options.url || null,
+      options.apiKey || null,
+    ]
+  );
+
+  const result = await pool.query(
+    `SELECT * FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    [league.league_id]
+  );
+
+  return result.rows[0] || {};
+}
+
+async function runMaddenExternalSyncPlaceholder(guild, league, options = {}) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  const runId = randomUUID();
+
+  await pool.query(
+    `INSERT INTO madden_sync_runs (id, guild_id, league_id, source, status, week_label, message)
+     VALUES ($1, $2, $3, $4, 'running', $5, $6)`,
+    [runId, guild.id, league.league_id, settings.sync_source || 'unlinked', options.week || null, 'Madden sync started.']
+  );
+
+  // V1 foundation: no external provider API is hardcoded yet.
+  // This creates the import pipeline, sync log, and local franchise/team bridge.
+  // Once the exact Neon/league export source is confirmed, this function becomes the real fetch/import worker.
+  await syncMaddenFranchises(guild, league).catch(() => null);
+
+  const teams = await pool.query(
+    `SELECT * FROM madden_franchises WHERE guild_id = $1 AND league_id = $2 ORDER BY team_name ASC`,
+    [guild.id, league.league_id]
+  );
+
+  for (const team of teams.rows) {
+    await pool.query(
+      `INSERT INTO madden_imported_team_stats (guild_id, league_id, team_name, team_role_id, owner_user_id, wins, losses, ties)
+       VALUES ($1, $2, $3, $4, $5, 0, 0, 0)
+       ON CONFLICT (league_id, team_name)
+       DO UPDATE SET team_role_id = $4, owner_user_id = $5, imported_at = NOW()`,
+      [guild.id, league.league_id, team.team_name, team.team_role_id, team.owner_user_id || null]
+    );
+  }
+
+  const message = settings.sync_source
+    ? 'Sync foundation completed. Teams were bridged locally. External fetch/import worker is ready for provider wiring.'
+    : 'No external Madden source linked yet. Use /madden link first. Local teams were still bridged.';
+
+  await pool.query(
+    `UPDATE madden_sync_runs
+     SET status = 'completed',
+         message = $2,
+         imported_teams = $3,
+         completed_at = NOW()
+     WHERE id = $1`,
+    [runId, message, teams.rows.length]
+  );
+
+  await pool.query(
+    `UPDATE madden_league_settings
+     SET last_sync_at = NOW(),
+         last_sync_status = 'completed',
+         last_sync_message = $2,
+         updated_at = NOW()
+     WHERE league_id = $1`,
+    [league.league_id, message]
+  );
+
+  const runResult = await pool.query(`SELECT * FROM madden_sync_runs WHERE id = $1 LIMIT 1`, [runId]);
+  return runResult.rows[0] || { id: runId, status: 'completed', message };
+}
+
+async function getMaddenImportedStatus(guildId, leagueId) {
+  const [teams, games, players, runs] = await Promise.all([
+    pool.query(`SELECT COUNT(*)::int AS count FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`, [guildId, leagueId]),
+    pool.query(`SELECT COUNT(*)::int AS count FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2`, [guildId, leagueId]),
+    pool.query(`SELECT COUNT(*)::int AS count FROM madden_imported_players WHERE guild_id = $1 AND league_id = $2`, [guildId, leagueId]),
+    pool.query(`SELECT * FROM madden_sync_runs WHERE guild_id = $1 AND league_id = $2 ORDER BY started_at DESC LIMIT 5`, [guildId, leagueId]),
+  ]);
+
+  return {
+    teams: Number(teams.rows[0]?.count || 0),
+    games: Number(games.rows[0]?.count || 0),
+    players: Number(players.rows[0]?.count || 0),
+    runs: runs.rows,
+  };
+}
+
+function buildMaddenSyncSettingsEmbed(league, settings, status = null) {
+  const maskedKey = settings.api_key ? 'Stored / hidden' : 'Not set';
+
+  const embed = new EmbedBuilder()
+    .setTitle('Madden Sync Settings • ' + league.league_name)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Sync Source', value: settings.sync_source || 'Not linked', inline: true },
+      { name: 'External Franchise ID', value: settings.external_franchise_id || 'Not set', inline: true },
+      { name: 'API Key', value: maskedKey, inline: true },
+      { name: 'External URL', value: settings.external_url || 'Not set', inline: false },
+      { name: 'Last Sync', value: settings.last_sync_at ? String(settings.last_sync_at) : 'Never', inline: true },
+      { name: 'Last Status', value: settings.last_sync_status || 'None', inline: true },
+      { name: 'Last Message', value: settings.last_sync_message || 'No sync has run yet.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Madden External Sync' })
+    .setTimestamp();
+
+  if (status) {
+    embed.addFields(
+      { name: 'Imported Teams', value: String(status.teams), inline: true },
+      { name: 'Imported Games', value: String(status.games), inline: true },
+      { name: 'Imported Players', value: String(status.players), inline: true }
+    );
+  }
+
+  return embed;
+}
+
+function buildMaddenSyncRunEmbed(league, run) {
+  return new EmbedBuilder()
+    .setTitle('Madden Sync Complete • ' + league.league_name)
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Status', value: run.status || 'completed', inline: true },
+      { name: 'Source', value: run.source || 'unlinked', inline: true },
+      { name: 'Week', value: run.week_label || 'Not specified', inline: true },
+      { name: 'Imported Teams', value: String(run.imported_teams || 0), inline: true },
+      { name: 'Imported Games', value: String(run.imported_games || 0), inline: true },
+      { name: 'Imported Players', value: String(run.imported_players || 0), inline: true },
+      { name: 'Message', value: run.message || 'Sync run completed.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Madden Sync Foundation' })
+    .setTimestamp();
+}
+
+
 async function ensureMaddenLeagueSettings(league, options = {}) {
   await pool.query(
     `INSERT INTO madden_league_settings (league_id, guild_id, console, advance_schedule, neon_sportz_url, updated_at)
@@ -13305,6 +13634,8 @@ function buildMaddenLeagueEmbed(league, summary) {
       { name: 'Platform / Console', value: summary.settings.console || 'Not set', inline: true },
       { name: 'Advance Schedule', value: summary.settings.advance_schedule || 'Not set', inline: true },
       { name: 'Teams Synced', value: String(summary.teams.length || 0), inline: true },
+      { name: 'Sync Source', value: summary.settings.sync_source || 'Not linked', inline: true },
+      { name: 'External Franchise ID', value: summary.settings.external_franchise_id || 'Not set', inline: true },
       { name: 'League Bridge', value: 'Uses existing GG Sports league roles, standings, sportsbook, activity, legacy, shop, avatar, and badge systems.', inline: false },
       { name: 'Next Commands', value: '/madden teams\\n/madden franchise\\n/game add\\n/game report', inline: false }
     )
