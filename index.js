@@ -23,6 +23,7 @@ import pkg from 'pg';
 import { randomUUID } from 'crypto';
 import zlib from 'zlib';
 import crypto from 'crypto';
+import http from 'http';
 
 const { Pool } = pkg;
 
@@ -3130,6 +3131,7 @@ client.once(Events.ClientReady, async () => {
   try {
     await initDatabase();
     await registerCommands();
+    startGGSportsInternalApiServer();
   } catch (error) {
     console.error('Startup failed:', error);
   }
@@ -5338,6 +5340,8 @@ if (gameSubcommand === 'report') {
             { name: 'Personas Endpoint', value: EA_DIRECT_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Retrieve Personas URL', value: EA_DIRECT_RETRIEVE_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Select League URL', value: EA_DIRECT_SELECT_LEAGUE_URL ? 'Configured' : 'Missing', inline: true },
+            { name: 'Internal API Port', value: String(GGSPORTS_API_PORT), inline: true },
+            { name: 'Internal API Secret', value: GGSPORTS_API_SECRET ? 'Configured' : 'Not required', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
@@ -14675,6 +14679,10 @@ const EA_DIRECT_PERSONAS_URL = process.env.EA_DIRECT_PERSONAS_URL || null;
 const EA_DIRECT_FRANCHISES_URL = process.env.EA_DIRECT_FRANCHISES_URL || null;
 const EA_DIRECT_RETRIEVE_PERSONAS_URL = process.env.EA_DIRECT_RETRIEVE_PERSONAS_URL || null;
 const EA_DIRECT_SELECT_LEAGUE_URL = process.env.EA_DIRECT_SELECT_LEAGUE_URL || null;
+const GGSPORTS_API_PORT = Number(process.env.PORT || process.env.GGSPORTS_API_PORT || 3000);
+const GGSPORTS_PUBLIC_BASE_URL = process.env.GGSPORTS_PUBLIC_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN || null;
+const GGSPORTS_API_SECRET = process.env.GGSPORTS_API_SECRET || null;
+
 
 const EA_DIRECT_TOKEN_AUTH_HEADER = process.env.EA_DIRECT_TOKEN_AUTH_HEADER || null;
 const EA_DIRECT_TOKEN_CLIENT_ID = process.env.EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP';
@@ -14930,6 +14938,198 @@ function extractLeagueChoiceRows(payload) {
   if (payload.data && Array.isArray(payload.data.leagues)) return payload.data.leagues;
   return [];
 }
+
+
+function sendJsonResponse(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-GG-Sports-Secret',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS, GET',
+  });
+  res.end(body);
+}
+
+function readJsonRequest(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 2_000_000) {
+        req.destroy();
+        reject(new Error('Request body too large.'));
+      }
+    });
+    req.on('end', () => {
+      if (!body) return resolve({});
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new Error('Invalid JSON body.'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function isAuthorizedInternalApiRequest(req) {
+  if (!GGSPORTS_API_SECRET) return true;
+  const headerSecret = req.headers['x-gg-sports-secret'];
+  const bearer = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  return headerSecret === GGSPORTS_API_SECRET || bearer === GGSPORTS_API_SECRET;
+}
+
+async function handleInternalRetrievePersonas(payload) {
+  const code = extractEaAuthCode(payload.code || payload.url || payload.authorization_code);
+  if (!code) {
+    return { statusCode: 400, payload: { error: 'Missing EA authorization code.' } };
+  }
+
+  const tokenPayload = await exchangeEaAuthorizationCode(code);
+  const accessToken = tokenPayload.access_token;
+
+  if (!accessToken) {
+    return { statusCode: 502, payload: { error: 'Token exchange returned no access_token.', tokenPayload } };
+  }
+
+  let personaPayload = { personas: [] };
+  if (EA_DIRECT_PERSONAS_URL) {
+    personaPayload = await fetchEaJson(EA_DIRECT_PERSONAS_URL, accessToken, 'EA personas');
+  }
+
+  const personas = extractEaPersonaRows(personaPayload);
+
+  return {
+    statusCode: 200,
+    payload: {
+      access_token: accessToken,
+      refresh_token: tokenPayload.refresh_token || null,
+      expiry: tokenPayload.expires_in ? Date.now() + Number(tokenPayload.expires_in) * 1000 : null,
+      token_type: tokenPayload.token_type || null,
+      scope: tokenPayload.scope || null,
+      personas,
+      namespaces: personaPayload.namespaces || {},
+      raw: personaPayload,
+    },
+  };
+}
+
+async function handleInternalSelectLeague(payload) {
+  const accessToken = payload.access_token || payload.accessToken;
+  const selectedPersona = payload.selected_persona || payload.selectedPersona || payload.persona;
+
+  if (!accessToken) {
+    return { statusCode: 400, payload: { error: 'Missing access_token.' } };
+  }
+
+  if (!selectedPersona) {
+    return { statusCode: 400, payload: { error: 'Missing selected_persona.' } };
+  }
+
+  let persona;
+  if (typeof selectedPersona === 'string') {
+    try {
+      persona = JSON.parse(selectedPersona);
+    } catch {
+      persona = { personaId: selectedPersona };
+    }
+  } else {
+    persona = selectedPersona;
+  }
+
+  if (!EA_DIRECT_FRANCHISES_URL) {
+    return {
+      statusCode: 501,
+      payload: {
+        error: 'EA_DIRECT_FRANCHISES_URL is not configured.',
+        access_token: accessToken,
+        selected_persona: persona,
+        leagues: [],
+      },
+    };
+  }
+
+  const personaId = String(persona.personaId || persona.persona_id || persona.id || '').trim();
+  const franchiseUrl = EA_DIRECT_FRANCHISES_URL
+    .replaceAll('{PERSONA_ID}', encodeURIComponent(personaId))
+    .replaceAll('{ACCESS_TOKEN}', encodeURIComponent(accessToken));
+
+  const franchisePayload = await fetchEaJson(franchiseUrl, accessToken, 'EA franchises/leagues');
+  const leagues = extractLeagueChoiceRows(franchisePayload);
+
+  return {
+    statusCode: 200,
+    payload: {
+      access_token: franchisePayload.access_token || accessToken,
+      refresh_token: franchisePayload.refresh_token || null,
+      systemConsole: franchisePayload.systemConsole || persona.namespaceName || persona.platform || null,
+      expiry: franchisePayload.expiry || null,
+      blazeId: franchisePayload.blazeId || persona.personaId || personaId || null,
+      leagues,
+      raw: franchisePayload,
+    },
+  };
+}
+
+let ggSportsInternalApiServer = null;
+
+function startGGSportsInternalApiServer() {
+  if (ggSportsInternalApiServer) return;
+
+  ggSportsInternalApiServer = http.createServer(async (req, res) => {
+    try {
+      if (req.method === 'OPTIONS') {
+        sendJsonResponse(res, 204, {});
+        return;
+      }
+
+      const url = new URL(req.url, 'http://localhost');
+
+      if (req.method === 'GET' && url.pathname === '/health') {
+        sendJsonResponse(res, 200, { ok: true, service: 'GG Sports', time: new Date().toISOString() });
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        sendJsonResponse(res, 405, { error: 'Method not allowed.' });
+        return;
+      }
+
+      if (!isAuthorizedInternalApiRequest(req)) {
+        sendJsonResponse(res, 401, { error: 'Unauthorized.' });
+        return;
+      }
+
+      const payload = await readJsonRequest(req);
+
+      if (url.pathname === '/api/ea/retrieve-personas') {
+        const result = await handleInternalRetrievePersonas(payload);
+        sendJsonResponse(res, result.statusCode, result.payload);
+        return;
+      }
+
+      if (url.pathname === '/api/ea/select-league') {
+        const result = await handleInternalSelectLeague(payload);
+        sendJsonResponse(res, result.statusCode, result.payload);
+        return;
+      }
+
+      sendJsonResponse(res, 404, { error: 'Route not found.' });
+    } catch (error) {
+      sendJsonResponse(res, 500, { error: error.message || 'Internal API error.' });
+    }
+  });
+
+  ggSportsInternalApiServer.listen(GGSPORTS_API_PORT, () => {
+    console.log('GG Sports internal API listening on port ' + GGSPORTS_API_PORT);
+    if (GGSPORTS_PUBLIC_BASE_URL) {
+      console.log('EA retrieve personas URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/retrieve-personas');
+      console.log('EA select league URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/select-league');
+    }
+  });
+}
+
 
 async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, code) {
   if (!EA_DIRECT_RETRIEVE_PERSONAS_URL) {
