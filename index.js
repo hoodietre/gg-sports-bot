@@ -214,6 +214,13 @@ async function initDatabase() {
   `);
   await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_effect TEXT NOT NULL DEFAULT 'none'`);
   await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_background TEXT NOT NULL DEFAULT 'Locker Room'`);
+  // 7I-4A polish: normalize starter avatar defaults for existing profiles.
+  await pool.query(`UPDATE user_avatar SET equipped_top = 'Basic Tee' WHERE equipped_top IS NULL OR equipped_top = 'none'`);
+  await pool.query(`UPDATE user_avatar SET equipped_bottom = 'Plain Shorts' WHERE equipped_bottom IS NULL OR LOWER(equipped_bottom) = 'plain shorts'`);
+  await pool.query(`UPDATE user_avatar SET equipped_footwear = 'Basic Sneakers' WHERE equipped_footwear IS NULL OR equipped_footwear = 'barefoot'`);
+  await pool.query(`UPDATE user_avatar SET equipped_accessory = 'Ghost Wristband' WHERE equipped_accessory IS NULL OR equipped_accessory = 'none'`);
+  await pool.query(`UPDATE user_avatar SET equipped_background = 'Locker Room' WHERE equipped_background IS NULL OR equipped_background = 'none'`);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_avatar_inventory (
@@ -1841,6 +1848,7 @@ function buildUserProfileEmbed(league, user, data) {
     .setTitle(`${league?.league_name || 'League'} • ${user.username} Profile`)
     .setColor(0x5865F2)
     .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .setImage('attachment://avatar.png')
     .addFields(
       { name: 'Team', value: data.teamName || 'No team assigned', inline: true },
       { name: 'Record', value: `${data.wins}-${data.losses}`, inline: true },
@@ -4522,7 +4530,7 @@ if (gameSubcommand === 'report') {
         const legacyIcon = getLegacyTierIcon(legacyTier);
         const activityIcon = getActivityTierIcon(activityTier);
         const normalizedActivityTier = normalizeActivityTierName(activityTier);
-        const badgesDisplay = badges.length ? badges.map(badge => badge.badge_icon + ' ' + badge.badge_label).join(String.fromCharCode(10)) : 'No badges unlocked yet.';
+        const badgesDisplay = badges.length ? badges.map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(String.fromCharCode(10)) : 'No badges unlocked yet.';
 
 
         const embed = new EmbedBuilder()
@@ -4543,7 +4551,7 @@ if (gameSubcommand === 'report') {
             { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false },
             { name: 'Badges', value: badgesDisplay.slice(0, 1024), inline: false },
             { name: 'Stream', value: streamUrl || 'No stream linked. Use /linkstream to add one.', inline: false },
-            { name: 'Cosmetics / Avatar', value: formatAvatarLoadout(avatar), inline: false }
+            { name: 'Visual Avatar', value: 'Rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.', inline: false }
           )
           .setFooter({ text: 'GG Sports • Franchise Hub Foundation' })
           .setTimestamp();
@@ -4687,36 +4695,18 @@ if (gameSubcommand === 'report') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
         await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
 
-        const profileResult = await pool.query(
+        const recognitionResult = await pool.query(
           `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
           [interaction.guild.id, targetUser.id]
         );
-        const profile = profileResult.rows[0] || {};
-        const activityPoints = Number(profile.activity_points || 0);
-        const legacyScore = Number(profile.legacy_score || 0);
-        const badges = [];
+        const recognition = recognitionResult.rows[0] || {};
+        const badges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, recognition);
 
-        badges.push('⚡ Activity Tier: **' + getActivityTier(activityPoints) + '**');
-        badges.push('🏆 Legacy Tier: **' + getLegacyTier(legacyScore) + '**');
-        if (Number(profile.championships || 0) > 0) badges.push('💍 Champion Badge');
-        if (Number(profile.tournament_titles || 0) > 0) badges.push('🏟️ Tournament Champion Badge');
-        if (Number(profile.sportsbook_wins || 0) >= 10) badges.push('🎯 Sharp Bettor Badge');
-        if (Number(profile.sportsbook_profit || 0) >= 1000) badges.push('💰 Profit Machine Badge');
-        if (Number(profile.tickets_resolved || 0) >= 10) badges.push('🛠️ Staff Helper Badge');
-        if (Number(profile.games_played || 0) >= 25) badges.push('🎮 League Grinder Badge');
-
-        const embed = new EmbedBuilder()
-          .setTitle(targetUser.username + ' • Badges')
-          .setColor(0xFEE75C)
-          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-          .setDescription(badges.length ? badges.join(String.fromCharCode(10)) : 'No badges unlocked yet.')
-          .setFooter({ text: 'GG Sports • Badge Foundation' })
-          .setTimestamp();
-
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [buildBadgesEmbed(targetUser, badges)], ephemeral: true });
         return;
       }
 
+      
       const profileCommandMap = {
         user: 'profile',
         stats: 'stats',
@@ -4764,7 +4754,7 @@ if (interaction.commandName === 'avatar') {
         const embed = buildVisualAvatarEmbed(targetUser, avatar);
         const avatarBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id);
         if (avatarBadges.length) {
-          embed.addFields({ name: 'Avatar Badges', value: avatarBadges.slice(0, 6).map(badge => badge.badge_icon + ' ' + badge.badge_label).join(' • '), inline: false });
+          embed.addFields({ name: '🏅 Avatar Badges', value: avatarBadges.slice(0, 8).map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(' • '), inline: false });
         }
         await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
         return;
@@ -9365,6 +9355,9 @@ if (shopSubcommand === 'view') {
       const profileStreamUrl = await getUserStreamUrl(interaction.guild.id, targetUser.id);
       const profileAvatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
 
+      const mappedProfileAvatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
+      const mappedProfileAvatarAttachment = buildAvatarAttachment(targetUser, mappedProfileAvatar);
+
       await interaction.reply({
         embeds: [buildUserProfileEmbed(activeLeague, targetUser, {
           teamName: team?.name || null,
@@ -9379,9 +9372,9 @@ if (shopSubcommand === 'view') {
           tournamentMvps,
           legacyDisplay: getLegacyTierIcon(profileLegacyTier) + ' ' + profileLegacyTier.name + ' • ' + String(profileRecognition.legacy_score || 0) + ' pts',
           activityDisplay: getActivityTierIcon(profileActivityTier) + ' ' + normalizeActivityTierName(profileActivityTier) + ' • ' + String(profileRecognition.activity_points || 0) + ' pts',
-          badgesDisplay: profileBadges.length ? profileBadges.map(badge => badge.badge_icon + ' ' + badge.badge_label).join(String.fromCharCode(10)).slice(0, 1024) : 'No badges unlocked yet.',
+          badgesDisplay: profileBadges.length ? profileBadges.map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(String.fromCharCode(10)).slice(0, 1024) : 'No badges unlocked yet.',
           streamDisplay: profileStreamUrl || 'No stream linked. Use /linkstream to add one.',
-          avatarDisplay: formatAvatarLoadout(profileAvatar),
+          avatarDisplay: 'Rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.',
         })],
         ephemeral: true,
       });
@@ -11798,11 +11791,11 @@ async function ensureUserAvatar(guildId, userId) {
   );
 
   return result.rows[0] || {
-    equipped_top: 'none',
-    equipped_bottom: 'plain shorts',
+    equipped_top: 'Basic Tee',
+    equipped_bottom: 'Plain Shorts',
     equipped_headwear: 'none',
-    equipped_accessory: 'none',
-    equipped_footwear: 'barefoot',
+    equipped_accessory: 'Ghost Wristband',
+    equipped_footwear: 'Basic Sneakers',
     equipped_pet: 'none',
   };
 }
@@ -11869,12 +11862,14 @@ async function getUserBadges(guildId, userId, recognition = null) {
 
 function formatAvatarLoadout(avatar) {
   return [
-    'Top: ' + (avatar.equipped_top || 'none'),
-    'Bottom: ' + (avatar.equipped_bottom || 'plain shorts'),
+    'Top: ' + (avatar.equipped_top || 'Basic Tee'),
+    'Bottom: ' + (avatar.equipped_bottom || 'Plain Shorts'),
     'Headwear: ' + (avatar.equipped_headwear || 'none'),
-    'Accessory: ' + (avatar.equipped_accessory || 'none'),
-    'Footwear: ' + (avatar.equipped_footwear || 'barefoot'),
+    'Accessory: ' + (avatar.equipped_accessory || 'Ghost Wristband'),
+    'Footwear: ' + (avatar.equipped_footwear || 'Basic Sneakers'),
     'Pet: ' + (avatar.equipped_pet || 'none'),
+    'Effect: ' + (avatar.equipped_effect || 'none'),
+    'Background: ' + (avatar.equipped_background || 'Locker Room'),
   ].join('\n');
 }
 
