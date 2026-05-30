@@ -14594,11 +14594,11 @@ async function upsertMaddenEaConnection(guildId, leagueId, userId, fields = {}) 
        id, guild_id, league_id, user_id, provider, connection_status, accepted_disclaimer,
        ea_auth_code, persona_id, persona_name, franchise_id, franchise_name, last_error, updated_at
      )
-     VALUES ($1, $2, $3, $4, 'ea_direct', $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+     VALUES ($1, $2, $3, $4, 'ea_direct', $5, COALESCE($6, FALSE), $7, $8, $9, $10, $11, $12, NOW())
      ON CONFLICT (league_id, user_id, provider)
      DO UPDATE SET
        connection_status = COALESCE($5, madden_ea_connections.connection_status),
-       accepted_disclaimer = COALESCE($6, madden_ea_connections.accepted_disclaimer),
+       accepted_disclaimer = CASE WHEN $6 IS NULL THEN madden_ea_connections.accepted_disclaimer ELSE $6 END,
        ea_auth_code = COALESCE($7, madden_ea_connections.ea_auth_code),
        persona_id = COALESCE($8, madden_ea_connections.persona_id),
        persona_name = COALESCE($9, madden_ea_connections.persona_name),
@@ -14609,7 +14609,7 @@ async function upsertMaddenEaConnection(guildId, leagueId, userId, fields = {}) 
     [
       id, guildId, leagueId, userId,
       fields.connection_status || null,
-      fields.accepted_disclaimer ?? null,
+      fields.accepted_disclaimer ?? false,
       fields.ea_auth_code || null,
       fields.persona_id || null,
       fields.persona_name || null,
