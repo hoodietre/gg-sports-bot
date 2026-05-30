@@ -5344,7 +5344,7 @@ if (gameSubcommand === 'report') {
             { name: 'Internal API Secret', value: GGSPORTS_API_SECRET ? 'Configured' : 'Not required', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Token exchange test mode: form-urlencoded/no-auth.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Token exchange test mode: form-urlencoded/basic-auth/no-body-client.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -14729,14 +14729,16 @@ function decryptEaSecret(value) {
 }
 
 async function exchangeEaAuthorizationCode(code) {
-  // Madden Companion / Snallapa-style exchange test.
-  // EA login/auth-code capture works. This exchange now uses a strict
-  // x-www-form-urlencoded request with the Companion public client parameters.
+  // Madden Companion / Snallapa-style exchange test W.
+  // This test uses form-urlencoded body + Basic Auth with the Companion client id,
+  // and intentionally removes client_id from the POST body.
+  const tokenClientId = EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP';
+  const tokenClientSecret = EA_DIRECT_TOKEN_CLIENT_SECRET || '';
+
   const params = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
     redirect_uri: EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success',
-    client_id: EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP',
     authentication_source: '317239',
     release_type: 'prod',
   });
@@ -14748,11 +14750,19 @@ async function exchangeEaAuthorizationCode(code) {
     }
   }
 
+  // Keep client_id out of the body for this test unless a Railway override explicitly adds it back.
+  if (String(process.env.EA_DIRECT_TOKEN_BODY_CLIENT_ID || 'false').toLowerCase() === 'true') {
+    params.set('client_id', tokenClientId);
+  }
+
+  const basicAuth = Buffer.from(tokenClientId + ':' + tokenClientSecret).toString('base64');
+
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       'Accept': 'application/json',
+      'Authorization': 'Basic ' + basicAuth,
     },
     body: params.toString(),
   });
@@ -14775,7 +14785,7 @@ async function exchangeEaAuthorizationCode(code) {
       ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
       ' • token_url=' + (EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token') +
       ' • body=' + safeBody +
-      ' • auth=none_form_urlencoded'
+      ' • auth=basic_' + (tokenClientSecret ? 'with_secret' : 'empty_secret') + '_no_body_client'
     );
   }
 
