@@ -9374,8 +9374,9 @@ if (shopSubcommand === 'view') {
           activityDisplay: getActivityTierIcon(profileActivityTier) + ' ' + normalizeActivityTierName(profileActivityTier) + ' • ' + String(profileRecognition.activity_points || 0) + ' pts',
           badgesDisplay: profileBadges.length ? profileBadges.map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(String.fromCharCode(10)).slice(0, 1024) : 'No badges unlocked yet.',
           streamDisplay: profileStreamUrl || 'No stream linked. Use /linkstream to add one.',
-          avatarDisplay: 'Rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.',
+          avatarDisplay: 'Visual avatar rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.',
         })],
+        files: [mappedProfileAvatarAttachment],
         ephemeral: true,
       });
       return;
