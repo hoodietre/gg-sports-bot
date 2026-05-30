@@ -12976,78 +12976,126 @@ async function refreshSetupDashboardInteraction(interaction, leagueId, selectedS
 }
 
 async function createConfiguredPanelFromSetup(interaction, league, panelType) {
-  if (panelType === 'standings_panel') {
-    const channelId = league.standings_channel_id;
-    const channel = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : interaction.channel;
-    if (typeof createOrUpdateStandingsPanel === 'function') {
-      await createOrUpdateStandingsPanel(interaction.guild, league, channel).catch(() => null);
-    } else if (typeof updateStandingsPanel === 'function') {
-      await updateStandingsPanel(interaction.guild, league).catch(() => null);
+  async function requireTextChannel(channelId, fallbackChannel, label) {
+    const channel = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : fallbackChannel;
+    const botMember = await interaction.guild.members.fetchMe();
+    const permissions = channel?.permissionsFor(botMember);
+
+    if (!channel || !channel.isTextBased()) {
+      return { channel: null, error: label + ' is not set or is unavailable.' };
     }
-    return 'Standings panel refreshed.';
+
+    if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+      return { channel: null, error: 'I need View Channel, Send Messages, and Embed Links permissions in the ' + label + '.' };
+    }
+
+    return { channel, error: null };
+  }
+
+  if (panelType === 'standings_panel') {
+    const { channel, error } = await requireTextChannel(league.standings_channel_id, interaction.channel, 'standings channel');
+    if (error) return error;
+
+    const rows = await getStandingsRows(interaction.guild.id, league.league_id);
+    const message = await channel.send({ embeds: [buildStandingsEmbed(league, rows)] });
+    await savePanel(league, 'standings', channel.id, message.id);
+    return 'Standings panel created/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'shop_panel') {
-    await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
-    return 'Shop panel refreshed. If no panel exists yet, use /shop panel once.';
+    const channelId = league.shop_channel_id || null;
+    const { channel, error } = await requireTextChannel(channelId, interaction.channel, 'shop channel');
+    if (error) return error;
+
+    const payload = await buildPermanentShopPayload(interaction.guild.id);
+    const message = await channel.send(payload);
+
+    await pool.query(
+      `DELETE FROM shop_panels WHERE guild_id = $1`,
+      [interaction.guild.id]
+    ).catch(() => null);
+
+    await pool.query(
+      `INSERT INTO shop_panels (guild_id, league_id, channel_id, message_id, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [interaction.guild.id, league.league_id, channel.id, message.id]
+    ).catch(async () => {
+      await pool.query(
+        `INSERT INTO shop_panels (guild_id, channel_id, message_id, updated_at)
+         VALUES ($1, $2, $3, NOW())`,
+        [interaction.guild.id, channel.id, message.id]
+      ).catch(() => null);
+    });
+
+    return 'Shop panel created/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'sportsbook_panel') {
-    if (typeof updateSportsbookPanel === 'function') await updateSportsbookPanel(interaction.guild).catch(() => null);
-    return 'Sportsbook board refreshed.';
+    const { channel, error } = await requireTextChannel(league.sportsbook_channel_id, interaction.channel, 'sportsbook channel');
+    if (error) return error;
+
+    const openSportsbookResult = await pool.query(
+      `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
+      [interaction.guild.id]
+    );
+
+    const message = await channel.send({
+      embeds: [await buildSportsbookPanelEmbed(interaction.guild.id)],
+      components: buildSportsbookBetBoardButtons(openSportsbookResult.rows),
+    });
+
+    await saveSportsbookPanel(interaction.guild.id, channel.id, message.id);
+    return 'Sportsbook board created/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'team_owners_panel') {
-    const channel = league.team_owners_channel_id ? await interaction.guild.channels.fetch(league.team_owners_channel_id).catch(() => null) : interaction.channel;
-    if (channel?.isTextBased()) {
-      await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
-      return 'Team Owners panel posted.';
-    }
-    return 'Team Owners channel is not set or unavailable.';
+    const { channel, error } = await requireTextChannel(league.team_owners_channel_id, interaction.channel, 'team owners channel');
+    if (error) return error;
+    await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
+    return 'Team Owners panel posted in ' + channel.toString() + '.';
   }
 
   if (panelType === 'trade_count_panel') {
-    const channel = league.trade_count_channel_id ? await interaction.guild.channels.fetch(league.trade_count_channel_id).catch(() => null) : interaction.channel;
-    if (channel?.isTextBased()) {
-      await channel.send({ embeds: [await buildTradeCountEmbed(league)] });
-      return 'Trade Count panel posted.';
-    }
-    return 'Trade Count channel is not set or unavailable.';
+    const { channel, error } = await requireTextChannel(league.trade_count_channel_id, interaction.channel, 'trade count channel');
+    if (error) return error;
+    await channel.send({ embeds: [await buildTradeCountEmbed(league)] });
+    return 'Trade Count panel posted in ' + channel.toString() + '.';
   }
 
   if (panelType === 'trade_offer_panel') {
-    const channel = league.trade_offer_channel_id ? await interaction.guild.channels.fetch(league.trade_offer_channel_id).catch(() => null) : interaction.channel;
-    if (channel?.isTextBased() && typeof buildTradeOfferPanel === 'function') {
+    const { channel, error } = await requireTextChannel(league.trade_offer_channel_id, interaction.channel, 'trade offer channel');
+    if (error) return error;
+
+    if (typeof buildTradeOfferPanel === 'function') {
       await channel.send(buildTradeOfferPanel(league));
-      return 'Trade Offer panel posted.';
+      return 'Trade Offer panel posted in ' + channel.toString() + '.';
     }
-    if (channel?.isTextBased()) {
-      const embed = new EmbedBuilder()
-        .setTitle('Offer a Trade')
-        .setDescription('Use the trade offer button/panel flow to begin a trade.')
-        .setColor(0x57F287)
-        .setFooter({ text: 'GG Sports • Trade Offers' })
-        .setTimestamp();
-      await channel.send({ embeds: [embed] });
-      return 'Basic Trade Offer panel posted.';
-    }
-    return 'Trade Offer channel is not set or unavailable.';
+
+    const embed = new EmbedBuilder()
+      .setTitle('Offer a Trade')
+      .setDescription('Use this channel to start and manage trade offers.')
+      .setColor(0x57F287)
+      .setFooter({ text: 'GG Sports • Trade Offers' })
+      .setTimestamp();
+
+    await channel.send({ embeds: [embed] });
+    return 'Basic Trade Offer panel posted in ' + channel.toString() + '.';
   }
 
   if (panelType === 'ticket_panel') {
     const channelId = league.setup_ticket_channel_id || league.setup_support_channel_id;
-    const channel = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : interaction.channel;
-    if (channel?.isTextBased()) {
-      const embed = new EmbedBuilder()
-        .setTitle('Support Tickets')
-        .setDescription('Use /ticket open, /ticket dispute, or /ticket game to create a ticket.')
-        .setColor(0x5865F2)
-        .setFooter({ text: 'GG Sports • Tickets' })
-        .setTimestamp();
-      await channel.send({ embeds: [embed] });
-      return 'Ticket panel posted.';
-    }
-    return 'Ticket channel is not set or unavailable.';
+    const { channel, error } = await requireTextChannel(channelId, interaction.channel, 'ticket/support channel');
+    if (error) return error;
+
+    const embed = new EmbedBuilder()
+      .setTitle('Support Tickets')
+      .setDescription('Use /ticket open, /ticket dispute, or /ticket game to create a ticket.')
+      .setColor(0x5865F2)
+      .setFooter({ text: 'GG Sports • Tickets' })
+      .setTimestamp();
+
+    await channel.send({ embeds: [embed] });
+    return 'Ticket panel posted in ' + channel.toString() + '.';
   }
 
   return 'Unknown panel type.';
