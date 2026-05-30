@@ -282,6 +282,24 @@ async function initDatabase() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_ea_league_choices (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      persona_id TEXT,
+      external_league_id TEXT NOT NULL,
+      external_league_name TEXT,
+      user_team_name TEXT,
+      system_console TEXT,
+      blaze_id TEXT,
+      raw_payload JSONB,
+      imported_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (league_id, user_id, external_league_id)
+    )
+  `);
+
 
 
 
@@ -4201,7 +4219,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
 
       try {
-        const exchange = await completeEaTokenExchange(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, code);
+        const exchange = EA_DIRECT_RETRIEVE_PERSONAS_URL
+          ? await completeEaRetrievePersonasViaEndpoint(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, code)
+          : await completeEaTokenExchange(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, code);
+
         connection = exchange.connection;
 
         const personas = await getEaPersonasForConnection(leagueId, interaction.user.id);
@@ -4209,8 +4230,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.editReply({
           content: exchange.personaCount
-            ? 'EA token exchange complete. Select your EA persona.'
-            : 'EA token exchange complete, but no persona endpoint/data is configured yet. Use the placeholder persona for now.',
+            ? 'EA persona lookup complete. Select your EA persona.'
+            : 'Authorization processed, but no persona rows were returned. Use the placeholder persona for now.',
           embeds: [buildMaddenEaConnectionEmbed(league, connection)],
           components,
         });
@@ -4250,7 +4271,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         persona_name: personaName,
       });
 
-      if (EA_DIRECT_FRANCHISES_URL && connection?.access_token_encrypted) {
+      if (EA_DIRECT_SELECT_LEAGUE_URL && connection?.access_token_encrypted) {
+        try {
+          await selectEaPersonaViaEndpoint(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, personaId);
+          connection = await getMaddenEaConnection(leagueId, interaction.user.id);
+        } catch (error) {
+          await pool.query(
+            `UPDATE madden_ea_connections SET last_error = $3, updated_at = NOW() WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+            [leagueId, interaction.user.id, error.message || 'League fetch failed']
+          ).catch(() => null);
+        }
+      } else if (EA_DIRECT_FRANCHISES_URL && connection?.access_token_encrypted) {
         try {
           const accessToken = decryptEaSecret(connection.access_token_encrypted);
           const franchiseUrl = EA_DIRECT_FRANCHISES_URL
@@ -4272,12 +4303,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       }
 
+      const leagueChoices = await getEaLeagueChoicesForConnection(leagueId, interaction.user.id).catch(() => []);
       const franchises = await getEaFranchisesForConnection(leagueId, interaction.user.id).catch(() => []);
 
       await interaction.update({
-        content: franchises.length ? 'Persona selected. Now choose the Madden franchise.' : 'Persona selected. No franchise endpoint/data is configured yet, so use the placeholder franchise for now.',
+        content: leagueChoices.length
+          ? 'Persona selected. Now choose the Madden league.'
+          : franchises.length
+            ? 'Persona selected. Now choose the Madden franchise.'
+            : 'Persona selected. No league/franchise endpoint data is configured yet, so use the placeholder franchise for now.',
         embeds: [buildMaddenEaConnectionEmbed(league, connection)],
-        components: buildMaddenEaFranchiseComponentsFromRows(leagueId, franchises),
+        components: leagueChoices.length ? buildMaddenEaLeagueChoiceComponents(leagueId, leagueChoices) : buildMaddenEaFranchiseComponentsFromRows(leagueId, franchises),
       });
       return;
     }
@@ -4292,6 +4328,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const franchiseId = interaction.values[0];
       let franchiseName = franchiseId === 'default_franchise' ? 'Default Madden Franchise' : franchiseId;
+      const leagueChoices = await getEaLeagueChoicesForConnection(leagueId, interaction.user.id).catch(() => []);
+      const leagueChoice = leagueChoices.find(row => String(row.external_league_id) === String(franchiseId));
+      if (leagueChoice?.external_league_name) franchiseName = leagueChoice.external_league_name;
+
       const franchiseRows = await getEaFranchisesForConnection(leagueId, interaction.user.id).catch(() => []);
       const franchiseRow = franchiseRows.find(row => String(row.franchise_id) === String(franchiseId));
       if (franchiseRow?.franchise_name) franchiseName = franchiseRow.franchise_name;
@@ -5295,8 +5335,9 @@ if (gameSubcommand === 'report') {
             { name: 'Token Client ID', value: EA_DIRECT_TOKEN_CLIENT_ID ? 'Configured' : 'Missing', inline: true },
             { name: 'Include Client ID', value: EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID ? 'Yes' : 'No', inline: true },
             { name: 'Basic Auth', value: EA_DIRECT_TOKEN_USE_BASIC_AUTH ? 'Yes' : 'No', inline: true },
-            { name: 'Token Secret', value: EA_DIRECT_TOKEN_CLIENT_SECRET ? 'Configured' : 'Missing / using empty secret', inline: true },
             { name: 'Personas Endpoint', value: EA_DIRECT_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
+            { name: 'Retrieve Personas URL', value: EA_DIRECT_RETRIEVE_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
+            { name: 'Select League URL', value: EA_DIRECT_SELECT_LEAGUE_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
@@ -14632,6 +14673,9 @@ const EA_DIRECT_RELEASE_TYPE = process.env.EA_DIRECT_RELEASE_TYPE || 'prod';
 const EA_DIRECT_TOKEN_URL = process.env.EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token';
 const EA_DIRECT_PERSONAS_URL = process.env.EA_DIRECT_PERSONAS_URL || null;
 const EA_DIRECT_FRANCHISES_URL = process.env.EA_DIRECT_FRANCHISES_URL || null;
+const EA_DIRECT_RETRIEVE_PERSONAS_URL = process.env.EA_DIRECT_RETRIEVE_PERSONAS_URL || null;
+const EA_DIRECT_SELECT_LEAGUE_URL = process.env.EA_DIRECT_SELECT_LEAGUE_URL || null;
+
 const EA_DIRECT_TOKEN_AUTH_HEADER = process.env.EA_DIRECT_TOKEN_AUTH_HEADER || null;
 const EA_DIRECT_TOKEN_CLIENT_ID = process.env.EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP';
 const EA_DIRECT_TOKEN_CLIENT_SECRET = process.env.EA_DIRECT_TOKEN_CLIENT_SECRET || null;
@@ -14705,10 +14749,8 @@ async function exchangeEaAuthorizationCode(code) {
 
   if (EA_DIRECT_TOKEN_AUTH_HEADER) {
     headers.Authorization = EA_DIRECT_TOKEN_AUTH_HEADER;
-  } else if (EA_DIRECT_TOKEN_USE_BASIC_AUTH && EA_DIRECT_TOKEN_CLIENT_ID) {
-    // Some EA/Madden Companion-style OAuth clients appear to use public-client Basic auth.
-    // If no secret is configured, still send "client_id:" as the Basic auth payload.
-    headers.Authorization = 'Basic ' + Buffer.from(EA_DIRECT_TOKEN_CLIENT_ID + ':' + (EA_DIRECT_TOKEN_CLIENT_SECRET || '')).toString('base64');
+  } else if (EA_DIRECT_TOKEN_USE_BASIC_AUTH && EA_DIRECT_TOKEN_CLIENT_ID && EA_DIRECT_TOKEN_CLIENT_SECRET) {
+    headers.Authorization = 'Basic ' + Buffer.from(EA_DIRECT_TOKEN_CLIENT_ID + ':' + EA_DIRECT_TOKEN_CLIENT_SECRET).toString('base64');
   }
 
   const response = await fetch(EA_DIRECT_TOKEN_URL, {
@@ -14734,7 +14776,7 @@ async function exchangeEaAuthorizationCode(code) {
       ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
       ' • token_url=' + EA_DIRECT_TOKEN_URL +
       ' • body=' + safeBody +
-      ' • auth=' + (headers.Authorization ? (EA_DIRECT_TOKEN_CLIENT_SECRET ? 'yes_with_secret' : 'yes_empty_secret') : 'no')
+      ' • auth=' + (headers.Authorization ? 'yes' : 'no')
     );
   }
 
@@ -14844,6 +14886,212 @@ async function saveEaFranchises(guildId, leagueId, userId, personaId, payload) {
 
   return imported;
 }
+
+
+async function postJsonToEndpoint(url, payload, label) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!response.ok) {
+    throw new Error(label + ' failed: HTTP ' + response.status + ' • ' + (data.error || data.detail || text).slice(0, 300));
+  }
+
+  return data;
+}
+
+function extractNeonStyleAccessToken(payload) {
+  return payload?.access_token || payload?.accessToken || null;
+}
+
+function extractNeonStyleRefreshToken(payload) {
+  return payload?.refresh_token || payload?.refreshToken || null;
+}
+
+function extractLeagueChoiceRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+  if (Array.isArray(payload.leagues)) return payload.leagues;
+  if (Array.isArray(payload.franchises)) return payload.franchises;
+  if (Array.isArray(payload.data)) return payload.data;
+  if (payload.data && Array.isArray(payload.data.leagues)) return payload.data.leagues;
+  return [];
+}
+
+async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, code) {
+  if (!EA_DIRECT_RETRIEVE_PERSONAS_URL) {
+    throw new Error('EA_DIRECT_RETRIEVE_PERSONAS_URL is not configured. Token exchange endpoint still needs to be wired.');
+  }
+
+  const payload = await postJsonToEndpoint(EA_DIRECT_RETRIEVE_PERSONAS_URL, { code }, 'EA retrieve-personas');
+  const accessToken = extractNeonStyleAccessToken(payload);
+
+  if (!accessToken) {
+    throw new Error('retrieve-personas did not return access_token.');
+  }
+
+  const personaCount = await saveEaPersonas(guildId, leagueId, userId, payload);
+
+  await pool.query(
+    `UPDATE madden_ea_connections
+     SET access_token_encrypted = $4,
+         raw_token_payload = $5,
+         raw_personas_payload = $6,
+         exchange_status = 'personas_fetched',
+         connection_status = 'personas_fetched',
+         last_error = NULL,
+         updated_at = NOW()
+     WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+    [
+      leagueId,
+      userId,
+      'ea_direct',
+      encryptEaSecret(accessToken),
+      JSON.stringify(payload),
+      JSON.stringify(payload),
+    ]
+  );
+
+  const connection = await getMaddenEaConnection(leagueId, userId);
+  return { connection, personaCount, payload };
+}
+
+async function selectEaPersonaViaEndpoint(guildId, leagueId, userId, personaId) {
+  const connection = await getMaddenEaConnection(leagueId, userId);
+  if (!connection?.access_token_encrypted) {
+    throw new Error('No access token is stored for this connection.');
+  }
+
+  const accessToken = decryptEaSecret(connection.access_token_encrypted);
+  const personaRows = await getEaPersonasForConnection(leagueId, userId);
+  const selectedPersona = personaRows.find(row => String(row.persona_id) === String(personaId));
+
+  if (!selectedPersona) {
+    throw new Error('Selected persona was not found in stored persona choices.');
+  }
+
+  if (!EA_DIRECT_SELECT_LEAGUE_URL) {
+    return { leagues: [], payload: null, message: 'EA_DIRECT_SELECT_LEAGUE_URL is not configured.' };
+  }
+
+  let selectedPersonaPayload = selectedPersona.raw_payload || {};
+  if (typeof selectedPersonaPayload === 'string') {
+    try {
+      selectedPersonaPayload = JSON.parse(selectedPersonaPayload);
+    } catch {
+      selectedPersonaPayload = {};
+    }
+  }
+
+  const payload = await postJsonToEndpoint(EA_DIRECT_SELECT_LEAGUE_URL, {
+    access_token: accessToken,
+    selected_persona: JSON.stringify(selectedPersonaPayload),
+  }, 'EA select-league');
+
+  const returnedAccessToken = extractNeonStyleAccessToken(payload);
+  const refreshToken = extractNeonStyleRefreshToken(payload);
+  const leagues = extractLeagueChoiceRows(payload);
+
+  if (returnedAccessToken || refreshToken) {
+    await pool.query(
+      `UPDATE madden_ea_connections
+       SET access_token_encrypted = COALESCE($4, access_token_encrypted),
+           refresh_token_encrypted = COALESCE($5, refresh_token_encrypted),
+           token_expires_at = $6,
+           raw_franchises_payload = $7,
+           exchange_status = 'leagues_fetched',
+           updated_at = NOW()
+       WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+      [
+        leagueId,
+        userId,
+        'ea_direct',
+        returnedAccessToken ? encryptEaSecret(returnedAccessToken) : null,
+        refreshToken ? encryptEaSecret(refreshToken) : null,
+        payload.expiry ? new Date(Number(payload.expiry)) : null,
+        JSON.stringify(payload),
+      ]
+    );
+  }
+
+  for (const leagueChoice of leagues) {
+    const externalLeagueId = String(getFirstValue(leagueChoice, ['leagueId', 'league_id', 'franchiseId', 'id'], '') || '').trim();
+    if (!externalLeagueId) continue;
+
+    const externalLeagueName = getFirstValue(leagueChoice, ['leagueName', 'league_name', 'franchiseName', 'name'], externalLeagueId);
+    const userTeamName = getFirstValue(leagueChoice, ['userTeamName', 'teamName', 'team_name', 'yourTeam'], null);
+
+    await pool.query(
+      `INSERT INTO madden_ea_league_choices (id, guild_id, league_id, user_id, persona_id, external_league_id, external_league_name, user_team_name, system_console, blaze_id, raw_payload, imported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       ON CONFLICT (league_id, user_id, external_league_id)
+       DO UPDATE SET
+         persona_id = $5,
+         external_league_name = $7,
+         user_team_name = $8,
+         system_console = $9,
+         blaze_id = $10,
+         raw_payload = $11,
+         imported_at = NOW()`,
+      [
+        randomUUID(),
+        guildId,
+        leagueId,
+        userId,
+        personaId,
+        externalLeagueId,
+        externalLeagueName,
+        userTeamName,
+        payload.systemConsole || null,
+        payload.blazeId ? String(payload.blazeId) : null,
+        JSON.stringify(leagueChoice),
+      ]
+    );
+  }
+
+  return { leagues, payload, message: 'Leagues fetched.' };
+}
+
+async function getEaLeagueChoicesForConnection(leagueId, userId) {
+  const result = await pool.query(
+    `SELECT * FROM madden_ea_league_choices WHERE league_id = $1 AND user_id = $2 ORDER BY external_league_name ASC LIMIT 25`,
+    [leagueId, userId]
+  );
+  return result.rows;
+}
+
+function buildMaddenEaLeagueChoiceComponents(leagueId, choices) {
+  const options = choices.length
+    ? choices.slice(0, 25).map(row => ({
+        label: String(row.external_league_name || row.external_league_id).slice(0, 100),
+        value: String(row.external_league_id).slice(0, 100),
+        description: row.user_team_name ? ('Team: ' + row.user_team_name).slice(0, 100) : 'Madden League',
+      }))
+    : [{ label: 'Default Madden Franchise', value: 'default_franchise', description: 'Temporary placeholder franchise' }];
+
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('madden_ea_franchise_select:' + leagueId)
+        .setPlaceholder('Select Madden League')
+        .addOptions(options)
+    ),
+  ];
+}
+
 
 async function completeEaTokenExchange(guildId, leagueId, userId, code) {
   const tokenPayload = await exchangeEaAuthorizationCode(code);
