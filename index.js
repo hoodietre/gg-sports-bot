@@ -206,6 +206,44 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS autosync_interval_minutes INTEGER NOT NULL DEFAULT 60`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS next_sync_at TIMESTAMP`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sync_feed_channel_id TEXT`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_ea_connections (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'ea_direct',
+      connection_status TEXT NOT NULL DEFAULT 'pending',
+      accepted_disclaimer BOOLEAN NOT NULL DEFAULT FALSE,
+      ea_auth_code TEXT,
+      access_token_encrypted TEXT,
+      refresh_token_encrypted TEXT,
+      token_expires_at TIMESTAMP,
+      persona_id TEXT,
+      persona_name TEXT,
+      franchise_id TEXT,
+      franchise_name TEXT,
+      last_error TEXT,
+      connected_at TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (league_id, user_id, provider)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_ea_connection_events (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      message TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS ea_direct_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+
 
 
   await pool.query(`
@@ -1154,6 +1192,10 @@ function buildCommands() {
 
       .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
       .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
+
+      .addSubcommand(sc => sc.setName('connect').setDescription('Start Discord-native EA Direct connection wizard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
+      .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('disconnect').setDescription('Disconnect your EA Direct Madden connection').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
 ,
 
     new SlashCommandBuilder()
@@ -5012,6 +5054,78 @@ if (gameSubcommand === 'report') {
     if (interaction.commandName === 'madden') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
+
+      if (maddenSubcommand === 'connect') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'Only league staff can start EA Direct connection setup.', ephemeral: true });
+          return;
+        }
+
+        await ensureMaddenLeagueSettings(activeLeague);
+        await upsertMaddenEaConnection(interaction.guild.id, activeLeague.league_id, interaction.user.id, {
+          connection_status: 'pending',
+          accepted_disclaimer: false,
+        });
+
+        await logMaddenEaConnectionEvent(interaction.guild.id, activeLeague.league_id, interaction.user.id, 'connect_started', 'EA Direct connection wizard started.');
+
+        try {
+          const dm = await interaction.user.createDM();
+          await dm.send({
+            embeds: [buildMaddenEaDisclaimerEmbed(activeLeague)],
+            components: buildMaddenEaStartComponents(activeLeague.league_id),
+          });
+
+          await interaction.reply({ content: 'I sent you a DM to continue EA Direct setup for **' + activeLeague.league_name + '**.', ephemeral: true });
+        } catch {
+          await interaction.reply({ content: 'I could not DM you. Please enable DMs from this server and run /madden connect again.', ephemeral: true });
+        }
+        return;
+      }
+
+      if (maddenSubcommand === 'connections') {
+        const leagueName = interaction.options.getString('league');
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found.', ephemeral: true });
+          return;
+        }
+
+        const connection = await getMaddenEaConnection(activeLeague.league_id, targetUser.id);
+        await interaction.reply({ embeds: [buildMaddenEaConnectionEmbed(activeLeague, connection)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'disconnect') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `DELETE FROM madden_ea_connections WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+          [activeLeague.league_id, interaction.user.id]
+        );
+
+        await logMaddenEaConnectionEvent(interaction.guild.id, activeLeague.league_id, interaction.user.id, 'disconnected', 'EA Direct connection removed.');
+        await interaction.reply({ content: 'Your EA Direct connection for **' + activeLeague.league_name + '** has been removed.', ephemeral: true });
+        return;
+      }
+
+
 
       if (maddenSubcommand === 'autosync') {
         const leagueName = interaction.options.getString('league');
@@ -12448,7 +12562,7 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Madden',
         value:
-          '/madden link, /madden sync, /madden autosync, /madden syncfeed, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
+          '/madden connect, /madden connections, /madden disconnect, /madden link, /madden sync, /madden autosync, /madden syncfeed, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
         inline: false,
       },
       {
@@ -14254,6 +14368,206 @@ async function importMaddenRowsByType(guild, league, type, rows, week = null) {
 }
 
 
+
+const EA_DIRECT_AUTH_BASE_URL = 'https://signin.ea.com/p/juno/login';
+const EA_DIRECT_REDIRECT_URI = 'http://127.0.0.1/success';
+const EA_DIRECT_CLIENT_ID = process.env.EA_DIRECT_CLIENT_ID || 'MADDEN_COMPANION_PLACEHOLDER';
+const EA_DIRECT_RELEASE_TYPE = process.env.EA_DIRECT_RELEASE_TYPE || 'prod';
+
+function buildEaDirectAuthUrl(connectionId) {
+  const params = new URLSearchParams({
+    client_id: EA_DIRECT_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: EA_DIRECT_REDIRECT_URI,
+    scope: 'basic.identity offline',
+    state: connectionId,
+    release_type: EA_DIRECT_RELEASE_TYPE,
+  });
+  return EA_DIRECT_AUTH_BASE_URL + '?' + params.toString();
+}
+
+function extractEaAuthCode(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+  try {
+    if (raw.includes('://')) {
+      const parsed = new URL(raw);
+      return parsed.searchParams.get('code') || parsed.searchParams.get('authorization_code') || raw;
+    }
+  } catch {}
+  const codeMatch = raw.match(/(?:code=)([^&\s]+)/i);
+  if (codeMatch) return decodeURIComponent(codeMatch[1]);
+  return raw;
+}
+
+async function logMaddenEaConnectionEvent(guildId, leagueId, userId, eventType, message = null) {
+  await pool.query(
+    `INSERT INTO madden_ea_connection_events (id, guild_id, league_id, user_id, event_type, message)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [randomUUID(), guildId, leagueId, userId, eventType, message]
+  ).catch(() => null);
+}
+
+async function upsertMaddenEaConnection(guildId, leagueId, userId, fields = {}) {
+  const id = fields.id || randomUUID();
+  await pool.query(
+    `INSERT INTO madden_ea_connections (
+       id, guild_id, league_id, user_id, provider, connection_status, accepted_disclaimer,
+       ea_auth_code, persona_id, persona_name, franchise_id, franchise_name, last_error, updated_at
+     )
+     VALUES ($1, $2, $3, $4, 'ea_direct', $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+     ON CONFLICT (league_id, user_id, provider)
+     DO UPDATE SET
+       connection_status = COALESCE($5, madden_ea_connections.connection_status),
+       accepted_disclaimer = COALESCE($6, madden_ea_connections.accepted_disclaimer),
+       ea_auth_code = COALESCE($7, madden_ea_connections.ea_auth_code),
+       persona_id = COALESCE($8, madden_ea_connections.persona_id),
+       persona_name = COALESCE($9, madden_ea_connections.persona_name),
+       franchise_id = COALESCE($10, madden_ea_connections.franchise_id),
+       franchise_name = COALESCE($11, madden_ea_connections.franchise_name),
+       last_error = $12,
+       updated_at = NOW()`,
+    [
+      id, guildId, leagueId, userId,
+      fields.connection_status || null,
+      fields.accepted_disclaimer ?? null,
+      fields.ea_auth_code || null,
+      fields.persona_id || null,
+      fields.persona_name || null,
+      fields.franchise_id || null,
+      fields.franchise_name || null,
+      fields.last_error || null,
+    ]
+  );
+  const result = await pool.query(
+    `SELECT * FROM madden_ea_connections WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct' LIMIT 1`,
+    [leagueId, userId]
+  );
+  return result.rows[0];
+}
+
+async function getMaddenEaConnection(leagueId, userId) {
+  const result = await pool.query(
+    `SELECT * FROM madden_ea_connections WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct' LIMIT 1`,
+    [leagueId, userId]
+  );
+  return result.rows[0] || null;
+}
+
+function buildMaddenEaDisclaimerEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle('GG Sports EA Direct Connect')
+    .setColor(0xFEE75C)
+    .setDescription(
+      '**Important before continuing:**\n\n' +
+      '• This is an **unofficial EA integration**.\n' +
+      '• GG Sports will **never ask for your EA password in Discord**.\n' +
+      '• You only sign in on EA-owned login pages.\n' +
+      '• After login, EA may show a local redirect page such as `127.0.0.1/success?code=...`.\n' +
+      '• You paste the full redirect URL or authorization code back into Discord.\n' +
+      '• Tokens should be encrypted before production use.\n' +
+      '• By continuing, you acknowledge the risks of unofficial third-party tools.\n\n' +
+      'League: **' + league.league_name + '**'
+    )
+    .setFooter({ text: 'GG Sports • Madden EA Direct' })
+    .setTimestamp();
+}
+
+function buildMaddenEaStartComponents(leagueId) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('madden_ea_accept:' + leagueId).setLabel('I Understand & Accept').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('madden_ea_cancel:' + leagueId).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+function buildMaddenEaLoginEmbed(league, connection) {
+  return new EmbedBuilder()
+    .setTitle('Connect to EA Account')
+    .setColor(0x00AEEF)
+    .setDescription(
+      'Click the EA login button below.\n\n' +
+      'After signing in, copy either the **full redirect URL** or just the **authorization code** and submit it using the button below.\n\n' +
+      'Expected redirect example:\n`http://127.0.0.1/success?code=...`\n\n' +
+      '**League:** ' + league.league_name
+    )
+    .setFooter({ text: 'GG Sports • EA Login Step' })
+    .setTimestamp();
+}
+
+function buildMaddenEaLoginComponents(leagueId, connectionId) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel('Login with EA').setStyle(ButtonStyle.Link).setURL(buildEaDirectAuthUrl(connectionId)),
+      new ButtonBuilder().setCustomId('madden_ea_submit_code:' + leagueId).setLabel('Submit Authorization Code').setStyle(ButtonStyle.Primary)
+    ),
+  ];
+}
+
+function buildMaddenEaCodeModal(leagueId) {
+  return new ModalBuilder()
+    .setCustomId('madden_ea_code_modal:' + leagueId)
+    .setTitle('EA Authorization Code')
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('ea_code')
+          .setLabel('Paste EA Authorization URL or Code')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setPlaceholder('http://127.0.0.1/success?code=... or code value')
+      )
+    );
+}
+
+function buildMaddenEaConnectionEmbed(league, connection) {
+  return new EmbedBuilder()
+    .setTitle('Madden EA Connection • ' + league.league_name)
+    .setColor(connection?.connection_status === 'connected' ? 0x57F287 : 0xFEE75C)
+    .addFields(
+      { name: 'Status', value: connection?.connection_status || 'Not connected', inline: true },
+      { name: 'Accepted Disclaimer', value: connection?.accepted_disclaimer ? 'Yes' : 'No', inline: true },
+      { name: 'Persona', value: connection?.persona_name || connection?.persona_id || 'Not selected', inline: true },
+      { name: 'Franchise', value: connection?.franchise_name || connection?.franchise_id || 'Not selected', inline: true },
+      { name: 'Auth Code Captured', value: connection?.ea_auth_code ? 'Yes' : 'No', inline: true },
+      { name: 'Last Error', value: connection?.last_error || 'None', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • EA Direct Connection' })
+    .setTimestamp();
+}
+
+function buildMaddenEaPersonaComponents(leagueId) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('madden_ea_persona_select:' + leagueId)
+        .setPlaceholder('Select EA Persona')
+        .addOptions([{ label: 'Default EA Persona', value: 'default_persona', description: 'Temporary placeholder persona' }])
+    ),
+  ];
+}
+
+function buildMaddenEaFranchiseComponents(leagueId) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('madden_ea_franchise_select:' + leagueId)
+        .setPlaceholder('Select Madden Franchise')
+        .addOptions([{ label: 'Default Madden Franchise', value: 'default_franchise', description: 'Temporary placeholder franchise' }])
+    ),
+  ];
+}
+
+async function markLeagueEaDirectEnabled(leagueId, enabled = true) {
+  await ensureMaddenLeagueSettings(await getLeagueById(leagueId));
+  await pool.query(
+    `UPDATE madden_league_settings SET ea_direct_enabled = $2, sync_source = 'ea_direct', updated_at = NOW() WHERE league_id = $1`,
+    [leagueId, enabled]
+  );
+}
+
+
 async function postMaddenSyncFeed(guild, league, run) {
   const settingsResult = await pool.query(
     `SELECT * FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
@@ -14545,7 +14859,7 @@ function buildMaddenSyncSettingsEmbed(league, settings, status = null) {
       { name: 'External Franchise ID', value: settings.external_franchise_id || 'Not set', inline: true },
       { name: 'API Key', value: maskedKey, inline: true },
       { name: 'External URL', value: settings.external_url || 'Not set', inline: false },
-      { name: 'Sync Worker', value: 'Runs GET requests against linked URL endpoints: /teams, /standings, /games, /players. Manual imports remain available as fallback.', inline: false },
+      { name: 'Sync Worker', value: 'EA Direct wizard stores connection state inside Discord. URL/JSON sync and manual imports remain available as fallback.', inline: false },
       { name: 'Last Sync', value: settings.last_sync_at ? String(settings.last_sync_at) : 'Never', inline: true },
       { name: 'Last Status', value: settings.last_sync_status || 'None', inline: true },
       { name: 'Last Message', value: settings.last_sync_message || 'No sync has run yet.', inline: false },
