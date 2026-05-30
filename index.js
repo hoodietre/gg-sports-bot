@@ -4345,12 +4345,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
 
       await pool.query(`UPDATE madden_ea_connections SET connected_at = NOW(), updated_at = NOW() WHERE id = $1`, [connection.id]).catch(() => null);
+      try {
+        const currentConnection = await getMaddenEaConnection(leagueId, interaction.user.id);
+        const accessToken = currentConnection?.access_token_encrypted ? decryptEaSecret(currentConnection.access_token_encrypted) : null;
+        const refreshToken = currentConnection?.refresh_token_encrypted ? decryptEaSecret(currentConnection.refresh_token_encrypted) : null;
+
+        if (EA_DIRECT_CONNECT_URL && accessToken) {
+          await postJsonToEndpoint(EA_DIRECT_CONNECT_URL, {
+            guild_id: interaction.guild?.id || league.guild_id,
+            league_id: leagueId,
+            user_id: interaction.user.id,
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            selected_league: franchiseId,
+            console: null,
+            blaze_id: currentConnection?.persona_id || null,
+            expiry: currentConnection?.token_expires_at ? new Date(currentConnection.token_expires_at).getTime() : null,
+          }, 'EA connect');
+        }
+      } catch (error) {
+        await pool.query(
+          `UPDATE madden_ea_connections SET last_error = $3, updated_at = NOW() WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+          [leagueId, interaction.user.id, error.message || 'EA final connect failed']
+        ).catch(() => null);
+      }
+
       await markLeagueEaDirectEnabled(leagueId, true).catch(() => null);
       await logMaddenEaConnectionEvent(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, 'connected', 'EA Direct connection completed.');
 
+      const finalConnection = await getMaddenEaConnection(leagueId, interaction.user.id);
+
       await interaction.update({
-        content: 'EA Direct Madden connection completed. Token exchange/franchise fetch worker is the next implementation step.',
-        embeds: [buildMaddenEaConnectionEmbed(league, { ...connection, connection_status: 'connected', franchise_id, franchise_name: franchiseName })],
+        content: 'EA Direct Madden connection completed.',
+        embeds: [buildMaddenEaConnectionEmbed(league, finalConnection || { ...connection, connection_status: 'connected', franchise_id, franchise_name: franchiseName })],
         components: [],
       });
       return;
@@ -5345,7 +5372,7 @@ if (gameSubcommand === 'report') {
             { name: 'Internal API Secret', value: GGSPORTS_API_SECRET ? 'Configured' : 'Not required', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Token exchange test mode: Neon-aligned connect → retrieve-personas flow.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Token exchange test mode: Correct Neon flow retrieve-personas → select-league → connect/save.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -15052,27 +15079,23 @@ async function handleInternalEaConnect(payload) {
 
 
 async function handleInternalRetrievePersonas(payload) {
+  // Correct Neon-aligned retrieve-personas route.
+  // Input: { code }
+  // Output: { access_token, personas, namespaces }
   const code = extractEaAuthCode(payload.code || payload.url || payload.authorization_code);
+  const guildId = payload.guild_id || payload.guildId || 'unknown';
   const leagueId = payload.league_id || payload.leagueId || null;
   const userId = payload.user_id || payload.userId || null;
 
-  if (!leagueId || !userId) {
-    return { statusCode: 400, payload: { error: 'Missing league_id or user_id.' } };
+  if (!code) {
+    return { statusCode: 400, payload: { error: 'Missing EA authorization code.' } };
   }
 
-  let connection = await getMaddenEaConnection(leagueId, userId);
-  let accessToken = connection?.access_token_encrypted ? decryptEaSecret(connection.access_token_encrypted) : null;
-
-  // Backward compatibility: if a stored token is missing but a code exists, run the connect step first.
-  if (!accessToken && code) {
-    const connectResult = await handleInternalEaConnect(payload);
-    if (connectResult.statusCode >= 400) return connectResult;
-    connection = await getMaddenEaConnection(leagueId, userId);
-    accessToken = connection?.access_token_encrypted ? decryptEaSecret(connection.access_token_encrypted) : null;
-  }
+  const tokenPayload = await exchangeEaAuthorizationCode(code);
+  const accessToken = tokenPayload.access_token;
 
   if (!accessToken) {
-    return { statusCode: 400, payload: { error: 'No stored EA access token found. Run /api/ea/connect first.' } };
+    return { statusCode: 502, payload: { error: 'Token exchange returned no access_token.', tokenPayload } };
   }
 
   let personaPayload = { personas: [] };
@@ -15081,18 +15104,24 @@ async function handleInternalRetrievePersonas(payload) {
   }
 
   const personas = extractEaPersonaRows(personaPayload);
-  const personaCount = await saveEaPersonas(payload.guild_id || payload.guildId || connection?.guild_id || 'unknown', leagueId, userId, personaPayload);
 
-  await pool.query(
-    `UPDATE madden_ea_connections
-     SET raw_personas_payload = $3,
-         exchange_status = 'personas_fetched',
-         connection_status = 'personas_fetched',
-         last_error = NULL,
-         updated_at = NOW()
-     WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
-    [leagueId, userId, JSON.stringify(personaPayload)]
-  );
+  if (leagueId && userId) {
+    await pool.query(
+      `UPDATE madden_ea_connections
+       SET access_token_encrypted = $4,
+           raw_token_payload = $5,
+           raw_personas_payload = $6,
+           exchange_status = 'personas_fetched',
+           connection_status = 'personas_fetched',
+           accepted_disclaimer = TRUE,
+           last_error = NULL,
+           updated_at = NOW()
+       WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+      [leagueId, userId, 'ea_direct', encryptEaSecret(accessToken), JSON.stringify(tokenPayload), JSON.stringify(personaPayload)]
+    ).catch(() => null);
+
+    await saveEaPersonas(guildId, leagueId, userId, personaPayload).catch(() => null);
+  }
 
   return {
     statusCode: 200,
@@ -15101,7 +15130,6 @@ async function handleInternalRetrievePersonas(payload) {
       personas,
       namespaces: personaPayload.namespaces || {},
       discord: null,
-      persona_count: personaCount,
       raw: personaPayload,
     },
   };
@@ -15236,22 +15264,11 @@ async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, 
     throw new Error('EA_DIRECT_RETRIEVE_PERSONAS_URL is not configured. Token exchange endpoint still needs to be wired.');
   }
 
-  // Neon-aligned backend flow:
-  // 1) /api/ea/connect exchanges and stores tokens.
-  // 2) /api/ea/retrieve-personas uses stored tokens to return persona data.
-  const connectUrl = EA_DIRECT_CONNECT_URL || EA_DIRECT_RETRIEVE_PERSONAS_URL.replace('/retrieve-personas', '/connect');
-
-  const connectPayload = await postJsonToEndpoint(connectUrl, {
-    code,
-    guild_id: guildId,
-    league_id: leagueId,
-    user_id: userId,
-  }, 'EA connect');
-
-  if (connectPayload.status && connectPayload.status !== 'ok') {
-    throw new Error('EA connect returned unexpected status: ' + connectPayload.status);
-  }
-
+  // Correct Neon-aligned flow:
+  // 1) retrieve-personas receives { code }
+  // 2) returns access_token + personas
+  // 3) selected persona is sent to select-league
+  // 4) selected league is sent to connect/save
   const payload = await postJsonToEndpoint(EA_DIRECT_RETRIEVE_PERSONAS_URL, {
     code,
     guild_id: guildId,
@@ -15269,13 +15286,23 @@ async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, 
 
   await pool.query(
     `UPDATE madden_ea_connections
-     SET raw_personas_payload = $4,
+     SET access_token_encrypted = $4,
+         raw_token_payload = $5,
+         raw_personas_payload = $6,
          exchange_status = 'personas_fetched',
          connection_status = 'personas_fetched',
+         accepted_disclaimer = TRUE,
          last_error = NULL,
          updated_at = NOW()
      WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
-    [leagueId, userId, 'ea_direct', JSON.stringify(payload)]
+    [
+      leagueId,
+      userId,
+      'ea_direct',
+      encryptEaSecret(accessToken),
+      JSON.stringify(payload),
+      JSON.stringify(payload),
+    ]
   );
 
   const connection = await getMaddenEaConnection(leagueId, userId);
