@@ -5338,13 +5338,14 @@ if (gameSubcommand === 'report') {
             { name: 'Include Client ID', value: EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID ? 'Yes' : 'No', inline: true },
             { name: 'Basic Auth', value: EA_DIRECT_TOKEN_USE_BASIC_AUTH ? 'Yes' : 'No', inline: true },
             { name: 'Personas Endpoint', value: EA_DIRECT_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
+            { name: 'Connect URL', value: (EA_DIRECT_CONNECT_URL || EA_DIRECT_RETRIEVE_PERSONAS_URL) ? 'Configured' : 'Missing', inline: true },
             { name: 'Retrieve Personas URL', value: EA_DIRECT_RETRIEVE_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Select League URL', value: EA_DIRECT_SELECT_LEAGUE_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Internal API Port', value: String(GGSPORTS_API_PORT), inline: true },
             { name: 'Internal API Secret', value: GGSPORTS_API_SECRET ? 'Configured' : 'Not required', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Token exchange test mode: form-urlencoded/basic-auth/no-body-client.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Token exchange test mode: Neon-aligned connect → retrieve-personas flow.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -14981,17 +14982,96 @@ function isAuthorizedInternalApiRequest(req) {
   return headerSecret === GGSPORTS_API_SECRET || bearer === GGSPORTS_API_SECRET;
 }
 
-async function handleInternalRetrievePersonas(payload) {
+
+async function handleInternalEaConnect(payload) {
   const code = extractEaAuthCode(payload.code || payload.url || payload.authorization_code);
+  const connectionId = payload.connection_id || payload.connectionId || null;
+  const guildId = payload.guild_id || payload.guildId || null;
+  const leagueId = payload.league_id || payload.leagueId || null;
+  const userId = payload.user_id || payload.userId || null;
+
   if (!code) {
     return { statusCode: 400, payload: { error: 'Missing EA authorization code.' } };
   }
 
+  if (!leagueId || !userId) {
+    return { statusCode: 400, payload: { error: 'Missing league_id or user_id.' } };
+  }
+
   const tokenPayload = await exchangeEaAuthorizationCode(code);
   const accessToken = tokenPayload.access_token;
+  const refreshToken = tokenPayload.refresh_token;
+  const expiresIn = Number(tokenPayload.expires_in || 0);
+  const expiresAt = expiresIn ? new Date(Date.now() + expiresIn * 1000) : null;
 
   if (!accessToken) {
     return { statusCode: 502, payload: { error: 'Token exchange returned no access_token.', tokenPayload } };
+  }
+
+  await pool.query(
+    `UPDATE madden_ea_connections
+     SET access_token_encrypted = $4,
+         refresh_token_encrypted = $5,
+         token_expires_at = $6,
+         token_type = $7,
+         token_scope = $8,
+         raw_token_payload = $9,
+         exchange_status = 'token_exchanged',
+         connection_status = 'token_exchanged',
+         accepted_disclaimer = TRUE,
+         last_error = NULL,
+         updated_at = NOW()
+     WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+    [
+      leagueId,
+      userId,
+      'ea_direct',
+      encryptEaSecret(accessToken),
+      encryptEaSecret(refreshToken),
+      expiresAt,
+      tokenPayload.token_type || null,
+      tokenPayload.scope || null,
+      JSON.stringify(tokenPayload),
+    ]
+  );
+
+  await logMaddenEaConnectionEvent(guildId || 'unknown', leagueId, userId, 'token_exchanged', 'EA token exchange completed through internal connect route.');
+
+  return {
+    statusCode: 200,
+    payload: {
+      status: 'ok',
+      connection_id: connectionId,
+      access_token: accessToken,
+      refresh_token: refreshToken || null,
+      expiry: expiresAt ? expiresAt.getTime() : null,
+    },
+  };
+}
+
+
+async function handleInternalRetrievePersonas(payload) {
+  const code = extractEaAuthCode(payload.code || payload.url || payload.authorization_code);
+  const leagueId = payload.league_id || payload.leagueId || null;
+  const userId = payload.user_id || payload.userId || null;
+
+  if (!leagueId || !userId) {
+    return { statusCode: 400, payload: { error: 'Missing league_id or user_id.' } };
+  }
+
+  let connection = await getMaddenEaConnection(leagueId, userId);
+  let accessToken = connection?.access_token_encrypted ? decryptEaSecret(connection.access_token_encrypted) : null;
+
+  // Backward compatibility: if a stored token is missing but a code exists, run the connect step first.
+  if (!accessToken && code) {
+    const connectResult = await handleInternalEaConnect(payload);
+    if (connectResult.statusCode >= 400) return connectResult;
+    connection = await getMaddenEaConnection(leagueId, userId);
+    accessToken = connection?.access_token_encrypted ? decryptEaSecret(connection.access_token_encrypted) : null;
+  }
+
+  if (!accessToken) {
+    return { statusCode: 400, payload: { error: 'No stored EA access token found. Run /api/ea/connect first.' } };
   }
 
   let personaPayload = { personas: [] };
@@ -15000,17 +15080,27 @@ async function handleInternalRetrievePersonas(payload) {
   }
 
   const personas = extractEaPersonaRows(personaPayload);
+  const personaCount = await saveEaPersonas(payload.guild_id || payload.guildId || connection?.guild_id || 'unknown', leagueId, userId, personaPayload);
+
+  await pool.query(
+    `UPDATE madden_ea_connections
+     SET raw_personas_payload = $3,
+         exchange_status = 'personas_fetched',
+         connection_status = 'personas_fetched',
+         last_error = NULL,
+         updated_at = NOW()
+     WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+    [leagueId, userId, JSON.stringify(personaPayload)]
+  );
 
   return {
     statusCode: 200,
     payload: {
       access_token: accessToken,
-      refresh_token: tokenPayload.refresh_token || null,
-      expiry: tokenPayload.expires_in ? Date.now() + Number(tokenPayload.expires_in) * 1000 : null,
-      token_type: tokenPayload.token_type || null,
-      scope: tokenPayload.scope || null,
       personas,
       namespaces: personaPayload.namespaces || {},
+      discord: null,
+      persona_count: personaCount,
       raw: personaPayload,
     },
   };
@@ -15104,6 +15194,13 @@ function startGGSportsInternalApiServer() {
 
       const payload = await readJsonRequest(req);
 
+      
+      if (url.pathname === '/api/ea/connect') {
+        const result = await handleInternalEaConnect(payload);
+        sendJsonResponse(res, result.statusCode, result.payload);
+        return;
+      }
+
       if (url.pathname === '/api/ea/retrieve-personas') {
         const result = await handleInternalRetrievePersonas(payload);
         sendJsonResponse(res, result.statusCode, result.payload);
@@ -15125,6 +15222,7 @@ function startGGSportsInternalApiServer() {
   ggSportsInternalApiServer.listen(GGSPORTS_API_PORT, () => {
     console.log('GG Sports internal API listening on port ' + GGSPORTS_API_PORT);
     if (GGSPORTS_PUBLIC_BASE_URL) {
+      console.log('EA connect URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/connect');
       console.log('EA retrieve personas URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/retrieve-personas');
       console.log('EA select league URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/select-league');
     }
@@ -15137,7 +15235,29 @@ async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, 
     throw new Error('EA_DIRECT_RETRIEVE_PERSONAS_URL is not configured. Token exchange endpoint still needs to be wired.');
   }
 
-  const payload = await postJsonToEndpoint(EA_DIRECT_RETRIEVE_PERSONAS_URL, { code }, 'EA retrieve-personas');
+  // Neon-aligned backend flow:
+  // 1) /api/ea/connect exchanges and stores tokens.
+  // 2) /api/ea/retrieve-personas uses stored tokens to return persona data.
+  const connectUrl = EA_DIRECT_CONNECT_URL || EA_DIRECT_RETRIEVE_PERSONAS_URL.replace('/retrieve-personas', '/connect');
+
+  const connectPayload = await postJsonToEndpoint(connectUrl, {
+    code,
+    guild_id: guildId,
+    league_id: leagueId,
+    user_id: userId,
+  }, 'EA connect');
+
+  if (connectPayload.status && connectPayload.status !== 'ok') {
+    throw new Error('EA connect returned unexpected status: ' + connectPayload.status);
+  }
+
+  const payload = await postJsonToEndpoint(EA_DIRECT_RETRIEVE_PERSONAS_URL, {
+    code,
+    guild_id: guildId,
+    league_id: leagueId,
+    user_id: userId,
+  }, 'EA retrieve-personas');
+
   const accessToken = extractNeonStyleAccessToken(payload);
 
   if (!accessToken) {
@@ -15148,22 +15268,13 @@ async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, 
 
   await pool.query(
     `UPDATE madden_ea_connections
-     SET access_token_encrypted = $4,
-         raw_token_payload = $5,
-         raw_personas_payload = $6,
+     SET raw_personas_payload = $4,
          exchange_status = 'personas_fetched',
          connection_status = 'personas_fetched',
          last_error = NULL,
          updated_at = NOW()
      WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
-    [
-      leagueId,
-      userId,
-      'ea_direct',
-      encryptEaSecret(accessToken),
-      JSON.stringify(payload),
-      JSON.stringify(payload),
-    ]
+    [leagueId, userId, 'ea_direct', JSON.stringify(payload)]
   );
 
   const connection = await getMaddenEaConnection(leagueId, userId);
