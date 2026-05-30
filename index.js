@@ -183,6 +183,51 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_count_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS setup_ticket_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS setup_support_channel_id TEXT`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_league_settings (
+      league_id UUID PRIMARY KEY REFERENCES leagues(id) ON DELETE CASCADE,
+      guild_id TEXT NOT NULL,
+      console TEXT,
+      advance_schedule TEXT,
+      neon_sportz_url TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_franchises (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+      team_role_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      owner_user_id TEXT,
+      coach_name TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (league_id, team_role_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_team_stats (
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+      team_role_id TEXT NOT NULL,
+      season_label TEXT NOT NULL DEFAULT 'Current',
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      ties INTEGER NOT NULL DEFAULT 0,
+      points_for INTEGER NOT NULL DEFAULT 0,
+      points_against INTEGER NOT NULL DEFAULT 0,
+      playoff_appearances INTEGER NOT NULL DEFAULT 0,
+      championships INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (league_id, team_role_id, season_label)
+    )
+  `);
+
 
 
 
@@ -985,6 +1030,14 @@ function buildCommands() {
     new SlashCommandBuilder().setName('commands').setDescription('Show available GG Sports commands'),
     new SlashCommandBuilder().setName('setupguide').setDescription('Show the full GG Sports server owner setup guide'),
     new SlashCommandBuilder().setName('quicksetup').setDescription('Show the quick GG Sports setup checklist'),
+    new SlashCommandBuilder()
+      .setName('madden')
+      .setDescription('Madden franchise and league commands')
+      .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
+      .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+
     new SlashCommandBuilder()
       .setName('setup')
       .setDescription('Interactive GG Sports setup dashboard')
@@ -4837,7 +4890,81 @@ if (gameSubcommand === 'report') {
     
     
     
-    if (interaction.commandName === 'setup') {
+    
+    if (interaction.commandName === 'madden') {
+      if (!interaction.guild) return;
+      const maddenSubcommand = interaction.options.getSubcommand();
+
+      if (maddenSubcommand === 'setup') {
+        const leagueName = interaction.options.getString('league');
+        const consoleText = interaction.options.getString('console');
+        const advance = interaction.options.getString('advance');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to configure Madden setup.', ephemeral: true });
+          return;
+        }
+
+        await ensureMaddenLeagueSettings(activeLeague, { console: consoleText, advance });
+        await syncMaddenFranchises(interaction.guild, activeLeague);
+
+        const summary = await getMaddenLeagueSummary(interaction.guild, activeLeague);
+        await interaction.reply({ embeds: [buildMaddenLeagueEmbed(activeLeague, summary)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'league') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const summary = await getMaddenLeagueSummary(interaction.guild, activeLeague);
+        await interaction.reply({ embeds: [buildMaddenLeagueEmbed(activeLeague, summary)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'teams') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const summary = await getMaddenLeagueSummary(interaction.guild, activeLeague);
+        await interaction.reply({ embeds: [buildMaddenTeamsEmbed(activeLeague, summary.teams)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'franchise') {
+        const leagueName = interaction.options.getString('league');
+        const teamRole = interaction.options.getRole('team');
+        const user = interaction.options.getUser('user');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const embed = await buildMaddenFranchiseEmbed(interaction.guild, activeLeague, teamRole?.id || null, user?.id || interaction.user.id);
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+    }
+
+if (interaction.commandName === 'setup') {
       if (!interaction.guild) return;
       const setupSubcommand = interaction.options.getSubcommand();
 
@@ -11798,7 +11925,7 @@ function buildCommandsGuideEmbed() {
   return new EmbedBuilder()
     .setTitle('GG Sports Commands')
     .setColor(0x5865F2)
-    .setDescription('Commands are organized by hub. Use /setupguide for full setup instructions.')
+    .setDescription('Commands are organized by hub. Use /setup panel for interactive setup or /setupguide for full setup instructions.')
     .addFields(
       {
         name: 'League Setup',
@@ -11806,6 +11933,12 @@ function buildCommandsGuideEmbed() {
           '/league create, /league delete, /league info, /league list, /league settings\\n' +
           '/league staff, /league teamrole, /league standingschannel, /league tournamentchannel\\n' +
           '/league sportsbookchannel, /league sportsbookfeed, /league currency, /league awards',
+        inline: false,
+      },
+      {
+        name: 'Madden',
+        value:
+          '/madden setup, /madden league, /madden teams, /madden franchise',
         inline: false,
       },
       {
@@ -12899,7 +13032,7 @@ function buildSetupDashboardEmbed(league) {
   return new EmbedBuilder()
     .setTitle('GG Sports Setup Dashboard')
     .setColor(0x5865F2)
-    .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Old slash commands still work as advanced/manual backups.')
+    .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Old slash commands still work as advanced/manual backups. Madden uses the same league role/team role setup bridge.')
     .addFields(
       { name: 'Roles', value: roleLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Core Channels', value: channelLines.join(String.fromCharCode(10)), inline: false },
@@ -13099,6 +13232,150 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
   }
 
   return 'Unknown panel type.';
+}
+
+
+
+async function ensureMaddenLeagueSettings(league, options = {}) {
+  await pool.query(
+    `INSERT INTO madden_league_settings (league_id, guild_id, console, advance_schedule, neon_sportz_url, updated_at)
+     VALUES ($1, $2, $3, $4, $5, NOW())
+     ON CONFLICT (league_id)
+     DO UPDATE SET
+       console = COALESCE($3, madden_league_settings.console),
+       advance_schedule = COALESCE($4, madden_league_settings.advance_schedule),
+       neon_sportz_url = COALESCE($5, madden_league_settings.neon_sportz_url),
+       updated_at = NOW()`,
+    [league.league_id, league.guild_id, options.console || null, options.advance || null, options.neonSportzUrl || null]
+  );
+
+  const result = await pool.query(
+    `SELECT * FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    [league.league_id]
+  );
+
+  return result.rows[0] || {};
+}
+
+async function syncMaddenFranchises(guild, league) {
+  const teamRoles = await getLeagueTeamRoles(league.league_id);
+
+  for (const team of teamRoles) {
+    const role = await guild.roles.fetch(team.role_id).catch(() => null);
+    const owner = role?.members?.find(member => !member.user.bot) || null;
+
+    await pool.query(
+      `INSERT INTO madden_franchises (id, guild_id, league_id, team_role_id, team_name, owner_user_id, coach_name, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (league_id, team_role_id)
+       DO UPDATE SET
+         team_name = $5,
+         owner_user_id = COALESCE($6, madden_franchises.owner_user_id),
+         coach_name = COALESCE($7, madden_franchises.coach_name),
+         updated_at = NOW()`,
+      [randomUUID(), guild.id, league.league_id, team.role_id, team.role_name, owner?.id || null, owner?.displayName || null]
+    );
+
+    await pool.query(
+      `INSERT INTO madden_team_stats (guild_id, league_id, team_role_id, season_label)
+       VALUES ($1, $2, $3, 'Current')
+       ON CONFLICT (league_id, team_role_id, season_label) DO NOTHING`,
+      [guild.id, league.league_id, team.role_id]
+    );
+  }
+}
+
+async function getMaddenLeagueSummary(guild, league) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  await syncMaddenFranchises(guild, league).catch(() => null);
+
+  const teams = await pool.query(
+    `SELECT * FROM madden_franchises WHERE guild_id = $1 AND league_id = $2 ORDER BY team_name ASC`,
+    [guild.id, league.league_id]
+  );
+
+  return { settings, teams: teams.rows };
+}
+
+function buildMaddenLeagueEmbed(league, summary) {
+  return new EmbedBuilder()
+    .setTitle('Madden League Hub • ' + league.league_name)
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Platform / Console', value: summary.settings.console || 'Not set', inline: true },
+      { name: 'Advance Schedule', value: summary.settings.advance_schedule || 'Not set', inline: true },
+      { name: 'Teams Synced', value: String(summary.teams.length || 0), inline: true },
+      { name: 'League Bridge', value: 'Uses existing GG Sports league roles, standings, sportsbook, activity, legacy, shop, avatar, and badge systems.', inline: false },
+      { name: 'Next Commands', value: '/madden teams\\n/madden franchise\\n/game add\\n/game report', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Madden Foundation' })
+    .setTimestamp();
+}
+
+function buildMaddenTeamsEmbed(league, teams) {
+  const NL = String.fromCharCode(10);
+  return new EmbedBuilder()
+    .setTitle('Madden Teams • ' + league.league_name)
+    .setColor(0x5865F2)
+    .setDescription(teams.length
+      ? teams.map(team => '**' + team.team_name + '** — ' + (team.owner_user_id ? '<@' + team.owner_user_id + '>' : 'Unassigned')).join(NL).slice(0, 4096)
+      : 'No Madden teams synced yet. Add team roles with /league teamrole, then run /madden setup.')
+    .setFooter({ text: 'GG Sports • Madden Teams' })
+    .setTimestamp();
+}
+
+async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userId = null) {
+  await syncMaddenFranchises(guild, league).catch(() => null);
+
+  let franchise;
+  if (teamRoleId) {
+    const result = await pool.query(
+      `SELECT * FROM madden_franchises WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3 LIMIT 1`,
+      [guild.id, league.league_id, teamRoleId]
+    );
+    franchise = result.rows[0];
+  } else if (userId) {
+    const result = await pool.query(
+      `SELECT * FROM madden_franchises WHERE guild_id = $1 AND league_id = $2 AND owner_user_id = $3 LIMIT 1`,
+      [guild.id, league.league_id, userId]
+    );
+    franchise = result.rows[0];
+  } else {
+    const result = await pool.query(
+      `SELECT * FROM madden_franchises WHERE guild_id = $1 AND league_id = $2 ORDER BY updated_at DESC LIMIT 1`,
+      [guild.id, league.league_id]
+    );
+    franchise = result.rows[0];
+  }
+
+  if (!franchise) {
+    return new EmbedBuilder()
+      .setTitle('Madden Franchise')
+      .setColor(0xED4245)
+      .setDescription('No franchise found. Add league team roles with /league teamrole, then run /madden setup.')
+      .setTimestamp();
+  }
+
+  const statsResult = await pool.query(
+    `SELECT * FROM madden_team_stats WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3 AND season_label = 'Current' LIMIT 1`,
+    [guild.id, league.league_id, franchise.team_role_id]
+  );
+  const stats = statsResult.rows[0] || {};
+
+  return new EmbedBuilder()
+    .setTitle('Madden Franchise • ' + franchise.team_name)
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Coach', value: franchise.owner_user_id ? '<@' + franchise.owner_user_id + '>' : 'Unassigned', inline: true },
+      { name: 'Team Role', value: '<@&' + franchise.team_role_id + '>', inline: true },
+      { name: 'Record', value: String(stats.wins || 0) + '-' + String(stats.losses || 0) + (Number(stats.ties || 0) ? '-' + String(stats.ties) : ''), inline: true },
+      { name: 'Points For', value: String(stats.points_for || 0), inline: true },
+      { name: 'Points Against', value: String(stats.points_against || 0), inline: true },
+      { name: 'Championships', value: String(stats.championships || 0), inline: true },
+      { name: 'Future Hooks', value: 'Scouting, depth chart notes, game strategy, draft primer, NeonSportz-style franchise hub.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Madden Franchise Foundation' })
+    .setTimestamp();
 }
 
 
