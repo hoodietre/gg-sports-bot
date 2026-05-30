@@ -1122,6 +1122,11 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('imported').setDescription('View imported Madden sync status').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+
+      .addSubcommand(sc => sc.setName('importteams').setDescription('Staff: import Madden teams from JSON text').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('json').setDescription('Teams JSON array').setRequired(true)))
+      .addSubcommand(sc => sc.setName('importgames').setDescription('Staff: import Madden games/schedule from JSON text').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('json').setDescription('Games JSON array').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
+      .addSubcommand(sc => sc.setName('importstandings').setDescription('Staff: import Madden standings from JSON text').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('json').setDescription('Standings JSON array').setRequired(true)))
+      .addSubcommand(sc => sc.setName('importplayers').setDescription('Staff: import Madden players from JSON text').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('json').setDescription('Players JSON array').setRequired(true)))
 ,
 
     new SlashCommandBuilder()
@@ -4980,6 +4985,121 @@ if (gameSubcommand === 'report') {
     if (interaction.commandName === 'madden') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
+
+      if (maddenSubcommand === 'importteams') {
+        const leagueName = interaction.options.getString('league');
+        const json = interaction.options.getString('json');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to import Madden teams.', ephemeral: true });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const rows = parseMaddenJsonInput(json);
+          const imported = await importMaddenTeamsFromArray(interaction.guild, activeLeague, rows);
+          const run = await logMaddenImportRun(interaction.guild, activeLeague, 'manual_import_teams', 'Imported Madden teams from JSON.', { teams: imported });
+          await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
+        } catch (error) {
+          await interaction.editReply({ content: error.message || 'Failed to import Madden teams.' });
+        }
+        return;
+      }
+
+      if (maddenSubcommand === 'importstandings') {
+        const leagueName = interaction.options.getString('league');
+        const json = interaction.options.getString('json');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to import Madden standings.', ephemeral: true });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const rows = parseMaddenJsonInput(json);
+          const imported = await importMaddenStandingsFromArray(interaction.guild, activeLeague, rows);
+          const run = await logMaddenImportRun(interaction.guild, activeLeague, 'manual_import_standings', 'Imported Madden standings from JSON.', { teams: imported });
+          await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
+        } catch (error) {
+          await interaction.editReply({ content: error.message || 'Failed to import Madden standings.' });
+        }
+        return;
+      }
+
+      if (maddenSubcommand === 'importgames') {
+        const leagueName = interaction.options.getString('league');
+        const json = interaction.options.getString('json');
+        const week = interaction.options.getString('week');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to import Madden games.', ephemeral: true });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const rows = parseMaddenJsonInput(json);
+          const imported = await importMaddenGamesFromArray(interaction.guild, activeLeague, rows, week);
+          const run = await logMaddenImportRun(interaction.guild, activeLeague, 'manual_import_games', 'Imported Madden games from JSON.', { games: imported }, week);
+          await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
+        } catch (error) {
+          await interaction.editReply({ content: error.message || 'Failed to import Madden games.' });
+        }
+        return;
+      }
+
+      if (maddenSubcommand === 'importplayers') {
+        const leagueName = interaction.options.getString('league');
+        const json = interaction.options.getString('json');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to import Madden players.', ephemeral: true });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+          const rows = parseMaddenJsonInput(json);
+          const imported = await importMaddenPlayersFromArray(interaction.guild, activeLeague, rows);
+          const run = await logMaddenImportRun(interaction.guild, activeLeague, 'manual_import_players', 'Imported Madden players from JSON.', { players: imported });
+          await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
+        } catch (error) {
+          await interaction.editReply({ content: error.message || 'Failed to import Madden players.' });
+        }
+        return;
+      }
+
+
 
       if (maddenSubcommand === 'link') {
         const leagueName = interaction.options.getString('league');
@@ -12117,7 +12237,7 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Madden',
         value:
-          '/madden link, /madden sync, /madden settings, /madden imported, /madden setup, /madden league, /madden teams, /madden franchise',
+          '/madden link, /madden sync, /madden settings, /madden imported, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
         inline: false,
       },
       {
@@ -13414,6 +13534,273 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
 }
 
 
+
+
+
+function parseMaddenJsonInput(jsonText) {
+  try {
+    const parsed = JSON.parse(jsonText);
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed.data)) return parsed.data;
+    if (Array.isArray(parsed.teams)) return parsed.teams;
+    if (Array.isArray(parsed.games)) return parsed.games;
+    if (Array.isArray(parsed.standings)) return parsed.standings;
+    if (Array.isArray(parsed.players)) return parsed.players;
+    return [parsed];
+  } catch (error) {
+    throw new Error('Invalid JSON. Paste a JSON array or object exported from your Madden/Neon source.');
+  }
+}
+
+function getFirstValue(obj, keys, fallback = null) {
+  for (const key of keys) {
+    if (obj && obj[key] !== undefined && obj[key] !== null && obj[key] !== '') return obj[key];
+  }
+  return fallback;
+}
+
+function normalizeMaddenTeamName(value) {
+  return String(value || '').trim();
+}
+
+async function findMaddenTeamRoleId(leagueId, teamName) {
+  if (!teamName) return null;
+  const teamRoles = await getLeagueTeamRoles(leagueId);
+  const normalized = teamName.toLowerCase();
+
+  const exact = teamRoles.find(team => String(team.role_name || '').toLowerCase() === normalized);
+  if (exact) return exact.role_id;
+
+  const contains = teamRoles.find(team => {
+    const roleName = String(team.role_name || '').toLowerCase();
+    return roleName.includes(normalized) || normalized.includes(roleName);
+  });
+
+  return contains?.role_id || null;
+}
+
+async function importMaddenTeamsFromArray(guild, league, rows) {
+  let imported = 0;
+
+  for (const row of rows) {
+    const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName', 'cityName', 'abbrName']));
+    if (!teamName) continue;
+
+    const externalTeamId = String(getFirstValue(row, ['id', 'teamId', 'team_id', 'externalTeamId', 'external_team_id'], teamName));
+    const roleId = await findMaddenTeamRoleId(league.league_id, teamName);
+    const ownerUserId = getFirstValue(row, ['ownerDiscordId', 'discord_id', 'discordId', 'owner_user_id', 'userId']);
+
+    await pool.query(
+      `INSERT INTO madden_imported_team_stats (guild_id, league_id, external_team_id, team_name, team_role_id, owner_user_id, wins, losses, ties, points_for, points_against, raw_payload, imported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+       ON CONFLICT (league_id, team_name)
+       DO UPDATE SET
+         external_team_id = $3,
+         team_role_id = COALESCE($5, madden_imported_team_stats.team_role_id),
+         owner_user_id = COALESCE($6, madden_imported_team_stats.owner_user_id),
+         wins = $7,
+         losses = $8,
+         ties = $9,
+         points_for = $10,
+         points_against = $11,
+         raw_payload = $12,
+         imported_at = NOW()`,
+      [
+        guild.id,
+        league.league_id,
+        externalTeamId,
+        teamName,
+        roleId,
+        ownerUserId || null,
+        Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
+        Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
+        Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
+        Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf'], 0)),
+        Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa'], 0)),
+        JSON.stringify(row),
+      ]
+    );
+
+    if (roleId) {
+      await pool.query(
+        `INSERT INTO madden_franchises (id, guild_id, league_id, team_role_id, team_name, owner_user_id, coach_name, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         ON CONFLICT (league_id, team_role_id)
+         DO UPDATE SET team_name = $5, owner_user_id = COALESCE($6, madden_franchises.owner_user_id), coach_name = COALESCE($7, madden_franchises.coach_name), updated_at = NOW()`,
+        [randomUUID(), guild.id, league.league_id, roleId, teamName, ownerUserId || null, getFirstValue(row, ['coachName', 'ownerName', 'userName']) || null]
+      );
+    }
+
+    imported += 1;
+  }
+
+  return imported;
+}
+
+async function importMaddenStandingsFromArray(guild, league, rows) {
+  let imported = 0;
+
+  for (const row of rows) {
+    const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName']));
+    if (!teamName) continue;
+
+    const roleId = await findMaddenTeamRoleId(league.league_id, teamName);
+
+    await pool.query(
+      `INSERT INTO madden_imported_team_stats (guild_id, league_id, external_team_id, team_name, team_role_id, wins, losses, ties, points_for, points_against, raw_payload, imported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       ON CONFLICT (league_id, team_name)
+       DO UPDATE SET
+         team_role_id = COALESCE($5, madden_imported_team_stats.team_role_id),
+         wins = $6,
+         losses = $7,
+         ties = $8,
+         points_for = $9,
+         points_against = $10,
+         raw_payload = $11,
+         imported_at = NOW()`,
+      [
+        guild.id,
+        league.league_id,
+        String(getFirstValue(row, ['id', 'teamId', 'team_id'], teamName)),
+        teamName,
+        roleId,
+        Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
+        Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
+        Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
+        Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf'], 0)),
+        Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa'], 0)),
+        JSON.stringify(row),
+      ]
+    );
+
+    if (roleId) {
+      await pool.query(
+        `INSERT INTO madden_team_stats (guild_id, league_id, team_role_id, season_label, wins, losses, ties, points_for, points_against, updated_at)
+         VALUES ($1, $2, $3, 'Current', $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (league_id, team_role_id, season_label)
+         DO UPDATE SET wins = $4, losses = $5, ties = $6, points_for = $7, points_against = $8, updated_at = NOW()`,
+        [
+          guild.id,
+          league.league_id,
+          roleId,
+          Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
+          Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
+          Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
+          Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf'], 0)),
+          Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa'], 0)),
+        ]
+      );
+    }
+
+    imported += 1;
+  }
+
+  return imported;
+}
+
+async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null) {
+  let imported = 0;
+
+  for (const row of rows) {
+    const homeTeam = normalizeMaddenTeamName(getFirstValue(row, ['homeTeam', 'home_team', 'home', 'homeName']));
+    const awayTeam = normalizeMaddenTeamName(getFirstValue(row, ['awayTeam', 'away_team', 'away', 'awayName']));
+    if (!homeTeam || !awayTeam) continue;
+
+    const externalGameId = String(getFirstValue(row, ['id', 'gameId', 'game_id', 'externalGameId'], homeTeam + '-' + awayTeam + '-' + (weekLabel || getFirstValue(row, ['week', 'weekLabel'], 'unknown'))));
+    const homeRoleId = await findMaddenTeamRoleId(league.league_id, homeTeam);
+    const awayRoleId = await findMaddenTeamRoleId(league.league_id, awayTeam);
+    const status = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
+
+    await pool.query(
+      `INSERT INTO madden_imported_games (id, guild_id, league_id, external_game_id, week_label, home_team, away_team, home_team_role_id, away_team_role_id, home_score, away_score, status, raw_payload, imported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+       ON CONFLICT (league_id, external_game_id)
+       DO UPDATE SET
+         week_label = $5,
+         home_team = $6,
+         away_team = $7,
+         home_team_role_id = COALESCE($8, madden_imported_games.home_team_role_id),
+         away_team_role_id = COALESCE($9, madden_imported_games.away_team_role_id),
+         home_score = $10,
+         away_score = $11,
+         status = $12,
+         raw_payload = $13,
+         imported_at = NOW()`,
+      [
+        randomUUID(),
+        guild.id,
+        league.league_id,
+        externalGameId,
+        weekLabel || getFirstValue(row, ['week', 'weekLabel', 'stage'], null),
+        homeTeam,
+        awayTeam,
+        homeRoleId,
+        awayRoleId,
+        Number(getFirstValue(row, ['homeScore', 'home_score', 'homePoints'], 0)),
+        Number(getFirstValue(row, ['awayScore', 'away_score', 'awayPoints'], 0)),
+        status,
+        JSON.stringify(row),
+      ]
+    );
+
+    imported += 1;
+  }
+
+  return imported;
+}
+
+async function importMaddenPlayersFromArray(guild, league, rows) {
+  let imported = 0;
+
+  for (const row of rows) {
+    const playerName = String(getFirstValue(row, ['playerName', 'player_name', 'name', 'fullName'], '')).trim();
+    if (!playerName) continue;
+
+    const externalPlayerId = String(getFirstValue(row, ['id', 'playerId', 'player_id', 'externalPlayerId'], playerName));
+
+    await pool.query(
+      `INSERT INTO madden_imported_players (id, guild_id, league_id, external_player_id, player_name, team_name, position, overall, raw_payload, imported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       ON CONFLICT (league_id, external_player_id)
+       DO UPDATE SET player_name = $5, team_name = $6, position = $7, overall = $8, raw_payload = $9, imported_at = NOW()`,
+      [
+        randomUUID(),
+        guild.id,
+        league.league_id,
+        externalPlayerId,
+        playerName,
+        getFirstValue(row, ['teamName', 'team_name', 'team'], null),
+        getFirstValue(row, ['position', 'pos'], null),
+        getFirstValue(row, ['overall', 'ovr', 'rating'], null),
+        JSON.stringify(row),
+      ]
+    );
+
+    imported += 1;
+  }
+
+  return imported;
+}
+
+async function logMaddenImportRun(guild, league, source, message, counts = {}, weekLabel = null) {
+  const runId = randomUUID();
+  await pool.query(
+    `INSERT INTO madden_sync_runs (id, guild_id, league_id, source, status, message, week_label, imported_teams, imported_games, imported_players, started_at, completed_at)
+     VALUES ($1, $2, $3, $4, 'completed', $5, $6, $7, $8, $9, NOW(), NOW())`,
+    [runId, guild.id, league.league_id, source, message, weekLabel, counts.teams || 0, counts.games || 0, counts.players || 0]
+  );
+
+  await pool.query(
+    `UPDATE madden_league_settings
+     SET last_sync_at = NOW(), last_sync_status = 'completed', last_sync_message = $2, updated_at = NOW()
+     WHERE league_id = $1`,
+    [league.league_id, message]
+  );
+
+  const result = await pool.query(`SELECT * FROM madden_sync_runs WHERE id = $1 LIMIT 1`, [runId]);
+  return result.rows[0];
+}
 
 
 async function linkMaddenExternalSource(league, options = {}) {
