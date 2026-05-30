@@ -5338,7 +5338,7 @@ if (gameSubcommand === 'report') {
             { name: 'Include Client ID', value: EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID ? 'Yes' : 'No', inline: true },
             { name: 'Basic Auth', value: EA_DIRECT_TOKEN_USE_BASIC_AUTH ? 'Yes' : 'No', inline: true },
             { name: 'Personas Endpoint', value: EA_DIRECT_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
-            { name: 'Connect URL', value: (EA_DIRECT_CONNECT_URL || EA_DIRECT_RETRIEVE_PERSONAS_URL) ? 'Configured' : 'Missing', inline: true },
+            { name: 'Connect URL', value: EA_DIRECT_CONNECT_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Retrieve Personas URL', value: EA_DIRECT_RETRIEVE_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Select League URL', value: EA_DIRECT_SELECT_LEAGUE_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Internal API Port', value: String(GGSPORTS_API_PORT), inline: true },
@@ -14680,6 +14680,7 @@ const EA_DIRECT_PERSONAS_URL = process.env.EA_DIRECT_PERSONAS_URL || null;
 const EA_DIRECT_FRANCHISES_URL = process.env.EA_DIRECT_FRANCHISES_URL || null;
 const EA_DIRECT_RETRIEVE_PERSONAS_URL = process.env.EA_DIRECT_RETRIEVE_PERSONAS_URL || null;
 const EA_DIRECT_SELECT_LEAGUE_URL = process.env.EA_DIRECT_SELECT_LEAGUE_URL || null;
+const EA_DIRECT_CONNECT_URL = process.env.EA_DIRECT_CONNECT_URL || null;
 const GGSPORTS_API_PORT = Number(process.env.PORT || process.env.GGSPORTS_API_PORT || 3000);
 const GGSPORTS_PUBLIC_BASE_URL = process.env.GGSPORTS_PUBLIC_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN || null;
 const GGSPORTS_API_SECRET = process.env.GGSPORTS_API_SECRET || null;
