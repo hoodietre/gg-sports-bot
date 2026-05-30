@@ -68,6 +68,7 @@ const pool = new Pool({
 });
 
 async function initDatabase() {
+
   await pool.query(`CREATE TABLE IF NOT EXISTS stream_links (user_id TEXT PRIMARY KEY, stream_url TEXT NOT NULL)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS bot_panels (panel_key TEXT PRIMARY KEY, channel_id TEXT NOT NULL, message_id TEXT NOT NULL)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS trade_counts (team_name TEXT PRIMARY KEY, trade_count INTEGER NOT NULL DEFAULT 0)`);
@@ -166,6 +167,63 @@ async function initDatabase() {
       standings_channel_id TEXT,
       tournament_channel_id TEXT,
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // 7I-4 hotfix: ensure trade setup columns exist before any league lookup selects them.
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS team_owners_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_offer_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_committee_role_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_committee_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS approved_trades_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS denied_trades_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_count_channel_id TEXT`);
+
+
+  // 7I-4 hotfix: ensure visual avatar/profile badge tables exist.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_badges (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      badge_key TEXT NOT NULL,
+      badge_label TEXT NOT NULL,
+      badge_icon TEXT NOT NULL,
+      source TEXT,
+      unlocked_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id, badge_key)
+    )
+  `);
+  await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS description TEXT`);
+  await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS tier TEXT`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_avatar (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      equipped_top TEXT NOT NULL DEFAULT 'Basic Tee',
+      equipped_bottom TEXT NOT NULL DEFAULT 'Plain Shorts',
+      equipped_headwear TEXT NOT NULL DEFAULT 'none',
+      equipped_accessory TEXT NOT NULL DEFAULT 'Ghost Wristband',
+      equipped_footwear TEXT NOT NULL DEFAULT 'Basic Sneakers',
+      equipped_pet TEXT NOT NULL DEFAULT 'none',
+      equipped_effect TEXT NOT NULL DEFAULT 'none',
+      equipped_background TEXT NOT NULL DEFAULT 'Locker Room',
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id)
+    )
+  `);
+  await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_effect TEXT NOT NULL DEFAULT 'none'`);
+  await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_background TEXT NOT NULL DEFAULT 'Locker Room'`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_avatar_inventory (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      item_name TEXT NOT NULL,
+      slot TEXT NOT NULL,
+      source TEXT,
+      unlocked_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id, item_name)
     )
   `);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS history_channel_id TEXT`);
