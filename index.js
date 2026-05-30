@@ -1127,6 +1127,12 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('importgames').setDescription('Staff: import Madden games/schedule from JSON text').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('json').setDescription('Games JSON array').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('importstandings').setDescription('Staff: import Madden standings from JSON text').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('json').setDescription('Standings JSON array').setRequired(true)))
       .addSubcommand(sc => sc.setName('importplayers').setDescription('Staff: import Madden players from JSON text').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('json').setDescription('Players JSON array').setRequired(true)))
+
+      .addSubcommand(sc => sc.setName('standings').setDescription('View imported Madden standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('schedule').setDescription('View imported Madden schedule/games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
+      .addSubcommand(sc => sc.setName('players').setDescription('Search imported Madden players').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false)).addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false)))
+      .addSubcommand(sc => sc.setName('team').setDescription('View imported Madden team profile').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('recentgames').setDescription('View recent imported Madden completed games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addIntegerOption(o => o.setName('limit').setDescription('Number of games').setRequired(false)))
 ,
 
     new SlashCommandBuilder()
@@ -4985,6 +4991,141 @@ if (gameSubcommand === 'report') {
     if (interaction.commandName === 'madden') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
+
+      if (maddenSubcommand === 'standings') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const result = await pool.query(
+          `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 ORDER BY wins DESC, losses ASC, team_name ASC`,
+          [interaction.guild.id, activeLeague.league_id]
+        );
+
+        await interaction.reply({ embeds: [buildMaddenImportedStandingsEmbed(activeLeague, result.rows)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'schedule') {
+        const leagueName = interaction.options.getString('league');
+        const week = interaction.options.getString('week');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const result = week
+          ? await pool.query(
+              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 AND LOWER(week_label) = LOWER($3) ORDER BY imported_at DESC LIMIT 25`,
+              [interaction.guild.id, activeLeague.league_id, week]
+            )
+          : await pool.query(
+              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 ORDER BY imported_at DESC LIMIT 25`,
+              [interaction.guild.id, activeLeague.league_id]
+            );
+
+        await interaction.reply({ embeds: [buildMaddenImportedScheduleEmbed(activeLeague, result.rows, week)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'players') {
+        const leagueName = interaction.options.getString('league');
+        const team = interaction.options.getString('team');
+        const position = interaction.options.getString('position');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const result = await pool.query(
+          `SELECT * FROM madden_imported_players
+           WHERE guild_id = $1 AND league_id = $2
+             AND ($3::text IS NULL OR LOWER(team_name) LIKE LOWER('%' || $3 || '%'))
+             AND ($4::text IS NULL OR LOWER(position) = LOWER($4))
+           ORDER BY overall DESC NULLS LAST, player_name ASC
+           LIMIT 25`,
+          [interaction.guild.id, activeLeague.league_id, team || null, position || null]
+        );
+
+        await interaction.reply({ embeds: [buildMaddenImportedPlayersEmbed(activeLeague, result.rows, { team, position })], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'team') {
+        const leagueName = interaction.options.getString('league');
+        const teamName = interaction.options.getString('team');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const teamResult = await pool.query(
+          `SELECT * FROM madden_imported_team_stats
+           WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) LIKE LOWER('%' || $3 || '%')
+           ORDER BY team_name ASC
+           LIMIT 1`,
+          [interaction.guild.id, activeLeague.league_id, teamName]
+        );
+
+        if (!teamResult.rows.length) {
+          await interaction.reply({ content: 'No imported Madden team found matching **' + teamName + '**.', ephemeral: true });
+          return;
+        }
+
+        const team = teamResult.rows[0];
+        const gamesResult = await pool.query(
+          `SELECT * FROM madden_imported_games
+           WHERE guild_id = $1 AND league_id = $2 AND (LOWER(home_team) = LOWER($3) OR LOWER(away_team) = LOWER($3))
+           ORDER BY imported_at DESC
+           LIMIT 5`,
+          [interaction.guild.id, activeLeague.league_id, team.team_name]
+        );
+
+        const playersResult = await pool.query(
+          `SELECT * FROM madden_imported_players
+           WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3)
+           ORDER BY overall DESC NULLS LAST, player_name ASC
+           LIMIT 8`,
+          [interaction.guild.id, activeLeague.league_id, team.team_name]
+        );
+
+        await interaction.reply({ embeds: [buildMaddenImportedTeamEmbed(activeLeague, team, gamesResult.rows, playersResult.rows)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'recentgames') {
+        const leagueName = interaction.options.getString('league');
+        const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 10, 1), 25);
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const result = await pool.query(
+          `SELECT * FROM madden_imported_games
+           WHERE guild_id = $1 AND league_id = $2 AND status IN ('final', 'completed', 'complete')
+           ORDER BY imported_at DESC
+           LIMIT $3`,
+          [interaction.guild.id, activeLeague.league_id, limit]
+        );
+
+        await interaction.reply({ embeds: [buildMaddenRecentGamesEmbed(activeLeague, result.rows)], ephemeral: true });
+        return;
+      }
+
+
 
       if (maddenSubcommand === 'importteams') {
         const leagueName = interaction.options.getString('league');
@@ -12237,7 +12378,7 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Madden',
         value:
-          '/madden link, /madden sync, /madden settings, /madden imported, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
+          '/madden link, /madden sync, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
         inline: false,
       },
       {
@@ -13535,6 +13676,128 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
 
 
 
+
+
+
+function buildMaddenImportedStandingsEmbed(league, rows) {
+  const NL = String.fromCharCode(10);
+  const sorted = [...rows].sort((a, b) =>
+    Number(b.wins || 0) - Number(a.wins || 0) ||
+    Number(a.losses || 0) - Number(b.losses || 0) ||
+    (String(a.team_name || '')).localeCompare(String(b.team_name || ''))
+  );
+
+  const lines = sorted.map((team, index) => {
+    const pf = Number(team.points_for || 0);
+    const pa = Number(team.points_against || 0);
+    const diff = pf - pa;
+    return '**' + (index + 1) + '. ' + team.team_name + '** — ' +
+      Number(team.wins || 0) + '-' + Number(team.losses || 0) + (Number(team.ties || 0) ? '-' + Number(team.ties || 0) : '') +
+      ' • PF ' + pf + ' • PA ' + pa + ' • DIFF ' + (diff >= 0 ? '+' : '') + diff;
+  });
+
+  return new EmbedBuilder()
+    .setTitle('Madden Imported Standings • ' + league.league_name)
+    .setColor(0x57F287)
+    .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'No imported Madden standings found yet. Use /madden importstandings or /madden sync.')
+    .setFooter({ text: 'GG Sports • Madden Imported Data' })
+    .setTimestamp();
+}
+
+function buildMaddenImportedScheduleEmbed(league, rows, week = null) {
+  const NL = String.fromCharCode(10);
+  const lines = rows.map(game => {
+    const score = game.home_score !== null && game.home_score !== undefined
+      ? ' • ' + game.away_score + '-' + game.home_score
+      : '';
+    return '**' + (game.week_label || 'Week TBD') + '** — ' + game.away_team + ' @ ' + game.home_team + score + ' • ' + (game.status || 'scheduled');
+  });
+
+  return new EmbedBuilder()
+    .setTitle('Madden Imported Schedule' + (week ? ' • ' + week : '') + ' • ' + league.league_name)
+    .setColor(0x5865F2)
+    .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'No imported Madden games found yet. Use /madden importgames or /madden sync.')
+    .setFooter({ text: 'GG Sports • Madden Schedule' })
+    .setTimestamp();
+}
+
+function buildMaddenImportedPlayersEmbed(league, rows, filters = {}) {
+  const NL = String.fromCharCode(10);
+  const lines = rows.map((player, index) =>
+    '**' + (index + 1) + '. ' + player.player_name + '** — ' +
+    (player.position || 'POS') +
+    (player.overall !== null && player.overall !== undefined ? ' • OVR ' + player.overall : '') +
+    (player.team_name ? ' • ' + player.team_name : '')
+  );
+
+  const filterText = [
+    filters.team ? 'Team: ' + filters.team : null,
+    filters.position ? 'Position: ' + filters.position : null,
+  ].filter(Boolean).join(' • ');
+
+  return new EmbedBuilder()
+    .setTitle('Madden Imported Players • ' + league.league_name)
+    .setColor(0xFEE75C)
+    .setDescription((filterText ? '_' + filterText + '_' + NL + NL : '') + (lines.length ? lines.join(NL).slice(0, 3900) : 'No imported Madden players found yet. Use /madden importplayers or /madden sync.'))
+    .setFooter({ text: 'GG Sports • Madden Players' })
+    .setTimestamp();
+}
+
+function buildMaddenImportedTeamEmbed(league, team, games, players) {
+  const NL = String.fromCharCode(10);
+  const pf = Number(team?.points_for || 0);
+  const pa = Number(team?.points_against || 0);
+  const diff = pf - pa;
+
+  const recentLines = games.length
+    ? games.map(game => {
+        const isHome = String(game.home_team || '').toLowerCase() === String(team.team_name || '').toLowerCase();
+        const opp = isHome ? game.away_team : game.home_team;
+        const teamScore = isHome ? game.home_score : game.away_score;
+        const oppScore = isHome ? game.away_score : game.home_score;
+        const result = teamScore !== null && oppScore !== null
+          ? (Number(teamScore) > Number(oppScore) ? 'W' : Number(teamScore) < Number(oppScore) ? 'L' : 'T') + ' ' + teamScore + '-' + oppScore
+          : game.status;
+        return '**' + (game.week_label || 'Week TBD') + '** vs ' + opp + ' — ' + result;
+      }).join(NL)
+    : 'No imported games found for this team.';
+
+  const playerLines = players.length
+    ? players.map(player => player.player_name + ' • ' + (player.position || 'POS') + (player.overall !== null && player.overall !== undefined ? ' • OVR ' + player.overall : '')).join(NL).slice(0, 1024)
+    : 'No imported players found for this team.';
+
+  return new EmbedBuilder()
+    .setTitle('Madden Team • ' + (team?.team_name || 'Unknown') + ' • ' + league.league_name)
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Record', value: Number(team?.wins || 0) + '-' + Number(team?.losses || 0) + (Number(team?.ties || 0) ? '-' + Number(team?.ties || 0) : ''), inline: true },
+      { name: 'PF / PA', value: pf + ' / ' + pa, inline: true },
+      { name: 'Point Diff', value: (diff >= 0 ? '+' : '') + diff, inline: true },
+      { name: 'Discord Team Role', value: team?.team_role_id ? '<@&' + team.team_role_id + '>' : 'Not mapped', inline: true },
+      { name: 'Coach', value: team?.owner_user_id ? '<@' + team.owner_user_id + '>' : 'Unassigned', inline: true },
+      { name: 'Recent Games', value: recentLines.slice(0, 1024), inline: false },
+      { name: 'Top Imported Players', value: playerLines, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Madden Team View' })
+    .setTimestamp();
+}
+
+function buildMaddenRecentGamesEmbed(league, rows) {
+  const NL = String.fromCharCode(10);
+  const lines = rows.map(game =>
+    '**' + (game.week_label || 'Week TBD') + '** — ' +
+    game.away_team + ' ' + (game.away_score ?? '-') + ' @ ' +
+    game.home_team + ' ' + (game.home_score ?? '-') +
+    ' • ' + (game.status || 'unknown')
+  );
+
+  return new EmbedBuilder()
+    .setTitle('Recent Madden Imported Games • ' + league.league_name)
+    .setColor(0x5865F2)
+    .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'No completed imported Madden games found yet.')
+    .setFooter({ text: 'GG Sports • Recent Madden Games' })
+    .setTimestamp();
+}
 
 
 function parseMaddenJsonInput(jsonText) {
