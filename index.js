@@ -4191,6 +4191,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       let connection = await upsertMaddenEaConnection(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, {
         connection_status: 'code_captured',
+        accepted_disclaimer: true,
         ea_auth_code: code,
       });
 
@@ -4221,7 +4222,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const failedConnection = await getMaddenEaConnection(leagueId, interaction.user.id);
         await interaction.editReply({
-          content: 'Authorization code captured, but token exchange failed: ' + (error.message || 'Unknown error'),
+          content: 'Authorization code captured, but token exchange failed. This usually means the EA token endpoint/client parameters need adjustment in Railway. Error: ' + (error.message || 'Unknown error'),
           embeds: [buildMaddenEaConnectionEmbed(league, failedConnection || connection)],
           components: buildMaddenEaPersonaComponents(leagueId),
         });
@@ -5291,6 +5292,9 @@ if (gameSubcommand === 'report') {
             { name: 'EA_DIRECT_CLIENT_ID', value: EA_DIRECT_CLIENT_ID ? 'Configured' : 'Missing', inline: true },
             { name: 'Redirect URI', value: EA_DIRECT_REDIRECT_URI, inline: false },
             { name: 'Token URL', value: EA_DIRECT_TOKEN_URL || 'Missing', inline: false },
+            { name: 'Token Client ID', value: EA_DIRECT_TOKEN_CLIENT_ID ? 'Configured' : 'Missing', inline: true },
+            { name: 'Include Client ID', value: EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID ? 'Yes' : 'No', inline: true },
+            { name: 'Basic Auth', value: EA_DIRECT_TOKEN_USE_BASIC_AUTH ? 'Yes' : 'No', inline: true },
             { name: 'Personas Endpoint', value: EA_DIRECT_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
@@ -14628,6 +14632,12 @@ const EA_DIRECT_TOKEN_URL = process.env.EA_DIRECT_TOKEN_URL || 'https://accounts
 const EA_DIRECT_PERSONAS_URL = process.env.EA_DIRECT_PERSONAS_URL || null;
 const EA_DIRECT_FRANCHISES_URL = process.env.EA_DIRECT_FRANCHISES_URL || null;
 const EA_DIRECT_TOKEN_AUTH_HEADER = process.env.EA_DIRECT_TOKEN_AUTH_HEADER || null;
+const EA_DIRECT_TOKEN_CLIENT_ID = process.env.EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP';
+const EA_DIRECT_TOKEN_CLIENT_SECRET = process.env.EA_DIRECT_TOKEN_CLIENT_SECRET || null;
+const EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID = String(process.env.EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID || 'true').toLowerCase() !== 'false';
+const EA_DIRECT_TOKEN_USE_BASIC_AUTH = String(process.env.EA_DIRECT_TOKEN_USE_BASIC_AUTH || 'false').toLowerCase() === 'true';
+const EA_DIRECT_TOKEN_EXTRA_PARAMS = process.env.EA_DIRECT_TOKEN_EXTRA_PARAMS || null;
+
 const EA_DIRECT_ENCRYPTION_KEY = process.env.EA_DIRECT_ENCRYPTION_KEY || null;
 
 
@@ -14670,8 +14680,22 @@ async function exchangeEaAuthorizationCode(code) {
     grant_type: 'authorization_code',
     code,
     redirect_uri: EA_DIRECT_REDIRECT_URI,
-    client_id: EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP',
   });
+
+  if (EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID && EA_DIRECT_TOKEN_CLIENT_ID) {
+    body.set('client_id', EA_DIRECT_TOKEN_CLIENT_ID);
+  }
+
+  if (EA_DIRECT_TOKEN_CLIENT_SECRET && !EA_DIRECT_TOKEN_USE_BASIC_AUTH) {
+    body.set('client_secret', EA_DIRECT_TOKEN_CLIENT_SECRET);
+  }
+
+  if (EA_DIRECT_TOKEN_EXTRA_PARAMS) {
+    for (const pair of EA_DIRECT_TOKEN_EXTRA_PARAMS.split('&')) {
+      const [key, value = ''] = pair.split('=');
+      if (key) body.set(decodeURIComponent(key), decodeURIComponent(value));
+    }
+  }
 
   const headers = {
     'Content-Type': 'application/x-www-form-urlencoded',
@@ -14680,6 +14704,8 @@ async function exchangeEaAuthorizationCode(code) {
 
   if (EA_DIRECT_TOKEN_AUTH_HEADER) {
     headers.Authorization = EA_DIRECT_TOKEN_AUTH_HEADER;
+  } else if (EA_DIRECT_TOKEN_USE_BASIC_AUTH && EA_DIRECT_TOKEN_CLIENT_ID && EA_DIRECT_TOKEN_CLIENT_SECRET) {
+    headers.Authorization = 'Basic ' + Buffer.from(EA_DIRECT_TOKEN_CLIENT_ID + ':' + EA_DIRECT_TOKEN_CLIENT_SECRET).toString('base64');
   }
 
   const response = await fetch(EA_DIRECT_TOKEN_URL, {
@@ -14697,7 +14723,16 @@ async function exchangeEaAuthorizationCode(code) {
   }
 
   if (!response.ok) {
-    throw new Error('EA token exchange failed: HTTP ' + response.status + ' • ' + (payload.error_description || payload.error || text).slice(0, 300));
+    const safeBody = body.toString()
+      .replace(/code=[^&]+/g, 'code=REDACTED')
+      .replace(/client_secret=[^&]+/g, 'client_secret=REDACTED');
+    throw new Error(
+      'EA token exchange failed: HTTP ' + response.status +
+      ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
+      ' • token_url=' + EA_DIRECT_TOKEN_URL +
+      ' • body=' + safeBody +
+      ' • auth=' + (headers.Authorization ? 'yes' : 'no')
+    );
   }
 
   return payload;
