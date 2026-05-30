@@ -4092,7 +4092,131 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.isButton() && interaction.customId.startsWith('madden_ea_accept:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) {
+        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        return;
+      }
+
+      const connection = await upsertMaddenEaConnection(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, {
+        connection_status: 'accepted',
+        accepted_disclaimer: true,
+      });
+
+      await logMaddenEaConnectionEvent(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, 'disclaimer_accepted', 'User accepted EA Direct disclaimer.');
+
+      await interaction.update({
+        embeds: [buildMaddenEaLoginEmbed(league, connection)],
+        components: buildMaddenEaLoginComponents(leagueId, connection.id),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madden_ea_cancel:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      await pool.query(
+        `UPDATE madden_ea_connections SET connection_status = 'cancelled', updated_at = NOW() WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+        [leagueId, interaction.user.id]
+      ).catch(() => null);
+
+      await interaction.update({ content: 'EA Direct connection cancelled.', embeds: [], components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madden_ea_submit_code:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      await interaction.showModal(buildMaddenEaCodeModal(leagueId));
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('madden_ea_code_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) {
+        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        return;
+      }
+
+      const input = interaction.fields.getTextInputValue('ea_code');
+      const code = extractEaAuthCode(input);
+
+      if (!code) {
+        await interaction.reply({ content: 'I could not find an authorization code in that input.', ephemeral: true });
+        return;
+      }
+
+      const connection = await upsertMaddenEaConnection(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, {
+        connection_status: 'code_captured',
+        ea_auth_code: code,
+      });
+
+      await markLeagueEaDirectEnabled(leagueId, true).catch(() => null);
+      await logMaddenEaConnectionEvent(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, 'code_captured', 'EA authorization code captured.');
+
+      await interaction.reply({
+        content: 'Authorization code captured. Next step is token exchange and EA persona lookup.',
+        embeds: [buildMaddenEaConnectionEmbed(league, connection)],
+        components: buildMaddenEaPersonaComponents(leagueId),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madden_ea_persona_select:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) {
+        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        return;
+      }
+
+      const personaId = interaction.values[0];
+      const connection = await upsertMaddenEaConnection(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, {
+        connection_status: 'persona_selected',
+        persona_id: personaId,
+        persona_name: personaId === 'default_persona' ? 'Default EA Persona' : personaId,
+      });
+
+      await interaction.update({
+        content: 'Persona selected. Now choose the Madden franchise.',
+        embeds: [buildMaddenEaConnectionEmbed(league, connection)],
+        components: buildMaddenEaFranchiseComponents(leagueId),
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madden_ea_franchise_select:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) {
+        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        return;
+      }
+
+      const franchiseId = interaction.values[0];
+      const connection = await upsertMaddenEaConnection(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, {
+        connection_status: 'connected',
+        franchise_id: franchiseId,
+        franchise_name: franchiseId === 'default_franchise' ? 'Default Madden Franchise' : franchiseId,
+      });
+
+      await pool.query(`UPDATE madden_ea_connections SET connected_at = NOW(), updated_at = NOW() WHERE id = $1`, [connection.id]).catch(() => null);
+      await markLeagueEaDirectEnabled(leagueId, true).catch(() => null);
+      await logMaddenEaConnectionEvent(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, 'connected', 'EA Direct connection completed.');
+
+      await interaction.update({
+        content: 'EA Direct Madden connection completed. Token exchange/franchise fetch worker is the next implementation step.',
+        embeds: [buildMaddenEaConnectionEmbed(league, { ...connection, connection_status: 'connected', franchise_id, franchise_name: franchiseId === 'default_franchise' ? 'Default Madden Franchise' : franchiseId })],
+        components: [],
+      });
+      return;
+    }
+
+
+    if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName.startsWith('league-')) {
       if (!interaction.guild) {
