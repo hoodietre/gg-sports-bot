@@ -5295,6 +5295,7 @@ if (gameSubcommand === 'report') {
             { name: 'Token Client ID', value: EA_DIRECT_TOKEN_CLIENT_ID ? 'Configured' : 'Missing', inline: true },
             { name: 'Include Client ID', value: EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID ? 'Yes' : 'No', inline: true },
             { name: 'Basic Auth', value: EA_DIRECT_TOKEN_USE_BASIC_AUTH ? 'Yes' : 'No', inline: true },
+            { name: 'Token Secret', value: EA_DIRECT_TOKEN_CLIENT_SECRET ? 'Configured' : 'Missing / using empty secret', inline: true },
             { name: 'Personas Endpoint', value: EA_DIRECT_PERSONAS_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
@@ -14704,8 +14705,10 @@ async function exchangeEaAuthorizationCode(code) {
 
   if (EA_DIRECT_TOKEN_AUTH_HEADER) {
     headers.Authorization = EA_DIRECT_TOKEN_AUTH_HEADER;
-  } else if (EA_DIRECT_TOKEN_USE_BASIC_AUTH && EA_DIRECT_TOKEN_CLIENT_ID && EA_DIRECT_TOKEN_CLIENT_SECRET) {
-    headers.Authorization = 'Basic ' + Buffer.from(EA_DIRECT_TOKEN_CLIENT_ID + ':' + EA_DIRECT_TOKEN_CLIENT_SECRET).toString('base64');
+  } else if (EA_DIRECT_TOKEN_USE_BASIC_AUTH && EA_DIRECT_TOKEN_CLIENT_ID) {
+    // Some EA/Madden Companion-style OAuth clients appear to use public-client Basic auth.
+    // If no secret is configured, still send "client_id:" as the Basic auth payload.
+    headers.Authorization = 'Basic ' + Buffer.from(EA_DIRECT_TOKEN_CLIENT_ID + ':' + (EA_DIRECT_TOKEN_CLIENT_SECRET || '')).toString('base64');
   }
 
   const response = await fetch(EA_DIRECT_TOKEN_URL, {
@@ -14731,7 +14734,7 @@ async function exchangeEaAuthorizationCode(code) {
       ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
       ' • token_url=' + EA_DIRECT_TOKEN_URL +
       ' • body=' + safeBody +
-      ' • auth=' + (headers.Authorization ? 'yes' : 'no')
+      ' • auth=' + (headers.Authorization ? (EA_DIRECT_TOKEN_CLIENT_SECRET ? 'yes_with_secret' : 'yes_empty_secret') : 'no')
     );
   }
 
