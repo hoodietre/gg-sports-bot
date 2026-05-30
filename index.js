@@ -202,6 +202,11 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMP`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_sync_status TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_sync_message TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS autosync_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS autosync_interval_minutes INTEGER NOT NULL DEFAULT 60`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS next_sync_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sync_feed_channel_id TEXT`);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_sync_runs (
@@ -1146,6 +1151,9 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('players').setDescription('Search imported Madden players').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false)).addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false)))
       .addSubcommand(sc => sc.setName('team').setDescription('View imported Madden team profile').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('recentgames').setDescription('View recent imported Madden completed games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addIntegerOption(o => o.setName('limit').setDescription('Number of games').setRequired(false)))
+
+      .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
+      .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
 ,
 
     new SlashCommandBuilder()
@@ -5005,6 +5013,54 @@ if (gameSubcommand === 'report') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
 
+      if (maddenSubcommand === 'autosync') {
+        const leagueName = interaction.options.getString('league');
+        const enabled = interaction.options.getBoolean('enabled');
+        const minutes = interaction.options.getInteger('minutes');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to configure Madden autosync.', ephemeral: true });
+          return;
+        }
+
+        const settings = await setMaddenAutosync(activeLeague, enabled, minutes);
+        await interaction.reply({ embeds: [buildMaddenAutosyncEmbed(activeLeague, settings)], ephemeral: true });
+        return;
+      }
+
+      if (maddenSubcommand === 'syncfeed') {
+        const leagueName = interaction.options.getString('league');
+        const channel = interaction.options.getChannel('channel');
+        const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+          return;
+        }
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to configure Madden sync feed.', ephemeral: true });
+          return;
+        }
+
+        const botMember = await interaction.guild.members.fetchMe();
+        const permissions = channel?.permissionsFor(botMember);
+        if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that sync feed channel.', ephemeral: true });
+          return;
+        }
+
+        const settings = await setMaddenSyncFeedChannel(activeLeague, channel.id);
+        await interaction.reply({ content: 'Madden sync feed set to ' + channel.toString() + '.', embeds: [buildMaddenAutosyncEmbed(activeLeague, settings)], ephemeral: true });
+        return;
+      }
+
+
+
       if (maddenSubcommand === 'standings') {
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
@@ -5301,6 +5357,7 @@ if (gameSubcommand === 'report') {
 
         await interaction.deferReply({ ephemeral: true });
         const run = await runMaddenExternalFetchSync(interaction.guild, activeLeague, { week });
+        await postMaddenSyncFeed(interaction.guild, activeLeague, run).catch(() => null);
         await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
         return;
       }
@@ -12391,7 +12448,7 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Madden',
         value:
-          '/madden link, /madden sync, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
+          '/madden link, /madden sync, /madden autosync, /madden syncfeed, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
         inline: false,
       },
       {
@@ -14196,6 +14253,123 @@ async function importMaddenRowsByType(guild, league, type, rows, week = null) {
   return { teams: 0, games: 0, players: 0 };
 }
 
+
+async function postMaddenSyncFeed(guild, league, run) {
+  const settingsResult = await pool.query(
+    `SELECT * FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    [league.league_id]
+  );
+  const settings = settingsResult.rows[0] || {};
+  const channelId = settings.sync_feed_channel_id || league.sportsbook_channel_id || null;
+  if (!channelId) return null;
+
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel || !channel.isTextBased()) return null;
+
+  const embed = buildMaddenSyncRunEmbed(league, run)
+    .setTitle((run.status === 'failed' ? '⚠️ Madden Sync Failed • ' : '✅ Madden Sync Complete • ') + league.league_name)
+    .setFooter({ text: 'GG Sports • Madden Auto Sync' })
+    .setTimestamp();
+
+  return channel.send({ embeds: [embed] }).catch(() => null);
+}
+
+async function setMaddenAutosync(league, enabled, minutes = null) {
+  const interval = Math.max(Number(minutes || 60), 15);
+  const nextSync = enabled ? new Date(Date.now() + interval * 60 * 1000) : null;
+  await ensureMaddenLeagueSettings(league);
+  await pool.query(
+    `UPDATE madden_league_settings
+     SET autosync_enabled = $2, autosync_interval_minutes = $3, next_sync_at = $4, updated_at = NOW()
+     WHERE league_id = $1`,
+    [league.league_id, enabled, interval, nextSync]
+  );
+  const result = await pool.query(`SELECT * FROM madden_league_settings WHERE league_id = $1 LIMIT 1`, [league.league_id]);
+  return result.rows[0] || {};
+}
+
+async function setMaddenSyncFeedChannel(league, channelId) {
+  await ensureMaddenLeagueSettings(league);
+  await pool.query(
+    `UPDATE madden_league_settings SET sync_feed_channel_id = $2, updated_at = NOW() WHERE league_id = $1`,
+    [league.league_id, channelId]
+  );
+  const result = await pool.query(`SELECT * FROM madden_league_settings WHERE league_id = $1 LIMIT 1`, [league.league_id]);
+  return result.rows[0] || {};
+}
+
+function buildMaddenAutosyncEmbed(league, settings) {
+  return new EmbedBuilder()
+    .setTitle('Madden Auto Sync • ' + league.league_name)
+    .setColor(settings.autosync_enabled ? 0x57F287 : 0xED4245)
+    .addFields(
+      { name: 'Enabled', value: settings.autosync_enabled ? 'Yes' : 'No', inline: true },
+      { name: 'Interval', value: String(settings.autosync_interval_minutes || 60) + ' minutes', inline: true },
+      { name: 'Next Sync', value: settings.next_sync_at ? String(settings.next_sync_at) : 'Not scheduled', inline: true },
+      { name: 'Feed Channel', value: settings.sync_feed_channel_id ? '<#' + settings.sync_feed_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Source', value: settings.sync_source || 'Not linked', inline: true },
+      { name: 'External URL', value: settings.external_url || 'Not set', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Madden Autosync' })
+    .setTimestamp();
+}
+
+let maddenAutosyncTimer = null;
+let maddenAutosyncRunning = false;
+
+async function runDueMaddenAutosyncs(client) {
+  if (maddenAutosyncRunning) return;
+  maddenAutosyncRunning = true;
+  try {
+    const due = await pool.query(
+      `SELECT mls.*, l.guild_id AS league_guild_id, l.league_name
+       FROM madden_league_settings mls
+       JOIN leagues l ON l.league_id = mls.league_id
+       WHERE mls.autosync_enabled = TRUE
+         AND (mls.next_sync_at IS NULL OR mls.next_sync_at <= NOW())
+       ORDER BY mls.next_sync_at ASC NULLS FIRST
+       LIMIT 10`
+    );
+
+    for (const row of due.rows) {
+      const guildId = row.guild_id || row.league_guild_id;
+      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      if (!guild) continue;
+      const league = await getLeagueById(row.league_id);
+      if (!league) continue;
+
+      let run;
+      try {
+        run = await runMaddenExternalFetchSync(guild, league, { week: null });
+      } catch (error) {
+        run = { status: 'failed', source: row.sync_source || 'unknown', message: error.message || 'Autosync failed.', imported_teams: 0, imported_games: 0, imported_players: 0 };
+      }
+      await postMaddenSyncFeed(guild, league, run).catch(() => null);
+
+      const interval = Math.max(Number(row.autosync_interval_minutes || 60), 15);
+      await pool.query(
+        `UPDATE madden_league_settings
+         SET next_sync_at = NOW() + ($2::int * INTERVAL '1 minute'), updated_at = NOW()
+         WHERE league_id = $1`,
+        [row.league_id, interval]
+      );
+    }
+  } catch (error) {
+    console.error('Madden autosync loop failed:', error);
+  } finally {
+    maddenAutosyncRunning = false;
+  }
+}
+
+function startMaddenAutosyncLoop(client) {
+  if (maddenAutosyncTimer) clearInterval(maddenAutosyncTimer);
+  maddenAutosyncTimer = setInterval(() => {
+    runDueMaddenAutosyncs(client).catch(error => console.error('Madden autosync tick failed:', error));
+  }, 60 * 1000);
+  setTimeout(() => runDueMaddenAutosyncs(client).catch(() => null), 10 * 1000);
+}
+
+
 async function runMaddenExternalFetchSync(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
   const runId = randomUUID();
@@ -14374,7 +14548,10 @@ function buildMaddenSyncSettingsEmbed(league, settings, status = null) {
       { name: 'Sync Worker', value: 'Runs GET requests against linked URL endpoints: /teams, /standings, /games, /players. Manual imports remain available as fallback.', inline: false },
       { name: 'Last Sync', value: settings.last_sync_at ? String(settings.last_sync_at) : 'Never', inline: true },
       { name: 'Last Status', value: settings.last_sync_status || 'None', inline: true },
-      { name: 'Last Message', value: settings.last_sync_message || 'No sync has run yet.', inline: false }
+      { name: 'Last Message', value: settings.last_sync_message || 'No sync has run yet.', inline: false },
+      { name: 'Autosync', value: settings.autosync_enabled ? 'Enabled every ' + String(settings.autosync_interval_minutes || 60) + ' minutes' : 'Disabled', inline: true },
+      { name: 'Next Sync', value: settings.next_sync_at ? String(settings.next_sync_at) : 'Not scheduled', inline: true },
+      { name: 'Sync Feed', value: settings.sync_feed_channel_id ? '<#' + settings.sync_feed_channel_id + '>' : 'Not set', inline: true }
     )
     .setFooter({ text: 'GG Sports • Madden External Sync' })
     .setTimestamp();
