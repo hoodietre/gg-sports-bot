@@ -782,6 +782,9 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS description TEXT`);
+  await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS tier TEXT`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_avatar (
       guild_id TEXT NOT NULL,
@@ -4454,9 +4457,10 @@ if (gameSubcommand === 'report') {
         const activityTier = getActivityTier(Number(recognition.activity_points || 0));
         const legacyTier = getLegacyTier(Number(recognition.legacy_score || 0));
         const settings = await getCurrencySettings(interaction.guild.id);
-        const badges = await getUserBadges(interaction.guild.id, targetUser.id, recognition);
+        const badges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, recognition);
         const streamUrl = await getUserStreamUrl(interaction.guild.id, targetUser.id);
         const avatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
+        const profileAvatarAttachment = buildAvatarAttachment(targetUser, avatar);
         const legacyIcon = getLegacyTierIcon(legacyTier);
         const activityIcon = getActivityTierIcon(activityTier);
         const normalizedActivityTier = normalizeActivityTierName(activityTier);
@@ -4467,6 +4471,7 @@ if (gameSubcommand === 'report') {
           .setTitle('Franchise Hub • ' + targetUser.username)
           .setColor(0xFEE75C)
           .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .setImage('attachment://avatar.png')
           .addFields(
             { name: 'League Scope', value: activeLeague ? activeLeague.league_name : 'All Leagues', inline: true },
             { name: '⚡ Activity', value: activityIcon + ' ' + normalizedActivityTier + ' • ' + String(recognition.activity_points || 0) + ' pts', inline: true },
@@ -4485,7 +4490,7 @@ if (gameSubcommand === 'report') {
           .setFooter({ text: 'GG Sports • Franchise Hub Foundation' })
           .setTimestamp();
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [embed], files: [profileAvatarAttachment], ephemeral: true });
         return;
       }
 
@@ -4663,7 +4668,33 @@ if (gameSubcommand === 'report') {
     }
 
     
-    if (interaction.commandName === 'avatar') {
+    
+    if (interaction.commandName === 'badges') {
+      if (!interaction.guild) return;
+      const badgeSubcommand = interaction.options.getSubcommand();
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+
+      await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
+      const recognitionResult = await pool.query(
+        `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+        [interaction.guild.id, targetUser.id]
+      );
+      const recognition = recognitionResult.rows[0] || {};
+
+      if (badgeSubcommand === 'view') {
+        const badges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, recognition);
+        await interaction.reply({ embeds: [buildBadgesEmbed(targetUser, badges)], ephemeral: true });
+        return;
+      }
+
+      if (badgeSubcommand === 'progress') {
+        await syncExpandedProfileBadges(interaction.guild.id, targetUser.id, recognition).catch(() => null);
+        await interaction.reply({ embeds: [buildBadgeProgressEmbed(targetUser, recognition)], ephemeral: true });
+        return;
+      }
+    }
+
+if (interaction.commandName === 'avatar') {
       if (!interaction.guild) return;
       const avatarSubcommand = interaction.options.getSubcommand();
 
@@ -4673,6 +4704,10 @@ if (gameSubcommand === 'report') {
         const avatar = await ensureVisualAvatar(interaction.guild.id, targetUser.id);
         const attachment = buildAvatarAttachment(targetUser, avatar);
         const embed = buildVisualAvatarEmbed(targetUser, avatar);
+        const avatarBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id);
+        if (avatarBadges.length) {
+          embed.addFields({ name: 'Avatar Badges', value: avatarBadges.slice(0, 6).map(badge => badge.badge_icon + ' ' + badge.badge_label).join(' • '), inline: false });
+        }
         await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
         return;
       }
@@ -9268,7 +9303,7 @@ if (shopSubcommand === 'view') {
       const profileRecognition = profileRecognitionResult.rows[0] || {};
       const profileActivityTier = typeof getActivityTier === 'function' ? getActivityTier(Number(profileRecognition.activity_points || 0)) : { name: 'Inactive' };
       const profileLegacyTier = typeof getLegacyTier === 'function' ? getLegacyTier(Number(profileRecognition.legacy_score || 0)) : { name: 'Rising Star' };
-      const profileBadges = await getUserBadges(interaction.guild.id, targetUser.id, profileRecognition);
+      const profileBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, profileRecognition);
       const profileStreamUrl = await getUserStreamUrl(interaction.guild.id, targetUser.id);
       const profileAvatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
 
@@ -12434,5 +12469,136 @@ function buildTradeSettingsEmbed(league) {
     .setFooter({ text: 'GG Sports • Trade Setup' })
     .setTimestamp();
 }
+
+
+const PROFILE_BADGE_DEFINITIONS = [
+  { key: 'champion', icon: '🏆', label: 'Champion', description: 'Won at least one championship.' },
+  { key: 'dynasty', icon: '👑', label: 'Dynasty', description: 'Won 5+ championships.' },
+  { key: 'legacy_goat', icon: '🐐', label: 'GOAT Legacy', description: 'Reached GOAT legacy tier.' },
+  { key: 'legacy_legend', icon: '🔥', label: 'Legend Legacy', description: 'Reached Legend legacy tier.' },
+  { key: 'legacy_elite', icon: '💎', label: 'Elite Legacy', description: 'Reached Elite legacy tier.' },
+  { key: 'activity_grinder', icon: '💀', label: 'Grinder Activity', description: 'Reached Grinder/Icon activity tier.' },
+  { key: 'activity_dedicated', icon: '🏹', label: 'Dedicated Activity', description: 'Reached Dedicated/Elite activity tier.' },
+  { key: 'sportsbook_winner', icon: '🎰', label: 'Sportsbook Winner', description: 'Won at least one sportsbook bet.' },
+  { key: 'sharp_bettor', icon: '🎯', label: 'Sharp Bettor', description: 'Won 10+ sportsbook bets.' },
+  { key: 'high_roller', icon: '💰', label: 'High Roller', description: 'Reached 10,000+ sportsbook profit.' },
+  { key: 'collector', icon: '🛒', label: 'Collector', description: 'Purchased 5+ shop/inventory items.' },
+  { key: 'streamer', icon: '📺', label: 'Streamer', description: 'Linked a stream URL.' },
+  { key: 'ticket_helper', icon: '🛠️', label: 'Ticket Helper', description: 'Resolved 10+ tickets.' },
+  { key: 'league_grinder', icon: '🎮', label: 'League Grinder', description: 'Played 25+ games.' },
+];
+
+function badgeDefinition(key) {
+  return PROFILE_BADGE_DEFINITIONS.find(badge => badge.key === key) || null;
+}
+
+async function awardProfileBadge(guildId, userId, key, source = null) {
+  const badge = badgeDefinition(key);
+  if (!badge) return;
+
+  await pool.query(
+    `INSERT INTO user_badges (guild_id, user_id, badge_key, badge_label, badge_icon, source, description)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (guild_id, user_id, badge_key)
+     DO UPDATE SET badge_label = $4, badge_icon = $5, source = COALESCE($6, user_badges.source), description = $7`,
+    [guildId, userId, badge.key, badge.label, badge.icon, source, badge.description]
+  );
+}
+
+async function syncExpandedProfileBadges(guildId, userId, recognition = null) {
+  const row = recognition || (await pool.query(
+    `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guildId, userId]
+  )).rows[0] || {};
+
+  const legacyScore = Number(row.legacy_score || 0);
+  const activityPoints = Number(row.activity_points || 0);
+  const championships = Number(row.championships || 0);
+  const sportsbookWins = Number(row.sportsbook_wins || 0);
+  const sportsbookProfit = Number(row.sportsbook_profit || 0);
+  const ticketsResolved = Number(row.tickets_resolved || 0);
+  const gamesPlayed = Number(row.games_played || 0);
+
+  const legacyTier = typeof getLegacyTier === 'function' ? getLegacyTier(legacyScore) : { name: 'Rising Star' };
+  const activityTier = typeof getActivityTier === 'function' ? getActivityTier(activityPoints) : { name: 'Inactive' };
+  const legacyName = legacyTier.name || legacyTier;
+  const activityName = typeof normalizeActivityTierName === 'function' ? normalizeActivityTierName(activityTier) : String(activityTier.name || activityTier);
+
+  if (championships >= 1) await awardProfileBadge(guildId, userId, 'champion', 'championship');
+  if (championships >= 5) await awardProfileBadge(guildId, userId, 'dynasty', 'championship');
+  if (legacyName === 'GOAT') await awardProfileBadge(guildId, userId, 'legacy_goat', 'legacy');
+  if (legacyName === 'Legend') await awardProfileBadge(guildId, userId, 'legacy_legend', 'legacy');
+  if (legacyName === 'Elite') await awardProfileBadge(guildId, userId, 'legacy_elite', 'legacy');
+  if (activityName === 'Grinder') await awardProfileBadge(guildId, userId, 'activity_grinder', 'activity');
+  if (activityName === 'Dedicated') await awardProfileBadge(guildId, userId, 'activity_dedicated', 'activity');
+  if (sportsbookWins >= 1) await awardProfileBadge(guildId, userId, 'sportsbook_winner', 'sportsbook');
+  if (sportsbookWins >= 10) await awardProfileBadge(guildId, userId, 'sharp_bettor', 'sportsbook');
+  if (sportsbookProfit >= 10000) await awardProfileBadge(guildId, userId, 'high_roller', 'sportsbook');
+  if (ticketsResolved >= 10) await awardProfileBadge(guildId, userId, 'ticket_helper', 'tickets');
+  if (gamesPlayed >= 25) await awardProfileBadge(guildId, userId, 'league_grinder', 'activity');
+
+  const inventoryCount = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM user_inventory WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId]
+  ).catch(() => ({ rows: [{ count: 0 }] }));
+  if (Number(inventoryCount.rows[0]?.count || 0) >= 5) await awardProfileBadge(guildId, userId, 'collector', 'shop');
+
+  const streamUrl = typeof getUserStreamUrl === 'function' ? await getUserStreamUrl(guildId, userId).catch(() => null) : null;
+  if (streamUrl) await awardProfileBadge(guildId, userId, 'streamer', 'stream');
+
+  if (typeof syncProfileBadges === 'function') {
+    await syncProfileBadges(guildId, userId, row).catch(() => null);
+  }
+}
+
+async function getExpandedUserBadges(guildId, userId, recognition = null) {
+  await syncExpandedProfileBadges(guildId, userId, recognition).catch(() => null);
+  const result = await pool.query(
+    `SELECT * FROM user_badges WHERE guild_id = $1 AND user_id = $2 ORDER BY unlocked_at ASC LIMIT 20`,
+    [guildId, userId]
+  );
+  return result.rows;
+}
+
+function formatBadgeLine(badge) {
+  return badge.badge_icon + ' **' + badge.badge_label + '**' + (badge.description ? ' — ' + badge.description : '');
+}
+
+function buildBadgesEmbed(user, badges) {
+  const NL = String.fromCharCode(10);
+  return new EmbedBuilder()
+    .setTitle(user.username + ' Badges')
+    .setColor(0xFEE75C)
+    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+    .setDescription(badges.length ? badges.map(formatBadgeLine).join(NL).slice(0, 4096) : 'No badges unlocked yet.')
+    .setFooter({ text: 'GG Sports • Badges' })
+    .setTimestamp();
+}
+
+function buildBadgeProgressEmbed(user, recognition = {}) {
+  const championships = Number(recognition.championships || 0);
+  const sportsbookWins = Number(recognition.sportsbook_wins || 0);
+  const sportsbookProfit = Number(recognition.sportsbook_profit || 0);
+  const ticketsResolved = Number(recognition.tickets_resolved || 0);
+  const gamesPlayed = Number(recognition.games_played || 0);
+
+  const lines = [
+    '🏆 Champion: ' + Math.min(championships, 1) + '/1 championship',
+    '👑 Dynasty: ' + Math.min(championships, 5) + '/5 championships',
+    '🎰 Sportsbook Winner: ' + Math.min(sportsbookWins, 1) + '/1 win',
+    '🎯 Sharp Bettor: ' + Math.min(sportsbookWins, 10) + '/10 wins',
+    '💰 High Roller: ' + Math.min(sportsbookProfit, 10000) + '/10000 profit',
+    '🛠️ Ticket Helper: ' + Math.min(ticketsResolved, 10) + '/10 tickets',
+    '🎮 League Grinder: ' + Math.min(gamesPlayed, 25) + '/25 games',
+  ];
+
+  return new EmbedBuilder()
+    .setTitle(user.username + ' Badge Progress')
+    .setColor(0x5865F2)
+    .setDescription(lines.join(String.fromCharCode(10)))
+    .setFooter({ text: 'GG Sports • Badge Progress' })
+    .setTimestamp();
+}
+
 
 
