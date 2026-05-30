@@ -8,6 +8,9 @@ import {
   PermissionFlagsBits,
   EmbedBuilder,
   AttachmentBuilder,
+  ChannelType,
+  RoleSelectMenuBuilder,
+  ChannelSelectMenuBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -178,6 +181,9 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS approved_trades_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS denied_trades_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_count_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS setup_ticket_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS setup_support_channel_id TEXT`);
+
 
 
   // 7I-4 hotfix: ensure visual avatar/profile badge tables exist.
@@ -4717,7 +4723,35 @@ if (gameSubcommand === 'report') {
 
     
     
-    if (interaction.commandName === 'badges') {
+    
+    if (interaction.commandName === 'setup') {
+      if (!interaction.guild) return;
+      const setupSubcommand = interaction.options.getSubcommand();
+
+      if (setupSubcommand === 'panel') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to open the setup dashboard.', ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({
+          embeds: [buildSetupDashboardEmbed(activeLeague)],
+          components: buildSetupDashboardComponents(activeLeague.league_id),
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+if (interaction.commandName === 'badges') {
       if (!interaction.guild) return;
       const badgeSubcommand = interaction.options.getSubcommand();
       const targetUser = interaction.options.getUser('user') || interaction.user;
@@ -11724,7 +11758,7 @@ function buildHelpEmbed() {
       {
         name: 'New Server Owners',
         value:
-          '**/setupguide** — full step-by-step setup guide.\\n' +
+          '**/setup panel** — interactive setup dashboard.\n**/setupguide** — full step-by-step setup guide.\\n' +
           '**/quicksetup** — short setup checklist.\\n' +
           '**/commands** — categorized command directory.',
         inline: false,
@@ -12652,6 +12686,258 @@ function buildBadgeProgressEmbed(user, recognition = {}) {
     .setDescription(lines.join(String.fromCharCode(10)))
     .setFooter({ text: 'GG Sports • Badge Progress' })
     .setTimestamp();
+}
+
+
+
+const SETUP_DASHBOARD_OPTIONS = [
+  { value: 'league_role', label: 'League Role', description: 'Main league member role', kind: 'role' },
+  { value: 'staff_role', label: 'Staff Role', description: 'Role allowed to manage league tools', kind: 'role' },
+  { value: 'trade_committee_role', label: 'Trade Committee Role', description: 'Role that votes on trades', kind: 'role' },
+  { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
+  { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed', kind: 'channel' },
+  { value: 'shop_channel', label: 'Shop Channel', description: 'Permanent shop panel channel', kind: 'channel' },
+  { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
+  { value: 'trade_offer_channel', label: 'Trade Offer Channel', description: 'Trade offer panel channel', kind: 'channel' },
+  { value: 'trade_committee_channel', label: 'Trade Committee Channel', description: 'Trade voting channel', kind: 'channel' },
+  { value: 'approved_trades_channel', label: 'Approved Trades Channel', description: 'Approved trade announcements', kind: 'channel' },
+  { value: 'denied_trades_channel', label: 'Denied Trades Channel', description: 'Denied trade announcements', kind: 'channel' },
+  { value: 'trade_count_channel', label: 'Trade Count Channel', description: 'Trade count panel channel', kind: 'channel' },
+  { value: 'tournament_channel', label: 'Tournament Channel', description: 'Tournament panels/announcements', kind: 'channel' },
+  { value: 'ticket_channel', label: 'Ticket Channel', description: 'Ticket panel channel', kind: 'channel' },
+  { value: 'support_channel', label: 'Support Channel', description: 'Support panel channel', kind: 'channel' },
+];
+
+const SETUP_PANEL_OPTIONS = [
+  { value: 'standings_panel', label: 'Create/Refresh Standings Panel' },
+  { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
+  { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
+  { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
+  { value: 'trade_offer_panel', label: 'Create/Refresh Trade Offer Panel' },
+  { value: 'trade_count_panel', label: 'Create/Refresh Trade Count Panel' },
+  { value: 'ticket_panel', label: 'Create/Refresh Ticket Panel' },
+];
+
+function setupDashboardColumn(settingKey) {
+  const map = {
+    league_role: 'league_role_id',
+    staff_role: 'staff_role_id',
+    trade_committee_role: 'trade_committee_role_id',
+    standings_channel: 'standings_channel_id',
+    sportsbook_channel: 'sportsbook_channel_id',
+    shop_channel: 'shop_channel_id',
+    team_owners_channel: 'team_owners_channel_id',
+    trade_offer_channel: 'trade_offer_channel_id',
+    trade_committee_channel: 'trade_committee_channel_id',
+    approved_trades_channel: 'approved_trades_channel_id',
+    denied_trades_channel: 'denied_trades_channel_id',
+    trade_count_channel: 'trade_count_channel_id',
+    tournament_channel: 'tournament_channel_id',
+    ticket_channel: 'setup_ticket_channel_id',
+    support_channel: 'setup_support_channel_id',
+  };
+  return map[settingKey] || null;
+}
+
+function setupDashboardLabel(settingKey) {
+  return SETUP_DASHBOARD_OPTIONS.find(option => option.value === settingKey)?.label || settingKey;
+}
+
+function setupDashboardKind(settingKey) {
+  return SETUP_DASHBOARD_OPTIONS.find(option => option.value === settingKey)?.kind || 'channel';
+}
+
+function setupDashboardValue(league, settingKey) {
+  const column = setupDashboardColumn(settingKey);
+  return column ? league?.[column] : null;
+}
+
+function setupDashboardFormatValue(league, settingKey) {
+  const value = setupDashboardValue(league, settingKey);
+  if (!value) return 'Not set';
+  return setupDashboardKind(settingKey) === 'role' ? '<@&' + value + '>' : '<#' + value + '>';
+}
+
+function buildSetupDashboardEmbed(league) {
+  const channelLines = [
+    'Standings: ' + setupDashboardFormatValue(league, 'standings_channel'),
+    'Sportsbook: ' + setupDashboardFormatValue(league, 'sportsbook_channel'),
+    'Shop: ' + setupDashboardFormatValue(league, 'shop_channel'),
+    'Tournament: ' + setupDashboardFormatValue(league, 'tournament_channel'),
+    'Tickets: ' + setupDashboardFormatValue(league, 'ticket_channel'),
+    'Support: ' + setupDashboardFormatValue(league, 'support_channel'),
+  ];
+
+  const tradeLines = [
+    'Team Owners: ' + setupDashboardFormatValue(league, 'team_owners_channel'),
+    'Trade Offer: ' + setupDashboardFormatValue(league, 'trade_offer_channel'),
+    'Committee: ' + setupDashboardFormatValue(league, 'trade_committee_channel'),
+    'Approved: ' + setupDashboardFormatValue(league, 'approved_trades_channel'),
+    'Denied: ' + setupDashboardFormatValue(league, 'denied_trades_channel'),
+    'Count: ' + setupDashboardFormatValue(league, 'trade_count_channel'),
+  ];
+
+  const roleLines = [
+    'League Role: ' + setupDashboardFormatValue(league, 'league_role'),
+    'Staff Role: ' + setupDashboardFormatValue(league, 'staff_role'),
+    'Trade Committee: ' + setupDashboardFormatValue(league, 'trade_committee_role'),
+  ];
+
+  return new EmbedBuilder()
+    .setTitle('GG Sports Setup Dashboard')
+    .setColor(0x5865F2)
+    .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Old slash commands still work as advanced/manual backups.')
+    .addFields(
+      { name: 'Roles', value: roleLines.join(String.fromCharCode(10)), inline: false },
+      { name: 'Core Channels', value: channelLines.join(String.fromCharCode(10)), inline: false },
+      { name: 'Trade Setup', value: tradeLines.join(String.fromCharCode(10)), inline: false },
+      { name: 'Panels', value: 'Use the panel menu to create or refresh common setup panels.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Interactive Setup' })
+    .setTimestamp();
+}
+
+function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
+  const settingMenu = new StringSelectMenuBuilder()
+    .setCustomId('setup_select_setting:' + leagueId)
+    .setPlaceholder('Choose a setting to update')
+    .addOptions(SETUP_DASHBOARD_OPTIONS.map(option => ({
+      label: option.label,
+      value: option.value,
+      description: option.description,
+      default: selectedSetting === option.value,
+    })));
+
+  const panelMenu = new StringSelectMenuBuilder()
+    .setCustomId('setup_create_panel:' + leagueId)
+    .setPlaceholder('Create/refresh a setup panel')
+    .addOptions(SETUP_PANEL_OPTIONS.map(option => ({
+      label: option.label,
+      value: option.value,
+    })));
+
+  const rows = [
+    new ActionRowBuilder().addComponents(settingMenu),
+  ];
+
+  if (selectedSetting) {
+    const kind = setupDashboardKind(selectedSetting);
+    if (kind === 'role') {
+      rows.push(new ActionRowBuilder().addComponents(
+        new RoleSelectMenuBuilder()
+          .setCustomId('setup_pick_role:' + leagueId + ':' + selectedSetting)
+          .setPlaceholder('Select ' + setupDashboardLabel(selectedSetting))
+          .setMinValues(1)
+          .setMaxValues(1)
+      ));
+    } else {
+      rows.push(new ActionRowBuilder().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId('setup_pick_channel:' + leagueId + ':' + selectedSetting)
+          .setPlaceholder('Select ' + setupDashboardLabel(selectedSetting))
+          .setChannelTypes(ChannelType.GuildText)
+          .setMinValues(1)
+          .setMaxValues(1)
+      ));
+    }
+  }
+
+  rows.push(new ActionRowBuilder().addComponents(panelMenu));
+  return rows;
+}
+
+async function refreshSetupDashboardInteraction(interaction, leagueId, selectedSetting = null, note = null) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+    return;
+  }
+
+  const embed = buildSetupDashboardEmbed(league);
+  if (note) embed.setDescription(embed.data.description + '\n\n' + note);
+
+  await interaction.update({
+    embeds: [embed],
+    components: buildSetupDashboardComponents(league.league_id, selectedSetting),
+  });
+}
+
+async function createConfiguredPanelFromSetup(interaction, league, panelType) {
+  if (panelType === 'standings_panel') {
+    const channelId = league.standings_channel_id;
+    const channel = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : interaction.channel;
+    if (typeof createOrUpdateStandingsPanel === 'function') {
+      await createOrUpdateStandingsPanel(interaction.guild, league, channel).catch(() => null);
+    } else if (typeof updateStandingsPanel === 'function') {
+      await updateStandingsPanel(interaction.guild, league).catch(() => null);
+    }
+    return 'Standings panel refreshed.';
+  }
+
+  if (panelType === 'shop_panel') {
+    await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+    return 'Shop panel refreshed. If no panel exists yet, use /shop panel once.';
+  }
+
+  if (panelType === 'sportsbook_panel') {
+    if (typeof updateSportsbookPanel === 'function') await updateSportsbookPanel(interaction.guild).catch(() => null);
+    return 'Sportsbook board refreshed.';
+  }
+
+  if (panelType === 'team_owners_panel') {
+    const channel = league.team_owners_channel_id ? await interaction.guild.channels.fetch(league.team_owners_channel_id).catch(() => null) : interaction.channel;
+    if (channel?.isTextBased()) {
+      await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
+      return 'Team Owners panel posted.';
+    }
+    return 'Team Owners channel is not set or unavailable.';
+  }
+
+  if (panelType === 'trade_count_panel') {
+    const channel = league.trade_count_channel_id ? await interaction.guild.channels.fetch(league.trade_count_channel_id).catch(() => null) : interaction.channel;
+    if (channel?.isTextBased()) {
+      await channel.send({ embeds: [await buildTradeCountEmbed(league)] });
+      return 'Trade Count panel posted.';
+    }
+    return 'Trade Count channel is not set or unavailable.';
+  }
+
+  if (panelType === 'trade_offer_panel') {
+    const channel = league.trade_offer_channel_id ? await interaction.guild.channels.fetch(league.trade_offer_channel_id).catch(() => null) : interaction.channel;
+    if (channel?.isTextBased() && typeof buildTradeOfferPanel === 'function') {
+      await channel.send(buildTradeOfferPanel(league));
+      return 'Trade Offer panel posted.';
+    }
+    if (channel?.isTextBased()) {
+      const embed = new EmbedBuilder()
+        .setTitle('Offer a Trade')
+        .setDescription('Use the trade offer button/panel flow to begin a trade.')
+        .setColor(0x57F287)
+        .setFooter({ text: 'GG Sports • Trade Offers' })
+        .setTimestamp();
+      await channel.send({ embeds: [embed] });
+      return 'Basic Trade Offer panel posted.';
+    }
+    return 'Trade Offer channel is not set or unavailable.';
+  }
+
+  if (panelType === 'ticket_panel') {
+    const channelId = league.setup_ticket_channel_id || league.setup_support_channel_id;
+    const channel = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : interaction.channel;
+    if (channel?.isTextBased()) {
+      const embed = new EmbedBuilder()
+        .setTitle('Support Tickets')
+        .setDescription('Use /ticket open, /ticket dispute, or /ticket game to create a ticket.')
+        .setColor(0x5865F2)
+        .setFooter({ text: 'GG Sports • Tickets' })
+        .setTimestamp();
+      await channel.send({ embeds: [embed] });
+      return 'Ticket panel posted.';
+    }
+    return 'Ticket channel is not set or unavailable.';
+  }
+
+  return 'Unknown panel type.';
 }
 
 
