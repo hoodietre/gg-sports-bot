@@ -185,7 +185,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS setup_support_channel_id TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_league_settings (
-      league_id UUID PRIMARY KEY REFERENCES leagues(id) ON DELETE CASCADE,
+      league_id UUID PRIMARY KEY REFERENCES leagues(league_id) ON DELETE CASCADE,
       guild_id TEXT NOT NULL,
       console TEXT,
       advance_schedule TEXT,
@@ -199,7 +199,7 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS madden_franchises (
       id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL,
-      league_id UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
       team_role_id TEXT NOT NULL,
       team_name TEXT NOT NULL,
       owner_user_id TEXT,
@@ -213,7 +213,7 @@ async function initDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_team_stats (
       guild_id TEXT NOT NULL,
-      league_id UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
       team_role_id TEXT NOT NULL,
       season_label TEXT NOT NULL DEFAULT 'Current',
       wins INTEGER NOT NULL DEFAULT 0,
