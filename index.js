@@ -1196,6 +1196,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('connect').setDescription('Start Discord-native EA Direct connection wizard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
       .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('disconnect').setDescription('Disconnect your EA Direct Madden connection').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
+
+      .addSubcommand(sc => sc.setName('eaconfig').setDescription('Staff: check EA Direct auth configuration'))
 ,
 
     new SlashCommandBuilder()
@@ -5178,6 +5180,30 @@ if (gameSubcommand === 'report') {
     if (interaction.commandName === 'madden') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
+
+      if (maddenSubcommand === 'eaconfig') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to view EA Direct config.', ephemeral: true });
+          return;
+        }
+
+        const embed = new EmbedBuilder()
+          .setTitle('EA Direct Auth Configuration')
+          .setColor(EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 0x57F287 : 0xED4245)
+          .addFields(
+            { name: 'EA_DIRECT_AUTH_TEMPLATE', value: EA_DIRECT_AUTH_TEMPLATE ? 'Configured' : 'Missing', inline: true },
+            { name: 'EA_DIRECT_CLIENT_ID', value: EA_DIRECT_CLIENT_ID ? 'Configured' : 'Missing', inline: true },
+            { name: 'Redirect URI', value: EA_DIRECT_REDIRECT_URI, inline: false },
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+          )
+          .setFooter({ text: 'GG Sports • EA Direct Config' })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+
 
       if (maddenSubcommand === 'connect') {
         const leagueName = interaction.options.getString('league');
@@ -14493,12 +14519,40 @@ async function importMaddenRowsByType(guild, league, type, rows, week = null) {
 
 
 
-const EA_DIRECT_AUTH_BASE_URL = 'https://signin.ea.com/p/juno/login';
-const EA_DIRECT_REDIRECT_URI = 'http://127.0.0.1/success';
-const EA_DIRECT_CLIENT_ID = process.env.EA_DIRECT_CLIENT_ID || 'MADDEN_COMPANION_PLACEHOLDER';
+const EA_DIRECT_AUTH_BASE_URL = process.env.EA_DIRECT_AUTH_BASE_URL || 'https://signin.ea.com/p/juno/login';
+const EA_DIRECT_REDIRECT_URI = process.env.EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success';
+const EA_DIRECT_AUTH_TEMPLATE = process.env.EA_DIRECT_AUTH_TEMPLATE || null;
+const EA_DIRECT_CLIENT_ID = process.env.EA_DIRECT_CLIENT_ID || null;
 const EA_DIRECT_RELEASE_TYPE = process.env.EA_DIRECT_RELEASE_TYPE || 'prod';
 
+// EA Direct uses an unofficial auth flow. For production, set EA_DIRECT_AUTH_TEMPLATE
+// in Railway to the known working EA login URL format discovered for the Madden flow.
+// Supported template placeholders:
+//   {STATE}
+//   {REDIRECT_URI}
+//   {CLIENT_ID}
+// Example:
+//   https://signin.ea.com/p/juno/login?...&redirect_uri={REDIRECT_URI}&state={STATE}
 function buildEaDirectAuthUrl(connectionId) {
+  if (EA_DIRECT_AUTH_TEMPLATE) {
+    return EA_DIRECT_AUTH_TEMPLATE
+      .replaceAll('{STATE}', encodeURIComponent(connectionId))
+      .replaceAll('{REDIRECT_URI}', encodeURIComponent(EA_DIRECT_REDIRECT_URI))
+      .replaceAll('{CLIENT_ID}', encodeURIComponent(EA_DIRECT_CLIENT_ID || ''));
+  }
+
+  if (!EA_DIRECT_CLIENT_ID) {
+    // No fake placeholder client id. Send users to the EA login root and make the setup issue obvious.
+    // The wizard will still work once EA_DIRECT_AUTH_TEMPLATE is provided in Railway.
+    const params = new URLSearchParams({
+      state: connectionId,
+      redirect_uri: EA_DIRECT_REDIRECT_URI,
+      release_type: EA_DIRECT_RELEASE_TYPE,
+      gg_error: 'missing_auth_template',
+    });
+    return EA_DIRECT_AUTH_BASE_URL + '?' + params.toString();
+  }
+
   const params = new URLSearchParams({
     client_id: EA_DIRECT_CLIENT_ID,
     response_type: 'code',
@@ -14507,6 +14561,7 @@ function buildEaDirectAuthUrl(connectionId) {
     state: connectionId,
     release_type: EA_DIRECT_RELEASE_TYPE,
   });
+
   return EA_DIRECT_AUTH_BASE_URL + '?' + params.toString();
 }
 
@@ -14607,6 +14662,10 @@ function buildMaddenEaStartComponents(leagueId) {
 }
 
 function buildMaddenEaLoginEmbed(league, connection) {
+  const configWarning = (!EA_DIRECT_AUTH_TEMPLATE && !EA_DIRECT_CLIENT_ID)
+    ? '\n\n⚠️ **Setup Required:** EA_DIRECT_AUTH_TEMPLATE is not configured in Railway yet. The login button may open EA but will not complete correctly until the working auth URL template is added.'
+    : '';
+
   return new EmbedBuilder()
     .setTitle('Connect to EA Account')
     .setColor(0x00AEEF)
@@ -14614,7 +14673,8 @@ function buildMaddenEaLoginEmbed(league, connection) {
       'Click the EA login button below.\n\n' +
       'After signing in, copy either the **full redirect URL** or just the **authorization code** and submit it using the button below.\n\n' +
       'Expected redirect example:\n`http://127.0.0.1/success?code=...`\n\n' +
-      '**League:** ' + league.league_name
+      '**League:** ' + league.league_name +
+      configWarning
     )
     .setFooter({ text: 'GG Sports • EA Login Step' })
     .setTimestamp();
