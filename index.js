@@ -953,7 +953,10 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('addcount').setDescription('Add 1 trade to a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)))
       .addSubcommand(sc => sc.setName('removecount').setDescription('Remove 1 trade from a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)))
       .addSubcommand(sc => sc.setName('tradecountpanel').setDescription('Create or refresh the Trade Count embed'))
-      .addSubcommand(sc => sc.setName('offerpanel').setDescription('Create or refresh the Offer a Trade panel')),
+      .addSubcommand(sc => sc.setName('offerpanel').setDescription('Create or refresh the Offer a Trade panel'))
+      .addSubcommand(sc => sc.setName('setup').setDescription('Staff: set trade channels/committee role').addStringOption(o => o.setName('type').setDescription('owners, offer, committee_role, committee_channel, approved, denied, count').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(false)).addRoleOption(o => o.setName('role').setDescription('Role for committee_role').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View trade setup settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+,
 
     new SlashCommandBuilder()
       .setName('profile')
@@ -1171,7 +1174,7 @@ async function registerCommands() {
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
+    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
             s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
@@ -1186,7 +1189,7 @@ async function getLeagueByName(guildId, leagueName) {
 async function getLeagueById(leagueId) {
   if (!leagueId) return null;
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
+    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
             s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
@@ -1200,7 +1203,7 @@ async function getLeagueById(leagueId) {
 
 async function getLeagueByChannel(guildId, channelId) {
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
+    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
             s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
@@ -1219,7 +1222,7 @@ async function getLeagueByChannel(guildId, channelId) {
 
 async function getDefaultLeague(guildId) {
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
+    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
             s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
@@ -4692,6 +4695,79 @@ if (gameSubcommand === 'report') {
 if (interaction.commandName === 'trade') {
       if (!interaction.guild) return;
       const tradeSubcommand = interaction.options.getSubcommand();
+
+      if (tradeSubcommand === 'setup') {
+        const type = interaction.options.getString('type');
+        const channel = interaction.options.getChannel('channel');
+        const role = interaction.options.getRole('role');
+        const leagueName = interaction.options.getString('league');
+        let activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to update trade setup.', ephemeral: true });
+          return;
+        }
+
+        const column = getTradeSetupColumn(type);
+        if (!column) {
+          await interaction.reply({ content: 'Invalid type. Use: owners, offer, committee_role, committee_channel, approved, denied, count.', ephemeral: true });
+          return;
+        }
+
+        const isRoleSetting = column === 'trade_committee_role_id';
+        const value = isRoleSetting ? role?.id : channel?.id;
+
+        if (!value) {
+          await interaction.reply({ content: isRoleSetting ? 'Please provide a role when setting committee_role.' : 'Please provide a channel.', ephemeral: true });
+          return;
+        }
+
+        if (!isRoleSetting) {
+          const botMember = await interaction.guild.members.fetchMe();
+          const permissions = channel?.permissionsFor(botMember);
+          if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+            await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that channel.', ephemeral: true });
+            return;
+          }
+        }
+
+        await pool.query(
+          `INSERT INTO league_settings (league_id, ${column}, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (league_id)
+           DO UPDATE SET ${column} = $2, updated_at = NOW()`,
+          [activeLeague.league_id, value]
+        );
+
+        activeLeague = await getLeagueById(activeLeague.league_id);
+
+        await interaction.reply({
+          content: getTradeSetupLabel(type) + ' updated for **' + activeLeague.league_name + '**.',
+          embeds: [buildTradeSettingsEmbed(activeLeague)],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (tradeSubcommand === 'settings') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({ embeds: [buildTradeSettingsEmbed(activeLeague)], ephemeral: true });
+        return;
+      }
+
+
 
       if (tradeSubcommand === 'history') {
         const leagueName = interaction.options.getString('league');
@@ -11522,7 +11598,7 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Trade System',
         value:
-          '/trade block, /trade history, /trade team, /trade addcount, /trade removecount, /trade tradecountpanel, /trade offerpanel',
+          '/trade setup, /trade settings, /trade block, /trade history, /trade team, /trade addcount, /trade removecount, /trade tradecountpanel, /trade offerpanel',
         inline: false,
       },
       {
@@ -12301,5 +12377,62 @@ function inferAvatarSlotFromItem(item) {
   return 'accessory';
 }
 
+
+
+function getTradeSetupColumn(type) {
+  const key = String(type || '').toLowerCase().replace(/\s+/g, '_');
+  const map = {
+    owners: 'team_owners_channel_id',
+    teamowners: 'team_owners_channel_id',
+    team_owners: 'team_owners_channel_id',
+    offer: 'trade_offer_channel_id',
+    offers: 'trade_offer_channel_id',
+    trade_offer: 'trade_offer_channel_id',
+    committee_role: 'trade_committee_role_id',
+    committeerole: 'trade_committee_role_id',
+    committee_channel: 'trade_committee_channel_id',
+    committeechannel: 'trade_committee_channel_id',
+    committee: 'trade_committee_channel_id',
+    approved: 'approved_trades_channel_id',
+    approved_trades: 'approved_trades_channel_id',
+    denied: 'denied_trades_channel_id',
+    denied_trades: 'denied_trades_channel_id',
+    count: 'trade_count_channel_id',
+    counts: 'trade_count_channel_id',
+    trade_count: 'trade_count_channel_id',
+  };
+  return map[key] || null;
+}
+
+function getTradeSetupLabel(type) {
+  const column = getTradeSetupColumn(type);
+  const labels = {
+    team_owners_channel_id: 'Team Owners Channel',
+    trade_offer_channel_id: 'Trade Offer Channel',
+    trade_committee_role_id: 'Trade Committee Role',
+    trade_committee_channel_id: 'Trade Committee Channel',
+    approved_trades_channel_id: 'Approved Trades Channel',
+    denied_trades_channel_id: 'Denied Trades Channel',
+    trade_count_channel_id: 'Trade Count Channel',
+  };
+  return labels[column] || 'Trade Setting';
+}
+
+function buildTradeSettingsEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle('Trade Setup • ' + league.league_name)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Team Owners Channel', value: league.team_owners_channel_id ? '<#' + league.team_owners_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Trade Offer Channel', value: league.trade_offer_channel_id ? '<#' + league.trade_offer_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Trade Committee Role', value: league.trade_committee_role_id ? '<@&' + league.trade_committee_role_id + '>' : 'Not set', inline: true },
+      { name: 'Committee Channel', value: league.trade_committee_channel_id ? '<#' + league.trade_committee_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Approved Trades', value: league.approved_trades_channel_id ? '<#' + league.approved_trades_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Denied Trades', value: league.denied_trades_channel_id ? '<#' + league.denied_trades_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Trade Count Channel', value: league.trade_count_channel_id ? '<#' + league.trade_count_channel_id + '>' : 'Not set', inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Trade Setup' })
+    .setTimestamp();
+}
 
 
