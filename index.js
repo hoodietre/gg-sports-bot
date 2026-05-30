@@ -221,6 +221,19 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_sync_payloads (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      sync_run_id UUID REFERENCES madden_sync_runs(id) ON DELETE SET NULL,
+      endpoint TEXT,
+      payload_type TEXT,
+      raw_payload JSONB,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_games (
       id UUID PRIMARY KEY,
       guild_id TEXT NOT NULL,
@@ -5287,7 +5300,7 @@ if (gameSubcommand === 'report') {
         }
 
         await interaction.deferReply({ ephemeral: true });
-        const run = await runMaddenExternalSyncPlaceholder(interaction.guild, activeLeague, { week });
+        const run = await runMaddenExternalFetchSync(interaction.guild, activeLeague, { week });
         await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
         return;
       }
@@ -14094,6 +14107,185 @@ async function linkMaddenExternalSource(league, options = {}) {
   return result.rows[0] || {};
 }
 
+
+function normalizeMaddenSource(source) {
+  const s = String(source || 'neon_sportz').toLowerCase();
+  if (s === 'neon' || s === 'neonsportz') return 'neon_sportz';
+  return s;
+}
+
+function buildMaddenEndpointList(settings) {
+  const baseUrl = String(settings.external_url || '').replace(/\/+$/, '');
+  const franchiseId = settings.external_franchise_id;
+
+  if (!baseUrl) return [];
+
+  // Generic Neon-style possibilities. The worker tries each endpoint safely.
+  const endpoints = [
+    { type: 'teams', url: baseUrl + '/teams' },
+    { type: 'standings', url: baseUrl + '/standings' },
+    { type: 'games', url: baseUrl + '/games' },
+    { type: 'players', url: baseUrl + '/players' },
+  ];
+
+  if (franchiseId) {
+    endpoints.push(
+      { type: 'teams', url: baseUrl + '/leagues/' + encodeURIComponent(franchiseId) + '/teams' },
+      { type: 'standings', url: baseUrl + '/leagues/' + encodeURIComponent(franchiseId) + '/standings' },
+      { type: 'games', url: baseUrl + '/leagues/' + encodeURIComponent(franchiseId) + '/games' },
+      { type: 'players', url: baseUrl + '/leagues/' + encodeURIComponent(franchiseId) + '/players' }
+    );
+  }
+
+  return endpoints;
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        ...(options.apiKey ? { 'Authorization': 'Bearer ' + options.apiKey, 'X-API-Key': options.apiKey } : {}),
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error('HTTP ' + response.status + ' from ' + url);
+    }
+
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractMaddenRowsByType(payload, type) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+
+  const candidates = {
+    teams: ['teams', 'data', 'leagueTeams', 'members', 'users'],
+    standings: ['standings', 'teams', 'data', 'records'],
+    games: ['games', 'schedule', 'data', 'matchups'],
+    players: ['players', 'roster', 'data'],
+  }[type] || ['data'];
+
+  for (const key of candidates) {
+    if (Array.isArray(payload[key])) return payload[key];
+  }
+
+  if (payload.data && typeof payload.data === 'object') {
+    for (const key of candidates) {
+      if (Array.isArray(payload.data[key])) return payload.data[key];
+    }
+  }
+
+  return [];
+}
+
+async function importMaddenRowsByType(guild, league, type, rows, week = null) {
+  if (type === 'teams') return { teams: await importMaddenTeamsFromArray(guild, league, rows), games: 0, players: 0 };
+  if (type === 'standings') return { teams: await importMaddenStandingsFromArray(guild, league, rows), games: 0, players: 0 };
+  if (type === 'games') return { teams: 0, games: await importMaddenGamesFromArray(guild, league, rows, week), players: 0 };
+  if (type === 'players') return { teams: 0, games: 0, players: await importMaddenPlayersFromArray(guild, league, rows) };
+  return { teams: 0, games: 0, players: 0 };
+}
+
+async function runMaddenExternalFetchSync(guild, league, options = {}) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  const runId = randomUUID();
+  const source = normalizeMaddenSource(settings.sync_source || 'unlinked');
+
+  await pool.query(
+    `INSERT INTO madden_sync_runs (id, guild_id, league_id, source, status, week_label, message)
+     VALUES ($1, $2, $3, $4, 'running', $5, $6)`,
+    [runId, guild.id, league.league_id, source, options.week || null, 'External Madden sync started.']
+  );
+
+  if (!settings.external_url) {
+    const message = 'No external URL linked. Use /madden link with a source URL first.';
+    await pool.query(
+      `UPDATE madden_sync_runs SET status = 'failed', message = $2, completed_at = NOW() WHERE id = $1`,
+      [runId, message]
+    );
+    await pool.query(
+      `UPDATE madden_league_settings SET last_sync_at = NOW(), last_sync_status = 'failed', last_sync_message = $2, updated_at = NOW() WHERE league_id = $1`,
+      [league.league_id, message]
+    );
+    const failed = await pool.query(`SELECT * FROM madden_sync_runs WHERE id = $1 LIMIT 1`, [runId]);
+    return failed.rows[0];
+  }
+
+  const endpoints = buildMaddenEndpointList(settings);
+  const totals = { teams: 0, games: 0, players: 0 };
+  const errors = [];
+  let successfulEndpoints = 0;
+
+  for (const endpoint of endpoints) {
+    try {
+      const payload = await fetchJsonWithTimeout(endpoint.url, { apiKey: settings.api_key });
+      await pool.query(
+        `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [randomUUID(), guild.id, league.league_id, runId, endpoint.url, endpoint.type, JSON.stringify(payload)]
+      );
+
+      const rows = extractMaddenRowsByType(payload, endpoint.type);
+      if (!rows.length) {
+        errors.push(endpoint.type + ': no rows found at ' + endpoint.url);
+        continue;
+      }
+
+      const counts = await importMaddenRowsByType(guild, league, endpoint.type, rows, options.week || null);
+      totals.teams += Number(counts.teams || 0);
+      totals.games += Number(counts.games || 0);
+      totals.players += Number(counts.players || 0);
+      successfulEndpoints += 1;
+    } catch (error) {
+      errors.push(endpoint.type + ': ' + (error.message || 'fetch failed'));
+    }
+  }
+
+  // Always keep local Discord team bridge updated too.
+  await syncMaddenFranchises(guild, league).catch(error => errors.push('local team bridge: ' + error.message));
+
+  const status = successfulEndpoints > 0 ? 'completed' : 'failed';
+  const message = successfulEndpoints > 0
+    ? 'External sync completed. Imported teams: ' + totals.teams + ', games: ' + totals.games + ', players: ' + totals.players + (errors.length ? '. Some endpoints had warnings.' : '.')
+    : 'External sync failed. ' + errors.slice(0, 3).join(' | ');
+
+  await pool.query(
+    `UPDATE madden_sync_runs
+     SET status = $2,
+         message = $3,
+         imported_teams = $4,
+         imported_games = $5,
+         imported_players = $6,
+         completed_at = NOW()
+     WHERE id = $1`,
+    [runId, status, message, totals.teams, totals.games, totals.players]
+  );
+
+  await pool.query(
+    `UPDATE madden_league_settings
+     SET last_sync_at = NOW(),
+         last_sync_status = $2,
+         last_sync_message = $3,
+         updated_at = NOW()
+     WHERE league_id = $1`,
+    [league.league_id, status, message]
+  );
+
+  const runResult = await pool.query(`SELECT * FROM madden_sync_runs WHERE id = $1 LIMIT 1`, [runId]);
+  return runResult.rows[0];
+}
+
+
 async function runMaddenExternalSyncPlaceholder(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
   const runId = randomUUID();
@@ -14179,6 +14371,7 @@ function buildMaddenSyncSettingsEmbed(league, settings, status = null) {
       { name: 'External Franchise ID', value: settings.external_franchise_id || 'Not set', inline: true },
       { name: 'API Key', value: maskedKey, inline: true },
       { name: 'External URL', value: settings.external_url || 'Not set', inline: false },
+      { name: 'Sync Worker', value: 'Runs GET requests against linked URL endpoints: /teams, /standings, /games, /players. Manual imports remain available as fallback.', inline: false },
       { name: 'Last Sync', value: settings.last_sync_at ? String(settings.last_sync_at) : 'Never', inline: true },
       { name: 'Last Status', value: settings.last_sync_status || 'None', inline: true },
       { name: 'Last Message', value: settings.last_sync_message || 'No sync has run yet.', inline: false }
@@ -14200,7 +14393,7 @@ function buildMaddenSyncSettingsEmbed(league, settings, status = null) {
 function buildMaddenSyncRunEmbed(league, run) {
   return new EmbedBuilder()
     .setTitle('Madden Sync Complete • ' + league.league_name)
-    .setColor(0x57F287)
+    .setColor(run.status === 'failed' ? 0xED4245 : 0x57F287)
     .addFields(
       { name: 'Status', value: run.status || 'completed', inline: true },
       { name: 'Source', value: run.source || 'unlinked', inline: true },
