@@ -986,6 +986,11 @@ function buildCommands() {
     new SlashCommandBuilder().setName('setupguide').setDescription('Show the full GG Sports server owner setup guide'),
     new SlashCommandBuilder().setName('quicksetup').setDescription('Show the quick GG Sports setup checklist'),
     new SlashCommandBuilder()
+      .setName('setup')
+      .setDescription('Interactive GG Sports setup dashboard')
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open the interactive setup dashboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+
+    new SlashCommandBuilder()
       .setName('avatar')
       .setDescription('Visual avatar and cosmetic commands')
       .addSubcommand(sc => sc.setName('view').setDescription('View your full-body avatar').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
