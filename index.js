@@ -3771,7 +3771,115 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    if (!interaction.isChatInputCommand()) return;
+    
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_select_setting:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const selectedSetting = interaction.values[0];
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to update setup.', ephemeral: true });
+        return;
+      }
+
+      await refreshSetupDashboardInteraction(interaction, leagueId, selectedSetting, 'Selected setting: **' + setupDashboardLabel(selectedSetting) + '**. Now choose the role/channel below.');
+      return;
+    }
+
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('setup_pick_role:')) {
+      const [, leagueId, settingKey] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to update setup.', ephemeral: true });
+        return;
+      }
+
+      const column = setupDashboardColumn(settingKey);
+      const roleId = interaction.values[0];
+
+      if (!column) {
+        await interaction.reply({ content: 'Invalid setup setting.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO league_settings (league_id, ${column}, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (league_id)
+         DO UPDATE SET ${column} = $2, updated_at = NOW()`,
+        [leagueId, roleId]
+      );
+
+      await refreshSetupDashboardInteraction(interaction, leagueId, null, 'Updated **' + setupDashboardLabel(settingKey) + '** to <@&' + roleId + '>.');
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('setup_pick_channel:')) {
+      const [, leagueId, settingKey] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to update setup.', ephemeral: true });
+        return;
+      }
+
+      const column = setupDashboardColumn(settingKey);
+      const channelId = interaction.values[0];
+
+      if (!column) {
+        await interaction.reply({ content: 'Invalid setup setting.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `INSERT INTO league_settings (league_id, ${column}, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (league_id)
+         DO UPDATE SET ${column} = $2, updated_at = NOW()`,
+        [leagueId, channelId]
+      );
+
+      await refreshSetupDashboardInteraction(interaction, leagueId, null, 'Updated **' + setupDashboardLabel(settingKey) + '** to <#' + channelId + '>.');
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_create_panel:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const panelType = interaction.values[0];
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to create setup panels.', ephemeral: true });
+        return;
+      }
+
+      const message = await createConfiguredPanelFromSetup(interaction, league, panelType);
+      await refreshSetupDashboardInteraction(interaction, leagueId, null, message);
+      return;
+    }
+
+if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName.startsWith('league-')) {
       if (!interaction.guild) {
