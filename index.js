@@ -5460,7 +5460,7 @@ if (gameSubcommand === 'report') {
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Holding Mode', value: EA_DIRECT_HOLDING_MODE ? 'Enabled' : 'Disabled', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Final Snallabot Blaze adapter enabled: Mobile_GetMyLeagues should populate real Madden leagues.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. EA Direct live leagues + sync foundation enabled.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -15688,6 +15688,233 @@ async function sendEaBlazeRequest(token, session, request) {
   return payload;
 }
 
+
+async function getEaBlazeLeagueHub(token, leagueId) {
+  const session = await retrieveBlazeSession(token);
+  const response = await sendEaBlazeRequest(token, session, {
+    commandName: 'Mobile_Career_GetLeagueHub',
+    componentId: 2060,
+    commandId: 811,
+    requestPayload: {
+      leagueId: Number(leagueId),
+    },
+    componentName: 'careermode',
+  });
+
+  return response?.responseInfo?.value || response;
+}
+
+function normalizeEaLeagueTeamsFromHub(hubPayload) {
+  const teamRows = [];
+
+  const teamIdInfoList = Array.isArray(hubPayload?.teamIdInfoList) ? hubPayload.teamIdInfoList : [];
+  const userInfoMap = hubPayload?.userAdminHubInfo?.userInfoMap || {};
+  const userRows = Object.values(userInfoMap || {});
+
+  for (const team of teamIdInfoList) {
+    const teamId = getFirstValue(team, ['teamId', 'id'], null);
+    const displayName = getFirstValue(team, ['displayName', 'teamName', 'name', 'shortName'], teamId ? String(teamId) : null);
+    if (!displayName) continue;
+
+    const matchedUser = userRows.find(user => String(getFirstValue(user, ['team'], '')) === String(teamId)) || null;
+    teamRows.push({
+      id: teamId,
+      teamId,
+      teamName: displayName,
+      name: displayName,
+      displayName,
+      shortName: getFirstValue(team, ['shortName'], displayName),
+      ownerDiscordId: null,
+      userName: getFirstValue(matchedUser, ['userName', 'characterName'], null),
+      wins: 0,
+      losses: 0,
+      ties: 0,
+      points_for: 0,
+      points_against: 0,
+      rawTeam: team,
+      rawUser: matchedUser,
+    });
+  }
+
+  return teamRows;
+}
+
+function normalizeEaScheduleFromHub(hubPayload) {
+  const schedule = hubPayload?.gameScheduleHubInfo?.leagueSchedule;
+  if (!Array.isArray(schedule)) return [];
+
+  return schedule.map(item => {
+    const game = item?.seasonGameInfo || item || {};
+    const weekType = getFirstValue(game, ['weekType'], null);
+    const week = getFirstValue(game, ['week'], null);
+    const weekLabel = getFirstValue(game, ['displayedWeek'], week !== null ? 'Week ' + String(Number(week) + 1) : null);
+
+    return {
+      id: getFirstValue(item, ['seasonGameKey', 'id'], null) || [weekType, week, getFirstValue(game, ['awayTeam'], ''), getFirstValue(game, ['homeTeam'], '')].join('-'),
+      external_game_id: getFirstValue(item, ['seasonGameKey', 'id'], null),
+      week_label: weekLabel,
+      home_team: getFirstValue(game, ['homeName', 'homeTeamName', 'homeCityName'], 'Home'),
+      away_team: getFirstValue(game, ['awayName', 'awayTeamName', 'awayCityName'], 'Away'),
+      home_score: getFirstValue(game, ['homeScore', 'homeTeamScore'], null),
+      away_score: getFirstValue(game, ['awayScore', 'awayTeamScore'], null),
+      status: game.isGamePlayed ? 'completed' : 'scheduled',
+      raw: item,
+    };
+  });
+}
+
+async function getConnectedEaTokenForLeague(leagueId) {
+  const result = await pool.query(
+    `SELECT * FROM madden_ea_connections
+     WHERE league_id = $1 AND provider = 'ea_direct' AND connection_status = 'connected'
+     ORDER BY connected_at DESC NULLS LAST, updated_at DESC
+     LIMIT 1`,
+    [leagueId]
+  );
+
+  const connection = result.rows[0];
+  if (!connection) {
+    throw new Error('No connected EA Direct account found for this Madden league. Run /madden connect first.');
+  }
+
+  const accessToken = decryptEaSecret(connection.access_token_encrypted);
+  const refreshToken = decryptEaSecret(connection.refresh_token_encrypted);
+
+  if (!accessToken) {
+    throw new Error('Connected EA account is missing an access token. Run /madden connect again.');
+  }
+
+  return {
+    connection,
+    token: {
+      accessToken,
+      refreshToken,
+      expiry: connection.token_expires_at ? new Date(connection.token_expires_at) : new Date(Date.now() + 60 * 60 * 1000),
+      console: null,
+      blazeId: connection.persona_id || connection.blaze_id || null,
+    },
+  };
+}
+
+async function getEaDirectLeagueSyncContext(league) {
+  const { connection, token } = await getConnectedEaTokenForLeague(league.league_id);
+  const choiceResult = await pool.query(
+    `SELECT * FROM madden_ea_league_choices
+     WHERE league_id = $1 AND external_league_id = $2
+     ORDER BY imported_at DESC
+     LIMIT 1`,
+    [league.league_id, connection.franchise_id]
+  );
+
+  const choice = choiceResult.rows[0] || null;
+  const externalLeagueId = connection.franchise_id || choice?.external_league_id;
+  if (!externalLeagueId || externalLeagueId === 'default_franchise') {
+    throw new Error('No real Madden league selected yet. Run /madden connect and select GGS TEST or GHOST REGS.');
+  }
+
+  token.console = choice?.system_console || token.console || 'xbsx';
+  token.blazeId = choice?.blaze_id || token.blazeId || connection.persona_id;
+
+  return {
+    connection,
+    choice,
+    token,
+    externalLeagueId,
+    externalLeagueName: connection.franchise_name || choice?.external_league_name || String(externalLeagueId),
+  };
+}
+
+async function runMaddenEaDirectSync(guild, league, options = {}) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  const runId = randomUUID();
+
+  await pool.query(
+    `INSERT INTO madden_sync_runs (id, guild_id, league_id, source, status, week_label, message)
+     VALUES ($1, $2, $3, 'ea_direct', 'running', $4, $5)`,
+    [runId, guild.id, league.league_id, options.week || null, 'EA Direct Madden sync started.']
+  );
+
+  try {
+    const context = await getEaDirectLeagueSyncContext(league);
+    const hub = await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+
+    await pool.query(
+      `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
+       VALUES ($1, $2, $3, $4, $5, 'league_hub', $6::jsonb)`,
+      [
+        randomUUID(),
+        guild.id,
+        league.league_id,
+        runId,
+        'ea_direct:Mobile_Career_GetLeagueHub:' + context.externalLeagueId,
+        JSON.stringify(hub || {}),
+      ]
+    );
+
+    const teams = normalizeEaLeagueTeamsFromHub(hub);
+    const games = normalizeEaScheduleFromHub(hub);
+
+    const importedTeams = teams.length ? await importMaddenTeamsFromArray(guild, league, teams) : 0;
+    const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null) : 0;
+
+    await syncMaddenFranchises(guild, league).catch(() => null);
+
+    const message =
+      'EA Direct sync completed for ' + context.externalLeagueName +
+      '. Imported teams: ' + importedTeams +
+      ', games: ' + importedGames +
+      ', players: 0.';
+
+    await pool.query(
+      `UPDATE madden_sync_runs
+       SET status = 'completed',
+           message = $2,
+           imported_teams = $3,
+           imported_games = $4,
+           imported_players = 0,
+           completed_at = NOW()
+       WHERE id = $1`,
+      [runId, message, importedTeams, importedGames]
+    );
+
+    await pool.query(
+      `UPDATE madden_league_settings
+       SET sync_source = 'ea_direct',
+           external_franchise_id = $2,
+           last_sync_at = NOW(),
+           last_sync_status = 'completed',
+           last_sync_message = $3,
+           updated_at = NOW()
+       WHERE league_id = $1`,
+      [league.league_id, String(context.externalLeagueId), message]
+    );
+  } catch (error) {
+    const message = 'EA Direct sync failed: ' + (error?.message || error);
+    await pool.query(
+      `UPDATE madden_sync_runs
+       SET status = 'failed',
+           message = $2,
+           completed_at = NOW()
+       WHERE id = $1`,
+      [runId, message.slice(0, 1000)]
+    );
+
+    await pool.query(
+      `UPDATE madden_league_settings
+       SET last_sync_at = NOW(),
+           last_sync_status = 'failed',
+           last_sync_message = $2,
+           updated_at = NOW()
+       WHERE league_id = $1`,
+      [league.league_id, message.slice(0, 1000)]
+    );
+  }
+
+  const runResult = await pool.query(`SELECT * FROM madden_sync_runs WHERE id = $1 LIMIT 1`, [runId]);
+  return runResult.rows[0];
+}
+
+
 async function getEaBlazeLeagues(token) {
   const session = await retrieveBlazeSession(token);
   const response = await sendEaBlazeRequest(token, session, {
@@ -16614,6 +16841,17 @@ function startMaddenAutosyncLoop(client) {
 
 async function runMaddenExternalFetchSync(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
+  const eaConnectionResult = await pool.query(
+    `SELECT id FROM madden_ea_connections
+     WHERE league_id = $1 AND provider = 'ea_direct' AND connection_status = 'connected'
+     LIMIT 1`,
+    [league.league_id]
+  );
+
+  if (settings.sync_source === 'ea_direct' || eaConnectionResult.rows.length) {
+    return await runMaddenEaDirectSync(guild, league, options);
+  }
+
   const runId = randomUUID();
   const source = normalizeMaddenSource(settings.sync_source || 'unlinked');
 
