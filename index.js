@@ -15704,6 +15704,151 @@ async function getEaBlazeLeagueHub(token, leagueId) {
   return response?.responseInfo?.value || response;
 }
 
+async function sendEaBlazeCareerModeCommand(token, commandName, commandId, requestPayload = {}, options = {}) {
+  const session = await retrieveBlazeSession(token);
+  return await sendEaBlazeRequest(token, session, {
+    commandName,
+    componentId: options.componentId || 2060,
+    commandId,
+    requestPayload,
+    componentName: options.componentName || 'careermode',
+  });
+}
+
+function logEaProbePayload(label, payload) {
+  try {
+    const value = payload?.responseInfo?.value || payload;
+    const arrays = deepFindArraysByKey(value, [
+      'standings',
+      'teamStandings',
+      'leagueStandings',
+      'teamStandingsInfoList',
+      'standingInfoList',
+      'teamStats',
+      'teamStatsInfoList',
+      'seasonTeamStatsInfoList',
+      'leagueTeamStats',
+      'rankings',
+      'stats',
+      'teams',
+      'teamInfoList'
+    ]);
+
+    const summary = {
+      label,
+      topKeys: Object.keys(value || {}),
+      candidateArrays: arrays.map(item => ({
+        path: item.path,
+        key: item.key,
+        length: Array.isArray(item.rows) ? item.rows.length : 0,
+        sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object' ? Object.keys(item.rows[0]) : [],
+        sample: Array.isArray(item.rows) && item.rows[0] ? summarizeEaHubShape(item.rows[0], 0, 2) : null,
+      })).slice(0, 40),
+      shape: summarizeEaHubShape(value, 0, 3),
+    };
+
+    console.log('[EA STANDINGS PROBE]', JSON.stringify(summary, null, 2).slice(0, 20000));
+  } catch (error) {
+    console.error('[EA STANDINGS PROBE] failed to summarize payload for ' + label + ':', error?.message || error);
+  }
+}
+
+async function probeEaStandingsCommands(token, leagueId) {
+  const leagueNumber = Number(leagueId);
+  const payloadVariants = [
+    { leagueId: leagueNumber },
+    { leagueId: String(leagueId) },
+    { franchiseId: leagueNumber },
+    { franchiseId: String(leagueId) },
+    { leagueId: leagueNumber, weekIndex: 0 },
+    { leagueId: leagueNumber, seasonIndex: 0 },
+  ];
+
+  const commandCandidates = [
+    { name: 'Mobile_Career_GetStandings', id: 802 },
+    { name: 'Mobile_Career_GetTeamStats', id: 803 },
+    { name: 'Mobile_Career_GetLeagueStandings', id: 804 },
+    { name: 'Mobile_Career_GetSeasonStats', id: 805 },
+    { name: 'Mobile_Career_GetLeagueTeams', id: 806 },
+    { name: 'Mobile_Career_GetTeamInfo', id: 807 },
+    { name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
+    { name: 'Mobile_Career_GetSeasonInfo', id: 809 },
+    { name: 'Mobile_Career_GetLeagueInfo', id: 810 },
+    { name: 'Mobile_Career_GetLeagueHub', id: 811 },
+    { name: 'Mobile_Career_GetSchedule', id: 812 },
+    { name: 'Mobile_Career_GetLeagueSchedule', id: 813 },
+    { name: 'Mobile_Career_GetPowerRankings', id: 814 },
+    { name: 'Mobile_Career_GetTeamRankings', id: 815 },
+  ];
+
+  const results = [];
+  for (const command of commandCandidates) {
+    for (const requestPayload of payloadVariants) {
+      try {
+        const response = await sendEaBlazeCareerModeCommand(token, command.name, command.id, requestPayload);
+        const value = response?.responseInfo?.value || response;
+        const arrays = deepFindArraysByKey(value, [
+          'standings',
+          'teamStandings',
+          'leagueStandings',
+          'teamStandingsInfoList',
+          'standingInfoList',
+          'teamStats',
+          'teamStatsInfoList',
+          'seasonTeamStatsInfoList',
+          'leagueTeamStats',
+          'rankings',
+          'stats'
+        ]);
+
+        logEaProbePayload(command.name + '#' + command.id + ' payload=' + JSON.stringify(requestPayload), response);
+
+        results.push({
+          commandName: command.name,
+          commandId: command.id,
+          payload: requestPayload,
+          success: true,
+          topKeys: Object.keys(value || {}),
+          candidateArrayCount: arrays.length,
+          candidateArrays: arrays.map(a => ({ path: a.path, key: a.key, length: Array.isArray(a.rows) ? a.rows.length : 0 })).slice(0, 10),
+          raw: value,
+        });
+
+        if (arrays.some(a => Array.isArray(a.rows) && a.rows.length >= 30)) {
+          return results;
+        }
+      } catch (error) {
+        console.log('[EA STANDINGS PROBE] failed:', {
+          commandName: command.name,
+          commandId: command.id,
+          payload: requestPayload,
+          error: String(error?.message || error).slice(0, 300),
+        });
+        results.push({
+          commandName: command.name,
+          commandId: command.id,
+          payload: requestPayload,
+          success: false,
+          error: String(error?.message || error).slice(0, 500),
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+function extractEaStandingsRowsFromProbeResults(probeResults) {
+  for (const result of probeResults || []) {
+    if (!result?.success || !result.raw) continue;
+    const rows = extractEaStandingsRowsFromHub(result.raw);
+    if (rows.length) return rows;
+  }
+  return [];
+}
+
+
+
 
 
 function summarizeEaHubShape(value, depth = 0, maxDepth = 4) {
@@ -16209,8 +16354,70 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ]
     );
 
-    const teams = normalizeEaLeagueTeamsDeepFromHub(hub);
+    let teams = normalizeEaLeagueTeamsDeepFromHub(hub);
     const games = normalizeEaScheduleDeepFromHub(hub);
+
+    const hasRealRecordData = teams.some(team =>
+      Number(team.wins || 0) > 0 ||
+      Number(team.losses || 0) > 0 ||
+      Number(team.ties || 0) > 0 ||
+      Number(team.points_for || 0) > 0 ||
+      Number(team.points_against || 0) > 0
+    );
+
+    let probeResults = [];
+    if (!hasRealRecordData) {
+      console.log('[EA STANDINGS PROBE] Hub did not contain standings/record data. Starting command probe.');
+      probeResults = await probeEaStandingsCommands(context.token, context.externalLeagueId).catch(error => {
+        console.error('[EA STANDINGS PROBE] probe failed completely:', error?.message || error);
+        return [];
+      });
+
+      const probeStandings = extractEaStandingsRowsFromProbeResults(probeResults);
+      if (probeStandings.length) {
+        const maps = buildEaTeamNameMaps(hub);
+        const byName = new Map(teams.map(team => [String(team.teamName || team.name || '').toLowerCase(), team]));
+        const byId = new Map(teams.map(team => [String(team.teamId || team.id || ''), team]));
+
+        for (const standing of probeStandings) {
+          const teamId = standing.teamId !== null && standing.teamId !== undefined ? String(standing.teamId) : null;
+          const teamName = standing.name || (teamId ? maps.byId.get(teamId) : null);
+          const existing = (teamId && byId.get(teamId)) || (teamName && byName.get(String(teamName).toLowerCase()));
+          if (!existing) continue;
+
+          existing.wins = standing.wins ?? Number(existing.wins || 0);
+          existing.losses = standing.losses ?? Number(existing.losses || 0);
+          existing.ties = standing.ties ?? Number(existing.ties || 0);
+          existing.points_for = standing.pf ?? Number(existing.points_for || 0);
+          existing.points_against = standing.pa ?? Number(existing.points_against || 0);
+          existing.rawStanding = standing.row;
+          existing.standingsSource = standing.sourcePath || 'probe';
+        }
+      }
+    }
+
+    if (probeResults.length) {
+      await pool.query(
+        `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, 'standings_probe', $6::jsonb)`,
+        [
+          randomUUID(),
+          guild.id,
+          league.league_id,
+          runId,
+          'ea_direct:standings_probe:' + context.externalLeagueId,
+          JSON.stringify(probeResults.map(result => ({
+            commandName: result.commandName,
+            commandId: result.commandId,
+            payload: result.payload,
+            success: result.success,
+            error: result.error || null,
+            topKeys: result.topKeys || [],
+            candidateArrays: result.candidateArrays || [],
+          }))),
+        ]
+      ).catch(() => null);
+    }
 
     const importedTeams = teams.length ? await importMaddenTeamsFromArray(guild, league, teams) : 0;
     const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null) : 0;
@@ -16221,7 +16428,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
       ', games: ' + importedGames +
-      ', players: 0. Deep parser active. Hub raw inspection logging enabled.';
+      ', players: 0. Deep parser active. Standings command probe enabled. Standings command probe enabled.';
 
     await pool.query(
       `UPDATE madden_sync_runs
