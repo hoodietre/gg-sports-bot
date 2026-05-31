@@ -15734,22 +15734,22 @@ function logEaProbePayload(label, payload) {
       'teamInfoList'
     ]);
 
-    const summary = {
+    const compact = {
       label,
-      topKeys: Object.keys(value || {}),
-      candidateArrays: arrays.map(item => ({
+      topKeys: Object.keys(value || {}).slice(0, 30),
+      arrays: arrays.map(item => ({
         path: item.path,
         key: item.key,
         length: Array.isArray(item.rows) ? item.rows.length : 0,
-        sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object' ? Object.keys(item.rows[0]) : [],
-        sample: Array.isArray(item.rows) && item.rows[0] ? summarizeEaHubShape(item.rows[0], 0, 2) : null,
-      })).slice(0, 40),
-      shape: summarizeEaHubShape(value, 0, 3),
+        sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+          ? Object.keys(item.rows[0]).slice(0, 40)
+          : [],
+      })).slice(0, 12),
     };
 
-    console.log('[EA STANDINGS PROBE]', JSON.stringify(summary, null, 2).slice(0, 20000));
+    console.log('[EA STANDINGS PROBE COMPACT] ' + JSON.stringify(compact));
   } catch (error) {
-    console.error('[EA STANDINGS PROBE] failed to summarize payload for ' + label + ':', error?.message || error);
+    console.error('[EA STANDINGS PROBE COMPACT] failed to summarize payload for ' + label + ':', error?.message || error);
   }
 }
 
@@ -15757,11 +15757,7 @@ async function probeEaStandingsCommands(token, leagueId) {
   const leagueNumber = Number(leagueId);
   const payloadVariants = [
     { leagueId: leagueNumber },
-    { leagueId: String(leagueId) },
-    { franchiseId: leagueNumber },
-    { franchiseId: String(leagueId) },
     { leagueId: leagueNumber, weekIndex: 0 },
-    { leagueId: leagueNumber, seasonIndex: 0 },
   ];
 
   const commandCandidates = [
@@ -15769,14 +15765,7 @@ async function probeEaStandingsCommands(token, leagueId) {
     { name: 'Mobile_Career_GetTeamStats', id: 803 },
     { name: 'Mobile_Career_GetLeagueStandings', id: 804 },
     { name: 'Mobile_Career_GetSeasonStats', id: 805 },
-    { name: 'Mobile_Career_GetLeagueTeams', id: 806 },
-    { name: 'Mobile_Career_GetTeamInfo', id: 807 },
     { name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
-    { name: 'Mobile_Career_GetSeasonInfo', id: 809 },
-    { name: 'Mobile_Career_GetLeagueInfo', id: 810 },
-    { name: 'Mobile_Career_GetLeagueHub', id: 811 },
-    { name: 'Mobile_Career_GetSchedule', id: 812 },
-    { name: 'Mobile_Career_GetLeagueSchedule', id: 813 },
     { name: 'Mobile_Career_GetPowerRankings', id: 814 },
     { name: 'Mobile_Career_GetTeamRankings', id: 815 },
   ];
@@ -15818,12 +15807,12 @@ async function probeEaStandingsCommands(token, leagueId) {
           return results;
         }
       } catch (error) {
-        console.log('[EA STANDINGS PROBE] failed:', {
+        console.log('[EA STANDINGS PROBE FAIL] ' + JSON.stringify({
           commandName: command.name,
           commandId: command.id,
           payload: requestPayload,
-          error: String(error?.message || error).slice(0, 300),
-        });
+          error: String(error?.message || error).slice(0, 180),
+        }));
         results.push({
           commandName: command.name,
           commandId: command.id,
@@ -16339,7 +16328,6 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
   try {
     const context = await getEaDirectLeagueSyncContext(league);
     const hub = await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
-    logEaHubRawInspection(hub);
 
     await pool.query(
       `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
@@ -16428,7 +16416,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
       ', games: ' + importedGames +
-      ', players: 0. Deep parser active. Standings command probe enabled. Standings command probe enabled.';
+      ', players: 0. Deep parser active. Compact standings probe enabled. Compact standings probe enabled.';
 
     await pool.query(
       `UPDATE madden_sync_runs
