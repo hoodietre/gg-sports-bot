@@ -14446,7 +14446,7 @@ async function importMaddenTeamsFromArray(guild, league, rows) {
   let imported = 0;
 
   for (const row of rows) {
-    const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName', 'cityName', 'abbrName']));
+    const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName', 'cityName', 'abbrName', 'shortName']));
     if (!teamName) continue;
 
     const externalTeamId = String(getFirstValue(row, ['id', 'teamId', 'team_id', 'externalTeamId', 'external_team_id'], teamName));
@@ -14478,8 +14478,8 @@ async function importMaddenTeamsFromArray(guild, league, rows) {
         Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
         Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
         Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
-        Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf'], 0)),
-        Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa'], 0)),
+        Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf', 'points_for_total', 'scoreFor'], 0)),
+        Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa', 'points_against_total', 'scoreAgainst'], 0)),
         JSON.stringify(row),
       ]
     );
@@ -14531,8 +14531,8 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
         Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
         Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
         Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
-        Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf'], 0)),
-        Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa'], 0)),
+        Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf', 'points_for_total', 'scoreFor'], 0)),
+        Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa', 'points_against_total', 'scoreAgainst'], 0)),
         JSON.stringify(row),
       ]
     );
@@ -14550,8 +14550,8 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
           Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
           Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
           Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
-          Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf'], 0)),
-          Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa'], 0)),
+          Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf', 'points_for_total', 'scoreFor'], 0)),
+          Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa', 'points_against_total', 'scoreAgainst'], 0)),
         ]
       );
     }
@@ -15704,6 +15704,293 @@ async function getEaBlazeLeagueHub(token, leagueId) {
   return response?.responseInfo?.value || response;
 }
 
+
+function deepFindArraysByKey(root, wantedKeys = []) {
+  const wanted = new Set(wantedKeys.map(k => String(k).toLowerCase()));
+  const found = [];
+  const seen = new WeakSet();
+
+  function walk(value, path = '') {
+    if (!value || typeof value !== 'object') return;
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) walk(value[i], path + '[' + i + ']');
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      const lower = String(key).toLowerCase();
+      if (Array.isArray(child) && wanted.has(lower)) {
+        found.push({ key, path: path ? path + '.' + key : key, rows: child });
+      }
+      walk(child, path ? path + '.' + key : key);
+    }
+  }
+
+  walk(root);
+  return found;
+}
+
+function deepFindObjectsWithKeys(root, requiredKeys = [], limit = 5000) {
+  const required = requiredKeys.map(k => String(k).toLowerCase());
+  const found = [];
+  const seen = new WeakSet();
+
+  function hasKey(obj, key) {
+    return Object.keys(obj || {}).some(k => String(k).toLowerCase() === key);
+  }
+
+  function walk(value) {
+    if (!value || typeof value !== 'object' || found.length >= limit) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    if (!Array.isArray(value)) {
+      if (required.every(k => hasKey(value, k))) found.push(value);
+      for (const child of Object.values(value)) walk(child);
+    } else {
+      for (const child of value) walk(child);
+    }
+  }
+
+  walk(root);
+  return found;
+}
+
+function getAnyValue(obj, possibleKeys, fallback = null) {
+  if (!obj || typeof obj !== 'object') return fallback;
+  const lowerMap = new Map(Object.keys(obj).map(k => [String(k).toLowerCase(), k]));
+  for (const key of possibleKeys) {
+    const actual = lowerMap.get(String(key).toLowerCase());
+    if (actual && obj[actual] !== undefined && obj[actual] !== null && obj[actual] !== '') return obj[actual];
+  }
+  return fallback;
+}
+
+function parseNumberOrNull(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeEaTeamNameFromAny(row) {
+  return normalizeMaddenTeamName(
+    getAnyValue(row, [
+      'teamName', 'team_name', 'displayName', 'display_name', 'fullName', 'cityName',
+      'abbrName', 'shortName', 'name', 'teamDisplayName'
+    ], '')
+  );
+}
+
+function buildEaTeamNameMaps(hubPayload) {
+  const byId = new Map();
+  const byName = new Map();
+
+  const teamIdInfoList = Array.isArray(hubPayload?.teamIdInfoList) ? hubPayload.teamIdInfoList : [];
+  for (const team of teamIdInfoList) {
+    const teamId = getAnyValue(team, ['teamId', 'id', 'presentationId'], null);
+    const name = normalizeEaTeamNameFromAny(team);
+    if (teamId !== null && teamId !== undefined && name) byId.set(String(teamId), name);
+    if (name) byName.set(name.toLowerCase(), name);
+  }
+
+  const teamObjects = deepFindObjectsWithKeys(hubPayload, ['teamId'], 1000);
+  for (const team of teamObjects) {
+    const teamId = getAnyValue(team, ['teamId', 'id'], null);
+    const name = normalizeEaTeamNameFromAny(team);
+    if (teamId !== null && teamId !== undefined && name && !byId.has(String(teamId))) byId.set(String(teamId), name);
+    if (name && !byName.has(name.toLowerCase())) byName.set(name.toLowerCase(), name);
+  }
+
+  return { byId, byName };
+}
+
+function extractEaStandingsRowsFromHub(hubPayload) {
+  const arrays = deepFindArraysByKey(hubPayload, [
+    'teamStandingsInfoList',
+    'standings',
+    'teamStandings',
+    'leagueStandings',
+    'standingInfoList',
+    'teamStatsInfoList',
+    'teamStats',
+    'leagueTeamStats'
+  ]);
+
+  const candidates = [];
+  for (const item of arrays) {
+    for (const row of item.rows) {
+      if (!row || typeof row !== 'object') continue;
+      const name = normalizeEaTeamNameFromAny(row);
+      const teamId = getAnyValue(row, ['teamId', 'team_id', 'id'], null);
+      const wins = parseNumberOrNull(getAnyValue(row, ['wins', 'win', 'totalWins', 'seasonWins'], null));
+      const losses = parseNumberOrNull(getAnyValue(row, ['losses', 'loss', 'totalLosses', 'seasonLosses'], null));
+      const ties = parseNumberOrNull(getAnyValue(row, ['ties', 'tie', 'totalTies', 'seasonTies'], null));
+      const pf = parseNumberOrNull(getAnyValue(row, ['pointsFor', 'points_for', 'pf', 'totalPointsFor', 'scoreFor'], null));
+      const pa = parseNumberOrNull(getAnyValue(row, ['pointsAgainst', 'points_against', 'pa', 'totalPointsAgainst', 'scoreAgainst'], null));
+
+      if ((name || teamId !== null) && (wins !== null || losses !== null || ties !== null || pf !== null || pa !== null)) {
+        candidates.push({ sourcePath: item.path, row, name, teamId, wins, losses, ties, pf, pa });
+      }
+    }
+  }
+
+  // Fallback: scan all objects for wins/losses/teamId style rows.
+  if (!candidates.length) {
+    const objects = deepFindObjectsWithKeys(hubPayload, ['teamId'], 5000);
+    for (const row of objects) {
+      const name = normalizeEaTeamNameFromAny(row);
+      const teamId = getAnyValue(row, ['teamId', 'team_id', 'id', 'team'], null);
+      const wins = parseNumberOrNull(getAnyValue(row, ['wins', 'win', 'totalWins', 'seasonWins'], null));
+      const losses = parseNumberOrNull(getAnyValue(row, ['losses', 'loss', 'totalLosses', 'seasonLosses'], null));
+      const ties = parseNumberOrNull(getAnyValue(row, ['ties', 'tie', 'totalTies', 'seasonTies'], null));
+      const pf = parseNumberOrNull(getAnyValue(row, ['pointsFor', 'points_for', 'pf', 'totalPointsFor', 'scoreFor'], null));
+      const pa = parseNumberOrNull(getAnyValue(row, ['pointsAgainst', 'points_against', 'pa', 'totalPointsAgainst', 'scoreAgainst'], null));
+      if ((name || teamId !== null) && (wins !== null || losses !== null || ties !== null || pf !== null || pa !== null)) {
+        candidates.push({ sourcePath: 'deep_scan', row, name, teamId, wins, losses, ties, pf, pa });
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function normalizeEaLeagueTeamsDeepFromHub(hubPayload) {
+  const basicTeams = normalizeEaLeagueTeamsFromHub(hubPayload);
+  const maps = buildEaTeamNameMaps(hubPayload);
+  const standings = extractEaStandingsRowsFromHub(hubPayload);
+  const byTeamKey = new Map();
+
+  for (const team of basicTeams) {
+    const teamId = getAnyValue(team, ['teamId', 'id'], null);
+    const name = normalizeEaTeamNameFromAny(team);
+    const key = teamId !== null && teamId !== undefined ? 'id:' + String(teamId) : 'name:' + name.toLowerCase();
+    byTeamKey.set(key, {
+      ...team,
+      wins: Number(team.wins || 0),
+      losses: Number(team.losses || 0),
+      ties: Number(team.ties || 0),
+      points_for: Number(team.points_for || 0),
+      points_against: Number(team.points_against || 0),
+    });
+  }
+
+  for (const standing of standings) {
+    const teamId = standing.teamId;
+    let name = standing.name || (teamId !== null && teamId !== undefined ? maps.byId.get(String(teamId)) : null);
+    if (!name && standing.row) name = normalizeEaTeamNameFromAny(standing.row);
+    if (!name && teamId !== null && teamId !== undefined) name = 'Team ' + String(teamId);
+    if (!name) continue;
+
+    const key = teamId !== null && teamId !== undefined ? 'id:' + String(teamId) : 'name:' + name.toLowerCase();
+    const existing = byTeamKey.get(key) || {
+      id: teamId || name,
+      teamId,
+      teamName: name,
+      name,
+      displayName: name,
+      shortName: name,
+      rawTeam: null,
+      rawUser: null,
+    };
+
+    byTeamKey.set(key, {
+      ...existing,
+      id: existing.id || teamId || name,
+      teamId: existing.teamId || teamId,
+      teamName: existing.teamName || name,
+      name: existing.name || name,
+      displayName: existing.displayName || name,
+      wins: standing.wins ?? Number(existing.wins || 0),
+      losses: standing.losses ?? Number(existing.losses || 0),
+      ties: standing.ties ?? Number(existing.ties || 0),
+      points_for: standing.pf ?? Number(existing.points_for || 0),
+      points_against: standing.pa ?? Number(existing.points_against || 0),
+      rawStanding: standing.row,
+      standingsSource: standing.sourcePath,
+    });
+  }
+
+  return Array.from(byTeamKey.values());
+}
+
+function normalizeEaWeekLabel(game) {
+  const explicit = getAnyValue(game, ['displayedWeek', 'weekTitle', 'week_label', 'weekLabel'], null);
+  if (explicit) return String(explicit);
+
+  const week = parseNumberOrNull(getAnyValue(game, ['week', 'weekIndex', 'seasonWeek'], null));
+  const weekType = parseNumberOrNull(getAnyValue(game, ['weekType', 'seasonWeekType', 'stageIndex'], null));
+
+  if (week !== null) {
+    const displayWeek = week >= 0 ? week + 1 : week;
+    if (weekType === 0) return 'Preseason Week ' + displayWeek;
+    if (weekType === 1 || weekType === null) return 'Week ' + displayWeek;
+    if (weekType === 2) return 'Wildcard Round';
+    if (weekType === 3) return 'Divisional Round';
+    if (weekType === 4) return 'Conference Championship';
+    if (weekType === 5 || weekType === 6) return 'Super Bowl';
+    return 'Week ' + displayWeek;
+  }
+
+  return 'Week TBD';
+}
+
+function getTeamNameFromGameSide(game, side, maps) {
+  const prefix = side === 'home' ? 'home' : 'away';
+  const name = getAnyValue(game, [
+    prefix + 'Name',
+    prefix + 'TeamName',
+    prefix + 'CityName',
+    prefix + 'DisplayName',
+    prefix + '_team',
+  ], null);
+  if (name) return normalizeMaddenTeamName(name);
+
+  const teamId = getAnyValue(game, [prefix + 'Team', prefix + 'TeamId', prefix + '_team_id'], null);
+  if (teamId !== null && teamId !== undefined && maps.byId.has(String(teamId))) return maps.byId.get(String(teamId));
+  if (teamId !== null && teamId !== undefined) return 'Team ' + String(teamId);
+
+  return side === 'home' ? 'Home' : 'Away';
+}
+
+function normalizeEaScheduleDeepFromHub(hubPayload) {
+  const maps = buildEaTeamNameMaps(hubPayload);
+  const schedule = hubPayload?.gameScheduleHubInfo?.leagueSchedule;
+  let rows = Array.isArray(schedule) ? schedule : [];
+
+  if (!rows.length) {
+    const arrays = deepFindArraysByKey(hubPayload, ['leagueSchedule', 'schedule', 'games', 'seasonGameInfoList', 'gameSchedule']);
+    rows = arrays.flatMap(item => item.rows || []);
+  }
+
+  return rows.map(item => {
+    const game = item?.seasonGameInfo || item?.gameInfo || item || {};
+    const homeTeam = getTeamNameFromGameSide(game, 'home', maps);
+    const awayTeam = getTeamNameFromGameSide(game, 'away', maps);
+
+    const homeScore = parseNumberOrNull(getAnyValue(game, ['homeScore', 'homeTeamScore', 'home_score', 'homePts'], null));
+    const awayScore = parseNumberOrNull(getAnyValue(game, ['awayScore', 'awayTeamScore', 'away_score', 'awayPts'], null));
+    const isPlayed = Boolean(getAnyValue(game, ['isGamePlayed', 'gamePlayed', 'isPlayed', 'played'], false)) || (homeScore !== null && awayScore !== null && (homeScore > 0 || awayScore > 0));
+    const result = getAnyValue(game, ['result', 'gameResult'], null);
+
+    return {
+      id: getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) || [normalizeEaWeekLabel(game), awayTeam, homeTeam].join('-'),
+      external_game_id: getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null),
+      week_label: normalizeEaWeekLabel(game),
+      home_team: homeTeam,
+      away_team: awayTeam,
+      home_score: homeScore,
+      away_score: awayScore,
+      status: isPlayed ? 'completed' : 'scheduled',
+      result,
+      raw: item,
+    };
+  });
+}
+
+
 function normalizeEaLeagueTeamsFromHub(hubPayload) {
   const teamRows = [];
 
@@ -15851,8 +16138,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ]
     );
 
-    const teams = normalizeEaLeagueTeamsFromHub(hub);
-    const games = normalizeEaScheduleFromHub(hub);
+    const teams = normalizeEaLeagueTeamsDeepFromHub(hub);
+    const games = normalizeEaScheduleDeepFromHub(hub);
 
     const importedTeams = teams.length ? await importMaddenTeamsFromArray(guild, league, teams) : 0;
     const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null) : 0;
@@ -15863,7 +16150,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
       ', games: ' + importedGames +
-      ', players: 0.';
+      ', players: 0. Deep parser active.';
 
     await pool.query(
       `UPDATE madden_sync_runs
