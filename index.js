@@ -14454,7 +14454,7 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
          ties = $8,
          points_for = $9,
          points_against = $10,
-         raw_payload = $11,
+         raw_payload = $11::jsonb,
          imported_at = NOW()`,
       [
         guild.id,
@@ -14560,7 +14560,7 @@ async function importMaddenPlayersFromArray(guild, league, rows) {
       `INSERT INTO madden_imported_players (id, guild_id, league_id, external_player_id, player_name, team_name, position, overall, raw_payload, imported_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
        ON CONFLICT (league_id, external_player_id)
-       DO UPDATE SET player_name = $5, team_name = $6, position = $7, overall = $8, raw_payload = $9, imported_at = NOW()`,
+       DO UPDATE SET player_name = $5, team_name = $6, position = $7, overall = $8, raw_payload = $9::jsonb, imported_at = NOW()`,
       [
         randomUUID(),
         guild.id,
@@ -14919,9 +14919,9 @@ async function saveEaPersonas(guildId, leagueId, userId, payload) {
 
     await pool.query(
       `INSERT INTO madden_ea_personas (id, guild_id, league_id, user_id, persona_id, persona_name, platform, raw_payload, imported_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW())
        ON CONFLICT (league_id, user_id, persona_id)
-       DO UPDATE SET persona_name = $6, platform = $7, raw_payload = $8, imported_at = NOW()`,
+       DO UPDATE SET persona_name = $6, platform = $7, raw_payload = $8::jsonb, imported_at = NOW()`,
       [randomUUID(), guildId, leagueId, userId, personaId, personaName, platform, JSON.stringify(row)]
     );
     imported += 1;
@@ -14945,7 +14945,7 @@ async function saveEaFranchises(guildId, leagueId, userId, personaId, payload) {
       `INSERT INTO madden_ea_franchises (id, guild_id, league_id, user_id, persona_id, franchise_id, franchise_name, platform, raw_payload, imported_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
        ON CONFLICT (league_id, user_id, franchise_id)
-       DO UPDATE SET persona_id = $5, franchise_name = $7, platform = $8, raw_payload = $9, imported_at = NOW()`,
+       DO UPDATE SET persona_id = $5, franchise_name = $7, platform = $8, raw_payload = $9::jsonb, imported_at = NOW()`,
       [randomUUID(), guildId, leagueId, userId, personaId, franchiseId, franchiseName, platform, JSON.stringify(row)]
     );
     imported += 1;
@@ -15078,7 +15078,7 @@ async function handleInternalEaConnect(payload) {
          accepted_disclaimer = TRUE,
          last_error = NULL,
          updated_at = NOW()
-     WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+     WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
     [
       leagueId,
       userId,
@@ -15250,14 +15250,14 @@ async function handleInternalRetrievePersonas(payload) {
        SET access_token_encrypted = $4,
            refresh_token_encrypted = COALESCE($5, refresh_token_encrypted),
            token_expires_at = $6,
-           raw_token_payload = $7,
-           raw_personas_payload = $8,
+           raw_token_payload = $7::jsonb,
+           raw_personas_payload = $8::jsonb,
            exchange_status = 'personas_fetched',
            connection_status = 'personas_fetched',
            accepted_disclaimer = TRUE,
            last_error = NULL,
            updated_at = NOW()
-       WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+       WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
       [
         leagueId,
         userId,
@@ -15428,14 +15428,14 @@ async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, 
   await pool.query(
     `UPDATE madden_ea_connections
      SET access_token_encrypted = $4,
-         raw_token_payload = $5,
-         raw_personas_payload = $6,
+         raw_token_payload = $5::jsonb,
+         raw_personas_payload = $6::jsonb,
          exchange_status = 'personas_fetched',
          connection_status = 'personas_fetched',
          accepted_disclaimer = TRUE,
          last_error = NULL,
          updated_at = NOW()
-     WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+     WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
     [
       leagueId,
       userId,
@@ -15492,7 +15492,7 @@ async function selectEaPersonaViaEndpoint(guildId, leagueId, userId, personaId) 
        SET access_token_encrypted = COALESCE($4, access_token_encrypted),
            refresh_token_encrypted = COALESCE($5, refresh_token_encrypted),
            token_expires_at = $6,
-           raw_franchises_payload = $7,
+           raw_franchises_payload = $7::jsonb,
            exchange_status = 'leagues_fetched',
            updated_at = NOW()
        WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
@@ -15525,7 +15525,7 @@ async function selectEaPersonaViaEndpoint(guildId, leagueId, userId, personaId) 
          user_team_name = $8,
          system_console = $9,
          blaze_id = $10,
-         raw_payload = $11,
+         raw_payload = $11::jsonb,
          imported_at = NOW()`,
       [
         randomUUID(),
@@ -15597,7 +15597,7 @@ async function completeEaTokenExchange(guildId, leagueId, userId, code) {
          connection_status = 'token_exchanged',
          last_error = NULL,
          updated_at = NOW()
-     WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+     WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
     [
       leagueId,
       userId,
