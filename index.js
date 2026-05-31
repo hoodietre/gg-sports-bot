@@ -15705,6 +15705,76 @@ async function getEaBlazeLeagueHub(token, leagueId) {
 }
 
 
+
+function summarizeEaHubShape(value, depth = 0, maxDepth = 4) {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== 'object') return typeof value === 'string' && value.length > 120 ? value.slice(0, 120) + '...' : value;
+
+  if (Array.isArray(value)) {
+    return {
+      __type: 'array',
+      length: value.length,
+      sample: value.length ? summarizeEaHubShape(value[0], depth + 1, maxDepth) : null,
+    };
+  }
+
+  const keys = Object.keys(value);
+  const out = {
+    __type: 'object',
+    keys,
+  };
+
+  if (depth >= maxDepth) return out;
+
+  for (const key of keys.slice(0, 40)) {
+    out[key] = summarizeEaHubShape(value[key], depth + 1, maxDepth);
+  }
+
+  return out;
+}
+
+function logEaHubRawInspection(hubPayload) {
+  try {
+    const arrays = deepFindArraysByKey(hubPayload, [
+      'teamIdInfoList',
+      'leagueSchedule',
+      'teamStandingsInfoList',
+      'standings',
+      'teamStandings',
+      'leagueStandings',
+      'teamStatsInfoList',
+      'teamStats',
+      'userInfoMap',
+      'playerInfoList',
+      'rosterInfoList',
+      'players',
+      'rosters',
+      'depthChartInfoList'
+    ]);
+
+    const summary = {
+      topKeys: Object.keys(hubPayload || {}),
+      candidateArrays: arrays.map(item => ({
+        path: item.path,
+        key: item.key,
+        length: Array.isArray(item.rows) ? item.rows.length : 0,
+        sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+          ? Object.keys(item.rows[0])
+          : [],
+        sample: Array.isArray(item.rows) && item.rows[0]
+          ? summarizeEaHubShape(item.rows[0], 0, 2)
+          : null,
+      })).slice(0, 60),
+      shape: summarizeEaHubShape(hubPayload, 0, 3),
+    };
+
+    console.log('[EA HUB RAW]', JSON.stringify(summary, null, 2).slice(0, 20000));
+  } catch (error) {
+    console.error('[EA HUB RAW] failed to summarize hub payload:', error?.message || error);
+  }
+}
+
+
 function deepFindArraysByKey(root, wantedKeys = []) {
   const wanted = new Set(wantedKeys.map(k => String(k).toLowerCase()));
   const found = [];
@@ -16124,6 +16194,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
   try {
     const context = await getEaDirectLeagueSyncContext(league);
     const hub = await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+    logEaHubRawInspection(hub);
 
     await pool.query(
       `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
@@ -16150,7 +16221,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
       ', games: ' + importedGames +
-      ', players: 0. Deep parser active.';
+      ', players: 0. Deep parser active. Hub raw inspection logging enabled.';
 
     await pool.query(
       `UPDATE madden_sync_runs
