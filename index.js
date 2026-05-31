@@ -4361,11 +4361,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const connection = await upsertMaddenEaConnection(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, {
         connection_status: 'connected',
+        accepted_disclaimer: true,
+        last_error: null,
         franchise_id: franchiseId,
         franchise_name: franchiseName,
       });
 
       await pool.query(`UPDATE madden_ea_connections SET connected_at = NOW(), updated_at = NOW() WHERE id = $1`, [connection.id]).catch(() => null);
+      await pool.query(`UPDATE madden_ea_connections SET last_error = NULL, accepted_disclaimer = TRUE, updated_at = NOW() WHERE id = $1`, [connection.id]).catch(() => null);
       try {
         const currentConnection = await getMaddenEaConnection(leagueId, interaction.user.id);
         const accessToken = currentConnection?.access_token_encrypted ? decryptEaSecret(currentConnection.access_token_encrypted) : null;
@@ -4379,6 +4382,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             access_token: accessToken,
             refresh_token: refreshToken,
             selected_league: franchiseId,
+            franchise_name: franchiseName,
             console: null,
             blaze_id: currentConnection?.persona_id || null,
             expiry: currentConnection?.token_expires_at ? new Date(currentConnection.token_expires_at).getTime() : null,
@@ -15041,41 +15045,44 @@ function isAuthorizedInternalApiRequest(req) {
 
 
 async function handleInternalEaConnect(payload) {
-  const code = extractEaAuthCode(payload.code || payload.url || payload.authorization_code);
-  const connectionId = payload.connection_id || payload.connectionId || null;
-  const guildId = payload.guild_id || payload.guildId || null;
+  // Final EA Direct save step.
+  // This route is called after persona selection / league selection.
+  // It should NOT require an EA authorization code.
+  const guildId = payload.guild_id || payload.guildId || 'unknown';
   const leagueId = payload.league_id || payload.leagueId || null;
   const userId = payload.user_id || payload.userId || null;
 
-  if (!code) {
-    return { statusCode: 400, payload: { error: 'Missing EA authorization code.' } };
-  }
+  const accessToken = payload.access_token || payload.accessToken || null;
+  const refreshToken = payload.refresh_token || payload.refreshToken || null;
+  const selectedLeague = payload.selected_league || payload.selectedLeague || payload.external_league_id || payload.franchise_id || null;
+  const blazeId = payload.blaze_id || payload.blazeId || payload.persona_id || null;
+  const systemConsole = payload.console || payload.systemConsole || null;
+  const expiry = payload.expiry || null;
 
   if (!leagueId || !userId) {
     return { statusCode: 400, payload: { error: 'Missing league_id or user_id.' } };
   }
 
-  const tokenPayload = await exchangeEaAuthorizationCode(code);
-  const accessToken = tokenPayload.access_token;
-  const refreshToken = tokenPayload.refresh_token;
-  const expiresIn = Number(tokenPayload.expires_in || 0);
-  const expiresAt = expiresIn ? new Date(Date.now() + expiresIn * 1000) : null;
+  const choices = await getEaLeagueChoicesForConnection(leagueId, userId).catch(() => []);
+  const choice = selectedLeague
+    ? choices.find(row => String(row.external_league_id) === String(selectedLeague))
+    : null;
 
-  if (!accessToken) {
-    return { statusCode: 502, payload: { error: 'Token exchange returned no access_token.', tokenPayload } };
-  }
+  const externalLeagueId = selectedLeague ? String(selectedLeague) : 'default_franchise';
+  const externalLeagueName = choice?.external_league_name || payload.franchise_name || payload.external_league_name || 'Default Madden Franchise';
+  const userTeamName = choice?.user_team_name || payload.user_team_name || payload.userTeamName || null;
 
   await pool.query(
     `UPDATE madden_ea_connections
-     SET access_token_encrypted = $4,
-         refresh_token_encrypted = $5,
-         token_expires_at = $6,
-         token_type = $7,
-         token_scope = $8,
-         raw_token_payload = $9,
-         exchange_status = 'token_exchanged',
-         connection_status = 'token_exchanged',
+     SET access_token_encrypted = COALESCE($4, access_token_encrypted),
+         refresh_token_encrypted = COALESCE($5, refresh_token_encrypted),
+         token_expires_at = COALESCE($6, token_expires_at),
+         franchise_id = $7,
+         franchise_name = $8,
+         connection_status = 'connected',
+         exchange_status = 'connected',
          accepted_disclaimer = TRUE,
+         connected_at = COALESCE(connected_at, NOW()),
          last_error = NULL,
          updated_at = NOW()
      WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
@@ -15083,27 +15090,46 @@ async function handleInternalEaConnect(payload) {
       leagueId,
       userId,
       'ea_direct',
-      encryptEaSecret(accessToken),
-      encryptEaSecret(refreshToken),
-      expiresAt,
-      tokenPayload.token_type || null,
-      tokenPayload.scope || null,
-      JSON.stringify(tokenPayload),
+      accessToken ? encryptEaSecret(accessToken) : null,
+      refreshToken ? encryptEaSecret(refreshToken) : null,
+      expiry ? new Date(Number(expiry)) : null,
+      externalLeagueId,
+      externalLeagueName,
     ]
   );
 
-  await logMaddenEaConnectionEvent(guildId || 'unknown', leagueId, userId, 'token_exchanged', 'EA token exchange completed through internal connect route.');
+  await pool.query(
+    `INSERT INTO madden_ea_league_choices (
+       id, guild_id, league_id, user_id, external_league_id, external_league_name,
+       user_team_name, system_console, blaze_id, raw_payload, imported_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW())
+     ON CONFLICT (league_id, user_id, external_league_id)
+     DO UPDATE SET
+       external_league_name = $6,
+       user_team_name = COALESCE($7, madden_ea_league_choices.user_team_name),
+       system_console = COALESCE($8, madden_ea_league_choices.system_console),
+       blaze_id = COALESCE($9, madden_ea_league_choices.blaze_id),
+       raw_payload = $10::jsonb,
+       imported_at = NOW()`,
+    [
+      randomUUID(),
+      guildId,
+      leagueId,
+      userId,
+      externalLeagueId,
+      externalLeagueName,
+      userTeamName,
+      systemConsole,
+      blazeId ? String(blazeId) : null,
+      JSON.stringify(payload),
+    ]
+  );
 
-  return {
-    statusCode: 200,
-    payload: {
-      status: 'ok',
-      connection_id: connectionId,
-      access_token: accessToken,
-      refresh_token: refreshToken || null,
-      expiry: expiresAt ? expiresAt.getTime() : null,
-    },
-  };
+  await markLeagueEaDirectEnabled(leagueId, true).catch(() => null);
+  await logMaddenEaConnectionEvent(guildId, leagueId, userId, 'connected', 'EA Direct connection saved.');
+
+  return { statusCode: 200, payload: { status: 'ok' } };
 }
 
 
@@ -15759,7 +15785,7 @@ async function upsertMaddenEaConnection(guildId, leagueId, userId, fields = {}) 
     [
       id, guildId, leagueId, userId,
       fields.connection_status || null,
-      fields.accepted_disclaimer ?? false,
+      fields.accepted_disclaimer ?? null,
       fields.ea_auth_code || null,
       fields.persona_id || null,
       fields.persona_name || null,
