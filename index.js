@@ -3129,7 +3129,7 @@ async function finalizeDeniedTrade(guild, offerId) {
 
 
 
-async let ggSportsInternalApiServer = null;
+let ggSportsInternalApiServer = null;
 
 function startGGSportsInternalApiServer() {
   if (ggSportsInternalApiServer) return ggSportsInternalApiServer;
