@@ -5460,7 +5460,7 @@ if (gameSubcommand === 'report') {
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Holding Mode', value: EA_DIRECT_HOLDING_MODE ? 'Enabled' : 'Disabled', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Final Snallabot Blaze adapter enabled with Snallabot service/product names.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Final Snallabot Blaze adapter enabled: Mobile_GetMyLeagues should populate real Madden leagues.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -14811,21 +14811,21 @@ const EA_DIRECT_ENABLE_BLAZE_LEAGUE_FETCH = String(process.env.EA_DIRECT_ENABLE_
 const EA_DIRECT_FORCE_BLAZE_FETCH = String(process.env.EA_DIRECT_FORCE_BLAZE_FETCH || 'true').toLowerCase() !== 'false';
 
 const EA_BLAZE_SERVICE = {
-  xone: process.env.EA_BLAZE_SERVICE_XONE || 'madden-2026-xone',
-  xbsx: process.env.EA_BLAZE_SERVICE_XBSX || 'madden-2026-xbsx',
-  ps4: process.env.EA_BLAZE_SERVICE_PS4 || 'madden-2026-ps4',
-  ps5: process.env.EA_BLAZE_SERVICE_PS5 || 'madden-2026-ps5',
-  pc: process.env.EA_BLAZE_SERVICE_PC || 'madden-2026-pc',
-  stadia: process.env.EA_BLAZE_SERVICE_STADIA || 'madden-2026-stadia',
+  xone: process.env.EA_BLAZE_SERVICE_XONE || 'gos-mca-xone',
+  xbsx: process.env.EA_BLAZE_SERVICE_XBSX || 'gos-mca-xbsx',
+  ps4: process.env.EA_BLAZE_SERVICE_PS4 || 'gos-mca-ps4',
+  ps5: process.env.EA_BLAZE_SERVICE_PS5 || 'gos-mca-ps5',
+  pc: process.env.EA_BLAZE_SERVICE_PC || 'gos-mca-pc',
+  stadia: process.env.EA_BLAZE_SERVICE_STADIA || 'gos-mca-stadia',
 };
 
 const EA_BLAZE_PRODUCT_NAME = {
-  xone: process.env.EA_BLAZE_PRODUCT_XONE || 'madden-2026-xone-mca',
-  xbsx: process.env.EA_BLAZE_PRODUCT_XBSX || 'madden-2026-xbsx-mca',
-  ps4: process.env.EA_BLAZE_PRODUCT_PS4 || 'madden-2026-ps4-mca',
-  ps5: process.env.EA_BLAZE_PRODUCT_PS5 || 'madden-2026-ps5-mca',
-  pc: process.env.EA_BLAZE_PRODUCT_PC || 'madden-2026-pc-mca',
-  stadia: process.env.EA_BLAZE_PRODUCT_STADIA || 'madden-2026-stadia-mca',
+  xone: process.env.EA_BLAZE_PRODUCT_XONE || 'madden-2026-xone',
+  xbsx: process.env.EA_BLAZE_PRODUCT_XBSX || 'madden-2026-xbsx',
+  ps4: process.env.EA_BLAZE_PRODUCT_PS4 || 'madden-2026-ps4',
+  ps5: process.env.EA_BLAZE_PRODUCT_PS5 || 'madden-2026-ps5',
+  pc: process.env.EA_BLAZE_PRODUCT_PC || 'madden-2026-pc',
+  stadia: process.env.EA_BLAZE_PRODUCT_STADIA || 'madden-2026-stadia',
 };
 
 
@@ -15582,12 +15582,22 @@ async function retrieveBlazeSession(token) {
     throw new Error('Could not connect to EA Blaze login. HTTP ' + response.status + ' • ' + text.slice(0, 500));
   }
 
-  return {
+  const sessionInfo = {
     blazeId: payload.userLoginInfo.personaDetails?.personaId || token.blazeId,
     sessionKey: payload.userLoginInfo.sessionKey,
     requestId: 1,
     raw: payload,
   };
+
+  console.log('[EA Direct] Blaze login success:', {
+    console: consoleKey,
+    service: EA_BLAZE_SERVICE[consoleKey] || EA_BLAZE_SERVICE.xbsx,
+    product: EA_BLAZE_PRODUCT_NAME[consoleKey] || EA_BLAZE_PRODUCT_NAME.xbsx,
+    blazeId: sessionInfo.blazeId,
+    sessionKeyLength: sessionInfo.sessionKey ? String(sessionInfo.sessionKey).length : 0,
+  });
+
+  return sessionInfo;
 }
 
 function calculateBlazeMessageAuthData(blazeId, requestId) {
@@ -15639,7 +15649,19 @@ async function sendEaBlazeRequest(token, session, request) {
     }),
   };
 
-  const response = await fetch('https://wal2.tools.gos.bio-iad.ea.com/wal/mca/Process/' + encodeURIComponent(session.sessionKey), {
+  console.log('[EA Direct] Blaze Process request:', {
+    commandName: request.commandName,
+    componentId: request.componentId,
+    commandId: request.commandId,
+    sessionKeyLength: session.sessionKey ? String(session.sessionKey).length : 0,
+    blazeId: session.blazeId,
+    requestId: session.requestId,
+    console: token.console,
+    service: EA_BLAZE_SERVICE[token.console || 'xbsx'],
+    product: EA_BLAZE_PRODUCT_NAME[token.console || 'xbsx'],
+  });
+
+  const response = await fetch('https://wal2.tools.gos.bio-iad.ea.com/wal/mca/Process/' + session.sessionKey, {
     method: 'POST',
     headers: eaBlazeHeaders(token),
     body: JSON.stringify(body),
