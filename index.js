@@ -5398,7 +5398,7 @@ if (gameSubcommand === 'report') {
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Holding Mode', value: EA_DIRECT_HOLDING_MODE ? 'Enabled' : 'Disabled', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Snallabot select-league token flow enabled. Blaze getLeagues adapter is the remaining live-franchise step.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Dynamic league dropdown enabled. If only Default appears, Blaze getLeagues adapter still needs a real endpoint/module.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -15513,6 +15513,14 @@ async function handleInternalSelectLeague(payload) {
   const blazeId = persona.personaId || persona.persona_id || persona.id || null;
 
   const leagues = await fetchMaddenLeaguesForPersonaToken(token, persona);
+  console.log('[EA Direct] select-league discovery result:', {
+    userId,
+    leagueId,
+    personaId: persona?.personaId || persona?.persona_id || persona?.id || null,
+    systemConsole,
+    leagueCount: Array.isArray(leagues) ? leagues.length : 0,
+    adapter: EA_DIRECT_LEAGUES_ENDPOINT_URL ? 'configured_endpoint' : 'pending_blaze_adapter',
+  });
 
   if (leagueId && userId) {
     await pool.query(
@@ -16189,15 +16197,49 @@ function buildMaddenEaPersonaComponents(leagueId) {
 }
 
 function buildMaddenEaFranchiseComponents(leagueId) {
+  return buildMaddenEaDynamicLeagueComponents(leagueId, []);
+}
+
+
+function buildMaddenEaDynamicLeagueComponents(leagueId, leagueRows = []) {
+  const rows = Array.isArray(leagueRows) ? leagueRows : [];
+  const options = rows
+    .filter(row => row && (row.external_league_id || row.franchise_id || row.league_id || row.id || row.value))
+    .slice(0, 25)
+    .map(row => {
+      const id = String(row.external_league_id || row.franchise_id || row.league_id || row.id || row.value);
+      const name = String(row.external_league_name || row.franchise_name || row.league_name || row.name || row.label || id);
+      const team = row.user_team_name || row.team_name || row.userTeamName || row.teamName || row.description || 'Madden League';
+      return {
+        label: name.slice(0, 100),
+        value: id.slice(0, 100),
+        description: String(team).slice(0, 100),
+      };
+    });
+
+  if (!options.length) {
+    options.push({
+      label: 'Default Madden Franchise',
+      value: 'default_franchise',
+      description: 'Temporary placeholder franchise',
+    });
+  }
+
   return [
     new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
         .setCustomId('madden_ea_franchise_select:' + leagueId)
-        .setPlaceholder('Select Madden Franchise')
-        .addOptions([{ label: 'Default Madden Franchise', value: 'default_franchise', description: 'Temporary placeholder franchise' }])
+        .setPlaceholder(options[0]?.value === 'default_franchise' ? 'Select Madden Franchise' : 'Select Madden League')
+        .addOptions(options)
     ),
   ];
 }
+
+async function getMaddenEaLeagueChoiceComponents(leagueId, userId) {
+  const choices = await getEaLeagueChoicesForConnection(leagueId, userId).catch(() => []);
+  return buildMaddenEaDynamicLeagueComponents(leagueId, choices);
+}
+
 
 async function markLeagueEaDirectEnabled(leagueId, enabled = true) {
   await ensureMaddenLeagueSettings(await getLeagueById(leagueId));
