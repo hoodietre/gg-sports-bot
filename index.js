@@ -15148,6 +15148,144 @@ function isAuthorizedInternalApiRequest(req) {
 }
 
 
+
+async function handleInternalSelectLeague(payload) {
+  const accessToken = payload.access_token || payload.accessToken;
+  const selectedPersona = payload.selected_persona || payload.selectedPersona || payload.persona;
+  const guildId = payload.guild_id || payload.guildId || 'unknown';
+  const leagueId = payload.league_id || payload.leagueId || null;
+  const userId = payload.user_id || payload.userId || null;
+
+  if (!accessToken) {
+    return { statusCode: 400, payload: { error: 'Missing access_token.' } };
+  }
+
+  if (!selectedPersona) {
+    return { statusCode: 400, payload: { error: 'Missing selected_persona.' } };
+  }
+
+  let persona;
+  if (typeof selectedPersona === 'string') {
+    try {
+      persona = JSON.parse(selectedPersona);
+    } catch {
+      persona = { personaId: selectedPersona };
+    }
+  } else {
+    persona = selectedPersona;
+  }
+
+  const token = await exchangePersonaForMaddenToken(accessToken, persona);
+  const systemConsole = getPersonaSystemConsole(persona);
+  const expiry = token.expires_in ? Date.now() + Number(token.expires_in) * 1000 : null;
+  const blazeId = persona.personaId || persona.persona_id || persona.id || null;
+
+  const leagues = await fetchMaddenLeaguesForPersonaToken(token, persona);
+
+  console.log('[EA Direct] select-league discovery result:', {
+    userId,
+    leagueId,
+    personaId: blazeId,
+    systemConsole,
+    leagueCount: Array.isArray(leagues) ? leagues.length : 0,
+    adapter: 'snallabot_blaze_mobile_get_my_leagues',
+  });
+
+  if (leagueId && userId) {
+    await pool.query(
+      `UPDATE madden_ea_connections
+       SET access_token_encrypted = COALESCE($4, access_token_encrypted),
+           refresh_token_encrypted = COALESCE($5, refresh_token_encrypted),
+           token_expires_at = COALESCE($6, token_expires_at),
+           token_type = $7,
+           token_scope = $8,
+           raw_franchises_payload = $9::jsonb,
+           exchange_status = 'leagues_fetched',
+           updated_at = NOW()
+       WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
+      [
+        leagueId,
+        userId,
+        'ea_direct',
+        token.access_token ? encryptEaSecret(token.access_token) : null,
+        token.refresh_token ? encryptEaSecret(token.refresh_token) : null,
+        expiry ? new Date(Number(expiry)) : null,
+        token.token_type || null,
+        token.scope || null,
+        JSON.stringify({
+          token: {
+            access_token: token.access_token ? '[stored]' : null,
+            refresh_token: token.refresh_token ? '[stored]' : null,
+            expires_in: token.expires_in || null,
+            token_type: token.token_type || null,
+          },
+          leagues,
+        }),
+      ]
+    ).catch(error => {
+      console.error('[EA Direct] failed to update connection after league discovery:', error?.message || error);
+    });
+
+    for (const row of leagues || []) {
+      const externalLeagueId = String(getFirstValue(row, ['leagueId', 'league_id', 'franchiseId', 'id'], '') || '').trim();
+      if (!externalLeagueId) continue;
+
+      const externalLeagueName = getFirstValue(row, ['leagueName', 'league_name', 'franchiseName', 'name'], externalLeagueId);
+      const userTeamName = getFirstValue(row, ['userTeamName', 'teamName', 'team_name', 'yourTeam'], null);
+
+      await pool.query(
+        `INSERT INTO madden_ea_league_choices (
+           id, guild_id, league_id, user_id, persona_id, external_league_id,
+           external_league_name, user_team_name, system_console, blaze_id, raw_payload, imported_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW())
+         ON CONFLICT (league_id, user_id, external_league_id)
+         DO UPDATE SET
+           persona_id = $5,
+           external_league_name = $7,
+           user_team_name = $8,
+           system_console = $9,
+           blaze_id = $10,
+           raw_payload = $11::jsonb,
+           imported_at = NOW()`,
+        [
+          randomUUID(),
+          guildId,
+          leagueId,
+          userId,
+          blazeId ? String(blazeId) : null,
+          externalLeagueId,
+          externalLeagueName,
+          userTeamName,
+          systemConsole,
+          blazeId ? String(blazeId) : null,
+          JSON.stringify(row),
+        ]
+      ).catch(error => {
+        console.error('[EA Direct] failed to save EA league choice:', error?.message || error);
+      });
+    }
+  }
+
+  return {
+    statusCode: 200,
+    payload: {
+      access_token: token.access_token,
+      refresh_token: token.refresh_token || null,
+      systemConsole,
+      expiry,
+      blazeId,
+      leagues: (leagues || []).map(l => ({
+        leagueId: getFirstValue(l, ['leagueId', 'league_id', 'franchiseId', 'id'], ''),
+        leagueName: getFirstValue(l, ['leagueName', 'league_name', 'franchiseName', 'name'], ''),
+        userTeamName: getFirstValue(l, ['userTeamName', 'teamName', 'team_name', 'yourTeam'], ''),
+      })),
+      adapterStatus: (leagues || []).length ? 'leagues_fetched' : 'no_leagues_returned',
+    },
+  };
+}
+
+
 async function handleInternalEaConnect(payload) {
   // Final EA Direct save step.
   // This route is called after persona selection / league selection.
