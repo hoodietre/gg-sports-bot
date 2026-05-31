@@ -15763,103 +15763,168 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
   const firstGame = firstScheduleItem.seasonGameInfo || firstScheduleItem.gameInfo || firstScheduleItem || {};
 
   const availableWeeks = Array.isArray(hubPayload?.availableWeekInfoList) ? hubPayload.availableWeekInfoList : [];
-  const firstWeek = availableWeeks[0] || {};
+  const currentDisplayedWeek =
+    parseNumberOrNull(getAnyValue(hubPayload, ['displayWeek', 'displayedWeek', 'weekIndex'], null)) ??
+    parseNumberOrNull(getAnyValue(hubPayload?.seasonInfo || {}, ['displayWeek', 'displayedWeek'], null));
+
+  const currentWeekInfo =
+    availableWeeks.find(w => String(getAnyValue(w, ['weekTitle', 'displayedWeek'], '')).toLowerCase().includes('preseason week 2')) ||
+    availableWeeks.find(w => parseNumberOrNull(getAnyValue(w, ['weekIndex'], null)) === currentDisplayedWeek) ||
+    availableWeeks.find(w => parseNumberOrNull(getAnyValue(w, ['seasonWeek'], null)) === 1 && parseNumberOrNull(getAnyValue(w, ['seasonWeekType'], null)) === 0) ||
+    availableWeeks[0] ||
+    {};
 
   const seasonInfo = hubPayload?.seasonInfo || {};
   const scheduleInfo = hubPayload?.gameScheduleHubInfo || {};
+  const careerInfo = hubPayload?.careerHubInfo || {};
 
   const seasonGameKey =
     getAnyValue(firstScheduleItem, ['seasonGameKey', 'gameKey', 'id'], null) ||
     getAnyValue(firstGame, ['seasonGameKey', 'gameKey', 'id'], null) ||
     getAnyValue(scheduleInfo, ['seasonGameKey'], null);
 
-  const week =
-    parseNumberOrNull(getAnyValue(firstGame, ['week', 'weekIndex', 'seasonWeek'], null)) ??
-    parseNumberOrNull(getAnyValue(firstWeek, ['weekIndex', 'seasonWeek', 'week'], null)) ??
-    parseNumberOrNull(getAnyValue(hubPayload, ['weekIndex', 'displayWeek'], null));
+  // IMPORTANT:
+  // EA's preseason weeks are not the same as regular weeks.
+  // For Preseason Week 2, hub often shows:
+  //   hub.displayWeek = 2
+  //   availableWeekInfoList item: seasonWeek = 1, seasonWeekType = 0, weekTitle = "Preseason Week 2"
+  // We preserve both literal values instead of converting everything to "Week 2".
+  const seasonWeek =
+    parseNumberOrNull(getAnyValue(currentWeekInfo, ['seasonWeek'], null)) ??
+    parseNumberOrNull(getAnyValue(firstGame, ['week', 'seasonWeek'], null)) ??
+    1;
+
+  const weekIndex =
+    parseNumberOrNull(getAnyValue(currentWeekInfo, ['weekIndex'], null)) ??
+    currentDisplayedWeek ??
+    parseNumberOrNull(getAnyValue(firstGame, ['weekIndex', 'week'], null)) ??
+    seasonWeek;
+
+  const displayedWeek =
+    getAnyValue(currentWeekInfo, ['weekTitle', 'displayedWeek'], null) ||
+    getAnyValue(firstGame, ['displayedWeek', 'weekTitle'], null) ||
+    getAnyValue(hubPayload, ['weekTitle'], null) ||
+    ('Preseason Week ' + String((seasonWeek ?? 1) + 1));
 
   const weekType =
+    parseNumberOrNull(getAnyValue(currentWeekInfo, ['seasonWeekType', 'weekType'], null)) ??
     parseNumberOrNull(getAnyValue(firstGame, ['weekType', 'seasonWeekType'], null)) ??
-    parseNumberOrNull(getAnyValue(firstWeek, ['seasonWeekType', 'weekType'], null)) ??
     0;
 
   const seasonYear =
+    parseNumberOrNull(getAnyValue(currentWeekInfo, ['seasonYear'], null)) ??
     parseNumberOrNull(getAnyValue(seasonInfo, ['seasonYear', 'calendarYear'], null)) ??
-    parseNumberOrNull(getAnyValue(firstWeek, ['seasonYear', 'calendarYear'], null)) ??
     parseNumberOrNull(getAnyValue(hubPayload, ['calendarYear', 'seasonYear'], null));
 
-  const displayedWeek =
-    getAnyValue(firstGame, ['displayedWeek', 'weekTitle'], null) ||
-    getAnyValue(firstWeek, ['weekTitle', 'displayedWeek'], null) ||
-    getAnyValue(hubPayload, ['weekTitle'], null);
-
-  return {
+  const ctx = {
     leagueId: Number(leagueId),
     leagueIdString: String(leagueId),
     seasonGameKey: seasonGameKey !== null && seasonGameKey !== undefined ? Number(seasonGameKey) : null,
-    weekIndex: week,
-    week,
+
+    // Literal hub values
+    displayWeek: currentDisplayedWeek,
+    weekIndex,
+    seasonWeek,
+    week: seasonWeek,
     weekType,
-    seasonYear,
+    seasonWeekType: weekType,
     displayedWeek,
+
+    seasonYear,
     calendarYear: parseNumberOrNull(getAnyValue(seasonInfo, ['calendarYear'], null)),
     superBowlNumber: parseNumberOrNull(getAnyValue(seasonInfo, ['superBowlNumber'], null)),
+
+    stageIndex: parseNumberOrNull(getAnyValue(hubPayload, ['stageIndex'], null)),
+    isPreseason: weekType === 0 || String(displayedWeek || '').toLowerCase().includes('preseason'),
+    gamesPlayedCount: parseNumberOrNull(getAnyValue(hubPayload, ['gamesPlayedCount'], null)),
+    gameTotalCount: parseNumberOrNull(getAnyValue(hubPayload, ['gameTotalCount'], null)),
+    regularSeasonWeekCount: parseNumberOrNull(getAnyValue(hubPayload, ['regularSeasonWeekCount'], null)),
+    preseasonWeekCount: parseNumberOrNull(getAnyValue(hubPayload, ['preseasonWeekCount'], null)),
+    nextSeasonWeek: parseNumberOrNull(getAnyValue(scheduleInfo, ['nextSeasonWeek'], null)),
+    nextSeasonWeekType: parseNumberOrNull(getAnyValue(scheduleInfo, ['nextSeasonWeekType'], null)),
+    isLeagueAdvancing: Boolean(getAnyValue(careerInfo, ['isLeagueAdvancing'], false)),
+    isLeagueAutoSimming: Boolean(getAnyValue(careerInfo, ['isLeagueAutoSimming'], false)),
   };
+
+  return ctx;
 }
 
 function buildEaStandingsPayloadVariantsFromHub(hubPayload, leagueId) {
   const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId);
   const variants = [];
 
+  // Baseline.
   variants.push({ leagueId: ctx.leagueId });
+
+  // Preseason-aware literal hub values.
+  variants.push({
+    leagueId: ctx.leagueId,
+    seasonWeek: ctx.seasonWeek,
+    seasonWeekType: ctx.seasonWeekType,
+  });
+
+  variants.push({
+    leagueId: ctx.leagueId,
+    weekIndex: ctx.weekIndex,
+    weekType: ctx.weekType,
+  });
+
+  variants.push({
+    leagueId: ctx.leagueId,
+    displayWeek: ctx.displayWeek,
+    seasonWeek: ctx.seasonWeek,
+    seasonWeekType: ctx.seasonWeekType,
+  });
 
   if (ctx.seasonGameKey !== null) {
     variants.push({
       leagueId: ctx.leagueId,
       seasonGameKey: ctx.seasonGameKey,
+      seasonWeek: ctx.seasonWeek,
+      seasonWeekType: ctx.seasonWeekType,
     });
   }
-
-  variants.push({
-    leagueId: ctx.leagueId,
-    week: ctx.week ?? 0,
-    weekIndex: ctx.weekIndex ?? 0,
-    weekType: ctx.weekType ?? 0,
-  });
 
   if (ctx.seasonYear !== null) {
     variants.push({
       leagueId: ctx.leagueId,
       seasonYear: ctx.seasonYear,
-      week: ctx.week ?? 0,
-      weekIndex: ctx.weekIndex ?? 0,
-      weekType: ctx.weekType ?? 0,
+      seasonWeek: ctx.seasonWeek,
+      seasonWeekType: ctx.seasonWeekType,
     });
   }
 
-  if (ctx.seasonGameKey !== null && ctx.seasonYear !== null) {
-    variants.push({
-      leagueId: ctx.leagueId,
-      seasonGameKey: ctx.seasonGameKey,
-      seasonYear: ctx.seasonYear,
-      week: ctx.week ?? 0,
-      weekType: ctx.weekType ?? 0,
-    });
-  }
+  // Some EA calls use "week" even though the hub labels it seasonWeek.
+  variants.push({
+    leagueId: ctx.leagueId,
+    week: ctx.seasonWeek,
+    weekType: ctx.seasonWeekType,
+  });
+
+  // Some EA calls use current week index/display week.
+  variants.push({
+    leagueId: ctx.leagueId,
+    week: ctx.displayWeek,
+    weekType: ctx.seasonWeekType,
+  });
 
   const unique = [];
   const seen = new Set();
   for (const payload of variants) {
-    const key = JSON.stringify(payload);
+    const cleaned = {};
+    for (const [key, value] of Object.entries(payload)) {
+      if (value !== null && value !== undefined && !Number.isNaN(value)) cleaned[key] = value;
+    }
+    const key = JSON.stringify(cleaned);
     if (seen.has(key)) continue;
     seen.add(key);
-    unique.push(payload);
+    unique.push(cleaned);
   }
 
-  console.log('[EA STANDINGS CONTEXT] ' + JSON.stringify(ctx));
-  console.log('[EA STANDINGS PAYLOADS] ' + JSON.stringify(unique));
+  console.log('[EA STANDINGS CONTEXT PRESEASON-AWARE] ' + JSON.stringify(ctx));
+  console.log('[EA STANDINGS PAYLOADS PRESEASON-AWARE] ' + JSON.stringify(unique));
 
-  return unique.slice(0, 5);
+  return unique.slice(0, 8);
 }
 
 async function probeEaStandingsCommandsWithHubContext(token, leagueId, hubPayload) {
@@ -15868,8 +15933,6 @@ async function probeEaStandingsCommandsWithHubContext(token, leagueId, hubPayloa
   const commandCandidates = [
     { name: 'Mobile_Career_GetStandings', id: 802 },
     { name: 'Mobile_Career_GetTeamStats', id: 803 },
-    { name: 'Mobile_Career_GetPowerRankings', id: 814 },
-    { name: 'Mobile_Career_GetTeamRankings', id: 815 },
   ];
 
   const results = [];
@@ -16599,7 +16662,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
       ', games: ' + importedGames +
-      ', players: 0. Deep parser active. Context-aware standings probe enabled. Context-aware standings probe enabled.';
+      ', players: 0. Deep parser active. Preseason-aware standings probe enabled.';
 
     await pool.query(
       `UPDATE madden_sync_runs
