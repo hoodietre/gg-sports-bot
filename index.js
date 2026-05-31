@@ -5394,7 +5394,7 @@ if (gameSubcommand === 'report') {
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Holding Mode', value: EA_DIRECT_HOLDING_MODE ? 'Enabled' : 'Disabled', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. EA Direct holding mode is enabled. Auth code capture works; token adapter pending.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Snallabot source-aligned token exchange is enabled. Holding mode should be disabled for testing.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -14733,10 +14733,14 @@ const EA_DIRECT_CONNECT_URL = process.env.EA_DIRECT_CONNECT_URL || null;
 const GGSPORTS_API_PORT = Number(process.env.PORT || process.env.GGSPORTS_API_PORT || 3000);
 const GGSPORTS_PUBLIC_BASE_URL = process.env.GGSPORTS_PUBLIC_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN || null;
 const GGSPORTS_API_SECRET = process.env.GGSPORTS_API_SECRET || null;
-const EA_DIRECT_HOLDING_MODE = String(process.env.EA_DIRECT_HOLDING_MODE || 'true').toLowerCase() !== 'false';
+const EA_DIRECT_HOLDING_MODE = String(process.env.EA_DIRECT_HOLDING_MODE || 'false').toLowerCase() === 'true';
 
 
 const EA_DIRECT_TOKEN_AUTH_HEADER = process.env.EA_DIRECT_TOKEN_AUTH_HEADER || null;
+const EA_DIRECT_AUTH_SOURCE = process.env.EA_DIRECT_AUTH_SOURCE || '317239';
+const EA_DIRECT_CLIENT_SECRET = process.env.EA_DIRECT_CLIENT_SECRET || process.env.EA_DIRECT_TOKEN_CLIENT_SECRET || null;
+const EA_DIRECT_MACHINE_KEY = process.env.EA_DIRECT_MACHINE_KEY || '444d362e8e067fe2';
+
 const EA_DIRECT_TOKEN_CLIENT_ID = process.env.EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP';
 const EA_DIRECT_TOKEN_CLIENT_SECRET = process.env.EA_DIRECT_TOKEN_CLIENT_SECRET || null;
 const EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID = String(process.env.EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID || 'true').toLowerCase() !== 'false';
@@ -14781,37 +14785,44 @@ function decryptEaSecret(value) {
 }
 
 async function exchangeEaAuthorizationCode(code) {
-  // 7J-5Z — EA Token Exchange Final Parity Test.
-  // Pure public-client OAuth style:
-  // - application/x-www-form-urlencoded
-  // - NO Authorization header
-  // - NO Basic auth
-  // - NO client_secret
-  // - client_id lives in the body
-  // - no authentication_source / release_type unless Railway explicitly adds them through EXTRA_PARAMS
-  const params = new URLSearchParams({
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success',
-    client_id: EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_26_COMP_APP',
-  });
-
-  // Optional override escape hatch only. Leave EA_DIRECT_TOKEN_EXTRA_PARAMS empty
-  // for the clean 7J-5Z parity test.
-  if (EA_DIRECT_TOKEN_EXTRA_PARAMS) {
-    for (const pair of EA_DIRECT_TOKEN_EXTRA_PARAMS.split('&')) {
-      const [key, value = ''] = pair.split('=');
-      if (key) params.set(decodeURIComponent(key), decodeURIComponent(value));
-    }
+  // 7J-5AB — Snallabot source-aligned EA token exchange.
+  // Source alignment:
+  // POST https://accounts.ea.com/connect/token
+  // Headers:
+  //   Accept-Charset: UTF-8
+  //   User-Agent: Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)
+  //   Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+  //   Accept-Encoding: gzip
+  // Body:
+  //   authentication_source
+  //   client_secret
+  //   grant_type=authorization_code
+  //   code
+  //   redirect_uri
+  //   release_type=prod
+  //   client_id
+  if (!EA_DIRECT_CLIENT_SECRET) {
+    throw new Error('EA_DIRECT_CLIENT_SECRET is missing. Add it in Railway Variables before testing EA Direct token exchange.');
   }
+
+  const body =
+    'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
+    '&client_secret=' + encodeURIComponent(EA_DIRECT_CLIENT_SECRET) +
+    '&grant_type=authorization_code' +
+    '&code=' + encodeURIComponent(code) +
+    '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
+    '&release_type=prod' +
+    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_26_COMP_APP');
 
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Accept': 'application/json',
+      'Accept-Charset': 'UTF-8',
+      'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'Accept-Encoding': 'gzip',
     },
-    body: params.toString(),
+    body,
   });
 
   const text = await response.text();
@@ -14823,7 +14834,7 @@ async function exchangeEaAuthorizationCode(code) {
   }
 
   if (!response.ok) {
-    const safeBody = params.toString()
+    const safeBody = body
       .replace(/code=[^&]+/g, 'code=REDACTED')
       .replace(/client_secret=[^&]+/g, 'client_secret=REDACTED');
 
@@ -14832,7 +14843,7 @@ async function exchangeEaAuthorizationCode(code) {
       ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
       ' • token_url=' + (EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token') +
       ' • body=' + safeBody +
-      ' • auth=none_body_client_form_urlencoded'
+      ' • auth=snallabot_body_secret'
     );
   }
 
@@ -15097,10 +15108,11 @@ async function handleInternalEaConnect(payload) {
 
 
 async function handleInternalRetrievePersonas(payload) {
-  // Correct Neon-aligned retrieve-personas route.
+  // Snallabot-aligned retrieve-personas route.
   // Input: { code }
   // Output: { access_token, personas, namespaces }
-  const code = extractEaAuthCode(payload.code || payload.url || payload.authorization_code);
+  const rawCode = payload.code || payload.url || payload.authorization_code;
+  const code = extractEaAuthCode(rawCode);
   const guildId = payload.guild_id || payload.guildId || 'unknown';
   const leagueId = payload.league_id || payload.leagueId || null;
   const userId = payload.user_id || payload.userId || null;
@@ -15116,41 +15128,152 @@ async function handleInternalRetrievePersonas(payload) {
     return { statusCode: 502, payload: { error: 'Token exchange returned no access_token.', tokenPayload } };
   }
 
-  let personaPayload = { personas: [] };
-  if (EA_DIRECT_PERSONAS_URL) {
-    personaPayload = await fetchEaJson(EA_DIRECT_PERSONAS_URL, accessToken, 'EA personas');
+  const pidResponse = await fetch('https://accounts.ea.com/connect/tokeninfo?access_token=' + encodeURIComponent(accessToken), {
+    headers: {
+      'Accept-Charset': 'UTF-8',
+      'X-Include-Deviceid': 'true',
+      'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
+      'Accept-Encoding': 'gzip',
+    },
+  });
+
+  if (!pidResponse.ok) {
+    const errorText = await pidResponse.text();
+    throw new Error('Failed to retrieve EA token info: ' + errorText.slice(0, 300));
   }
 
-  const personas = extractEaPersonaRows(personaPayload);
+  const tokenInfo = await pidResponse.json();
+  const pid = tokenInfo.pid_id;
+
+  if (!pid) {
+    throw new Error('EA token info response did not include pid_id.');
+  }
+
+  const entitlementsResponse = await fetch('https://gateway.ea.com/proxy/identity/pids/' + encodeURIComponent(pid) + '/entitlements/?status=ACTIVE', {
+    headers: {
+      'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
+      'Accept-Charset': 'UTF-8',
+      'X-Expand-Results': 'true',
+      'Accept-Encoding': 'gzip',
+      'Authorization': 'Bearer ' + accessToken,
+    },
+  });
+
+  if (!entitlementsResponse.ok) {
+    const errorText = await entitlementsResponse.text();
+    throw new Error('Failed to retrieve Madden entitlements: ' + errorText.slice(0, 300));
+  }
+
+  const entitlementsPayload = await entitlementsResponse.json();
+  const entitlementRows = entitlementsPayload?.entitlements?.entitlement || [];
+
+  const validGroupNames = new Set([
+    'MADDEN_26XONE',
+    'MADDEN_26PS4',
+    'MADDEN_26PC',
+    'MADDEN_26PS5',
+    'MADDEN_26XBSX',
+    'MADDEN_26SDA',
+  ]);
+
+  const entitlementToValidNamespace = {
+    MADDEN_26XONE: 'xbox',
+    MADDEN_26PS4: 'ps3',
+    MADDEN_26PC: 'cem_ea_id',
+    MADDEN_26PS5: 'ps3',
+    MADDEN_26XBSX: 'xbox',
+    MADDEN_26SDA: 'stadia',
+  };
+
+  const validEntitlements = entitlementRows.filter(e =>
+    e.entitlementTag === 'ONLINE_ACCESS' &&
+    validGroupNames.has(e.groupName)
+  );
+
+  if (!validEntitlements.length) {
+    throw new Error('No active Madden 26 entitlements were found for this EA account.');
+  }
+
+  const personaGroups = await Promise.all(validEntitlements.map(async entitlement => {
+    const pidUri = entitlement.pidUri;
+    const maddenEntitlement = entitlement.groupName;
+
+    const personasResponse = await fetch(
+      'https://gateway.ea.com/proxy/identity' + pidUri + '/personas?status=ACTIVE&access_token=' + encodeURIComponent(accessToken),
+      {
+        headers: {
+          'Accept-Charset': 'UTF-8',
+          'X-Expand-Results': 'true',
+          'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
+          'Accept-Encoding': 'gzip',
+        },
+      }
+    );
+
+    if (!personasResponse.ok) {
+      const errorText = await personasResponse.text();
+      throw new Error('Failed to retrieve Madden personas: ' + errorText.slice(0, 300));
+    }
+
+    const personasPayload = await personasResponse.json();
+    const personaRows = personasPayload?.personas?.persona || [];
+    return personaRows.map(p => ({ ...p, maddenEntitlement }));
+  }));
+
+  const personas = personaGroups
+    .flat()
+    .filter(p => entitlementToValidNamespace[p.maddenEntitlement] === p.namespaceName);
+
+  if (!personas.length) {
+    throw new Error('No Madden personas matched the valid namespace for this EA account.');
+  }
+
+  const responsePayload = {
+    access_token: accessToken,
+    personas,
+    namespaces: {
+      xbox: 'XBOX',
+      ps3: 'PSN',
+      cem_ea_id: 'EA Account',
+      stadia: 'Stadia',
+    },
+    discord: null,
+    raw: {
+      tokenInfo,
+      entitlements: entitlementsPayload,
+    },
+  };
 
   if (leagueId && userId) {
     await pool.query(
       `UPDATE madden_ea_connections
        SET access_token_encrypted = $4,
-           raw_token_payload = $5,
-           raw_personas_payload = $6,
+           refresh_token_encrypted = COALESCE($5, refresh_token_encrypted),
+           token_expires_at = $6,
+           raw_token_payload = $7,
+           raw_personas_payload = $8,
            exchange_status = 'personas_fetched',
            connection_status = 'personas_fetched',
            accepted_disclaimer = TRUE,
            last_error = NULL,
            updated_at = NOW()
        WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
-      [leagueId, userId, 'ea_direct', encryptEaSecret(accessToken), JSON.stringify(tokenPayload), JSON.stringify(personaPayload)]
+      [
+        leagueId,
+        userId,
+        'ea_direct',
+        encryptEaSecret(accessToken),
+        tokenPayload.refresh_token ? encryptEaSecret(tokenPayload.refresh_token) : null,
+        tokenPayload.expires_in ? new Date(Date.now() + Number(tokenPayload.expires_in) * 1000) : null,
+        JSON.stringify(tokenPayload),
+        JSON.stringify(responsePayload),
+      ]
     ).catch(() => null);
 
-    await saveEaPersonas(guildId, leagueId, userId, personaPayload).catch(() => null);
+    await saveEaPersonas(guildId, leagueId, userId, responsePayload).catch(() => null);
   }
 
-  return {
-    statusCode: 200,
-    payload: {
-      access_token: accessToken,
-      personas,
-      namespaces: personaPayload.namespaces || {},
-      discord: null,
-      raw: personaPayload,
-    },
-  };
+  return { statusCode: 200, payload: responsePayload };
 }
 
 async function handleInternalSelectLeague(payload) {
