@@ -4220,6 +4220,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.deferReply({ ephemeral: true });
 
+      if (EA_DIRECT_HOLDING_MODE) {
+        await pool.query(
+          `UPDATE madden_ea_connections
+           SET connection_status = 'adapter_pending',
+               exchange_status = 'adapter_pending',
+               last_error = NULL,
+               updated_at = NOW()
+           WHERE league_id = $1 AND user_id = $2 AND provider = 'ea_direct'`,
+          [leagueId, interaction.user.id]
+        ).catch(() => null);
+
+        const holdingConnection = await getMaddenEaConnection(leagueId, interaction.user.id);
+
+        await interaction.editReply({
+          content: 'Authorization code captured. EA Direct is parked in adapter-pending mode while we wait on the final token-exchange details.',
+          embeds: [buildMaddenEaHoldingEmbed(league, holdingConnection || connection)],
+          components: buildMaddenEaHoldingComponents(),
+        });
+        return;
+      }
+
       try {
         const exchange = EA_DIRECT_RETRIEVE_PERSONAS_URL
           ? await completeEaRetrievePersonasViaEndpoint(interaction.guild?.id || league.guild_id, leagueId, interaction.user.id, code)
@@ -5372,7 +5393,8 @@ if (gameSubcommand === 'report') {
             { name: 'Internal API Secret', value: GGSPORTS_API_SECRET ? 'Configured' : 'Not required', inline: true },
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Token exchange test mode: 7J-5Z pure form-urlencoded public-client body mode.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Holding Mode', value: EA_DIRECT_HOLDING_MODE ? 'Enabled' : 'Disabled', inline: true },
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. EA Direct holding mode is enabled. Auth code capture works; token adapter pending.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -14711,6 +14733,7 @@ const EA_DIRECT_CONNECT_URL = process.env.EA_DIRECT_CONNECT_URL || null;
 const GGSPORTS_API_PORT = Number(process.env.PORT || process.env.GGSPORTS_API_PORT || 3000);
 const GGSPORTS_PUBLIC_BASE_URL = process.env.GGSPORTS_PUBLIC_BASE_URL || process.env.RAILWAY_PUBLIC_DOMAIN || null;
 const GGSPORTS_API_SECRET = process.env.GGSPORTS_API_SECRET || null;
+const EA_DIRECT_HOLDING_MODE = String(process.env.EA_DIRECT_HOLDING_MODE || 'true').toLowerCase() !== 'false';
 
 
 const EA_DIRECT_TOKEN_AUTH_HEADER = process.env.EA_DIRECT_TOKEN_AUTH_HEADER || null;
@@ -15719,11 +15742,51 @@ function buildMaddenEaConnectionEmbed(league, connection) {
       { name: 'Persona', value: connection?.persona_name || connection?.persona_id || 'Not selected', inline: true },
       { name: 'Franchise', value: connection?.franchise_name || connection?.franchise_id || 'Not selected', inline: true },
       { name: 'Auth Code Captured', value: connection?.ea_auth_code ? 'Yes' : 'No', inline: true },
-      { name: 'Last Error', value: connection?.last_error || 'None', inline: false }
+      { name: 'Last Error', value: connection?.last_error || (connection?.connection_status === 'adapter_pending' ? 'None — waiting on token adapter.' : 'None'), inline: false }
     )
     .setFooter({ text: 'GG Sports • EA Direct Connection' })
     .setTimestamp();
 }
+
+
+function buildMaddenEaHoldingEmbed(league, connection) {
+  return new EmbedBuilder()
+    .setTitle('Madden EA Direct • Adapter Pending')
+    .setColor(0xFEE75C)
+    .setDescription(
+      'EA login and authorization code capture are working.\n\n' +
+      '**Current Status:** Waiting on the final EA token-exchange adapter details.\n\n' +
+      'What is already complete:\n' +
+      '• Real EA login opens from Discord\n' +
+      '• Auth code returns from EA\n' +
+      '• GG Sports captures and stores the code\n' +
+      '• Persona/league selection flow is scaffolded\n\n' +
+      'What is paused:\n' +
+      '• Exchanging the EA code for access/refresh tokens\n' +
+      '• Pulling live Madden franchise data automatically\n\n' +
+      'League: **' + league.league_name + '**'
+    )
+    .addFields(
+      { name: 'Status', value: connection?.connection_status || 'code_captured', inline: true },
+      { name: 'Auth Code Captured', value: connection?.ea_auth_code ? 'Yes' : 'No', inline: true },
+      { name: 'Next Step', value: 'Waiting for token adapter recipe from Snallapa.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • EA Direct Holding Pattern' })
+    .setTimestamp();
+}
+
+function buildMaddenEaHoldingComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('madden_ea_retry_adapter')
+        .setLabel('Adapter Pending')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(true)
+    ),
+  ];
+}
+
 
 function buildMaddenEaPersonaComponents(leagueId) {
   return [
