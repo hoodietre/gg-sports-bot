@@ -5460,7 +5460,7 @@ if (gameSubcommand === 'report') {
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Holding Mode', value: EA_DIRECT_HOLDING_MODE ? 'Enabled' : 'Disabled', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Final Snallabot Blaze adapter enabled: Mobile_GetMyLeagues should populate real Madden leagues.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Final Snallabot Blaze adapter enabled with Snallabot service/product names.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -14811,21 +14811,21 @@ const EA_DIRECT_ENABLE_BLAZE_LEAGUE_FETCH = String(process.env.EA_DIRECT_ENABLE_
 const EA_DIRECT_FORCE_BLAZE_FETCH = String(process.env.EA_DIRECT_FORCE_BLAZE_FETCH || 'true').toLowerCase() !== 'false';
 
 const EA_BLAZE_SERVICE = {
-  xone: process.env.EA_BLAZE_SERVICE_XONE || 'gos-mca-xone',
-  xbsx: process.env.EA_BLAZE_SERVICE_XBSX || 'gos-mca-xbsx',
-  ps4: process.env.EA_BLAZE_SERVICE_PS4 || 'gos-mca-ps4',
-  ps5: process.env.EA_BLAZE_SERVICE_PS5 || 'gos-mca-ps5',
-  pc: process.env.EA_BLAZE_SERVICE_PC || 'gos-mca-pc',
-  stadia: process.env.EA_BLAZE_SERVICE_STADIA || 'gos-mca-stadia',
+  xone: process.env.EA_BLAZE_SERVICE_XONE || 'madden-2026-xone',
+  xbsx: process.env.EA_BLAZE_SERVICE_XBSX || 'madden-2026-xbsx',
+  ps4: process.env.EA_BLAZE_SERVICE_PS4 || 'madden-2026-ps4',
+  ps5: process.env.EA_BLAZE_SERVICE_PS5 || 'madden-2026-ps5',
+  pc: process.env.EA_BLAZE_SERVICE_PC || 'madden-2026-pc',
+  stadia: process.env.EA_BLAZE_SERVICE_STADIA || 'madden-2026-stadia',
 };
 
 const EA_BLAZE_PRODUCT_NAME = {
-  xone: process.env.EA_BLAZE_PRODUCT_XONE || 'madden-2026-xone',
-  xbsx: process.env.EA_BLAZE_PRODUCT_XBSX || 'madden-2026-xbsx',
-  ps4: process.env.EA_BLAZE_PRODUCT_PS4 || 'madden-2026-ps4',
-  ps5: process.env.EA_BLAZE_PRODUCT_PS5 || 'madden-2026-ps5',
-  pc: process.env.EA_BLAZE_PRODUCT_PC || 'madden-2026-pc',
-  stadia: process.env.EA_BLAZE_PRODUCT_STADIA || 'madden-2026-stadia',
+  xone: process.env.EA_BLAZE_PRODUCT_XONE || 'madden-2026-xone-mca',
+  xbsx: process.env.EA_BLAZE_PRODUCT_XBSX || 'madden-2026-xbsx-mca',
+  ps4: process.env.EA_BLAZE_PRODUCT_PS4 || 'madden-2026-ps4-mca',
+  ps5: process.env.EA_BLAZE_PRODUCT_PS5 || 'madden-2026-ps5-mca',
+  pc: process.env.EA_BLAZE_PRODUCT_PC || 'madden-2026-pc-mca',
+  stadia: process.env.EA_BLAZE_PRODUCT_STADIA || 'madden-2026-stadia-mca',
 };
 
 
