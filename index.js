@@ -20,7 +20,7 @@ import {
   TextInputStyle,
 } from 'discord.js';
 import pkg from 'pg';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes, createHash, constants as cryptoConstants } from 'crypto';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import http from 'http';
@@ -5398,7 +5398,7 @@ if (gameSubcommand === 'report') {
             { name: 'Franchises Endpoint', value: EA_DIRECT_FRANCHISES_URL ? 'Configured' : 'Missing', inline: true },
             { name: 'Encryption Key', value: EA_DIRECT_ENCRYPTION_KEY ? 'Configured' : 'Using fallback key', inline: true },
             { name: 'Holding Mode', value: EA_DIRECT_HOLDING_MODE ? 'Enabled' : 'Disabled', inline: true },
-            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Dynamic league dropdown enabled. If only Default appears, Blaze getLeagues adapter still needs a real endpoint/module.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
+            { name: 'Status', value: EA_DIRECT_AUTH_TEMPLATE || EA_DIRECT_CLIENT_ID ? 'Login URL can be generated. Final Snallabot Blaze adapter enabled: Mobile_GetMyLeagues should populate real Madden leagues.' : 'Missing working auth template/client id. The EA login page may fail.', inline: false }
           )
           .setFooter({ text: 'GG Sports • EA Direct Config' })
           .setTimestamp();
@@ -14746,6 +14746,27 @@ const EA_DIRECT_CLIENT_SECRET = process.env.EA_DIRECT_CLIENT_SECRET || process.e
 const EA_DIRECT_MACHINE_KEY = process.env.EA_DIRECT_MACHINE_KEY || '444d362e8e067fe2';
 const EA_DIRECT_LEAGUES_ENDPOINT_URL = process.env.EA_DIRECT_LEAGUES_ENDPOINT_URL || null;
 const EA_DIRECT_ENABLE_BLAZE_LEAGUE_FETCH = String(process.env.EA_DIRECT_ENABLE_BLAZE_LEAGUE_FETCH || 'false').toLowerCase() === 'true';
+const EA_DIRECT_FORCE_BLAZE_FETCH = String(process.env.EA_DIRECT_FORCE_BLAZE_FETCH || 'true').toLowerCase() !== 'false';
+
+const EA_BLAZE_SERVICE = {
+  xone: process.env.EA_BLAZE_SERVICE_XONE || 'gos-mca-xone',
+  xbsx: process.env.EA_BLAZE_SERVICE_XBSX || 'gos-mca-xbsx',
+  ps4: process.env.EA_BLAZE_SERVICE_PS4 || 'gos-mca-ps4',
+  ps5: process.env.EA_BLAZE_SERVICE_PS5 || 'gos-mca-ps5',
+  pc: process.env.EA_BLAZE_SERVICE_PC || 'gos-mca-pc',
+  stadia: process.env.EA_BLAZE_SERVICE_STADIA || 'gos-mca-stadia',
+};
+
+const EA_BLAZE_PRODUCT_NAME = {
+  xone: process.env.EA_BLAZE_PRODUCT_XONE || 'madden-2026-xone',
+  xbsx: process.env.EA_BLAZE_PRODUCT_XBSX || 'madden-2026-xbsx',
+  ps4: process.env.EA_BLAZE_PRODUCT_PS4 || 'madden-2026-ps4',
+  ps5: process.env.EA_BLAZE_PRODUCT_PS5 || 'madden-2026-ps5',
+  pc: process.env.EA_BLAZE_PRODUCT_PC || 'madden-2026-pc',
+  stadia: process.env.EA_BLAZE_PRODUCT_STADIA || 'madden-2026-stadia',
+};
+
+
 
 const EA_MADDEN_ENTITLEMENT_TO_SYSTEM = {
   MADDEN_26XONE: 'xone',
@@ -15324,6 +15345,141 @@ async function handleInternalRetrievePersonas(payload) {
 }
 
 
+
+function eaBlazeHeaders(token) {
+  const consoleKey = token.console || 'xbsx';
+  return {
+    'Accept-Charset': 'UTF-8',
+    'Accept': 'application/json',
+    'X-BLAZE-ID': EA_BLAZE_SERVICE[consoleKey] || EA_BLAZE_SERVICE.xbsx,
+    'X-BLAZE-VOID-RESP': 'XML',
+    'X-Application-Key': 'MADDEN-MCA',
+    'Content-Type': 'application/json',
+    'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
+  };
+}
+
+async function retrieveBlazeSession(token) {
+  const consoleKey = token.console || 'xbsx';
+  const response = await fetch('https://wal2.tools.gos.bio-iad.ea.com/wal/authentication/login', {
+    method: 'POST',
+    headers: eaBlazeHeaders(token),
+    body: JSON.stringify({
+      accessToken: token.accessToken,
+      productName: EA_BLAZE_PRODUCT_NAME[consoleKey] || EA_BLAZE_PRODUCT_NAME.xbsx,
+    }),
+  });
+
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = { raw: text };
+  }
+
+  if (!response.ok || !payload?.userLoginInfo?.sessionKey) {
+    throw new Error('Could not connect to EA Blaze login. HTTP ' + response.status + ' • ' + text.slice(0, 500));
+  }
+
+  return {
+    blazeId: payload.userLoginInfo.personaDetails?.personaId || token.blazeId,
+    sessionKey: payload.userLoginInfo.sessionKey,
+    requestId: 1,
+    raw: payload,
+  };
+}
+
+function calculateBlazeMessageAuthData(blazeId, requestId) {
+  const rand4bytes = randomBytes(4);
+  const requestData = JSON.stringify({
+    staticData: '05e6a7ead5584ab4',
+    requestId,
+    blazeId: Number(blazeId),
+  });
+
+  const staticBytes = Buffer.from('634203362017bf72f70ba900c0aa4e6b', 'hex');
+  const xorHash = createHash('md5')
+    .update(rand4bytes)
+    .update(staticBytes)
+    .digest();
+
+  const requestBuffer = Buffer.from(requestData, 'utf-8');
+  const scrambledBytes = requestBuffer.map((b, i) => b ^ xorHash[i % 16]);
+  const authDataBytes = Buffer.concat([rand4bytes, scrambledBytes]);
+
+  const staticAuthCode = Buffer.from('3a53413521464c3b6531326530705b70203a2900', 'hex');
+  const authCode = createHash('md5')
+    .update(staticAuthCode)
+    .update(authDataBytes)
+    .digest('base64');
+
+  return {
+    authData: authDataBytes.toString('base64'),
+    authCode,
+    authType: 17039361,
+  };
+}
+
+async function sendEaBlazeRequest(token, session, request) {
+  const authData = calculateBlazeMessageAuthData(session.blazeId, session.requestId);
+  const messageExpiration = Math.floor(Date.now() / 1000);
+  const { requestPayload, ...rest } = request;
+
+  const body = {
+    apiVersion: 2,
+    clientDevice: 3,
+    requestInfo: JSON.stringify({
+      ...rest,
+      messageAuthData: authData,
+      messageExpirationTime: messageExpiration,
+      deviceId: EA_DIRECT_MACHINE_KEY || '444d362e8e067fe2',
+      ipAddress: '127.0.0.1',
+      requestPayload: JSON.stringify(requestPayload || {}),
+    }),
+  };
+
+  const response = await fetch('https://wal2.tools.gos.bio-iad.ea.com/wal/mca/Process/' + encodeURIComponent(session.sessionKey), {
+    method: 'POST',
+    headers: eaBlazeHeaders(token),
+    body: JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    const cleaned = text.replaceAll(/[\u0000-\u001F\u007F-\u009F]/g, '');
+    try {
+      payload = JSON.parse(cleaned);
+    } catch {
+      payload = { raw: text };
+    }
+  }
+
+  if (!response.ok || payload?.error) {
+    throw new Error('EA Blaze request failed. HTTP ' + response.status + ' • ' + JSON.stringify(payload).slice(0, 800));
+  }
+
+  session.requestId = Number(session.requestId || 1) + 1;
+  return payload;
+}
+
+async function getEaBlazeLeagues(token) {
+  const session = await retrieveBlazeSession(token);
+  const response = await sendEaBlazeRequest(token, session, {
+    commandName: 'Mobile_GetMyLeagues',
+    componentId: 2060,
+    commandId: 801,
+    requestPayload: {},
+    componentName: 'careermode',
+  });
+
+  return response?.responseInfo?.value?.leagues || [];
+}
+
+
 function getPersonaSystemConsole(persona) {
   return EA_MADDEN_ENTITLEMENT_TO_SYSTEM[persona?.maddenEntitlement] || 'xbsx';
 }
@@ -15443,18 +15599,47 @@ function normalizeLeagueRowsFromPayload(payload) {
 }
 
 async function fetchMaddenLeaguesForPersonaToken(tokenPayload, persona) {
-  // Snallabot uses ephemeralClientFromToken(...).getLeagues(), which is in ea_client.
-  // This project now has the token step ready. The actual Blaze getLeagues adapter can be dropped in here.
-  // For now we support a configurable HTTP endpoint for testing if one is provided.
-  if (!EA_DIRECT_LEAGUES_ENDPOINT_URL) {
-    return [];
+  const systemConsole = getPersonaSystemConsole(persona);
+  const blazeId = String(persona?.personaId || persona?.persona_id || persona?.id || '');
+
+  const token = {
+    accessToken: tokenPayload.access_token,
+    refreshToken: tokenPayload.refresh_token,
+    expiry: tokenPayload.expires_in ? new Date(Date.now() + Number(tokenPayload.expires_in) * 1000) : new Date(Date.now() + 60 * 60 * 1000),
+    console: systemConsole,
+    blazeId,
+  };
+
+  if (!token.accessToken) {
+    throw new Error('Cannot fetch Madden leagues because the persona-scoped access token is missing.');
   }
 
-  const systemConsole = getPersonaSystemConsole(persona);
+  if (!token.refreshToken) {
+    console.log('[EA Direct] Warning: persona-scoped token has no refresh_token; live league fetch may still work for current session.');
+  }
+
+  if (EA_DIRECT_FORCE_BLAZE_FETCH || !EA_DIRECT_LEAGUES_ENDPOINT_URL) {
+    try {
+      const leagues = await getEaBlazeLeagues(token);
+      console.log('[EA Direct] Blaze Mobile_GetMyLeagues success:', {
+        systemConsole,
+        blazeId,
+        leagueCount: Array.isArray(leagues) ? leagues.length : 0,
+      });
+      return leagues;
+    } catch (error) {
+      console.error('[EA Direct] Blaze Mobile_GetMyLeagues failed:', error?.message || error);
+      if (!EA_DIRECT_LEAGUES_ENDPOINT_URL) {
+        throw error;
+      }
+    }
+  }
+
+  // Optional endpoint fallback for testing/custom adapters.
   const url = EA_DIRECT_LEAGUES_ENDPOINT_URL
     .replaceAll('{ACCESS_TOKEN}', encodeURIComponent(tokenPayload.access_token || ''))
     .replaceAll('{REFRESH_TOKEN}', encodeURIComponent(tokenPayload.refresh_token || ''))
-    .replaceAll('{BLAZE_ID}', encodeURIComponent(String(persona?.personaId || persona?.persona_id || '')))
+    .replaceAll('{BLAZE_ID}', encodeURIComponent(blazeId))
     .replaceAll('{CONSOLE}', encodeURIComponent(systemConsole));
 
   const response = await fetch(url, {
@@ -15478,247 +15663,6 @@ async function fetchMaddenLeaguesForPersonaToken(tokenPayload, persona) {
   }
 
   return normalizeLeagueRowsFromPayload(payload);
-}
-
-
-async function handleInternalSelectLeague(payload) {
-  const accessToken = payload.access_token || payload.accessToken;
-  const selectedPersona = payload.selected_persona || payload.selectedPersona || payload.persona;
-  const guildId = payload.guild_id || payload.guildId || 'unknown';
-  const leagueId = payload.league_id || payload.leagueId || null;
-  const userId = payload.user_id || payload.userId || null;
-
-  if (!accessToken) {
-    return { statusCode: 400, payload: { error: 'Missing access_token.' } };
-  }
-
-  if (!selectedPersona) {
-    return { statusCode: 400, payload: { error: 'Missing selected_persona.' } };
-  }
-
-  let persona;
-  if (typeof selectedPersona === 'string') {
-    try {
-      persona = JSON.parse(selectedPersona);
-    } catch {
-      persona = { personaId: selectedPersona };
-    }
-  } else {
-    persona = selectedPersona;
-  }
-
-  const token = await exchangePersonaForMaddenToken(accessToken, persona);
-  const systemConsole = getPersonaSystemConsole(persona);
-  const expiry = token.expires_in ? Date.now() + Number(token.expires_in) * 1000 : null;
-  const blazeId = persona.personaId || persona.persona_id || persona.id || null;
-
-  const leagues = await fetchMaddenLeaguesForPersonaToken(token, persona);
-  console.log('[EA Direct] select-league discovery result:', {
-    userId,
-    leagueId,
-    personaId: persona?.personaId || persona?.persona_id || persona?.id || null,
-    systemConsole,
-    leagueCount: Array.isArray(leagues) ? leagues.length : 0,
-    adapter: EA_DIRECT_LEAGUES_ENDPOINT_URL ? 'configured_endpoint' : 'pending_blaze_adapter',
-  });
-
-  if (leagueId && userId) {
-    await pool.query(
-      `UPDATE madden_ea_connections
-       SET access_token_encrypted = $4,
-           refresh_token_encrypted = $5,
-           token_expires_at = $6,
-           token_type = $7,
-           token_scope = $8,
-           raw_franchises_payload = $9::jsonb,
-           exchange_status = 'leagues_fetched',
-           updated_at = NOW()
-       WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
-      [
-        leagueId,
-        userId,
-        'ea_direct',
-        token.access_token ? encryptEaSecret(token.access_token) : null,
-        token.refresh_token ? encryptEaSecret(token.refresh_token) : null,
-        expiry ? new Date(Number(expiry)) : null,
-        token.token_type || null,
-        token.scope || null,
-        JSON.stringify({ token: { ...token, access_token: '[stored]', refresh_token: token.refresh_token ? '[stored]' : null }, leagues }),
-      ]
-    ).catch(() => null);
-
-    for (const row of leagues) {
-      const externalLeagueId = String(getFirstValue(row, ['leagueId', 'league_id', 'franchiseId', 'id'], '') || '').trim();
-      if (!externalLeagueId) continue;
-
-      const externalLeagueName = getFirstValue(row, ['leagueName', 'league_name', 'franchiseName', 'name'], externalLeagueId);
-      const userTeamName = getFirstValue(row, ['userTeamName', 'teamName', 'team_name', 'yourTeam'], null);
-
-      await pool.query(
-        `INSERT INTO madden_ea_league_choices (
-           id, guild_id, league_id, user_id, persona_id, external_league_id,
-           external_league_name, user_team_name, system_console, blaze_id, raw_payload, imported_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW())
-         ON CONFLICT (league_id, user_id, external_league_id)
-         DO UPDATE SET
-           persona_id = $5,
-           external_league_name = $7,
-           user_team_name = $8,
-           system_console = $9,
-           blaze_id = $10,
-           raw_payload = $11::jsonb,
-           imported_at = NOW()`,
-        [
-          randomUUID(),
-          guildId,
-          leagueId,
-          userId,
-          blazeId ? String(blazeId) : null,
-          externalLeagueId,
-          externalLeagueName,
-          userTeamName,
-          systemConsole,
-          blazeId ? String(blazeId) : null,
-          JSON.stringify(row),
-        ]
-      );
-    }
-  }
-
-  return {
-    statusCode: 200,
-    payload: {
-      access_token: token.access_token,
-      refresh_token: token.refresh_token || null,
-      systemConsole,
-      expiry,
-      blazeId,
-      leagues: leagues.map(l => ({
-        leagueId: getFirstValue(l, ['leagueId', 'league_id', 'franchiseId', 'id'], ''),
-        leagueName: getFirstValue(l, ['leagueName', 'league_name', 'franchiseName', 'name'], ''),
-        userTeamName: getFirstValue(l, ['userTeamName', 'teamName', 'team_name', 'yourTeam'], ''),
-      })),
-      adapterStatus: leagues.length ? 'leagues_fetched' : 'blaze_get_leagues_adapter_pending',
-    },
-  };
-}
-
-let ggSportsInternalApiServer = null;
-
-function startGGSportsInternalApiServer() {
-  if (ggSportsInternalApiServer) return;
-
-  ggSportsInternalApiServer = http.createServer(async (req, res) => {
-    try {
-      if (req.method === 'OPTIONS') {
-        sendJsonResponse(res, 204, {});
-        return;
-      }
-
-      const url = new URL(req.url, 'http://localhost');
-
-      if (req.method === 'GET' && url.pathname === '/health') {
-        sendJsonResponse(res, 200, { ok: true, service: 'GG Sports', time: new Date().toISOString() });
-        return;
-      }
-
-      if (req.method !== 'POST') {
-        sendJsonResponse(res, 405, { error: 'Method not allowed.' });
-        return;
-      }
-
-      if (!isAuthorizedInternalApiRequest(req)) {
-        sendJsonResponse(res, 401, { error: 'Unauthorized.' });
-        return;
-      }
-
-      const payload = await readJsonRequest(req);
-
-      
-      if (url.pathname === '/api/ea/connect') {
-        const result = await handleInternalEaConnect(payload);
-        sendJsonResponse(res, result.statusCode, result.payload);
-        return;
-      }
-
-      if (url.pathname === '/api/ea/retrieve-personas') {
-        const result = await handleInternalRetrievePersonas(payload);
-        sendJsonResponse(res, result.statusCode, result.payload);
-        return;
-      }
-
-      if (url.pathname === '/api/ea/select-league') {
-        const result = await handleInternalSelectLeague(payload);
-        sendJsonResponse(res, result.statusCode, result.payload);
-        return;
-      }
-
-      sendJsonResponse(res, 404, { error: 'Route not found.' });
-    } catch (error) {
-      sendJsonResponse(res, 500, { error: error.message || 'Internal API error.' });
-    }
-  });
-
-  ggSportsInternalApiServer.listen(GGSPORTS_API_PORT, () => {
-    console.log('GG Sports internal API listening on port ' + GGSPORTS_API_PORT);
-    if (GGSPORTS_PUBLIC_BASE_URL) {
-      console.log('EA connect URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/connect');
-      console.log('EA retrieve personas URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/retrieve-personas');
-      console.log('EA select league URL: https://' + String(GGSPORTS_PUBLIC_BASE_URL).replace(/^https?:\/\//, '') + '/api/ea/select-league');
-    }
-  });
-}
-
-
-async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, code) {
-  if (!EA_DIRECT_RETRIEVE_PERSONAS_URL) {
-    throw new Error('EA_DIRECT_RETRIEVE_PERSONAS_URL is not configured. Token exchange endpoint still needs to be wired.');
-  }
-
-  // Correct Neon-aligned flow:
-  // 1) retrieve-personas receives { code }
-  // 2) returns access_token + personas
-  // 3) selected persona is sent to select-league
-  // 4) selected league is sent to connect/save
-  const payload = await postJsonToEndpoint(EA_DIRECT_RETRIEVE_PERSONAS_URL, {
-    code,
-    guild_id: guildId,
-    league_id: leagueId,
-    user_id: userId,
-  }, 'EA retrieve-personas');
-
-  const accessToken = extractNeonStyleAccessToken(payload);
-
-  if (!accessToken) {
-    throw new Error('retrieve-personas did not return access_token.');
-  }
-
-  const personaCount = await saveEaPersonas(guildId, leagueId, userId, payload);
-
-  await pool.query(
-    `UPDATE madden_ea_connections
-     SET access_token_encrypted = $4,
-         raw_token_payload = $5::jsonb,
-         raw_personas_payload = $6::jsonb,
-         exchange_status = 'personas_fetched',
-         connection_status = 'personas_fetched',
-         accepted_disclaimer = TRUE,
-         last_error = NULL,
-         updated_at = NOW()
-     WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
-    [
-      leagueId,
-      userId,
-      'ea_direct',
-      encryptEaSecret(accessToken),
-      JSON.stringify(payload),
-      JSON.stringify(payload),
-    ]
-  );
-
-  const connection = await getMaddenEaConnection(leagueId, userId);
-  return { connection, personaCount, payload };
 }
 
 async function selectEaPersonaViaEndpoint(guildId, leagueId, userId, personaId) {
