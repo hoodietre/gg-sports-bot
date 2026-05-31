@@ -15753,6 +15753,189 @@ function logEaProbePayload(label, payload) {
   }
 }
 
+
+function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
+  const scheduleRows = Array.isArray(hubPayload?.gameScheduleHubInfo?.leagueSchedule)
+    ? hubPayload.gameScheduleHubInfo.leagueSchedule
+    : [];
+
+  const firstScheduleItem = scheduleRows[0] || {};
+  const firstGame = firstScheduleItem.seasonGameInfo || firstScheduleItem.gameInfo || firstScheduleItem || {};
+
+  const availableWeeks = Array.isArray(hubPayload?.availableWeekInfoList) ? hubPayload.availableWeekInfoList : [];
+  const firstWeek = availableWeeks[0] || {};
+
+  const seasonInfo = hubPayload?.seasonInfo || {};
+  const scheduleInfo = hubPayload?.gameScheduleHubInfo || {};
+
+  const seasonGameKey =
+    getAnyValue(firstScheduleItem, ['seasonGameKey', 'gameKey', 'id'], null) ||
+    getAnyValue(firstGame, ['seasonGameKey', 'gameKey', 'id'], null) ||
+    getAnyValue(scheduleInfo, ['seasonGameKey'], null);
+
+  const week =
+    parseNumberOrNull(getAnyValue(firstGame, ['week', 'weekIndex', 'seasonWeek'], null)) ??
+    parseNumberOrNull(getAnyValue(firstWeek, ['weekIndex', 'seasonWeek', 'week'], null)) ??
+    parseNumberOrNull(getAnyValue(hubPayload, ['weekIndex', 'displayWeek'], null));
+
+  const weekType =
+    parseNumberOrNull(getAnyValue(firstGame, ['weekType', 'seasonWeekType'], null)) ??
+    parseNumberOrNull(getAnyValue(firstWeek, ['seasonWeekType', 'weekType'], null)) ??
+    0;
+
+  const seasonYear =
+    parseNumberOrNull(getAnyValue(seasonInfo, ['seasonYear', 'calendarYear'], null)) ??
+    parseNumberOrNull(getAnyValue(firstWeek, ['seasonYear', 'calendarYear'], null)) ??
+    parseNumberOrNull(getAnyValue(hubPayload, ['calendarYear', 'seasonYear'], null));
+
+  const displayedWeek =
+    getAnyValue(firstGame, ['displayedWeek', 'weekTitle'], null) ||
+    getAnyValue(firstWeek, ['weekTitle', 'displayedWeek'], null) ||
+    getAnyValue(hubPayload, ['weekTitle'], null);
+
+  return {
+    leagueId: Number(leagueId),
+    leagueIdString: String(leagueId),
+    seasonGameKey: seasonGameKey !== null && seasonGameKey !== undefined ? Number(seasonGameKey) : null,
+    weekIndex: week,
+    week,
+    weekType,
+    seasonYear,
+    displayedWeek,
+    calendarYear: parseNumberOrNull(getAnyValue(seasonInfo, ['calendarYear'], null)),
+    superBowlNumber: parseNumberOrNull(getAnyValue(seasonInfo, ['superBowlNumber'], null)),
+  };
+}
+
+function buildEaStandingsPayloadVariantsFromHub(hubPayload, leagueId) {
+  const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId);
+  const variants = [];
+
+  variants.push({ leagueId: ctx.leagueId });
+
+  if (ctx.seasonGameKey !== null) {
+    variants.push({
+      leagueId: ctx.leagueId,
+      seasonGameKey: ctx.seasonGameKey,
+    });
+  }
+
+  variants.push({
+    leagueId: ctx.leagueId,
+    week: ctx.week ?? 0,
+    weekIndex: ctx.weekIndex ?? 0,
+    weekType: ctx.weekType ?? 0,
+  });
+
+  if (ctx.seasonYear !== null) {
+    variants.push({
+      leagueId: ctx.leagueId,
+      seasonYear: ctx.seasonYear,
+      week: ctx.week ?? 0,
+      weekIndex: ctx.weekIndex ?? 0,
+      weekType: ctx.weekType ?? 0,
+    });
+  }
+
+  if (ctx.seasonGameKey !== null && ctx.seasonYear !== null) {
+    variants.push({
+      leagueId: ctx.leagueId,
+      seasonGameKey: ctx.seasonGameKey,
+      seasonYear: ctx.seasonYear,
+      week: ctx.week ?? 0,
+      weekType: ctx.weekType ?? 0,
+    });
+  }
+
+  const unique = [];
+  const seen = new Set();
+  for (const payload of variants) {
+    const key = JSON.stringify(payload);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(payload);
+  }
+
+  console.log('[EA STANDINGS CONTEXT] ' + JSON.stringify(ctx));
+  console.log('[EA STANDINGS PAYLOADS] ' + JSON.stringify(unique));
+
+  return unique.slice(0, 5);
+}
+
+async function probeEaStandingsCommandsWithHubContext(token, leagueId, hubPayload) {
+  const payloadVariants = buildEaStandingsPayloadVariantsFromHub(hubPayload, leagueId);
+
+  const commandCandidates = [
+    { name: 'Mobile_Career_GetStandings', id: 802 },
+    { name: 'Mobile_Career_GetTeamStats', id: 803 },
+    { name: 'Mobile_Career_GetPowerRankings', id: 814 },
+    { name: 'Mobile_Career_GetTeamRankings', id: 815 },
+  ];
+
+  const results = [];
+  for (const command of commandCandidates) {
+    for (const requestPayload of payloadVariants) {
+      try {
+        const response = await sendEaBlazeCareerModeCommand(token, command.name, command.id, requestPayload);
+        const value = response?.responseInfo?.value || response;
+        const arrays = deepFindArraysByKey(value, [
+          'standings',
+          'teamStandings',
+          'leagueStandings',
+          'teamStandingsInfoList',
+          'standingInfoList',
+          'teamStats',
+          'teamStatsInfoList',
+          'seasonTeamStatsInfoList',
+          'leagueTeamStats',
+          'rankings',
+          'stats'
+        ]);
+
+        logEaProbePayload(command.name + '#' + command.id + ' payload=' + JSON.stringify(requestPayload), response);
+
+        results.push({
+          commandName: command.name,
+          commandId: command.id,
+          payload: requestPayload,
+          success: true,
+          topKeys: Object.keys(value || {}),
+          candidateArrayCount: arrays.length,
+          candidateArrays: arrays.map(a => ({ path: a.path, key: a.key, length: Array.isArray(a.rows) ? a.rows.length : 0 })).slice(0, 10),
+          raw: value,
+        });
+
+        if (arrays.some(a => Array.isArray(a.rows) && a.rows.length >= 30)) {
+          console.log('[EA STANDINGS FOUND] ' + JSON.stringify({
+            commandName: command.name,
+            commandId: command.id,
+            payload: requestPayload,
+            arrays: arrays.map(a => ({ path: a.path, key: a.key, length: Array.isArray(a.rows) ? a.rows.length : 0 })).slice(0, 10),
+          }));
+          return results;
+        }
+      } catch (error) {
+        console.log('[EA STANDINGS PROBE FAIL] ' + JSON.stringify({
+          commandName: command.name,
+          commandId: command.id,
+          payload: requestPayload,
+          error: String(error?.message || error).slice(0, 220),
+        }));
+        results.push({
+          commandName: command.name,
+          commandId: command.id,
+          payload: requestPayload,
+          success: false,
+          error: String(error?.message || error).slice(0, 500),
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+
 async function probeEaStandingsCommands(token, leagueId) {
   const leagueNumber = Number(leagueId);
   const payloadVariants = [
@@ -16356,7 +16539,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     let probeResults = [];
     if (!hasRealRecordData) {
       console.log('[EA STANDINGS PROBE] Hub did not contain standings/record data. Starting command probe.');
-      probeResults = await probeEaStandingsCommands(context.token, context.externalLeagueId).catch(error => {
+      probeResults = await probeEaStandingsCommandsWithHubContext(context.token, context.externalLeagueId, hub).catch(error => {
         console.error('[EA STANDINGS PROBE] probe failed completely:', error?.message || error);
         return [];
       });
@@ -16416,7 +16599,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
       ', games: ' + importedGames +
-      ', players: 0. Deep parser active. Compact standings probe enabled. Compact standings probe enabled.';
+      ', players: 0. Deep parser active. Context-aware standings probe enabled. Context-aware standings probe enabled.';
 
     await pool.query(
       `UPDATE madden_sync_runs
