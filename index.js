@@ -3126,6 +3126,84 @@ async function finalizeDeniedTrade(guild, offerId) {
   }
 }
 
+
+function sendJsonResponse(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(payload || {}));
+}
+
+async function readJsonRequest(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString('utf8');
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+let ggSportsInternalApiServer = null;
+
+function startGGSportsInternalApiServer() {
+  if (ggSportsInternalApiServer) return ggSportsInternalApiServer;
+
+  const port = Number(process.env.PORT || EA_DIRECT_INTERNAL_API_PORT || 8080);
+
+  ggSportsInternalApiServer = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+
+      if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
+        sendJsonResponse(res, 200, { status: 'ok', service: 'gg-sports-ea-direct' });
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        sendJsonResponse(res, 404, { error: 'Not found.' });
+        return;
+      }
+
+      const payload = await readJsonRequest(req);
+
+      if (url.pathname === '/api/ea/retrieve-personas') {
+        const result = await handleInternalRetrievePersonas(payload);
+        sendJsonResponse(res, result.statusCode, result.payload);
+        return;
+      }
+
+      if (url.pathname === '/api/ea/select-league') {
+        const result = await handleInternalSelectLeague(payload);
+        sendJsonResponse(res, result.statusCode, result.payload);
+        return;
+      }
+
+      if (url.pathname === '/api/ea/connect') {
+        const result = await handleInternalEaConnect(payload);
+        sendJsonResponse(res, result.statusCode, result.payload);
+        return;
+      }
+
+      sendJsonResponse(res, 404, { error: 'Unknown endpoint.' });
+    } catch (error) {
+      console.error('[GG Sports Internal API] Error:', error);
+      sendJsonResponse(res, 500, { error: error?.message || 'Internal API error.' });
+    }
+  });
+
+  ggSportsInternalApiServer.listen(port, () => {
+    console.log('GG Sports internal API listening on port', port);
+    if (EA_DIRECT_CONNECT_URL) console.log('EA connect URL:', EA_DIRECT_CONNECT_URL);
+    if (EA_DIRECT_RETRIEVE_PERSONAS_URL) console.log('EA retrieve personas URL:', EA_DIRECT_RETRIEVE_PERSONAS_URL);
+    if (EA_DIRECT_SELECT_LEAGUE_URL) console.log('EA select league URL:', EA_DIRECT_SELECT_LEAGUE_URL);
+  });
+
+  return ggSportsInternalApiServer;
+}
+
+
 client.once(Events.ClientReady, async () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
   try {
@@ -15692,13 +15770,29 @@ async function selectEaPersonaViaEndpoint(guildId, leagueId, userId, personaId) 
     }
   }
 
-  const payload = await postJsonToEndpoint(EA_DIRECT_SELECT_LEAGUE_URL, {
-    access_token: accessToken,
-    selected_persona: JSON.stringify(selectedPersonaPayload),
-    guild_id: guildId,
-    league_id: leagueId,
-    user_id: userId,
-  }, 'EA select-league');
+  let payload;
+  try {
+    payload = await postJsonToEndpoint(EA_DIRECT_SELECT_LEAGUE_URL, {
+      access_token: accessToken,
+      selected_persona: JSON.stringify(selectedPersonaPayload),
+      guild_id: guildId,
+      league_id: leagueId,
+      user_id: userId,
+    }, 'EA select-league');
+  } catch (error) {
+    console.error('[EA Direct] select-league endpoint failed, using internal handler fallback:', error?.message || error);
+    const fallback = await handleInternalSelectLeague({
+      access_token: accessToken,
+      selected_persona: JSON.stringify(selectedPersonaPayload),
+      guild_id: guildId,
+      league_id: leagueId,
+      user_id: userId,
+    });
+    if (fallback.statusCode >= 400) {
+      throw new Error(fallback.payload?.error || 'EA select-league fallback failed.');
+    }
+    payload = fallback.payload;
+  }
 
   const returnedAccessToken = extractNeonStyleAccessToken(payload);
   const refreshToken = extractNeonStyleRefreshToken(payload);
@@ -15789,6 +15883,70 @@ function buildMaddenEaLeagueChoiceComponents(leagueId, choices) {
         .addOptions(options)
     ),
   ];
+}
+
+
+
+async function completeEaRetrievePersonasViaEndpoint(guildId, leagueId, userId, code) {
+  if (!EA_DIRECT_RETRIEVE_PERSONAS_URL) {
+    throw new Error('EA_DIRECT_RETRIEVE_PERSONAS_URL is not configured.');
+  }
+
+  let payload;
+  try {
+    payload = await postJsonToEndpoint(EA_DIRECT_RETRIEVE_PERSONAS_URL, {
+      code,
+      guild_id: guildId,
+      league_id: leagueId,
+      user_id: userId,
+    }, 'EA retrieve-personas');
+  } catch (error) {
+    console.error('[EA Direct] retrieve-personas endpoint failed, using internal handler fallback:', error?.message || error);
+    const fallback = await handleInternalRetrievePersonas({
+      code,
+      guild_id: guildId,
+      league_id: leagueId,
+      user_id: userId,
+    });
+    if (fallback.statusCode >= 400) {
+      throw new Error(fallback.payload?.error || 'EA retrieve-personas fallback failed.');
+    }
+    payload = fallback.payload;
+  }
+
+  const personas = await saveEaPersonas(guildId, leagueId, userId, payload);
+
+  const tokenPayload = payload?.tokenPayload || payload?.token || null;
+  const accessToken = payload?.access_token || payload?.accessToken || tokenPayload?.access_token || null;
+  const refreshToken = payload?.refresh_token || payload?.refreshToken || tokenPayload?.refresh_token || null;
+
+  await pool.query(
+    `UPDATE madden_ea_connections
+     SET access_token_encrypted = COALESCE($4, access_token_encrypted),
+         refresh_token_encrypted = COALESCE($5, refresh_token_encrypted),
+         raw_personas_payload = $6::jsonb,
+         exchange_status = 'personas_fetched',
+         connection_status = 'personas_fetched',
+         last_error = NULL,
+         updated_at = NOW()
+     WHERE league_id = $1 AND user_id = $2 AND provider = $3`,
+    [
+      leagueId,
+      userId,
+      'ea_direct',
+      accessToken ? encryptEaSecret(accessToken) : null,
+      refreshToken ? encryptEaSecret(refreshToken) : null,
+      JSON.stringify(payload || {}),
+    ]
+  ).catch(() => null);
+
+  const connection = await getMaddenEaConnection(leagueId, userId);
+  return {
+    payload,
+    personas,
+    personaCount: personas.length,
+    connection,
+  };
 }
 
 
