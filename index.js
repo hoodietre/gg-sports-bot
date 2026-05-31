@@ -15849,6 +15849,31 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
   return ctx;
 }
 
+
+function isEaHubInPreseason(hubPayload, leagueId = null) {
+  const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId || 0);
+  return Boolean(
+    ctx.isPreseason ||
+    ctx.seasonWeekType === 0 ||
+    ctx.weekType === 0 ||
+    String(ctx.displayedWeek || '').toLowerCase().includes('preseason')
+  );
+}
+
+function getEaHubSeasonModeLabel(hubPayload, leagueId = null) {
+  const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId || 0);
+  if (isEaHubInPreseason(hubPayload, leagueId)) {
+    return ctx.displayedWeek || 'Preseason';
+  }
+
+  if (ctx.seasonWeekType === 1 || ctx.weekType === 1) {
+    return ctx.displayedWeek || ('Regular Season Week ' + String(ctx.week ?? ctx.weekIndex ?? '?'));
+  }
+
+  return ctx.displayedWeek || 'Season Active';
+}
+
+
 function buildEaStandingsPayloadVariantsFromHub(hubPayload, leagueId) {
   const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId);
   const variants = [];
@@ -16599,9 +16624,14 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       Number(team.points_against || 0) > 0
     );
 
+    const preseasonMode = isEaHubInPreseason(hub, context.externalLeagueId);
+    const seasonModeLabel = getEaHubSeasonModeLabel(hub, context.externalLeagueId);
+
     let probeResults = [];
-    if (!hasRealRecordData) {
-      console.log('[EA STANDINGS PROBE] Hub did not contain standings/record data. Starting command probe.');
+    if (!hasRealRecordData && preseasonMode) {
+      console.log('[EA STANDINGS PRESEASON-SAFE] Skipping standings probe because league is currently in ' + seasonModeLabel + '. EA standings usually reset/not available until regular season.');
+    } else if (!hasRealRecordData) {
+      console.log('[EA STANDINGS PROBE] Regular season detected and Hub did not contain standings/record data. Starting command probe.');
       probeResults = await probeEaStandingsCommandsWithHubContext(context.token, context.externalLeagueId, hub).catch(error => {
         console.error('[EA STANDINGS PROBE] probe failed completely:', error?.message || error);
         return [];
@@ -16662,7 +16692,10 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
       ', games: ' + importedGames +
-      ', players: 0. Deep parser active. Preseason-aware standings probe enabled.';
+      ', players: 0. ' +
+      (preseasonMode
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season.'
+        : 'Regular season mode: standings probe enabled when Hub has no records.');
 
     await pool.query(
       `UPDATE madden_sync_runs
