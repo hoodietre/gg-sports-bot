@@ -17647,100 +17647,153 @@ async function probeEaDirectScoreSources(context, guild, league) {
 
   const sampleGames = gamesResult.rows || [];
   if (!sampleGames.length) {
-    console.log('[EA SCORE SOURCE DISCOVERY 7J-5BN] No completed games available for score-source probing.');
+    console.log('[EA SCORE SOURCE DISCOVERY 7J-5BO] No completed games available for score-source probing.');
     return [];
   }
 
-  // This is aligned with the Snallabot/export clue: LeagueHub gives schedule/outcome only,
-  // while richer details likely live behind separate export/detail/stat commands.
+  // Snallabot reference:
+  // Dashboard export calls exporter.exportCurrentWeek(), exporter.exportAllWeeks(), or
+  // exporter.exportSpecificWeeks([{ weekIndex: exportValue.week - 1, stage: exportValue.stage }]).
+  // So this probe focuses on export-style WEEK payloads first, not game-id-only payloads.
   const commandCandidates = [
+    { name: 'Mobile_Career_GetWeeklyStats', id: 804 },
+    { name: 'Mobile_Career_GetSeasonStats', id: 805 },
     { name: 'Mobile_Career_GetGameStats', id: 806 },
+    { name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
     { name: 'Mobile_Career_GetGameStatsInfo', id: 809 },
     { name: 'Mobile_Career_GetGameInfo', id: 810 },
-    { name: 'Mobile_Career_GetSeasonGame', id: 812 },
     { name: 'Mobile_Career_GetGameDetails', id: 813 },
-    { name: 'Mobile_Career_GetGameResult', id: 816 },
     { name: 'Mobile_Career_GetBoxScore', id: 817 },
     { name: 'Mobile_Career_GetScoringSummary', id: 818 },
   ];
 
   const results = [];
   let attempted = 0;
-  const maxAttempts = Number(process.env.EA_SCORE_DISCOVERY_MAX_ATTEMPTS || 18);
+  const maxAttempts = Number(process.env.EA_SCORE_DISCOVERY_MAX_ATTEMPTS || 36);
+
+  function pushUnique(list, payload) {
+    const clean = {};
+    for (const [key, value] of Object.entries(payload || {})) {
+      if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
+    }
+    const key = JSON.stringify(clean);
+    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(clean);
+  }
+
+  const leagueCtx = {
+    leagueId: Number(context.externalLeagueId),
+    leagueIdString: String(context.externalLeagueId),
+  };
 
   for (const game of sampleGames) {
     const rawGame = extractMaddenRawGamePayload(game);
     const seasonGameKey = extractMaddenSeasonGameKeyFromAny(game);
     const weekNumber = maddenWeekNumberFromLabel(game.week_label);
-    const seasonWeek = weekNumber !== null ? weekNumber + 3 : null;
+
+    // Snallabot exportSpecificWeeks passes weekIndex = userWeek - 1.
+    // EA Hub internals sometimes use Madden's seasonWeek index, where regular Week 1 starts after preseason.
+    const exportWeekIndex = weekNumber !== null ? Math.max(0, weekNumber - 1) : null;
+    const mcaSeasonWeek = weekNumber !== null ? weekNumber + 3 : null;
+    const stage = 1;
+    const seasonWeekType = 1;
 
     const payloadVariants = [];
-    const addPayload = payload => {
-      const clean = {};
-      for (const [key, value] of Object.entries(payload)) {
-        if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
-      }
-      const key = JSON.stringify(clean);
-      if (!payloadVariants.some(existing => JSON.stringify(existing) === key)) payloadVariants.push(clean);
-    };
 
-    addPayload({ leagueId: Number(context.externalLeagueId), seasonGameKey: Number(seasonGameKey) });
-    addPayload({ leagueId: Number(context.externalLeagueId), gameId: Number(seasonGameKey) });
-    addPayload({ leagueId: Number(context.externalLeagueId), week: seasonWeek, weekType: 1 });
-    addPayload({ leagueId: Number(context.externalLeagueId), weekIndex: seasonWeek, seasonWeekType: 1 });
-    addPayload({ leagueId: Number(context.externalLeagueId), seasonWeek, seasonWeekType: 1, seasonGameKey: Number(seasonGameKey) });
+    // Export-style weekly payloads, based directly on Snallabot's exportSpecificWeeks shape.
+    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, stage });
+    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, stageIndex: stage });
+    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, weekType: seasonWeekType });
+    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, seasonWeekType });
+    pushUnique(payloadVariants, { ...leagueCtx, week: exportWeekIndex, stage });
+    pushUnique(payloadVariants, { ...leagueCtx, week: weekNumber, stage });
+    pushUnique(payloadVariants, { ...leagueCtx, seasonWeek: mcaSeasonWeek, seasonWeekType });
+
+    // Game-detail style payloads.
+    pushUnique(payloadVariants, { ...leagueCtx, seasonGameKey: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
+    pushUnique(payloadVariants, { ...leagueCtx, gameId: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
+    pushUnique(payloadVariants, { ...leagueCtx, game: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
+    pushUnique(payloadVariants, { ...leagueCtx, scheduleId: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
+
+    // Raw field carry-through variants.
+    pushUnique(payloadVariants, {
+      ...leagueCtx,
+      seasonGameKey: Number(seasonGameKey),
+      homeTeam: getAnyValue(rawGame, ['homeTeam'], null),
+      awayTeam: getAnyValue(rawGame, ['awayTeam'], null),
+      week: getAnyValue(rawGame, ['week'], null),
+      weekType: getAnyValue(rawGame, ['weekType'], null),
+    });
+
+    console.log('[SNALLAPA TRACE 7J-5BO] ' + JSON.stringify({
+      source: 'snallabot routes.ts uses exportSpecificWeeks([{ weekIndex: exportValue.week - 1, stage: exportValue.stage }])',
+      game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey },
+      derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage, seasonWeekType },
+      payloadVariants: payloadVariants.slice(0, 14),
+      commands: commandCandidates.map(c => c.name + ':' + c.id),
+    }).slice(0, 9000));
 
     for (const command of commandCandidates) {
-      for (const requestPayload of payloadVariants.slice(0, 3)) {
+      for (const requestPayload of payloadVariants) {
         if (attempted >= maxAttempts) break;
         attempted += 1;
+
         try {
           const response = await sendEaBlazeCareerModeCommand(context.token, command.name, command.id, requestPayload);
           const summary = summarizeEaScoreProbeValue(command, requestPayload, response);
-          results.push({ success: true, game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey }, ...summary });
-          console.log('[EA SCORE SOURCE DISCOVERY HIT 7J-5BN] ' + JSON.stringify(results[results.length - 1]).slice(0, 6000));
+          const record = {
+            success: true,
+            game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey },
+            derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage },
+            ...summary,
+          };
+          results.push(record);
 
-          const hasScoreSignal = Object.keys(summary.scoreLikeFields || {}).some(key => /score|point|pts/i.test(key));
-          if (hasScoreSignal) {
-            console.log('[EA SCORE SOURCE DISCOVERY FOUND SCORE-LIKE DATA 7J-5BN] ' + JSON.stringify({
+          console.log('[EA SCORE SOURCE DISCOVERY HIT 7J-5BO] ' + JSON.stringify(record).slice(0, 9000));
+
+          const scoreKeys = Object.keys(summary.scoreLikeFields || {}).filter(key => /score|point|pts|stat|total/i.test(key));
+          if (scoreKeys.length) {
+            console.log('[EA SCORE SOURCE DISCOVERY FOUND SCORE-LIKE DATA 7J-5BO] ' + JSON.stringify({
               commandName: command.name,
               commandId: command.id,
               payload: requestPayload,
+              scoreKeys: scoreKeys.slice(0, 80),
               scoreLikeFields: summary.scoreLikeFields,
               arrays: summary.arrays,
-            }).slice(0, 6000));
+            }).slice(0, 12000));
           }
         } catch (error) {
           const fail = {
             success: false,
             game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey },
+            derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage },
             commandName: command.name,
             commandId: command.id,
             payload: requestPayload,
-            error: String(error?.message || error).slice(0, 500),
+            error: String(error?.message || error).slice(0, 700),
           };
           results.push(fail);
-          console.log('[EA SCORE SOURCE DISCOVERY FAIL 7J-5BN] ' + JSON.stringify(fail));
+          console.log('[EA SCORE SOURCE DISCOVERY FAIL 7J-5BO] ' + JSON.stringify(fail));
         }
       }
       if (attempted >= maxAttempts) break;
     }
+
     if (attempted >= maxAttempts) break;
   }
 
-  console.log('[EA SCORE SOURCE DISCOVERY SUMMARY 7J-5BN] ' + JSON.stringify({
+  console.log('[EA SCORE SOURCE DISCOVERY SUMMARY 7J-5BO] ' + JSON.stringify({
     attempted,
     successes: results.filter(r => r.success).length,
     failures: results.filter(r => !r.success).length,
     commandsTried: [...new Set(results.map(r => r.commandName))],
-    successSummaries: results.filter(r => r.success).map(r => ({
+    successfulPayloads: results.filter(r => r.success).map(r => ({
       commandName: r.commandName,
       commandId: r.commandId,
       payload: r.payload,
-      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 30),
+      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 40),
       arrays: r.arrays,
     })).slice(0, 12),
-  }).slice(0, 8000));
+  }).slice(0, 12000));
 
   return results;
 }
@@ -17786,7 +17839,7 @@ async function inspectMaddenCompletedGameRawScores(guild, league) {
     };
   });
 
-  console.log('[Madden Raw Score Inspector 7J-5BN] ' + JSON.stringify({
+  console.log('[Madden Raw Score Inspector 7J-5BO] ' + JSON.stringify({
     inspectedGames: samples.length,
     samples,
   }).slice(0, 18000));
@@ -18073,8 +18126,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; score source discovery enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; score source discovery enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa-guided score discovery enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa-guided score discovery enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
