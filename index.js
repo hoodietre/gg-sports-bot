@@ -5621,11 +5621,11 @@ if (gameSubcommand === 'report') {
 
         const result = week
           ? await pool.query(
-              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 AND LOWER(week_label) = LOWER($3) ORDER BY imported_at DESC LIMIT 25`,
+              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 AND LOWER(week_label) = LOWER($3) ORDER BY week_label ASC, away_team ASC LIMIT 25`,
               [interaction.guild.id, activeLeague.league_id, week]
             )
           : await pool.query(
-              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 ORDER BY imported_at DESC LIMIT 25`,
+              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 ORDER BY week_label ASC, away_team ASC LIMIT 25`,
               [interaction.guild.id, activeLeague.league_id]
             );
 
@@ -5685,7 +5685,13 @@ if (gameSubcommand === 'report') {
         const gamesResult = await pool.query(
           `SELECT * FROM madden_imported_games
            WHERE guild_id = $1 AND league_id = $2 AND (LOWER(home_team) = LOWER($3) OR LOWER(away_team) = LOWER($3))
-           ORDER BY imported_at DESC
+           ORDER BY
+             CASE
+               WHEN LOWER(COALESCE(status, 'scheduled')) IN ('completed', 'final') THEN 0
+               ELSE 1
+             END,
+             week_label ASC,
+             imported_at DESC
            LIMIT 5`,
           [interaction.guild.id, activeLeague.league_id, team.team_name]
         );
@@ -14279,6 +14285,49 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
 
 
 
+
+function maddenWeekSortValue(weekLabel) {
+  const label = String(weekLabel || '').toLowerCase();
+  const n = Number((label.match(/\d+/) || [999])[0]);
+  if (label.includes('preseason')) return n - 100;
+  if (label.includes('wildcard')) return 100;
+  if (label.includes('divisional')) return 101;
+  if (label.includes('conference')) return 102;
+  if (label.includes('super bowl')) return 103;
+  if (label.includes('week')) return n;
+  return 999;
+}
+
+function formatMaddenGameScore(game) {
+  const away = game.away_score;
+  const home = game.home_score;
+  const hasScore = away !== null && away !== undefined && home !== null && home !== undefined;
+  if (!hasScore) return '';
+  return ' • ' + away + '-' + home;
+}
+
+function formatMaddenTeamGameLine(teamName, game) {
+  const isHome = String(game.home_team || '').toLowerCase() === String(teamName || '').toLowerCase();
+  const opp = isHome ? game.away_team : game.home_team;
+  const teamScore = isHome ? game.home_score : game.away_score;
+  const oppScore = isHome ? game.away_score : game.home_score;
+  const status = String(game.status || 'scheduled').toLowerCase();
+
+  let result;
+  if (status === 'completed' || status === 'final') {
+    result = Number(teamScore) > Number(oppScore)
+      ? 'W ' + teamScore + '-' + oppScore
+      : Number(teamScore) < Number(oppScore)
+        ? 'L ' + teamScore + '-' + oppScore
+        : 'T ' + teamScore + '-' + oppScore;
+  } else {
+    result = 'scheduled';
+  }
+
+  return '**' + (game.week_label || 'Week TBD') + '** ' + (isHome ? 'vs ' : '@ ') + opp + ' — ' + result;
+}
+
+
 function buildMaddenImportedStandingsEmbed(league, rows) {
   const NL = String.fromCharCode(10);
   const sorted = [...rows].sort((a, b) =>
@@ -14306,11 +14355,16 @@ function buildMaddenImportedStandingsEmbed(league, rows) {
 
 function buildMaddenImportedScheduleEmbed(league, rows, week = null) {
   const NL = String.fromCharCode(10);
-  const lines = rows.map(game => {
-    const score = game.home_score !== null && game.home_score !== undefined
-      ? ' • ' + game.away_score + '-' + game.home_score
-      : '';
-    return '**' + (game.week_label || 'Week TBD') + '** — ' + game.away_team + ' @ ' + game.home_team + score + ' • ' + (game.status || 'scheduled');
+  const sorted = [...rows].sort((a, b) =>
+    maddenWeekSortValue(a.week_label) - maddenWeekSortValue(b.week_label) ||
+    String(a.away_team || '').localeCompare(String(b.away_team || ''))
+  );
+
+  const lines = sorted.map(game => {
+    return '**' + (game.week_label || 'Week TBD') + '** — ' +
+      game.away_team + ' @ ' + game.home_team +
+      formatMaddenGameScore(game) +
+      ' • ' + (game.status || 'scheduled');
   });
 
   return new EmbedBuilder()
@@ -14350,16 +14404,10 @@ function buildMaddenImportedTeamEmbed(league, team, games, players) {
   const diff = pf - pa;
 
   const recentLines = games.length
-    ? games.map(game => {
-        const isHome = String(game.home_team || '').toLowerCase() === String(team.team_name || '').toLowerCase();
-        const opp = isHome ? game.away_team : game.home_team;
-        const teamScore = isHome ? game.home_score : game.away_score;
-        const oppScore = isHome ? game.away_score : game.home_score;
-        const result = teamScore !== null && oppScore !== null
-          ? (Number(teamScore) > Number(oppScore) ? 'W' : Number(teamScore) < Number(oppScore) ? 'L' : 'T') + ' ' + teamScore + '-' + oppScore
-          : game.status;
-        return '**' + (game.week_label || 'Week TBD') + '** vs ' + opp + ' — ' + result;
-      }).join(NL)
+    ? [...games]
+        .sort((a, b) => maddenWeekSortValue(a.week_label) - maddenWeekSortValue(b.week_label))
+        .map(game => formatMaddenTeamGameLine(team.team_name, game))
+        .join(NL)
     : 'No imported games found for this team.';
 
   const playerLines = players.length
@@ -17025,6 +17073,47 @@ async function getEaBlazeLeagueHubWithRefreshRetry(context) {
 }
 
 
+
+async function recalculateMaddenTeamPointsFromImportedGames(guild, league) {
+  const teamsResult = await pool.query(
+    `SELECT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`,
+    [guild.id, league.league_id]
+  );
+
+  for (const row of teamsResult.rows) {
+    const teamName = row.team_name;
+    const gamesResult = await pool.query(
+      `SELECT * FROM madden_imported_games
+       WHERE guild_id = $1 AND league_id = $2
+         AND LOWER(COALESCE(status, '')) IN ('completed', 'final')
+         AND (LOWER(home_team) = LOWER($3) OR LOWER(away_team) = LOWER($3))`,
+      [guild.id, league.league_id, teamName]
+    );
+
+    let pf = 0;
+    let pa = 0;
+
+    for (const game of gamesResult.rows) {
+      const isHome = String(game.home_team || '').toLowerCase() === String(teamName || '').toLowerCase();
+      const teamScore = Number(isHome ? game.home_score : game.away_score);
+      const oppScore = Number(isHome ? game.away_score : game.home_score);
+      if (!Number.isFinite(teamScore) || !Number.isFinite(oppScore)) continue;
+      pf += teamScore;
+      pa += oppScore;
+    }
+
+    await pool.query(
+      `UPDATE madden_imported_team_stats
+       SET points_for = $3,
+           points_against = $4,
+           imported_at = NOW()
+       WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
+      [guild.id, league.league_id, pf, pa, teamName]
+    );
+  }
+}
+
+
 async function runMaddenEaDirectSync(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
   const runId = randomUUID();
@@ -17103,6 +17192,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
     const importedTeams = teams.length ? await importMaddenTeamsFromArray(guild, league, teams) : 0;
     const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null) : 0;
+    await recalculateMaddenTeamPointsFromImportedGames(guild, league).catch(error => {
+      console.error('[Madden Sync] PF/PA recompute failed:', error?.message || error);
+    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
 
@@ -17112,8 +17204,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; schedule cleanup enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; schedule cleanup enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; final standings/schedule polish enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; final standings/schedule polish enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
