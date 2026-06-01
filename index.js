@@ -5630,6 +5630,19 @@ if (gameSubcommand === 'report') {
               [interaction.guild.id, activeLeague.league_id]
             );
 
+        if (week && !result.rows.length) {
+          const availableResult = await pool.query(
+            `SELECT * FROM madden_imported_games
+             WHERE guild_id = $1 AND league_id = $2
+             ORDER BY CASE WHEN week_label IS NULL OR LOWER(week_label) = 'week tbd' THEN 1 ELSE 0 END, week_label DESC, imported_at DESC
+             LIMIT 50`,
+            [interaction.guild.id, activeLeague.league_id]
+          );
+          const availableWeek = getMostRecentImportedWeekLabel(availableResult.rows);
+          await interaction.reply({ embeds: [buildMaddenScheduleUnavailableEmbed(activeLeague, rawWeek || week, availableWeek)], ephemeral: true });
+          return;
+        }
+
         await interaction.reply({ embeds: [buildMaddenImportedScheduleEmbed(activeLeague, result.rows, week || rawWeek)], ephemeral: true });
         return;
       }
@@ -14389,6 +14402,35 @@ function buildMaddenImportedStandingsEmbed(league, rows) {
     .setTimestamp();
 }
 
+
+function getMostRecentImportedWeekLabel(rows) {
+  const labels = [...new Set((rows || [])
+    .map(row => row.week_label)
+    .filter(label => label && String(label).toLowerCase() !== 'week tbd'))];
+
+  if (!labels.length) return null;
+
+  labels.sort((a, b) => maddenWeekSortValue(b) - maddenWeekSortValue(a));
+  return labels[0] || null;
+}
+
+function buildMaddenScheduleUnavailableEmbed(league, requestedWeek, availableWeek = null) {
+  const normalizedRequested = normalizeMaddenWeekFilterInput(requestedWeek) || requestedWeek || 'that week';
+  const message =
+    '**' + normalizedRequested + '** is not available from EA Direct yet.' + String.fromCharCode(10) + String.fromCharCode(10) +
+    'EA Direct currently exposes the active/imported weekly schedule snapshot' +
+    (availableWeek ? ', which is **' + availableWeek + '** right now.' : '.') + String.fromCharCode(10) +
+    'After the franchise advances and `/madden sync` is run, that new week will become available.';
+
+  return new EmbedBuilder()
+    .setTitle('Madden Schedule Not Available Yet • ' + league.league_name)
+    .setColor(0xFEE75C)
+    .setDescription(message)
+    .setFooter({ text: 'GG Sports • EA Direct Current-Week Schedule' })
+    .setTimestamp();
+}
+
+
 function buildMaddenImportedScheduleEmbed(league, rows, week = null) {
   const NL = String.fromCharCode(10);
   const sorted = [...rows].sort((a, b) =>
@@ -14407,7 +14449,7 @@ function buildMaddenImportedScheduleEmbed(league, rows, week = null) {
     .setTitle('Madden Imported Schedule' + (week ? ' • ' + week : '') + ' • ' + league.league_name)
     .setColor(0x5865F2)
     .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'No imported Madden games found yet. Use /madden importgames or /madden sync.')
-    .setFooter({ text: 'GG Sports • Madden Schedule' })
+    .setFooter({ text: 'GG Sports • Madden Schedule • EA Direct weekly snapshot' })
     .setTimestamp();
 }
 
@@ -14462,7 +14504,7 @@ function buildMaddenImportedTeamEmbed(league, team, games, players) {
       { name: 'Recent Games', value: recentLines.slice(0, 1024), inline: false },
       { name: 'Top Imported Players', value: playerLines, inline: false }
     )
-    .setFooter({ text: 'GG Sports • Madden Team View' })
+    .setFooter({ text: 'GG Sports • Madden Team View • EA Direct weekly snapshot' })
     .setTimestamp();
 }
 
@@ -17026,7 +17068,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     return aw - bw || String(a.away_team).localeCompare(String(b.away_team));
   });
 
-  console.log('[EA SCHEDULE NORMALIZED 7J-5BH] ' + JSON.stringify({
+  console.log('[EA SCHEDULE NORMALIZED 7J-5BI] ' + JSON.stringify({
     candidateRows: candidates.length,
     dedupedGames: games.length,
     sources: Array.from(new Set(candidates.map(c => c.sourceLabel))).slice(0, 20),
@@ -17401,8 +17443,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full schedule expansion enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full schedule expansion enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; current-week schedule UX enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; current-week schedule UX enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
