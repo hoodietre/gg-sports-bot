@@ -14570,7 +14570,7 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
     const awayTeam = normalizeMaddenTeamName(getFirstValue(row, ['awayTeam', 'away_team', 'away', 'awayName']));
     if (!homeTeam || !awayTeam) continue;
 
-    const externalGameId = String(getFirstValue(row, ['id', 'gameId', 'game_id', 'externalGameId'], homeTeam + '-' + awayTeam + '-' + (weekLabel || getFirstValue(row, ['week', 'weekLabel'], 'unknown'))));
+    const externalGameId = String(getFirstValue(row, ['external_game_id', 'id', 'gameId', 'game_id', 'externalGameId'], homeTeam + '-' + awayTeam + '-' + (weekLabel || getFirstValue(row, ['week_label', 'week', 'weekLabel'], 'unknown'))));
     const homeRoleId = await findMaddenTeamRoleId(league.league_id, homeTeam);
     const awayRoleId = await findMaddenTeamRoleId(league.league_id, awayTeam);
     const status = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
@@ -14595,7 +14595,7 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
         guild.id,
         league.league_id,
         externalGameId,
-        weekLabel || getFirstValue(row, ['week', 'weekLabel', 'stage'], null),
+        weekLabel || getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null),
         homeTeam,
         awayTeam,
         homeRoleId,
@@ -16708,18 +16708,24 @@ function normalizeEaWeekLabel(game) {
   const explicit = getAnyValue(game, ['displayedWeek', 'weekTitle', 'week_label', 'weekLabel'], null);
   if (explicit) return String(explicit);
 
-  const week = parseNumberOrNull(getAnyValue(game, ['week', 'weekIndex', 'seasonWeek'], null));
+  const rawWeek = parseNumberOrNull(getAnyValue(game, ['week', 'weekIndex', 'seasonWeek'], null));
   const weekType = parseNumberOrNull(getAnyValue(game, ['weekType', 'seasonWeekType', 'stageIndex'], null));
 
-  if (week !== null) {
-    const displayWeek = week >= 0 ? week + 1 : week;
-    if (weekType === 0) return 'Preseason Week ' + displayWeek;
-    if (weekType === 1 || weekType === null) return 'Week ' + displayWeek;
+  if (rawWeek !== null) {
+    if (weekType === 0) return 'Preseason Week ' + String(rawWeek + 1);
+
+    // EA regular season schedule rows commonly use week=4 for Regular Season Week 1
+    // because preseason weeks occupy indices 0-3. Convert only for regular season.
+    if (weekType === 1 || weekType === null) {
+      const regularWeek = rawWeek >= 4 ? rawWeek - 3 : rawWeek + 1;
+      return 'Week ' + String(regularWeek);
+    }
+
     if (weekType === 2) return 'Wildcard Round';
     if (weekType === 3) return 'Divisional Round';
     if (weekType === 4) return 'Conference Championship';
     if (weekType === 5 || weekType === 6) return 'Super Bowl';
-    return 'Week ' + displayWeek;
+    return 'Week ' + String(rawWeek + 1);
   }
 
   return 'Week TBD';
@@ -16753,29 +16759,71 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     rows = arrays.flatMap(item => item.rows || []);
   }
 
-  return rows.map(item => {
+  const byGameKey = new Map();
+
+  for (const item of rows) {
     const game = item?.seasonGameInfo || item?.gameInfo || item || {};
     const homeTeam = getTeamNameFromGameSide(game, 'home', maps);
     const awayTeam = getTeamNameFromGameSide(game, 'away', maps);
+    if (!homeTeam || !awayTeam || homeTeam === 'Home' || awayTeam === 'Away') continue;
+
+    const seasonGameKey = getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) ||
+      getAnyValue(game, ['seasonGameKey', 'id', 'gameId'], null);
+
+    const weekLabel = normalizeEaWeekLabel(game);
+    const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
+    const externalGameId = String(seasonGameKey || fallbackId);
 
     const homeScore = parseNumberOrNull(getAnyValue(game, ['homeScore', 'homeTeamScore', 'home_score', 'homePts'], null));
     const awayScore = parseNumberOrNull(getAnyValue(game, ['awayScore', 'awayTeamScore', 'away_score', 'awayPts'], null));
-    const isPlayed = Boolean(getAnyValue(game, ['isGamePlayed', 'gamePlayed', 'isPlayed', 'played'], false)) || (homeScore !== null && awayScore !== null && (homeScore > 0 || awayScore > 0));
+    const isPlayed = isGameCompletedFromHubGame(game) || (homeScore !== null && awayScore !== null && (homeScore > 0 || awayScore > 0));
     const result = getAnyValue(game, ['result', 'gameResult'], null);
 
-    return {
-      id: getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) || [normalizeEaWeekLabel(game), awayTeam, homeTeam].join('-'),
-      external_game_id: getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null),
-      week_label: normalizeEaWeekLabel(game),
+    const normalized = {
+      id: externalGameId,
+      external_game_id: externalGameId,
+      week: weekLabel,
+      weekLabel,
+      week_label: weekLabel,
       home_team: homeTeam,
       away_team: awayTeam,
-      home_score: homeScore,
-      away_score: awayScore,
+      homeTeam,
+      awayTeam,
+      home_score: homeScore ?? 0,
+      away_score: awayScore ?? 0,
+      homeScore: homeScore ?? 0,
+      awayScore: awayScore ?? 0,
       status: isPlayed ? 'completed' : 'scheduled',
       result,
       raw: item,
     };
+
+    // Prefer completed rows over scheduled duplicates for the same key.
+    const previous = byGameKey.get(externalGameId);
+    if (!previous || (previous.status !== 'completed' && normalized.status === 'completed')) {
+      byGameKey.set(externalGameId, normalized);
+    }
+  }
+
+  const games = Array.from(byGameKey.values()).sort((a, b) => {
+    const aw = parseNumberOrNull(String(a.week_label || '').match(/\d+/)?.[0]) ?? 999;
+    const bw = parseNumberOrNull(String(b.week_label || '').match(/\d+/)?.[0]) ?? 999;
+    return aw - bw || String(a.away_team).localeCompare(String(b.away_team));
   });
+
+  console.log('[EA SCHEDULE NORMALIZED 7J-5BC] ' + JSON.stringify({
+    inputRows: rows.length,
+    dedupedGames: games.length,
+    sample: games.slice(0, 8).map(g => ({
+      id: g.external_game_id,
+      week: g.week_label,
+      matchup: g.away_team + ' @ ' + g.home_team,
+      status: g.status,
+      score: g.away_score + '-' + g.home_score,
+    })),
+  }));
+
+  return games;
 }
 
 
@@ -17064,8 +17112,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; schedule cleanup enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; schedule cleanup enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
