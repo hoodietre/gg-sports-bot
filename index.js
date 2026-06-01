@@ -14368,30 +14368,11 @@ function formatMaddenTeamGameLine(teamName, game) {
         ? 'L ' + teamScore + '-' + oppScore
         : 'T ' + teamScore + '-' + oppScore;
   } else if (status === 'completed' || status === 'final') {
-    let raw = {};
-    try {
-      raw = typeof game.raw_payload === 'string' ? JSON.parse(game.raw_payload) : (game.raw_payload || {});
-    } catch {
-      raw = {};
-    }
-
-    const rawGame = raw?.raw?.seasonGameInfo || raw?.raw?.gameInfo || raw?.seasonGameInfo || raw?.gameInfo || raw || {};
-    const homeWin = Number(getAnyValue(rawGame, ['homeWin'], 0));
-    const awayWin = Number(getAnyValue(rawGame, ['awayWin'], 0));
-    const homeLoss = Number(getAnyValue(rawGame, ['homeLoss'], 0));
-    const awayLoss = Number(getAnyValue(rawGame, ['awayLoss'], 0));
-    const homeTie = Number(getAnyValue(rawGame, ['homeTie'], 0));
-    const awayTie = Number(getAnyValue(rawGame, ['awayTie'], 0));
-
-    if (homeTie === 1 || awayTie === 1) {
-      result = 'T';
-    } else if ((isHome && (homeWin === 1 || awayLoss === 1)) || (!isHome && (awayWin === 1 || homeLoss === 1))) {
-      result = 'W';
-    } else if ((isHome && (homeLoss === 1 || awayWin === 1)) || (!isHome && (awayLoss === 1 || homeWin === 1))) {
-      result = 'L';
-    } else {
-      result = 'completed';
-    }
+    const winner = resolveMaddenWinnerFromRawGame(game, game.home_team, game.away_team);
+    if (winner === 'tie') result = 'T';
+    else if ((isHome && winner === 'home') || (!isHome && winner === 'away')) result = 'W';
+    else if ((isHome && winner === 'away') || (!isHome && winner === 'home')) result = 'L';
+    else result = 'completed';
   } else {
     result = 'scheduled';
   }
@@ -17334,6 +17315,90 @@ async function cleanupMaddenWeekTbdRows(guild, league) {
 
 
 
+
+function extractMaddenRawGamePayload(gameRowOrRaw) {
+  let raw = gameRowOrRaw?.raw_payload ?? gameRowOrRaw;
+  try {
+    raw = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});
+  } catch {
+    raw = {};
+  }
+
+  return raw?.raw?.seasonGameInfo ||
+    raw?.raw?.gameInfo ||
+    raw?.seasonGameInfo ||
+    raw?.gameInfo ||
+    raw?.raw ||
+    raw ||
+    {};
+}
+
+function resolveMaddenWinnerFromRawGame(gameRow, homeTeam, awayTeam) {
+  const rawGame = extractMaddenRawGamePayload(gameRow);
+
+  const homeWin = Number(getAnyValue(rawGame, ['homeWin', 'home_win', 'isHomeWinner'], 0));
+  const awayWin = Number(getAnyValue(rawGame, ['awayWin', 'away_win', 'isAwayWinner'], 0));
+  const homeLoss = Number(getAnyValue(rawGame, ['homeLoss', 'home_loss'], 0));
+  const awayLoss = Number(getAnyValue(rawGame, ['awayLoss', 'away_loss'], 0));
+  const homeTie = Number(getAnyValue(rawGame, ['homeTie', 'home_tie'], 0));
+  const awayTie = Number(getAnyValue(rawGame, ['awayTie', 'away_tie'], 0));
+  const forceWin = Number(getAnyValue(rawGame, ['forceWin', 'userForceWin', 'canForceWin'], 0));
+  const result = String(getAnyValue(rawGame, ['result', 'gameResult', 'winner', 'winnerName'], '') || '').toLowerCase();
+
+  const homeUserName = String(getAnyValue(rawGame, ['homeUserName'], '') || '').toLowerCase();
+  const awayUserName = String(getAnyValue(rawGame, ['awayUserName'], '') || '').toLowerCase();
+  const homeName = String(getAnyValue(rawGame, ['homeName', 'homeCityName'], homeTeam || '') || '').toLowerCase();
+  const awayName = String(getAnyValue(rawGame, ['awayName', 'awayCityName'], awayTeam || '') || '').toLowerCase();
+
+  // Direct EA flags.
+  if (homeTie === 1 || awayTie === 1) return 'tie';
+  if (homeWin === 1 || awayLoss === 1) return 'home';
+  if (awayWin === 1 || homeLoss === 1) return 'away';
+
+  // Some payloads encode the winner/result as text.
+  if (result) {
+    if (homeName && result.includes(homeName)) return 'home';
+    if (awayName && result.includes(awayName)) return 'away';
+    if (result.includes('home')) return 'home';
+    if (result.includes('away')) return 'away';
+    if (result.includes('tie') || result.includes('draw')) return 'tie';
+  }
+
+  // Force win values appear in some Madden Hub rows.
+  // Known observed values can be title/build dependent, so only use obvious one-sided pairings when present.
+  if (forceWin === 1) return 'home';
+  if (forceWin === 2) return 'away';
+
+  return null;
+}
+
+function applyMaddenWinnerToRecord(records, homeTeam, awayTeam, winner) {
+  const home = records.get(String(homeTeam || '').toLowerCase());
+  const away = records.get(String(awayTeam || '').toLowerCase());
+  if (!home || !away) return false;
+
+  if (winner === 'tie') {
+    home.ties += 1;
+    away.ties += 1;
+    return true;
+  }
+
+  if (winner === 'home') {
+    home.wins += 1;
+    away.losses += 1;
+    return true;
+  }
+
+  if (winner === 'away') {
+    away.wins += 1;
+    home.losses += 1;
+    return true;
+  }
+
+  return false;
+}
+
+
 async function recalculateMaddenStandingsFromImportedGames(guild, league) {
   const teamsResult = await pool.query(
     `SELECT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`,
@@ -17366,6 +17431,10 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
     return records.get(key);
   }
 
+  for (const row of teamsResult.rows) ensure(row.team_name);
+
+  const winnerSamples = [];
+
   for (const game of gamesResult.rows) {
     const homeTeam = game.home_team;
     const awayTeam = game.away_team;
@@ -17381,53 +17450,39 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
     home.games_played += 1;
     away.games_played += 1;
 
+    let winner = null;
+
     if (hasRealScore) {
       home.points_for += homeScore;
       home.points_against += awayScore;
       away.points_for += awayScore;
       away.points_against += homeScore;
 
-      if (homeScore > awayScore) {
-        home.wins += 1;
-        away.losses += 1;
-      } else if (awayScore > homeScore) {
-        away.wins += 1;
-        home.losses += 1;
-      } else {
-        home.ties += 1;
-        away.ties += 1;
-      }
+      if (homeScore > awayScore) winner = 'home';
+      else if (awayScore > homeScore) winner = 'away';
+      else winner = 'tie';
     } else {
-      // EA sometimes marks games completed but still reports 0-0 placeholder scores.
-      // Use Hub-derived win/loss flags when available in raw_payload.
-      let raw = {};
-      try {
-        raw = typeof game.raw_payload === 'string' ? JSON.parse(game.raw_payload) : (game.raw_payload || {});
-      } catch {
-        raw = {};
-      }
+      winner = resolveMaddenWinnerFromRawGame(game, homeTeam, awayTeam);
+    }
 
-      const rawGame = raw?.raw?.seasonGameInfo || raw?.raw?.gameInfo || raw?.seasonGameInfo || raw?.gameInfo || raw || {};
-      const homeWin = Number(getAnyValue(rawGame, ['homeWin'], 0));
-      const awayWin = Number(getAnyValue(rawGame, ['awayWin'], 0));
-      const homeLoss = Number(getAnyValue(rawGame, ['homeLoss'], 0));
-      const awayLoss = Number(getAnyValue(rawGame, ['awayLoss'], 0));
-      const homeTie = Number(getAnyValue(rawGame, ['homeTie'], 0));
-      const awayTie = Number(getAnyValue(rawGame, ['awayTie'], 0));
+    const applied = applyMaddenWinnerToRecord(records, homeTeam, awayTeam, winner);
 
-      if (homeTie === 1 || awayTie === 1) {
-        home.ties += 1;
-        away.ties += 1;
-      } else if (homeWin === 1 || awayLoss === 1) {
-        home.wins += 1;
-        away.losses += 1;
-      } else if (awayWin === 1 || homeLoss === 1) {
-        away.wins += 1;
-        home.losses += 1;
-      } else {
-        // Last-resort fallback: completed 0-0 with no winner flags remains a neutral completed game.
-        // Do not invent a winner.
-      }
+    if (winnerSamples.length < 16) {
+      const rawGame = extractMaddenRawGamePayload(game);
+      winnerSamples.push({
+        week: game.week_label,
+        matchup: awayTeam + ' @ ' + homeTeam,
+        winner,
+        applied,
+        homeWin: getAnyValue(rawGame, ['homeWin'], null),
+        awayWin: getAnyValue(rawGame, ['awayWin'], null),
+        homeLoss: getAnyValue(rawGame, ['homeLoss'], null),
+        awayLoss: getAnyValue(rawGame, ['awayLoss'], null),
+        homeTie: getAnyValue(rawGame, ['homeTie'], null),
+        awayTie: getAnyValue(rawGame, ['awayTie'], null),
+        forceWin: getAnyValue(rawGame, ['forceWin', 'userForceWin'], null),
+        result: getAnyValue(rawGame, ['result', 'gameResult', 'winner', 'winnerName'], null),
+      });
     }
   }
 
@@ -17467,10 +17522,11 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
     updated += 1;
   }
 
-  console.log('[Madden Standings Accumulator 7J-5BJ] ' + JSON.stringify({
-    importedCompletedGames: gamesResult.rows.length,
+  console.log('[Madden Winner Resolver 7J-5BK] ' + JSON.stringify({
+    completedGames: gamesResult.rows.length,
     teamsUpdated: updated,
-    sample: Array.from(records.entries()).slice(0, 8).map(([team, record]) => ({ team, ...record })),
+    winnerSamples,
+    recordSample: Array.from(records.entries()).slice(0, 8).map(([team, record]) => ({ team, ...record })),
   }));
 
   return updated;
@@ -17610,8 +17666,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; multi-week standings accumulator enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; multi-week standings accumulator enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; raw winner flag parser enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; raw winner flag parser enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
