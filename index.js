@@ -16009,7 +16009,7 @@ function cloneEaBlazeSessionForSingleReplay(session) {
 }
 
 async function probeEaSingleUseSessionReplay(context, guild, league) {
-  const enabled = String(process.env.EA_SINGLE_USE_SESSION_REPLAY_ENABLED || 'true').toLowerCase() !== 'false';
+  const enabled = String(process.env.EA_SINGLE_USE_SESSION_REPLAY_ENABLED || 'false').toLowerCase() === 'true';
   if (!enabled) return null;
 
   const activeSession = context.activeBlazeSession || null;
@@ -18112,6 +18112,193 @@ async function backfillMaddenGameScoresFromRawPayload(guild, league) {
 
 
 
+
+function deepFindObjectsByKeyPattern(obj, patterns, path = '', out = [], depth = 0, seen = new Set()) {
+  if (!obj || typeof obj !== 'object' || depth > 8 || seen.has(obj)) return out;
+  seen.add(obj);
+
+  if (!Array.isArray(obj)) {
+    const keys = Object.keys(obj);
+    const matchingKeys = keys.filter(key => patterns.some(pattern => pattern.test(key)));
+    if (matchingKeys.length) {
+      out.push({
+        path,
+        matchingKeys,
+        keys: keys.slice(0, 80),
+        excerpt: compactMaddenRawExcerpt(obj),
+      });
+    }
+  }
+
+  if (Array.isArray(obj)) {
+    obj.slice(0, 150).forEach((item, index) => {
+      deepFindObjectsByKeyPattern(item, patterns, path + '[' + index + ']', out, depth + 1, seen);
+    });
+  } else {
+    for (const [key, value] of Object.entries(obj)) {
+      if (value && typeof value === 'object') {
+        deepFindObjectsByKeyPattern(value, patterns, path ? path + '.' + key : key, out, depth + 1, seen);
+      }
+    }
+  }
+
+  return out;
+}
+
+function deepFindPotentialStatArrays(obj, path = '', out = [], depth = 0, seen = new Set()) {
+  if (!obj || typeof obj !== 'object' || depth > 8 || seen.has(obj)) return out;
+  seen.add(obj);
+
+  if (Array.isArray(obj)) {
+    if (obj.length && obj.some(item => item && typeof item === 'object')) {
+      const firstObj = obj.find(item => item && typeof item === 'object');
+      const keys = Object.keys(firstObj || {});
+      const keyText = keys.join(' ').toLowerCase();
+
+      const interesting =
+        /score|point|pts|stat|standing|record|win|loss|tie|rank|team|game|player|schedule|box|summary|offense|defense|passing|rushing|receiving/.test(keyText);
+
+      if (interesting) {
+        out.push({
+          path,
+          length: obj.length,
+          sampleKeys: keys.slice(0, 120),
+          scoreLikeFields: collectMaddenScoreLikeFields(firstObj),
+          scorePairs: deepFindMaddenNumericScorePairs(firstObj).slice(0, 8),
+          sample: obj.slice(0, 3).map(item => compactMaddenRawExcerpt(item)),
+        });
+      }
+    }
+
+    obj.slice(0, 150).forEach((item, index) => {
+      deepFindPotentialStatArrays(item, path + '[' + index + ']', out, depth + 1, seen);
+    });
+  } else {
+    for (const [key, value] of Object.entries(obj)) {
+      if (value && typeof value === 'object') {
+        deepFindPotentialStatArrays(value, path ? path + '.' + key : key, out, depth + 1, seen);
+      }
+    }
+  }
+
+  return out;
+}
+
+async function inspectLeagueHubDeepExtraction(context, guild, league, hub) {
+  const enabled = String(process.env.EA_LEAGUEHUB_DEEP_EXTRACTION_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const keyPatterns = [
+    /standing/i,
+    /teamStat/i,
+    /gameStat/i,
+    /weeklyStat/i,
+    /seasonStat/i,
+    /box/i,
+    /score/i,
+    /point/i,
+    /pts/i,
+    /summary/i,
+    /playerStat/i,
+    /passing/i,
+    /rushing/i,
+    /receiving/i,
+    /defensive/i,
+    /kicking/i,
+    /punting/i,
+    /export/i,
+    /estimate/i,
+  ];
+
+  const knownArrays = deepFindArraysByKey(hub, [
+    'teamStandingInfoList',
+    'teamStatInfoList',
+    'gameScheduleInfoList',
+    'gameScheduleHubInfo',
+    'leagueSchedule',
+    'availableWeekInfoList',
+    'teamIdInfoList',
+    'playerCountInfo',
+    'gamesPlayerStatsCount',
+    'exportSizeEstimateInfo',
+    'passingStatsPerGameEstimate',
+    'rushingStatsPerGameEstimate',
+    'receivingStatsPerGameEstimate',
+    'defensiveStatsPerGameEstimate',
+    'teamStatsPerGameEstimate',
+    'kickingStatsPerGameEstimate',
+    'puntingStatsPerGameEstimate',
+    'boxScoreInfoList',
+    'scoringSummaryInfoList',
+    'stats',
+    'teams',
+    'games',
+  ]).map(item => ({
+    path: item.path,
+    key: item.key,
+    length: Array.isArray(item.rows) ? item.rows.length : 0,
+    sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+      ? Object.keys(item.rows[0]).slice(0, 120)
+      : [],
+    sample: Array.isArray(item.rows)
+      ? item.rows.slice(0, 3).map(row => compactMaddenRawExcerpt(row))
+      : [],
+  })).slice(0, 40);
+
+  const potentialArrays = deepFindPotentialStatArrays(hub).slice(0, 60);
+  const keyMatches = deepFindObjectsByKeyPattern(hub, keyPatterns).slice(0, 80);
+  const scoreLikeFields = collectMaddenScoreLikeFields(hub);
+  const scorePairs = deepFindMaddenNumericScorePairs(hub).slice(0, 60);
+
+  const scheduleRows = collectEaScheduleCandidateRows(hub).slice(0, 20).map(row => {
+    const item = row.item;
+    const game = item?.seasonGameInfo || item?.gameInfo || item || {};
+    return {
+      source: row.sourceLabel,
+      keys: Object.keys(item || {}).slice(0, 80),
+      seasonGameInfoKeys: Object.keys(game || {}).slice(0, 80),
+      matchup: getAnyValue(game, ['matchup'], null),
+      homeName: getAnyValue(game, ['homeName'], null),
+      awayName: getAnyValue(game, ['awayName'], null),
+      homeWin: getAnyValue(game, ['homeWin'], null),
+      awayWin: getAnyValue(game, ['awayWin'], null),
+      homeLoss: getAnyValue(game, ['homeLoss'], null),
+      awayLoss: getAnyValue(game, ['awayLoss'], null),
+      homeScore: getAnyValue(game, ['homeScore', 'home_score'], null),
+      awayScore: getAnyValue(game, ['awayScore', 'away_score'], null),
+      forceWin: getAnyValue(game, ['forceWin'], null),
+      isBoxScoreUnavailable: getAnyValue(game, ['isBoxScoreUnavailable'], null),
+      gameTime: getAnyValue(game, ['gameTime'], null),
+      excerpt: compactMaddenRawExcerpt(item),
+    };
+  });
+
+  const summary = {
+    leagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    hubTopKeys: Object.keys(hub || {}).slice(0, 100),
+    knownArrays,
+    potentialArrays,
+    keyMatches,
+    scoreLikeFieldCount: Object.keys(scoreLikeFields || {}).length,
+    scoreLikeFields,
+    scorePairs,
+    scheduleRows,
+    conclusionHints: {
+      hasTeamStatsArray: knownArrays.some(a => /teamStat/i.test(a.path || a.key || '') && Number(a.length || 0) > 0),
+      hasStandingsArray: knownArrays.some(a => /standing/i.test(a.path || a.key || '') && Number(a.length || 0) > 0),
+      hasRealScorePair: scorePairs.some(p => p.hasRealScore),
+      scheduleHasBoxScoreUnavailableFlag: scheduleRows.some(r => r.isBoxScoreUnavailable !== null),
+      scheduleRowsWithNonZeroScore: scheduleRows.filter(r => Number(r.homeScore || 0) !== 0 || Number(r.awayScore || 0) !== 0).length,
+    },
+  };
+
+  console.log('[LEAGUEHUB DEEP EXTRACTION 7J-5BV] ' + JSON.stringify(summary).slice(0, 24000));
+
+  return summary;
+}
+
+
 function collectMaddenScoreLikeFields(obj, prefix = '', out = {}, depth = 0) {
   if (!obj || typeof obj !== 'object' || depth > 4) return out;
 
@@ -19060,6 +19247,10 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ]
     );
 
+    await inspectLeagueHubDeepExtraction(context, guild, league, hub).catch(error => {
+      console.error('[Madden Sync] LeagueHub deep extraction inspector failed:', error?.message || error);
+    });
+
     let teams = normalizeEaLeagueTeamsDeepFromHub(hub);
     const games = normalizeEaScheduleDeepFromHub(hub);
 
@@ -19147,8 +19338,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; single-use session replay probe enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; single-use session replay probe enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; LeagueHub deep extraction probe enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; LeagueHub deep extraction probe enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
