@@ -14958,6 +14958,114 @@ async function exchangeEaAuthorizationCode(code) {
   return payload;
 }
 
+
+async function refreshEaAccessToken(refreshToken) {
+  if (!refreshToken) {
+    throw new Error('EA refresh token is missing. Run /madden connect again.');
+  }
+
+  if (!EA_DIRECT_CLIENT_SECRET) {
+    throw new Error('EA_DIRECT_CLIENT_SECRET is missing. Add it in Railway Variables before refreshing EA tokens.');
+  }
+
+  const body =
+    'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
+    '&client_secret=' + encodeURIComponent(EA_DIRECT_CLIENT_SECRET) +
+    '&grant_type=refresh_token' +
+    '&refresh_token=' + encodeURIComponent(refreshToken) +
+    '&release_type=prod' +
+    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_26_COMP_APP');
+
+  const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
+    method: 'POST',
+    headers: {
+      'Accept-Charset': 'UTF-8',
+      'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'Accept-Encoding': 'gzip',
+    },
+    body,
+  });
+
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = { raw: text };
+  }
+
+  if (!response.ok || payload?.error) {
+    const safeBody = body
+      .replace(/refresh_token=[^&]+/g, 'refresh_token=REDACTED')
+      .replace(/client_secret=[^&]+/g, 'client_secret=REDACTED');
+
+    throw new Error(
+      'EA token refresh failed: HTTP ' + response.status +
+      ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
+      ' • token_url=' + (EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token') +
+      ' • body=' + safeBody
+    );
+  }
+
+  return payload;
+}
+
+function isEaExpiredTokenError(error) {
+  const message = String(error?.message || error || '');
+  return message.includes('AUTH_ERR_EXPIRED_TOKEN') ||
+    message.toLowerCase().includes('expired_token') ||
+    message.toLowerCase().includes('expired token');
+}
+
+async function refreshEaConnectionTokens(connection, existingRefreshToken) {
+  const refreshToken = existingRefreshToken || decryptEaSecret(connection.refresh_token_encrypted);
+  const payload = await refreshEaAccessToken(refreshToken);
+
+  const nextAccessToken = payload.access_token;
+  const nextRefreshToken = payload.refresh_token || refreshToken;
+
+  if (!nextAccessToken) {
+    throw new Error('EA token refresh response did not include an access token.');
+  }
+
+  await pool.query(
+    `UPDATE madden_ea_connections
+     SET access_token_encrypted = $2,
+         refresh_token_encrypted = COALESCE($3, refresh_token_encrypted),
+         token_expires_at = $4,
+         token_type = $5,
+         token_scope = $6,
+         raw_token_payload = $7::jsonb,
+         last_error = NULL,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [
+      connection.id,
+      encryptEaSecret(nextAccessToken),
+      nextRefreshToken ? encryptEaSecret(nextRefreshToken) : null,
+      payload.expires_in ? new Date(Date.now() + Number(payload.expires_in) * 1000) : null,
+      payload.token_type || connection.token_type || null,
+      payload.scope || connection.token_scope || null,
+      JSON.stringify(payload || {}),
+    ]
+  );
+
+  console.log('[EA Direct] Refreshed EA token for connection:', {
+    connectionId: connection.id,
+    expiresIn: payload.expires_in || null,
+    tokenType: payload.token_type || null,
+  });
+
+  return {
+    accessToken: nextAccessToken,
+    refreshToken: nextRefreshToken,
+    expiry: payload.expires_in ? new Date(Date.now() + Number(payload.expires_in) * 1000) : new Date(Date.now() + 60 * 60 * 1000),
+    payload,
+  };
+}
+
+
 async function fetchEaJson(url, accessToken, label) {
   if (!url) {
     throw new Error(label + ' endpoint is not configured.');
@@ -16723,11 +16831,21 @@ async function getConnectedEaTokenForLeague(leagueId) {
     throw new Error('No connected EA Direct account found for this Madden league. Run /madden connect first.');
   }
 
-  const accessToken = decryptEaSecret(connection.access_token_encrypted);
-  const refreshToken = decryptEaSecret(connection.refresh_token_encrypted);
+  let accessToken = decryptEaSecret(connection.access_token_encrypted);
+  let refreshToken = decryptEaSecret(connection.refresh_token_encrypted);
+  let expiry = connection.token_expires_at ? new Date(connection.token_expires_at) : new Date(Date.now() + 60 * 60 * 1000);
 
   if (!accessToken) {
     throw new Error('Connected EA account is missing an access token. Run /madden connect again.');
+  }
+
+  const expiresSoon = expiry && expiry.getTime && expiry.getTime() <= Date.now() + 2 * 60 * 1000;
+  if (expiresSoon && refreshToken) {
+    console.log('[EA Direct] Access token expired or near expiry; refreshing before sync.');
+    const refreshed = await refreshEaConnectionTokens(connection, refreshToken);
+    accessToken = refreshed.accessToken;
+    refreshToken = refreshed.refreshToken;
+    expiry = refreshed.expiry;
   }
 
   return {
@@ -16735,7 +16853,7 @@ async function getConnectedEaTokenForLeague(leagueId) {
     token: {
       accessToken,
       refreshToken,
-      expiry: connection.token_expires_at ? new Date(connection.token_expires_at) : new Date(Date.now() + 60 * 60 * 1000),
+      expiry,
       console: null,
       blazeId: connection.persona_id || connection.blaze_id || null,
     },
@@ -16770,6 +16888,24 @@ async function getEaDirectLeagueSyncContext(league) {
   };
 }
 
+
+async function getEaBlazeLeagueHubWithRefreshRetry(context) {
+  try {
+    return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+  } catch (error) {
+    if (!isEaExpiredTokenError(error)) throw error;
+
+    console.log('[EA Direct] Blaze login reported expired token. Refreshing and retrying LeagueHub once.');
+    const refreshed = await refreshEaConnectionTokens(context.connection, context.token.refreshToken);
+    context.token.accessToken = refreshed.accessToken;
+    context.token.refreshToken = refreshed.refreshToken;
+    context.token.expiry = refreshed.expiry;
+
+    return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+  }
+}
+
+
 async function runMaddenEaDirectSync(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
   const runId = randomUUID();
@@ -16782,7 +16918,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
   try {
     const context = await getEaDirectLeagueSyncContext(league);
-    const hub = await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+    const hub = await getEaBlazeLeagueHubWithRefreshRetry(context);
 
     await pool.query(
       `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
@@ -16857,8 +16993,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season.'
-        : 'Regular season mode: hub-native standings parser enabled; unstable EA standings probes disabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
@@ -16884,7 +17020,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       [league.league_id, String(context.externalLeagueId), message]
     );
   } catch (error) {
-    const message = 'EA Direct sync failed: ' + (error?.message || error);
+    const message = 'EA Direct sync failed: ' + (isEaExpiredTokenError(error) ? 'EA token expired and refresh failed. Run /madden connect again. Details: ' : '') + (error?.message || error);
     await pool.query(
       `UPDATE madden_sync_runs
        SET status = 'failed',
