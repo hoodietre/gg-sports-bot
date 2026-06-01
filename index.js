@@ -16821,6 +16821,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       console.log('[EA STANDINGS PRESEASON-SAFE] Skipping standings probe because league is currently in ' + seasonModeLabel + '. EA standings usually reset/not available until regular season.');
     } else if (!hasRealRecordData) {
       console.log('[EA STANDINGS HUB-NATIVE] Regular season detected, but LeagueHub did not include completed standings/record fields yet. Skipping unstable 802/803 probes and relying on Hub schedule-derived records.');
+    }
 
     if (probeResults.length) {
       await pool.query(
