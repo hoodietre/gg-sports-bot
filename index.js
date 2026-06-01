@@ -17818,6 +17818,245 @@ function summarizeEaTeamStatsProbeValue(command, requestPayload, response) {
   };
 }
 
+
+function summarizeSnallapaExportProbe(command, requestPayload, response) {
+  const value = response?.responseInfo?.value || response;
+
+  const arrays = deepFindArraysByKey(value, [
+    'teamStatInfoList',
+    'gameScheduleInfoList',
+    'teamStandingInfoList',
+    'playerPassingStatInfoList',
+    'playerRushingStatInfoList',
+    'playerReceivingStatInfoList',
+    'playerDefensiveStatInfoList',
+    'playerKickingStatInfoList',
+    'playerPuntingStatInfoList',
+    'rosterInfoList',
+    'gameStatInfoList',
+    'gameStatsInfoList',
+    'scoreSummaryInfoList',
+    'scoringSummaryInfoList',
+    'boxScoreInfoList',
+    'stats',
+    'games',
+    'teams',
+  ]);
+
+  const scoreLikeFields = collectMaddenScoreLikeFields(value);
+  const scorePairs = deepFindMaddenNumericScorePairs(value).slice(0, 20);
+
+  return {
+    commandName: command.name,
+    commandId: command.id,
+    expectedExport: command.exportType,
+    payload: requestPayload,
+    topKeys: Object.keys(value || {}).slice(0, 60),
+    arrays: arrays.map(item => ({
+      path: item.path,
+      key: item.key,
+      length: Array.isArray(item.rows) ? item.rows.length : 0,
+      sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+        ? Object.keys(item.rows[0]).slice(0, 100)
+        : [],
+      sample: Array.isArray(item.rows)
+        ? item.rows.slice(0, 2).map(row => compactMaddenRawExcerpt(row))
+        : [],
+    })).slice(0, 16),
+    scoreLikeFields,
+    scorePairs,
+    rawExcerpt: compactMaddenRawExcerpt(value),
+  };
+}
+
+async function probeSnallapaCommandMapReconstruction(context, guild, league) {
+  const enabled = String(process.env.EA_SNALLAPA_COMMAND_MAP_PROBE_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return [];
+
+  const weekResult = await pool.query(
+    `SELECT week_label, COUNT(*)::int AS games
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+     GROUP BY week_label
+     ORDER BY week_label DESC
+     LIMIT 3`,
+    [guild.id, league.league_id]
+  );
+
+  const weeks = (weekResult.rows || []).map(row => row.week_label).filter(Boolean);
+  if (!weeks.length) {
+    console.log('[SNALLAPA COMMAND MAP 7J-5BR] No imported weeks available.');
+    return [];
+  }
+
+  // Reconstructed from Snallapa's export destination names:
+  // standings -> StandingExport.teamStandingInfoList
+  // schedules -> SchedulesExport.gameScheduleInfoList
+  // teamStats -> TeamStatsExport.teamStatInfoList
+  // player stat exports -> weekly stat info lists
+  // We probe the likely command ids close to the known Madden mobile career ids.
+  const commandMap = [
+    { exportType: 'standings', name: 'Mobile_Career_GetStandings', id: 802 },
+    { exportType: 'teamStats', name: 'Mobile_Career_GetTeamStats', id: 803 },
+    { exportType: 'weeklyStats', name: 'Mobile_Career_GetWeeklyStats', id: 804 },
+    { exportType: 'seasonStats', name: 'Mobile_Career_GetSeasonStats', id: 805 },
+    { exportType: 'gameStats', name: 'Mobile_Career_GetGameStats', id: 806 },
+    { exportType: 'teamStatsInfo', name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
+    { exportType: 'gameStatsInfo', name: 'Mobile_Career_GetGameStatsInfo', id: 809 },
+    { exportType: 'gameInfo', name: 'Mobile_Career_GetGameInfo', id: 810 },
+    { exportType: 'leagueHub', name: 'Mobile_Career_GetLeagueHub', id: 811 },
+    { exportType: 'seasonGame', name: 'Mobile_Career_GetSeasonGame', id: 812 },
+    { exportType: 'gameDetails', name: 'Mobile_Career_GetGameDetails', id: 813 },
+    { exportType: 'powerRankings', name: 'Mobile_Career_GetPowerRankings', id: 814 },
+    { exportType: 'teamRankings', name: 'Mobile_Career_GetTeamRankings', id: 815 },
+    { exportType: 'gameResult', name: 'Mobile_Career_GetGameResult', id: 816 },
+    { exportType: 'boxScore', name: 'Mobile_Career_GetBoxScore', id: 817 },
+    { exportType: 'scoringSummary', name: 'Mobile_Career_GetScoringSummary', id: 818 },
+  ];
+
+  function pushUnique(list, payload) {
+    const clean = {};
+    for (const [key, value] of Object.entries(payload || {})) {
+      if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
+    }
+    const key = JSON.stringify(clean);
+    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(clean);
+  }
+
+  const gamesResult = await pool.query(
+    `SELECT *
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+     ORDER BY week_label DESC, imported_at DESC
+     LIMIT 2`,
+    [guild.id, league.league_id]
+  );
+
+  const sampleGame = gamesResult.rows?.[0] || null;
+  const rawGame = sampleGame ? extractMaddenRawGamePayload(sampleGame) : {};
+  const sampleSeasonGameKey = sampleGame ? extractMaddenSeasonGameKeyFromAny(sampleGame) : null;
+
+  const results = [];
+  let attempted = 0;
+  const maxAttempts = Number(process.env.EA_SNALLAPA_COMMAND_MAP_MAX_ATTEMPTS || 48);
+
+  for (const weekLabel of weeks) {
+    const weekNumber = maddenWeekNumberFromLabel(weekLabel);
+    const exportWeekIndex = weekNumber !== null ? Math.max(0, weekNumber - 1) : null;
+    const mcaSeasonWeek = weekNumber !== null ? weekNumber + 3 : null;
+    const stage = 1;
+    const seasonWeekType = 1;
+
+    const payloadVariants = [];
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId) });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stageIndex: stage });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, weekType: seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: weekNumber, stage });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: weekNumber, weekType: seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: mcaSeasonWeek, weekType: seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, weekType: seasonWeekType });
+
+    if (sampleSeasonGameKey) {
+      pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonGameKey: Number(sampleSeasonGameKey) });
+      pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), gameId: Number(sampleSeasonGameKey) });
+      pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonGameKey: Number(sampleSeasonGameKey), weekIndex: exportWeekIndex, stage });
+      pushUnique(payloadVariants, {
+        leagueId: Number(context.externalLeagueId),
+        seasonGameKey: Number(sampleSeasonGameKey),
+        homeTeam: getAnyValue(rawGame, ['homeTeam'], null),
+        awayTeam: getAnyValue(rawGame, ['awayTeam'], null),
+        week: getAnyValue(rawGame, ['week'], null),
+        weekType: getAnyValue(rawGame, ['weekType'], null),
+      });
+    }
+
+    console.log('[SNALLAPA COMMAND MAP TRACE 7J-5BR] ' + JSON.stringify({
+      weekLabel,
+      derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage, seasonWeekType },
+      sampleGame: sampleGame ? {
+        matchup: sampleGame.away_team + ' @ ' + sampleGame.home_team,
+        seasonGameKey: sampleSeasonGameKey,
+        rawKeys: Object.keys(rawGame || {}).slice(0, 50),
+      } : null,
+      payloadVariants: payloadVariants.slice(0, 16),
+      commandMap: commandMap.map(c => c.exportType + ':' + c.name + ':' + c.id),
+    }).slice(0, 12000));
+
+    for (const command of commandMap) {
+      for (const payload of payloadVariants) {
+        if (attempted >= maxAttempts) break;
+        attempted += 1;
+
+        try {
+          const response = await sendEaBlazeCareerModeCommand(context.token, command.name, command.id, payload);
+          const summary = summarizeSnallapaExportProbe(command, payload, response);
+          const record = { success: true, weekLabel, ...summary };
+          results.push(record);
+
+          console.log('[SNALLAPA COMMAND MAP HIT 7J-5BR] ' + JSON.stringify(record).slice(0, 14000));
+
+          const hasUsefulArray = (summary.arrays || []).some(a => Number(a.length || 0) > 0);
+          const hasScorePair = (summary.scorePairs || []).some(pair => pair.hasRealScore);
+          const scoreKeys = Object.keys(summary.scoreLikeFields || {}).filter(key => /score|point|pts|for|against|total|stat/i.test(key));
+
+          if (hasUsefulArray || hasScorePair || scoreKeys.length) {
+            console.log('[SNALLAPA COMMAND MAP CANDIDATE 7J-5BR] ' + JSON.stringify({
+              weekLabel,
+              commandName: command.name,
+              commandId: command.id,
+              exportType: command.exportType,
+              payload,
+              arrays: summary.arrays,
+              scorePairs: summary.scorePairs,
+              scoreKeys: scoreKeys.slice(0, 100),
+              scoreLikeFields: summary.scoreLikeFields,
+            }).slice(0, 18000));
+          }
+        } catch (error) {
+          const fail = {
+            success: false,
+            weekLabel,
+            commandName: command.name,
+            commandId: command.id,
+            exportType: command.exportType,
+            payload,
+            error: String(error?.message || error).slice(0, 900),
+          };
+          results.push(fail);
+          console.log('[SNALLAPA COMMAND MAP FAIL 7J-5BR] ' + JSON.stringify(fail));
+        }
+      }
+      if (attempted >= maxAttempts) break;
+    }
+
+    if (attempted >= maxAttempts) break;
+  }
+
+  console.log('[SNALLAPA COMMAND MAP SUMMARY 7J-5BR] ' + JSON.stringify({
+    attempted,
+    successes: results.filter(r => r.success).length,
+    failures: results.filter(r => !r.success).length,
+    commandsTried: [...new Set(results.map(r => r.commandName))],
+    successfulPayloads: results.filter(r => r.success).map(r => ({
+      weekLabel: r.weekLabel,
+      exportType: r.exportType,
+      commandName: r.commandName,
+      commandId: r.commandId,
+      payload: r.payload,
+      arrays: r.arrays,
+      scorePairs: r.scorePairs,
+      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 80),
+    })).slice(0, 20),
+  }).slice(0, 18000));
+
+  return results;
+}
+
+
 async function probeEaTeamStatsMirrorSource(context, guild, league) {
   const enabled = String(process.env.EA_TEAMSTATS_PROBE_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return [];
@@ -18444,6 +18683,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await inspectMaddenDeepRawScoreCandidates(guild, league).catch(error => {
       console.error('[Madden Sync] Deep raw score candidate inspector failed:', error?.message || error);
     });
+    await probeSnallapaCommandMapReconstruction(context, guild, league).catch(error => {
+      console.error('[Madden Sync] Snallapa command-map probe failed:', error?.message || error);
+    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
 
@@ -18453,8 +18695,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa raw game parser mode enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa raw game parser mode enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa command-map reconstruction enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa command-map reconstruction enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
