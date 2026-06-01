@@ -4752,7 +4752,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
          FROM franchise_legacy
          WHERE guild_id = $1 AND league_id = $2
          ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
-         LIMIT 25`,
+         LIMIT 50`,
         [interaction.guild.id, activeLeague.league_id]
       );
       await interaction.reply({ embeds: [buildFranchiseLegacyEmbed(activeLeague, result.rows)], ephemeral: true });
@@ -4769,8 +4769,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       const result = awardFilter
-        ? await pool.query(`SELECT season_label, award_name, winner FROM award_history WHERE guild_id = $1 AND league_id = $2 AND LOWER(award_name) = LOWER($3) ORDER BY created_at DESC LIMIT 25`, [interaction.guild.id, activeLeague.league_id, awardFilter])
-        : await pool.query(`SELECT season_label, award_name, winner FROM award_history WHERE guild_id = $1 AND league_id = $2 ORDER BY created_at DESC LIMIT 25`, [interaction.guild.id, activeLeague.league_id]);
+        ? await pool.query(`SELECT season_label, award_name, winner FROM award_history WHERE guild_id = $1 AND league_id = $2 AND LOWER(award_name) = LOWER($3) ORDER BY created_at DESC LIMIT 50`, [interaction.guild.id, activeLeague.league_id, awardFilter])
+        : await pool.query(`SELECT season_label, award_name, winner FROM award_history WHERE guild_id = $1 AND league_id = $2 ORDER BY created_at DESC LIMIT 50`, [interaction.guild.id, activeLeague.league_id]);
       await interaction.reply({ embeds: [buildAwardHistoryEmbed(activeLeague, result.rows, awardFilter)], ephemeral: true });
       return;
     }
@@ -5622,11 +5622,11 @@ if (gameSubcommand === 'report') {
 
         const result = week
           ? await pool.query(
-              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 AND LOWER(week_label) = LOWER($3) ORDER BY week_label ASC, away_team ASC LIMIT 25`,
+              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 AND LOWER(week_label) = LOWER($3) ORDER BY week_label ASC, away_team ASC LIMIT 50`,
               [interaction.guild.id, activeLeague.league_id, week]
             )
           : await pool.query(
-              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 ORDER BY CASE WHEN week_label IS NULL OR LOWER(week_label) = 'week tbd' THEN 1 ELSE 0 END, week_label ASC, away_team ASC LIMIT 25`,
+              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 ORDER BY CASE WHEN week_label IS NULL OR LOWER(week_label) = 'week tbd' THEN 1 ELSE 0 END, week_label ASC, away_team ASC LIMIT 50`,
               [interaction.guild.id, activeLeague.league_id]
             );
 
@@ -5651,7 +5651,7 @@ if (gameSubcommand === 'report') {
              AND ($3::text IS NULL OR LOWER(team_name) LIKE LOWER('%' || $3 || '%'))
              AND ($4::text IS NULL OR LOWER(position) = LOWER($4))
            ORDER BY overall DESC NULLS LAST, player_name ASC
-           LIMIT 25`,
+           LIMIT 50`,
           [interaction.guild.id, activeLeague.league_id, team || null, position || null]
         );
 
@@ -6610,7 +6610,7 @@ if (shopSubcommand === 'view') {
           `SELECT * FROM shop_items
            WHERE guild_id = $1 AND is_active = TRUE
            ORDER BY price ASC, item_name ASC
-           LIMIT 25`,
+           LIMIT 50`,
           [interaction.guild.id]
         );
 
@@ -6706,7 +6706,7 @@ if (shopSubcommand === 'view') {
           `SELECT * FROM user_inventory
            WHERE guild_id = $1 AND user_id = $2
            ORDER BY purchased_at DESC
-           LIMIT 25`,
+           LIMIT 50`,
           [interaction.guild.id, targetUser.id]
         );
 
@@ -8267,7 +8267,7 @@ if (shopSubcommand === 'view') {
              AND request_action IN ('lagout', 'quit', 'reset')
              AND review_decision = $3
            ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
-           LIMIT 25`,
+           LIMIT 50`,
           [interaction.guild.id, activeLeague.league_id, decision]
         );
       } else if (activeLeague) {
@@ -8276,7 +8276,7 @@ if (shopSubcommand === 'view') {
            WHERE guild_id = $1 AND league_id = $2 AND ticket_type = 'gamerequest'
              AND request_action IN ('lagout', 'quit', 'reset')
            ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
-           LIMIT 25`,
+           LIMIT 50`,
           [interaction.guild.id, activeLeague.league_id]
         );
       } else if (decision) {
@@ -8286,7 +8286,7 @@ if (shopSubcommand === 'view') {
              AND request_action IN ('lagout', 'quit', 'reset')
              AND review_decision = $2
            ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
-           LIMIT 25`,
+           LIMIT 50`,
           [interaction.guild.id, decision]
         );
       } else {
@@ -8295,7 +8295,7 @@ if (shopSubcommand === 'view') {
            WHERE guild_id = $1 AND ticket_type = 'gamerequest'
              AND request_action IN ('lagout', 'quit', 'reset')
            ORDER BY review_decision_at DESC NULLS LAST, created_at DESC
-           LIMIT 25`,
+           LIMIT 50`,
           [interaction.guild.id]
         );
       }
@@ -9737,7 +9737,7 @@ if (shopSubcommand === 'view') {
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
-        `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY created_at DESC LIMIT 25`,
+        `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY created_at DESC LIMIT 50`,
         [interaction.guild.id]
       );
       await interaction.reply({ embeds: [buildShopEmbed(settings, result.rows)], ephemeral: true });
@@ -9788,7 +9788,7 @@ if (shopSubcommand === 'view') {
       const targetUser = interaction.options.getUser('user') || interaction.user;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
-        `SELECT * FROM user_inventory WHERE guild_id = $1 AND user_id = $2 ORDER BY purchased_at DESC LIMIT 25`,
+        `SELECT * FROM user_inventory WHERE guild_id = $1 AND user_id = $2 ORDER BY purchased_at DESC LIMIT 50`,
         [interaction.guild.id, targetUser.id]
       );
       await interaction.reply({ embeds: [buildInventoryEmbed(settings, targetUser, result.rows)], ephemeral: true });
@@ -16893,21 +16893,69 @@ function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = n
 }
 
 
+
+function collectEaScheduleCandidateRows(hubPayload) {
+  const rows = [];
+  const seenObjects = new Set();
+
+  function addRows(list, sourceLabel) {
+    if (!Array.isArray(list)) return;
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      if (seenObjects.has(item)) continue;
+      seenObjects.add(item);
+      rows.push({ item, sourceLabel });
+    }
+  }
+
+  addRows(hubPayload?.gameScheduleHubInfo?.leagueSchedule, 'gameScheduleHubInfo.leagueSchedule');
+  addRows(hubPayload?.seasonGameInfoList, 'seasonGameInfoList');
+  addRows(hubPayload?.leagueSchedule, 'leagueSchedule');
+  addRows(hubPayload?.schedule, 'schedule');
+  addRows(hubPayload?.games, 'games');
+
+  const arrays = deepFindArraysByKey(hubPayload, [
+    'leagueSchedule',
+    'gameSchedule',
+    'gameScheduleInfo',
+    'schedule',
+    'games',
+    'seasonGameInfoList',
+    'seasonGames',
+    'futureGames',
+    'weeklySchedule',
+    'allGames'
+  ]);
+
+  for (const found of arrays) {
+    addRows(found.rows || [], found.path || found.key || 'deepScheduleArray');
+  }
+
+  return rows;
+}
+
+function looksLikeEaScheduleGame(item) {
+  const game = item?.seasonGameInfo || item?.gameInfo || item || {};
+  const hasHome = getAnyValue(game, ['homeName', 'homeTeamName', 'homeCityName', 'homeTeam', 'homeTeamId', 'homeTeamLogoId'], null) !== null ||
+    getAnyValue(item, ['homeName', 'homeTeamName', 'homeCityName', 'homeTeam', 'homeTeamId', 'homeTeamLogoId'], null) !== null;
+  const hasAway = getAnyValue(game, ['awayName', 'awayTeamName', 'awayCityName', 'awayTeam', 'awayTeamId', 'awayTeamLogoId'], null) !== null ||
+    getAnyValue(item, ['awayName', 'awayTeamName', 'awayCityName', 'awayTeam', 'awayTeamId', 'awayTeamLogoId'], null) !== null;
+  return Boolean(hasHome && hasAway);
+}
+
+
 function normalizeEaScheduleDeepFromHub(hubPayload) {
   const maps = buildEaTeamNameMaps(hubPayload);
   const currentCtx = extractEaStandingsRequestContextFromHub(hubPayload, 0);
-  const schedule = hubPayload?.gameScheduleHubInfo?.leagueSchedule;
-  let rows = Array.isArray(schedule) ? schedule : [];
 
-  if (!rows.length) {
-    const arrays = deepFindArraysByKey(hubPayload, ['leagueSchedule', 'schedule', 'games', 'seasonGameInfoList', 'gameSchedule']);
-    rows = arrays.flatMap(item => item.rows || []);
-  }
+  const candidates = collectEaScheduleCandidateRows(hubPayload)
+    .filter(row => looksLikeEaScheduleGame(row.item));
 
   const byGameKey = new Map();
 
-  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-    const item = rows[rowIndex];
+  for (let rowIndex = 0; rowIndex < candidates.length; rowIndex++) {
+    const wrapper = candidates[rowIndex];
+    const item = wrapper.item;
     const game = item?.seasonGameInfo || item?.gameInfo || item || {};
     const homeTeam = getTeamNameFromGameSide(game, 'home', maps);
     const awayTeam = getTeamNameFromGameSide(game, 'away', maps);
@@ -16941,12 +16989,15 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
       awayScore: awayScore ?? 0,
       status: isPlayed ? ((Number(homeScore || 0) !== 0 || Number(awayScore || 0) !== 0) ? 'completed_with_real_score' : 'completed') : 'scheduled',
       result,
+      sourceLabel: wrapper.sourceLabel,
       raw: item,
     };
 
-    // Prefer completed rows over scheduled duplicates for the same key.
     const previous = byGameKey.get(externalGameId);
-    if (!previous || (!String(previous.status || '').startsWith('completed') && String(normalized.status || '').startsWith('completed'))) {
+    const previousCompleted = String(previous?.status || '').startsWith('completed');
+    const currentCompleted = String(normalized.status || '').startsWith('completed');
+
+    if (!previous || (!previousCompleted && currentCompleted)) {
       byGameKey.set(externalGameId, normalized);
     }
   }
@@ -16970,19 +17021,21 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
   }
 
   games = games.sort((a, b) => {
-    const aw = parseNumberOrNull(String(a.week_label || '').match(/\d+/)?.[0]) ?? 999;
-    const bw = parseNumberOrNull(String(b.week_label || '').match(/\d+/)?.[0]) ?? 999;
+    const aw = maddenWeekSortValue(a.week_label);
+    const bw = maddenWeekSortValue(b.week_label);
     return aw - bw || String(a.away_team).localeCompare(String(b.away_team));
   });
 
-  console.log('[EA SCHEDULE NORMALIZED 7J-5BG] ' + JSON.stringify({
-    inputRows: rows.length,
+  console.log('[EA SCHEDULE NORMALIZED 7J-5BH] ' + JSON.stringify({
+    candidateRows: candidates.length,
     dedupedGames: games.length,
-    sample: games.slice(0, 8).map(g => ({
+    sources: Array.from(new Set(candidates.map(c => c.sourceLabel))).slice(0, 20),
+    sample: games.slice(0, 12).map(g => ({
       id: g.external_game_id,
       week: g.week_label,
       matchup: g.away_team + ' @ ' + g.home_team,
       status: g.status,
+      source: g.sourceLabel,
       score: g.away_score + '-' + g.home_score,
     })),
   }));
@@ -17348,8 +17401,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; future week resolver expansion enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; future week resolver expansion enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full schedule expansion enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full schedule expansion enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
@@ -17717,7 +17770,7 @@ async function selectEaPersonaViaEndpoint(guildId, leagueId, userId, personaId) 
 
 async function getEaLeagueChoicesForConnection(leagueId, userId) {
   const result = await pool.query(
-    `SELECT * FROM madden_ea_league_choices WHERE league_id = $1 AND user_id = $2 ORDER BY external_league_name ASC LIMIT 25`,
+    `SELECT * FROM madden_ea_league_choices WHERE league_id = $1 AND user_id = $2 ORDER BY external_league_name ASC LIMIT 50`,
     [leagueId, userId]
   );
   return result.rows;
@@ -17863,7 +17916,7 @@ async function completeEaTokenExchange(guildId, leagueId, userId, code) {
 
 async function getEaPersonasForConnection(leagueId, userId) {
   const result = await pool.query(
-    `SELECT * FROM madden_ea_personas WHERE league_id = $1 AND user_id = $2 ORDER BY persona_name ASC LIMIT 25`,
+    `SELECT * FROM madden_ea_personas WHERE league_id = $1 AND user_id = $2 ORDER BY persona_name ASC LIMIT 50`,
     [leagueId, userId]
   );
   return result.rows;
@@ -17871,7 +17924,7 @@ async function getEaPersonasForConnection(leagueId, userId) {
 
 async function getEaFranchisesForConnection(leagueId, userId) {
   const result = await pool.query(
-    `SELECT * FROM madden_ea_franchises WHERE league_id = $1 AND user_id = $2 ORDER BY franchise_name ASC LIMIT 25`,
+    `SELECT * FROM madden_ea_franchises WHERE league_id = $1 AND user_id = $2 ORDER BY franchise_name ASC LIMIT 50`,
     [leagueId, userId]
   );
   return result.rows;
