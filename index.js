@@ -14356,8 +14356,11 @@ function formatMaddenGameScore(game) {
 function formatMaddenTeamGameLine(teamName, game) {
   const isHome = String(game.home_team || '').toLowerCase() === String(teamName || '').toLowerCase();
   const opp = isHome ? game.away_team : game.home_team;
-  const teamScore = isHome ? game.home_score : game.away_score;
-  const oppScore = isHome ? game.away_score : game.home_score;
+  const scoreInfo = resolveMaddenScoresFromRawGame(game);
+  const resolvedHomeScore = scoreInfo.homeScore ?? game.home_score;
+  const resolvedAwayScore = scoreInfo.awayScore ?? game.away_score;
+  const teamScore = isHome ? resolvedHomeScore : resolvedAwayScore;
+  const oppScore = isHome ? resolvedAwayScore : resolvedHomeScore;
   const status = String(game.status || 'scheduled').toLowerCase();
 
   let result;
@@ -17014,9 +17017,10 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
 
-    const homeScore = parseNumberOrNull(getAnyValue(game, ['homeScore', 'homeTeamScore', 'home_score', 'homePts'], null));
-    const awayScore = parseNumberOrNull(getAnyValue(game, ['awayScore', 'awayTeamScore', 'away_score', 'awayPts'], null));
-    const isPlayed = isGameCompletedFromHubGame(game) || (homeScore !== null && awayScore !== null && (homeScore > 0 || awayScore > 0));
+    const scoreInfo = resolveMaddenScoresFromRawGame({ raw: item });
+    const homeScore = scoreInfo.homeScore;
+    const awayScore = scoreInfo.awayScore;
+    const isPlayed = isGameCompletedFromHubGame(game) || scoreInfo.hasRealScore;
     const result = getAnyValue(game, ['result', 'gameResult'], null);
 
     const normalized = {
@@ -17033,7 +17037,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
       away_score: awayScore ?? 0,
       homeScore: homeScore ?? 0,
       awayScore: awayScore ?? 0,
-      status: isPlayed ? ((Number(homeScore || 0) !== 0 || Number(awayScore || 0) !== 0) ? 'completed_with_real_score' : 'completed') : 'scheduled',
+      status: isPlayed ? (scoreInfo.hasRealScore ? 'completed_with_real_score' : 'completed') : 'scheduled',
       result,
       sourceLabel: wrapper.sourceLabel,
       raw: item,
@@ -17333,6 +17337,79 @@ function extractMaddenRawGamePayload(gameRowOrRaw) {
     {};
 }
 
+
+function parseMaddenScoreValue(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function resolveMaddenScoresFromRawGame(gameRow) {
+  const rawGame = extractMaddenRawGamePayload(gameRow);
+
+  const homeCandidates = [
+    gameRow?.home_score,
+    gameRow?.homeScore,
+    getAnyValue(rawGame, ['homeScore', 'home_score', 'homeTeamScore', 'homePts', 'homePoints', 'homeFinalScore', 'homeTeamFinalScore'], null),
+    getAnyValue(rawGame, ['homeStatScore', 'homeScoreValue', 'homeTotalScore'], null),
+  ];
+
+  const awayCandidates = [
+    gameRow?.away_score,
+    gameRow?.awayScore,
+    getAnyValue(rawGame, ['awayScore', 'away_score', 'awayTeamScore', 'awayPts', 'awayPoints', 'awayFinalScore', 'awayTeamFinalScore'], null),
+    getAnyValue(rawGame, ['awayStatScore', 'awayScoreValue', 'awayTotalScore'], null),
+  ];
+
+  let homeScore = null;
+  let awayScore = null;
+
+  for (const candidate of homeCandidates) {
+    const parsed = parseMaddenScoreValue(candidate);
+    if (parsed !== null) {
+      homeScore = parsed;
+      break;
+    }
+  }
+
+  for (const candidate of awayCandidates) {
+    const parsed = parseMaddenScoreValue(candidate);
+    if (parsed !== null) {
+      awayScore = parsed;
+      break;
+    }
+  }
+
+  // If EA only stores a text result like "24-17", parse it cautiously.
+  if ((homeScore === null || awayScore === null)) {
+    const resultText = String(getAnyValue(rawGame, ['score', 'finalScore', 'resultText', 'gameResultText'], '') || '');
+    const match = resultText.match(/(\d+)\s*[-–]\s*(\d+)/);
+    if (match) {
+      // Unknown orientation, only use this when both explicit scores are missing.
+      if (awayScore === null) awayScore = Number(match[1]);
+      if (homeScore === null) homeScore = Number(match[2]);
+    }
+  }
+
+  const hasRealScore = homeScore !== null && awayScore !== null && (homeScore !== 0 || awayScore !== 0);
+
+  return {
+    homeScore,
+    awayScore,
+    hasRealScore,
+    rawScoreKeys: {
+      homeScore: getAnyValue(rawGame, ['homeScore'], null),
+      awayScore: getAnyValue(rawGame, ['awayScore'], null),
+      homeTeamScore: getAnyValue(rawGame, ['homeTeamScore'], null),
+      awayTeamScore: getAnyValue(rawGame, ['awayTeamScore'], null),
+      homePts: getAnyValue(rawGame, ['homePts', 'homePoints'], null),
+      awayPts: getAnyValue(rawGame, ['awayPts', 'awayPoints'], null),
+      score: getAnyValue(rawGame, ['score', 'finalScore', 'resultText', 'gameResultText'], null),
+    },
+  };
+}
+
+
 function resolveMaddenWinnerFromRawGame(gameRow, homeTeam, awayTeam) {
   const rawGame = extractMaddenRawGamePayload(gameRow);
 
@@ -17399,6 +17476,43 @@ function applyMaddenWinnerToRecord(records, homeTeam, awayTeam, winner) {
 }
 
 
+
+async function backfillMaddenGameScoresFromRawPayload(guild, league) {
+  const gamesResult = await pool.query(
+    `SELECT *
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2`,
+    [guild.id, league.league_id]
+  );
+
+  let updated = 0;
+  for (const game of gamesResult.rows) {
+    const scoreInfo = resolveMaddenScoresFromRawGame(game);
+    if (!scoreInfo.hasRealScore) continue;
+
+    await pool.query(
+      `UPDATE madden_imported_games
+       SET home_score = $3,
+           away_score = $4,
+           status = CASE
+             WHEN LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score') THEN 'completed_with_real_score'
+             ELSE status
+           END,
+           imported_at = NOW()
+       WHERE id = $1 AND league_id = $2`,
+      [game.id, league.league_id, scoreInfo.homeScore, scoreInfo.awayScore]
+    );
+    updated += 1;
+  }
+
+  if (updated) {
+    console.log('[Madden Score Backfill 7J-5BL] Updated game scores from raw payload:', updated);
+  }
+
+  return updated;
+}
+
+
 async function recalculateMaddenStandingsFromImportedGames(guild, league) {
   const teamsResult = await pool.query(
     `SELECT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`,
@@ -17443,9 +17557,10 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
     const home = ensure(homeTeam);
     const away = ensure(awayTeam);
 
-    const homeScore = Number(game.home_score ?? 0);
-    const awayScore = Number(game.away_score ?? 0);
-    const hasRealScore = Number.isFinite(homeScore) && Number.isFinite(awayScore) && (homeScore !== 0 || awayScore !== 0);
+    const scoreInfo = resolveMaddenScoresFromRawGame(game);
+    const homeScore = Number(scoreInfo.homeScore ?? 0);
+    const awayScore = Number(scoreInfo.awayScore ?? 0);
+    const hasRealScore = Boolean(scoreInfo.hasRealScore);
 
     home.games_played += 1;
     away.games_played += 1;
@@ -17482,6 +17597,7 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
         awayTie: getAnyValue(rawGame, ['awayTie'], null),
         forceWin: getAnyValue(rawGame, ['forceWin', 'userForceWin'], null),
         result: getAnyValue(rawGame, ['result', 'gameResult', 'winner', 'winnerName'], null),
+        scoreInfo: resolveMaddenScoresFromRawGame(game),
       });
     }
   }
@@ -17654,6 +17770,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await cleanupMaddenWeekTbdRows(guild, league).catch(error => {
       console.error('[Madden Sync] Week TBD cleanup failed:', error?.message || error);
     });
+    await backfillMaddenGameScoresFromRawPayload(guild, league).catch(error => {
+      console.error('[Madden Sync] Score backfill failed:', error?.message || error);
+    });
     await recalculateMaddenStandingsFromImportedGames(guild, league).catch(error => {
       console.error('[Madden Sync] Multi-week standings accumulator failed:', error?.message || error);
     });
@@ -17666,8 +17785,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; raw winner flag parser enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; raw winner flag parser enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; real PF/PA score import enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; real PF/PA score import enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
