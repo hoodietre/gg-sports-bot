@@ -15951,7 +15951,7 @@ async function sendEaBlazeRequest(token, session, request) {
 }
 
 
-async function getEaBlazeLeagueHub(token, leagueId) {
+async function getEaBlazeLeagueHubDetailed(token, leagueId) {
   const session = await retrieveBlazeSession(token);
   const response = await sendEaBlazeRequest(token, session, {
     commandName: 'Mobile_Career_GetLeagueHub',
@@ -15963,7 +15963,16 @@ async function getEaBlazeLeagueHub(token, leagueId) {
     componentName: 'careermode',
   });
 
-  return response?.responseInfo?.value || response;
+  return {
+    value: response?.responseInfo?.value || response,
+    response,
+    session,
+  };
+}
+
+async function getEaBlazeLeagueHub(token, leagueId) {
+  const detailed = await getEaBlazeLeagueHubDetailed(token, leagueId);
+  return detailed.value;
 }
 
 
@@ -16001,19 +16010,21 @@ async function probeSnallapaSessionEscalation(context, guild, league) {
     attempts: [],
   };
 
-  let baseSession = null;
-  try {
-    baseSession = await retrieveBlazeSession(context.token);
-    trace.baseSession = {
-      blazeId: baseSession?.blazeId,
-      requestId: baseSession?.requestId,
-      sessionKeyLength: String(baseSession?.sessionKey || '').length,
-    };
-  } catch (error) {
-    trace.baseSessionError = String(error?.message || error).slice(0, 1000);
-    console.log('[SNALLAPA SESSION ESCALATION 7J-5BS] ' + JSON.stringify(trace).slice(0, 12000));
+  const baseSession = context.activeBlazeSession || context.blazeSession || context.session || null;
+
+  if (!baseSession?.sessionKey) {
+    trace.baseSessionError = 'No active LeagueHub Blaze session found on sync context. Existing-session harvest cannot run.';
+    trace.contextKeys = Object.keys(context || {}).slice(0, 80);
+    console.log('[SNALLAPA EXISTING SESSION HARVEST 7J-5BT] ' + JSON.stringify(trace).slice(0, 12000));
     return trace;
   }
+
+  trace.baseSession = {
+    source: 'context.activeBlazeSession',
+    blazeId: baseSession?.blazeId,
+    requestId: baseSession?.requestId,
+    sessionKeyLength: String(baseSession?.sessionKey || '').length,
+  };
 
   const weekResult = await pool.query(
     `SELECT week_label
@@ -16038,10 +16049,11 @@ async function probeSnallapaSessionEscalation(context, guild, league) {
   ];
 
   const commandTests = [
-    { label: 'known-working-leaguehub', name: 'Mobile_Career_GetLeagueHub', id: 811, payload: { leagueId: Number(context.externalLeagueId) } },
-    { label: 'standings-export', name: 'Mobile_Career_GetStandings', id: 802 },
-    { label: 'teamstats-export', name: 'Mobile_Career_GetTeamStats', id: 803 },
-    { label: 'weeklystats-export', name: 'Mobile_Career_GetWeeklyStats', id: 804 },
+    { label: 'known-working-leaguehub-reuse', name: 'Mobile_Career_GetLeagueHub', id: 811, payload: { leagueId: Number(context.externalLeagueId) } },
+    { label: 'standings-export-reuse', name: 'Mobile_Career_GetStandings', id: 802 },
+    { label: 'teamstats-export-reuse', name: 'Mobile_Career_GetTeamStats', id: 803 },
+    { label: 'weeklystats-export-reuse', name: 'Mobile_Career_GetWeeklyStats', id: 804 },
+    { label: 'seasonstats-export-reuse', name: 'Mobile_Career_GetSeasonStats', id: 805 },
   ];
 
   const componentVariants = [
@@ -16050,6 +16062,9 @@ async function probeSnallapaSessionEscalation(context, guild, league) {
     { componentId: 2060, componentName: 'madden', label: 'madden-name-2060' },
   ];
 
+  let attemptCount = 0;
+  const maxAttempts = Number(process.env.EA_EXISTING_SESSION_HARVEST_MAX_ATTEMPTS || 40);
+
   for (const command of commandTests) {
     const payloadSet = command.payload
       ? [{ label: 'command-default', payload: command.payload }]
@@ -16057,6 +16072,9 @@ async function probeSnallapaSessionEscalation(context, guild, league) {
 
     for (const p of payloadSet) {
       for (const component of componentVariants) {
+        if (attemptCount >= maxAttempts) break;
+        attemptCount += 1;
+
         const attempt = {
           commandLabel: command.label,
           commandName: command.name,
@@ -16064,6 +16082,10 @@ async function probeSnallapaSessionEscalation(context, guild, league) {
           payloadLabel: p.label,
           payload: p.payload,
           component,
+          sessionBefore: {
+            requestId: baseSession.requestId,
+            sessionKeyLength: String(baseSession.sessionKey || '').length,
+          },
         };
 
         try {
@@ -16096,21 +16118,21 @@ async function probeSnallapaSessionEscalation(context, guild, league) {
           attempt.scoreLikeKeys = Object.keys(collectMaddenScoreLikeFields(value)).slice(0, 50);
           trace.attempts.push(attempt);
 
-          console.log('[SNALLAPA SESSION ESCALATION HIT 7J-5BS] ' + JSON.stringify(attempt).slice(0, 10000));
+          console.log('[SNALLAPA EXISTING SESSION HARVEST HIT 7J-5BT] ' + JSON.stringify(attempt).slice(0, 12000));
         } catch (error) {
           attempt.success = false;
           attempt.error = String(error?.message || error).slice(0, 900);
           trace.attempts.push(attempt);
 
-          console.log('[SNALLAPA SESSION ESCALATION FAIL 7J-5BS] ' + JSON.stringify(attempt));
+          console.log('[SNALLAPA EXISTING SESSION HARVEST FAIL 7J-5BT] ' + JSON.stringify(attempt));
         }
-
-        if (command.id === 811) break;
       }
+      if (attemptCount >= maxAttempts) break;
     }
+    if (attemptCount >= maxAttempts) break;
   }
 
-  console.log('[SNALLAPA SESSION ESCALATION SUMMARY 7J-5BS] ' + JSON.stringify({
+  console.log('[SNALLAPA EXISTING SESSION HARVEST SUMMARY 7J-5BT] ' + JSON.stringify({
     token: trace.token,
     baseSession: trace.baseSession,
     externalLeagueId: trace.externalLeagueId,
@@ -17456,6 +17478,77 @@ async function getEaBlazeLeagueHubWithRefreshRetry(context) {
 }
 
 
+async function getEaBlazeLeagueHubWithRefreshRetryDetailed(context) {
+  const preRefreshToken = { ...context.token };
+
+  try {
+    const detailed = await getEaBlazeLeagueHubDetailed(context.token, context.externalLeagueId);
+    context.activeBlazeSession = detailed.session;
+    context.activeLeagueHubResponse = detailed.response;
+    return detailed;
+  } catch (error) {
+    const isExpired = isEaExpiredTokenError(error);
+    const isInvalidRequest = isEaInvalidRequestTokenError(error);
+
+    if (!isExpired && !isInvalidRequest) throw error;
+
+    if (isInvalidRequest && !isExpired) {
+      console.log('[EA Direct] Blaze rejected current token with invalid request before refresh:', summarizeEaTokenForLog(context.token));
+    }
+
+    console.log('[EA Direct] Blaze login token error. Refreshing and retrying LeagueHub once.', {
+      expired: isExpired,
+      invalidRequest: isInvalidRequest,
+      tokenBeforeRefresh: summarizeEaTokenForLog(context.token),
+    });
+
+    const refreshed = await refreshEaConnectionTokens(context.connection, context.token.refreshToken);
+
+    const refreshedToken = {
+      ...context.token,
+      accessToken: refreshed.accessToken,
+      refreshToken: refreshed.refreshToken,
+      expiry: refreshed.expiry,
+    };
+
+    console.log('[EA Direct] Retrying Blaze login with refreshed token:', summarizeEaTokenForLog(refreshedToken));
+
+    try {
+      context.token = refreshedToken;
+      const detailed = await getEaBlazeLeagueHubDetailed(context.token, context.externalLeagueId);
+      context.activeBlazeSession = detailed.session;
+      context.activeLeagueHubResponse = detailed.response;
+      return detailed;
+    } catch (refreshError) {
+      console.log('[EA Direct] Refreshed token Blaze retry failed:', {
+        expired: isEaExpiredTokenError(refreshError),
+        invalidRequest: isEaInvalidRequestTokenError(refreshError),
+        error: String(refreshError?.message || refreshError).slice(0, 500),
+      });
+
+      if (isEaInvalidRequestTokenError(refreshError) && preRefreshToken?.accessToken) {
+        console.log('[EA Direct] Trying pre-refresh access token once for compatibility comparison:', summarizeEaTokenForLog(preRefreshToken));
+        try {
+          context.token = preRefreshToken;
+          const detailed = await getEaBlazeLeagueHubDetailed(context.token, context.externalLeagueId);
+          context.activeBlazeSession = detailed.session;
+          context.activeLeagueHubResponse = detailed.response;
+          return detailed;
+        } catch (previousTokenError) {
+          console.log('[EA Direct] Pre-refresh token fallback also failed:', {
+            expired: isEaExpiredTokenError(previousTokenError),
+            invalidRequest: isEaInvalidRequestTokenError(previousTokenError),
+            error: String(previousTokenError?.message || previousTokenError).slice(0, 500),
+          });
+        }
+      }
+
+      throw refreshError;
+    }
+  }
+}
+
+
 
 
 async function cleanupMaddenWeekTbdRows(guild, league) {
@@ -18760,7 +18853,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
   try {
     const context = await getEaDirectLeagueSyncContext(league);
-    const hub = await getEaBlazeLeagueHubWithRefreshRetry(context);
+    const hubDetailed = await getEaBlazeLeagueHubWithRefreshRetryDetailed(context);
+    const hub = hubDetailed.value;
+    context.activeBlazeSession = hubDetailed.session;
 
     await pool.query(
       `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
@@ -18862,8 +18957,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa session escalation probe enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa session escalation probe enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; existing session harvest probe enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; existing session harvest probe enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
