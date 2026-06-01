@@ -16869,7 +16869,8 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
 
   const byGameKey = new Map();
 
-  for (const item of rows) {
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const item = rows[rowIndex];
     const game = item?.seasonGameInfo || item?.gameInfo || item || {};
     const homeTeam = getTeamNameFromGameSide(game, 'home', maps);
     const awayTeam = getTeamNameFromGameSide(game, 'away', maps);
@@ -16908,7 +16909,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
 
     // Prefer completed rows over scheduled duplicates for the same key.
     const previous = byGameKey.get(externalGameId);
-    if (!previous || (previous.status !== 'completed' && normalized.status === 'completed')) {
+    if (!previous || (!String(previous.status || '').startsWith('completed') && String(normalized.status || '').startsWith('completed'))) {
       byGameKey.set(externalGameId, normalized);
     }
   }
@@ -16919,7 +16920,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     return aw - bw || String(a.away_team).localeCompare(String(b.away_team));
   });
 
-  console.log('[EA SCHEDULE NORMALIZED 7J-5BC] ' + JSON.stringify({
+  console.log('[EA SCHEDULE NORMALIZED 7J-5BF] ' + JSON.stringify({
     inputRows: rows.length,
     dedupedGames: games.length,
     sample: games.slice(0, 8).map(g => ({
@@ -17264,8 +17265,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; week filter + future week label polish enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; week filter + future week label polish enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; rowIndex fix + safe week repair enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; rowIndex fix + safe week repair enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
