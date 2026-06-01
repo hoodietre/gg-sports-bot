@@ -17579,6 +17579,172 @@ function compactMaddenRawExcerpt(obj, depth = 0) {
   return excerpt;
 }
 
+
+function extractMaddenSeasonGameKeyFromAny(gameLike) {
+  const raw = extractMaddenRawGamePayload(gameLike);
+  return getAnyValue(gameLike, ['seasonGameKey', 'external_game_id', 'id'], null) ||
+    getAnyValue(raw, ['seasonGameKey', 'gameId', 'id'], null);
+}
+
+function maddenWeekNumberFromLabel(label) {
+  const text = String(label || '');
+  const match = text.match(/(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function summarizeEaScoreProbeValue(command, requestPayload, response) {
+  const value = response?.responseInfo?.value || response;
+  const scoreLikeFields = collectMaddenScoreLikeFields(value);
+  const arrays = deepFindArraysByKey(value, [
+    'games',
+    'gameStats',
+    'gameStatsInfo',
+    'gameStatsInfoList',
+    'teamStats',
+    'teamStatsInfoList',
+    'playerStats',
+    'playerStatsInfoList',
+    'scoringSummary',
+    'scoreSummary',
+    'boxScore',
+    'boxScoreInfo',
+    'gameInfo',
+    'seasonGameInfo',
+  ]);
+
+  return {
+    commandName: command.name,
+    commandId: command.id,
+    payload: requestPayload,
+    topKeys: Object.keys(value || {}).slice(0, 40),
+    scoreLikeFields,
+    arrays: arrays.map(item => ({
+      path: item.path,
+      key: item.key,
+      length: Array.isArray(item.rows) ? item.rows.length : 0,
+      sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+        ? Object.keys(item.rows[0]).slice(0, 50)
+        : [],
+    })).slice(0, 12),
+    rawExcerpt: compactMaddenRawExcerpt(value),
+  };
+}
+
+async function probeEaDirectScoreSources(context, guild, league) {
+  const enabled = String(process.env.EA_SCORE_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return [];
+
+  const gamesResult = await pool.query(
+    `SELECT *
+     FROM madden_imported_games
+     WHERE guild_id = $1
+       AND league_id = $2
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+     ORDER BY week_label DESC, imported_at DESC
+     LIMIT 2`,
+    [guild.id, league.league_id]
+  );
+
+  const sampleGames = gamesResult.rows || [];
+  if (!sampleGames.length) {
+    console.log('[EA SCORE SOURCE DISCOVERY 7J-5BN] No completed games available for score-source probing.');
+    return [];
+  }
+
+  // This is aligned with the Snallabot/export clue: LeagueHub gives schedule/outcome only,
+  // while richer details likely live behind separate export/detail/stat commands.
+  const commandCandidates = [
+    { name: 'Mobile_Career_GetGameStats', id: 806 },
+    { name: 'Mobile_Career_GetGameStatsInfo', id: 809 },
+    { name: 'Mobile_Career_GetGameInfo', id: 810 },
+    { name: 'Mobile_Career_GetSeasonGame', id: 812 },
+    { name: 'Mobile_Career_GetGameDetails', id: 813 },
+    { name: 'Mobile_Career_GetGameResult', id: 816 },
+    { name: 'Mobile_Career_GetBoxScore', id: 817 },
+    { name: 'Mobile_Career_GetScoringSummary', id: 818 },
+  ];
+
+  const results = [];
+  let attempted = 0;
+  const maxAttempts = Number(process.env.EA_SCORE_DISCOVERY_MAX_ATTEMPTS || 18);
+
+  for (const game of sampleGames) {
+    const rawGame = extractMaddenRawGamePayload(game);
+    const seasonGameKey = extractMaddenSeasonGameKeyFromAny(game);
+    const weekNumber = maddenWeekNumberFromLabel(game.week_label);
+    const seasonWeek = weekNumber !== null ? weekNumber + 3 : null;
+
+    const payloadVariants = [];
+    const addPayload = payload => {
+      const clean = {};
+      for (const [key, value] of Object.entries(payload)) {
+        if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
+      }
+      const key = JSON.stringify(clean);
+      if (!payloadVariants.some(existing => JSON.stringify(existing) === key)) payloadVariants.push(clean);
+    };
+
+    addPayload({ leagueId: Number(context.externalLeagueId), seasonGameKey: Number(seasonGameKey) });
+    addPayload({ leagueId: Number(context.externalLeagueId), gameId: Number(seasonGameKey) });
+    addPayload({ leagueId: Number(context.externalLeagueId), week: seasonWeek, weekType: 1 });
+    addPayload({ leagueId: Number(context.externalLeagueId), weekIndex: seasonWeek, seasonWeekType: 1 });
+    addPayload({ leagueId: Number(context.externalLeagueId), seasonWeek, seasonWeekType: 1, seasonGameKey: Number(seasonGameKey) });
+
+    for (const command of commandCandidates) {
+      for (const requestPayload of payloadVariants.slice(0, 3)) {
+        if (attempted >= maxAttempts) break;
+        attempted += 1;
+        try {
+          const response = await sendEaBlazeCareerModeCommand(context.token, command.name, command.id, requestPayload);
+          const summary = summarizeEaScoreProbeValue(command, requestPayload, response);
+          results.push({ success: true, game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey }, ...summary });
+          console.log('[EA SCORE SOURCE DISCOVERY HIT 7J-5BN] ' + JSON.stringify(results[results.length - 1]).slice(0, 6000));
+
+          const hasScoreSignal = Object.keys(summary.scoreLikeFields || {}).some(key => /score|point|pts/i.test(key));
+          if (hasScoreSignal) {
+            console.log('[EA SCORE SOURCE DISCOVERY FOUND SCORE-LIKE DATA 7J-5BN] ' + JSON.stringify({
+              commandName: command.name,
+              commandId: command.id,
+              payload: requestPayload,
+              scoreLikeFields: summary.scoreLikeFields,
+              arrays: summary.arrays,
+            }).slice(0, 6000));
+          }
+        } catch (error) {
+          const fail = {
+            success: false,
+            game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey },
+            commandName: command.name,
+            commandId: command.id,
+            payload: requestPayload,
+            error: String(error?.message || error).slice(0, 500),
+          };
+          results.push(fail);
+          console.log('[EA SCORE SOURCE DISCOVERY FAIL 7J-5BN] ' + JSON.stringify(fail));
+        }
+      }
+      if (attempted >= maxAttempts) break;
+    }
+    if (attempted >= maxAttempts) break;
+  }
+
+  console.log('[EA SCORE SOURCE DISCOVERY SUMMARY 7J-5BN] ' + JSON.stringify({
+    attempted,
+    successes: results.filter(r => r.success).length,
+    failures: results.filter(r => !r.success).length,
+    commandsTried: [...new Set(results.map(r => r.commandName))],
+    successSummaries: results.filter(r => r.success).map(r => ({
+      commandName: r.commandName,
+      commandId: r.commandId,
+      payload: r.payload,
+      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 30),
+      arrays: r.arrays,
+    })).slice(0, 12),
+  }).slice(0, 8000));
+
+  return results;
+}
+
 async function inspectMaddenCompletedGameRawScores(guild, league) {
   const gamesResult = await pool.query(
     `SELECT *
@@ -17620,7 +17786,7 @@ async function inspectMaddenCompletedGameRawScores(guild, league) {
     };
   });
 
-  console.log('[Madden Raw Score Inspector 7J-5BM] ' + JSON.stringify({
+  console.log('[Madden Raw Score Inspector 7J-5BN] ' + JSON.stringify({
     inspectedGames: samples.length,
     samples,
   }).slice(0, 18000));
@@ -17895,6 +18061,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await inspectMaddenCompletedGameRawScores(guild, league).catch(error => {
       console.error('[Madden Sync] Raw score inspector failed:', error?.message || error);
     });
+    await probeEaDirectScoreSources(context, guild, league).catch(error => {
+      console.error('[Madden Sync] EA score source discovery failed:', error?.message || error);
+    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
 
@@ -17904,8 +18073,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; deep raw score inspector enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; deep raw score inspector enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; score source discovery enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; score source discovery enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
