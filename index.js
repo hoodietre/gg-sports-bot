@@ -14356,7 +14356,7 @@ function formatMaddenGameScore(game) {
 function formatMaddenTeamGameLine(teamName, game) {
   const isHome = String(game.home_team || '').toLowerCase() === String(teamName || '').toLowerCase();
   const opp = isHome ? game.away_team : game.home_team;
-  const scoreInfo = resolveMaddenScoresFromRawGame(game);
+  const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
   const resolvedHomeScore = scoreInfo.homeScore ?? game.home_score;
   const resolvedAwayScore = scoreInfo.awayScore ?? game.away_score;
   const teamScore = isHome ? resolvedHomeScore : resolvedAwayScore;
@@ -17017,7 +17017,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
 
-    const scoreInfo = resolveMaddenScoresFromRawGame({ raw: item });
+    const scoreInfo = resolveMaddenScoresFromRawGameDeep({ raw: item });
     const homeScore = scoreInfo.homeScore;
     const awayScore = scoreInfo.awayScore;
     const isPlayed = isGameCompletedFromHubGame(game) || scoreInfo.hasRealScore;
@@ -17344,6 +17344,157 @@ function parseMaddenScoreValue(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+
+function deepFindMaddenNumericScorePairs(obj, path = '', out = [], depth = 0, seen = new Set()) {
+  if (!obj || typeof obj !== 'object' || depth > 7 || seen.has(obj)) return out;
+  seen.add(obj);
+
+  if (!Array.isArray(obj)) {
+    const entries = Object.entries(obj);
+    const lowerMap = new Map(entries.map(([key, value]) => [key.toLowerCase(), { key, value }]));
+
+    const homeKeys = [
+      'homescore', 'home_score', 'hometeamscore', 'homepoints', 'homepts',
+      'homefinalscore', 'homescoretotal', 'homepointsscored', 'homeoffscore'
+    ];
+    const awayKeys = [
+      'awayscore', 'away_score', 'awayteamscore', 'awaypoints', 'awaypts',
+      'awayfinalscore', 'awayscoretotal', 'awaypointsscored', 'awayoffscore'
+    ];
+
+    for (const h of homeKeys) {
+      for (const a of awayKeys) {
+        const hv = lowerMap.get(h)?.value;
+        const av = lowerMap.get(a)?.value;
+        const homeScore = parseMaddenScoreValue(hv);
+        const awayScore = parseMaddenScoreValue(av);
+        if (homeScore !== null && awayScore !== null) {
+          out.push({
+            path,
+            homeKey: lowerMap.get(h)?.key || h,
+            awayKey: lowerMap.get(a)?.key || a,
+            homeScore,
+            awayScore,
+            hasRealScore: homeScore !== 0 || awayScore !== 0,
+          });
+        }
+      }
+    }
+
+    // Also detect text scores like "24-17" / "24 – 17".
+    for (const [key, value] of entries) {
+      if (typeof value === 'string' && /score|result|final|game/i.test(key)) {
+        const m = value.match(/(\d+)\s*[-–]\s*(\d+)/);
+        if (m) {
+          out.push({
+            path,
+            homeKey: key + ':textHomeAssumedSecond',
+            awayKey: key + ':textAwayAssumedFirst',
+            homeScore: Number(m[2]),
+            awayScore: Number(m[1]),
+            hasRealScore: Number(m[1]) !== 0 || Number(m[2]) !== 0,
+            textValue: value,
+          });
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(obj)) {
+    obj.slice(0, 100).forEach((item, index) => {
+      deepFindMaddenNumericScorePairs(item, path + '[' + index + ']', out, depth + 1, seen);
+    });
+  } else {
+    for (const [key, value] of Object.entries(obj)) {
+      if (value && typeof value === 'object') {
+        deepFindMaddenNumericScorePairs(value, path ? path + '.' + key : key, out, depth + 1, seen);
+      }
+    }
+  }
+
+  return out;
+}
+
+function resolveMaddenScoresFromRawGameDeep(gameRow) {
+  const shallow = resolveMaddenScoresFromRawGame(gameRow);
+  if (shallow.hasRealScore) {
+    return {
+      ...shallow,
+      source: 'shallow',
+      candidates: [],
+    };
+  }
+
+  let parsedRaw = gameRow?.raw_payload ?? gameRow;
+  try {
+    parsedRaw = typeof parsedRaw === 'string' ? JSON.parse(parsedRaw) : (parsedRaw || {});
+  } catch {
+    parsedRaw = {};
+  }
+
+  const candidates = deepFindMaddenNumericScorePairs(parsedRaw)
+    .filter(candidate => candidate.homeScore !== null && candidate.awayScore !== null);
+
+  const real = candidates.find(candidate => candidate.hasRealScore);
+  const chosen = real || candidates[0] || null;
+
+  if (chosen) {
+    return {
+      homeScore: chosen.homeScore,
+      awayScore: chosen.awayScore,
+      hasRealScore: Boolean(chosen.hasRealScore),
+      source: 'deep:' + chosen.path,
+      rawScoreKeys: {
+        homeKey: chosen.homeKey,
+        awayKey: chosen.awayKey,
+        textValue: chosen.textValue || null,
+      },
+      candidates: candidates.slice(0, 12),
+    };
+  }
+
+  return {
+    ...shallow,
+    source: 'none',
+    candidates: [],
+  };
+}
+
+async function inspectMaddenDeepRawScoreCandidates(guild, league) {
+  const gamesResult = await pool.query(
+    `SELECT *
+     FROM madden_imported_games
+     WHERE guild_id = $1
+       AND league_id = $2
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+     ORDER BY week_label DESC, imported_at DESC
+     LIMIT 12`,
+    [guild.id, league.league_id]
+  );
+
+  const samples = gamesResult.rows.map(game => {
+    const deep = resolveMaddenScoresFromRawGameDeep(game);
+    return {
+      week: game.week_label,
+      matchup: game.away_team + ' @ ' + game.home_team,
+      dbScore: String(game.away_score) + '-' + String(game.home_score),
+      source: deep.source,
+      hasRealScore: deep.hasRealScore,
+      homeScore: deep.homeScore,
+      awayScore: deep.awayScore,
+      candidates: (deep.candidates || []).slice(0, 8),
+    };
+  });
+
+  console.log('[Madden Deep Raw Score Candidates 7J-5BQ] ' + JSON.stringify({
+    inspectedGames: samples.length,
+    samples,
+  }).slice(0, 14000));
+
+  return samples;
+}
+
+
 function resolveMaddenScoresFromRawGame(gameRow) {
   const rawGame = extractMaddenRawGamePayload(gameRow);
 
@@ -17487,7 +17638,7 @@ async function backfillMaddenGameScoresFromRawPayload(guild, league) {
 
   let updated = 0;
   for (const game of gamesResult.rows) {
-    const scoreInfo = resolveMaddenScoresFromRawGame(game);
+    const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
     if (!scoreInfo.hasRealScore) continue;
 
     await pool.query(
@@ -17990,7 +18141,7 @@ async function inspectMaddenCompletedGameRawScores(guild, league) {
     })();
 
     const rawGame = extractMaddenRawGamePayload(game);
-    const scoreInfo = resolveMaddenScoresFromRawGame(game);
+    const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
 
     return {
       db: {
@@ -18062,7 +18213,7 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
     const home = ensure(homeTeam);
     const away = ensure(awayTeam);
 
-    const scoreInfo = resolveMaddenScoresFromRawGame(game);
+    const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
     const homeScore = Number(scoreInfo.homeScore ?? 0);
     const awayScore = Number(scoreInfo.awayScore ?? 0);
     const hasRealScore = Boolean(scoreInfo.hasRealScore);
@@ -18290,6 +18441,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await probeEaTeamStatsMirrorSource(context, guild, league).catch(error => {
       console.error('[Madden Sync] TeamStats mirror probe failed:', error?.message || error);
     });
+    await inspectMaddenDeepRawScoreCandidates(guild, league).catch(error => {
+      console.error('[Madden Sync] Deep raw score candidate inspector failed:', error?.message || error);
+    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
 
@@ -18299,8 +18453,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; TeamStats mirror probe enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; TeamStats mirror probe enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa raw game parser mode enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa raw game parser mode enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
