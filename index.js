@@ -16391,6 +16391,131 @@ function extractEaStandingsRowsFromHub(hubPayload) {
   return candidates;
 }
 
+
+function isGameCompletedFromHubGame(game) {
+  return Boolean(
+    getAnyValue(game, ['isGamePlayed', 'gamePlayed', 'isPlayed', 'played'], false) ||
+    parseNumberOrNull(getAnyValue(game, ['homeWin'], null)) === 1 ||
+    parseNumberOrNull(getAnyValue(game, ['awayWin'], null)) === 1 ||
+    parseNumberOrNull(getAnyValue(game, ['homeLoss'], null)) === 1 ||
+    parseNumberOrNull(getAnyValue(game, ['awayLoss'], null)) === 1 ||
+    parseNumberOrNull(getAnyValue(game, ['homeTie'], null)) === 1 ||
+    parseNumberOrNull(getAnyValue(game, ['awayTie'], null)) === 1
+  );
+}
+
+function getHubGameScore(game, side) {
+  const prefix = side === 'home' ? 'home' : 'away';
+  return parseNumberOrNull(getAnyValue(game, [
+    prefix + 'Score',
+    prefix + 'TeamScore',
+    prefix + 'Points',
+    prefix + 'Pts',
+    prefix + 'FinalScore',
+  ], null));
+}
+
+function inferEaRecordsFromLeagueHubSchedule(hubPayload) {
+  const maps = buildEaTeamNameMaps(hubPayload);
+  const schedule = hubPayload?.gameScheduleHubInfo?.leagueSchedule;
+  const rows = Array.isArray(schedule) ? schedule : [];
+  const records = new Map();
+
+  function ensure(teamName) {
+    const key = String(teamName || '').toLowerCase();
+    if (!records.has(key)) {
+      records.set(key, {
+        teamName,
+        wins: 0,
+        losses: 0,
+        ties: 0,
+        points_for: 0,
+        points_against: 0,
+        games_played: 0,
+      });
+    }
+    return records.get(key);
+  }
+
+  for (const item of rows) {
+    const game = item?.seasonGameInfo || item?.gameInfo || item || {};
+    const homeTeam = getTeamNameFromGameSide(game, 'home', maps);
+    const awayTeam = getTeamNameFromGameSide(game, 'away', maps);
+
+    if (!homeTeam || !awayTeam || homeTeam === 'Home' || awayTeam === 'Away') continue;
+
+    const home = ensure(homeTeam);
+    const away = ensure(awayTeam);
+
+    const homeScore = getHubGameScore(game, 'home');
+    const awayScore = getHubGameScore(game, 'away');
+
+    const homeWin = parseNumberOrNull(getAnyValue(game, ['homeWin'], null));
+    const awayWin = parseNumberOrNull(getAnyValue(game, ['awayWin'], null));
+    const homeLoss = parseNumberOrNull(getAnyValue(game, ['homeLoss'], null));
+    const awayLoss = parseNumberOrNull(getAnyValue(game, ['awayLoss'], null));
+    const homeTie = parseNumberOrNull(getAnyValue(game, ['homeTie'], null));
+    const awayTie = parseNumberOrNull(getAnyValue(game, ['awayTie'], null));
+
+    const completed = isGameCompletedFromHubGame(game);
+
+    if (homeScore !== null && awayScore !== null) {
+      home.points_for += homeScore;
+      home.points_against += awayScore;
+      away.points_for += awayScore;
+      away.points_against += homeScore;
+    }
+
+    if (!completed) continue;
+
+    home.games_played += 1;
+    away.games_played += 1;
+
+    if (homeTie === 1 || awayTie === 1 || (homeScore !== null && awayScore !== null && homeScore === awayScore)) {
+      home.ties += 1;
+      away.ties += 1;
+    } else if (homeWin === 1 || awayLoss === 1 || (homeScore !== null && awayScore !== null && homeScore > awayScore)) {
+      home.wins += 1;
+      away.losses += 1;
+    } else if (awayWin === 1 || homeLoss === 1 || (homeScore !== null && awayScore !== null && awayScore > homeScore)) {
+      away.wins += 1;
+      home.losses += 1;
+    }
+  }
+
+  return records;
+}
+
+function mergeEaHubNativeRecordsIntoTeams(hubPayload, teams) {
+  const records = inferEaRecordsFromLeagueHubSchedule(hubPayload);
+  if (!records.size) return teams;
+
+  let merged = 0;
+  for (const team of teams) {
+    const name = String(team.teamName || team.name || team.displayName || '').toLowerCase();
+    const record = records.get(name);
+    if (!record) continue;
+
+    team.wins = record.wins;
+    team.losses = record.losses;
+    team.ties = record.ties;
+    team.points_for = record.points_for;
+    team.points_against = record.points_against;
+    team.games_played = record.games_played;
+    team.standingsSource = 'league_hub_schedule_native';
+    merged += 1;
+  }
+
+  console.log('[EA HUB-NATIVE STANDINGS] ' + JSON.stringify({
+    teamsWithRecords: merged,
+    totalScheduleTeams: records.size,
+    sample: Array.from(records.values()).slice(0, 8),
+  }));
+
+  return teams;
+}
+
+
 function normalizeEaLeagueTeamsDeepFromHub(hubPayload) {
   const basicTeams = normalizeEaLeagueTeamsFromHub(hubPayload);
   const maps = buildEaTeamNameMaps(hubPayload);
@@ -16447,7 +16572,7 @@ function normalizeEaLeagueTeamsDeepFromHub(hubPayload) {
     });
   }
 
-  return Array.from(byTeamKey.values());
+  return mergeEaHubNativeRecordsIntoTeams(hubPayload, Array.from(byTeamKey.values()));
 }
 
 function normalizeEaWeekLabel(game) {
@@ -16695,34 +16820,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     if (!hasRealRecordData && preseasonMode) {
       console.log('[EA STANDINGS PRESEASON-SAFE] Skipping standings probe because league is currently in ' + seasonModeLabel + '. EA standings usually reset/not available until regular season.');
     } else if (!hasRealRecordData) {
-      console.log('[EA STANDINGS PROBE] Regular season detected and Hub did not contain standings/record data. Starting command probe.');
-      probeResults = await probeEaStandingsCommandsWithHubContext(context.token, context.externalLeagueId, hub).catch(error => {
-        console.error('[EA STANDINGS PROBE] probe failed completely:', error?.message || error);
-        return [];
-      });
-
-      const probeStandings = extractEaStandingsRowsFromProbeResults(probeResults);
-      if (probeStandings.length) {
-        const maps = buildEaTeamNameMaps(hub);
-        const byName = new Map(teams.map(team => [String(team.teamName || team.name || '').toLowerCase(), team]));
-        const byId = new Map(teams.map(team => [String(team.teamId || team.id || ''), team]));
-
-        for (const standing of probeStandings) {
-          const teamId = standing.teamId !== null && standing.teamId !== undefined ? String(standing.teamId) : null;
-          const teamName = standing.name || (teamId ? maps.byId.get(teamId) : null);
-          const existing = (teamId && byId.get(teamId)) || (teamName && byName.get(String(teamName).toLowerCase()));
-          if (!existing) continue;
-
-          existing.wins = standing.wins ?? Number(existing.wins || 0);
-          existing.losses = standing.losses ?? Number(existing.losses || 0);
-          existing.ties = standing.ties ?? Number(existing.ties || 0);
-          existing.points_for = standing.pf ?? Number(existing.points_for || 0);
-          existing.points_against = standing.pa ?? Number(existing.points_against || 0);
-          existing.rawStanding = standing.row;
-          existing.standingsSource = standing.sourcePath || 'probe';
-        }
-      }
-    }
+      console.log('[EA STANDINGS HUB-NATIVE] Regular season detected, but LeagueHub did not include completed standings/record fields yet. Skipping unstable 802/803 probes and relying on Hub schedule-derived records.');
 
     if (probeResults.length) {
       await pool.query(
@@ -16759,7 +16857,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', players: 0. ' +
       (preseasonMode
         ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season.'
-        : 'Regular season mode: standings probe enabled when Hub has no records.');
+        : 'Regular season mode: hub-native standings parser enabled; unstable EA standings probes disabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
