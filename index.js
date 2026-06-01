@@ -5611,7 +5611,8 @@ if (gameSubcommand === 'report') {
 
       if (maddenSubcommand === 'schedule') {
         const leagueName = interaction.options.getString('league');
-        const week = interaction.options.getString('week');
+        const rawWeek = interaction.options.getString('week');
+        const week = normalizeMaddenWeekFilterInput(rawWeek);
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
@@ -5629,7 +5630,7 @@ if (gameSubcommand === 'report') {
               [interaction.guild.id, activeLeague.league_id]
             );
 
-        await interaction.reply({ embeds: [buildMaddenImportedScheduleEmbed(activeLeague, result.rows, week)], ephemeral: true });
+        await interaction.reply({ embeds: [buildMaddenImportedScheduleEmbed(activeLeague, result.rows, week || rawWeek)], ephemeral: true });
         return;
       }
 
@@ -14298,11 +14299,44 @@ function maddenWeekSortValue(weekLabel) {
   return 999;
 }
 
+
+function normalizeMaddenWeekFilterInput(week) {
+  if (!week) return null;
+  const value = String(week).trim();
+  if (!value) return null;
+
+  const compact = value.toLowerCase().replace(/\s+/g, '');
+  const numberOnly = compact.match(/^\d+$/);
+  if (numberOnly) return 'Week ' + value;
+
+  const weekNumber = compact.match(/^week(\d+)$/);
+  if (weekNumber) return 'Week ' + weekNumber[1];
+
+  const preseasonNumber = compact.match(/^preseason(?:week)?(\d+)$/);
+  if (preseasonNumber) return 'Preseason Week ' + preseasonNumber[1];
+
+  return value.replace(/^week\s*(\d+)$/i, 'Week $1').replace(/^preseason\s*week\s*(\d+)$/i, 'Preseason Week $1');
+}
+
+function isPlaceholderZeroZero(game) {
+  const status = String(game?.status || '').toLowerCase();
+  const away = Number(game?.away_score ?? 0);
+  const home = Number(game?.home_score ?? 0);
+  return away === 0 && home === 0 && status !== 'completed_with_real_score';
+}
+
+
 function formatMaddenGameScore(game) {
   const away = game.away_score;
   const home = game.home_score;
   const hasScore = away !== null && away !== undefined && home !== null && home !== undefined;
   if (!hasScore) return '';
+
+  const awayNum = Number(away);
+  const homeNum = Number(home);
+  const realScore = awayNum !== 0 || homeNum !== 0 || String(game.status || '').toLowerCase() === 'completed_with_real_score';
+  if (!realScore) return '';
+
   return ' • ' + away + '-' + home;
 }
 
@@ -14314,12 +14348,14 @@ function formatMaddenTeamGameLine(teamName, game) {
   const status = String(game.status || 'scheduled').toLowerCase();
 
   let result;
-  if (status === 'completed' || status === 'final') {
+  if (status === 'completed_with_real_score' || ((status === 'completed' || status === 'final') && (Number(teamScore) !== 0 || Number(oppScore) !== 0))) {
     result = Number(teamScore) > Number(oppScore)
       ? 'W ' + teamScore + '-' + oppScore
       : Number(teamScore) < Number(oppScore)
         ? 'L ' + teamScore + '-' + oppScore
         : 'T ' + teamScore + '-' + oppScore;
+  } else if (status === 'completed' || status === 'final') {
+    result = 'completed';
   } else {
     result = 'scheduled';
   }
@@ -14364,7 +14400,7 @@ function buildMaddenImportedScheduleEmbed(league, rows, week = null) {
     return '**' + (game.week_label || 'Week TBD') + '** — ' +
       game.away_team + ' @ ' + game.home_team +
       formatMaddenGameScore(game) +
-      ' • ' + (game.status || 'scheduled');
+      ' • ' + (String(game.status || 'scheduled') === 'completed_with_real_score' ? 'completed' : (game.status || 'scheduled'));
   });
 
   return new EmbedBuilder()
@@ -16614,7 +16650,8 @@ function inferEaRecordsFromLeagueHubSchedule(hubPayload) {
     return records.get(key);
   }
 
-  for (const item of rows) {
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const item = rows[rowIndex];
     const game = item?.seasonGameInfo || item?.gameInfo || item || {};
     const homeTeam = getTeamNameFromGameSide(game, 'home', maps);
     const awayTeam = getTeamNameFromGameSide(game, 'away', maps);
@@ -16797,8 +16834,31 @@ function getTeamNameFromGameSide(game, side, maps) {
   return side === 'home' ? 'Home' : 'Away';
 }
 
+
+function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = null) {
+  const direct = normalizeEaWeekLabel(game);
+  if (direct && direct !== 'Week TBD') return direct;
+
+  const weekType = parseNumberOrNull(getAnyValue(game, ['weekType', 'seasonWeekType'], null));
+  const rawWeek = parseNumberOrNull(getAnyValue(game, ['week', 'weekIndex', 'seasonWeek'], null));
+
+  if (weekType === 0 && rawWeek !== null) return 'Preseason Week ' + String(rawWeek + 1);
+  if ((weekType === 1 || weekType === null) && rawWeek !== null) {
+    return 'Week ' + String(rawWeek >= 4 ? rawWeek - 3 : rawWeek + 1);
+  }
+
+  if (currentCtx?.seasonWeek !== null && currentCtx?.seasonWeek !== undefined) {
+    const base = Number(currentCtx.seasonWeek);
+    if (Number.isFinite(base)) return 'Week ' + String(Math.max(1, base - 3 + fallbackIndex));
+  }
+
+  return 'Week TBD';
+}
+
+
 function normalizeEaScheduleDeepFromHub(hubPayload) {
   const maps = buildEaTeamNameMaps(hubPayload);
+  const currentCtx = extractEaStandingsRequestContextFromHub(hubPayload, 0);
   const schedule = hubPayload?.gameScheduleHubInfo?.leagueSchedule;
   let rows = Array.isArray(schedule) ? schedule : [];
 
@@ -16818,7 +16878,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const seasonGameKey = getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) ||
       getAnyValue(game, ['seasonGameKey', 'id', 'gameId'], null);
 
-    const weekLabel = normalizeEaWeekLabel(game);
+    const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, currentCtx);
     const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
 
@@ -16841,7 +16901,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
       away_score: awayScore ?? 0,
       homeScore: homeScore ?? 0,
       awayScore: awayScore ?? 0,
-      status: isPlayed ? 'completed' : 'scheduled',
+      status: isPlayed ? ((Number(homeScore || 0) !== 0 || Number(awayScore || 0) !== 0) ? 'completed_with_real_score' : 'completed') : 'scheduled',
       result,
       raw: item,
     };
@@ -17204,8 +17264,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; final standings/schedule polish enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; final standings/schedule polish enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; week filter + future week label polish enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; week filter + future week label polish enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
