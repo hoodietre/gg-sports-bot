@@ -17506,10 +17506,126 @@ async function backfillMaddenGameScoresFromRawPayload(guild, league) {
   }
 
   if (updated) {
-    console.log('[Madden Score Backfill 7J-5BL] Updated game scores from raw payload:', updated);
+    console.log('[Madden Score Backfill 7J-5BM] Updated game scores from raw payload:', updated);
   }
 
   return updated;
+}
+
+
+
+function collectMaddenScoreLikeFields(obj, prefix = '', out = {}, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 4) return out;
+
+  for (const [key, value] of Object.entries(obj)) {
+    const fullKey = prefix ? prefix + '.' + key : key;
+    const lower = key.toLowerCase();
+
+    if (
+      lower.includes('score') ||
+      lower.includes('point') ||
+      lower.includes('pts') ||
+      lower.includes('stat') ||
+      lower.includes('result') ||
+      lower.includes('winner') ||
+      lower.includes('win') ||
+      lower.includes('loss') ||
+      lower.includes('tie')
+    ) {
+      if (value === null || typeof value !== 'object') {
+        out[fullKey] = value;
+      } else if (Array.isArray(value)) {
+        out[fullKey] = '[array length ' + value.length + ']';
+      } else {
+        out[fullKey] = '[object keys ' + Object.keys(value).slice(0, 12).join(',') + ']';
+      }
+    }
+
+    if (value && typeof value === 'object') {
+      collectMaddenScoreLikeFields(value, fullKey, out, depth + 1);
+    }
+  }
+
+  return out;
+}
+
+function compactMaddenRawExcerpt(obj, depth = 0) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (depth > 2) return '[depth_limit]';
+
+  if (Array.isArray(obj)) {
+    return obj.slice(0, 3).map(item => compactMaddenRawExcerpt(item, depth + 1));
+  }
+
+  const excerpt = {};
+  for (const [key, value] of Object.entries(obj).slice(0, 40)) {
+    if (value === null || typeof value !== 'object') {
+      excerpt[key] = value;
+    } else if (Array.isArray(value)) {
+      excerpt[key] = {
+        __type: 'array',
+        length: value.length,
+        sample: value.slice(0, 2).map(item => compactMaddenRawExcerpt(item, depth + 1)),
+      };
+    } else {
+      excerpt[key] = {
+        __type: 'object',
+        keys: Object.keys(value).slice(0, 30),
+        sample: compactMaddenRawExcerpt(value, depth + 1),
+      };
+    }
+  }
+
+  return excerpt;
+}
+
+async function inspectMaddenCompletedGameRawScores(guild, league) {
+  const gamesResult = await pool.query(
+    `SELECT *
+     FROM madden_imported_games
+     WHERE guild_id = $1
+       AND league_id = $2
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+     ORDER BY week_label ASC, imported_at DESC
+     LIMIT 8`,
+    [guild.id, league.league_id]
+  );
+
+  const samples = gamesResult.rows.map(game => {
+    const parsedRaw = (() => {
+      try {
+        return typeof game.raw_payload === 'string' ? JSON.parse(game.raw_payload) : (game.raw_payload || {});
+      } catch {
+        return {};
+      }
+    })();
+
+    const rawGame = extractMaddenRawGamePayload(game);
+    const scoreInfo = resolveMaddenScoresFromRawGame(game);
+
+    return {
+      db: {
+        id: game.external_game_id,
+        week: game.week_label,
+        matchup: game.away_team + ' @ ' + game.home_team,
+        status: game.status,
+        dbScore: String(game.away_score) + '-' + String(game.home_score),
+      },
+      scoreInfo,
+      parsedRawTopKeys: Object.keys(parsedRaw || {}).slice(0, 50),
+      rawGameKeys: Object.keys(rawGame || {}).slice(0, 80),
+      scoreLikeFields: collectMaddenScoreLikeFields(parsedRaw),
+      rawGameScoreLikeFields: collectMaddenScoreLikeFields(rawGame),
+      rawExcerpt: compactMaddenRawExcerpt(parsedRaw),
+    };
+  });
+
+  console.log('[Madden Raw Score Inspector 7J-5BM] ' + JSON.stringify({
+    inspectedGames: samples.length,
+    samples,
+  }).slice(0, 18000));
+
+  return samples.length;
 }
 
 
@@ -17776,6 +17892,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await recalculateMaddenStandingsFromImportedGames(guild, league).catch(error => {
       console.error('[Madden Sync] Multi-week standings accumulator failed:', error?.message || error);
     });
+    await inspectMaddenCompletedGameRawScores(guild, league).catch(error => {
+      console.error('[Madden Sync] Raw score inspector failed:', error?.message || error);
+    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
 
@@ -17785,8 +17904,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; real PF/PA score import enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; real PF/PA score import enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; deep raw score inspector enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; deep raw score inspector enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
