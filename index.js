@@ -17630,6 +17630,176 @@ function summarizeEaScoreProbeValue(command, requestPayload, response) {
   };
 }
 
+
+function summarizeEaTeamStatsProbeValue(command, requestPayload, response) {
+  const value = response?.responseInfo?.value || response;
+  const arrays = deepFindArraysByKey(value, [
+    'teamStatInfoList',
+    'teamStatsInfoList',
+    'seasonTeamStatsInfoList',
+    'teamStats',
+    'teamStatList',
+    'stats',
+    'teamStatsInfo',
+    'teamStatInfo'
+  ]);
+
+  const scoreLikeFields = collectMaddenScoreLikeFields(value);
+
+  return {
+    commandName: command.name,
+    commandId: command.id,
+    payload: requestPayload,
+    topKeys: Object.keys(value || {}).slice(0, 50),
+    arrays: arrays.map(item => ({
+      path: item.path,
+      key: item.key,
+      length: Array.isArray(item.rows) ? item.rows.length : 0,
+      sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+        ? Object.keys(item.rows[0]).slice(0, 80)
+        : [],
+      sample: Array.isArray(item.rows)
+        ? item.rows.slice(0, 3).map(row => compactMaddenRawExcerpt(row))
+        : [],
+    })).slice(0, 12),
+    scoreLikeFields,
+    rawExcerpt: compactMaddenRawExcerpt(value),
+  };
+}
+
+async function probeEaTeamStatsMirrorSource(context, guild, league) {
+  const enabled = String(process.env.EA_TEAMSTATS_PROBE_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return [];
+
+  const currentWeekResult = await pool.query(
+    `SELECT week_label, COUNT(*)::int AS games
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+     GROUP BY week_label
+     ORDER BY week_label DESC
+     LIMIT 4`,
+    [guild.id, league.league_id]
+  );
+
+  const weekLabels = (currentWeekResult.rows || [])
+    .map(row => row.week_label)
+    .filter(Boolean);
+
+  if (!weekLabels.length) {
+    console.log('[EA TEAMSTATS MIRROR PROBE 7J-5BP] No imported weeks available.');
+    return [];
+  }
+
+  const commandCandidates = [
+    // Snallapa MaddenExportDestination.teamStats consumes TeamStatsExport.teamStatInfoList.
+    // Command ids are inferred from earlier EA probes and Snallapa export naming.
+    { name: 'Mobile_Career_GetTeamStats', id: 803 },
+    { name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
+    { name: 'Mobile_Career_GetSeasonStats', id: 805 },
+    { name: 'Mobile_Career_GetWeeklyStats', id: 804 },
+  ];
+
+  const results = [];
+  let attempted = 0;
+  const maxAttempts = Number(process.env.EA_TEAMSTATS_PROBE_MAX_ATTEMPTS || 32);
+
+  function pushUnique(list, payload) {
+    const clean = {};
+    for (const [key, value] of Object.entries(payload || {})) {
+      if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
+    }
+    const key = JSON.stringify(clean);
+    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(clean);
+  }
+
+  for (const weekLabel of weekLabels) {
+    const weekNumber = maddenWeekNumberFromLabel(weekLabel);
+    const exportWeekIndex = weekNumber !== null ? Math.max(0, weekNumber - 1) : null;
+    const mcaSeasonWeek = weekNumber !== null ? weekNumber + 3 : null;
+    const stage = 1;
+    const seasonWeekType = 1;
+
+    const payloadVariants = [];
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stageIndex: stage });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, weekType: seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: weekNumber, weekType: seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: mcaSeasonWeek, weekType: seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, seasonWeekType });
+    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId) });
+
+    console.log('[SNALLAPA TEAMSTATS TRACE 7J-5BP] ' + JSON.stringify({
+      clue: 'Snallapa export destination posts TeamStatsExport.teamStatInfoList to /week/{stage}/{week}/teamstats',
+      weekLabel,
+      derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage, seasonWeekType },
+      payloadVariants,
+      commands: commandCandidates.map(c => c.name + ':' + c.id),
+    }).slice(0, 9000));
+
+    for (const command of commandCandidates) {
+      for (const requestPayload of payloadVariants) {
+        if (attempted >= maxAttempts) break;
+        attempted += 1;
+
+        try {
+          const response = await sendEaBlazeCareerModeCommand(context.token, command.name, command.id, requestPayload);
+          const summary = summarizeEaTeamStatsProbeValue(command, requestPayload, response);
+          const record = { success: true, weekLabel, ...summary };
+          results.push(record);
+
+          console.log('[EA TEAMSTATS MIRROR HIT 7J-5BP] ' + JSON.stringify(record).slice(0, 12000));
+
+          const arraysWithRows = (summary.arrays || []).filter(a => Number(a.length || 0) > 0);
+          const scoreKeys = Object.keys(summary.scoreLikeFields || {}).filter(key => /score|point|pts|for|against|total/i.test(key));
+
+          if (arraysWithRows.length || scoreKeys.length) {
+            console.log('[EA TEAMSTATS MIRROR CANDIDATE 7J-5BP] ' + JSON.stringify({
+              commandName: command.name,
+              commandId: command.id,
+              payload: requestPayload,
+              arrays: arraysWithRows,
+              scoreKeys: scoreKeys.slice(0, 80),
+              scoreLikeFields: summary.scoreLikeFields,
+            }).slice(0, 15000));
+          }
+        } catch (error) {
+          const fail = {
+            success: false,
+            weekLabel,
+            commandName: command.name,
+            commandId: command.id,
+            payload: requestPayload,
+            error: String(error?.message || error).slice(0, 800),
+          };
+          results.push(fail);
+          console.log('[EA TEAMSTATS MIRROR FAIL 7J-5BP] ' + JSON.stringify(fail));
+        }
+      }
+      if (attempted >= maxAttempts) break;
+    }
+    if (attempted >= maxAttempts) break;
+  }
+
+  console.log('[EA TEAMSTATS MIRROR SUMMARY 7J-5BP] ' + JSON.stringify({
+    attempted,
+    successes: results.filter(r => r.success).length,
+    failures: results.filter(r => !r.success).length,
+    commandsTried: [...new Set(results.map(r => r.commandName))],
+    successfulPayloads: results.filter(r => r.success).map(r => ({
+      weekLabel: r.weekLabel,
+      commandName: r.commandName,
+      commandId: r.commandId,
+      payload: r.payload,
+      arrays: r.arrays,
+      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 50),
+    })).slice(0, 16),
+  }).slice(0, 15000));
+
+  return results;
+}
+
+
 async function probeEaDirectScoreSources(context, guild, league) {
   const enabled = String(process.env.EA_SCORE_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return [];
@@ -18117,6 +18287,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await probeEaDirectScoreSources(context, guild, league).catch(error => {
       console.error('[Madden Sync] EA score source discovery failed:', error?.message || error);
     });
+    await probeEaTeamStatsMirrorSource(context, guild, league).catch(error => {
+      console.error('[Madden Sync] TeamStats mirror probe failed:', error?.message || error);
+    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
 
@@ -18126,8 +18299,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa-guided score discovery enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa-guided score discovery enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; TeamStats mirror probe enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; TeamStats mirror probe enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
