@@ -15966,6 +15966,170 @@ async function getEaBlazeLeagueHub(token, leagueId) {
   return response?.responseInfo?.value || response;
 }
 
+
+async function sendEaBlazeCareerModeCommandWithSession(token, session, commandName, commandId, requestPayload = {}, options = {}) {
+  return await sendEaBlazeRequest(token, session, {
+    commandName,
+    componentId: options.componentId || 2060,
+    commandId,
+    requestPayload,
+    componentName: options.componentName || 'careermode',
+  });
+}
+
+function summarizeEaTokenForSessionTrace(token) {
+  return {
+    console: token?.console,
+    blazeId: token?.blazeId,
+    personaId: token?.personaId,
+    hasAccessToken: Boolean(token?.accessToken || token?.access_token),
+    accessTokenLength: String(token?.accessToken || token?.access_token || '').length,
+    hasRefreshToken: Boolean(token?.refreshToken || token?.refresh_token),
+    refreshTokenLength: String(token?.refreshToken || token?.refresh_token || '').length,
+    expiry: token?.expiry || token?.expiresAt || token?.expires_at || null,
+  };
+}
+
+async function probeSnallapaSessionEscalation(context, guild, league) {
+  const enabled = String(process.env.EA_SESSION_ESCALATION_PROBE_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const trace = {
+    token: summarizeEaTokenForSessionTrace(context.token),
+    externalLeagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    attempts: [],
+  };
+
+  let baseSession = null;
+  try {
+    baseSession = await retrieveBlazeSession(context.token);
+    trace.baseSession = {
+      blazeId: baseSession?.blazeId,
+      requestId: baseSession?.requestId,
+      sessionKeyLength: String(baseSession?.sessionKey || '').length,
+    };
+  } catch (error) {
+    trace.baseSessionError = String(error?.message || error).slice(0, 1000);
+    console.log('[SNALLAPA SESSION ESCALATION 7J-5BS] ' + JSON.stringify(trace).slice(0, 12000));
+    return trace;
+  }
+
+  const weekResult = await pool.query(
+    `SELECT week_label
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+     GROUP BY week_label
+     ORDER BY week_label DESC
+     LIMIT 1`,
+    [guild.id, league.league_id]
+  );
+
+  const weekLabel = weekResult.rows?.[0]?.week_label || 'Week 1';
+  const weekNumber = maddenWeekNumberFromLabel(weekLabel) || 1;
+  const exportWeekIndex = Math.max(0, weekNumber - 1);
+  const mcaSeasonWeek = weekNumber + 3;
+
+  const payloads = [
+    { label: 'league-only', payload: { leagueId: Number(context.externalLeagueId) } },
+    { label: 'snallapa-export-week', payload: { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage: 1 } },
+    { label: 'snallapa-export-week-stageIndex', payload: { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stageIndex: 1 } },
+    { label: 'mca-season-week', payload: { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, seasonWeekType: 1 } },
+  ];
+
+  const commandTests = [
+    { label: 'known-working-leaguehub', name: 'Mobile_Career_GetLeagueHub', id: 811, payload: { leagueId: Number(context.externalLeagueId) } },
+    { label: 'standings-export', name: 'Mobile_Career_GetStandings', id: 802 },
+    { label: 'teamstats-export', name: 'Mobile_Career_GetTeamStats', id: 803 },
+    { label: 'weeklystats-export', name: 'Mobile_Career_GetWeeklyStats', id: 804 },
+  ];
+
+  const componentVariants = [
+    { componentId: 2060, componentName: 'careermode', label: 'career-2060' },
+    { componentId: 2060, componentName: 'stats', label: 'stats-name-2060' },
+    { componentId: 2060, componentName: 'madden', label: 'madden-name-2060' },
+  ];
+
+  for (const command of commandTests) {
+    const payloadSet = command.payload
+      ? [{ label: 'command-default', payload: command.payload }]
+      : payloads;
+
+    for (const p of payloadSet) {
+      for (const component of componentVariants) {
+        const attempt = {
+          commandLabel: command.label,
+          commandName: command.name,
+          commandId: command.id,
+          payloadLabel: p.label,
+          payload: p.payload,
+          component,
+        };
+
+        try {
+          const response = await sendEaBlazeCareerModeCommandWithSession(
+            context.token,
+            baseSession,
+            command.name,
+            command.id,
+            p.payload,
+            component
+          );
+          const value = response?.responseInfo?.value || response;
+          attempt.success = true;
+          attempt.topKeys = Object.keys(value || {}).slice(0, 40);
+          attempt.arrays = deepFindArraysByKey(value, [
+            'teamStandingInfoList',
+            'teamStatInfoList',
+            'gameScheduleInfoList',
+            'stats',
+            'teams',
+            'games',
+          ]).map(item => ({
+            path: item.path,
+            key: item.key,
+            length: Array.isArray(item.rows) ? item.rows.length : 0,
+            sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+              ? Object.keys(item.rows[0]).slice(0, 50)
+              : [],
+          })).slice(0, 8);
+          attempt.scoreLikeKeys = Object.keys(collectMaddenScoreLikeFields(value)).slice(0, 50);
+          trace.attempts.push(attempt);
+
+          console.log('[SNALLAPA SESSION ESCALATION HIT 7J-5BS] ' + JSON.stringify(attempt).slice(0, 10000));
+        } catch (error) {
+          attempt.success = false;
+          attempt.error = String(error?.message || error).slice(0, 900);
+          trace.attempts.push(attempt);
+
+          console.log('[SNALLAPA SESSION ESCALATION FAIL 7J-5BS] ' + JSON.stringify(attempt));
+        }
+
+        if (command.id === 811) break;
+      }
+    }
+  }
+
+  console.log('[SNALLAPA SESSION ESCALATION SUMMARY 7J-5BS] ' + JSON.stringify({
+    token: trace.token,
+    baseSession: trace.baseSession,
+    externalLeagueId: trace.externalLeagueId,
+    weekLabel,
+    derived: { weekNumber, exportWeekIndex, mcaSeasonWeek },
+    successes: trace.attempts.filter(a => a.success).length,
+    failures: trace.attempts.filter(a => !a.success).length,
+    successAttempts: trace.attempts.filter(a => a.success).slice(0, 12),
+    errorBuckets: trace.attempts.filter(a => !a.success).reduce((acc, a) => {
+      const key = (a.error || '').slice(0, 160);
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {}),
+  }).slice(0, 18000));
+
+  return trace;
+}
+
+
 async function sendEaBlazeCareerModeCommand(token, commandName, commandId, requestPayload = {}, options = {}) {
   const session = await retrieveBlazeSession(token);
   return await sendEaBlazeRequest(token, session, {
@@ -18686,6 +18850,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await probeSnallapaCommandMapReconstruction(context, guild, league).catch(error => {
       console.error('[Madden Sync] Snallapa command-map probe failed:', error?.message || error);
     });
+    await probeSnallapaSessionEscalation(context, guild, league).catch(error => {
+      console.error('[Madden Sync] Snallapa session escalation probe failed:', error?.message || error);
+    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
 
@@ -18695,8 +18862,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa command-map reconstruction enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa command-map reconstruction enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Snallapa session escalation probe enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Snallapa session escalation probe enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
