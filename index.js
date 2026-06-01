@@ -15018,6 +15018,27 @@ function isEaExpiredTokenError(error) {
     message.toLowerCase().includes('expired token');
 }
 
+function isEaInvalidRequestTokenError(error) {
+  const message = String(error?.message || error || '');
+  return message.includes('AUTH_ERR_INVALID_REQUEST') ||
+    message.includes('"errorcode":131073') ||
+    message.toLowerCase().includes('invalid_request');
+}
+
+function summarizeEaTokenForLog(token) {
+  return {
+    hasAccessToken: Boolean(token?.accessToken),
+    accessTokenLength: token?.accessToken ? String(token.accessToken).length : 0,
+    hasRefreshToken: Boolean(token?.refreshToken),
+    refreshTokenLength: token?.refreshToken ? String(token.refreshToken).length : 0,
+    expiry: token?.expiry ? String(token.expiry) : null,
+    console: token?.console || null,
+    blazeId: token?.blazeId || null,
+  };
+}
+
+
+
 async function refreshEaConnectionTokens(connection, existingRefreshToken) {
   const refreshToken = existingRefreshToken || decryptEaSecret(connection.refresh_token_encrypted);
   const payload = await refreshEaAccessToken(refreshToken);
@@ -16890,18 +16911,68 @@ async function getEaDirectLeagueSyncContext(league) {
 
 
 async function getEaBlazeLeagueHubWithRefreshRetry(context) {
+  const preRefreshToken = { ...context.token };
+
   try {
     return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
   } catch (error) {
-    if (!isEaExpiredTokenError(error)) throw error;
+    const isExpired = isEaExpiredTokenError(error);
+    const isInvalidRequest = isEaInvalidRequestTokenError(error);
 
-    console.log('[EA Direct] Blaze login reported expired token. Refreshing and retrying LeagueHub once.');
+    if (!isExpired && !isInvalidRequest) throw error;
+
+    if (isInvalidRequest && !isExpired) {
+      console.log('[EA Direct] Blaze rejected current token with invalid request before refresh:', summarizeEaTokenForLog(context.token));
+    }
+
+    console.log('[EA Direct] Blaze login token error. Refreshing and retrying LeagueHub once.', {
+      expired: isExpired,
+      invalidRequest: isInvalidRequest,
+      tokenBeforeRefresh: summarizeEaTokenForLog(context.token),
+    });
+
     const refreshed = await refreshEaConnectionTokens(context.connection, context.token.refreshToken);
-    context.token.accessToken = refreshed.accessToken;
-    context.token.refreshToken = refreshed.refreshToken;
-    context.token.expiry = refreshed.expiry;
 
-    return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+    const refreshedToken = {
+      ...context.token,
+      accessToken: refreshed.accessToken,
+      refreshToken: refreshed.refreshToken,
+      expiry: refreshed.expiry,
+    };
+
+    console.log('[EA Direct] Retrying Blaze login with refreshed token:', summarizeEaTokenForLog(refreshedToken));
+
+    try {
+      context.token = refreshedToken;
+      return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+    } catch (refreshError) {
+      console.log('[EA Direct] Refreshed token Blaze retry failed:', {
+        expired: isEaExpiredTokenError(refreshError),
+        invalidRequest: isEaInvalidRequestTokenError(refreshError),
+        error: String(refreshError?.message || refreshError).slice(0, 500),
+      });
+
+      // Diagnostic fallback:
+      // If a freshly refreshed access token is rejected as AUTH_ERR_INVALID_REQUEST,
+      // retry the pre-refresh token once. This distinguishes:
+      //   A) refresh output is not Blaze-compatible
+      //   B) Blaze login is rejecting this connection generally
+      if (isEaInvalidRequestTokenError(refreshError) && preRefreshToken?.accessToken) {
+        console.log('[EA Direct] Trying pre-refresh access token once for compatibility comparison:', summarizeEaTokenForLog(preRefreshToken));
+        try {
+          context.token = preRefreshToken;
+          return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
+        } catch (previousTokenError) {
+          console.log('[EA Direct] Pre-refresh token fallback also failed:', {
+            expired: isEaExpiredTokenError(previousTokenError),
+            invalidRequest: isEaInvalidRequestTokenError(previousTokenError),
+            error: String(previousTokenError?.message || previousTokenError).slice(0, 500),
+          });
+        }
+      }
+
+      throw refreshError;
+    }
   }
 }
 
@@ -16993,8 +17064,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
@@ -17020,7 +17091,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       [league.league_id, String(context.externalLeagueId), message]
     );
   } catch (error) {
-    const message = 'EA Direct sync failed: ' + (isEaExpiredTokenError(error) ? 'EA token expired and refresh failed. Run /madden connect again. Details: ' : '') + (error?.message || error);
+    const message = 'EA Direct sync failed: ' + (isEaExpiredTokenError(error) ? 'EA token expired and refresh failed. Run /madden connect again. Details: ' : isEaInvalidRequestTokenError(error) ? 'EA refreshed token was rejected by Blaze. Run /madden connect again if this persists. Details: ' : '') + (error?.message || error);
     await pool.query(
       `UPDATE madden_sync_runs
        SET status = 'failed',
