@@ -5626,7 +5626,7 @@ if (gameSubcommand === 'report') {
               [interaction.guild.id, activeLeague.league_id, week]
             )
           : await pool.query(
-              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 ORDER BY week_label ASC, away_team ASC LIMIT 25`,
+              `SELECT * FROM madden_imported_games WHERE guild_id = $1 AND league_id = $2 ORDER BY CASE WHEN week_label IS NULL OR LOWER(week_label) = 'week tbd' THEN 1 ELSE 0 END, week_label ASC, away_team ASC LIMIT 25`,
               [interaction.guild.id, activeLeague.league_id]
             );
 
@@ -16835,21 +16835,58 @@ function getTeamNameFromGameSide(game, side, maps) {
 }
 
 
-function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = null) {
-  const direct = normalizeEaWeekLabel(game);
-  if (direct && direct !== 'Week TBD') return direct;
+function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = null, parentRow = null) {
+  const sources = [game, parentRow, parentRow?.seasonGameInfo, parentRow?.gameInfo].filter(Boolean);
 
-  const weekType = parseNumberOrNull(getAnyValue(game, ['weekType', 'seasonWeekType'], null));
-  const rawWeek = parseNumberOrNull(getAnyValue(game, ['week', 'weekIndex', 'seasonWeek'], null));
+  for (const source of sources) {
+    const explicit = getAnyValue(source, [
+      'displayedWeek',
+      'weekTitle',
+      'week_label',
+      'weekLabel',
+      'displayWeekLabel',
+      'seasonWeekTitle'
+    ], null);
 
-  if (weekType === 0 && rawWeek !== null) return 'Preseason Week ' + String(rawWeek + 1);
-  if ((weekType === 1 || weekType === null) && rawWeek !== null) {
-    return 'Week ' + String(rawWeek >= 4 ? rawWeek - 3 : rawWeek + 1);
+    if (explicit && String(explicit).trim() && String(explicit).trim() !== 'Week TBD') {
+      const value = String(explicit).trim();
+      if (value.match(/^\d+$/)) return 'Week ' + value;
+      return value;
+    }
+  }
+
+  for (const source of sources) {
+    const weekType = parseNumberOrNull(getAnyValue(source, ['weekType', 'seasonWeekType', 'stageIndex'], null));
+    const rawWeek = parseNumberOrNull(getAnyValue(source, [
+      'week',
+      'weekIndex',
+      'seasonWeek',
+      'displayWeek',
+      'displayedWeekIndex',
+      'scheduleWeek',
+      'gameWeek'
+    ], null));
+
+    if (rawWeek !== null) {
+      if (weekType === 0) return 'Preseason Week ' + String(rawWeek + 1);
+      if (weekType === 1 || weekType === null) return 'Week ' + String(rawWeek >= 4 ? rawWeek - 3 : rawWeek + 1);
+      if (weekType === 2) return 'Wildcard Round';
+      if (weekType === 3) return 'Divisional Round';
+      if (weekType === 4) return 'Conference Championship';
+      if (weekType === 5 || weekType === 6) return 'Super Bowl';
+    }
+  }
+
+  if (currentCtx && currentCtx.isRegularSeason) {
+    const currentWeekNumber = Number(String(currentCtx.displayedWeek || '').match(/\d+/)?.[0] || 0) ||
+      (Number.isFinite(Number(currentCtx.seasonWeek)) ? Math.max(1, Number(currentCtx.seasonWeek) - 3) : null);
+
+    if (currentWeekNumber) return 'Week ' + String(currentWeekNumber);
   }
 
   if (currentCtx?.seasonWeek !== null && currentCtx?.seasonWeek !== undefined) {
     const base = Number(currentCtx.seasonWeek);
-    if (Number.isFinite(base)) return 'Week ' + String(Math.max(1, base - 3 + fallbackIndex));
+    if (Number.isFinite(base)) return 'Week ' + String(Math.max(1, base - 3));
   }
 
   return 'Week TBD';
@@ -16879,7 +16916,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const seasonGameKey = getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) ||
       getAnyValue(game, ['seasonGameKey', 'id', 'gameId'], null);
 
-    const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, currentCtx);
+    const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, currentCtx, item);
     const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
 
@@ -16914,13 +16951,31 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     }
   }
 
-  const games = Array.from(byGameKey.values()).sort((a, b) => {
+  let games = Array.from(byGameKey.values());
+
+  const knownWeek = games
+    .map(g => String(g.week_label || ''))
+    .find(label => label && label !== 'Week TBD' && /^Week\s+\d+/i.test(label));
+
+  if (knownWeek) {
+    games = games.map(game => {
+      if (String(game.week_label || '') !== 'Week TBD') return game;
+      return {
+        ...game,
+        week: knownWeek,
+        weekLabel: knownWeek,
+        week_label: knownWeek,
+      };
+    });
+  }
+
+  games = games.sort((a, b) => {
     const aw = parseNumberOrNull(String(a.week_label || '').match(/\d+/)?.[0]) ?? 999;
     const bw = parseNumberOrNull(String(b.week_label || '').match(/\d+/)?.[0]) ?? 999;
     return aw - bw || String(a.away_team).localeCompare(String(b.away_team));
   });
 
-  console.log('[EA SCHEDULE NORMALIZED 7J-5BF] ' + JSON.stringify({
+  console.log('[EA SCHEDULE NORMALIZED 7J-5BG] ' + JSON.stringify({
     inputRows: rows.length,
     dedupedGames: games.length,
     sample: games.slice(0, 8).map(g => ({
@@ -17135,6 +17190,31 @@ async function getEaBlazeLeagueHubWithRefreshRetry(context) {
 
 
 
+
+async function cleanupMaddenWeekTbdRows(guild, league) {
+  const normalized = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2 AND week_label IS NOT NULL AND LOWER(week_label) <> 'week tbd'`,
+    [guild.id, league.league_id]
+  );
+
+  if (Number(normalized.rows[0]?.count || 0) <= 0) return 0;
+
+  const deleted = await pool.query(
+    `DELETE FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2 AND (week_label IS NULL OR LOWER(week_label) = 'week tbd')`,
+    [guild.id, league.league_id]
+  );
+
+  if (Number(deleted.rowCount || 0) > 0) {
+    console.log('[Madden Schedule Cleanup 7J-5BG] Removed stale Week TBD rows:', deleted.rowCount);
+  }
+
+  return Number(deleted.rowCount || 0);
+}
+
+
 async function recalculateMaddenTeamPointsFromImportedGames(guild, league) {
   const teamsResult = await pool.query(
     `SELECT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`,
@@ -17253,6 +17333,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
     const importedTeams = teams.length ? await importMaddenTeamsFromArray(guild, league, teams) : 0;
     const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null) : 0;
+    await cleanupMaddenWeekTbdRows(guild, league).catch(error => {
+      console.error('[Madden Sync] Week TBD cleanup failed:', error?.message || error);
+    });
     await recalculateMaddenTeamPointsFromImportedGames(guild, league).catch(error => {
       console.error('[Madden Sync] PF/PA recompute failed:', error?.message || error);
     });
@@ -17265,8 +17348,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; rowIndex fix + safe week repair enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; rowIndex fix + safe week repair enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; future week resolver expansion enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; future week resolver expansion enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
