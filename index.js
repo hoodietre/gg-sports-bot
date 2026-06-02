@@ -18437,6 +18437,245 @@ function normalizeRequestInfoTeamAnalytics(teamInfo, sideLabel = 'team') {
   };
 }
 
+
+function looksLikeMaddenTeamAnalyticsObject(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+
+  const keys = Object.keys(obj);
+  const keySet = new Set(keys);
+
+  const hasTeamName =
+    keySet.has('displayName') ||
+    keySet.has('teamName') ||
+    keySet.has('shortName') ||
+    keySet.has('longName') ||
+    keySet.has('TEAM_ASSETNAME');
+
+  const hasRecord =
+    keySet.has('wins') ||
+    keySet.has('losses') ||
+    keySet.has('ties');
+
+  const hasPfPa =
+    keySet.has('teamTotalPointsScored') ||
+    keySet.has('teamTotalPointsAllowed') ||
+    keySet.has('totalPointsScored') ||
+    keySet.has('totalPointsAllowed') ||
+    keySet.has('pointsFor') ||
+    keySet.has('pointsAgainst');
+
+  const hasTeamRatings =
+    keySet.has('ovr') ||
+    keySet.has('offenseOvr') ||
+    keySet.has('defenseOvr');
+
+  const hasFootballStats =
+    keySet.has('totalPassYards') ||
+    keySet.has('totalRushYards') ||
+    keySet.has('passTds') ||
+    keySet.has('rushTds') ||
+    keySet.has('sacks') ||
+    keySet.has('takeaways') ||
+    keySet.has('giveAways') ||
+    keySet.has('thirdDownPercent') ||
+    keySet.has('redZonePercent');
+
+  return Boolean(hasTeamName && (hasRecord || hasPfPa || hasTeamRatings || hasFootballStats));
+}
+
+function deepFindMaddenTeamAnalyticsObjects(obj, path = '', out = [], depth = 0, seen = new Set()) {
+  if (!obj || typeof obj !== 'object' || depth > 10 || seen.has(obj)) return out;
+  seen.add(obj);
+
+  if (!Array.isArray(obj) && looksLikeMaddenTeamAnalyticsObject(obj)) {
+    out.push({
+      path,
+      raw: obj,
+      normalized: normalizeRequestInfoTeamAnalytics(obj, path.includes('away') ? 'away' : path.includes('home') ? 'home' : 'team'),
+    });
+  }
+
+  if (Array.isArray(obj)) {
+    obj.slice(0, 300).forEach((item, index) => {
+      deepFindMaddenTeamAnalyticsObjects(item, path + '[' + index + ']', out, depth + 1, seen);
+    });
+  } else {
+    for (const [key, value] of Object.entries(obj)) {
+      if (value && typeof value === 'object') {
+        deepFindMaddenTeamAnalyticsObjects(value, path ? path + '.' + key : key, out, depth + 1, seen);
+      }
+    }
+  }
+
+  return out;
+}
+
+function mergeMaddenTeamAnalyticsObjects(items) {
+  const byTeam = new Map();
+
+  function qualityScore(team) {
+    let score = 0;
+    for (const key of [
+      'wins', 'losses', 'ties',
+      'teamTotalPointsScored', 'teamTotalPointsAllowed',
+      'teamTotalPointsScoredRank', 'teamTotalPointsAllowedRank',
+      'totalPassYards', 'totalRushYards',
+      'totalDefPassYards', 'totalDefRushYards',
+      'passTds', 'rushTds', 'sacks', 'takeaways', 'giveAways',
+      'thirdDownPercent', 'redZonePercent',
+      'ovr', 'offenseOvr', 'defenseOvr',
+    ]) {
+      if (team[key] !== null && team[key] !== undefined && team[key] !== '') score += 1;
+    }
+    if (Array.isArray(team.topThreats) && team.topThreats.length) score += 4;
+    if (team.teamTotalPointsScored !== null && team.teamTotalPointsAllowed !== null) score += 10;
+    return score;
+  }
+
+  for (const item of items) {
+    const team = item.normalized || item;
+    if (!team) continue;
+
+    const canonicalName = canonicalMaddenTeamNameFromAny(
+      team.canonicalName || team.displayName || team.teamName || team.shortName || team.longName
+    );
+    if (!canonicalName) continue;
+
+    const key = canonicalName.toLowerCase();
+    const existing = byTeam.get(key);
+
+    if (!existing) {
+      byTeam.set(key, {
+        ...team,
+        canonicalName,
+        sourcePaths: item.path ? [item.path] : [],
+        qualityScore: qualityScore(team),
+      });
+      continue;
+    }
+
+    const merged = { ...existing };
+    for (const [field, value] of Object.entries(team)) {
+      if (field === 'topThreats') {
+        if (Array.isArray(value) && value.length && (!Array.isArray(merged.topThreats) || !merged.topThreats.length)) {
+          merged.topThreats = value;
+        }
+        continue;
+      }
+
+      if (value !== null && value !== undefined && value !== '') {
+        const existingValue = merged[field];
+        // Prefer nonzero PF/PA/team totals, but keep existing if new value is zero and existing is nonzero.
+        if (
+          ['teamTotalPointsScored', 'teamTotalPointsAllowed'].includes(field) &&
+          Number(value) === 0 &&
+          Number(existingValue || 0) > 0
+        ) {
+          continue;
+        }
+        merged[field] = value;
+      }
+    }
+    merged.canonicalName = canonicalName;
+    merged.sourcePaths = Array.from(new Set([...(merged.sourcePaths || []), item.path].filter(Boolean))).slice(0, 12);
+    merged.qualityScore = Math.max(existing.qualityScore || 0, qualityScore(team));
+    byTeam.set(key, merged);
+  }
+
+  return Array.from(byTeam.values()).sort((a, b) => {
+    const aHas = Number(a.teamTotalPointsScored ?? 0) || Number(a.teamTotalPointsAllowed ?? 0) ? 1 : 0;
+    const bHas = Number(b.teamTotalPointsScored ?? 0) || Number(b.teamTotalPointsAllowed ?? 0) ? 1 : 0;
+    if (aHas !== bHas) return bHas - aHas;
+    return String(a.canonicalName).localeCompare(String(b.canonicalName));
+  });
+}
+
+async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub) {
+  const enabled = String(process.env.EA_FULL_LEAGUE_ANALYTICS_EXPANSION_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const allObjects = deepFindMaddenTeamAnalyticsObjects(hub);
+  const mergedTeams = mergeMaddenTeamAnalyticsObjects(allObjects);
+
+  const pfPaTeams = mergedTeams.filter(team =>
+    team.teamTotalPointsScored !== null &&
+    team.teamTotalPointsAllowed !== null &&
+    team.teamTotalPointsScored !== undefined &&
+    team.teamTotalPointsAllowed !== undefined
+  );
+
+  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C1] ' + JSON.stringify({
+    leagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    rawTeamObjectCount: allObjects.length,
+    mergedTeamCount: mergedTeams.length,
+    pfPaTeamCount: pfPaTeams.length,
+    pfPaTeams: pfPaTeams.map(team => ({
+      team: team.canonicalName,
+      displayName: team.displayName,
+      teamName: team.teamName,
+      wins: team.wins,
+      losses: team.losses,
+      ties: team.ties,
+      pf: team.teamTotalPointsScored,
+      pa: team.teamTotalPointsAllowed,
+      pfRank: team.teamTotalPointsScoredRank,
+      paRank: team.teamTotalPointsAllowedRank,
+      sourcePaths: team.sourcePaths,
+      topThreats: (team.topThreats || []).slice(0, 3).map(p => ({
+        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
+        ovr: p.ovr,
+        s1: p.stat1Label,
+        v1: p.stat1Value,
+        s2: p.stat2Label,
+        v2: p.stat2Value,
+      })),
+    })).slice(0, 40),
+    mergedTeamsSample: mergedTeams.slice(0, 40).map(team => ({
+      team: team.canonicalName,
+      wins: team.wins,
+      losses: team.losses,
+      pf: team.teamTotalPointsScored,
+      pa: team.teamTotalPointsAllowed,
+      qualityScore: team.qualityScore,
+      sourcePaths: team.sourcePaths,
+    })),
+  }).slice(0, 30000));
+
+  const shouldWrite = String(process.env.EA_FULL_LEAGUE_ANALYTICS_WRITE || 'true').toLowerCase() !== 'false';
+  if (shouldWrite) {
+    let updated = 0;
+    const updateResults = [];
+
+    for (const team of pfPaTeams) {
+      const teamName = team.canonicalName || team.displayName || team.teamName;
+      const pf = parseNumberOrNull(team.teamTotalPointsScored);
+      const pa = parseNumberOrNull(team.teamTotalPointsAllowed);
+      if (!teamName || pf === null || pa === null) continue;
+
+      const result = await pool.query(
+        `UPDATE madden_imported_team_stats
+         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+             imported_at = NOW()
+         WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
+        [guild.id, league.league_id, pf, pa, teamName]
+      );
+
+      updated += Number(result.rowCount || 0);
+      updateResults.push({ teamName, pf, pa, rowCount: Number(result.rowCount || 0) });
+    }
+
+    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C1] ' + JSON.stringify({
+      updated,
+      updateResults,
+    }).slice(0, 12000));
+  }
+
+  return { allObjects, mergedTeams, pfPaTeams };
+}
+
+
 function extractRequestInfoSeasonGameAnalytics(entry, index) {
   const requestData = getAnyValue(entry, ['requestData', 'data'], {}) || {};
   const value = getAnyValue(requestData, ['value'], requestData) || {};
@@ -18498,7 +18737,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C0] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C1] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -18527,7 +18766,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C0] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C1] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -18551,7 +18790,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5C0] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5C1] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -18586,7 +18825,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5C0] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5C1] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -18646,7 +18885,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5C0] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5C1] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -19803,6 +20042,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await harvestRequestInfoTeamAnalytics(context, guild, league, hub).catch(error => {
       console.error('[Madden Sync] RequestInfo analytics harvest failed:', error?.message || error);
     });
+    await harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub).catch(error => {
+      console.error('[Madden Sync] Full-league RequestInfo analytics expansion failed:', error?.message || error);
+    });
 
     let teams = normalizeEaLeagueTeamsDeepFromHub(hub);
     const games = normalizeEaScheduleDeepFromHub(hub);
@@ -19870,6 +20112,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await harvestRequestInfoTeamAnalytics(context, guild, league, hub).catch(error => {
       console.error('[Madden Sync] RequestInfo PF/PA post-accumulator reapply failed:', error?.message || error);
     });
+    await harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub).catch(error => {
+      console.error('[Madden Sync] Full-league RequestInfo PF/PA post-accumulator reapply failed:', error?.message || error);
+    });
     await logMaddenTeamStatsDbTruth(guild, league, 'after-requestinfo-post-accumulator-reapply').catch(error => {
       console.error('[Madden Sync] DB truth after RequestInfo reapply failed:', error?.message || error);
     });
@@ -19900,8 +20145,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; PF/PA preservation patch enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; PF/PA preservation patch enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full-league analytics expansion enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full-league analytics expansion enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
