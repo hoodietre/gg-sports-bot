@@ -18598,6 +18598,240 @@ function hasUsableMaddenScorePair(homeScore, awayScore) {
   return h > 0 || a > 0;
 }
 
+
+async function loadImportedMaddenTeamSeedMap(guild, league) {
+  const rows = await pool.query(
+    `SELECT team_name, wins, losses, ties, points_for, points_against, raw_payload
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id = $2`,
+    [guild.id, league.league_id]
+  );
+
+  const map = new Map();
+
+  for (const row of rows.rows || []) {
+    const canonicalName = canonicalMaddenTeamNameFromAny(row.team_name);
+    if (!canonicalName) continue;
+
+    map.set(canonicalName.toLowerCase(), {
+      canonicalName,
+      teamName: canonicalName,
+      displayName: canonicalName,
+      wins: parseNumberOrNull(row.wins) ?? 0,
+      losses: parseNumberOrNull(row.losses) ?? 0,
+      ties: parseNumberOrNull(row.ties) ?? 0,
+      teamTotalPointsScored: parseNumberOrNull(row.points_for) ?? 0,
+      teamTotalPointsAllowed: parseNumberOrNull(row.points_against) ?? 0,
+      sourcePaths: ['db:madden_imported_team_stats'],
+      seededFromDb: true,
+    });
+  }
+
+  return map;
+}
+
+function mergeTeamIntoDiscoveryMap(map, team, sourcePath = 'unknown') {
+  if (!team) return;
+
+  const canonicalName = canonicalMaddenTeamNameFromAny(
+    team.canonicalName || team.displayName || team.teamName || team.name || team.shortName || team.longName
+  );
+  if (!canonicalName) return;
+
+  const key = canonicalName.toLowerCase();
+  const existing = map.get(key) || {
+    canonicalName,
+    teamName: canonicalName,
+    displayName: canonicalName,
+    wins: 0,
+    losses: 0,
+    ties: 0,
+    teamTotalPointsScored: 0,
+    teamTotalPointsAllowed: 0,
+    sourcePaths: [],
+  };
+
+  const merged = { ...existing, canonicalName };
+
+  function preferNumber(field, value) {
+    const parsed = parseNumberOrNull(value);
+    if (parsed === null) return;
+
+    const current = parseNumberOrNull(merged[field]);
+    // For PF/PA, never replace nonzero with zero.
+    if (
+      ['teamTotalPointsScored', 'teamTotalPointsAllowed'].includes(field) &&
+      parsed === 0 &&
+      current !== null &&
+      current > 0
+    ) {
+      return;
+    }
+
+    // For record fields, use latest numeric value.
+    merged[field] = parsed;
+  }
+
+  preferNumber('wins', team.wins);
+  preferNumber('losses', team.losses);
+  preferNumber('ties', team.ties);
+
+  preferNumber('teamTotalPointsScored',
+    team.teamTotalPointsScored ?? team.points_for ?? team.pointsFor ?? team.pf
+  );
+  preferNumber('teamTotalPointsAllowed',
+    team.teamTotalPointsAllowed ?? team.points_against ?? team.pointsAgainst ?? team.pa
+  );
+
+  preferNumber('teamTotalPointsScoredRank', team.teamTotalPointsScoredRank ?? team.pfRank);
+  preferNumber('teamTotalPointsAllowedRank', team.teamTotalPointsAllowedRank ?? team.paRank);
+
+  for (const field of [
+    'ovr', 'offenseOvr', 'defenseOvr',
+    'totalPassYards', 'totalRushYards', 'totalDefPassYards', 'totalDefRushYards',
+    'passTds', 'rushTds', 'sacks', 'takeaways', 'giveAways',
+    'thirdDownPercent', 'redZonePercent',
+  ]) {
+    preferNumber(field, team[field]);
+  }
+
+  for (const field of ['displayName', 'teamName', 'logoId', 'userName', 'isHuman']) {
+    if (team[field] !== null && team[field] !== undefined && team[field] !== '') merged[field] = team[field];
+  }
+
+  if (Array.isArray(team.topThreats) && team.topThreats.length) {
+    if (!Array.isArray(merged.topThreats) || !merged.topThreats.length) merged.topThreats = team.topThreats;
+  }
+
+  merged.sourcePaths = Array.from(new Set([...(existing.sourcePaths || []), sourcePath].filter(Boolean))).slice(0, 20);
+  map.set(key, merged);
+}
+
+async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label = 'full-discovery') {
+  const enabled = String(process.env.EA_FULL_TEAM_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const discovery = await loadImportedMaddenTeamSeedMap(guild, league);
+
+  // Source 1: recursively discovered analytics objects from the full 811 hub.
+  const recursiveObjects = deepFindMaddenTeamAnalyticsObjects(hub);
+  for (const item of recursiveObjects) {
+    mergeTeamIntoDiscoveryMap(discovery, item.normalized, item.path || 'hub:recursive');
+  }
+
+  // Source 2: explicit RequestInfo season-game analytics.
+  const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
+  const requestInfoList =
+    getAnyValue(careerHubInfo, ['requestInfoList'], null) ||
+    getAnyValue(hub, ['requestInfoList'], null) ||
+    [];
+
+  if (Array.isArray(requestInfoList)) {
+    for (let i = 0; i < requestInfoList.length; i++) {
+      const analytics = extractRequestInfoSeasonGameAnalytics(requestInfoList[i], i);
+      if (!analytics) continue;
+      mergeTeamIntoDiscoveryMap(discovery, analytics.awayTeamInfo, 'careerHubInfo.requestInfoList[' + i + '].awayTeamInfo');
+      mergeTeamIntoDiscoveryMap(discovery, analytics.homeTeamInfo, 'careerHubInfo.requestInfoList[' + i + '].homeTeamInfo');
+    }
+  }
+
+  // Source 3: schedule rows can seed team names for all 32 even without score.
+  const scheduleRows = collectEaScheduleCandidateRows(hub);
+  for (const row of scheduleRows) {
+    const game = row.item?.seasonGameInfo || row.item?.gameInfo || row.item || {};
+    const homeTeam = getTeamNameFromGameSide(game, 'home', buildEaTeamNameMapsFromHub(hub));
+    const awayTeam = getTeamNameFromGameSide(game, 'away', buildEaTeamNameMapsFromHub(hub));
+
+    if (homeTeam) mergeTeamIntoDiscoveryMap(discovery, { canonicalName: homeTeam, teamName: homeTeam }, row.sourceLabel + ':home');
+    if (awayTeam) mergeTeamIntoDiscoveryMap(discovery, { canonicalName: awayTeam, teamName: awayTeam }, row.sourceLabel + ':away');
+
+    const homeScore = parseNumberOrNull(getAnyValue(game, ['homeScore', 'home_score'], null));
+    const awayScore = parseNumberOrNull(getAnyValue(game, ['awayScore', 'away_score'], null));
+
+    if (hasUsableMaddenScorePair(homeScore, awayScore)) {
+      mergeTeamIntoDiscoveryMap(discovery, {
+        canonicalName: homeTeam,
+        teamTotalPointsScored: homeScore,
+        teamTotalPointsAllowed: awayScore,
+      }, row.sourceLabel + ':score:home');
+
+      mergeTeamIntoDiscoveryMap(discovery, {
+        canonicalName: awayTeam,
+        teamTotalPointsScored: awayScore,
+        teamTotalPointsAllowed: homeScore,
+      }, row.sourceLabel + ':score:away');
+    }
+  }
+
+  const teams = Array.from(discovery.values()).sort((a, b) => String(a.canonicalName).localeCompare(String(b.canonicalName)));
+  const pfPaTeams = teams.filter(team =>
+    parseNumberOrNull(team.teamTotalPointsScored) !== null &&
+    parseNumberOrNull(team.teamTotalPointsAllowed) !== null &&
+    (
+      Number(team.teamTotalPointsScored || 0) > 0 ||
+      Number(team.teamTotalPointsAllowed || 0) > 0
+    )
+  );
+
+  console.log('[FULL TEAM DISCOVERY 7J-5C3] ' + JSON.stringify({
+    label,
+    totalTeams: teams.length,
+    pfPaTeams: pfPaTeams.length,
+    teams: teams.map(team => ({
+      team: team.canonicalName,
+      wins: team.wins,
+      losses: team.losses,
+      ties: team.ties,
+      pf: team.teamTotalPointsScored,
+      pa: team.teamTotalPointsAllowed,
+      sources: team.sourcePaths,
+      topThreats: (team.topThreats || []).slice(0, 2).map(p => ({
+        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
+        ovr: p.ovr,
+        s1: p.stat1Label,
+        v1: p.stat1Value,
+      })),
+    })),
+  }).slice(0, 24000));
+
+  const shouldWrite = String(process.env.EA_FULL_TEAM_DISCOVERY_WRITE || 'true').toLowerCase() !== 'false';
+  if (shouldWrite) {
+    let updated = 0;
+    const updateResults = [];
+
+    for (const team of pfPaTeams) {
+      const pf = parseNumberOrNull(team.teamTotalPointsScored);
+      const pa = parseNumberOrNull(team.teamTotalPointsAllowed);
+      if (pf === null || pa === null) continue;
+
+      const result = await pool.query(
+        `UPDATE madden_imported_team_stats
+         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+             imported_at = NOW()
+         WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
+        [guild.id, league.league_id, pf, pa, team.canonicalName]
+      );
+
+      updated += Number(result.rowCount || 0);
+      updateResults.push({
+        teamName: team.canonicalName,
+        pf,
+        pa,
+        rowCount: Number(result.rowCount || 0),
+      });
+    }
+
+    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C3] ' + JSON.stringify({
+      updated,
+      updateResults,
+    }).slice(0, 12000));
+  }
+
+  return { teams, pfPaTeams };
+}
+
+
 async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'schedule-derived') {
   const enabled = String(process.env.EA_SCHEDULE_DERIVED_PFPA_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
@@ -18702,7 +18936,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
     .filter(row => row.scored_games > 0)
     .sort((a, b) => String(a.teamName).localeCompare(String(b.teamName)));
 
-  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C2] ' + JSON.stringify({
+  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C3] ' + JSON.stringify({
     label,
     totalCompletedGames: gamesResult.rows.length,
     scoredGames,
@@ -18737,7 +18971,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
       });
     }
 
-    console.log('[SCHEDULE PFPA WRITE 7J-5C2] ' + JSON.stringify({
+    console.log('[SCHEDULE PFPA WRITE 7J-5C3] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -18761,7 +18995,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
     team.teamTotalPointsAllowed !== undefined
   );
 
-  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C2] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C3] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     rawTeamObjectCount: allObjects.length,
@@ -18823,7 +19057,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       updateResults.push({ teamName, pf, pa, rowCount: Number(result.rowCount || 0) });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C2] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C3] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -18894,7 +19128,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C2] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C3] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -18923,7 +19157,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C2] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C3] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -18947,7 +19181,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5C2] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5C3] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -18982,7 +19216,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5C2] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5C3] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -19042,7 +19276,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5C2] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5C3] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -20275,6 +20509,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await synthesizeFullLeaguePfPaFromSchedule(guild, league, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Schedule-derived PF/PA synthesis failed:', error?.message || error);
     });
+    await expandFullLeagueTeamDiscovery(context, guild, league, hub, 'post-accumulator').catch(error => {
+      console.error('[Madden Sync] Full team discovery expansion failed:', error?.message || error);
+    });
     await logMaddenTeamStatsDbTruth(guild, league, 'after-schedule-derived-pfpa-synthesis').catch(error => {
       console.error('[Madden Sync] DB truth after schedule PF/PA synthesis failed:', error?.message || error);
     });
@@ -20308,8 +20545,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; schedule-derived PF/PA synthesizer enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; schedule-derived PF/PA synthesizer enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full league team discovery expansion enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full league team discovery expansion enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
