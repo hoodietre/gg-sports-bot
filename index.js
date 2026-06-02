@@ -14597,8 +14597,8 @@ async function importMaddenTeamsFromArray(guild, league, rows) {
          wins = $7,
          losses = $8,
          ties = $9,
-         points_for = $10,
-         points_against = $11,
+         points_for = CASE WHEN $10 > 0 OR $11 > 0 THEN $10 ELSE madden_imported_team_stats.points_for END,
+         points_against = CASE WHEN $10 > 0 OR $11 > 0 THEN $11 ELSE madden_imported_team_stats.points_against END,
          raw_payload = $12,
          imported_at = NOW()`,
       [
@@ -18498,7 +18498,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5BZ] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C0] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -18527,7 +18527,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5BZ] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C0] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -18551,7 +18551,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5BZ] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5C0] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -18586,7 +18586,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5BZ] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5C0] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -18646,7 +18646,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5BZ] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5C0] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -19689,8 +19689,14 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
        SET wins = $3,
            losses = $4,
            ties = $5,
-           points_for = CASE WHEN $6 > 0 OR $7 > 0 THEN $6 ELSE points_for END,
-           points_against = CASE WHEN $6 > 0 OR $7 > 0 THEN $7 ELSE points_against END,
+           points_for = CASE
+             WHEN $6 > 0 OR $7 > 0 THEN $6
+             ELSE madden_imported_team_stats.points_for
+           END,
+           points_against = CASE
+             WHEN $6 > 0 OR $7 > 0 THEN $7
+             ELSE madden_imported_team_stats.points_against
+           END,
            imported_at = NOW()
        WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($8)`,
       [
@@ -19749,8 +19755,8 @@ async function recalculateMaddenTeamPointsFromImportedGames(guild, league) {
 
     await pool.query(
       `UPDATE madden_imported_team_stats
-       SET points_for = $3,
-           points_against = $4,
+       SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
+           points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
            imported_at = NOW()
        WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
       [guild.id, league.league_id, pf, pa, teamName]
@@ -19861,6 +19867,12 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-accumulator').catch(error => {
       console.error('[Madden Sync] DB truth after accumulator failed:', error?.message || error);
     });
+    await harvestRequestInfoTeamAnalytics(context, guild, league, hub).catch(error => {
+      console.error('[Madden Sync] RequestInfo PF/PA post-accumulator reapply failed:', error?.message || error);
+    });
+    await logMaddenTeamStatsDbTruth(guild, league, 'after-requestinfo-post-accumulator-reapply').catch(error => {
+      console.error('[Madden Sync] DB truth after RequestInfo reapply failed:', error?.message || error);
+    });
     await inspectMaddenCompletedGameRawScores(guild, league).catch(error => {
       console.error('[Madden Sync] Raw score inspector failed:', error?.message || error);
     });
@@ -19888,8 +19900,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Database truth probe enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Database truth probe enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; PF/PA preservation patch enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; PF/PA preservation patch enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
