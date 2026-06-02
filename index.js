@@ -18184,8 +18184,154 @@ function deepFindPotentialStatArrays(obj, path = '', out = [], depth = 0, seen =
   return out;
 }
 
+
+function summarizeMaddenRequestInfoEntry(entry, index) {
+  const requestData = getAnyValue(entry, ['requestData', 'data'], {}) || {};
+  const value = getAnyValue(requestData, ['value'], requestData) || {};
+  const arrays = deepFindPotentialStatArrays(value).slice(0, 20);
+  const knownArrays = deepFindArraysByKey(value, [
+    'teamStandingInfoList',
+    'teamStatInfoList',
+    'gameScheduleInfoList',
+    'leagueSchedule',
+    'topThreats',
+    'playerStatInfoList',
+    'playerPassingStatInfoList',
+    'playerRushingStatInfoList',
+    'playerReceivingStatInfoList',
+    'playerDefensiveStatInfoList',
+    'playerKickingStatInfoList',
+    'playerPuntingStatInfoList',
+    'rosterInfoList',
+    'teamInfoList',
+    'standings',
+    'stats',
+    'leaders',
+    'rankings',
+    'games',
+    'teams',
+    'players',
+  ]).map(item => ({
+    path: item.path,
+    key: item.key,
+    length: Array.isArray(item.rows) ? item.rows.length : 0,
+    sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
+      ? Object.keys(item.rows[0]).slice(0, 100)
+      : [],
+    sample: Array.isArray(item.rows)
+      ? item.rows.slice(0, 2).map(row => compactMaddenRawExcerpt(row))
+      : [],
+  })).slice(0, 20);
+
+  const scoreLikeFields = collectMaddenScoreLikeFields(value);
+  const scorePairs = deepFindMaddenNumericScorePairs(value).slice(0, 20);
+  const keyMatches = deepFindObjectsByKeyPattern(value, [
+    /standing/i,
+    /teamStat/i,
+    /gameStat/i,
+    /weekly/i,
+    /season/i,
+    /score/i,
+    /point/i,
+    /pts/i,
+    /leader/i,
+    /rank/i,
+    /threat/i,
+    /matchup/i,
+    /record/i,
+    /win/i,
+    /loss/i,
+  ]).slice(0, 20);
+
+  return {
+    index,
+    topKeys: Object.keys(entry || {}).slice(0, 80),
+    entryMeta: {
+      title: getAnyValue(entry, ['title'], null),
+      type: getAnyValue(entry, ['type'], null),
+      description: getAnyValue(entry, ['description'], null),
+      priority: getAnyValue(entry, ['priority'], null),
+      requestId: getAnyValue(entry, ['requestId'], null),
+      issueTime: getAnyValue(entry, ['issueTime'], null),
+      expireTime: getAnyValue(entry, ['expireTime'], null),
+      canSubmitResponse: getAnyValue(entry, ['canSubmitResponse'], null),
+      canDismiss: getAnyValue(entry, ['canDismiss'], null),
+      isPersistent: getAnyValue(entry, ['isPersistent'], null),
+      isResolved: getAnyValue(entry, ['isResolved'], null),
+    },
+    requestDataKeys: Object.keys(requestData || {}).slice(0, 120),
+    valueKeys: Object.keys(value || {}).slice(0, 120),
+    knownArrays,
+    potentialArrays: arrays,
+    scoreLikeFieldCount: Object.keys(scoreLikeFields || {}).length,
+    scoreLikeFields,
+    scorePairs,
+    keyMatches,
+    excerpt: compactMaddenRawExcerpt(value),
+  };
+}
+
+async function inspectMaddenRequestInfoListExcavation(context, guild, league, hub) {
+  const enabled = String(process.env.EA_REQUEST_INFO_EXCAVATION_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
+  const requestInfoList =
+    getAnyValue(careerHubInfo, ['requestInfoList'], null) ||
+    getAnyValue(hub, ['requestInfoList'], null) ||
+    [];
+
+  if (!Array.isArray(requestInfoList)) {
+    console.log('[REQUESTINFOLIST EXCAVATION 7J-5BW] ' + JSON.stringify({
+      leagueId: context.externalLeagueId,
+      leagueName: league?.league_name,
+      found: false,
+      requestInfoType: typeof requestInfoList,
+      careerHubInfoKeys: Object.keys(careerHubInfo || {}).slice(0, 80),
+    }));
+    return null;
+  }
+
+  const summaries = requestInfoList.map((entry, index) => summarizeMaddenRequestInfoEntry(entry, index));
+
+  const candidates = summaries.filter(summary =>
+    summary.knownArrays.some(array => Number(array.length || 0) > 0) ||
+    summary.potentialArrays.some(array => Number(array.length || 0) > 0) ||
+    summary.scorePairs.some(pair => pair.hasRealScore) ||
+    Object.keys(summary.scoreLikeFields || {}).length > 0 ||
+    summary.keyMatches.length > 0
+  );
+
+  const compact = {
+    leagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    totalRequests: requestInfoList.length,
+    careerHubInfoKeys: Object.keys(careerHubInfo || {}).slice(0, 100),
+    indexOverview: summaries.map(summary => ({
+      index: summary.index,
+      title: summary.entryMeta.title,
+      type: summary.entryMeta.type,
+      description: summary.entryMeta.description,
+      requestId: summary.entryMeta.requestId,
+      valueKeys: summary.valueKeys.slice(0, 30),
+      knownArrayHits: summary.knownArrays.map(a => ({ path: a.path, key: a.key, length: a.length })).slice(0, 8),
+      potentialArrayHits: summary.potentialArrays.map(a => ({ path: a.path, length: a.length, sampleKeys: a.sampleKeys })).slice(0, 5),
+      scoreLikeFieldCount: summary.scoreLikeFieldCount,
+      hasRealScorePair: summary.scorePairs.some(pair => pair.hasRealScore),
+      keyMatchPaths: summary.keyMatches.map(k => ({ path: k.path, matchingKeys: k.matchingKeys })).slice(0, 6),
+    })),
+    candidateCount: candidates.length,
+    candidates: candidates.slice(0, 12),
+  };
+
+  console.log('[REQUESTINFOLIST EXCAVATION 7J-5BW] ' + JSON.stringify(compact).slice(0, 30000));
+
+  return compact;
+}
+
+
 async function inspectLeagueHubDeepExtraction(context, guild, league, hub) {
-  const enabled = String(process.env.EA_LEAGUEHUB_DEEP_EXTRACTION_ENABLED || 'true').toLowerCase() !== 'false';
+  const enabled = String(process.env.EA_LEAGUEHUB_DEEP_EXTRACTION_ENABLED || 'false').toLowerCase() === 'true';
   if (!enabled) return null;
 
   const keyPatterns = [
@@ -19250,6 +19396,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await inspectLeagueHubDeepExtraction(context, guild, league, hub).catch(error => {
       console.error('[Madden Sync] LeagueHub deep extraction inspector failed:', error?.message || error);
     });
+    await inspectMaddenRequestInfoListExcavation(context, guild, league, hub).catch(error => {
+      console.error('[Madden Sync] RequestInfoList excavation inspector failed:', error?.message || error);
+    });
 
     let teams = normalizeEaLeagueTeamsDeepFromHub(hub);
     const games = normalizeEaScheduleDeepFromHub(hub);
@@ -19338,8 +19487,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; LeagueHub deep extraction probe enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; LeagueHub deep extraction probe enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; RequestInfoList excavation probe enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; RequestInfoList excavation probe enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
