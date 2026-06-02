@@ -18484,6 +18484,62 @@ function extractRequestInfoSeasonGameAnalytics(entry, index) {
   };
 }
 
+
+async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
+  const rows = await pool.query(
+    `SELECT team_name, wins, losses, ties, points_for, points_against, imported_at
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id = $2
+     ORDER BY team_name ASC`,
+    [guild.id, league.league_id]
+  );
+
+  const focus = rows.rows.filter(row =>
+    ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
+  );
+
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5BZ] ' + JSON.stringify({
+    label,
+    totalRows: rows.rows.length,
+    focus,
+    sample: rows.rows.slice(0, 12),
+  }).slice(0, 12000));
+
+  return rows.rows;
+}
+
+async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins') {
+  const importedTeamStats = await pool.query(
+    `SELECT *
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3)
+     LIMIT 1`,
+    [guild.id, league.league_id, teamName]
+  );
+
+  const importedGames = await pool.query(
+    `SELECT week_label, away_team, home_team, away_score, home_score, status, result, imported_at
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+       AND (LOWER(away_team) = LOWER($3) OR LOWER(home_team) = LOWER($3))
+     ORDER BY week_label ASC, imported_at DESC
+     LIMIT 12`,
+    [guild.id, league.league_id, teamName]
+  );
+
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5BZ] ' + JSON.stringify({
+    teamName,
+    importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
+    importedGamesRows: importedGames.rows || [],
+  }).slice(0, 12000));
+
+  return {
+    importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
+    importedGamesRows: importedGames.rows || [],
+  };
+}
+
+
 async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
   const enabled = String(process.env.EA_REQUEST_INFO_HARVEST_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
@@ -18495,7 +18551,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5BY] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5BZ] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -18530,7 +18586,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5BY] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5BZ] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -18590,7 +18646,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5BY] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5BZ] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -18600,6 +18656,10 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
         pa: team.teamTotalPointsAllowed,
       })).slice(0, 16),
     }));
+
+    await logMaddenTeamStatsDbTruth(guild, league, 'immediately-after-requestinfo-write');
+    await logMaddenDisplaySourceTruth(guild, league, 'Dolphins');
+    await logMaddenDisplaySourceTruth(guild, league, 'Bills');
   }
 
   return { seasonGameAnalytics, teamAnalytics };
@@ -19798,6 +19858,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await recalculateMaddenStandingsFromImportedGames(guild, league).catch(error => {
       console.error('[Madden Sync] Multi-week standings accumulator failed:', error?.message || error);
     });
+    await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-accumulator').catch(error => {
+      console.error('[Madden Sync] DB truth after accumulator failed:', error?.message || error);
+    });
     await inspectMaddenCompletedGameRawScores(guild, league).catch(error => {
       console.error('[Madden Sync] Raw score inspector failed:', error?.message || error);
     });
@@ -19825,8 +19888,15 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; RequestInfo PF/PA injection enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; RequestInfo PF/PA injection enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; Database truth probe enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; Database truth probe enabled.');
+
+    await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
+      console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
+    });
+    await logMaddenDisplaySourceTruth(guild, league, 'Dolphins').catch(error => {
+      console.error('[Madden Sync] Final display source truth probe failed:', error?.message || error);
+    });
 
     await pool.query(
       `UPDATE madden_sync_runs
