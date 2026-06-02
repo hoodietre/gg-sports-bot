@@ -18805,7 +18805,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
     )
   );
 
-  console.log('[FULL TEAM DISCOVERY 7J-5C3A] ' + JSON.stringify({
+  console.log('[FULL TEAM DISCOVERY 7J-5C4] ' + JSON.stringify({
     label,
     totalTeams: teams.length,
     pfPaTeams: pfPaTeams.length,
@@ -18854,13 +18854,255 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
       });
     }
 
-    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C3A] ' + JSON.stringify({
+    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C4] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
   }
 
   return { teams, pfPaTeams };
+}
+
+
+
+function normalizeMaddenScheduleScoreCandidate(gameLike) {
+  const game = gameLike?.seasonGameInfo || gameLike?.gameInfo || gameLike || {};
+
+  const deep = resolveMaddenScoresFromRawGameDeep(game);
+  const shallow = resolveMaddenScoresFromRawGame(game);
+
+  const candidates = [
+    {
+      source: 'direct-seasonGameInfo',
+      homeScore: getAnyValue(game, ['homeScore', 'home_score', 'homeTeamScore', 'homePts', 'homePoints'], null),
+      awayScore: getAnyValue(game, ['awayScore', 'away_score', 'awayTeamScore', 'awayPts', 'awayPoints'], null),
+    },
+    {
+      source: 'deep-resolver',
+      homeScore: deep.homeScore,
+      awayScore: deep.awayScore,
+    },
+    {
+      source: 'shallow-resolver',
+      homeScore: shallow.homeScore,
+      awayScore: shallow.awayScore,
+    },
+    {
+      source: 'seasonGameInfo-raw',
+      homeScore: getAnyValue(game, ['seasonGameInfo.homeScore', 'seasonGameInfo.home_score'], null),
+      awayScore: getAnyValue(game, ['seasonGameInfo.awayScore', 'seasonGameInfo.away_score'], null),
+    },
+    {
+      source: 'scoreInfo',
+      homeScore: getAnyValue(game, ['scoreInfo.homeScore', 'scoreInfo.home_score', 'scoreInfo.home'], null),
+      awayScore: getAnyValue(game, ['scoreInfo.awayScore', 'scoreInfo.away_score', 'scoreInfo.away'], null),
+    },
+    {
+      source: 'boxScore',
+      homeScore: getAnyValue(game, ['boxScore.homeScore', 'boxScore.home_score', 'boxScore.home'], null),
+      awayScore: getAnyValue(game, ['boxScore.awayScore', 'boxScore.away_score', 'boxScore.away'], null),
+    },
+  ];
+
+  for (const candidate of candidates) {
+    const homeScore = parseNumberOrNull(candidate.homeScore);
+    const awayScore = parseNumberOrNull(candidate.awayScore);
+    if (hasUsableMaddenScorePair(homeScore, awayScore)) {
+      return {
+        hasScore: true,
+        source: candidate.source,
+        homeScore,
+        awayScore,
+        deep,
+        shallow,
+      };
+    }
+  }
+
+  return {
+    hasScore: false,
+    source: 'none',
+    homeScore: parseNumberOrNull(candidates[0].homeScore) ?? 0,
+    awayScore: parseNumberOrNull(candidates[0].awayScore) ?? 0,
+    deep,
+    shallow,
+  };
+}
+
+function buildScheduleScoreAccumulatorFromHub(hub) {
+  const teamMaps =
+    typeof buildEaTeamNameMapsFromHub === 'function'
+      ? buildEaTeamNameMapsFromHub(hub)
+      : (typeof buildEaTeamNameMaps === 'function'
+        ? buildEaTeamNameMaps(hub)
+        : (typeof buildEaTeamNameMapsFromLeagueHub === 'function'
+          ? buildEaTeamNameMapsFromLeagueHub(hub)
+          : {}));
+
+  const rows = collectEaScheduleCandidateRows(hub);
+  const accumulator = new Map();
+  const scoredGames = [];
+  const unscoredGames = [];
+
+  function ensure(teamName) {
+    const canonical = canonicalMaddenTeamNameFromAny(teamName);
+    if (!canonical) return null;
+
+    const key = canonical.toLowerCase();
+    if (!accumulator.has(key)) {
+      accumulator.set(key, {
+        teamName: canonical,
+        points_for: 0,
+        points_against: 0,
+        scored_games: 0,
+        sources: [],
+      });
+    }
+    return accumulator.get(key);
+  }
+
+  for (const row of rows) {
+    const game = row.item?.seasonGameInfo || row.item?.gameInfo || row.item || {};
+
+    const homeTeam = safeDiscoveryTeamNameFromGameSide(game, 'home', teamMaps);
+    const awayTeam = safeDiscoveryTeamNameFromGameSide(game, 'away', teamMaps);
+
+    if (!homeTeam || !awayTeam) continue;
+
+    ensure(homeTeam);
+    ensure(awayTeam);
+
+    const score = normalizeMaddenScheduleScoreCandidate(game);
+    const status = String(
+      getAnyValue(game, ['status', 'result', 'gameStatus'], '') ||
+      getAnyValue(row.item, ['status', 'result', 'gameStatus'], '') ||
+      ''
+    ).toLowerCase();
+
+    const isCompleted =
+      status.includes('complete') ||
+      status.includes('final') ||
+      getAnyValue(game, ['isComplete', 'isCompleted', 'isGamePlayed'], false) === true ||
+      getAnyValue(game, ['isGamePlayed'], false) === true ||
+      getAnyValue(game, ['homeWin'], null) !== null ||
+      getAnyValue(game, ['awayWin'], null) !== null ||
+      getAnyValue(game, ['homeLoss'], null) !== null ||
+      getAnyValue(game, ['awayLoss'], null) !== null;
+
+    const gameSummary = {
+      sourceLabel: row.sourceLabel,
+      week: getAnyValue(game, ['week', 'displayedWeek', 'weekLabel'], null),
+      matchup: getAnyValue(game, ['matchup'], null) || (awayTeam + ' @ ' + homeTeam),
+      homeTeam,
+      awayTeam,
+      status,
+      isCompleted,
+      homeScore: score.homeScore,
+      awayScore: score.awayScore,
+      scoreSource: score.source,
+      hasScore: score.hasScore,
+      keys: Object.keys(game || {}).slice(0, 100),
+      excerpt: compactMaddenRawExcerpt(game),
+    };
+
+    if (!isCompleted || !score.hasScore) {
+      if (unscoredGames.length < 40) unscoredGames.push(gameSummary);
+      continue;
+    }
+
+    const home = ensure(homeTeam);
+    const away = ensure(awayTeam);
+    if (!home || !away) continue;
+
+    home.points_for += score.homeScore;
+    home.points_against += score.awayScore;
+    home.scored_games += 1;
+    home.sources.push(row.sourceLabel + ':' + score.source);
+
+    away.points_for += score.awayScore;
+    away.points_against += score.homeScore;
+    away.scored_games += 1;
+    away.sources.push(row.sourceLabel + ':' + score.source);
+
+    scoredGames.push(gameSummary);
+  }
+
+  return {
+    teams: Array.from(accumulator.values()).sort((a, b) => String(a.teamName).localeCompare(String(b.teamName))),
+    scoredGames,
+    unscoredGames,
+    totalScheduleRows: rows.length,
+  };
+}
+
+async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, label = 'hub-schedule-accumulator') {
+  const enabled = String(process.env.EA_HUB_SCHEDULE_SCORE_ACCUMULATOR_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const result = buildScheduleScoreAccumulatorFromHub(hub);
+  const pfPaTeams = result.teams.filter(team => team.scored_games > 0 && (team.points_for > 0 || team.points_against > 0));
+
+  console.log('[HUB SCHEDULE SCORE ACCUMULATOR 7J-5C4] ' + JSON.stringify({
+    label,
+    totalScheduleRows: result.totalScheduleRows,
+    totalTeamsSeeded: result.teams.length,
+    scoredGames: result.scoredGames.length,
+    unscoredGameSamples: result.unscoredGames.slice(0, 20).map(g => ({
+      week: g.week,
+      matchup: g.matchup,
+      status: g.status,
+      isCompleted: g.isCompleted,
+      homeScore: g.homeScore,
+      awayScore: g.awayScore,
+      scoreSource: g.scoreSource,
+      hasScore: g.hasScore,
+      keys: g.keys,
+    })),
+    scoredGameSamples: result.scoredGames.slice(0, 20).map(g => ({
+      week: g.week,
+      matchup: g.matchup,
+      homeScore: g.homeScore,
+      awayScore: g.awayScore,
+      source: g.scoreSource,
+    })),
+    pfPaTeams,
+    conclusion: pfPaTeams.length
+      ? 'Hub schedule exposed usable scores; PF/PA accumulator can write full league values.'
+      : 'Hub schedule did not expose usable nonzero scores; preserving RequestInfo/DB PF/PA values only.',
+  }).slice(0, 24000));
+
+  const shouldWrite = String(process.env.EA_HUB_SCHEDULE_SCORE_ACCUMULATOR_WRITE || 'true').toLowerCase() !== 'false';
+  if (shouldWrite && pfPaTeams.length) {
+    let updated = 0;
+    const updateResults = [];
+
+    for (const team of pfPaTeams) {
+      const queryResult = await pool.query(
+        `UPDATE madden_imported_team_stats
+         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+             imported_at = NOW()
+         WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
+        [guild.id, league.league_id, team.points_for, team.points_against, team.teamName]
+      );
+
+      updated += Number(queryResult.rowCount || 0);
+      updateResults.push({
+        teamName: team.teamName,
+        pf: team.points_for,
+        pa: team.points_against,
+        scoredGames: team.scored_games,
+        rowCount: Number(queryResult.rowCount || 0),
+      });
+    }
+
+    console.log('[HUB SCHEDULE SCORE ACCUMULATOR WRITE 7J-5C4] ' + JSON.stringify({
+      updated,
+      updateResults,
+    }).slice(0, 12000));
+  }
+
+  return result;
 }
 
 
@@ -18968,7 +19210,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
     .filter(row => row.scored_games > 0)
     .sort((a, b) => String(a.teamName).localeCompare(String(b.teamName)));
 
-  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C3A] ' + JSON.stringify({
+  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C4] ' + JSON.stringify({
     label,
     totalCompletedGames: gamesResult.rows.length,
     scoredGames,
@@ -19003,7 +19245,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
       });
     }
 
-    console.log('[SCHEDULE PFPA WRITE 7J-5C3A] ' + JSON.stringify({
+    console.log('[SCHEDULE PFPA WRITE 7J-5C4] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19027,7 +19269,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
     team.teamTotalPointsAllowed !== undefined
   );
 
-  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C3A] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C4] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     rawTeamObjectCount: allObjects.length,
@@ -19089,7 +19331,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       updateResults.push({ teamName, pf, pa, rowCount: Number(result.rowCount || 0) });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C3A] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C4] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19160,7 +19402,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C3A] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C4] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -19189,7 +19431,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C3A] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C4] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -19213,7 +19455,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5C3A] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5C4] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -19248,7 +19490,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5C3A] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5C4] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -19308,7 +19550,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5C3A] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5C4] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -20541,6 +20783,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await synthesizeFullLeaguePfPaFromSchedule(guild, league, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Schedule-derived PF/PA synthesis failed:', error?.message || error);
     });
+    await accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 'post-accumulator').catch(error => {
+      console.error('[Madden Sync] Hub schedule score accumulator failed:', error?.message || error);
+    });
     await expandFullLeagueTeamDiscovery(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Full team discovery expansion failed:', error?.message || error);
     });
@@ -20577,8 +20822,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full league team discovery hotfix enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full league team discovery hotfix enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; hub schedule score accumulator enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; hub schedule score accumulator enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
