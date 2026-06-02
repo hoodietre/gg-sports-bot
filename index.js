@@ -18630,6 +18630,29 @@ async function loadImportedMaddenTeamSeedMap(guild, league) {
   return map;
 }
 
+
+function safeDiscoveryTeamNameFromGameSide(game, side, maps = {}) {
+  try {
+    const viaHelper = typeof getTeamNameFromGameSide === 'function'
+      ? getTeamNameFromGameSide(game, side, maps)
+      : null;
+    if (viaHelper) return canonicalMaddenTeamNameFromAny(viaHelper);
+  } catch (_) {}
+
+  const prefixes = side === 'home'
+    ? ['homeName', 'homeTeamName', 'homeTeam', 'homeCityName', 'homeDisplayName']
+    : ['awayName', 'awayTeamName', 'awayTeam', 'awayCityName', 'awayDisplayName'];
+
+  for (const key of prefixes) {
+    const value = getAnyValue(game, [key], null);
+    const canonical = canonicalMaddenTeamNameFromAny(value);
+    if (canonical && canonical !== 'Home' && canonical !== 'Away') return canonical;
+  }
+
+  return '';
+}
+
+
 function mergeTeamIntoDiscoveryMap(map, team, sourcePath = 'unknown') {
   if (!team) return;
 
@@ -18737,10 +18760,19 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
 
   // Source 3: schedule rows can seed team names for all 32 even without score.
   const scheduleRows = collectEaScheduleCandidateRows(hub);
+  const teamMapsForDiscovery =
+    typeof buildEaTeamNameMapsFromHub === 'function'
+      ? buildEaTeamNameMapsFromHub(hub)
+      : (typeof buildEaTeamNameMaps === 'function'
+        ? buildEaTeamNameMaps(hub)
+        : (typeof buildEaTeamNameMapsFromLeagueHub === 'function'
+          ? buildEaTeamNameMapsFromLeagueHub(hub)
+          : {}));
+
   for (const row of scheduleRows) {
     const game = row.item?.seasonGameInfo || row.item?.gameInfo || row.item || {};
-    const homeTeam = getTeamNameFromGameSide(game, 'home', buildEaTeamNameMapsFromHub(hub));
-    const awayTeam = getTeamNameFromGameSide(game, 'away', buildEaTeamNameMapsFromHub(hub));
+    const homeTeam = safeDiscoveryTeamNameFromGameSide(game, 'home', teamMapsForDiscovery);
+    const awayTeam = safeDiscoveryTeamNameFromGameSide(game, 'away', teamMapsForDiscovery);
 
     if (homeTeam) mergeTeamIntoDiscoveryMap(discovery, { canonicalName: homeTeam, teamName: homeTeam }, row.sourceLabel + ':home');
     if (awayTeam) mergeTeamIntoDiscoveryMap(discovery, { canonicalName: awayTeam, teamName: awayTeam }, row.sourceLabel + ':away');
@@ -18773,7 +18805,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
     )
   );
 
-  console.log('[FULL TEAM DISCOVERY 7J-5C3] ' + JSON.stringify({
+  console.log('[FULL TEAM DISCOVERY 7J-5C3A] ' + JSON.stringify({
     label,
     totalTeams: teams.length,
     pfPaTeams: pfPaTeams.length,
@@ -18822,7 +18854,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
       });
     }
 
-    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C3] ' + JSON.stringify({
+    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C3A] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -18936,7 +18968,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
     .filter(row => row.scored_games > 0)
     .sort((a, b) => String(a.teamName).localeCompare(String(b.teamName)));
 
-  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C3] ' + JSON.stringify({
+  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C3A] ' + JSON.stringify({
     label,
     totalCompletedGames: gamesResult.rows.length,
     scoredGames,
@@ -18971,7 +19003,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
       });
     }
 
-    console.log('[SCHEDULE PFPA WRITE 7J-5C3] ' + JSON.stringify({
+    console.log('[SCHEDULE PFPA WRITE 7J-5C3A] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -18995,7 +19027,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
     team.teamTotalPointsAllowed !== undefined
   );
 
-  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C3] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C3A] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     rawTeamObjectCount: allObjects.length,
@@ -19057,7 +19089,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       updateResults.push({ teamName, pf, pa, rowCount: Number(result.rowCount || 0) });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C3] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C3A] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19128,7 +19160,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C3] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C3A] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -19157,7 +19189,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C3] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C3A] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -19181,7 +19213,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5C3] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5C3A] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -19216,7 +19248,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5C3] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5C3A] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -19276,7 +19308,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5C3] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5C3A] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -20545,8 +20577,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full league team discovery expansion enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full league team discovery expansion enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full league team discovery hotfix enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full league team discovery hotfix enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
