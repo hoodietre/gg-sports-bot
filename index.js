@@ -18271,8 +18271,225 @@ function summarizeMaddenRequestInfoEntry(entry, index) {
   };
 }
 
+
+function normalizeRequestInfoTeamAnalytics(teamInfo, sideLabel = 'team') {
+  if (!teamInfo || typeof teamInfo !== 'object') return null;
+
+  const topThreats = Array.isArray(teamInfo.topThreats)
+    ? teamInfo.topThreats.slice(0, 5).map(player => ({
+      firstName: getAnyValue(player, ['firstName'], null),
+      lastName: getAnyValue(player, ['lastName'], null),
+      jerseyNumber: getAnyValue(player, ['jerseyNumber'], null),
+      position: getAnyValue(player, ['position'], null),
+      ovr: parseNumberOrNull(getAnyValue(player, ['ovr'], null)),
+      devTrait: getAnyValue(player, ['devTrait'], null),
+      stat1Label: getAnyValue(player, ['stat1Label'], null),
+      stat1Value: getAnyValue(player, ['stat1Value'], null),
+      stat2Label: getAnyValue(player, ['stat2Label'], null),
+      stat2Value: getAnyValue(player, ['stat2Value'], null),
+      stat3Label: getAnyValue(player, ['stat3Label'], null),
+      stat3Value: getAnyValue(player, ['stat3Value'], null),
+      stat4Label: getAnyValue(player, ['stat4Label'], null),
+      stat4Value: getAnyValue(player, ['stat4Value'], null),
+      stat5Label: getAnyValue(player, ['stat5Label'], null),
+      stat5Value: getAnyValue(player, ['stat5Value'], null),
+    }))
+    : [];
+
+  return {
+    side: sideLabel,
+    displayName: getAnyValue(teamInfo, ['displayName', 'longName', 'TEAM_ASSETNAME'], null),
+    teamName: getAnyValue(teamInfo, ['teamName', 'shortName', 'longName', 'displayName', 'TEAM_ASSETNAME'], null),
+    logoId: getAnyValue(teamInfo, ['logoId'], null),
+    userName: getAnyValue(teamInfo, ['userName'], null),
+    isHuman: getAnyValue(teamInfo, ['isHuman'], null),
+    wins: parseNumberOrNull(getAnyValue(teamInfo, ['wins'], null)),
+    losses: parseNumberOrNull(getAnyValue(teamInfo, ['losses'], null)),
+    ties: parseNumberOrNull(getAnyValue(teamInfo, ['ties'], null)),
+    ovr: parseNumberOrNull(getAnyValue(teamInfo, ['ovr'], null)),
+    offenseOvr: parseNumberOrNull(getAnyValue(teamInfo, ['offenseOvr'], null)),
+    defenseOvr: parseNumberOrNull(getAnyValue(teamInfo, ['defenseOvr'], null)),
+    teamTotalPointsScored: parseNumberOrNull(getAnyValue(teamInfo, ['teamTotalPointsScored'], null)),
+    teamTotalPointsAllowed: parseNumberOrNull(getAnyValue(teamInfo, ['teamTotalPointsAllowed'], null)),
+    teamTotalPointsScoredRank: parseNumberOrNull(getAnyValue(teamInfo, ['teamTotalPointsScoredRank'], null)),
+    teamTotalPointsAllowedRank: parseNumberOrNull(getAnyValue(teamInfo, ['teamTotalPointsAllowedRank'], null)),
+    totalPassYards: parseNumberOrNull(getAnyValue(teamInfo, ['totalPassYards'], null)),
+    totalRushYards: parseNumberOrNull(getAnyValue(teamInfo, ['totalRushYards'], null)),
+    totalDefPassYards: parseNumberOrNull(getAnyValue(teamInfo, ['totalDefPassYards'], null)),
+    totalDefRushYards: parseNumberOrNull(getAnyValue(teamInfo, ['totalDefRushYards'], null)),
+    passTds: parseNumberOrNull(getAnyValue(teamInfo, ['passTds'], null)),
+    rushTds: parseNumberOrNull(getAnyValue(teamInfo, ['rushTds'], null)),
+    sacks: parseNumberOrNull(getAnyValue(teamInfo, ['sacks'], null)),
+    takeaways: parseNumberOrNull(getAnyValue(teamInfo, ['takeaways'], null)),
+    giveAways: parseNumberOrNull(getAnyValue(teamInfo, ['giveAways'], null)),
+    thirdDownPercent: parseNumberOrNull(getAnyValue(teamInfo, ['thirdDownPercent'], null)),
+    redZonePercent: parseNumberOrNull(getAnyValue(teamInfo, ['redZonePercent'], null)),
+    topThreats,
+    availableKeys: Object.keys(teamInfo || {}).slice(0, 120),
+  };
+}
+
+function extractRequestInfoSeasonGameAnalytics(entry, index) {
+  const requestData = getAnyValue(entry, ['requestData', 'data'], {}) || {};
+  const value = getAnyValue(requestData, ['value'], requestData) || {};
+
+  const awayTeamInfo =
+    getAnyValue(value, ['awayTeamInfo'], null) ||
+    getAnyValue(value, ['awayTeam'], null) ||
+    null;
+
+  const homeTeamInfo =
+    getAnyValue(value, ['homeTeamInfo'], null) ||
+    getAnyValue(value, ['homeTeam'], null) ||
+    null;
+
+  const hasTeamInfo = Boolean(awayTeamInfo || homeTeamInfo);
+
+  if (!hasTeamInfo) return null;
+
+  const awayScore = parseNumberOrNull(getAnyValue(value, ['awayScore'], null));
+  const homeScore = parseNumberOrNull(getAnyValue(value, ['homeScore'], null));
+  const hasRealScore = awayScore !== null && homeScore !== null && (awayScore !== 0 || homeScore !== 0);
+
+  return {
+    index,
+    title: getAnyValue(entry, ['title'], null),
+    type: getAnyValue(entry, ['type'], null),
+    description: getAnyValue(entry, ['description'], null),
+    requestId: getAnyValue(entry, ['requestId'], null),
+    gameContext: {
+      week: getAnyValue(value, ['week'], null),
+      weekTitle: getAnyValue(value, ['weekTitle'], null),
+      gameTime: getAnyValue(value, ['gameTime'], null),
+      gameLocation: getAnyValue(value, ['gameLocation'], null),
+      gameGoalKey: getAnyValue(value, ['gameGoalKey'], null),
+      gameSetupKey: getAnyValue(value, ['gameSetupKey'], null),
+      isComplete: getAnyValue(value, ['isComplete'], null),
+      navigationString: getAnyValue(value, ['navigationString'], null),
+      awayScore,
+      homeScore,
+      hasRealScore,
+    },
+    awayTeamInfo: normalizeRequestInfoTeamAnalytics(awayTeamInfo, 'away'),
+    homeTeamInfo: normalizeRequestInfoTeamAnalytics(homeTeamInfo, 'home'),
+    valueKeys: Object.keys(value || {}).slice(0, 120),
+  };
+}
+
+async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
+  const enabled = String(process.env.EA_REQUEST_INFO_HARVEST_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
+  const requestInfoList =
+    getAnyValue(careerHubInfo, ['requestInfoList'], null) ||
+    getAnyValue(hub, ['requestInfoList'], null) ||
+    [];
+
+  if (!Array.isArray(requestInfoList)) {
+    console.log('[REQUESTINFO HARVEST 7J-5BX] ' + JSON.stringify({
+      leagueId: context.externalLeagueId,
+      found: false,
+      requestInfoType: typeof requestInfoList,
+    }));
+    return null;
+  }
+
+  const seasonGameAnalytics = requestInfoList
+    .map((entry, index) => extractRequestInfoSeasonGameAnalytics(entry, index))
+    .filter(Boolean);
+
+  const teamsByName = new Map();
+
+  function mergeTeam(team) {
+    if (!team) return;
+    const key = String(team.displayName || team.teamName || '').toLowerCase();
+    if (!key) return;
+
+    const existing = teamsByName.get(key) || {};
+    teamsByName.set(key, {
+      ...existing,
+      ...Object.fromEntries(Object.entries(team).filter(([, value]) => value !== null && value !== undefined && value !== '')),
+      topThreats: team.topThreats?.length ? team.topThreats : (existing.topThreats || []),
+      seenInRequestInfo: true,
+    });
+  }
+
+  for (const item of seasonGameAnalytics) {
+    mergeTeam(item.awayTeamInfo);
+    mergeTeam(item.homeTeamInfo);
+  }
+
+  const teamAnalytics = Array.from(teamsByName.values());
+
+  console.log('[REQUESTINFO HARVEST 7J-5BX] ' + JSON.stringify({
+    leagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    totalRequests: requestInfoList.length,
+    seasonGameAnalyticsCount: seasonGameAnalytics.length,
+    teamAnalyticsCount: teamAnalytics.length,
+    seasonGameAnalytics: seasonGameAnalytics.slice(0, 8),
+    teamAnalytics: teamAnalytics.slice(0, 16),
+    scoreCandidates: seasonGameAnalytics
+      .filter(item => item.gameContext?.awayScore !== null || item.gameContext?.homeScore !== null)
+      .map(item => ({
+        index: item.index,
+        title: item.title,
+        away: item.awayTeamInfo?.displayName || item.awayTeamInfo?.teamName,
+        home: item.homeTeamInfo?.displayName || item.homeTeamInfo?.teamName,
+        awayScore: item.gameContext.awayScore,
+        homeScore: item.gameContext.homeScore,
+        hasRealScore: item.gameContext.hasRealScore,
+      })),
+    pfPaCandidates: teamAnalytics.map(team => ({
+      team: team.displayName || team.teamName,
+      wins: team.wins,
+      losses: team.losses,
+      pf: team.teamTotalPointsScored,
+      pa: team.teamTotalPointsAllowed,
+      pfRank: team.teamTotalPointsScoredRank,
+      paRank: team.teamTotalPointsAllowedRank,
+      topThreats: (team.topThreats || []).slice(0, 3).map(p => ({
+        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
+        ovr: p.ovr,
+        s1: p.stat1Label,
+        v1: p.stat1Value,
+        s2: p.stat2Label,
+        v2: p.stat2Value,
+      })),
+    })),
+  }).slice(0, 30000));
+
+  // Optional controlled write: only use requestInfo PF/PA when it looks real and complete enough.
+  const shouldWrite = String(process.env.EA_REQUEST_INFO_HARVEST_WRITE || 'false').toLowerCase() === 'true';
+  if (shouldWrite) {
+    let updated = 0;
+    for (const team of teamAnalytics) {
+      const teamName = team.displayName || team.teamName;
+      const pf = team.teamTotalPointsScored;
+      const pa = team.teamTotalPointsAllowed;
+      if (!teamName || pf === null || pa === null) continue;
+
+      await pool.query(
+        `UPDATE madden_imported_team_stats
+         SET points_for = $3,
+             points_against = $4,
+             imported_at = NOW()
+         WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
+        [guild.id, league.league_id, pf, pa, teamName]
+      );
+      updated += 1;
+    }
+
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5BX] ' + JSON.stringify({ updated }));
+  }
+
+  return { seasonGameAnalytics, teamAnalytics };
+}
+
+
 async function inspectMaddenRequestInfoListExcavation(context, guild, league, hub) {
-  const enabled = String(process.env.EA_REQUEST_INFO_EXCAVATION_ENABLED || 'true').toLowerCase() !== 'false';
+  const enabled = String(process.env.EA_REQUEST_INFO_EXCAVATION_ENABLED || 'false').toLowerCase() === 'true';
   if (!enabled) return null;
 
   const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
@@ -19399,6 +19616,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await inspectMaddenRequestInfoListExcavation(context, guild, league, hub).catch(error => {
       console.error('[Madden Sync] RequestInfoList excavation inspector failed:', error?.message || error);
     });
+    await harvestRequestInfoTeamAnalytics(context, guild, league, hub).catch(error => {
+      console.error('[Madden Sync] RequestInfo analytics harvest failed:', error?.message || error);
+    });
 
     let teams = normalizeEaLeagueTeamsDeepFromHub(hub);
     const games = normalizeEaScheduleDeepFromHub(hub);
@@ -19487,8 +19707,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; RequestInfoList excavation probe enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; RequestInfoList excavation probe enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; RequestInfo targeted value harvester enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; RequestInfo targeted value harvester enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
