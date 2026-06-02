@@ -18730,6 +18730,227 @@ function mergeTeamIntoDiscoveryMap(map, team, sourcePath = 'unknown') {
   map.set(key, merged);
 }
 
+
+function looksLikeFullLeagueTeamStatRow(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+  const keys = Object.keys(obj);
+  const lower = new Set(keys.map(k => k.toLowerCase()));
+
+  const hasName =
+    lower.has('team') ||
+    lower.has('teamname') ||
+    lower.has('displayname') ||
+    lower.has('shortname') ||
+    lower.has('longname') ||
+    lower.has('teamassetname') ||
+    lower.has('team_assetname') ||
+    lower.has('name');
+
+  const hasPfPa =
+    lower.has('pf') ||
+    lower.has('pa') ||
+    lower.has('pointsfor') ||
+    lower.has('pointsagainst') ||
+    lower.has('points_for') ||
+    lower.has('points_against') ||
+    lower.has('teamtotalpointsscored') ||
+    lower.has('teamtotalpointsallowed') ||
+    lower.has('totalpointsscored') ||
+    lower.has('totalpointsallowed');
+
+  const hasRecord =
+    lower.has('wins') ||
+    lower.has('losses') ||
+    lower.has('ties');
+
+  const hasRanks =
+    lower.has('teamtotalpointsscoredrank') ||
+    lower.has('teamtotalpointsallowedrank') ||
+    lower.has('pfrank') ||
+    lower.has('parank') ||
+    lower.has('offenserank') ||
+    lower.has('defenserank');
+
+  return hasName && (hasPfPa || hasRecord || hasRanks);
+}
+
+function normalizeFullLeagueAnalyticsRow(row, sourcePath = '') {
+  if (!row || typeof row !== 'object') return null;
+
+  const teamName = canonicalMaddenTeamNameFromAny(
+    getAnyValue(row, [
+      'canonicalName',
+      'displayName',
+      'teamName',
+      'team',
+      'shortName',
+      'longName',
+      'TEAM_ASSETNAME',
+      'name',
+    ], '')
+  );
+
+  if (!teamName) return null;
+
+  return {
+    canonicalName: teamName,
+    displayName: getAnyValue(row, ['displayName', 'teamName', 'team', 'shortName', 'longName', 'name'], teamName),
+    teamName,
+    wins: parseNumberOrNull(getAnyValue(row, ['wins', 'win', 'w'], null)),
+    losses: parseNumberOrNull(getAnyValue(row, ['losses', 'loss', 'l'], null)),
+    ties: parseNumberOrNull(getAnyValue(row, ['ties', 'tie', 't'], null)),
+    teamTotalPointsScored: parseNumberOrNull(getAnyValue(row, [
+      'teamTotalPointsScored',
+      'totalPointsScored',
+      'pointsFor',
+      'points_for',
+      'pf',
+      'scoreFor',
+      'ptsFor',
+    ], null)),
+    teamTotalPointsAllowed: parseNumberOrNull(getAnyValue(row, [
+      'teamTotalPointsAllowed',
+      'totalPointsAllowed',
+      'pointsAgainst',
+      'points_against',
+      'pa',
+      'scoreAgainst',
+      'ptsAgainst',
+    ], null)),
+    teamTotalPointsScoredRank: parseNumberOrNull(getAnyValue(row, ['teamTotalPointsScoredRank', 'pfRank', 'pointsForRank'], null)),
+    teamTotalPointsAllowedRank: parseNumberOrNull(getAnyValue(row, ['teamTotalPointsAllowedRank', 'paRank', 'pointsAgainstRank'], null)),
+    totalPassYards: parseNumberOrNull(getAnyValue(row, ['totalPassYards', 'passYards'], null)),
+    totalRushYards: parseNumberOrNull(getAnyValue(row, ['totalRushYards', 'rushYards'], null)),
+    totalDefPassYards: parseNumberOrNull(getAnyValue(row, ['totalDefPassYards', 'defPassYards'], null)),
+    totalDefRushYards: parseNumberOrNull(getAnyValue(row, ['totalDefRushYards', 'defRushYards'], null)),
+    passTds: parseNumberOrNull(getAnyValue(row, ['passTds', 'passingTds'], null)),
+    rushTds: parseNumberOrNull(getAnyValue(row, ['rushTds', 'rushingTds'], null)),
+    sacks: parseNumberOrNull(getAnyValue(row, ['sacks'], null)),
+    takeaways: parseNumberOrNull(getAnyValue(row, ['takeaways'], null)),
+    giveAways: parseNumberOrNull(getAnyValue(row, ['giveAways', 'giveaways'], null)),
+    thirdDownPercent: parseNumberOrNull(getAnyValue(row, ['thirdDownPercent'], null)),
+    redZonePercent: parseNumberOrNull(getAnyValue(row, ['redZonePercent'], null)),
+    ovr: parseNumberOrNull(getAnyValue(row, ['ovr'], null)),
+    offenseOvr: parseNumberOrNull(getAnyValue(row, ['offenseOvr'], null)),
+    defenseOvr: parseNumberOrNull(getAnyValue(row, ['defenseOvr'], null)),
+    topThreats: Array.isArray(row.topThreats) ? row.topThreats : [],
+    sourcePaths: [sourcePath].filter(Boolean),
+  };
+}
+
+function deepHarvestFullLeagueAnalyticsRows(obj, path = '', out = [], depth = 0, seen = new Set()) {
+  if (!obj || typeof obj !== 'object' || depth > 12 || seen.has(obj)) return out;
+  seen.add(obj);
+
+  if (Array.isArray(obj)) {
+    if (obj.length >= 2 && obj.some(item => looksLikeFullLeagueTeamStatRow(item))) {
+      obj.forEach((item, idx) => {
+        if (looksLikeFullLeagueTeamStatRow(item)) {
+          const normalized = normalizeFullLeagueAnalyticsRow(item, `${path}[${idx}]`);
+          if (normalized) out.push({ path: `${path}[${idx}]`, raw: item, normalized });
+        }
+      });
+    }
+
+    obj.slice(0, 500).forEach((item, idx) => {
+      deepHarvestFullLeagueAnalyticsRows(item, `${path}[${idx}]`, out, depth + 1, seen);
+    });
+  } else {
+    if (looksLikeFullLeagueTeamStatRow(obj)) {
+      const normalized = normalizeFullLeagueAnalyticsRow(obj, path);
+      if (normalized) out.push({ path, raw: obj, normalized });
+    }
+
+    for (const [key, value] of Object.entries(obj)) {
+      if (value && typeof value === 'object') {
+        deepHarvestFullLeagueAnalyticsRows(value, path ? `${path}.${key}` : key, out, depth + 1, seen);
+      }
+    }
+  }
+
+  return out;
+}
+
+async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, label = 'full-league-analytics-harvester') {
+  const enabled = String(process.env.EA_FULL_LEAGUE_ANALYTICS_HARVESTER_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const seeded = await loadImportedMaddenTeamSeedMap(guild, league);
+  const discoveredRows = deepHarvestFullLeagueAnalyticsRows(hub);
+
+  for (const item of discoveredRows) {
+    mergeTeamIntoDiscoveryMap(seeded, item.normalized, item.path);
+  }
+
+  const teams = Array.from(seeded.values()).sort((a, b) => String(a.canonicalName).localeCompare(String(b.canonicalName)));
+  const writeCandidates = teams.filter(team =>
+    (Number(team.teamTotalPointsScored || 0) > 0 || Number(team.teamTotalPointsAllowed || 0) > 0)
+  );
+
+  console.log('[FULL LEAGUE ANALYTICS HARVESTER 7J-5C5] ' + JSON.stringify({
+    label,
+    rawRowsFound: discoveredRows.length,
+    mergedTeams: teams.length,
+    writeCandidates: writeCandidates.length,
+    discoveredSamples: discoveredRows.slice(0, 30).map(item => ({
+      path: item.path,
+      team: item.normalized?.canonicalName,
+      wins: item.normalized?.wins,
+      losses: item.normalized?.losses,
+      pf: item.normalized?.teamTotalPointsScored,
+      pa: item.normalized?.teamTotalPointsAllowed,
+      keys: Object.keys(item.raw || {}).slice(0, 80),
+    })),
+    teams: teams.map(team => ({
+      team: team.canonicalName,
+      wins: team.wins,
+      losses: team.losses,
+      ties: team.ties,
+      pf: team.teamTotalPointsScored,
+      pa: team.teamTotalPointsAllowed,
+      sources: team.sourcePaths,
+    })),
+  }).slice(0, 30000));
+
+  const shouldWrite = String(process.env.EA_FULL_LEAGUE_ANALYTICS_HARVESTER_WRITE || 'true').toLowerCase() !== 'false';
+  if (shouldWrite && writeCandidates.length) {
+    let updated = 0;
+    const updateResults = [];
+
+    for (const team of writeCandidates) {
+      const pf = parseNumberOrNull(team.teamTotalPointsScored);
+      const pa = parseNumberOrNull(team.teamTotalPointsAllowed);
+      if (pf === null || pa === null) continue;
+
+      const result = await pool.query(
+        `UPDATE madden_imported_team_stats
+         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+             imported_at = NOW()
+         WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
+        [guild.id, league.league_id, pf, pa, team.canonicalName]
+      );
+
+      updated += Number(result.rowCount || 0);
+      updateResults.push({
+        teamName: team.canonicalName,
+        pf,
+        pa,
+        rowCount: Number(result.rowCount || 0),
+        sources: team.sourcePaths,
+      });
+    }
+
+    console.log('[FULL LEAGUE ANALYTICS HARVESTER WRITE 7J-5C5] ' + JSON.stringify({
+      updated,
+      updateResults,
+    }).slice(0, 16000));
+  }
+
+  return { discoveredRows, teams, writeCandidates };
+}
+
+
 async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label = 'full-discovery') {
   const enabled = String(process.env.EA_FULL_TEAM_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
@@ -18805,7 +19026,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
     )
   );
 
-  console.log('[FULL TEAM DISCOVERY 7J-5C4] ' + JSON.stringify({
+  console.log('[FULL TEAM DISCOVERY 7J-5C5] ' + JSON.stringify({
     label,
     totalTeams: teams.length,
     pfPaTeams: pfPaTeams.length,
@@ -18854,7 +19075,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
       });
     }
 
-    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C4] ' + JSON.stringify({
+    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C5] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19042,7 +19263,7 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
   const result = buildScheduleScoreAccumulatorFromHub(hub);
   const pfPaTeams = result.teams.filter(team => team.scored_games > 0 && (team.points_for > 0 || team.points_against > 0));
 
-  console.log('[HUB SCHEDULE SCORE ACCUMULATOR 7J-5C4] ' + JSON.stringify({
+  console.log('[HUB SCHEDULE SCORE ACCUMULATOR 7J-5C5] ' + JSON.stringify({
     label,
     totalScheduleRows: result.totalScheduleRows,
     totalTeamsSeeded: result.teams.length,
@@ -19096,7 +19317,7 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
       });
     }
 
-    console.log('[HUB SCHEDULE SCORE ACCUMULATOR WRITE 7J-5C4] ' + JSON.stringify({
+    console.log('[HUB SCHEDULE SCORE ACCUMULATOR WRITE 7J-5C5] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19210,7 +19431,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
     .filter(row => row.scored_games > 0)
     .sort((a, b) => String(a.teamName).localeCompare(String(b.teamName)));
 
-  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C4] ' + JSON.stringify({
+  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C5] ' + JSON.stringify({
     label,
     totalCompletedGames: gamesResult.rows.length,
     scoredGames,
@@ -19245,7 +19466,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
       });
     }
 
-    console.log('[SCHEDULE PFPA WRITE 7J-5C4] ' + JSON.stringify({
+    console.log('[SCHEDULE PFPA WRITE 7J-5C5] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19269,7 +19490,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
     team.teamTotalPointsAllowed !== undefined
   );
 
-  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C4] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C5] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     rawTeamObjectCount: allObjects.length,
@@ -19331,7 +19552,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       updateResults.push({ teamName, pf, pa, rowCount: Number(result.rowCount || 0) });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C4] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C5] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19402,7 +19623,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C4] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C5] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -19431,7 +19652,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C4] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C5] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -19455,7 +19676,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5C4] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5C5] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -19490,7 +19711,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5C4] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5C5] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -19550,7 +19771,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5C4] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5C5] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -20786,6 +21007,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Hub schedule score accumulator failed:', error?.message || error);
     });
+    await harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, 'post-accumulator').catch(error => {
+      console.error('[Madden Sync] Full league analytics harvester failed:', error?.message || error);
+    });
     await expandFullLeagueTeamDiscovery(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Full team discovery expansion failed:', error?.message || error);
     });
@@ -20822,8 +21046,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; hub schedule score accumulator enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; hub schedule score accumulator enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full league analytics harvester enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full league analytics harvester enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
