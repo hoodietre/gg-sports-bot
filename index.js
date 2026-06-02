@@ -18272,6 +18272,111 @@ function summarizeMaddenRequestInfoEntry(entry, index) {
 }
 
 
+
+function canonicalMaddenTeamNameFromAny(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const aliases = {
+    ARI: 'Cardinals',
+    ATL: 'Falcons',
+    BAL: 'Ravens',
+    BUF: 'Bills',
+    CAR: 'Panthers',
+    CHI: 'Bears',
+    CIN: 'Bengals',
+    CLE: 'Browns',
+    DAL: 'Cowboys',
+    DEN: 'Broncos',
+    DET: 'Lions',
+    GB: 'Packers',
+    GBP: 'Packers',
+    HOU: 'Texans',
+    IND: 'Colts',
+    JAX: 'Jaguars',
+    JAC: 'Jaguars',
+    KC: 'Chiefs',
+    KAN: 'Chiefs',
+    LV: 'Raiders',
+    LVR: 'Raiders',
+    LAC: 'Chargers',
+    LA: 'Rams',
+    LAR: 'Rams',
+    MIA: 'Dolphins',
+    MIN: 'Vikings',
+    NE: 'Patriots',
+    NEP: 'Patriots',
+    NO: 'Saints',
+    NOS: 'Saints',
+    NYG: 'Giants',
+    NYJ: 'Jets',
+    PHI: 'Eagles',
+    PIT: 'Steelers',
+    SEA: 'Seahawks',
+    SF: '49ers',
+    SFO: '49ers',
+    TB: 'Buccaneers',
+    TB12: 'Buccaneers',
+    TEN: 'Titans',
+    WAS: 'Commanders',
+    WSH: 'Commanders',
+  };
+
+  const upper = raw.toUpperCase();
+  if (aliases[upper]) return aliases[upper];
+
+  const cityAliases = {
+    ARIZONA: 'Cardinals',
+    ATLANTA: 'Falcons',
+    BALTIMORE: 'Ravens',
+    BUFFALO: 'Bills',
+    CAROLINA: 'Panthers',
+    CHICAGO: 'Bears',
+    CINCINNATI: 'Bengals',
+    CLEVELAND: 'Browns',
+    DALLAS: 'Cowboys',
+    DENVER: 'Broncos',
+    DETROIT: 'Lions',
+    GREENBAY: 'Packers',
+    GREEN_BAY: 'Packers',
+    HOUSTON: 'Texans',
+    INDIANAPOLIS: 'Colts',
+    JACKSONVILLE: 'Jaguars',
+    KANSASCITY: 'Chiefs',
+    KANSAS_CITY: 'Chiefs',
+    LASVEGAS: 'Raiders',
+    LAS_VEGAS: 'Raiders',
+    LOSANGELESCHARGERS: 'Chargers',
+    LOS_ANGELES_CHARGERS: 'Chargers',
+    LOSANGELESRAMS: 'Rams',
+    LOS_ANGELES_RAMS: 'Rams',
+    MIAMI: 'Dolphins',
+    MINNESOTA: 'Vikings',
+    NEWENGLAND: 'Patriots',
+    NEW_ENGLAND: 'Patriots',
+    NEWORLEANS: 'Saints',
+    NEW_ORLEANS: 'Saints',
+    NEWYORKGIANTS: 'Giants',
+    NEW_YORK_GIANTS: 'Giants',
+    NEWYORKJETS: 'Jets',
+    NEW_YORK_JETS: 'Jets',
+    PHILADELPHIA: 'Eagles',
+    PITTSBURGH: 'Steelers',
+    SEATTLE: 'Seahawks',
+    SANFRANCISCO: '49ers',
+    SAN_FRANCISCO: '49ers',
+    TAMPABAY: 'Buccaneers',
+    TAMPA_BAY: 'Buccaneers',
+    TENNESSEE: 'Titans',
+    WASHINGTON: 'Commanders',
+  };
+
+  const normalized = upper.replace(/[^A-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+  const compact = normalized.replace(/_/g, '');
+  return cityAliases[normalized] || cityAliases[compact] || raw;
+}
+
+
 function normalizeRequestInfoTeamAnalytics(teamInfo, sideLabel = 'team') {
   if (!teamInfo || typeof teamInfo !== 'object') return null;
 
@@ -18300,6 +18405,9 @@ function normalizeRequestInfoTeamAnalytics(teamInfo, sideLabel = 'team') {
     side: sideLabel,
     displayName: getAnyValue(teamInfo, ['displayName', 'longName', 'TEAM_ASSETNAME'], null),
     teamName: getAnyValue(teamInfo, ['teamName', 'shortName', 'longName', 'displayName', 'TEAM_ASSETNAME'], null),
+    canonicalName: canonicalMaddenTeamNameFromAny(
+      getAnyValue(teamInfo, ['displayName', 'longName', 'TEAM_ASSETNAME', 'teamName', 'shortName'], null)
+    ),
     logoId: getAnyValue(teamInfo, ['logoId'], null),
     userName: getAnyValue(teamInfo, ['userName'], null),
     isHuman: getAnyValue(teamInfo, ['isHuman'], null),
@@ -18387,7 +18495,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5BX] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5BY] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -18403,7 +18511,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   function mergeTeam(team) {
     if (!team) return;
-    const key = String(team.displayName || team.teamName || '').toLowerCase();
+    const key = String(team.canonicalName || team.displayName || team.teamName || '').toLowerCase();
     if (!key) return;
 
     const existing = teamsByName.get(key) || {};
@@ -18422,7 +18530,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5BX] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5BY] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -18461,16 +18569,16 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
   }).slice(0, 30000));
 
   // Optional controlled write: only use requestInfo PF/PA when it looks real and complete enough.
-  const shouldWrite = String(process.env.EA_REQUEST_INFO_HARVEST_WRITE || 'false').toLowerCase() === 'true';
+  const shouldWrite = String(process.env.EA_REQUEST_INFO_HARVEST_WRITE || 'true').toLowerCase() !== 'false';
   if (shouldWrite) {
     let updated = 0;
     for (const team of teamAnalytics) {
-      const teamName = team.displayName || team.teamName;
+      const teamName = team.canonicalName || team.displayName || team.teamName;
       const pf = team.teamTotalPointsScored;
       const pa = team.teamTotalPointsAllowed;
       if (!teamName || pf === null || pa === null) continue;
 
-      await pool.query(
+      const result = await pool.query(
         `UPDATE madden_imported_team_stats
          SET points_for = $3,
              points_against = $4,
@@ -18478,10 +18586,20 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, pf, pa, teamName]
       );
-      updated += 1;
+
+      updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5BX] ' + JSON.stringify({ updated }));
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5BY] ' + JSON.stringify({
+      updated,
+      candidateTeams: teamAnalytics.map(team => ({
+        canonicalName: team.canonicalName,
+        displayName: team.displayName,
+        teamName: team.teamName,
+        pf: team.teamTotalPointsScored,
+        pa: team.teamTotalPointsAllowed,
+      })).slice(0, 16),
+    }));
   }
 
   return { seasonGameAnalytics, teamAnalytics };
@@ -19511,8 +19629,8 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
        SET wins = $3,
            losses = $4,
            ties = $5,
-           points_for = $6,
-           points_against = $7,
+           points_for = CASE WHEN $6 > 0 OR $7 > 0 THEN $6 ELSE points_for END,
+           points_against = CASE WHEN $6 > 0 OR $7 > 0 THEN $7 ELSE points_against END,
            imported_at = NOW()
        WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($8)`,
       [
@@ -19707,8 +19825,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; RequestInfo targeted value harvester enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; RequestInfo targeted value harvester enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; RequestInfo PF/PA injection enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; RequestInfo PF/PA injection enabled.');
 
     await pool.query(
       `UPDATE madden_sync_runs
