@@ -18871,6 +18871,174 @@ function deepHarvestFullLeagueAnalyticsRows(obj, path = '', out = [], depth = 0,
   return out;
 }
 
+
+function harvestRequestInfoEntryForTeamAnalytics(entry, index) {
+  const requestData = getAnyValue(entry, ['requestData', 'data'], {}) || {};
+  const value = getAnyValue(requestData, ['value'], requestData) || {};
+  const harvested = [];
+
+  const direct = extractRequestInfoSeasonGameAnalytics(entry, index);
+  if (direct?.awayTeamInfo) {
+    harvested.push({
+      sourcePath: `careerHubInfo.requestInfoList[${index}].direct.awayTeamInfo`,
+      team: direct.awayTeamInfo,
+    });
+  }
+  if (direct?.homeTeamInfo) {
+    harvested.push({
+      sourcePath: `careerHubInfo.requestInfoList[${index}].direct.homeTeamInfo`,
+      team: direct.homeTeamInfo,
+    });
+  }
+
+  const recursive = deepFindMaddenTeamAnalyticsObjects(value);
+  for (const item of recursive) {
+    harvested.push({
+      sourcePath: `careerHubInfo.requestInfoList[${index}].requestData.value.${item.path}`,
+      team: item.normalized,
+    });
+  }
+
+  const fullRows = deepHarvestFullLeagueAnalyticsRows(value);
+  for (const item of fullRows) {
+    harvested.push({
+      sourcePath: `careerHubInfo.requestInfoList[${index}].requestData.value.${item.path}`,
+      team: item.normalized,
+    });
+  }
+
+  return harvested;
+}
+
+async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, label = 'requestinfo-multi-sweep') {
+  const enabled = String(process.env.EA_REQUESTINFO_MULTI_SWEEP_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
+  const requestInfoList =
+    getAnyValue(careerHubInfo, ['requestInfoList'], null) ||
+    getAnyValue(hub, ['requestInfoList'], null) ||
+    [];
+
+  const seeded = await loadImportedMaddenTeamSeedMap(guild, league);
+  const requestSummaries = [];
+  const harvestedTeams = [];
+
+  if (Array.isArray(requestInfoList)) {
+    for (let index = 0; index < requestInfoList.length; index++) {
+      const entry = requestInfoList[index];
+      const title = getAnyValue(entry, ['title'], null);
+      const type = getAnyValue(entry, ['type'], null);
+      const requestId = getAnyValue(entry, ['requestId'], null);
+
+      const entryHarvest = harvestRequestInfoEntryForTeamAnalytics(entry, index);
+
+      for (const item of entryHarvest) {
+        if (!item.team) continue;
+        harvestedTeams.push({
+          index,
+          title,
+          type,
+          requestId,
+          sourcePath: item.sourcePath,
+          team: item.team,
+        });
+        mergeTeamIntoDiscoveryMap(seeded, item.team, item.sourcePath);
+      }
+
+      requestSummaries.push({
+        index,
+        title,
+        type,
+        requestId,
+        harvestedTeamCount: entryHarvest.length,
+        harvestedTeams: entryHarvest.slice(0, 8).map(item => ({
+          sourcePath: item.sourcePath,
+          team: item.team?.canonicalName || item.team?.displayName || item.team?.teamName,
+          wins: item.team?.wins,
+          losses: item.team?.losses,
+          pf: item.team?.teamTotalPointsScored,
+          pa: item.team?.teamTotalPointsAllowed,
+        })),
+        valueKeys: Object.keys(getAnyValue(getAnyValue(entry, ['requestData', 'data'], {}) || {}, ['value'], {}) || {}).slice(0, 50),
+      });
+    }
+  }
+
+  const teams = Array.from(seeded.values()).sort((a, b) => String(a.canonicalName).localeCompare(String(b.canonicalName)));
+  const writeCandidates = teams.filter(team =>
+    Number(team.teamTotalPointsScored || 0) > 0 ||
+    Number(team.teamTotalPointsAllowed || 0) > 0
+  );
+
+  console.log('[REQUESTINFO MULTI SWEEP 7J-5C6] ' + JSON.stringify({
+    label,
+    totalRequests: Array.isArray(requestInfoList) ? requestInfoList.length : 0,
+    totalHarvestedTeamObjects: harvestedTeams.length,
+    mergedTeams: teams.length,
+    writeCandidates: writeCandidates.length,
+    requestSummaries,
+    harvestedTeamSamples: harvestedTeams.slice(0, 40).map(item => ({
+      index: item.index,
+      title: item.title,
+      type: item.type,
+      sourcePath: item.sourcePath,
+      team: item.team?.canonicalName || item.team?.displayName || item.team?.teamName,
+      wins: item.team?.wins,
+      losses: item.team?.losses,
+      pf: item.team?.teamTotalPointsScored,
+      pa: item.team?.teamTotalPointsAllowed,
+    })),
+    teams: teams.map(team => ({
+      team: team.canonicalName,
+      wins: team.wins,
+      losses: team.losses,
+      ties: team.ties,
+      pf: team.teamTotalPointsScored,
+      pa: team.teamTotalPointsAllowed,
+      sources: team.sourcePaths,
+    })),
+  }).slice(0, 30000));
+
+  const shouldWrite = String(process.env.EA_REQUESTINFO_MULTI_SWEEP_WRITE || 'true').toLowerCase() !== 'false';
+  if (shouldWrite && writeCandidates.length) {
+    let updated = 0;
+    const updateResults = [];
+
+    for (const team of writeCandidates) {
+      const pf = parseNumberOrNull(team.teamTotalPointsScored);
+      const pa = parseNumberOrNull(team.teamTotalPointsAllowed);
+      if (pf === null || pa === null) continue;
+
+      const result = await pool.query(
+        `UPDATE madden_imported_team_stats
+         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+             imported_at = NOW()
+         WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
+        [guild.id, league.league_id, pf, pa, team.canonicalName]
+      );
+
+      updated += Number(result.rowCount || 0);
+      updateResults.push({
+        teamName: team.canonicalName,
+        pf,
+        pa,
+        rowCount: Number(result.rowCount || 0),
+        sources: team.sourcePaths,
+      });
+    }
+
+    console.log('[REQUESTINFO MULTI SWEEP WRITE 7J-5C6] ' + JSON.stringify({
+      updated,
+      updateResults,
+    }).slice(0, 16000));
+  }
+
+  return { harvestedTeams, teams, writeCandidates, requestSummaries };
+}
+
+
 async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, label = 'full-league-analytics-harvester') {
   const enabled = String(process.env.EA_FULL_LEAGUE_ANALYTICS_HARVESTER_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
@@ -18887,7 +19055,7 @@ async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, la
     (Number(team.teamTotalPointsScored || 0) > 0 || Number(team.teamTotalPointsAllowed || 0) > 0)
   );
 
-  console.log('[FULL LEAGUE ANALYTICS HARVESTER 7J-5C5] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS HARVESTER 7J-5C6] ' + JSON.stringify({
     label,
     rawRowsFound: discoveredRows.length,
     mergedTeams: teams.length,
@@ -18941,7 +19109,7 @@ async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, la
       });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS HARVESTER WRITE 7J-5C5] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS HARVESTER WRITE 7J-5C6] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 16000));
@@ -19026,7 +19194,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
     )
   );
 
-  console.log('[FULL TEAM DISCOVERY 7J-5C5] ' + JSON.stringify({
+  console.log('[FULL TEAM DISCOVERY 7J-5C6] ' + JSON.stringify({
     label,
     totalTeams: teams.length,
     pfPaTeams: pfPaTeams.length,
@@ -19075,7 +19243,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
       });
     }
 
-    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C5] ' + JSON.stringify({
+    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C6] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19263,7 +19431,7 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
   const result = buildScheduleScoreAccumulatorFromHub(hub);
   const pfPaTeams = result.teams.filter(team => team.scored_games > 0 && (team.points_for > 0 || team.points_against > 0));
 
-  console.log('[HUB SCHEDULE SCORE ACCUMULATOR 7J-5C5] ' + JSON.stringify({
+  console.log('[HUB SCHEDULE SCORE ACCUMULATOR 7J-5C6] ' + JSON.stringify({
     label,
     totalScheduleRows: result.totalScheduleRows,
     totalTeamsSeeded: result.teams.length,
@@ -19317,7 +19485,7 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
       });
     }
 
-    console.log('[HUB SCHEDULE SCORE ACCUMULATOR WRITE 7J-5C5] ' + JSON.stringify({
+    console.log('[HUB SCHEDULE SCORE ACCUMULATOR WRITE 7J-5C6] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19431,7 +19599,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
     .filter(row => row.scored_games > 0)
     .sort((a, b) => String(a.teamName).localeCompare(String(b.teamName)));
 
-  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C5] ' + JSON.stringify({
+  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C6] ' + JSON.stringify({
     label,
     totalCompletedGames: gamesResult.rows.length,
     scoredGames,
@@ -19466,7 +19634,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
       });
     }
 
-    console.log('[SCHEDULE PFPA WRITE 7J-5C5] ' + JSON.stringify({
+    console.log('[SCHEDULE PFPA WRITE 7J-5C6] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19490,7 +19658,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
     team.teamTotalPointsAllowed !== undefined
   );
 
-  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C5] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C6] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     rawTeamObjectCount: allObjects.length,
@@ -19552,7 +19720,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       updateResults.push({ teamName, pf, pa, rowCount: Number(result.rowCount || 0) });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C5] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C6] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19623,7 +19791,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C5] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C6] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -19652,7 +19820,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C5] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C6] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -19676,7 +19844,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5C5] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5C6] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -19711,7 +19879,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5C5] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5C6] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -19771,7 +19939,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5C5] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5C6] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -21010,6 +21178,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Full league analytics harvester failed:', error?.message || error);
     });
+    await sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, 'post-accumulator').catch(error => {
+      console.error('[Madden Sync] RequestInfo multi-sweep failed:', error?.message || error);
+    });
     await expandFullLeagueTeamDiscovery(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Full team discovery expansion failed:', error?.message || error);
     });
@@ -21046,8 +21217,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full league analytics harvester enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full league analytics harvester enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; RequestInfo multi-sweep miner enabled.'
+        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; RequestInfo multi-sweep miner enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
