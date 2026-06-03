@@ -15951,6 +15951,190 @@ async function sendEaBlazeRequest(token, session, request) {
 }
 
 
+
+async function sendEaBlazeExportRequest(token, session, exportType, payload = {}, options = {}) {
+  const maxAttempts = Number(options.maxAttempts || process.env.EA_EXPORT_MAX_ATTEMPTS || 5);
+  const baseDelayMs = Number(options.baseDelayMs || process.env.EA_EXPORT_BASE_DELAY_MS || 1000);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const url = 'https://wal2.tools.gos.bio-iad.ea.com/wal/mca/' + exportType + '/' + session.sessionKey;
+      console.log('[EA EXPORT REQUEST 7J-5D] ' + JSON.stringify({
+        exportType,
+        attempt,
+        sessionKeyLength: String(session.sessionKey || '').length,
+        blazeId: session.blazeId,
+        console: token.console,
+        payload,
+      }).slice(0, 4000));
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: eaBlazeHeaders(token),
+        body: JSON.stringify(payload || {}),
+      });
+
+      const rawText = await response.text();
+      const cleanedText = String(rawText || '').replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
+      let parsed;
+      try {
+        parsed = JSON.parse(cleanedText || rawText || '{}');
+      } catch {
+        parsed = { raw: rawText };
+      }
+
+      if (!response.ok || parsed?.error) {
+        const errorText = JSON.stringify(parsed).slice(0, 1000);
+        const isRetryable = /ERR_TIMEOUT|timeout|server|temporarily|try again|MCA_ERR_SERVER_ERROR/i.test(errorText);
+        if (attempt < maxAttempts && isRetryable) {
+          lastError = new Error('EA export request failed retryably. HTTP ' + response.status + ' • ' + errorText);
+          await new Promise(resolve => setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1)));
+          continue;
+        }
+        throw new Error('EA export request failed. HTTP ' + response.status + ' • ' + errorText);
+      }
+
+      return parsed;
+    } catch (error) {
+      lastError = error;
+      const isRetryable = /ERR_TIMEOUT|timeout|server|temporarily|try again|MCA_ERR_SERVER_ERROR/i.test(String(error?.message || error));
+      if (attempt < maxAttempts && isRetryable) {
+        await new Promise(resolve => setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError || new Error('EA export request failed without a specific error.');
+}
+
+function extractEaStandingsExportList(payload) {
+  const candidates = [
+    payload?.teamStandingInfoList,
+    payload?.standingsInfoList,
+    payload?.standingInfoList,
+    payload?.responseInfo?.value?.teamStandingInfoList,
+    payload?.responseInfo?.value?.standingsInfoList,
+    payload?.value?.teamStandingInfoList,
+    payload?.value?.standingsInfoList,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+
+  const deepArrays = deepFindArraysWithObjects(payload, 2000)
+    .filter(item => Array.isArray(item.array) && item.array.some(row => row && typeof row === 'object' && (
+      Object.prototype.hasOwnProperty.call(row, 'ptsFor') ||
+      Object.prototype.hasOwnProperty.call(row, 'ptsAgainst') ||
+      Object.prototype.hasOwnProperty.call(row, 'totalWins') ||
+      Object.prototype.hasOwnProperty.call(row, 'totalLosses') ||
+      Object.prototype.hasOwnProperty.call(row, 'teamStandingInfoList')
+    )))
+    .sort((a, b) => Number(b.array?.length || 0) - Number(a.array?.length || 0));
+
+  return deepArrays[0]?.array || [];
+}
+
+function normalizeEaStandingsExportRows(payload) {
+  const list = extractEaStandingsExportList(payload);
+  return list.map(row => {
+    const teamName = canonicalMaddenTeamNameFromAny(row.teamName || row.displayName || row.shortName || row.longName || row.name);
+    return {
+      ...row,
+      teamName,
+      id: row.teamId ?? row.id ?? teamName,
+      teamId: row.teamId ?? row.id ?? teamName,
+      wins: parseNumberOrNull(row.totalWins ?? row.wins) ?? 0,
+      losses: parseNumberOrNull(row.totalLosses ?? row.losses) ?? 0,
+      ties: parseNumberOrNull(row.totalTies ?? row.ties) ?? 0,
+      pointsFor: parseNumberOrNull(row.ptsFor ?? row.pointsFor ?? row.points_for ?? row.pf) ?? 0,
+      pointsAgainst: parseNumberOrNull(row.ptsAgainst ?? row.pointsAgainst ?? row.points_against ?? row.pa) ?? 0,
+      points_for: parseNumberOrNull(row.ptsFor ?? row.pointsFor ?? row.points_for ?? row.pf) ?? 0,
+      points_against: parseNumberOrNull(row.ptsAgainst ?? row.pointsAgainst ?? row.points_against ?? row.pa) ?? 0,
+      netPts: parseNumberOrNull(row.netPts ?? row.pointDiff ?? row.pointDifferential) ?? 0,
+      rank: parseNumberOrNull(row.rank) ?? null,
+      seed: parseNumberOrNull(row.seed) ?? null,
+      conferenceName: row.conferenceName || null,
+      divisionName: row.divisionName || null,
+      playoffStatus: row.playoffStatus ?? null,
+      source: 'CareerMode_GetStandingsExport',
+    };
+  }).filter(row => row.teamName);
+}
+
+async function importEaStandingsExportForLeague(context, guild, league, runId = null, label = 'standings-export') {
+  const enabled = String(process.env.EA_STANDINGS_EXPORT_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return { imported: 0, rows: [], payload: null, skipped: true };
+
+  const session = context.activeBlazeSession || context.session || null;
+  if (!session?.sessionKey) {
+    throw new Error('No active Blaze session available for CareerMode_GetStandingsExport.');
+  }
+
+  const payload = await sendEaBlazeExportRequest(
+    context.token,
+    session,
+    'CareerMode_GetStandingsExport',
+    { leagueId: Number(context.externalLeagueId) }
+  );
+
+  const rows = normalizeEaStandingsExportRows(payload);
+
+  console.log('[STANDINGS EXPORT 7J-5D] ' + JSON.stringify({
+    label,
+    leagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    success: payload?.success,
+    message: payload?.message || '',
+    rawTopKeys: Object.keys(payload || {}).slice(0, 80),
+    rowCount: rows.length,
+    sample: rows.slice(0, 12).map(row => ({
+      team: row.teamName,
+      wins: row.wins,
+      losses: row.losses,
+      ties: row.ties,
+      pf: row.pointsFor,
+      pa: row.pointsAgainst,
+      netPts: row.netPts,
+      rank: row.rank,
+      seed: row.seed,
+      divisionName: row.divisionName,
+      conferenceName: row.conferenceName,
+    })),
+  }).slice(0, 16000));
+
+  if (runId) {
+    await pool.query(
+      `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
+       VALUES ($1, $2, $3, $4, $5, 'standings_export', $6::jsonb)`,
+      [
+        randomUUID(),
+        guild.id,
+        league.league_id,
+        runId,
+        'ea_direct:CareerMode_GetStandingsExport:' + context.externalLeagueId,
+        JSON.stringify(payload || {}),
+      ]
+    ).catch(error => {
+      console.error('[STANDINGS EXPORT 7J-5D] Failed to save raw payload:', error?.message || error);
+    });
+  }
+
+  const imported = rows.length ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
+
+  console.log('[STANDINGS EXPORT WRITE 7J-5D] ' + JSON.stringify({
+    imported,
+    rowCount: rows.length,
+    teams: rows.map(row => ({ team: row.teamName, wins: row.wins, losses: row.losses, ties: row.ties, pf: row.pointsFor, pa: row.pointsAgainst })),
+  }).slice(0, 16000));
+
+  return { imported, rows, payload };
+}
+
+
 async function getEaBlazeLeagueHubDetailed(token, leagueId) {
   const session = await retrieveBlazeSession(token);
   const response = await sendEaBlazeRequest(token, session, {
@@ -19021,7 +19205,7 @@ async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, l
     Number(team.teamTotalPointsAllowed || 0) > 0
   );
 
-  console.log('[FULL FRANCHISE WALK 7J-5C7] ' + JSON.stringify({
+  console.log('[FULL FRANCHISE WALK 7J-5D] ' + JSON.stringify({
     label,
     hubTopKeys: Object.keys(hub || {}).slice(0, 120),
     totalHits: hits.length,
@@ -19093,7 +19277,7 @@ async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, l
       });
     }
 
-    console.log('[FULL FRANCHISE WALK WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[FULL FRANCHISE WALK WRITE 7J-5D] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 16000));
@@ -19164,7 +19348,7 @@ async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, 
     Number(team.teamTotalPointsAllowed || 0) > 0
   );
 
-  console.log('[REQUESTINFO MULTI SWEEP 7J-5C7] ' + JSON.stringify({
+  console.log('[REQUESTINFO MULTI SWEEP 7J-5D] ' + JSON.stringify({
     label,
     totalRequests: Array.isArray(requestInfoList) ? requestInfoList.length : 0,
     totalHarvestedTeamObjects: harvestedTeams.length,
@@ -19222,7 +19406,7 @@ async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, 
       });
     }
 
-    console.log('[REQUESTINFO MULTI SWEEP WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[REQUESTINFO MULTI SWEEP WRITE 7J-5D] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 16000));
@@ -19248,7 +19432,7 @@ async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, la
     (Number(team.teamTotalPointsScored || 0) > 0 || Number(team.teamTotalPointsAllowed || 0) > 0)
   );
 
-  console.log('[FULL LEAGUE ANALYTICS HARVESTER 7J-5C7] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS HARVESTER 7J-5D] ' + JSON.stringify({
     label,
     rawRowsFound: discoveredRows.length,
     mergedTeams: teams.length,
@@ -19302,7 +19486,7 @@ async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, la
       });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS HARVESTER WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS HARVESTER WRITE 7J-5D] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 16000));
@@ -19387,7 +19571,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
     )
   );
 
-  console.log('[FULL TEAM DISCOVERY 7J-5C7] ' + JSON.stringify({
+  console.log('[FULL TEAM DISCOVERY 7J-5D] ' + JSON.stringify({
     label,
     totalTeams: teams.length,
     pfPaTeams: pfPaTeams.length,
@@ -19436,7 +19620,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
       });
     }
 
-    console.log('[FULL TEAM DISCOVERY WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[FULL TEAM DISCOVERY WRITE 7J-5D] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19624,7 +19808,7 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
   const result = buildScheduleScoreAccumulatorFromHub(hub);
   const pfPaTeams = result.teams.filter(team => team.scored_games > 0 && (team.points_for > 0 || team.points_against > 0));
 
-  console.log('[HUB SCHEDULE SCORE ACCUMULATOR 7J-5C7] ' + JSON.stringify({
+  console.log('[HUB SCHEDULE SCORE ACCUMULATOR 7J-5D] ' + JSON.stringify({
     label,
     totalScheduleRows: result.totalScheduleRows,
     totalTeamsSeeded: result.teams.length,
@@ -19678,7 +19862,7 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
       });
     }
 
-    console.log('[HUB SCHEDULE SCORE ACCUMULATOR WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[HUB SCHEDULE SCORE ACCUMULATOR WRITE 7J-5D] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19792,7 +19976,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
     .filter(row => row.scored_games > 0)
     .sort((a, b) => String(a.teamName).localeCompare(String(b.teamName)));
 
-  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5C7] ' + JSON.stringify({
+  console.log('[SCHEDULE PFPA SYNTHESIS 7J-5D] ' + JSON.stringify({
     label,
     totalCompletedGames: gamesResult.rows.length,
     scoredGames,
@@ -19827,7 +20011,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
       });
     }
 
-    console.log('[SCHEDULE PFPA WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[SCHEDULE PFPA WRITE 7J-5D] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19851,7 +20035,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
     team.teamTotalPointsAllowed !== undefined
   );
 
-  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5C7] ' + JSON.stringify({
+  console.log('[FULL LEAGUE ANALYTICS EXPANSION 7J-5D] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     rawTeamObjectCount: allObjects.length,
@@ -19913,7 +20097,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       updateResults.push({ teamName, pf, pa, rowCount: Number(result.rowCount || 0) });
     }
 
-    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[FULL LEAGUE ANALYTICS WRITE 7J-5D] ' + JSON.stringify({
       updated,
       updateResults,
     }).slice(0, 12000));
@@ -19984,7 +20168,7 @@ async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
     ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
   );
 
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5C7] ' + JSON.stringify({
+  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5D] ' + JSON.stringify({
     label,
     totalRows: rows.rows.length,
     focus,
@@ -20013,7 +20197,7 @@ async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins')
     [guild.id, league.league_id, teamName]
   );
 
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5C7] ' + JSON.stringify({
+  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5D] ' + JSON.stringify({
     teamName,
     importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
     importedGamesRows: importedGames.rows || [],
@@ -20037,7 +20221,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
     [];
 
   if (!Array.isArray(requestInfoList)) {
-    console.log('[REQUESTINFO HARVEST 7J-5C7] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST 7J-5D] ' + JSON.stringify({
       leagueId: context.externalLeagueId,
       found: false,
       requestInfoType: typeof requestInfoList,
@@ -20072,7 +20256,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
 
   const teamAnalytics = Array.from(teamsByName.values());
 
-  console.log('[REQUESTINFO HARVEST 7J-5C7] ' + JSON.stringify({
+  console.log('[REQUESTINFO HARVEST 7J-5D] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     totalRequests: requestInfoList.length,
@@ -20132,7 +20316,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       updated += Number(result.rowCount || 0);
     }
 
-    console.log('[REQUESTINFO HARVEST WRITE 7J-5C7] ' + JSON.stringify({
+    console.log('[REQUESTINFO HARVEST WRITE 7J-5D] ' + JSON.stringify({
       updated,
       candidateTeams: teamAnalytics.map(team => ({
         canonicalName: team.canonicalName,
@@ -21380,6 +21564,13 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await expandFullLeagueTeamDiscovery(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Full team discovery expansion failed:', error?.message || error);
     });
+    const standingsExportResult = await importEaStandingsExportForLeague(context, guild, league, runId, 'post-accumulator').catch(error => {
+      console.error('[Madden Sync] Standings export endpoint failed:', error?.message || error);
+      return { imported: 0, rows: [], error: error?.message || String(error) };
+    });
+    await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-export-7j5d').catch(error => {
+      console.error('[Madden Sync] DB truth after standings export failed:', error?.message || error);
+    });
     await logMaddenTeamStatsDbTruth(guild, league, 'after-schedule-derived-pfpa-synthesis').catch(error => {
       console.error('[Madden Sync] DB truth after schedule PF/PA synthesis failed:', error?.message || error);
     });
@@ -21413,8 +21604,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', games: ' + importedGames +
       ', players: 0. ' +
       (preseasonMode
-        ? 'Preseason mode active (' + seasonModeLabel + '): standings probe skipped until regular season; token auto-refresh + Blaze compatibility retry enabled; full franchise object walker enabled.'
-        : 'Regular season mode: hub-native standings parser enabled; token auto-refresh + Blaze compatibility retry enabled; full franchise object walker enabled.');
+        ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
+        : 'Regular season mode: CareerMode_GetStandingsExport enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
