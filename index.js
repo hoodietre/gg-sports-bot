@@ -15960,7 +15960,7 @@ async function sendEaBlazeExportRequest(token, session, exportType, payload = {}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const url = 'https://wal2.tools.gos.bio-iad.ea.com/wal/mca/' + exportType + '/' + session.sessionKey;
-      console.log('[EA EXPORT REQUEST 7J-5E] ' + JSON.stringify({
+      console.log('[EA EXPORT REQUEST 7J-5E1] ' + JSON.stringify({
         exportType,
         attempt,
         sessionKeyLength: String(session.sessionKey || '').length,
@@ -16251,14 +16251,14 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
           JSON.stringify(result.payload || {}),
         ]
       ).catch(error => {
-        console.error('[SCHEDULE EXPORT 7J-5E] Failed to save raw payload:', error?.message || error);
+        console.error('[SCHEDULE EXPORT 7J-5E1] Failed to save raw payload:', error?.message || error);
       });
     }
 
     imported += await importMaddenGamesFromArray(guild, league, rows, 'Week ' + weekNumber);
   }
 
-  console.log('[SCHEDULE EXPORT 7J-5E] ' + JSON.stringify({
+  console.log('[SCHEDULE EXPORT 7J-5E1] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -16354,7 +16354,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const rows = normalizeEaStandingsExportRows(payload);
 
-  console.log('[STANDINGS EXPORT 7J-5E] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT 7J-5E1] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -16390,13 +16390,13 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
         JSON.stringify(payload || {}),
       ]
     ).catch(error => {
-      console.error('[STANDINGS EXPORT 7J-5E] Failed to save raw payload:', error?.message || error);
+      console.error('[STANDINGS EXPORT 7J-5E1] Failed to save raw payload:', error?.message || error);
     });
   }
 
   const imported = rows.length ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
 
-  console.log('[STANDINGS EXPORT WRITE 7J-5E] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT WRITE 7J-5E1] ' + JSON.stringify({
     imported,
     rowCount: rows.length,
     teams: rows.map(row => ({ team: row.teamName, wins: row.wins, losses: row.losses, ties: row.ties, pf: row.pointsFor, pa: row.pointsAgainst })),
@@ -21835,12 +21835,12 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await expandFullLeagueTeamDiscovery(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Full team discovery expansion failed:', error?.message || error);
     });
-    const standingsExportResult = const standingsExportResult = await importEaStandingsExportForLeague(context, guild, league, runId, 'post-accumulator').catch(error => {
+    const standingsExportResult = await importEaStandingsExportForLeague(context, guild, league, runId, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Standings export endpoint failed:', error?.message || error);
+      return { imported: 0, rows: [], error: error?.message || String(error) };
+    });
     await importEaScheduleExportForLeague(context, guild, league, runId, standingsExportResult?.rows || [], 'post-standings-export').catch(error => {
       console.error('[Madden Sync] Schedule export import failed:', error?.message || error);
-    });
-      return { imported: 0, rows: [], error: error?.message || String(error) };
     });
     await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-export-7j5d').catch(error => {
       console.error('[Madden Sync] DB truth after standings export failed:', error?.message || error);
@@ -21879,7 +21879,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', players: 0. ' +
       (preseasonMode
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: CareerMode_GetStandingsExport + schedules export enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
+        : 'Regular season mode: CareerMode_GetStandingsExport + schedules export syntax hotfix enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
