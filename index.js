@@ -15960,7 +15960,7 @@ async function sendEaBlazeExportRequest(token, session, exportType, payload = {}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const url = 'https://wal2.tools.gos.bio-iad.ea.com/wal/mca/' + exportType + '/' + session.sessionKey;
-      console.log('[EA EXPORT REQUEST 7J-5D] ' + JSON.stringify({
+      console.log('[EA EXPORT REQUEST 7J-5E] ' + JSON.stringify({
         exportType,
         attempt,
         sessionKeyLength: String(session.sessionKey || '').length,
@@ -16009,6 +16009,277 @@ async function sendEaBlazeExportRequest(token, session, exportType, payload = {}
 
   throw lastError || new Error('EA export request failed without a specific error.');
 }
+
+
+function extractEaScheduleExportList(payload) {
+  const candidates = [
+    payload?.gameScheduleInfoList,
+    payload?.scheduleInfoList,
+    payload?.seasonGameInfoList,
+    payload?.leagueSchedule,
+    payload?.schedules,
+    payload?.games,
+    payload?.schedule,
+    payload?.responseInfo?.value?.gameScheduleInfoList,
+    payload?.responseInfo?.value?.scheduleInfoList,
+    payload?.responseInfo?.value?.seasonGameInfoList,
+    payload?.responseInfo?.value?.leagueSchedule,
+    payload?.responseInfo?.value?.schedules,
+    payload?.responseInfo?.value?.games,
+    payload?.value?.gameScheduleInfoList,
+    payload?.value?.scheduleInfoList,
+    payload?.value?.seasonGameInfoList,
+    payload?.value?.leagueSchedule,
+    payload?.value?.schedules,
+    payload?.value?.games,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+
+  const deepArrays = deepFindArraysWithObjects(payload, 2000)
+    .filter(item => Array.isArray(item.array) && item.array.some(row => row && typeof row === 'object' && (
+      Object.prototype.hasOwnProperty.call(row, 'homeTeamId') ||
+      Object.prototype.hasOwnProperty.call(row, 'awayTeamId') ||
+      Object.prototype.hasOwnProperty.call(row, 'homeName') ||
+      Object.prototype.hasOwnProperty.call(row, 'awayName') ||
+      Object.prototype.hasOwnProperty.call(row, 'homeScore') ||
+      Object.prototype.hasOwnProperty.call(row, 'awayScore') ||
+      Object.prototype.hasOwnProperty.call(row, 'gameResult')
+    )));
+
+  if (deepArrays.length) {
+    deepArrays.sort((a, b) => b.array.length - a.array.length);
+    return deepArrays[0].array;
+  }
+
+  return [];
+}
+
+function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg', teamNameMaps = {}) {
+  const rows = extractEaScheduleExportList(payload);
+  const normalized = [];
+
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index] || {};
+    const game = row.seasonGameInfo || row.gameInfo || row;
+
+    const awayTeam = canonicalMaddenTeamNameFromAny(
+      getAnyValue(game, ['awayName', 'awayTeamName', 'awayTeam', 'awayCityName'], null) ||
+      getAnyValue(row, ['awayName', 'awayTeamName', 'awayTeam', 'awayCityName'], null) ||
+      teamNameMaps.byId?.get?.(String(getAnyValue(game, ['awayTeamId', 'awayTeamLogoId', 'awayTeam'], ''))) ||
+      teamNameMaps.byId?.get?.(String(getAnyValue(row, ['awayTeamId', 'awayTeamLogoId', 'awayTeam'], '')))
+    );
+
+    const homeTeam = canonicalMaddenTeamNameFromAny(
+      getAnyValue(game, ['homeName', 'homeTeamName', 'homeTeam', 'homeCityName'], null) ||
+      getAnyValue(row, ['homeName', 'homeTeamName', 'homeTeam', 'homeCityName'], null) ||
+      teamNameMaps.byId?.get?.(String(getAnyValue(game, ['homeTeamId', 'homeTeamLogoId', 'homeTeam'], ''))) ||
+      teamNameMaps.byId?.get?.(String(getAnyValue(row, ['homeTeamId', 'homeTeamLogoId', 'homeTeam'], '')))
+    );
+
+    if (!awayTeam || !homeTeam) continue;
+
+    const scheduleId = getAnyValue(game, ['id', 'scheduleId', 'gameId', 'seasonGameKey', 'seasonGameId'], null) ||
+      getAnyValue(row, ['id', 'scheduleId', 'gameId', 'seasonGameKey', 'seasonGameId'], null);
+
+    const rawWeek = getAnyValue(game, ['weekIndex', 'week', 'weekNumber', 'seasonWeek'], null) ??
+      getAnyValue(row, ['weekIndex', 'week', 'weekNumber', 'seasonWeek'], null) ??
+      weekNumber;
+
+    const rawStage = getAnyValue(game, ['stageIndex', 'stage', 'seasonStage', 'weekType'], null) ??
+      getAnyValue(row, ['stageIndex', 'stage', 'seasonStage', 'weekType'], null) ??
+      stage;
+
+    const weekLabel = 'Week ' + String(weekNumber || rawWeek || 'TBD');
+
+    const awayScore = parseNumberOrNull(
+      getAnyValue(game, ['awayScore', 'away_score', 'awayTeamScore', 'awayPoints', 'awayPts', 'away_score_total'], null) ??
+      getAnyValue(row, ['awayScore', 'away_score', 'awayTeamScore', 'awayPoints', 'awayPts', 'away_score_total'], null)
+    ) ?? 0;
+
+    const homeScore = parseNumberOrNull(
+      getAnyValue(game, ['homeScore', 'home_score', 'homeTeamScore', 'homePoints', 'homePts', 'home_score_total'], null) ??
+      getAnyValue(row, ['homeScore', 'home_score', 'homeTeamScore', 'homePoints', 'homePts', 'home_score_total'], null)
+    ) ?? 0;
+
+    const gameResult = parseNumberOrNull(getAnyValue(game, ['gameResult', 'result'], null) ?? getAnyValue(row, ['gameResult', 'result'], null));
+    const isPlayed =
+      gameResult === 2 ||
+      gameResult === 3 ||
+      gameResult === 4 ||
+      getAnyValue(game, ['isGamePlayed', 'isPlayed', 'isComplete', 'isCompleted'], false) === true ||
+      getAnyValue(row, ['isGamePlayed', 'isPlayed', 'isComplete', 'isCompleted'], false) === true ||
+      awayScore > 0 ||
+      homeScore > 0;
+
+    let status = isPlayed ? 'completed' : 'scheduled';
+    if (gameResult === 2) status = 'away_win';
+    if (gameResult === 3) status = 'home_win';
+    if (gameResult === 4) status = 'tie';
+
+    const externalGameId = String([
+      'ea-schedule-export',
+      stage,
+      weekNumber || rawWeek || 'unknown',
+      scheduleId || index,
+      awayTeam,
+      homeTeam,
+    ].join(':'));
+
+    normalized.push({
+      id: externalGameId,
+      external_game_id: externalGameId,
+      scheduleId,
+      week: weekLabel,
+      weekLabel,
+      week_label: weekLabel,
+      stage,
+      stageIndex: rawStage,
+      home_team: homeTeam,
+      away_team: awayTeam,
+      homeTeam,
+      awayTeam,
+      home_score: homeScore,
+      away_score: awayScore,
+      homeScore,
+      awayScore,
+      gameResult,
+      status,
+      source: 'CareerMode_GetSchedulesExport',
+      raw: row,
+    });
+  }
+
+  return normalized;
+}
+
+function guessEaRegularSeasonWeeksFromStandingsRows(standingsRows) {
+  const maxWeek = Math.max(
+    1,
+    ...((standingsRows || []).map(row => Number(row.weekIndex || row.week_index || 0)).filter(Number.isFinite))
+  );
+
+  // The standings export often carries current week context; include a safe window.
+  const configured = Number(process.env.EA_SCHEDULE_EXPORT_MAX_WEEK || 0);
+  const limit = configured || Math.max(3, Math.min(18, maxWeek + 3));
+
+  return Array.from({ length: limit }, (_, index) => index + 1);
+}
+
+async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage = 'reg') {
+  const session = context.activeBlazeSession || context.session || null;
+  if (!session?.sessionKey) {
+    throw new Error('No active Blaze session available for schedule export.');
+  }
+
+  const leagueId = Number(context.externalLeagueId);
+  const exportTypes = String(process.env.EA_SCHEDULE_EXPORT_TYPES || 'CareerMode_GetSchedulesExport,CareerMode_GetWeeklySchedulesExport,CareerMode_GetScheduleExport')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+
+  const payloads = [
+    { leagueId, week: weekNumber, stage },
+    { leagueId, weekIndex: weekNumber, stage },
+    { leagueId, weekIndex: weekNumber, stageIndex: stage === 'pre' ? 0 : 1 },
+    { leagueId, week: weekNumber, weekType: stage },
+    { leagueId, seasonWeek: weekNumber, seasonWeekType: stage === 'pre' ? 0 : 1 },
+  ];
+
+  const attempts = [];
+  let lastError = null;
+
+  for (const exportType of exportTypes) {
+    for (const payload of payloads) {
+      try {
+        const result = await sendEaBlazeExportRequest(context.token, session, exportType, payload, { maxAttempts: 2 });
+        const rows = extractEaScheduleExportList(result);
+        attempts.push({ exportType, payload, success: true, rowCount: rows.length, topKeys: Object.keys(result || {}).slice(0, 40) });
+        if (rows.length) return { payload: result, exportType, requestPayload: payload, attempts };
+      } catch (error) {
+        lastError = error;
+        attempts.push({ exportType, payload, success: false, error: String(error?.message || error).slice(0, 500) });
+      }
+    }
+  }
+
+  return { payload: null, exportType: null, requestPayload: null, attempts, error: lastError };
+}
+
+async function importEaScheduleExportForLeague(context, guild, league, runId = null, standingsRows = [], label = 'schedule-export') {
+  const enabled = String(process.env.EA_SCHEDULE_EXPORT_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return { imported: 0, rows: [], skipped: true };
+
+  const weeks = String(process.env.EA_SCHEDULE_EXPORT_WEEKS || '')
+    .split(',')
+    .map(value => Number(String(value).trim()))
+    .filter(value => Number.isFinite(value) && value > 0);
+
+  const targetWeeks = weeks.length ? weeks : guessEaRegularSeasonWeeksFromStandingsRows(standingsRows);
+  const teamNameMaps = {};
+  let imported = 0;
+  const allRows = [];
+  const attemptSummaries = [];
+
+  for (const weekNumber of targetWeeks) {
+    const result = await requestEaScheduleExportWithFallbacks(context, weekNumber, 'reg');
+    attemptSummaries.push({
+      week: weekNumber,
+      exportType: result.exportType,
+      requestPayload: result.requestPayload,
+      attempts: result.attempts.slice(0, 8),
+      error: result.error ? String(result.error?.message || result.error).slice(0, 500) : null,
+    });
+
+    if (!result.payload) continue;
+
+    const rows = normalizeEaScheduleExportRows(result.payload, weekNumber, 'reg', teamNameMaps);
+    allRows.push(...rows);
+
+    if (runId) {
+      await pool.query(
+        `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, 'schedule_export', $6::jsonb)`,
+        [
+          randomUUID(),
+          guild.id,
+          league.league_id,
+          runId,
+          'ea_direct:' + result.exportType + ':' + context.externalLeagueId + ':week:' + weekNumber,
+          JSON.stringify(result.payload || {}),
+        ]
+      ).catch(error => {
+        console.error('[SCHEDULE EXPORT 7J-5E] Failed to save raw payload:', error?.message || error);
+      });
+    }
+
+    imported += await importMaddenGamesFromArray(guild, league, rows, 'Week ' + weekNumber);
+  }
+
+  console.log('[SCHEDULE EXPORT 7J-5E] ' + JSON.stringify({
+    label,
+    leagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    targetWeeks,
+    imported,
+    rowCount: allRows.length,
+    attempts: attemptSummaries,
+    sample: allRows.slice(0, 30).map(row => ({
+      week: row.week_label,
+      matchup: row.awayTeam + ' @ ' + row.homeTeam,
+      awayScore: row.awayScore,
+      homeScore: row.homeScore,
+      gameResult: row.gameResult,
+      status: row.status,
+      scheduleId: row.scheduleId,
+    })),
+  }).slice(0, 30000));
+
+  return { imported, rows: allRows, attempts: attemptSummaries };
+}
+
 
 function extractEaStandingsExportList(payload) {
   const candidates = [
@@ -16083,7 +16354,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const rows = normalizeEaStandingsExportRows(payload);
 
-  console.log('[STANDINGS EXPORT 7J-5D] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT 7J-5E] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -16119,13 +16390,13 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
         JSON.stringify(payload || {}),
       ]
     ).catch(error => {
-      console.error('[STANDINGS EXPORT 7J-5D] Failed to save raw payload:', error?.message || error);
+      console.error('[STANDINGS EXPORT 7J-5E] Failed to save raw payload:', error?.message || error);
     });
   }
 
   const imported = rows.length ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
 
-  console.log('[STANDINGS EXPORT WRITE 7J-5D] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT WRITE 7J-5E] ' + JSON.stringify({
     imported,
     rowCount: rows.length,
     teams: rows.map(row => ({ team: row.teamName, wins: row.wins, losses: row.losses, ties: row.ties, pf: row.pointsFor, pa: row.pointsAgainst })),
@@ -21564,8 +21835,11 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await expandFullLeagueTeamDiscovery(context, guild, league, hub, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Full team discovery expansion failed:', error?.message || error);
     });
-    const standingsExportResult = await importEaStandingsExportForLeague(context, guild, league, runId, 'post-accumulator').catch(error => {
+    const standingsExportResult = const standingsExportResult = await importEaStandingsExportForLeague(context, guild, league, runId, 'post-accumulator').catch(error => {
       console.error('[Madden Sync] Standings export endpoint failed:', error?.message || error);
+    await importEaScheduleExportForLeague(context, guild, league, runId, standingsExportResult?.rows || [], 'post-standings-export').catch(error => {
+      console.error('[Madden Sync] Schedule export import failed:', error?.message || error);
+    });
       return { imported: 0, rows: [], error: error?.message || String(error) };
     });
     await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-export-7j5d').catch(error => {
@@ -21605,7 +21879,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', players: 0. ' +
       (preseasonMode
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: CareerMode_GetStandingsExport enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
+        : 'Regular season mode: CareerMode_GetStandingsExport + schedules export enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
