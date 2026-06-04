@@ -15974,7 +15974,7 @@ async function sendEaBlazeExportRequest(token, session, exportType, payload = {}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const url = 'https://wal2.tools.gos.bio-iad.ea.com/wal/mca/' + exportType + '/' + session.sessionKey;
-      console.log('[EA EXPORT REQUEST 7J-5E3] ' + JSON.stringify({
+      console.log('[EA EXPORT REQUEST 7J-6A] ' + JSON.stringify({
         exportType,
         attempt,
         sessionKeyLength: String(session.sessionKey || '').length,
@@ -16337,6 +16337,161 @@ function extractEaPlayerStatExportList(payload) {
   return [];
 }
 
+
+function extractGenericMaddenExportRows(payload) {
+  const candidates = [
+    payload?.rosterInfoList,
+    payload?.leagueTeamInfoList,
+    payload?.teamStandingInfoList,
+    payload?.gameScheduleInfoList,
+    payload?.teamStatInfoList,
+    payload?.playerPassingStatInfoList,
+    payload?.playerRushingStatInfoList,
+    payload?.playerReceivingStatInfoList,
+    payload?.playerDefensiveStatInfoList,
+    payload?.playerKickingStatInfoList,
+    payload?.playerPuntingStatInfoList,
+    payload?.playerStatInfoList,
+    payload?.statInfoList,
+    payload?.players,
+    payload?.stats,
+    payload?.responseInfo?.value?.rosterInfoList,
+    payload?.responseInfo?.value?.teamStatInfoList,
+    payload?.responseInfo?.value?.playerPassingStatInfoList,
+    payload?.responseInfo?.value?.playerRushingStatInfoList,
+    payload?.responseInfo?.value?.playerReceivingStatInfoList,
+    payload?.responseInfo?.value?.playerDefensiveStatInfoList,
+    payload?.responseInfo?.value?.playerKickingStatInfoList,
+    payload?.responseInfo?.value?.playerPuntingStatInfoList,
+    payload?.value?.rosterInfoList,
+    payload?.value?.teamStatInfoList,
+    payload?.value?.playerPassingStatInfoList,
+    payload?.value?.playerRushingStatInfoList,
+    payload?.value?.playerReceivingStatInfoList,
+    payload?.value?.playerDefensiveStatInfoList,
+    payload?.value?.playerKickingStatInfoList,
+    payload?.value?.playerPuntingStatInfoList,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+
+  const arrays = typeof findArraysWithObjectsLocal === 'function' ? findArraysWithObjectsLocal(payload, 2000) : [];
+  if (!arrays.length) return [];
+  arrays.sort((a, b) => b.array.length - a.array.length);
+  return arrays[0].array;
+}
+
+async function probeOneMaddenWeeklyExport(context, exportType, weekNumber, stage = 'reg') {
+  const session = context.activeBlazeSession || context.session || null;
+  if (!session?.sessionKey) throw new Error('No active Blaze session available for ' + exportType);
+
+  const leagueId = Number(context.externalLeagueId);
+  const payloads = [
+    { leagueId, week: weekNumber, stage },
+    { leagueId, weekIndex: weekNumber, stage },
+    { leagueId, weekIndex: weekNumber, stageIndex: stage === 'pre' ? 0 : 1 },
+    { leagueId, seasonWeek: weekNumber, seasonWeekType: stage === 'pre' ? 0 : 1 },
+  ];
+
+  const attempts = [];
+  for (const requestPayload of payloads) {
+    try {
+      const payload = await sendEaBlazeExportRequest(context.token, session, exportType, requestPayload, { maxAttempts: 2 });
+      const rows = extractGenericMaddenExportRows(payload);
+      attempts.push({
+        exportType,
+        requestPayload,
+        success: true,
+        rowCount: rows.length,
+        topKeys: Object.keys(payload || {}).slice(0, 50),
+        sampleKeys: rows.slice(0, 3).map(row => Object.keys(row || {}).slice(0, 60)),
+        sample: rows.slice(0, 3).map(row => compactMaddenRawExcerpt(row)),
+      });
+      if (rows.length) return { success: true, exportType, requestPayload, payload, rows, attempts };
+    } catch (error) {
+      attempts.push({ exportType, requestPayload, success: false, error: String(error?.message || error).slice(0, 500) });
+    }
+  }
+  return { success: false, exportType, requestPayload: null, payload: null, rows: [], attempts };
+}
+
+async function discoverMaddenPlayerAndStatExports(context, guild, league, runId = null, label = 'player-stat-discovery') {
+  const enabled = String(process.env.EA_PLAYER_STAT_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
+  if (!enabled) return null;
+
+  const weeks = String(process.env.EA_PLAYER_STAT_DISCOVERY_WEEKS || '1,2')
+    .split(',')
+    .map(value => Number(String(value).trim()))
+    .filter(value => Number.isFinite(value) && value > 0);
+
+  const weeklyExports = [
+    'CareerMode_GetTeamStatsExport',
+    'CareerMode_GetPassingStatsExport',
+    'CareerMode_GetRushingStatsExport',
+    'CareerMode_GetReceivingStatsExport',
+    'CareerMode_GetDefenseStatsExport',
+    'CareerMode_GetKickingStatsExport',
+    'CareerMode_GetPuntingStatsExport',
+  ];
+
+  const results = [];
+  for (const weekNumber of weeks) {
+    for (const exportType of weeklyExports) {
+      const result = await probeOneMaddenWeeklyExport(context, exportType, weekNumber, 'reg')
+        .catch(error => ({ success: false, exportType, weekNumber, error: String(error?.message || error).slice(0, 500), attempts: [] }));
+      results.push({ weekNumber, ...result });
+    }
+  }
+
+  const successful = results.filter(result => result.success && result.rows?.length);
+
+  console.log('[PLAYER STAT DISCOVERY 7J-6A] ' + JSON.stringify({
+    label,
+    leagueId: context.externalLeagueId,
+    leagueName: league?.league_name,
+    weeks,
+    successfulCount: successful.length,
+    successful: successful.map(result => ({
+      week: result.weekNumber,
+      exportType: result.exportType,
+      rowCount: result.rows.length,
+      requestPayload: result.requestPayload,
+      sampleKeys: result.rows.slice(0, 3).map(row => Object.keys(row || {}).slice(0, 80)),
+      sample: result.rows.slice(0, 5).map(row => compactMaddenRawExcerpt(row)),
+    })),
+    failures: results.filter(result => !result.success).map(result => ({
+      week: result.weekNumber,
+      exportType: result.exportType,
+      attempts: (result.attempts || []).slice(0, 4),
+      error: result.error || null,
+    })),
+  }).slice(0, 30000));
+
+  if (runId) {
+    for (const result of successful.slice(0, 20)) {
+      await pool.query(
+        `INSERT INTO madden_sync_payloads (id, guild_id, league_id, sync_run_id, endpoint, payload_type, raw_payload)
+         VALUES ($1, $2, $3, $4, $5, 'player_stat_discovery', $6::jsonb)`,
+        [
+          randomUUID(),
+          guild.id,
+          league.league_id,
+          runId,
+          'ea_direct:' + result.exportType + ':' + context.externalLeagueId + ':week:' + result.weekNumber,
+          JSON.stringify(result.payload || {}),
+        ]
+      ).catch(error => {
+        console.error('[PLAYER STAT DISCOVERY 7J-6A] Failed to save raw payload:', error?.message || error);
+      });
+    }
+  }
+
+  return { results, successful };
+}
+
+
 async function probeEaPassingStatsExport(context, guild, league, runId = null, label = 'passing-stats-probe') {
   const enabled = String(process.env.EA_PASSING_STATS_PROBE_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
@@ -16402,7 +16557,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
     }
   }
 
-  console.log('[PASSING STATS PROBE 7J-5E3] ' + JSON.stringify({
+  console.log('[PASSING STATS PROBE 7J-6A] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -16431,7 +16586,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
         JSON.stringify(best.payload || {}),
       ]
     ).catch(error => {
-      console.error('[PASSING STATS PROBE 7J-5E3] Failed to save raw payload:', error?.message || error);
+      console.error('[PASSING STATS PROBE 7J-6A] Failed to save raw payload:', error?.message || error);
     });
   }
 
@@ -16456,7 +16611,7 @@ async function repairMaddenImportedZeroZeroCompletedGames(guild, league, label =
     [guild.id, league.league_id]
   );
 
-  console.log('[ZERO ZERO GAME REPAIR 7J-5E3] ' + JSON.stringify({
+  console.log('[ZERO ZERO GAME REPAIR 7J-6A] ' + JSON.stringify({
     label,
     repaired: Number(result.rowCount || 0),
     leagueId: league.league_id,
@@ -16510,14 +16665,14 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
           JSON.stringify(result.payload || {}),
         ]
       ).catch(error => {
-        console.error('[SCHEDULE EXPORT 7J-5E3] Failed to save raw payload:', error?.message || error);
+        console.error('[SCHEDULE EXPORT 7J-6A] Failed to save raw payload:', error?.message || error);
       });
     }
 
     imported += await importMaddenGamesFromArray(guild, league, rows, 'Week ' + weekNumber);
   }
 
-  console.log('[SCHEDULE EXPORT 7J-5E3] ' + JSON.stringify({
+  console.log('[SCHEDULE EXPORT 7J-6A] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -16613,7 +16768,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const rows = normalizeEaStandingsExportRows(payload);
 
-  console.log('[STANDINGS EXPORT 7J-5E3] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT 7J-6A] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -16649,13 +16804,13 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
         JSON.stringify(payload || {}),
       ]
     ).catch(error => {
-      console.error('[STANDINGS EXPORT 7J-5E3] Failed to save raw payload:', error?.message || error);
+      console.error('[STANDINGS EXPORT 7J-6A] Failed to save raw payload:', error?.message || error);
     });
   }
 
   const imported = rows.length ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
 
-  console.log('[STANDINGS EXPORT WRITE 7J-5E3] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT WRITE 7J-6A] ' + JSON.stringify({
     imported,
     rowCount: rows.length,
     teams: rows.map(row => ({ team: row.teamName, wins: row.wins, losses: row.losses, ties: row.ties, pf: row.pointsFor, pa: row.pointsAgainst })),
@@ -22107,6 +22262,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await probeEaPassingStatsExport(context, guild, league, runId, 'post-schedule-export').catch(error => {
       console.error('[Madden Sync] Passing stats export probe failed:', error?.message || error);
     });
+    await discoverMaddenPlayerAndStatExports(context, guild, league, runId, 'post-passing-probe').catch(error => {
+      console.error('[Madden Sync] Player/stat export discovery failed:', error?.message || error);
+    });
     await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-export-7j5d').catch(error => {
       console.error('[Madden Sync] DB truth after standings export failed:', error?.message || error);
     });
@@ -22144,7 +22302,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', players: 0. ' +
       (preseasonMode
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: CareerMode_GetStandingsExport + schedule status repair + passing probe fix enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
+        : 'Regular season mode: CareerMode_GetStandingsExport + player/stat discovery foundation enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
