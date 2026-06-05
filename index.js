@@ -5771,7 +5771,7 @@ if (gameSubcommand === 'report') {
                   COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name
            FROM madden_players p
            LEFT JOIN madden_imported_team_stats t
-             ON t.guild_id = p.guild_id
+             ON t.guild_id = p.guild_id::text
             AND t.league_id::text = p.league_id::text
             AND p.team_id IS NOT NULL
             AND t.external_team_id::text = p.team_id
@@ -16089,7 +16089,7 @@ async function sendEaBlazeExportRequest(token, session, exportType, payload = {}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const url = 'https://wal2.tools.gos.bio-iad.ea.com/wal/mca/' + exportType + '/' + session.sessionKey;
-      console.log('[EA EXPORT REQUEST 7J-7H] ' + JSON.stringify({
+      console.log('[EA EXPORT REQUEST 7J-7I] ' + JSON.stringify({
         exportType,
         attempt,
         sessionKeyLength: String(session.sessionKey || '').length,
@@ -16853,14 +16853,15 @@ async function getMaddenPlayerAutocompleteChoices(guildId, leagueId, focusedValu
 
   const query = String(focusedValue || '').trim();
   const like = `%${query}%`;
+  console.log('[MADDEN AUTOCOMPLETE] query=%s guild=%s league=%s', query, guildId, leagueId);
 
   async function runAutocompleteSearch(scopeMode) {
     const scopeWhere = {
-      guildLeague: `p.guild_id = $1 AND p.league_id::text = $2::text`,
-      guildOnly: `p.guild_id = $1`,
-      leagueOnly: `p.league_id::text = $2::text`,
-      fallback: `1 = 1`,
-    }[scopeMode] || `p.guild_id = $1 AND p.league_id::text = $2::text`;
+      guildLeague: `p.guild_id = $1::text AND p.league_id::text = $2::text`,
+      guildOnly: `p.guild_id = $1::text AND ($2::text IS NOT NULL OR TRUE)`,
+      leagueOnly: `($1::text IS NOT NULL OR TRUE) AND p.league_id::text = $2::text`,
+      fallback: `($1::text IS NOT NULL OR TRUE) AND ($2::text IS NOT NULL OR TRUE)`,
+    }[scopeMode] || `p.guild_id = $1::text AND p.league_id::text = $2::text`;
 
     if (!query) {
       const result = await pool.query(
@@ -16868,7 +16869,7 @@ async function getMaddenPlayerAutocompleteChoices(guildId, leagueId, focusedValu
                 COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name
          FROM madden_players p
          LEFT JOIN madden_imported_team_stats t
-           ON t.guild_id = p.guild_id
+           ON t.guild_id = p.guild_id::text
           AND t.league_id::text = p.league_id::text
           AND p.team_id IS NOT NULL
           AND t.external_team_id::text = p.team_id
@@ -16897,7 +16898,7 @@ async function getMaddenPlayerAutocompleteChoices(guildId, leagueId, focusedValu
               END AS match_rank
        FROM madden_players p
        LEFT JOIN madden_imported_team_stats t
-         ON t.guild_id = p.guild_id
+         ON t.guild_id = p.guild_id::text
         AND t.league_id::text = p.league_id::text
         AND p.team_id IS NOT NULL
         AND t.external_team_id::text = p.team_id
@@ -16950,11 +16951,11 @@ async function findMaddenImportedPlayer(guildId, leagueId, name, team = null) {
 
   async function runPlayerSearch(scopeMode) {
     const scopeWhere = {
-      guildLeague: `p.guild_id = $1 AND p.league_id::text = $2::text`,
-      guildOnly: `p.guild_id = $1`,
-      leagueOnly: `p.league_id::text = $2::text`,
-      fallback: `1 = 1`,
-    }[scopeMode] || `p.guild_id = $1 AND p.league_id::text = $2::text`;
+      guildLeague: `p.guild_id = $1::text AND p.league_id::text = $2::text`,
+      guildOnly: `p.guild_id = $1::text AND ($2::text IS NOT NULL OR TRUE)`,
+      leagueOnly: `($1::text IS NOT NULL OR TRUE) AND p.league_id::text = $2::text`,
+      fallback: `($1::text IS NOT NULL OR TRUE) AND ($2::text IS NOT NULL OR TRUE)`,
+    }[scopeMode] || `p.guild_id = $1::text AND p.league_id::text = $2::text`;
 
     const result = await pool.query(
       `SELECT p.*,
@@ -16972,7 +16973,7 @@ async function findMaddenImportedPlayer(guildId, leagueId, name, team = null) {
               END AS match_rank
        FROM madden_players p
        LEFT JOIN madden_imported_team_stats t
-         ON t.guild_id = p.guild_id
+         ON t.guild_id = p.guild_id::text
         AND t.league_id::text = p.league_id::text
         AND p.team_id IS NOT NULL
         AND t.external_team_id::text = p.team_id
@@ -17312,7 +17313,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
     else updated += 1;
   }
 
-  console.log('[MADDEN ROSTER IMPORT 7J-7H] ' + JSON.stringify({ label, rows: rows?.length || 0, inserted, updated }));
+  console.log('[MADDEN ROSTER IMPORT 7J-7I] ' + JSON.stringify({ label, rows: rows?.length || 0, inserted, updated }));
   return { inserted, updated, total: inserted + updated };
 }
 
@@ -17378,7 +17379,7 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
     else updated += 1;
   }
 
-  console.log('[MADDEN WEEKLY STAT IMPORT 7J-7H] ' + JSON.stringify({ label, exportType, statType, weekIndex, displayWeek, rows: rows?.length || 0, inserted, updated }));
+  console.log('[MADDEN WEEKLY STAT IMPORT 7J-7I] ' + JSON.stringify({ label, exportType, statType, weekIndex, displayWeek, rows: rows?.length || 0, inserted, updated }));
   return { inserted, updated, total: inserted + updated };
 }
 
@@ -17431,13 +17432,13 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
     if (statTypeFromMaddenExportType(result.exportType) === 'team') continue;
     const importResult = await upsertMaddenWeeklyStatRows(guild, league, context, result.exportType, result.rows, result.requestPayload, 'player-stat-discovery')
       .catch(error => {
-        console.error('[MADDEN WEEKLY STAT IMPORT 7J-7H] Failed:', error?.message || error);
+        console.error('[MADDEN WEEKLY STAT IMPORT 7J-7I] Failed:', error?.message || error);
         return { inserted: 0, updated: 0, total: 0, error: error?.message || String(error) };
       });
     statImportResults.push({ exportType: result.exportType, weekIndex: result.weekIndex, ...importResult });
   }
 
-  console.log('[PLAYER STAT DISCOVERY 7J-7H] ' + JSON.stringify({
+  console.log('[PLAYER STAT DISCOVERY 7J-7I] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -17573,13 +17574,13 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
   for (const result of successful) {
     const importResult = await upsertMaddenRosterRows(guild, league, context, result.rows, result.requestPayload, 'team-roster-discovery')
       .catch(error => {
-        console.error('[MADDEN ROSTER IMPORT 7J-7H] Failed:', error?.message || error);
+        console.error('[MADDEN ROSTER IMPORT 7J-7I] Failed:', error?.message || error);
         return { inserted: 0, updated: 0, total: 0, error: error?.message || String(error) };
       });
     rosterImportResults.push({ requestPayload: result.requestPayload, ...importResult });
   }
 
-  console.log('[TEAM ROSTER DISCOVERY 7J-7H] ' + JSON.stringify({
+  console.log('[TEAM ROSTER DISCOVERY 7J-7I] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -17688,7 +17689,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
     }
   }
 
-  console.log('[PASSING STATS PROBE 7J-7H] ' + JSON.stringify({
+  console.log('[PASSING STATS PROBE 7J-7I] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -17717,7 +17718,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
         JSON.stringify(best.payload || {}),
       ]
     ).catch(error => {
-      console.error('[PASSING STATS PROBE 7J-7H] Failed to save raw payload:', error?.message || error);
+      console.error('[PASSING STATS PROBE 7J-7I] Failed to save raw payload:', error?.message || error);
     });
   }
 
@@ -17742,7 +17743,7 @@ async function repairMaddenImportedZeroZeroCompletedGames(guild, league, label =
     [guild.id, league.league_id]
   );
 
-  console.log('[ZERO ZERO GAME REPAIR 7J-7H] ' + JSON.stringify({
+  console.log('[ZERO ZERO GAME REPAIR 7J-7I] ' + JSON.stringify({
     label,
     repaired: Number(result.rowCount || 0),
     leagueId: league.league_id,
@@ -17796,14 +17797,14 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
           JSON.stringify(result.payload || {}),
         ]
       ).catch(error => {
-        console.error('[SCHEDULE EXPORT 7J-7H] Failed to save raw payload:', error?.message || error);
+        console.error('[SCHEDULE EXPORT 7J-7I] Failed to save raw payload:', error?.message || error);
       });
     }
 
     imported += await importMaddenGamesFromArray(guild, league, rows, 'Week ' + weekNumber);
   }
 
-  console.log('[SCHEDULE EXPORT 7J-7H] ' + JSON.stringify({
+  console.log('[SCHEDULE EXPORT 7J-7I] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -17899,7 +17900,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const rows = normalizeEaStandingsExportRows(payload);
 
-  console.log('[STANDINGS EXPORT 7J-7H] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT 7J-7I] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -17935,13 +17936,13 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
         JSON.stringify(payload || {}),
       ]
     ).catch(error => {
-      console.error('[STANDINGS EXPORT 7J-7H] Failed to save raw payload:', error?.message || error);
+      console.error('[STANDINGS EXPORT 7J-7I] Failed to save raw payload:', error?.message || error);
     });
   }
 
   const imported = rows.length ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
 
-  console.log('[STANDINGS EXPORT WRITE 7J-7H] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT WRITE 7J-7I] ' + JSON.stringify({
     imported,
     rowCount: rows.length,
     teams: rows.map(row => ({ team: row.teamName, wins: row.wins, losses: row.losses, ties: row.ties, pf: row.pointsFor, pa: row.pointsAgainst })),
@@ -23403,7 +23404,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       console.error('[Madden Sync] Player/stat count failed:', error?.message || error);
       return { players: 0, stats: 0 };
     });
-    console.log('[MADDEN PLAYER IMPORT COUNTS 7J-7H] ' + JSON.stringify(maddenPlayerImportCounts));
+    console.log('[MADDEN PLAYER IMPORT COUNTS 7J-7I] ' + JSON.stringify(maddenPlayerImportCounts));
     await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-export-7j5d').catch(error => {
       console.error('[Madden Sync] DB truth after standings export failed:', error?.message || error);
     });
@@ -23441,7 +23442,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', players: 0. ' +
       (preseasonMode
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: CareerMode_GetStandingsExport + player autocomplete fallback search enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
+        : 'Regular season mode: CareerMode_GetStandingsExport + player autocomplete SQL parameter fix enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
