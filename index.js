@@ -15328,18 +15328,17 @@ function buildMaddenRosterGroupedText(rows) {
   const lines = [];
   for (const [group, players] of [...groups.entries()].sort((a, b) => maddenRosterGroupSortValue(a[0]) - maddenRosterGroupSortValue(b[0]))) {
     lines.push(`**${group}**`);
-    for (const player of players.slice(0, 12)) {
+    for (const player of players.slice(0, 14)) {
       const name = player.player_name || maddenPlayerDisplayName(player);
       const pos = player.position || 'POS';
       const ovr = player.overall !== null && player.overall !== undefined ? player.overall : 'N/A';
-      const dev = maddenPlayerDevBadge(player.dev_trait);
-      lines.push(`${name} — ${pos} • ${ovr} OVR • ${maddenPlayerDevEmojiOnly(player.dev_trait)}`);
+      const ageText = Number(player.age || 0) > 0 && Number(player.age || 0) <= 24 ? ` • Age ${player.age}` : '';
+      lines.push(`${name} — ${pos} • ${ovr} OVR • ${maddenPlayerDevEmojiOnly(player.dev_trait)}${ageText}`);
     }
   }
 
   return lines.join('\n');
 }
-
 
 function buildMaddenImportedPlayersEmbed(league, rows, filters = {}) {
   const NL = String.fromCharCode(10);
@@ -15362,6 +15361,66 @@ function buildMaddenImportedPlayersEmbed(league, rows, filters = {}) {
     .setTimestamp();
 }
 
+
+function summarizeMaddenRosterRows(rows = []) {
+  const total = rows.length;
+  const avgOvr = total ? (rows.reduce((sum, p) => sum + Number(p.overall || 0), 0) / total).toFixed(1) : '0.0';
+  const counts = { xfactor: 0, superstar: 0, star: 0, hidden: 0, normal: 0 };
+
+  for (const player of rows) {
+    const dev = String(player.dev_trait || '').toLowerCase();
+    if (dev.includes('x-factor') || dev.includes('xfactor')) counts.xfactor += 1;
+    else if (dev.includes('superstar')) counts.superstar += 1;
+    else if (dev === 'star' || dev.includes('star')) counts.star += 1;
+    else if (dev.includes('hidden')) counts.hidden += 1;
+    else counts.normal += 1;
+  }
+
+  return { total, avgOvr, counts };
+}
+
+function maddenRosterEmbedColor(rows = []) {
+  const best = Math.max(0, ...rows.map(player => getMaddenDevTraitSortValue(player.dev_trait)));
+  if (best >= 5) return 0xED4245;
+  if (best >= 4) return 0xFEE75C;
+  if (best >= 3) return 0xC0C0C0;
+  if (best >= 2) return 0x5865F2;
+  return 0xCD7F32;
+}
+
+function buildMaddenRosterSummaryText(rows = []) {
+  const summary = summarizeMaddenRosterRows(rows);
+  return [
+    `**Players:** ${summary.total}`,
+    `**Avg OVR:** ${summary.avgOvr}`,
+    `${DEV_EMOJIS.xfactor} X-Factor: ${summary.counts.xfactor}`,
+    `${DEV_EMOJIS.superstar} Superstar: ${summary.counts.superstar}`,
+    `${DEV_EMOJIS.star} Star: ${summary.counts.star}`,
+    `${DEV_EMOJIS.hidden} Hidden: ${summary.counts.hidden}`,
+    `${DEV_EMOJIS.normal} Normal: ${summary.counts.normal}`,
+  ].join('\n');
+}
+
+function buildMaddenCornerstonesText(rows = []) {
+  const featured = [...rows]
+    .sort((a, b) =>
+      getMaddenDevTraitSortValue(b.dev_trait) - getMaddenDevTraitSortValue(a.dev_trait) ||
+      Number(b.overall || 0) - Number(a.overall || 0) ||
+      String(a.player_name || a.full_name || '').localeCompare(String(b.player_name || b.full_name || ''))
+    )
+    .slice(0, 5);
+
+  if (!featured.length) return 'No cornerstone players found.';
+
+  return featured.map((player, index) => {
+    const name = player.player_name || maddenPlayerDisplayName(player);
+    const pos = player.position || 'POS';
+    const ovr = player.overall !== null && player.overall !== undefined ? player.overall : 'N/A';
+    const age = player.age ? ` • Age ${player.age}` : '';
+    return `${index + 1}. ${name} — ${pos} • ${ovr} OVR • ${maddenPlayerDevEmojiOnly(player.dev_trait)}${age}`;
+  }).join('\n');
+}
+
 function buildMaddenRosterEmbed(league, teamName, rows, filters = {}) {
   const NL = String.fromCharCode(10);
   const teamAbbrev = getMaddenTeamAbbrev(teamName);
@@ -15370,17 +15429,22 @@ function buildMaddenRosterEmbed(league, teamName, rows, filters = {}) {
     filters.dev ? 'Dev: ' + filters.dev : null,
   ].filter(Boolean).join(' • ');
 
-  const body = buildMaddenRosterGroupedText(rows).slice(0, 3900);
+  const body = buildMaddenRosterGroupedText(rows).slice(0, 3000);
+  const summaryText = buildMaddenRosterSummaryText(rows);
+  const cornerstonesText = buildMaddenCornerstonesText(rows);
 
   return new EmbedBuilder()
     .setTitle(`Madden Roster • ${teamName}${teamAbbrev ? ` (${teamAbbrev})` : ''}`)
-    .setDescription(`${league.league_name || 'Madden League'}${filterText ? NL + '_' + filterText + '_' : ''}${NL}${NL}${body || 'No imported players found for this roster.'}`)
-    .setColor(0xFEE75C)
+    .setDescription(`${league.league_name || 'Madden League'}${filterText ? NL + '_' + filterText + '_' : ''}`)
+    .setColor(maddenRosterEmbedColor(rows))
+    .addFields(
+      { name: 'Roster Summary', value: summaryText, inline: true },
+      { name: 'Franchise Cornerstones', value: cornerstonesText.slice(0, 1024), inline: false },
+      { name: 'Full Roster', value: body || 'No imported players found for this roster.', inline: false }
+    )
     .setFooter({ text: `GG Sports • Madden Roster • ${rows.length} player(s)` })
     .setTimestamp();
 }
-
-
 
 function maddenTeamRecordText(teamRow) {
   const wins = Number(teamRow?.wins || 0);
@@ -17177,7 +17241,7 @@ async function sendEaBlazeExportRequest(token, session, exportType, payload = {}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const url = 'https://wal2.tools.gos.bio-iad.ea.com/wal/mca/' + exportType + '/' + session.sessionKey;
-      console.log('[EA EXPORT REQUEST 7J-7ZM] ' + JSON.stringify({
+      console.log('[EA EXPORT REQUEST 7J-7ZN] ' + JSON.stringify({
         exportType,
         attempt,
         sessionKeyLength: String(session.sessionKey || '').length,
@@ -18758,7 +18822,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
     else updated += 1;
   }
 
-  console.log('[MADDEN ROSTER IMPORT 7J-7ZM] ' + JSON.stringify({ label, rows: rows?.length || 0, inserted, updated }));
+  console.log('[MADDEN ROSTER IMPORT 7J-7ZN] ' + JSON.stringify({ label, rows: rows?.length || 0, inserted, updated }));
   return { inserted, updated, total: inserted + updated };
 }
 
@@ -18824,7 +18888,7 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
     else updated += 1;
   }
 
-  console.log('[MADDEN WEEKLY STAT IMPORT 7J-7ZM] ' + JSON.stringify({ label, exportType, statType, weekIndex, displayWeek, rows: rows?.length || 0, inserted, updated }));
+  console.log('[MADDEN WEEKLY STAT IMPORT 7J-7ZN] ' + JSON.stringify({ label, exportType, statType, weekIndex, displayWeek, rows: rows?.length || 0, inserted, updated }));
   return { inserted, updated, total: inserted + updated };
 }
 
@@ -18877,13 +18941,13 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
     if (statTypeFromMaddenExportType(result.exportType) === 'team') continue;
     const importResult = await upsertMaddenWeeklyStatRows(guild, league, context, result.exportType, result.rows, result.requestPayload, 'player-stat-discovery')
       .catch(error => {
-        console.error('[MADDEN WEEKLY STAT IMPORT 7J-7ZM] Failed:', error?.message || error);
+        console.error('[MADDEN WEEKLY STAT IMPORT 7J-7ZN] Failed:', error?.message || error);
         return { inserted: 0, updated: 0, total: 0, error: error?.message || String(error) };
       });
     statImportResults.push({ exportType: result.exportType, weekIndex: result.weekIndex, ...importResult });
   }
 
-  console.log('[PLAYER STAT DISCOVERY 7J-7ZM] ' + JSON.stringify({
+  console.log('[PLAYER STAT DISCOVERY 7J-7ZN] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -19063,7 +19127,7 @@ async function buildMaddenRosterImportHints(context, guild, league) {
       offset += 1;
     }
   } catch (error) {
-    console.error('[MADDEN ROSTER HINTS 7J-7ZM] DB seed failed:', error?.message || error);
+    console.error('[MADDEN ROSTER HINTS 7J-7ZN] DB seed failed:', error?.message || error);
   }
 
   // Add a generic 0-31 listIndex pass with known team ids when available.
@@ -19182,7 +19246,7 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
   for (const result of successful) {
     const importResult = await upsertMaddenRosterRows(guild, league, context, result.rows, result.requestPayload, 'team-roster-discovery')
       .catch(error => {
-        console.error('[MADDEN ROSTER IMPORT 7J-7ZM] Failed:', error?.message || error);
+        console.error('[MADDEN ROSTER IMPORT 7J-7ZN] Failed:', error?.message || error);
         return { inserted: 0, updated: 0, total: 0, error: error?.message || String(error) };
       });
     rosterImportResults.push({ requestPayload: result.requestPayload, ...importResult });
@@ -19195,7 +19259,7 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
     .filter(item => item.requestPayload?.returnFreeAgents === true)
     .reduce((sum, item) => sum + Number(item.total || 0), 0);
 
-  console.log('[TEAM ROSTER DISCOVERY 7J-7ZM] ' + JSON.stringify({
+  console.log('[TEAM ROSTER DISCOVERY 7J-7ZN] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -19234,7 +19298,7 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
           JSON.stringify(result.payload || {}),
         ]
       ).catch(error => {
-        console.error('[TEAM ROSTER DISCOVERY 7J-7ZM] Failed to save raw payload:', error?.message || error);
+        console.error('[TEAM ROSTER DISCOVERY 7J-7ZN] Failed to save raw payload:', error?.message || error);
       });
     }
   }
@@ -19308,7 +19372,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
     }
   }
 
-  console.log('[PASSING STATS PROBE 7J-7ZM] ' + JSON.stringify({
+  console.log('[PASSING STATS PROBE 7J-7ZN] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -19337,7 +19401,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
         JSON.stringify(best.payload || {}),
       ]
     ).catch(error => {
-      console.error('[PASSING STATS PROBE 7J-7ZM] Failed to save raw payload:', error?.message || error);
+      console.error('[PASSING STATS PROBE 7J-7ZN] Failed to save raw payload:', error?.message || error);
     });
   }
 
@@ -19362,7 +19426,7 @@ async function repairMaddenImportedZeroZeroCompletedGames(guild, league, label =
     [guild.id, league.league_id]
   );
 
-  console.log('[ZERO ZERO GAME REPAIR 7J-7ZM] ' + JSON.stringify({
+  console.log('[ZERO ZERO GAME REPAIR 7J-7ZN] ' + JSON.stringify({
     label,
     repaired: Number(result.rowCount || 0),
     leagueId: league.league_id,
@@ -19416,14 +19480,14 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
           JSON.stringify(result.payload || {}),
         ]
       ).catch(error => {
-        console.error('[SCHEDULE EXPORT 7J-7ZM] Failed to save raw payload:', error?.message || error);
+        console.error('[SCHEDULE EXPORT 7J-7ZN] Failed to save raw payload:', error?.message || error);
       });
     }
 
     imported += await importMaddenGamesFromArray(guild, league, rows, 'Week ' + weekNumber);
   }
 
-  console.log('[SCHEDULE EXPORT 7J-7ZM] ' + JSON.stringify({
+  console.log('[SCHEDULE EXPORT 7J-7ZN] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -19519,7 +19583,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const rows = normalizeEaStandingsExportRows(payload);
 
-  console.log('[STANDINGS EXPORT 7J-7ZM] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT 7J-7ZN] ' + JSON.stringify({
     label,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
@@ -19555,13 +19619,13 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
         JSON.stringify(payload || {}),
       ]
     ).catch(error => {
-      console.error('[STANDINGS EXPORT 7J-7ZM] Failed to save raw payload:', error?.message || error);
+      console.error('[STANDINGS EXPORT 7J-7ZN] Failed to save raw payload:', error?.message || error);
     });
   }
 
   const imported = rows.length ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
 
-  console.log('[STANDINGS EXPORT WRITE 7J-7ZM] ' + JSON.stringify({
+  console.log('[STANDINGS EXPORT WRITE 7J-7ZN] ' + JSON.stringify({
     imported,
     rowCount: rows.length,
     teams: rows.map(row => ({ team: row.teamName, wins: row.wins, losses: row.losses, ties: row.ties, pf: row.pointsFor, pa: row.pointsAgainst })),
@@ -25023,7 +25087,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       console.error('[Madden Sync] Player/stat count failed:', error?.message || error);
       return { players: 0, stats: 0 };
     });
-    console.log('[MADDEN PLAYER IMPORT COUNTS 7J-7ZM] ' + JSON.stringify(maddenPlayerImportCounts));
+    console.log('[MADDEN PLAYER IMPORT COUNTS 7J-7ZN] ' + JSON.stringify(maddenPlayerImportCounts));
     await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-export-7j5d').catch(error => {
       console.error('[Madden Sync] DB truth after standings export failed:', error?.message || error);
     });
@@ -25061,7 +25125,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', players: ' + Number(maddenPlayerImportCounts?.players || 0) + '. ' +
       (preseasonMode
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: CareerMode_GetStandingsExport + madden roster command enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
+        : 'Regular season mode: CareerMode_GetStandingsExport + madden roster scouting polish enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
