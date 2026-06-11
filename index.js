@@ -423,6 +423,22 @@ async function initDatabase() {
     )
   `);
 
+  // 7J-7ZQ-R: Madden Power Rankings storage. Keeps previous_rank so movement can be shown as ▲, ▼, or NEW.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_power_rankings (
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      team_name TEXT NOT NULL,
+      rank INTEGER NOT NULL,
+      previous_rank INTEGER,
+      power_score NUMERIC NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (league_id, team_name)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_power_rankings ADD COLUMN IF NOT EXISTS previous_rank INTEGER`);
+  await pool.query(`ALTER TABLE madden_power_rankings ADD COLUMN IF NOT EXISTS power_score NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_power_rankings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+
 
 
 
@@ -1235,6 +1251,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('powerrankings').setDescription('View Madden power rankings with movement').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       
 
       
@@ -1306,22 +1323,6 @@ function buildCommands() {
 ,
 
     new SlashCommandBuilder()
-      .setName('maddenintel')
-      .setDescription('Madden franchise intelligence commands')
-      .addSubcommand(sc => sc.setName('value').setDescription('View Madden player value using the GG Sports value engine')
-        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
-        .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false)))
-      .addSubcommand(sc => sc.setName('matchup').setDescription('Compare two teams for a matchup preview')
-        .addStringOption(o => o.setName('team1').setDescription('First team').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('team2').setDescription('Second team').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('news').setDescription('View Madden league news feed')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('awards').setDescription('View Madden award watch powered by imported stats')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
-
-    new SlashCommandBuilder()
       .setName('setup')
       .setDescription('Interactive GG Sports setup dashboard')
       .addSubcommand(sc => sc.setName('panel').setDescription('Open the interactive setup dashboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
@@ -1379,7 +1380,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('user').setDescription('Show a user profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('stats').setDescription('Show league stats').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('team').setDescription('Show a team profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
+      .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('awards').setDescription('Show award history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
       .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('franchise').setDescription('Show the full Franchise Hub profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('activity').setDescription('Show profile activity snapshot').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
@@ -1514,7 +1516,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
-      .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('awards').setDescription('Open a customizable league awards form').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
 
     new SlashCommandBuilder()
@@ -5569,7 +5572,7 @@ if (gameSubcommand === 'report') {
     
     
     
-    if (interaction.commandName === 'madden' || interaction.commandName === 'maddenintel') {
+    if (interaction.commandName === 'madden') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
 
@@ -5730,62 +5733,7 @@ if (gameSubcommand === 'report') {
 
 
 
-      if (maddenSubcommand === 'value') {
-        const leagueName = interaction.options.getString('league');
-        const playerName = interaction.options.getString('player');
-        const teamFilter = interaction.options.getString('team');
-        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
-          return;
-        }
-
-        const player = await findMaddenImportedPlayer(interaction.guild.id, activeLeague.league_id, playerName, teamFilter)
-          || await findMaddenPlayerFromWeeklyStats(interaction.guild.id, activeLeague.league_id, playerName, teamFilter);
-
-        if (!player) {
-          await interaction.reply({ content: `No imported Madden player found for "${playerName}". Try autocomplete or run /madden sync first.`, ephemeral: true });
-          return;
-        }
-
-        await interaction.reply({ embeds: [buildMaddenPlayerValueEmbed(activeLeague, player)], ephemeral: true });
-        return;
-      }
-
-      if (maddenSubcommand === 'matchup') {
-        const leagueName = interaction.options.getString('league');
-        const homeName = interaction.options.getString('home');
-        const awayName = interaction.options.getString('away');
-        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
-          return;
-        }
-
-        const [home, away] = await Promise.all([
-          getMaddenTeamCompareRow(interaction.guild.id, activeLeague.league_id, homeName),
-          getMaddenTeamCompareRow(interaction.guild.id, activeLeague.league_id, awayName),
-        ]);
-
-        if (!home || !away) {
-          await interaction.reply({ content: 'Could not find one or both Madden teams. Try autocomplete or run `/madden sync` first.', ephemeral: true });
-          return;
-        }
-
-        const [rosterHome, rosterAway, leadersHome, leadersAway] = await Promise.all([
-          getMaddenRosterRowsForCompare(interaction.guild.id, activeLeague.league_id, home.team_name),
-          getMaddenRosterRowsForCompare(interaction.guild.id, activeLeague.league_id, away.team_name),
-          getMaddenTeamLeaders(interaction.guild.id, activeLeague.league_id, home.team_name),
-          getMaddenTeamLeaders(interaction.guild.id, activeLeague.league_id, away.team_name),
-        ]);
-
-        await interaction.reply({ embeds: [buildMaddenMatchupPreviewEmbed(activeLeague, home, away, rosterHome, rosterAway, leadersHome, leadersAway)], ephemeral: true });
-        return;
-      }
-
-      if (maddenSubcommand === 'news') {
+      if (maddenSubcommand === 'powerrankings') {
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
@@ -5794,29 +5742,8 @@ if (gameSubcommand === 'report') {
           return;
         }
 
-        const recentGamesResult = await pool.query(
-          `SELECT * FROM madden_imported_games
-           WHERE guild_id = $1 AND league_id = $2
-           ORDER BY imported_at DESC
-           LIMIT 8`,
-          [interaction.guild.id, activeLeague.league_id]
-        );
-        const topValuePlayers = await getMaddenTopValuePlayers(interaction.guild.id, activeLeague.league_id, 5);
-        await interaction.reply({ embeds: [buildMaddenNewsEmbed(activeLeague, recentGamesResult.rows, topValuePlayers)], ephemeral: true });
-        return;
-      }
-
-      if (maddenSubcommand === 'awards') {
-        const leagueName = interaction.options.getString('league');
-        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
-          return;
-        }
-
-        const awards = await getMaddenAwardWatch(interaction.guild.id, activeLeague.league_id);
-        await interaction.reply({ embeds: [buildMaddenAwardsWatchEmbed(activeLeague, awards)], ephemeral: true });
+        const rankings = await recalculateMaddenPowerRankings(interaction.guild.id, activeLeague.league_id);
+        await interaction.reply({ embeds: [buildMaddenPowerRankingsEmbed(activeLeague, rankings)] });
         return;
       }
 
@@ -14981,6 +14908,120 @@ function formatMaddenStandingLine(team, index) {
   return `**${seed}${team.team_name}** — ${formatMaddenStandingsRecord(team)} • PF ${pf} • PA ${pa} • DIFF ${diff >= 0 ? '+' : ''}${diff}${rank}`;
 }
 
+
+function formatMaddenPowerMovement(row) {
+  const currentRank = Number(row.rank || 0);
+  const previousRank = row.previous_rank == null ? null : Number(row.previous_rank || 0);
+  if (!previousRank || !currentRank) return 'NEW';
+  const movement = previousRank - currentRank;
+  if (movement > 0) return '▲ +' + movement;
+  if (movement < 0) return '▼ ' + movement;
+  return '—';
+}
+
+function formatMaddenPowerScore(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return '0';
+  return n.toFixed(1).replace(/\.0$/, '');
+}
+
+async function recalculateMaddenPowerRankings(guildId, leagueId) {
+  const previousResult = await pool.query(
+    `SELECT team_name, rank
+     FROM madden_power_rankings
+     WHERE league_id::text = $1::text`,
+    [leagueId]
+  );
+  const previousRanks = new Map(previousResult.rows.map(row => [String(row.team_name || '').toLowerCase(), Number(row.rank || 0)]));
+
+  const result = await pool.query(
+    `WITH base AS (
+       SELECT
+         team_name,
+         wins,
+         losses,
+         ties,
+         points_for,
+         points_against,
+         GREATEST((wins + losses + ties), 1) AS games_played
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+     ), ranked AS (
+       SELECT
+         *,
+         (points_for - points_against) AS point_diff,
+         DENSE_RANK() OVER (ORDER BY (points_for::numeric / games_played::numeric) DESC) AS offense_rank,
+         DENSE_RANK() OVER (ORDER BY (points_against::numeric / games_played::numeric) ASC) AS defense_rank
+       FROM base
+     ), scored AS (
+       SELECT
+         *,
+         ((wins * 100)
+          + ((points_for - points_against) * 3)
+          + ((33 - offense_rank) * 5)
+          + ((33 - defense_rank) * 5))::numeric AS power_score
+       FROM ranked
+     )
+     SELECT *
+     FROM scored
+     ORDER BY power_score DESC, wins DESC, losses ASC, point_diff DESC, points_for DESC, team_name ASC`,
+    [guildId, leagueId]
+  );
+
+  const rankings = result.rows.map((row, index) => ({
+    ...row,
+    rank: index + 1,
+    previous_rank: previousRanks.get(String(row.team_name || '').toLowerCase()) || null,
+  }));
+
+  for (const row of rankings) {
+    await pool.query(
+      `INSERT INTO madden_power_rankings (league_id, team_name, rank, previous_rank, power_score, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (league_id, team_name)
+       DO UPDATE SET
+         rank = EXCLUDED.rank,
+         previous_rank = EXCLUDED.previous_rank,
+         power_score = EXCLUDED.power_score,
+         updated_at = NOW()`,
+      [leagueId, row.team_name, row.rank, row.previous_rank, row.power_score]
+    );
+  }
+
+  return rankings;
+}
+
+function buildMaddenPowerRankingsEmbed(league, rankings) {
+  const NL = String.fromCharCode(10);
+
+  if (!rankings?.length) {
+    return new EmbedBuilder()
+      .setTitle('🏆 Madden Power Rankings • ' + league.league_name)
+      .setColor(0xFEE75C)
+      .setDescription('No imported Madden team stats found yet. Run `/madden sync` first, then try `/madden powerrankings`.')
+      .setFooter({ text: 'GG Sports • 7J-7ZQ-R Power Rankings' })
+      .setTimestamp();
+  }
+
+  const lines = rankings.map(row => {
+    const wins = Number(row.wins || 0);
+    const losses = Number(row.losses || 0);
+    const ties = Number(row.ties || 0);
+    const record = ties ? `${wins}-${losses}-${ties}` : `${wins}-${losses}`;
+    const diff = Number(row.point_diff || 0);
+    const diffText = diff >= 0 ? '+' + diff : String(diff);
+    return `**${row.rank}. ${row.team_name}** (${record}) — ${formatMaddenPowerMovement(row)}\nScore ${formatMaddenPowerScore(row.power_score)} • DIFF ${diffText} • OFF #${row.offense_rank || 'N/A'} • DEF #${row.defense_rank || 'N/A'}`;
+  });
+
+  return new EmbedBuilder()
+    .setTitle('🏆 Madden Power Rankings • ' + league.league_name)
+    .setColor(0xFEE75C)
+    .setDescription(lines.join(NL + NL).slice(0, 4096))
+    .setFooter({ text: 'GG Sports • 7J-7ZQ-R Power Rankings' })
+    .setTimestamp();
+}
+
 function buildMaddenImportedStandingsEmbed(league, rows, scope = 'division') {
   const NL = String.fromCharCode(10);
   const cleanRows = rows || [];
@@ -15636,218 +15677,6 @@ function splitMaddenEmbedFieldText(text, maxLength = 1000) {
   return chunks.length ? chunks : ['No data found.'];
 }
 
-
-
-
-// 7J-8A: Madden Franchise Intelligence + Player Value Engine
-const MADDEN_VALUE_OVERALL_TABLE = {
-  67: 70, 68: 77.5, 69: 84.8, 70: 93.2, 71: 102.9, 72: 112.8, 73: 123, 74: 133.4,
-  75: 144.3, 76: 155.5, 77: 167.3, 78: 179.4, 79: 192.8, 80: 207.2, 81: 224.1,
-  82: 246.6, 83: 270, 84: 300.4, 85: 335.4, 86: 376.6, 87: 419.3, 88: 463.9,
-  89: 522.7, 90: 596.7, 91: 664.1, 92: 735.2, 93: 871.3, 94: 989.2, 95: 1118.4,
-  96: 1316.3, 97: 1505.7, 98: 1790.7, 99: 2293.6,
-};
-const MADDEN_VALUE_POSITION_TABLE = {
-  C: 0.13, K: -0.85, P: -0.9, CB: 0.29, DT: 0.22, FB: -0.65, FS: 0.19, HB: 0.25,
-  RB: 0.25, LG: 0.1, LT: 0.17, QB: 1.6, RG: 0.1, RT: 0.1, SS: 0.21, TE: 0.21,
-  WR: 0.27, SAM: 0.22, MIKE: 0.29, WILL: 0.27, LEDGE: 0.27, REDGE: 0.29,
-  LE: 0.27, RE: 0.29, MLB: 0.29, LOLB: 0.22, ROLB: 0.27, EDGE: 0.28,
-};
-const MADDEN_VALUE_AGE_TABLE = {
-  20: 4.2, 21: 3.7, 22: 3.3, 23: 2.4, 24: 1.5, 25: 0.6, 26: 0.3, 27: 0.2,
-  28: 0.1, 29: 0, 30: -0.1, 31: -0.25, 32: -0.5, 33: -0.7, 34: -0.8, 35: -1,
-  36: -1.4, 37: -1.5, 38: -1.55, 39: -1.6, 40: -1.63, 41: -1.64, 42: -1.65,
-  43: -1.66, 44: -1.67, 45: -1.68, 46: -1.69, 47: -1.7, 48: -1.71,
-};
-const MADDEN_VALUE_YEARS_TABLE = { 0: -0.2, 1: -0.1, 2: 0, 3: 0.1, 4: 0.15, 5: 0.2, 6: 0.25, 7: 0.3, 8: 0.35 };
-const MADDEN_VALUE_DEV_TABLE = { normal: -0.2, star: 0.05, superstar: 0.3, xfactor: 0.6, 'x-factor': 0.6, hidden: -0.2 };
-
-function lookupMaddenOverallValue(overall) {
-  const rating = Math.max(0, Math.min(99, Math.round(Number(overall || 0))));
-  if (MADDEN_VALUE_OVERALL_TABLE[rating] != null) return MADDEN_VALUE_OVERALL_TABLE[rating];
-  if (rating < 67) return Math.max(1, rating);
-  return rating;
-}
-
-function lookupMaddenAgeValue(age) {
-  const value = Math.round(Number(age || 0));
-  if (MADDEN_VALUE_AGE_TABLE[value] != null) return MADDEN_VALUE_AGE_TABLE[value];
-  if (value && value < 20) return MADDEN_VALUE_AGE_TABLE[20];
-  if (value && value > 48) return MADDEN_VALUE_AGE_TABLE[48];
-  return 0;
-}
-
-function lookupMaddenCapHitValue(capHit) {
-  const raw = Number(capHit || 0);
-  const millions = raw > 1000000 ? raw / 1000000 : raw;
-  if (!millions || millions < 1) return 0.25;
-  if (millions > 15) return -0.3;
-  if (millions >= 1 && millions < 2) return 0.2;
-  if (millions >= 2 && millions < 4) return 0.1;
-  if (millions >= 4 && millions < 7) return 0;
-  if (millions >= 7 && millions < 10) return -0.1;
-  if (millions >= 10 && millions <= 15) return -0.2;
-  return 0;
-}
-
-function lookupMaddenYearsLeftValue(yearsLeft) {
-  const value = Math.max(0, Math.min(8, Math.round(Number(yearsLeft || 0))));
-  return MADDEN_VALUE_YEARS_TABLE[value] ?? 0;
-}
-
-function lookupMaddenDevValue(devTrait) {
-  const key = String(devTrait || 'normal').toLowerCase().replace(/\s+/g, '').replace('x-factor', 'xfactor');
-  if (key.includes('xfactor')) return 0.6;
-  if (key.includes('superstar')) return 0.3;
-  if (key === 'star') return 0.05;
-  if (key.includes('hidden')) return -0.2;
-  if (key.includes('normal')) return -0.2;
-  return -0.2;
-}
-
-function lookupMaddenSpeedValue(speed) {
-  // 7J-8A placeholder: formula supports SPEED, but no default speed table was provided yet.
-  return 0;
-}
-
-function calculateMaddenPlayerValue(player) {
-  const overall = parseNumberOrNull(player?.overall) ?? 0;
-  const position = String(player?.position || '').toUpperCase();
-  const age = parseNumberOrNull(player?.age) ?? null;
-  const speed = parseNumberOrNull(player?.speed ?? player?.raw_payload?.speed ?? player?.raw_payload?.spd) ?? null;
-  const yearsLeft = parseNumberOrNull(player?.years_left ?? player?.raw_payload?.yearsLeft ?? player?.raw_payload?.contractYearsLeft) ?? 0;
-  const capHit = parseNumberOrNull(player?.cap_hit ?? player?.raw_payload?.capHit ?? player?.raw_payload?.salaryCapHit ?? player?.raw_payload?.salary) ?? 0;
-  const baseOverallValue = lookupMaddenOverallValue(overall);
-  const modifiers = {
-    position: MADDEN_VALUE_POSITION_TABLE[position] ?? 0,
-    age: lookupMaddenAgeValue(age),
-    devTrait: lookupMaddenDevValue(player?.dev_trait),
-    speed: lookupMaddenSpeedValue(speed),
-    yearsLeft: lookupMaddenYearsLeftValue(yearsLeft),
-    capHit: lookupMaddenCapHitValue(capHit),
-  };
-  const multiplier = 1 + modifiers.position + modifiers.age + modifiers.devTrait + modifiers.speed + modifiers.yearsLeft + modifiers.capHit;
-  const value = Math.max(0, baseOverallValue * multiplier);
-  return { value, baseOverallValue, multiplier, modifiers, overall, position, age, speed, yearsLeft, capHit };
-}
-
-function formatMaddenValueNumber(value) {
-  const n = Number(value || 0);
-  return n >= 100 ? n.toFixed(1) : n.toFixed(2);
-}
-
-function buildMaddenPlayerValueEmbed(league, player) {
-  const detail = calculateMaddenPlayerValue(player);
-  const playerName = player?.player_name || player?.full_name || [player?.first_name, player?.last_name].filter(Boolean).join(' ') || 'Unknown Player';
-  return new EmbedBuilder()
-    .setTitle('Madden Player Value • ' + playerName)
-    .setColor(0xF1C40F)
-    .setDescription('VALUE = OVERALL × (1.0 + POSITION + AGE + DEV TRAIT + SPEED + YEARS LEFT + CAP HIT)')
-    .addFields(
-      { name: 'Final Value', value: '**' + formatMaddenValueNumber(detail.value) + '**', inline: true },
-      { name: 'Base Overall Value', value: formatMaddenValueNumber(detail.baseOverallValue), inline: true },
-      { name: 'Multiplier', value: formatMaddenValueNumber(detail.multiplier) + 'x', inline: true },
-      { name: 'Player', value: `${detail.position || 'UNK'} • OVR ${detail.overall || 'N/A'} • Age ${detail.age ?? 'N/A'} • ${maddenPlayerDevBadge(player?.dev_trait)}`, inline: false },
-      { name: 'Modifiers', value:
-          'Position: `' + detail.modifiers.position + '`\n' +
-          'Age: `' + detail.modifiers.age + '`\n' +
-          'Dev Trait: `' + detail.modifiers.devTrait + '`\n' +
-          'Speed: `' + detail.modifiers.speed + '`\n' +
-          'Years Left: `' + detail.modifiers.yearsLeft + '`\n' +
-          'Cap Hit: `' + detail.modifiers.capHit + '`', inline: true },
-      { name: 'Contract Inputs', value: 'Cap Hit: `' + (detail.capHit || 'N/A') + '`\nYears Left: `' + (detail.yearsLeft ?? 'N/A') + '`\nSpeed: `' + (detail.speed ?? 'N/A') + '`', inline: true }
-    )
-    .setFooter({ text: 'GG Sports • 7J-8A Value Engine • ' + (league?.league_name || 'Madden') })
-    .setTimestamp();
-}
-
-function buildMaddenMatchupPreviewEmbed(league, home, away, rosterHome, rosterAway, leadersHome, leadersAway) {
-  const homeValue = rosterHome.reduce((sum, p) => sum + calculateMaddenPlayerValue(p).value, 0);
-  const awayValue = rosterAway.reduce((sum, p) => sum + calculateMaddenPlayerValue(p).value, 0);
-  const homeDiff = Number(home.points_for || 0) - Number(home.points_against || 0);
-  const awayDiff = Number(away.points_for || 0) - Number(away.points_against || 0);
-  const projectedHome = 21 + Math.round((homeDiff - awayDiff) / 16) + Math.round((homeValue - awayValue) / 900);
-  const projectedAway = 21 + Math.round((awayDiff - homeDiff) / 16) + Math.round((awayValue - homeValue) / 900);
-  const favorite = projectedHome === projectedAway ? 'Even matchup' : (projectedHome > projectedAway ? home.team_name : away.team_name);
-  return new EmbedBuilder()
-    .setTitle('Madden Matchup Preview')
-    .setColor(0x5865F2)
-    .setDescription('**' + home.team_name + '** vs **' + away.team_name + '**')
-    .addFields(
-      { name: home.team_name, value: `Record: ${formatMaddenStandingsRecord(home)}\nPoint Diff: ${homeDiff}\nRoster Value: ${formatMaddenValueNumber(homeValue)}`, inline: true },
-      { name: away.team_name, value: `Record: ${formatMaddenStandingsRecord(away)}\nPoint Diff: ${awayDiff}\nRoster Value: ${formatMaddenValueNumber(awayValue)}`, inline: true },
-      { name: 'Projection', value: `${home.team_name} ${Math.max(0, projectedHome)} - ${away.team_name} ${Math.max(0, projectedAway)}\nFavorite: **${favorite}**`, inline: false },
-      { name: 'Key Leaders', value: `${home.team_name}: ${formatMaddenTeamLeaderLine(leadersHome)}\n${away.team_name}: ${formatMaddenTeamLeaderLine(leadersAway)}`, inline: false }
-    )
-    .setFooter({ text: 'GG Sports • 7J-8A Matchup • ' + (league?.league_name || 'Madden') })
-    .setTimestamp();
-}
-
-function formatMaddenTeamLeaderLine(leaders) {
-  if (!leaders) return 'No imported stat leaders yet.';
-  const parts = [];
-  if (leaders.passing?.name) parts.push('Pass: ' + leaders.passing.name);
-  if (leaders.rushing?.name) parts.push('Rush: ' + leaders.rushing.name);
-  if (leaders.receiving?.name) parts.push('Rec: ' + leaders.receiving.name);
-  return parts.length ? parts.join(' • ') : 'No imported stat leaders yet.';
-}
-
-async function getMaddenTopValuePlayers(guildId, leagueId, limit = 10) {
-  const result = await pool.query(
-    `SELECT *, COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name) AS player_name
-     FROM madden_players
-     WHERE guild_id = $1 AND league_id = $2 AND overall IS NOT NULL
-     ORDER BY overall DESC NULLS LAST, age ASC NULLS LAST
-     LIMIT 150`,
-    [guildId, leagueId]
-  );
-  return result.rows
-    .map(row => ({ ...row, value_detail: calculateMaddenPlayerValue(row) }))
-    .sort((a, b) => b.value_detail.value - a.value_detail.value)
-    .slice(0, limit);
-}
-
-function buildMaddenNewsEmbed(league, recentGames, topValuePlayers) {
-  const gameLines = (recentGames || []).slice(0, 5).map(g => `${g.week_label || 'Week TBD'}: ${g.away_team} ${g.away_score ?? '-'} @ ${g.home_team} ${g.home_score ?? '-'}`);
-  const valueLines = (topValuePlayers || []).slice(0, 5).map((p, i) => `${i + 1}. ${p.player_name || p.full_name} (${p.position || 'UNK'}, ${p.team_name || 'FA'}) — ${formatMaddenValueNumber(p.value_detail.value)}`);
-  return new EmbedBuilder()
-    .setTitle('Madden League News')
-    .setColor(0x2ECC71)
-    .addFields(
-      { name: 'Recent Results', value: gameLines.length ? gameLines.join('\n') : 'No imported games yet.', inline: false },
-      { name: 'Top Player Values', value: valueLines.length ? valueLines.join('\n') : 'No imported players yet.', inline: false }
-    )
-    .setFooter({ text: 'GG Sports • 7J-8A News • ' + (league?.league_name || 'Madden') })
-    .setTimestamp();
-}
-
-function buildMaddenAwardsWatchEmbed(league, awards) {
-  const lines = awards.map(a => `**${a.label}:** ${a.name || 'No data'}${a.value != null ? ' — ' + a.value : ''}${a.team ? ' (' + a.team + ')' : ''}`);
-  return new EmbedBuilder()
-    .setTitle('Madden Awards Watch')
-    .setColor(0xE67E22)
-    .setDescription(lines.length ? lines.join('\n') : 'No imported stat data yet.')
-    .setFooter({ text: 'GG Sports • 7J-8A Awards • ' + (league?.league_name || 'Madden') })
-    .setTimestamp();
-}
-
-async function getMaddenAwardWatch(guildId, leagueId) {
-  const topValue = await getMaddenTopValuePlayers(guildId, leagueId, 1);
-  const passing = await getMaddenLeagueLeaders(guildId, leagueId, 'passing', null, 1).catch(() => ({ rows: [] }));
-  const rushing = await getMaddenLeagueLeaders(guildId, leagueId, 'rushing', null, 1).catch(() => ({ rows: [] }));
-  const receiving = await getMaddenLeagueLeaders(guildId, leagueId, 'receiving', null, 1).catch(() => ({ rows: [] }));
-  const sacks = await getMaddenLeagueLeaders(guildId, leagueId, 'sacks', null, 1).catch(() => ({ rows: [] }));
-  const interceptions = await getMaddenLeagueLeaders(guildId, leagueId, 'interceptions', null, 1).catch(() => ({ rows: [] }));
-  const pick = rows => rows?.[0] || null;
-  return [
-    { label: 'MVP / Most Valuable Asset', name: topValue[0]?.player_name || topValue[0]?.full_name, team: topValue[0]?.team_name, value: topValue[0] ? formatMaddenValueNumber(topValue[0].value_detail.value) : null },
-    { label: 'QB of the Year', name: pick(passing.rows)?.player_name || pick(passing.rows)?.full_name, team: pick(passing.rows)?.team_name, value: pick(passing.rows)?.stat_value },
-    { label: 'RB of the Year', name: pick(rushing.rows)?.player_name || pick(rushing.rows)?.full_name, team: pick(rushing.rows)?.team_name, value: pick(rushing.rows)?.stat_value },
-    { label: 'WR of the Year', name: pick(receiving.rows)?.player_name || pick(receiving.rows)?.full_name, team: pick(receiving.rows)?.team_name, value: pick(receiving.rows)?.stat_value },
-    { label: 'Defensive Player Watch', name: pick(sacks.rows)?.player_name || pick(sacks.rows)?.full_name, team: pick(sacks.rows)?.team_name, value: pick(sacks.rows)?.stat_value ? pick(sacks.rows).stat_value + ' sacks' : null },
-    { label: 'Ball Hawk Watch', name: pick(interceptions.rows)?.player_name || pick(interceptions.rows)?.full_name, team: pick(interceptions.rows)?.team_name, value: pick(interceptions.rows)?.stat_value ? pick(interceptions.rows).stat_value + ' INT' : null },
-  ];
-}
 
 function maddenComparePair(label, aValue, bValue, higherIsBetter = true) {
   const av = Number(aValue || 0);
@@ -19271,9 +19100,6 @@ async function ensureMaddenPlayerPersistenceTables() {
       age INTEGER,
       height INTEGER,
       weight INTEGER,
-      speed INTEGER,
-      cap_hit NUMERIC,
-      years_left INTEGER,
       dev_trait TEXT,
       is_free_agent BOOLEAN DEFAULT false,
       raw_payload JSONB DEFAULT '{}'::jsonb,
@@ -19281,9 +19107,6 @@ async function ensureMaddenPlayerPersistenceTables() {
       UNIQUE (guild_id, league_id, id)
     )
   `);
-  await pool.query(`ALTER TABLE madden_players ADD COLUMN IF NOT EXISTS speed INTEGER`);
-  await pool.query(`ALTER TABLE madden_players ADD COLUMN IF NOT EXISTS cap_hit NUMERIC`);
-  await pool.query(`ALTER TABLE madden_players ADD COLUMN IF NOT EXISTS years_left INTEGER`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_player_weekly_stats (
@@ -19391,9 +19214,6 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
     const age = parseNumberOrNull(getAnyValue(row, ['age'], null));
     const height = parseNumberOrNull(getAnyValue(row, ['height'], null));
     const weight = parseNumberOrNull(getAnyValue(row, ['weight'], null));
-    const speed = parseNumberOrNull(getAnyValue(row, ['speed', 'spd', 'speedRating'], null));
-    const capHit = parseNumberOrNull(getAnyValue(row, ['capHit', 'cap_hit', 'salaryCapHit', 'contractSalary', 'salary'], null));
-    const yearsLeft = parseNumberOrNull(getAnyValue(row, ['yearsLeft', 'years_left', 'contractYearsLeft', 'contractLength', 'yearsRemaining'], null));
     const devTrait = normalizeMaddenDevTrait(getAnyValue(row, ['devTrait', 'developmentTrait'], null));
     const isFreeAgent = Boolean(getAnyValue(row, ['isFreeAgent'], false)) || requestPayload?.returnFreeAgents === true;
 
@@ -19401,9 +19221,9 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
       `INSERT INTO madden_players (
         id, guild_id, league_id, external_league_id, roster_id, presentation_id, team_id, team_name,
         full_name, first_name, last_name, position, jersey_number, overall, age, height, weight,
-        speed, cap_hit, years_left, dev_trait, is_free_agent, raw_payload, imported_at
+        dev_trait, is_free_agent, raw_payload, imported_at
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,NOW())
       ON CONFLICT (guild_id, league_id, id)
       DO UPDATE SET
         external_league_id = EXCLUDED.external_league_id,
@@ -19420,9 +19240,6 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
         age = EXCLUDED.age,
         height = EXCLUDED.height,
         weight = EXCLUDED.weight,
-        speed = EXCLUDED.speed,
-        cap_hit = EXCLUDED.cap_hit,
-        years_left = EXCLUDED.years_left,
         dev_trait = EXCLUDED.dev_trait,
         is_free_agent = EXCLUDED.is_free_agent,
         raw_payload = EXCLUDED.raw_payload,
@@ -19439,7 +19256,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
         lastName == null ? null : String(lastName),
         position == null ? null : String(position),
         jerseyNumber == null ? null : String(jerseyNumber),
-        overall, age, height, weight, speed, capHit, yearsLeft, devTrait, isFreeAgent, JSON.stringify(row || {}),
+        overall, age, height, weight, devTrait, isFreeAgent, JSON.stringify(row || {}),
       ]
     );
 
