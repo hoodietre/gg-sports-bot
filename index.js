@@ -1294,16 +1294,10 @@ function buildCommands() {
         .addStringOption(o => o.setName('second').setDescription('Second player/team').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))).addSubcommand(sc => sc.setName('team').setDescription('View imported Madden team profile').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('recentgames').setDescription('View recent imported Madden completed games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addIntegerOption(o => o.setName('limit').setDescription('Number of games').setRequired(false)))
-      .addSubcommand(sc => sc.setName('value').setDescription('View Madden player value using the GG Sports value engine')
-        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
         .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false)))
-      .addSubcommand(sc => sc.setName('matchup').setDescription('Compare two teams for a matchup preview')
-        .addStringOption(o => o.setName('home').setDescription('Home/team A').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('away').setDescription('Away/team B').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('news').setDescription('View Madden league news feed').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('awards').setDescription('View Madden award watch powered by imported stats').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))))
 
       .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
       .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
@@ -1314,6 +1308,22 @@ function buildCommands() {
 
       .addSubcommand(sc => sc.setName('eaconfig').setDescription('Staff: check EA Direct auth configuration'))
 ,
+
+    new SlashCommandBuilder()
+      .setName('maddenintel')
+      .setDescription('Madden franchise intelligence commands')
+      .addSubcommand(sc => sc.setName('value').setDescription('View Madden player value using the GG Sports value engine')
+        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+        .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false)))
+      .addSubcommand(sc => sc.setName('matchup').setDescription('Compare two teams for a matchup preview')
+        .addStringOption(o => o.setName('team1').setDescription('First team').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team2').setDescription('Second team').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('news').setDescription('View Madden league news feed')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('awards').setDescription('View Madden award watch powered by imported stats')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('setup')
@@ -1373,8 +1383,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('user').setDescription('Show a user profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('stats').setDescription('Show league stats').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('team').setDescription('Show a team profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('awards').setDescription('Show award history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
+      .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
       .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('franchise').setDescription('Show the full Franchise Hub profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('activity').setDescription('Show profile activity snapshot').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
@@ -1509,8 +1518,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
-      .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('awards').setDescription('Open a customizable league awards form').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))))
       .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
 
     new SlashCommandBuilder()
@@ -5565,7 +5573,7 @@ if (gameSubcommand === 'report') {
     
     
     
-    if (interaction.commandName === 'madden') {
+    if (interaction.commandName === 'madden' || interaction.commandName === 'maddenintel') {
       if (!interaction.guild) return;
       const maddenSubcommand = interaction.options.getSubcommand();
 
