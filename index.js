@@ -1252,6 +1252,16 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('powerrankings').setDescription('View Madden power rankings with movement').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('awards').setDescription('View Madden award races from imported stats')
+        .addStringOption(o => o.setName('award').setDescription('Award race').setRequired(true)
+          .addChoices(
+            { name: 'MVP', value: 'mvp' },
+            { name: 'OPOY', value: 'opoy' },
+            { name: 'DPOY', value: 'dpoy' },
+            { name: 'OROY', value: 'oroy' },
+            { name: 'DROY', value: 'droy' }
+          ))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       
 
       
@@ -5731,6 +5741,22 @@ if (gameSubcommand === 'report') {
         return;
       }
 
+
+
+      if (maddenSubcommand === 'awards') {
+        const leagueName = interaction.options.getString('league');
+        const awardKey = interaction.options.getString('award') || 'mvp';
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const rows = await getMaddenAwardsRace(interaction.guild.id, activeLeague.league_id, awardKey, 5);
+        await interaction.reply({ embeds: [buildMaddenAwardsRaceEmbed(activeLeague, awardKey, rows)] });
+        return;
+      }
 
 
       if (maddenSubcommand === 'powerrankings') {
@@ -18318,6 +18344,137 @@ function maddenCompactStatLine(line) {
   return String(line || '').replaceAll(' • ', ' | ');
 }
 
+const MADDEN_AWARD_RACES = {
+  mvp: { title: 'MVP Race', emoji: '🏆', type: 'overall' },
+  opoy: { title: 'Offensive Player of the Year Race', emoji: '⚡', type: 'offense' },
+  dpoy: { title: 'Defensive Player of the Year Race', emoji: '🛡️', type: 'defense' },
+  oroy: { title: 'Offensive Rookie of the Year Race', emoji: '🌟', type: 'offense_rookie' },
+  droy: { title: 'Defensive Rookie of the Year Race', emoji: '🔒', type: 'defense_rookie' },
+};
+
+function maddenAwardPlayerKey(row) {
+  return String(row?.roster_id || row?.grouping_key || `${row?.player_name || 'Unknown'}:${row?.resolved_team_name || row?.stat_team_name || ''}`).toLowerCase();
+}
+
+function mergeMaddenAwardRow(map, row) {
+  const key = maddenAwardPlayerKey(row);
+  const current = map.get(key) || {
+    player_name: row.player_name || 'Unknown Player',
+    team_name: row.resolved_team_name || row.stat_team_name || '',
+    position: row.position || '',
+    age: row.age == null ? null : Number(row.age),
+    passYds: 0, passTDs: 0, passInts: 0,
+    rushYds: 0, rushTDs: 0,
+    recYds: 0, recTDs: 0, recCatches: 0,
+    defTotalTackles: 0, defSacks: 0, defInts: 0, defForcedFum: 0, defDeflections: 0, defTDs: 0,
+  };
+
+  current.player_name = current.player_name || row.player_name || 'Unknown Player';
+  current.team_name = current.team_name || row.resolved_team_name || row.stat_team_name || '';
+  current.position = current.position || row.position || '';
+  if (current.age == null && row.age != null) current.age = Number(row.age);
+
+  for (const field of ['passYds','passTDs','passInts','rushYds','rushTDs','recYds','recTDs','recCatches','defTotalTackles','defSacks','defInts','defForcedFum','defDeflections','defTDs']) {
+    current[field] += Number(row[field] || 0);
+  }
+
+  map.set(key, current);
+}
+
+function isMaddenOffensivePosition(position) {
+  return ['QB', 'HB', 'RB', 'FB', 'WR', 'TE'].includes(String(position || '').toUpperCase());
+}
+
+function isMaddenDefensivePosition(position) {
+  return ['DE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'LB', 'CB', 'FS', 'SS', 'S'].includes(String(position || '').toUpperCase());
+}
+
+function isMaddenRookieCandidate(player) {
+  // EA exports do not always include a clean rookie flag in weekly stat rows.
+  // Age is the safest stable fallback available in the current imported roster table.
+  return player.age == null || Number(player.age) <= 24;
+}
+
+function scoreMaddenAwardCandidate(player, type) {
+  const passScore = (Number(player.passYds || 0) * 0.05) + (Number(player.passTDs || 0) * 25) - (Number(player.passInts || 0) * 10);
+  const rushScore = (Number(player.rushYds || 0) * 0.08) + (Number(player.rushTDs || 0) * 30);
+  const recScore = (Number(player.recYds || 0) * 0.08) + (Number(player.recTDs || 0) * 30) + (Number(player.recCatches || 0) * 1.5);
+  const defScore = (Number(player.defTotalTackles || 0) * 2) + (Number(player.defSacks || 0) * 25) + (Number(player.defInts || 0) * 30) + (Number(player.defForcedFum || 0) * 20) + (Number(player.defDeflections || 0) * 4) + (Number(player.defTDs || 0) * 35);
+
+  if (type === 'defense' || type === 'defense_rookie') return defScore;
+  if (type === 'offense' || type === 'offense_rookie') return passScore + rushScore + recScore;
+  return passScore + rushScore + recScore + (defScore * 0.8);
+}
+
+function formatMaddenAwardStatLine(player, type) {
+  if (type === 'defense' || type === 'defense_rookie') {
+    return `${formatMaddenLeaderNumber(player.defTotalTackles)} TKL | ${formatMaddenLeaderNumber(player.defSacks)} SACK | ${formatMaddenLeaderNumber(player.defInts)} INT | ${formatMaddenLeaderNumber(player.defForcedFum)} FF`;
+  }
+
+  const pos = String(player.position || '').toUpperCase();
+  if (pos === 'QB' || Number(player.passYds || 0) >= Number(player.rushYds || 0) + Number(player.recYds || 0)) {
+    return `${formatMaddenLeaderNumber(player.passYds)} YDS | ${formatMaddenLeaderNumber(player.passTDs)} TD | ${formatMaddenLeaderNumber(player.passInts)} INT`;
+  }
+  if (Number(player.rushYds || 0) >= Number(player.recYds || 0)) {
+    return `${formatMaddenLeaderNumber(player.rushYds)} RUSH YDS | ${formatMaddenLeaderNumber(player.rushTDs)} TD | ${formatMaddenLeaderNumber(player.recYds)} REC YDS`;
+  }
+  return `${formatMaddenLeaderNumber(player.recYds)} REC YDS | ${formatMaddenLeaderNumber(player.recTDs)} TD | ${formatMaddenLeaderNumber(player.recCatches)} REC`;
+}
+
+async function getMaddenAwardsRace(guildId, leagueId, awardKey, limit = 5) {
+  const race = MADDEN_AWARD_RACES[awardKey] || MADDEN_AWARD_RACES.mvp;
+  const map = new Map();
+
+  const categories = race.type === 'defense' || race.type === 'defense_rookie'
+    ? ['tackles', 'sacks', 'interceptions', 'forced_fumbles', 'pass_deflections']
+    : ['passing', 'rushing', 'receiving', 'passing_tds', 'rushing_tds', 'receiving_tds'];
+
+  for (const categoryKey of categories) {
+    const data = await getMaddenLeagueLeaders(guildId, leagueId, categoryKey, null, 75).catch(() => ({ rows: [] }));
+    for (const row of data.rows || []) mergeMaddenAwardRow(map, row);
+  }
+
+  let players = Array.from(map.values())
+    .filter(player => {
+      if (race.type === 'defense' || race.type === 'defense_rookie') return isMaddenDefensivePosition(player.position) || scoreMaddenAwardCandidate(player, race.type) > 0;
+      if (race.type === 'offense' || race.type === 'offense_rookie') return isMaddenOffensivePosition(player.position) || scoreMaddenAwardCandidate(player, race.type) > 0;
+      return scoreMaddenAwardCandidate(player, race.type) > 0;
+    });
+
+  if (race.type.endsWith('_rookie')) {
+    const rookieFiltered = players.filter(isMaddenRookieCandidate);
+    if (rookieFiltered.length) players = rookieFiltered;
+  }
+
+  return players
+    .map(player => ({ ...player, award_score: scoreMaddenAwardCandidate(player, race.type) }))
+    .filter(player => player.award_score > 0)
+    .sort((a, b) => b.award_score - a.award_score || String(a.player_name).localeCompare(String(b.player_name)))
+    .slice(0, limit);
+}
+
+function buildMaddenAwardsRaceEmbed(league, awardKey, rows) {
+  const race = MADDEN_AWARD_RACES[awardKey] || MADDEN_AWARD_RACES.mvp;
+  const lines = rows.length
+    ? rows.map((player, index) => {
+        const medal = getMaddenRankMedal(index);
+        const team = getMaddenTeamAbbrev(player.team_name);
+        const label = [team, String(player.position || '').toUpperCase()].filter(Boolean).join(' ');
+        const ageText = race.type.endsWith('_rookie') && player.age != null ? ` | Age ${player.age}` : '';
+        return `${medal} **${player.player_name}**${label ? `
+${label}` : ''}
+${formatMaddenAwardStatLine(player, race.type)}${ageText}`;
+      }).join('\n\n')
+    : 'No imported stat rows found for this award race yet. Run `/madden sync` after games have been played.';
+
+  return new EmbedBuilder()
+    .setTitle(`${race.emoji} Madden ${race.title} • ${league.league_name || 'Madden League'}`)
+    .setColor(0xFEE75C)
+    .setDescription(lines.slice(0, 3900))
+    .setFooter({ text: 'GG Sports • Madden Awards Race' })
+    .setTimestamp();
+}
+
 async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = null, limit = 10) {
   await ensureMaddenPlayerPersistenceTables();
 
@@ -18362,7 +18519,8 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
      SELECT
        g.*,
        COALESCE(NULLIF(MAX(p.team_name), ''), NULLIF(MAX(t.team_name), ''), NULLIF(g.stat_team_name, ''), '') AS resolved_team_name,
-       COALESCE(NULLIF(MAX(p.position), ''), '') AS position
+       COALESCE(NULLIF(MAX(p.position), ''), '') AS position,
+       MAX(p.age) AS age
      FROM grouped g
      LEFT JOIN madden_players p
        ON p.guild_id = $1
