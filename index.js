@@ -1294,10 +1294,6 @@ function buildCommands() {
         .addStringOption(o => o.setName('second').setDescription('Second player/team').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))).addSubcommand(sc => sc.setName('team').setDescription('View imported Madden team profile').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('recentgames').setDescription('View recent imported Madden completed games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addIntegerOption(o => o.setName('limit').setDescription('Number of games').setRequired(false)))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
-        .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false)))
-        .addStringOption(o => o.setName('away').setDescription('Away/team B').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))))
 
       .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
       .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
