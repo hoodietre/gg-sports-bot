@@ -18367,12 +18367,16 @@ function mergeMaddenAwardRow(map, row) {
     rushYds: 0, rushTDs: 0,
     recYds: 0, recTDs: 0, recCatches: 0,
     defTotalTackles: 0, defSacks: 0, defInts: 0, defForcedFum: 0, defDeflections: 0, defTDs: 0,
+    is_rookie: false,
+    roster_raw_payload: row.roster_raw_payload_text || row.roster_raw_payload || row.raw_payload || null,
   };
 
   current.player_name = current.player_name || row.player_name || 'Unknown Player';
   current.team_name = current.team_name || row.resolved_team_name || row.stat_team_name || '';
   current.position = current.position || row.position || '';
   if (current.age == null && row.age != null) current.age = Number(row.age);
+  if (!current.roster_raw_payload && (row.roster_raw_payload_text || row.roster_raw_payload || row.raw_payload)) current.roster_raw_payload = row.roster_raw_payload_text || row.roster_raw_payload || row.raw_payload;
+  current.is_rookie = current.is_rookie || isMaddenRawPayloadRookie(current.roster_raw_payload);
 
   for (const field of ['passYds','passTDs','passInts','rushYds','rushTDs','recYds','recTDs','recCatches','defTotalTackles','defSacks','defInts','defForcedFum','defDeflections','defTDs']) {
     current[field] += Number(row[field] || 0);
@@ -18389,10 +18393,69 @@ function isMaddenDefensivePosition(position) {
   return ['DE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'LB', 'CB', 'FS', 'SS', 'S'].includes(String(position || '').toUpperCase());
 }
 
+function parseMaddenJsonMaybe(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(String(value)); } catch { return null; }
+}
+
+function findMaddenRawValueByKey(raw, wantedKeys) {
+  const seen = new Set();
+  const stack = [raw];
+  const wanted = new Set(wantedKeys.map(k => String(k).toLowerCase()));
+  while (stack.length) {
+    const item = stack.pop();
+    if (!item || typeof item !== 'object') continue;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    if (Array.isArray(item)) {
+      for (const child of item) stack.push(child);
+      continue;
+    }
+    for (const [key, value] of Object.entries(item)) {
+      const normalizedKey = String(key).toLowerCase();
+      if (wanted.has(normalizedKey)) return value;
+      if (value && typeof value === 'object') stack.push(value);
+    }
+  }
+  return null;
+}
+
+function booleanishMaddenRookieValue(value) {
+  if (value === true) return true;
+  if (value === false) return false;
+  const text = String(value ?? '').trim().toLowerCase();
+  if (['true', 'yes', 'y', 'rookie'].includes(text)) return true;
+  if (['false', 'no', 'n', 'veteran'].includes(text)) return false;
+  const number = Number(text);
+  if (Number.isFinite(number)) return number === 1;
+  return null;
+}
+
+function isMaddenRawPayloadRookie(rawPayload) {
+  const raw = parseMaddenJsonMaybe(rawPayload);
+  if (!raw) return false;
+
+  const explicitRookie = findMaddenRawValueByKey(raw, [
+    'isRookie', 'rookie', 'rookieFlag', 'is_rookie', 'isRookieFlag'
+  ]);
+  const explicit = booleanishMaddenRookieValue(explicitRookie);
+  if (explicit === true) return true;
+  if (explicit === false) return false;
+
+  const yearsValue = findMaddenRawValueByKey(raw, [
+    'yearsPro', 'yrsPro', 'proYears', 'yearsInLeague', 'nflYears', 'experience', 'exp', 'playerExperience'
+  ]);
+  if (yearsValue != null && yearsValue !== '') {
+    const years = Number(String(yearsValue).replace(/[^0-9.-]/g, ''));
+    if (Number.isFinite(years)) return years === 0;
+  }
+
+  return false;
+}
+
 function isMaddenRookieCandidate(player) {
-  // EA exports do not always include a clean rookie flag in weekly stat rows.
-  // Age is the safest stable fallback available in the current imported roster table.
-  return player.age == null || Number(player.age) <= 24;
+  return player.is_rookie === true || isMaddenRawPayloadRookie(player.roster_raw_payload || player.raw_payload || player.roster_raw_payload_text);
 }
 
 function scoreMaddenAwardCandidate(player, type) {
@@ -18442,8 +18505,7 @@ async function getMaddenAwardsRace(guildId, leagueId, awardKey, limit = 5) {
     });
 
   if (race.type.endsWith('_rookie')) {
-    const rookieFiltered = players.filter(isMaddenRookieCandidate);
-    if (rookieFiltered.length) players = rookieFiltered;
+    players = players.filter(isMaddenRookieCandidate);
   }
 
   return players
@@ -18460,12 +18522,14 @@ function buildMaddenAwardsRaceEmbed(league, awardKey, rows) {
         const medal = getMaddenRankMedal(index);
         const team = getMaddenTeamAbbrev(player.team_name);
         const label = [team, String(player.position || '').toUpperCase()].filter(Boolean).join(' ');
-        const ageText = race.type.endsWith('_rookie') && player.age != null ? ` | Age ${player.age}` : '';
+        const rookieText = race.type.endsWith('_rookie') ? ' | Rookie' : '';
         return `${medal} **${player.player_name}**${label ? `
 ${label}` : ''}
-${formatMaddenAwardStatLine(player, race.type)}${ageText}`;
+${formatMaddenAwardStatLine(player, race.type)}${rookieText}`;
       }).join('\n\n')
-    : 'No imported stat rows found for this award race yet. Run `/madden sync` after games have been played.';
+    : (race.type.endsWith('_rookie')
+        ? 'No rookie stat rows found for this award race yet. This command now requires a real rookie flag or 0 years pro from the imported EA roster data.'
+        : 'No imported stat rows found for this award race yet. Run `/madden sync` after games have been played.');
 
   return new EmbedBuilder()
     .setTitle(`${race.emoji} Madden ${race.title} • ${league.league_name || 'Madden League'}`)
@@ -18520,7 +18584,8 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
        g.*,
        COALESCE(NULLIF(MAX(p.team_name), ''), NULLIF(MAX(t.team_name), ''), NULLIF(g.stat_team_name, ''), '') AS resolved_team_name,
        COALESCE(NULLIF(MAX(p.position), ''), '') AS position,
-       MAX(p.age) AS age
+       MAX(p.age) AS age,
+       MAX(p.raw_payload::text) AS roster_raw_payload_text
      FROM grouped g
      LEFT JOIN madden_players p
        ON p.guild_id = $1
