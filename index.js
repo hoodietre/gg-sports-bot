@@ -18920,12 +18920,35 @@ function maddenNewsTeamRecordText(row) {
   return formatMaddenStandingsRecord(row);
 }
 
+function maddenNewsHasRealScore(game) {
+  const homeRaw = game?.home_score;
+  const awayRaw = game?.away_score;
+  if (homeRaw === null || homeRaw === undefined || awayRaw === null || awayRaw === undefined) return false;
+  const homeScore = Number(homeRaw);
+  const awayScore = Number(awayRaw);
+  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return false;
+  // Imported EA schedules can sometimes carry 0-0 placeholders. Do not report those as completed results.
+  if (homeScore === 0 && awayScore === 0) return false;
+  return true;
+}
+
 function maddenNewsGameHeadline(game, teamRowsByName) {
-  const homeScore = Number(game.home_score ?? 0);
-  const awayScore = Number(game.away_score ?? 0);
-  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return null;
   const home = String(game.home_team || 'Home');
   const away = String(game.away_team || 'Away');
+  const homeScore = Number(game.home_score);
+  const awayScore = Number(game.away_score);
+
+  if (!maddenNewsHasRealScore(game)) {
+    const homeRow = teamRowsByName.get(home.toLowerCase());
+    const awayRow = teamRowsByName.get(away.toLowerCase());
+    const homeRecord = maddenNewsTeamRecordText(homeRow);
+    const awayRecord = maddenNewsTeamRecordText(awayRow);
+    if (homeRow && Number(homeRow.wins || 0) >= 2 && Number(homeRow.losses || 0) === 0) return `⚡ ${home} improves to ${homeRecord}`;
+    if (awayRow && Number(awayRow.wins || 0) >= 2 && Number(awayRow.losses || 0) === 0) return `⚡ ${away} improves to ${awayRecord}`;
+    if (homeRecord || awayRecord) return `⚡ ${away} at ${home} headlines the week${homeRecord ? ` with ${home} sitting at ${homeRecord}` : ''}${awayRecord ? ` and ${away} at ${awayRecord}` : ''}`;
+    return null;
+  }
+
   const winner = homeScore >= awayScore ? home : away;
   const loser = homeScore >= awayScore ? away : home;
   const winnerScore = homeScore >= awayScore ? homeScore : awayScore;
@@ -18936,16 +18959,26 @@ function maddenNewsGameHeadline(game, teamRowsByName) {
   const winnerRecord = maddenNewsTeamRecordText(winnerRow);
   const loserRecord = maddenNewsTeamRecordText(loserRow);
 
+  if (winnerRow && Number(winnerRow.losses || 0) === 0 && Number(winnerRow.wins || 0) >= 2) return `🔥 ${winner} stays undefeated at ${winnerRecord} after beating ${loser} ${winnerScore}-${loserScore}`;
+  if (loserRow && Number(loserRow.wins || 0) === 0 && Number(loserRow.losses || 0) >= 2) return `📉 ${loser} falls to ${loserRecord} after losing ${winnerScore}-${loserScore} to ${winner}`;
   if (margin >= 21) return `🔥 ${winner} dominates ${loser} ${winnerScore}-${loserScore}${winnerRecord ? ` and moves to ${winnerRecord}` : ''}`;
   if (margin <= 3) return `⚡ ${winner} edges ${loser} ${winnerScore}-${loserScore}${winnerRecord ? ` and moves to ${winnerRecord}` : ''}`;
-  if (winnerRow && Number(winnerRow.losses || 0) === 0 && Number(winnerRow.wins || 0) >= 2) return `🔥 ${winner} stays undefeated at ${winnerRecord} after beating ${loser} ${winnerScore}-${loserScore}`;
-  if (loserRow && Number(loserRow.wins || 0) === 0 && Number(loserRow.losses || 0) >= 2) return `📉 ${loser} falls to ${loserRecord} after loss to ${winner}`;
-  return `🔥 ${winner} defeats ${loser} ${winnerScore}-${loserScore}${winnerRecord ? ` and moves to ${winnerRecord}` : ''}`;
+  return `⚡ ${winner} defeats ${loser} ${winnerScore}-${loserScore}${winnerRecord ? ` and moves to ${winnerRecord}` : ''}`;
+}
+
+function addMaddenNewsHeadline(bucket, text) {
+  if (!text) return;
+  bucket.push(String(text).trim());
 }
 
 async function buildMaddenNewsFeedEmbed(guildId, league) {
   const leagueId = league.league_id;
-  const headlines = [];
+  const buckets = {
+    awards: [],
+    rankings: [],
+    records: [],
+    results: [],
+  };
 
   const [rankings, standingsResult, gamesResult, mvpRace, oroyRace, droyRace] = await Promise.all([
     recalculateMaddenPowerRankings(guildId, leagueId).catch(() => []),
@@ -18961,12 +18994,10 @@ async function buildMaddenNewsFeedEmbed(guildId, league) {
        FROM madden_imported_games
        WHERE guild_id = $1::text
          AND league_id::text = $2::text
-         AND home_score IS NOT NULL
-         AND away_score IS NOT NULL
        ORDER BY
          COALESCE(NULLIF(regexp_replace(week_label, '[^0-9]', '', 'g'), ''), '0')::int DESC,
          imported_at DESC
-       LIMIT 8`,
+       LIMIT 12`,
       [guildId, leagueId]
     ).catch(() => ({ rows: [] })),
     getMaddenAwardsRace(guildId, leagueId, 'mvp', 1).catch(() => []),
@@ -18976,33 +19007,40 @@ async function buildMaddenNewsFeedEmbed(guildId, league) {
 
   const teamRowsByName = new Map((standingsResult.rows || []).map(row => [String(row.team_name || '').toLowerCase(), row]));
 
+  if (mvpRace?.[0]) addMaddenNewsHeadline(buckets.awards, `🏆 ${mvpRace[0].player_name} leads the MVP race for ${getMaddenTeamAbbrev(mvpRace[0].team_name) || mvpRace[0].team_name || 'his team'}`);
+  if (oroyRace?.[0]) addMaddenNewsHeadline(buckets.awards, `🌟 ${oroyRace[0].player_name} leads the Offensive Rookie of the Year race`);
+  if (droyRace?.[0]) addMaddenNewsHeadline(buckets.awards, `🔒 ${droyRace[0].player_name} leads the Defensive Rookie of the Year race`);
+
   for (const row of rankings || []) {
     const movement = formatMaddenPowerMovement(row);
-    if (movement.startsWith('▲')) headlines.push(`📈 ${row.team_name} climbs ${movement.replace('▲ +', '')} spots to #${row.rank} in the Power Rankings`);
-    if (movement.startsWith('▼')) headlines.push(`📉 ${row.team_name} drops ${movement.replace('▼ ', '')} spots to #${row.rank} in the Power Rankings`);
-    if (headlines.length >= 3) break;
+    if (movement.startsWith('▲')) addMaddenNewsHeadline(buckets.rankings, `📈 ${row.team_name} climbs ${movement.replace('▲ +', '')} spots to #${row.rank} in the Power Rankings`);
+    if (movement.startsWith('▼')) addMaddenNewsHeadline(buckets.rankings, `📉 ${row.team_name} drops ${movement.replace('▼ ', '')} spots to #${row.rank} in the Power Rankings`);
+    if (buckets.rankings.length >= 4) break;
   }
 
   const topTeams = (standingsResult.rows || [])
     .filter(row => Number(row.losses || 0) === 0 && Number(row.wins || 0) >= 2)
     .sort((a, b) => Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name).localeCompare(String(b.team_name)))
-    .slice(0, 2);
-  for (const row of topTeams) headlines.push(`🔥 ${row.team_name} remains undefeated at ${formatMaddenStandingsRecord(row)}`);
+    .slice(0, 3);
+  for (const row of topTeams) addMaddenNewsHeadline(buckets.records, `🔥 ${row.team_name} remains undefeated at ${formatMaddenStandingsRecord(row)}`);
 
   for (const game of gamesResult.rows || []) {
     const headline = maddenNewsGameHeadline(game, teamRowsByName);
-    if (headline) headlines.push(headline);
-    if (headlines.length >= 7) break;
+    if (headline) addMaddenNewsHeadline(buckets.results, headline);
+    if (buckets.results.length >= 5) break;
   }
 
-  if (mvpRace?.[0]) headlines.push(`🏆 ${mvpRace[0].player_name} leads the MVP race for ${getMaddenTeamAbbrev(mvpRace[0].team_name) || mvpRace[0].team_name || 'his team'}`);
-  if (oroyRace?.[0]) headlines.push(`🌟 ${oroyRace[0].player_name} leads the Offensive Rookie of the Year race`);
-  if (droyRace?.[0]) headlines.push(`🔒 ${droyRace[0].player_name} leads the Defensive Rookie of the Year race`);
+  const priorityHeadlines = [
+    ...buckets.awards,
+    ...buckets.rankings,
+    ...buckets.records,
+    ...buckets.results,
+  ];
 
   const uniqueHeadlines = [];
   const seen = new Set();
-  for (const item of headlines) {
-    const key = String(item || '').toLowerCase();
+  for (const item of priorityHeadlines) {
+    const key = String(item || '').toLowerCase().replace(/\s+/g, ' ').trim();
     if (!key || seen.has(key)) continue;
     seen.add(key);
     uniqueHeadlines.push(item);
@@ -19018,10 +19056,10 @@ async function buildMaddenNewsFeedEmbed(guildId, league) {
     .setColor(0x3498DB)
     .setDescription(description.slice(0, 4096))
     .addFields(
-      { name: 'News Sources', value: 'Power Rankings • Awards Race • Standings • Recent Games', inline: false },
+      { name: 'News Priority', value: 'Awards • Rankings Movement • Undefeated Teams • Recent Results', inline: false },
       { name: 'Command', value: '`/madden franchise view:News Feed`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-7ZT News Feed' })
+    .setFooter({ text: 'GG Sports • 7J-7ZT-A News Feed' })
     .setTimestamp();
 }
 
