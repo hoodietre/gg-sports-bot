@@ -19304,6 +19304,69 @@ async function getMaddenPlayerLeagueRanks(guildId, leagueId, player) {
   return ranks.slice(0, 8);
 }
 
+
+function maddenNormalizeMetadataValue(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'string') return value.trim() || null;
+  try { return JSON.stringify(value).slice(0, 120); } catch { return String(value).slice(0, 120); }
+}
+
+function maddenDeepFindRawValue(obj, keyPatterns, maxDepth = 4) {
+  const seen = new Set();
+  function walk(current, depth) {
+    if (!current || typeof current !== 'object' || depth > maxDepth || seen.has(current)) return null;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const item of current.slice(0, 20)) {
+        const found = walk(item, depth + 1);
+        if (found != null) return found;
+      }
+      return null;
+    }
+    for (const [key, value] of Object.entries(current)) {
+      const cleanKey = String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (keyPatterns.some(pattern => pattern.test(cleanKey))) {
+        const normalized = maddenNormalizeMetadataValue(value);
+        if (normalized != null) return normalized;
+      }
+    }
+    for (const value of Object.values(current)) {
+      const found = walk(value, depth + 1);
+      if (found != null) return found;
+    }
+    return null;
+  }
+  return walk(obj, 0);
+}
+
+function maddenFindPlayerMetadataValue(player, raw, columnNames, rawKeyPatterns) {
+  for (const name of columnNames) {
+    if (player && Object.prototype.hasOwnProperty.call(player, name)) {
+      const normalized = maddenNormalizeMetadataValue(player[name]);
+      if (normalized != null) return normalized;
+    }
+  }
+  return maddenDeepFindRawValue(raw, rawKeyPatterns);
+}
+
+function buildMaddenImportedMetadataText(player) {
+  const raw = player?.raw_payload && typeof player.raw_payload === 'object' ? player.raw_payload : {};
+  const metadata = [
+    ['Experience', ['experience', 'exp', 'years_pro', 'yearspro', 'yrs_pro', 'yrspro', 'pro_years', 'proyears', 'years_in_league', 'yearsinleague', 'nfl_years', 'nflyears'], [/^(experience|exp|yearspro|yrspro|proyears|yearsinleague|nflyears|seasonsplayed|serviceyears)$/]],
+    ['Rookie', ['is_rookie', 'isrookie', 'rookie', 'rookie_flag', 'rookieflag', 'rookie_status', 'rookiestatus'], [/rookie/]],
+    ['Draft Year', ['draft_year', 'draftyear', 'rookie_year', 'rookieyear'], [/draftyear/, /rookieyear/]],
+    ['Draft Round', ['draft_round', 'draftround'], [/draftround/]],
+    ['Draft Pick', ['draft_pick', 'draftpick', 'draft_pick_number', 'draftpicknumber'], [/draftpick/]],
+  ];
+  const lines = metadata.map(([label, columns, patterns]) => {
+    const value = maddenFindPlayerMetadataValue(player, raw, columns, patterns);
+    return `**${label}:** ${value ?? 'Not Imported'}`;
+  });
+  return lines.join('\n');
+}
+
 function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []) {
   const displayName = maddenPlayerDisplayName(player);
   const teamName = player.resolved_team_name || player.team_name || 'Free Agent';
@@ -19340,6 +19403,13 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
   if (physical) {
     fields.push({ name: 'Bio', value: physical, inline: false });
   }
+
+
+  fields.push({
+    name: 'Imported Metadata',
+    value: buildMaddenImportedMetadataText(player),
+    inline: false,
+  });
 
   const passing = byType.passing;
   if (passing && Number(passing.pass_yds || 0) > 0) {
