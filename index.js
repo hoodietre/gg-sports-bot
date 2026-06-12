@@ -1277,7 +1277,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news feed, or league records').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news feed, records, or Hall of Fame').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6546,6 +6546,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'records') {
           const embed = await buildMaddenLeagueRecordsEmbed(interaction.guild.id, activeLeague);
+          await interaction.reply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'hof') {
+          const embed = await buildMaddenHallOfFameEmbed(interaction.guild.id, activeLeague);
           await interaction.reply({ embeds: [embed] });
           return;
         }
@@ -19256,6 +19262,149 @@ function buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards,
   const intRows = interceptions?.rows || [];
   if (intRows[0]) lines.push(`🔒 **${intRows[0].player_name || 'INT leader'}** leads the ballhawk race with ${formatMaddenLeaderNumber(intRows[0].leader_value)} INT.`);
   return lines.slice(0, 5).join('\n') || 'No record-watch storylines yet.';
+}
+
+
+function maddenHallOfFameScore(row) {
+  const passYards = Number(row?.career_pass_yards || 0);
+  const passTds = Number(row?.career_pass_tds || 0);
+  const rushYards = Number(row?.career_rush_yards || 0);
+  const rushTds = Number(row?.career_rush_tds || 0);
+  const recYards = Number(row?.career_rec_yards || 0);
+  const recTds = Number(row?.career_rec_tds || 0);
+  const sacks = Number(row?.career_sacks || 0);
+  const interceptions = Number(row?.career_interceptions || 0);
+  return Math.round(
+    (passYards * 0.02) + (passTds * 5) +
+    (rushYards * 0.03) + (rushTds * 5) +
+    (recYards * 0.03) + (recTds * 5) +
+    (sacks * 8) + (interceptions * 10)
+  );
+}
+
+function maddenHallOfFameStatLine(row) {
+  const parts = [];
+  const passYards = Number(row?.career_pass_yards || 0);
+  const passTds = Number(row?.career_pass_tds || 0);
+  const rushYards = Number(row?.career_rush_yards || 0);
+  const rushTds = Number(row?.career_rush_tds || 0);
+  const recYards = Number(row?.career_rec_yards || 0);
+  const recTds = Number(row?.career_rec_tds || 0);
+  const sacks = Number(row?.career_sacks || 0);
+  const interceptions = Number(row?.career_interceptions || 0);
+  if (passYards || passTds) parts.push(`${formatMaddenLeaderNumber(passYards)} PYDS • ${formatMaddenLeaderNumber(passTds)} PTD`);
+  if (rushYards || rushTds) parts.push(`${formatMaddenLeaderNumber(rushYards)} RYDS • ${formatMaddenLeaderNumber(rushTds)} RTD`);
+  if (recYards || recTds) parts.push(`${formatMaddenLeaderNumber(recYards)} RECYDS • ${formatMaddenLeaderNumber(recTds)} RECTD`);
+  if (sacks || interceptions) parts.push(`${formatMaddenLeaderNumber(sacks)} SACK • ${formatMaddenLeaderNumber(interceptions)} INT`);
+  return parts.length ? parts.join('\n') : 'No career stats imported yet.';
+}
+
+function formatMaddenHallOfFameRow(row, index) {
+  if (!row) return 'No data yet.';
+  const medal = maddenRecordMedal(index);
+  const team = getMaddenTeamAbbrev(row.team_name) || row.team_name || 'FA';
+  const position = row.position || 'UNK';
+  const score = formatMaddenLeaderNumber(row.hof_score ?? maddenHallOfFameScore(row));
+  return `${medal} **${row.player_name || 'Unknown Player'}** (${team} ${position}) — **${score} HOF Score**\n${maddenHallOfFameStatLine(row)}`;
+}
+
+function formatMaddenHallOfFameList(rows, limit = 5) {
+  const list = (rows || []).slice(0, limit);
+  if (!list.length) return 'No career foundation data yet. Run `/madden sync`, then open `/madden franchise view:League Records` once to refresh career records.';
+  return list.map((row, index) => formatMaddenHallOfFameRow(row, index)).join('\n\n');
+}
+
+function formatMaddenHallOfFameAwardsLine(label, race, icon) {
+  const leader = race?.[0];
+  if (!leader) return `${icon} **${label}:** No data yet.`;
+  const team = getMaddenTeamAbbrev(leader.team_name) || leader.team_name || 'FA';
+  return `${icon} **${label}:** ${leader.player_name} (${team})`;
+}
+
+async function getMaddenHallOfFameRows(guildId, leagueId) {
+  await ensureMaddenCareerRecordsFoundationTable();
+  const result = await pool.query(
+    `SELECT *,
+       ROUND(
+         (career_pass_yards * 0.02) + (career_pass_tds * 5) +
+         (career_rush_yards * 0.03) + (career_rush_tds * 5) +
+         (career_rec_yards * 0.03) + (career_rec_tds * 5) +
+         (career_sacks * 8) + (career_interceptions * 10)
+       ) AS hof_score
+     FROM madden_career_records
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+     ORDER BY hof_score DESC NULLS LAST, player_name ASC
+     LIMIT 15`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+async function getMaddenHallOfFameCategoryRows(guildId, leagueId, whereSql, orderSql, limit = 5) {
+  await ensureMaddenCareerRecordsFoundationTable();
+  const result = await pool.query(
+    `SELECT *,
+       ROUND(
+         (career_pass_yards * 0.02) + (career_pass_tds * 5) +
+         (career_rush_yards * 0.03) + (career_rush_tds * 5) +
+         (career_rec_yards * 0.03) + (career_rec_tds * 5) +
+         (career_sacks * 8) + (career_interceptions * 10)
+       ) AS hof_score
+     FROM madden_career_records
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+       AND (${whereSql})
+     ORDER BY ${orderSql}
+     LIMIT $3::int`,
+    [guildId, leagueId, limit]
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+async function buildMaddenHallOfFameEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  await refreshMaddenCareerRecordsFoundation(guildId, leagueId);
+
+  const [overallRows, qbRows, skillRows, defensiveRows, mvpRace, opoyRace, dpoyRace, oroyRace, droyRace] = await Promise.all([
+    getMaddenHallOfFameRows(guildId, leagueId),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_pass_yards > 0 OR career_pass_tds > 0)`, 'career_pass_tds DESC, career_pass_yards DESC, hof_score DESC', 5),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_rush_yards > 0 OR career_rec_yards > 0 OR career_rush_tds > 0 OR career_rec_tds > 0)`, '(career_rush_tds + career_rec_tds) DESC, (career_rush_yards + career_rec_yards) DESC, hof_score DESC', 5),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_sacks > 0 OR career_interceptions > 0)`, '(career_sacks * 8 + career_interceptions * 10) DESC, hof_score DESC', 5),
+    getMaddenAwardsRace(guildId, leagueId, 'mvp', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'opoy', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'dpoy', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'oroy', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'droy', 1).catch(() => []),
+  ]);
+
+  const awardsWatch = [
+    formatMaddenHallOfFameAwardsLine('MVP Favorite', mvpRace, '🏆'),
+    formatMaddenHallOfFameAwardsLine('OPOY Favorite', opoyRace, '⚡'),
+    formatMaddenHallOfFameAwardsLine('DPOY Favorite', dpoyRace, '🛡️'),
+    formatMaddenHallOfFameAwardsLine('OROY Favorite', oroyRace, '🌟'),
+    formatMaddenHallOfFameAwardsLine('DROY Favorite', droyRace, '🔒'),
+  ].join('\n');
+
+  const topPlayer = overallRows?.[0] || null;
+  const thumb = getMaddenTeamLogoUrl(topPlayer?.team_name);
+  const embed = new EmbedBuilder()
+    .setTitle('🏛️ Madden Hall of Fame • ' + (league.league_name || 'Madden League'))
+    .setColor(0x9B59B6)
+    .setDescription('Career foundation leaderboard generated from imported Madden stats. This view starts the long-term league legacy system and will grow stronger every season.')
+    .addFields(
+      { name: '👑 Hall of Fame Score Leaders', value: formatMaddenHallOfFameList(overallRows, 5).slice(0, 1024), inline: false },
+      { name: '🏈 Quarterback Resume', value: formatMaddenHallOfFameList(qbRows, 3).slice(0, 1024), inline: false },
+      { name: '⚡ Skill Player Resume', value: formatMaddenHallOfFameList(skillRows, 3).slice(0, 1024), inline: false },
+      { name: '🛡️ Defensive Resume', value: formatMaddenHallOfFameList(defensiveRows, 3).slice(0, 1024), inline: false },
+      { name: '🏆 Current Awards Watch', value: awardsWatch.slice(0, 1024), inline: false },
+      { name: 'Scoring Model', value: '`Pass/Rush/Rec Yards + TDs + Sacks + INTs` • future seasons can add MVPs, championships, and playoff success.', inline: false },
+      { name: 'Command', value: '`/madden franchise view:Hall of Fame`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-8B Hall of Fame' })
+    .setTimestamp();
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
 }
 
 async function buildMaddenLeagueRecordsEmbed(guildId, league) {
