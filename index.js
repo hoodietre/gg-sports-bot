@@ -439,6 +439,36 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_power_rankings ADD COLUMN IF NOT EXISTS power_score NUMERIC NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE madden_power_rankings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
 
+  // 7J-8A-B: Madden career records foundation. This is hidden for now and is refreshed idempotently from imported stats.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_career_records (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_key TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      career_pass_yards NUMERIC NOT NULL DEFAULT 0,
+      career_pass_tds NUMERIC NOT NULL DEFAULT 0,
+      career_rush_yards NUMERIC NOT NULL DEFAULT 0,
+      career_rush_tds NUMERIC NOT NULL DEFAULT 0,
+      career_rec_yards NUMERIC NOT NULL DEFAULT 0,
+      career_rec_tds NUMERIC NOT NULL DEFAULT 0,
+      career_sacks NUMERIC NOT NULL DEFAULT 0,
+      career_interceptions NUMERIC NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_key)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_pass_yards NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_pass_tds NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_rush_yards NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_rush_tds NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_rec_yards NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_rec_tds NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_sacks NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_interceptions NUMERIC NOT NULL DEFAULT 0`);
+
 
 
 
@@ -15238,6 +15268,9 @@ async function getMaddenMatchupPreviewData(guildId, leagueId, homeTeamName, away
     getMaddenImportedTeamRow(guildId, leagueId, homeTeamName),
     getMaddenImportedTeamRow(guildId, leagueId, awayTeamName),
     recalculateMaddenPowerRankings(guildId, leagueId).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'mvp', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'oroy', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'droy', 1).catch(() => []),
   ]);
 
   const homeName = home?.team_name || homeTeamName;
@@ -19112,6 +19145,93 @@ async function getMaddenTopRecordLeaders(guildId, leagueId, categoryKey, limit =
   return { rows: result.rows || [], category: result.category || MADDEN_LEADER_CATEGORIES[categoryKey] };
 }
 
+
+async function ensureMaddenCareerRecordsFoundationTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_career_records (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_key TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      career_pass_yards NUMERIC NOT NULL DEFAULT 0,
+      career_pass_tds NUMERIC NOT NULL DEFAULT 0,
+      career_rush_yards NUMERIC NOT NULL DEFAULT 0,
+      career_rush_tds NUMERIC NOT NULL DEFAULT 0,
+      career_rec_yards NUMERIC NOT NULL DEFAULT 0,
+      career_rec_tds NUMERIC NOT NULL DEFAULT 0,
+      career_sacks NUMERIC NOT NULL DEFAULT 0,
+      career_interceptions NUMERIC NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_key)
+    )
+  `);
+}
+
+async function refreshMaddenCareerRecordsFoundation(guildId, leagueId) {
+  await ensureMaddenPlayerPersistenceTables();
+  await ensureMaddenCareerRecordsFoundationTable();
+  await pool.query(
+    `WITH base AS (
+       SELECT
+         s.guild_id,
+         s.league_id,
+         COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, '')) AS player_key,
+         COALESCE(NULLIF(s.full_name, ''), 'Unknown Player') AS player_name,
+         MAX(NULLIF(s.team_name, '')) AS team_name,
+         MAX(NULLIF(s.position, '')) AS position,
+         SUM(CASE WHEN s.stat_type = 'passing' AND s.raw_payload->>'passYds' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'passYds')::numeric ELSE 0 END) AS pass_yards,
+         SUM(CASE WHEN s.stat_type = 'passing' AND s.raw_payload->>'passTDs' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'passTDs')::numeric ELSE 0 END) AS pass_tds,
+         SUM(CASE WHEN s.stat_type = 'rushing' AND s.raw_payload->>'rushYds' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'rushYds')::numeric ELSE 0 END) AS rush_yards,
+         SUM(CASE WHEN s.stat_type = 'rushing' AND s.raw_payload->>'rushTDs' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'rushTDs')::numeric ELSE 0 END) AS rush_tds,
+         SUM(CASE WHEN s.stat_type = 'receiving' AND s.raw_payload->>'recYds' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'recYds')::numeric ELSE 0 END) AS rec_yards,
+         SUM(CASE WHEN s.stat_type = 'receiving' AND s.raw_payload->>'recTDs' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'recTDs')::numeric ELSE 0 END) AS rec_tds,
+         SUM(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defSacks' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'defSacks')::numeric ELSE 0 END) AS sacks,
+         SUM(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defInts' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'defInts')::numeric ELSE 0 END) AS interceptions
+       FROM madden_player_weekly_stats s
+       WHERE s.guild_id = $1::text
+         AND s.league_id = $2::text
+       GROUP BY s.guild_id, s.league_id, COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, '')), COALESCE(NULLIF(s.full_name, ''), 'Unknown Player')
+     )
+     INSERT INTO madden_career_records (
+       guild_id, league_id, player_key, player_name, team_name, position,
+       career_pass_yards, career_pass_tds, career_rush_yards, career_rush_tds,
+       career_rec_yards, career_rec_tds, career_sacks, career_interceptions, updated_at
+     )
+     SELECT guild_id, league_id, player_key, player_name, team_name, position,
+       pass_yards, pass_tds, rush_yards, rush_tds, rec_yards, rec_tds, sacks, interceptions, NOW()
+     FROM base
+     WHERE player_key IS NOT NULL
+     ON CONFLICT (guild_id, league_id, player_key) DO UPDATE SET
+       player_name = EXCLUDED.player_name,
+       team_name = COALESCE(EXCLUDED.team_name, madden_career_records.team_name),
+       position = COALESCE(EXCLUDED.position, madden_career_records.position),
+       career_pass_yards = EXCLUDED.career_pass_yards,
+       career_pass_tds = EXCLUDED.career_pass_tds,
+       career_rush_yards = EXCLUDED.career_rush_yards,
+       career_rush_tds = EXCLUDED.career_rush_tds,
+       career_rec_yards = EXCLUDED.career_rec_yards,
+       career_rec_tds = EXCLUDED.career_rec_tds,
+       career_sacks = EXCLUDED.career_sacks,
+       career_interceptions = EXCLUDED.career_interceptions,
+       updated_at = NOW()`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden career foundation refresh skipped:', error.message);
+  });
+}
+
+function buildMaddenLeagueSnapshotLines({ mvpRace, oroyRace, droyRace, topPower, undefeatedTeams }) {
+  const lines = [];
+  if (mvpRace?.[0]) lines.push(`🏆 **MVP Favorite:** ${mvpRace[0].player_name} (${getMaddenTeamAbbrev(mvpRace[0].team_name) || mvpRace[0].team_name || 'FA'})`);
+  if (oroyRace?.[0]) lines.push(`🌟 **OROY Favorite:** ${oroyRace[0].player_name} (${getMaddenTeamAbbrev(oroyRace[0].team_name) || oroyRace[0].team_name || 'FA'})`);
+  if (droyRace?.[0]) lines.push(`🛡️ **DROY Favorite:** ${droyRace[0].player_name} (${getMaddenTeamAbbrev(droyRace[0].team_name) || droyRace[0].team_name || 'FA'})`);
+  if (topPower) lines.push(`👑 **#1 Power Ranked Team:** ${topPower.team_name} — Score ${formatMaddenPowerScore(topPower.power_score)}`);
+  if (undefeatedTeams?.length) lines.push(`🔥 **Undefeated Teams:** ${undefeatedTeams.map(t => t.team_name).join(' • ')}`);
+  return lines.join('\n') || 'League snapshot will populate after more Madden data is imported.';
+}
+
 function buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards, sacks, interceptions }) {
   const lines = [];
   const passTdRows = passingTDs?.rows || [];
@@ -19138,6 +19258,7 @@ function buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards,
 
 async function buildMaddenLeagueRecordsEmbed(guildId, league) {
   const leagueId = league.league_id;
+  await refreshMaddenCareerRecordsFoundation(guildId, leagueId);
 
   const [
     passingYards,
@@ -19151,6 +19272,9 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     tackles,
     teamStatsResult,
     rankings,
+    mvpRace,
+    oroyRace,
+    droyRace,
   ] = await Promise.all([
     getMaddenTopRecordLeaders(guildId, leagueId, 'passing', 3),
     getMaddenTopRecordLeaders(guildId, leagueId, 'passing_tds', 3),
@@ -19188,6 +19312,11 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
   ).slice(0, 3);
   const topPowerRows = (rankings || []).slice(0, 3);
   const topPower = topPowerRows?.[0] || null;
+  const undefeatedSnapshotTeams = [...teams]
+    .filter(row => Number(row.losses || 0) === 0 && Number(row.wins || 0) > 0)
+    .sort((a, b) => Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name || '').localeCompare(String(b.team_name || '')))
+    .slice(0, 6);
+  const leagueSnapshot = buildMaddenLeagueSnapshotLines({ mvpRace, oroyRace, droyRace, topPower, undefeatedTeams: undefeatedSnapshotTeams });
 
   const offenseRecords = [
     `**Passing Yards**\n${formatMaddenRecordsPlayerTopList(passingYards.rows, 'YDS')}`,
@@ -19216,15 +19345,16 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle('🏆 Madden League Records • ' + (league.league_name || 'Madden League'))
     .setColor(0xF1C40F)
-    .setDescription('Current-season top-three records generated from imported Madden stats.')
+    .setDescription('Current-season top-three records generated from imported Madden stats. Career records foundation refreshes quietly in the background for future Hall of Fame features.')
     .addFields(
+      { name: '🏈 League Snapshot', value: leagueSnapshot.slice(0, 1024), inline: false },
       { name: 'Offensive Records', value: offenseRecords.slice(0, 1024), inline: false },
       { name: 'Defensive Records', value: defensiveRecords.slice(0, 1024), inline: false },
       { name: 'Team Records', value: teamRecords.slice(0, 1024), inline: false },
       { name: '📈 Record Watch', value: recordWatch.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:League Records`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8A-A League Records Polish' })
+    .setFooter({ text: 'GG Sports • 7J-8A-B League Snapshot + Career Foundation' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
