@@ -15160,12 +15160,42 @@ async function getMaddenTeamSeasonLeader(guildId, leagueId, teamName, categoryKe
   return (result.rows || []).find(row => maddenTeamNameMatches(row.resolved_team_name || row.stat_team_name || row.team_name, teamName)) || null;
 }
 
-function formatMaddenMatchupLeader(row, fallback = 'No data') {
+function formatMaddenMatchupLeader(row, statLabel = 'Yards', fallback = 'No data') {
   if (!row) return fallback;
   const team = getMaddenTeamAbbrev(row.resolved_team_name || row.stat_team_name || row.team_name);
-  const position = row.position ? ` ${String(row.position).toUpperCase()}` : '';
-  const value = row.leader_value != null ? ` — ${formatMaddenLeaderNumber(row.leader_value)}` : '';
-  return `${row.player_name || 'Unknown'}${team ? ` (${team}${position})` : position}${value}`;
+  const position = row.position ? String(row.position).toUpperCase() : '';
+  const meta = [team, position].filter(Boolean).join(' ');
+  const value = row.leader_value != null ? formatMaddenLeaderNumber(row.leader_value) + ' ' + statLabel : 'No stat';
+  return `**${row.player_name || 'Unknown'}**${meta ? ` (${meta})` : ''}\n${value}`;
+}
+
+const NFL_TEAM_LOGO_SLUGS = {
+  SF: 'sf', CHI: 'chi', CIN: 'cin', BUF: 'buf', DEN: 'den', CLE: 'cle', TB: 'tb', ARI: 'ari',
+  LAC: 'lac', KC: 'kc', IND: 'ind', WAS: 'wsh', DAL: 'dal', MIA: 'mia', PHI: 'phi', ATL: 'atl',
+  NYG: 'nyg', JAX: 'jax', NYJ: 'nyj', DET: 'det', GB: 'gb', CAR: 'car', NE: 'ne', LV: 'lv',
+  LAR: 'lar', BAL: 'bal', NO: 'no', SEA: 'sea', PIT: 'pit', HOU: 'hou', TEN: 'ten', MIN: 'min',
+};
+
+function getMaddenTeamLogoUrl(teamName) {
+  const abbr = getMaddenTeamAbbrev(teamName);
+  const slug = NFL_TEAM_LOGO_SLUGS[String(abbr || '').toUpperCase()];
+  return slug ? `https://a.espncdn.com/i/teamlogos/nfl/500/${slug}.png` : null;
+}
+
+function buildMaddenMatchupStoryline(homeName, awayName, home, away, homePower, awayPower) {
+  const homeWins = Number(home?.wins || 0);
+  const homeLosses = Number(home?.losses || 0);
+  const awayWins = Number(away?.wins || 0);
+  const awayLosses = Number(away?.losses || 0);
+  const homeRank = Number(homePower?.rank || 0);
+  const awayRank = Number(awayPower?.rank || 0);
+  if (homeLosses === 0 && awayLosses === 0) return 'Two unbeaten teams collide with early-season positioning on the line.';
+  if (homeWins === 0 && awayWins === 0) return 'Both teams are chasing their first win and a chance to reset the season.';
+  if (homeWins === 0) return `${homeName} looks to avoid a deeper slide while ${awayName} tries to take care of business.`;
+  if (awayWins === 0) return `${awayName} looks to avoid a deeper slide while ${homeName} tries to take care of business.`;
+  if (homeRank && awayRank && Math.abs(homeRank - awayRank) <= 5) return 'A tight power-ranking matchup that could swing the league picture.';
+  const favorite = homeRank && awayRank ? (homeRank < awayRank ? homeName : awayName) : null;
+  return favorite ? `${favorite} enters with the stronger profile, but the numbers still leave upset potential.` : 'A key matchup with playoff-picture momentum already starting to build.';
 }
 
 function getMaddenMatchupTeamScore(team, powerRow) {
@@ -15187,7 +15217,7 @@ function getMaddenProjectedScore(team, opponent, teamScore, opponentScore) {
   const oppPapg = Number(opponent?.points_against || 0) / oppGames;
   const base = (ppg + oppPapg) / 2;
   const edge = Math.max(-10, Math.min(10, (teamScore - opponentScore) / 12));
-  return Math.max(0, Math.round(base + edge));
+  return Math.max(10, Math.round(base + edge));
 }
 
 async function getMaddenMatchupPreviewData(guildId, leagueId, homeTeamName, awayTeamName) {
@@ -15242,42 +15272,35 @@ function buildMaddenMatchupPreviewEmbed(league, matchup) {
   const awayDiff = awayPf - awayPa;
   const homeName = home.team_name;
   const awayName = away.team_name;
+  const homeLogo = getMaddenTeamLogoUrl(homeName);
+  const awayLogo = getMaddenTeamLogoUrl(awayName);
   const favorite = matchup.prediction.projectedHome === matchup.prediction.projectedAway
     ? 'Even matchup'
     : (matchup.prediction.projectedHome > matchup.prediction.projectedAway ? homeName : awayName);
+  const storyline = buildMaddenMatchupStoryline(homeName, awayName, home, away, matchup.homePower, matchup.awayPower);
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setTitle('🏈 Madden Matchup Preview • ' + (league.league_name || 'Madden League'))
     .setColor(0x5865F2)
-    .setDescription(`**${awayName} vs ${homeName}**`)
+    .setDescription(`**${awayName} vs ${homeName}**\n${storyline}`)
     .addFields(
       { name: 'Record', value: `${formatMaddenStandingsRecord(away)} vs ${formatMaddenStandingsRecord(home)}`, inline: true },
       { name: 'PPG', value: `${formatMaddenOneDecimal(awayPf / awayGames)} vs ${formatMaddenOneDecimal(homePf / homeGames)}`, inline: true },
       { name: 'PAPG', value: `${formatMaddenOneDecimal(awayPa / awayGames)} vs ${formatMaddenOneDecimal(homePa / homeGames)}`, inline: true },
       { name: 'Point Differential', value: `${awayDiff >= 0 ? '+' : ''}${awayDiff} vs ${homeDiff >= 0 ? '+' : ''}${homeDiff}`, inline: true },
       { name: 'Power Rank', value: `#${matchup.awayPower?.rank || 'N/A'} vs #${matchup.homePower?.rank || 'N/A'}`, inline: true },
-      { name: 'Off / Def Rank', value: `OFF #${matchup.awayPower?.offense_rank || 'N/A'} • DEF #${matchup.awayPower?.defense_rank || 'N/A'}
-OFF #${matchup.homePower?.offense_rank || 'N/A'} • DEF #${matchup.homePower?.defense_rank || 'N/A'}`, inline: true },
-      { name: 'Top QB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayQB)}
-vs
-${formatMaddenMatchupLeader(matchup.leaders.homeQB)}`, inline: true },
-      { name: 'Top RB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayRB)}
-vs
-${formatMaddenMatchupLeader(matchup.leaders.homeRB)}`, inline: true },
-      { name: 'Top WR', value: `${formatMaddenMatchupLeader(matchup.leaders.awayWR)}
-vs
-${formatMaddenMatchupLeader(matchup.leaders.homeWR)}`, inline: true },
-      { name: '🤖 GG Sports Prediction', value: `**${awayName} ${matchup.prediction.projectedAway}**
-**${homeName} ${matchup.prediction.projectedHome}**
-
-Favorite: **${favorite}**
-
-Win Probability
-${awayName}: **${matchup.prediction.awayProb}%**
-${homeName}: **${matchup.prediction.homeProb}%**`, inline: false }
+      { name: 'Off / Def Rank', value: `OFF #${matchup.awayPower?.offense_rank || 'N/A'} • DEF #${matchup.awayPower?.defense_rank || 'N/A'}\nOFF #${matchup.homePower?.offense_rank || 'N/A'} • DEF #${matchup.homePower?.defense_rank || 'N/A'}`, inline: true },
+      { name: 'Top QB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayQB, 'Pass Yards')}\nvs\n${formatMaddenMatchupLeader(matchup.leaders.homeQB, 'Pass Yards')}`, inline: true },
+      { name: 'Top RB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayRB, 'Rush Yards')}\nvs\n${formatMaddenMatchupLeader(matchup.leaders.homeRB, 'Rush Yards')}`, inline: true },
+      { name: 'Top WR', value: `${formatMaddenMatchupLeader(matchup.leaders.awayWR, 'Rec Yards')}\nvs\n${formatMaddenMatchupLeader(matchup.leaders.homeWR, 'Rec Yards')}`, inline: true },
+      { name: '🤖 GG Sports Prediction', value: `**${awayName} ${matchup.prediction.projectedAway}**\n**${homeName} ${matchup.prediction.projectedHome}**\n\nFavorite: **${favorite}**\n\nWin Probability\n${awayName}: **${matchup.prediction.awayProb}%**\n${homeName}: **${matchup.prediction.homeProb}%**`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-7ZS Matchup Preview' })
+    .setFooter({ text: 'GG Sports • 7J-7ZS-D Matchup Preview' })
     .setTimestamp();
+
+  if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(awayName)} at ${getMaddenTeamAbbrev(homeName)}`, iconURL: awayLogo });
+  if (homeLogo) embed.setThumbnail(homeLogo);
+  return embed;
 }
 
 function buildMaddenImportedStandingsEmbed(league, rows, scope = 'division') {
