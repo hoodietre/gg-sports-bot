@@ -19053,7 +19053,9 @@ async function buildMaddenNewsFeedEmbed(guildId, league) {
   for (const row of rankings || []) {
     const movement = formatMaddenPowerMovement(row);
     if (movement.startsWith('▲')) addMaddenNewsHeadline(buckets.rankings, `📈 ${row.team_name} climbs ${movement.replace('▲ +', '')} spots to #${row.rank} in the Power Rankings`);
-    if (movement.startsWith('▼')) addMaddenNewsHeadline(buckets.rankings, `📉 ${row.team_name} drops ${movement.replace('▼ ', '')} spots to #${row.rank} in the Power Rankings`);
+    else if (movement.startsWith('▼')) addMaddenNewsHeadline(buckets.rankings, `📉 ${row.team_name} drops ${movement.replace('▼ ', '')} spots to #${row.rank} in the Power Rankings`);
+    else if (Number(row.rank || 0) === 1) addMaddenNewsHeadline(buckets.rankings, `👑 ${row.team_name} holds the #1 spot in the Power Rankings`);
+    else if (Number(row.rank || 0) <= 3 && buckets.rankings.length < 3) addMaddenNewsHeadline(buckets.rankings, `📊 ${row.team_name} sits at #${row.rank} in the Power Rankings`);
     if (buckets.rankings.length >= 4) break;
   }
 
@@ -19293,6 +19295,9 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
       [guildId, leagueId]
     ).catch(() => ({ rows: [] })),
     recalculateMaddenPowerRankings(guildId, leagueId).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'mvp', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'oroy', 1).catch(() => []),
+    getMaddenAwardsRace(guildId, leagueId, 'droy', 1).catch(() => []),
   ]);
 
   const teams = teamStatsResult.rows || [];
@@ -19345,7 +19350,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle('🏆 Madden League Records • ' + (league.league_name || 'Madden League'))
     .setColor(0xF1C40F)
-    .setDescription('Current-season top-three records generated from imported Madden stats. Career records foundation refreshes quietly in the background for future Hall of Fame features.')
+    .setDescription('Current-season top-three records, award favorites, power rankings, and career foundation generated from imported Madden stats.')
     .addFields(
       { name: '🏈 League Snapshot', value: leagueSnapshot.slice(0, 1024), inline: false },
       { name: 'Offensive Records', value: offenseRecords.slice(0, 1024), inline: false },
@@ -19354,7 +19359,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
       { name: '📈 Record Watch', value: recordWatch.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:League Records`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8A-B League Snapshot + Career Foundation' })
+    .setFooter({ text: 'GG Sports • 7J-8A-C Franchise Ecosystem Completion' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
@@ -28188,6 +28193,7 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
       { name: 'Coach', value: franchise.owner_user_id ? '<@' + franchise.owner_user_id + '>' : 'Unassigned', inline: true },
       { name: 'Team Role', value: franchise.team_role_id ? '<@&' + franchise.team_role_id + '>' : 'Unassigned', inline: true },
       { name: 'Record', value: `${record}\nPF ${pf} | PA ${pa} | DIFF ${diff >= 0 ? '+' : ''}${diff}`, inline: true },
+      { name: 'Power Rank', value: powerRankText, inline: true },
       { name: 'Team Rankings', value: buildMaddenDetailedRankText(detailedRanks), inline: false },
       { name: 'Team Leaders', value: leadersText.slice(0, 1024), inline: false },
       { name: 'Top Players', value: topPlayersText.slice(0, 1024), inline: false },
