@@ -1261,7 +1261,8 @@ function buildCommands() {
             { name: 'OROY', value: 'oroy' },
             { name: 'DROY', value: 'droy' }
           ))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+        .addStringOption(o => o.setName('probe_player').setDescription('Debug: inspect rookie/experience fields for a player').setRequired(false)))
       
 
       
@@ -5750,6 +5751,13 @@ if (gameSubcommand === 'report') {
 
         if (!activeLeague) {
           await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        const probePlayer = interaction.options.getString('probe_player');
+        if (probePlayer) {
+          const embed = await buildMaddenRookieDataProbeEmbed(interaction.guild.id, activeLeague.league_id, activeLeague, probePlayer);
+          await interaction.reply({ embeds: [embed], ephemeral: true });
           return;
         }
 
@@ -18456,6 +18464,100 @@ function isMaddenRawPayloadRookie(rawPayload) {
 
 function isMaddenRookieCandidate(player) {
   return player.is_rookie === true || isMaddenRawPayloadRookie(player.roster_raw_payload || player.raw_payload || player.roster_raw_payload_text);
+}
+
+
+function collectMaddenRookieProbeFields(rawPayload) {
+  const raw = parseMaddenJsonMaybe(rawPayload);
+  if (!raw || typeof raw !== 'object') return { matches: [], topLevelKeys: [] };
+
+  const matches = [];
+  const topLevelKeys = Array.isArray(raw) ? [] : Object.keys(raw).slice(0, 30);
+  const seen = new Set();
+  const stack = [{ value: raw, path: '' }];
+  const keyPattern = /(rook|exp|year|yrs|pro|draft|season|service|league|contract)/i;
+
+  while (stack.length && matches.length < 40) {
+    const { value, path } = stack.pop();
+    if (!value || typeof value !== 'object') continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < Math.min(value.length, 20); i++) stack.push({ value: value[i], path: `${path}[${i}]` });
+      continue;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = path ? `${path}.${key}` : key;
+      if (keyPattern.test(key)) {
+        const displayValue = child && typeof child === 'object'
+          ? (Array.isArray(child) ? `[Array ${child.length}]` : '[Object]')
+          : String(child ?? 'null');
+        matches.push({ path: childPath, value: displayValue.slice(0, 90) });
+      }
+      if (child && typeof child === 'object') stack.push({ value: child, path: childPath });
+    }
+  }
+
+  return { matches, topLevelKeys };
+}
+
+function formatMaddenRookieProbeRow(row, index) {
+  const probe = collectMaddenRookieProbeFields(row.raw_payload_text || row.raw_payload);
+  const header = `**${index + 1}. ${row.player_name || row.full_name || 'Unknown'}** — ${row.team_name || 'FA'} ${row.position || ''}${row.age != null ? ` • Age ${row.age}` : ''}`;
+  const keyLines = probe.matches.length
+    ? probe.matches.slice(0, 12).map(item => `\`${item.path}\`: ${item.value}`).join('\n')
+    : 'No rookie/experience-style keys found in this raw payload.';
+  const topKeys = probe.topLevelKeys.length ? `\nTop keys: ${probe.topLevelKeys.slice(0, 12).map(k => `\`${k}\``).join(', ')}` : '';
+  return `${header}\n${keyLines}${topKeys}`;
+}
+
+async function buildMaddenRookieDataProbeEmbed(guildId, leagueId, league, playerName) {
+  await ensureMaddenPlayerPersistenceTables();
+  const search = `%${String(playerName || '').trim()}%`;
+  const rows = [];
+
+  const primary = await pool.query(
+    `SELECT 'madden_players' AS source_table, full_name AS player_name, team_name, position, age, roster_id, presentation_id, raw_payload::text AS raw_payload_text
+     FROM madden_players
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(full_name) LIKE LOWER($3)
+     ORDER BY imported_at DESC
+     LIMIT 5`,
+    [guildId, leagueId, search]
+  ).catch(() => ({ rows: [] }));
+  rows.push(...(primary.rows || []));
+
+  const imported = await pool.query(
+    `SELECT 'madden_imported_players' AS source_table, player_name, team_name, position, overall, raw_payload::text AS raw_payload_text
+     FROM madden_imported_players
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(player_name) LIKE LOWER($3)
+     ORDER BY imported_at DESC
+     LIMIT 5`,
+    [guildId, leagueId, search]
+  ).catch(() => ({ rows: [] }));
+  rows.push(...(imported.rows || []));
+
+  const statRows = await pool.query(
+    `SELECT 'madden_player_weekly_stats' AS source_table, full_name AS player_name, team_name, position, raw_payload::text AS raw_payload_text
+     FROM madden_player_weekly_stats
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(full_name) LIKE LOWER($3)
+     ORDER BY imported_at DESC
+     LIMIT 3`,
+    [guildId, leagueId, search]
+  ).catch(() => ({ rows: [] }));
+  rows.push(...(statRows.rows || []));
+
+  const description = rows.length
+    ? rows.slice(0, 6).map(formatMaddenRookieProbeRow).join('\n\n').slice(0, 3900)
+    : `No imported player rows found matching \`${String(playerName || '').slice(0, 80)}\`. Try the exact player name from \`/madden player\`.`;
+
+  return new EmbedBuilder()
+    .setTitle(`🔎 Madden Rookie Data Probe • ${league?.league_name || 'Madden League'}`)
+    .setDescription(description)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • 7J-7ZR-B Rookie Data Probe' })
+    .setTimestamp();
 }
 
 function scoreMaddenAwardCandidate(player, type) {
