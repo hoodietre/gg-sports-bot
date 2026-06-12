@@ -19082,9 +19082,58 @@ function formatMaddenRecordsTeamLine(row, valueText) {
   return `**${row.team_name || 'Unknown Team'}** — ${valueText}`;
 }
 
+function maddenRecordMedal(index) {
+  return ['🥇', '🥈', '🥉'][index] || `${index + 1}.`;
+}
+
+function formatMaddenRecordsPlayerTopList(rows, metricLabel) {
+  const list = (rows || []).slice(0, 3);
+  if (!list.length) return 'No data yet.';
+  return list.map((row, index) => {
+    const team = getMaddenTeamAbbrev(row.resolved_team_name || row.stat_team_name || row.team_name);
+    const teamText = team ? ` (${team})` : '';
+    return `${maddenRecordMedal(index)} **${row.player_name || 'Unknown Player'}${teamText}** — ${formatMaddenLeaderNumber(row.leader_value)} ${metricLabel}`;
+  }).join('\n');
+}
+
+function formatMaddenRecordsTeamTopList(rows, valueBuilder) {
+  const list = (rows || []).slice(0, 3);
+  if (!list.length) return 'No data yet.';
+  return list.map((row, index) => `${maddenRecordMedal(index)} **${row.team_name || 'Unknown Team'}** — ${valueBuilder(row)}`).join('\n');
+}
+
 async function getMaddenSingleRecordLeader(guildId, leagueId, categoryKey) {
   const result = await getMaddenLeagueLeaders(guildId, leagueId, categoryKey, null, 1).catch(() => ({ rows: [], category: MADDEN_LEADER_CATEGORIES[categoryKey] }));
   return { row: result.rows?.[0] || null, category: result.category || MADDEN_LEADER_CATEGORIES[categoryKey] };
+}
+
+async function getMaddenTopRecordLeaders(guildId, leagueId, categoryKey, limit = 3) {
+  const result = await getMaddenLeagueLeaders(guildId, leagueId, categoryKey, null, limit).catch(() => ({ rows: [], category: MADDEN_LEADER_CATEGORIES[categoryKey] }));
+  return { rows: result.rows || [], category: result.category || MADDEN_LEADER_CATEGORIES[categoryKey] };
+}
+
+function buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards, sacks, interceptions }) {
+  const lines = [];
+  const passTdRows = passingTDs?.rows || [];
+  if (passTdRows[0] && passTdRows[1]) {
+    const gap = Number(passTdRows[0].leader_value || 0) - Number(passTdRows[1].leader_value || 0);
+    lines.push(`🏈 **${passTdRows[1].player_name || 'No. 2 passer'}** is ${gap + 1} TD${gap + 1 === 1 ? '' : 's'} from taking the Passing TD lead.`);
+  }
+  const rushRows = rushingYards?.rows || [];
+  if (rushRows[0]) {
+    const nextMilestone = Math.ceil((Number(rushRows[0].leader_value || 0) + 1) / 50) * 50;
+    lines.push(`📈 **${rushRows[0].player_name || 'Rushing leader'}** is chasing ${nextMilestone} rushing yards.`);
+  }
+  const recRows = receivingYards?.rows || [];
+  if (recRows[0] && recRows[1]) {
+    const lead = Number(recRows[0].leader_value || 0) - Number(recRows[1].leader_value || 0);
+    lines.push(`🎯 **${recRows[0].player_name || 'Receiving leader'}** leads the receiving race by ${Math.max(0, lead)} yards.`);
+  }
+  const sackRows = sacks?.rows || [];
+  if (sackRows[0]) lines.push(`🛡️ **${sackRows[0].player_name || 'Sack leader'}** is setting the pace with ${formatMaddenLeaderNumber(sackRows[0].leader_value)} sacks.`);
+  const intRows = interceptions?.rows || [];
+  if (intRows[0]) lines.push(`🔒 **${intRows[0].player_name || 'INT leader'}** leads the ballhawk race with ${formatMaddenLeaderNumber(intRows[0].leader_value)} INT.`);
+  return lines.slice(0, 5).join('\n') || 'No record-watch storylines yet.';
 }
 
 async function buildMaddenLeagueRecordsEmbed(guildId, league) {
@@ -19103,15 +19152,15 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     teamStatsResult,
     rankings,
   ] = await Promise.all([
-    getMaddenSingleRecordLeader(guildId, leagueId, 'passing'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'passing_tds'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'rushing'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'rushing_tds'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'receiving'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'receiving_tds'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'sacks'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'interceptions'),
-    getMaddenSingleRecordLeader(guildId, leagueId, 'tackles'),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'passing', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'passing_tds', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'rushing', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'rushing_tds', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'receiving', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'receiving_tds', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'sacks', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'interceptions', 3),
+    getMaddenTopRecordLeaders(guildId, leagueId, 'tackles', 3),
     pool.query(
       `SELECT *, GREATEST((wins + losses + ties), 1) AS games_played
        FROM madden_imported_team_stats
@@ -19123,62 +19172,62 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
   ]);
 
   const teams = teamStatsResult.rows || [];
-  const bestRecord = [...teams].sort((a, b) =>
+  const bestRecordRows = [...teams].sort((a, b) =>
     Number(b.wins || 0) - Number(a.wins || 0) ||
     Number(a.losses || 0) - Number(b.losses || 0) ||
     (Number(b.points_for || 0) - Number(b.points_against || 0)) - (Number(a.points_for || 0) - Number(a.points_against || 0)) ||
     String(a.team_name || '').localeCompare(String(b.team_name || ''))
-  )[0] || null;
-  const highestScoring = [...teams].sort((a, b) =>
+  ).slice(0, 3);
+  const highestScoringRows = [...teams].sort((a, b) =>
     (Number(b.points_for || 0) / Math.max(1, Number(b.games_played || 1))) -
     (Number(a.points_for || 0) / Math.max(1, Number(a.games_played || 1)))
-  )[0] || null;
-  const bestDefense = [...teams].sort((a, b) =>
+  ).slice(0, 3);
+  const bestDefenseRows = [...teams].sort((a, b) =>
     (Number(a.points_against || 0) / Math.max(1, Number(a.games_played || 1))) -
     (Number(b.points_against || 0) / Math.max(1, Number(b.games_played || 1)))
-  )[0] || null;
-  const topPower = rankings?.[0] || null;
+  ).slice(0, 3);
+  const topPowerRows = (rankings || []).slice(0, 3);
+  const topPower = topPowerRows?.[0] || null;
 
-  const playerRecords = [
-    `**Passing Yards**\n${formatMaddenRecordsPlayerLine(passingYards.row, 'YDS')}`,
-    `**Passing TDs**\n${formatMaddenRecordsPlayerLine(passingTDs.row, 'TD')}`,
-    `**Rushing Yards**\n${formatMaddenRecordsPlayerLine(rushingYards.row, 'YDS')}`,
-    `**Rushing TDs**\n${formatMaddenRecordsPlayerLine(rushingTDs.row, 'TD')}`,
-    `**Receiving Yards**\n${formatMaddenRecordsPlayerLine(receivingYards.row, 'YDS')}`,
-    `**Receiving TDs**\n${formatMaddenRecordsPlayerLine(receivingTDs.row, 'TD')}`,
-    `**Sacks**\n${formatMaddenRecordsPlayerLine(sacks.row, 'SACK')}`,
-    `**Interceptions**\n${formatMaddenRecordsPlayerLine(interceptions.row, 'INT')}`,
-    `**Tackles**\n${formatMaddenRecordsPlayerLine(tackles.row, 'TKL')}`,
+  const offenseRecords = [
+    `**Passing Yards**\n${formatMaddenRecordsPlayerTopList(passingYards.rows, 'YDS')}`,
+    `**Passing TDs**\n${formatMaddenRecordsPlayerTopList(passingTDs.rows, 'TD')}`,
+    `**Rushing Yards**\n${formatMaddenRecordsPlayerTopList(rushingYards.rows, 'YDS')}`,
+    `**Rushing TDs**\n${formatMaddenRecordsPlayerTopList(rushingTDs.rows, 'TD')}`,
+    `**Receiving Yards**\n${formatMaddenRecordsPlayerTopList(receivingYards.rows, 'YDS')}`,
+    `**Receiving TDs**\n${formatMaddenRecordsPlayerTopList(receivingTDs.rows, 'TD')}`,
   ].join('\n\n');
 
-  const highestScoringText = highestScoring
-    ? `${(Number(highestScoring.points_for || 0) / Math.max(1, Number(highestScoring.games_played || 1))).toFixed(1)} PPG`
-    : 'No data yet.';
-  const bestDefenseText = bestDefense
-    ? `${(Number(bestDefense.points_against || 0) / Math.max(1, Number(bestDefense.games_played || 1))).toFixed(1)} PAPG`
-    : 'No data yet.';
-  const topPowerText = topPower
-    ? `#${topPower.rank} • Score ${formatMaddenPowerScore(topPower.power_score)}`
-    : 'No power rankings yet.';
+  const defensiveRecords = [
+    `**Sacks**\n${formatMaddenRecordsPlayerTopList(sacks.rows, 'SACK')}`,
+    `**Interceptions**\n${formatMaddenRecordsPlayerTopList(interceptions.rows, 'INT')}`,
+    `**Tackles**\n${formatMaddenRecordsPlayerTopList(tackles.rows, 'TKL')}`,
+  ].join('\n\n');
 
   const teamRecords = [
-    `**Best Record**\n${formatMaddenRecordsTeamLine(bestRecord, bestRecord ? formatMaddenStandingsRecord(bestRecord) : 'No data yet.')}`,
-    `**Highest Scoring Team**\n${formatMaddenRecordsTeamLine(highestScoring, highestScoringText)}`,
-    `**Best Defense**\n${formatMaddenRecordsTeamLine(bestDefense, bestDefenseText)}`,
-    `**Top Power Ranked Team**\n${formatMaddenRecordsTeamLine(topPower, topPowerText)}`,
+    `**Best Record**\n${formatMaddenRecordsTeamTopList(bestRecordRows, row => formatMaddenStandingsRecord(row))}`,
+    `**Highest Scoring Teams**\n${formatMaddenRecordsTeamTopList(highestScoringRows, row => `${(Number(row.points_for || 0) / Math.max(1, Number(row.games_played || 1))).toFixed(1)} PPG`)}`,
+    `**Best Defenses**\n${formatMaddenRecordsTeamTopList(bestDefenseRows, row => `${(Number(row.points_against || 0) / Math.max(1, Number(row.games_played || 1))).toFixed(1)} PAPG`)}`,
+    `**Top Power Ranked Teams**\n${formatMaddenRecordsTeamTopList(topPowerRows, row => `#${row.rank} • Score ${formatMaddenPowerScore(row.power_score)}`)}`,
   ].join('\n\n');
 
-  return new EmbedBuilder()
+  const recordWatch = buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards, sacks, interceptions });
+  const thumb = getMaddenTeamLogoUrl(topPower?.team_name || bestRecordRows?.[0]?.team_name);
+  const embed = new EmbedBuilder()
     .setTitle('🏆 Madden League Records • ' + (league.league_name || 'Madden League'))
     .setColor(0xF1C40F)
-    .setDescription('Current-season records generated from imported Madden stats.')
+    .setDescription('Current-season top-three records generated from imported Madden stats.')
     .addFields(
-      { name: 'Player Records', value: playerRecords.slice(0, 1024), inline: false },
+      { name: 'Offensive Records', value: offenseRecords.slice(0, 1024), inline: false },
+      { name: 'Defensive Records', value: defensiveRecords.slice(0, 1024), inline: false },
       { name: 'Team Records', value: teamRecords.slice(0, 1024), inline: false },
+      { name: '📈 Record Watch', value: recordWatch.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:League Records`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8A League Records' })
+    .setFooter({ text: 'GG Sports • 7J-8A-A League Records Polish' })
     .setTimestamp();
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
 }
 
 async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = null, limit = 10) {
