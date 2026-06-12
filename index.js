@@ -1247,7 +1247,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub or league news feed').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news feed, or league records').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6510,6 +6510,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'news') {
           const embed = await buildMaddenNewsFeedEmbed(interaction.guild.id, activeLeague);
+          await interaction.reply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'records') {
+          const embed = await buildMaddenLeagueRecordsEmbed(interaction.guild.id, activeLeague);
           await interaction.reply({ embeds: [embed] });
           return;
         }
@@ -19063,6 +19069,118 @@ async function buildMaddenNewsFeedEmbed(guildId, league) {
     .setTimestamp();
 }
 
+
+function formatMaddenRecordsPlayerLine(row, metricLabel) {
+  if (!row) return 'No data yet.';
+  const team = getMaddenTeamAbbrev(row.resolved_team_name || row.stat_team_name || row.team_name);
+  const teamText = team ? ` (${team})` : '';
+  return `**${row.player_name || 'Unknown Player'}${teamText}** — ${formatMaddenLeaderNumber(row.leader_value)} ${metricLabel}`;
+}
+
+function formatMaddenRecordsTeamLine(row, valueText) {
+  if (!row) return 'No data yet.';
+  return `**${row.team_name || 'Unknown Team'}** — ${valueText}`;
+}
+
+async function getMaddenSingleRecordLeader(guildId, leagueId, categoryKey) {
+  const result = await getMaddenLeagueLeaders(guildId, leagueId, categoryKey, null, 1).catch(() => ({ rows: [], category: MADDEN_LEADER_CATEGORIES[categoryKey] }));
+  return { row: result.rows?.[0] || null, category: result.category || MADDEN_LEADER_CATEGORIES[categoryKey] };
+}
+
+async function buildMaddenLeagueRecordsEmbed(guildId, league) {
+  const leagueId = league.league_id;
+
+  const [
+    passingYards,
+    passingTDs,
+    rushingYards,
+    rushingTDs,
+    receivingYards,
+    receivingTDs,
+    sacks,
+    interceptions,
+    tackles,
+    teamStatsResult,
+    rankings,
+  ] = await Promise.all([
+    getMaddenSingleRecordLeader(guildId, leagueId, 'passing'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'passing_tds'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'rushing'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'rushing_tds'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'receiving'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'receiving_tds'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'sacks'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'interceptions'),
+    getMaddenSingleRecordLeader(guildId, leagueId, 'tackles'),
+    pool.query(
+      `SELECT *, GREATEST((wins + losses + ties), 1) AS games_played
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text`,
+      [guildId, leagueId]
+    ).catch(() => ({ rows: [] })),
+    recalculateMaddenPowerRankings(guildId, leagueId).catch(() => []),
+  ]);
+
+  const teams = teamStatsResult.rows || [];
+  const bestRecord = [...teams].sort((a, b) =>
+    Number(b.wins || 0) - Number(a.wins || 0) ||
+    Number(a.losses || 0) - Number(b.losses || 0) ||
+    (Number(b.points_for || 0) - Number(b.points_against || 0)) - (Number(a.points_for || 0) - Number(a.points_against || 0)) ||
+    String(a.team_name || '').localeCompare(String(b.team_name || ''))
+  )[0] || null;
+  const highestScoring = [...teams].sort((a, b) =>
+    (Number(b.points_for || 0) / Math.max(1, Number(b.games_played || 1))) -
+    (Number(a.points_for || 0) / Math.max(1, Number(a.games_played || 1)))
+  )[0] || null;
+  const bestDefense = [...teams].sort((a, b) =>
+    (Number(a.points_against || 0) / Math.max(1, Number(a.games_played || 1))) -
+    (Number(b.points_against || 0) / Math.max(1, Number(b.games_played || 1)))
+  )[0] || null;
+  const topPower = rankings?.[0] || null;
+
+  const playerRecords = [
+    `**Passing Yards**\n${formatMaddenRecordsPlayerLine(passingYards.row, 'YDS')}`,
+    `**Passing TDs**\n${formatMaddenRecordsPlayerLine(passingTDs.row, 'TD')}`,
+    `**Rushing Yards**\n${formatMaddenRecordsPlayerLine(rushingYards.row, 'YDS')}`,
+    `**Rushing TDs**\n${formatMaddenRecordsPlayerLine(rushingTDs.row, 'TD')}`,
+    `**Receiving Yards**\n${formatMaddenRecordsPlayerLine(receivingYards.row, 'YDS')}`,
+    `**Receiving TDs**\n${formatMaddenRecordsPlayerLine(receivingTDs.row, 'TD')}`,
+    `**Sacks**\n${formatMaddenRecordsPlayerLine(sacks.row, 'SACK')}`,
+    `**Interceptions**\n${formatMaddenRecordsPlayerLine(interceptions.row, 'INT')}`,
+    `**Tackles**\n${formatMaddenRecordsPlayerLine(tackles.row, 'TKL')}`,
+  ].join('\n\n');
+
+  const highestScoringText = highestScoring
+    ? `${(Number(highestScoring.points_for || 0) / Math.max(1, Number(highestScoring.games_played || 1))).toFixed(1)} PPG`
+    : 'No data yet.';
+  const bestDefenseText = bestDefense
+    ? `${(Number(bestDefense.points_against || 0) / Math.max(1, Number(bestDefense.games_played || 1))).toFixed(1)} PAPG`
+    : 'No data yet.';
+  const topPowerText = topPower
+    ? `#${topPower.rank} • Score ${formatMaddenPowerScore(topPower.power_score)}`
+    : 'No power rankings yet.';
+
+  const teamRecords = [
+    `**Best Record**\n${formatMaddenRecordsTeamLine(bestRecord, bestRecord ? formatMaddenStandingsRecord(bestRecord) : 'No data yet.')}`,
+    `**Highest Scoring Team**\n${formatMaddenRecordsTeamLine(highestScoring, highestScoringText)}`,
+    `**Best Defense**\n${formatMaddenRecordsTeamLine(bestDefense, bestDefenseText)}`,
+    `**Top Power Ranked Team**\n${formatMaddenRecordsTeamLine(topPower, topPowerText)}`,
+  ].join('\n\n');
+
+  return new EmbedBuilder()
+    .setTitle('🏆 Madden League Records • ' + (league.league_name || 'Madden League'))
+    .setColor(0xF1C40F)
+    .setDescription('Current-season records generated from imported Madden stats.')
+    .addFields(
+      { name: 'Player Records', value: playerRecords.slice(0, 1024), inline: false },
+      { name: 'Team Records', value: teamRecords.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:League Records`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-8A League Records' })
+    .setTimestamp();
+}
+
 async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = null, limit = 10) {
   await ensureMaddenPlayerPersistenceTables();
 
@@ -27813,7 +27931,7 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
   }
 
   const teamName = franchise.team_name;
-  const [teamStatsResult, detailedRanks, leaders, topPlayers, recentGamesResult, nextGame] = await Promise.all([
+  const [teamStatsResult, detailedRanks, leaders, topPlayers, recentGamesResult, nextGame, powerRankResult] = await Promise.all([
     pool.query(
       `SELECT *
        FROM madden_imported_team_stats
@@ -27848,6 +27966,14 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
       [guild.id, league.league_id, String(teamName).toLowerCase(), String(getMaddenTeamAbbrev(teamName) || '').toLowerCase()]
     ),
     findMaddenGameCenterGame(guild.id, league.league_id, teamName, null, null).catch(() => null),
+    pool.query(
+      `SELECT *
+       FROM madden_power_rankings
+       WHERE league_id::text = $1::text
+         AND LOWER(team_name) = LOWER($2)
+       LIMIT 1`,
+      [league.league_id, teamName]
+    ).catch(() => ({ rows: [] })),
   ]);
 
   const teamStats = teamStatsResult.rows?.[0] || {};
@@ -27855,6 +27981,8 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
   const pf = Number(teamStats.points_for || 0);
   const pa = Number(teamStats.points_against || 0);
   const diff = pf - pa;
+  const powerRank = powerRankResult?.rows?.[0] || null;
+  const powerRankText = powerRank ? `Power Rank: #${powerRank.rank} ${formatMaddenPowerMovement(powerRank)}` : 'Power Rank: Not calculated';
 
   const leadersText = leaders.length
     ? leaders.map(item => `**${item.label}:** ${item.text}`).join('\n')
