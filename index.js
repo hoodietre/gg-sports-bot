@@ -18462,7 +18462,26 @@ function isMaddenRawPayloadRookie(rawPayload) {
   return false;
 }
 
+function getMaddenYearsProValue(player) {
+  const directNames = ['yearsPro', 'yearspro', 'years_pro', 'yrsPro', 'yrspro', 'yrs_pro', 'proYears', 'proyears', 'pro_years', 'yearsInLeague', 'yearsinleague', 'nflYears', 'nflyears', 'experience', 'exp'];
+  for (const name of directNames) {
+    if (player && Object.prototype.hasOwnProperty.call(player, name)) {
+      const n = Number(String(player[name]).replace(/[^0-9.-]/g, ''));
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  const raw = parseMaddenJsonMaybe(player?.roster_raw_payload || player?.raw_payload || player?.roster_raw_payload_text);
+  const rawValue = findMaddenRawValueByKey(raw, directNames);
+  if (rawValue != null && rawValue !== '') {
+    const n = Number(String(rawValue).replace(/[^0-9.-]/g, ''));
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 function isMaddenRookieCandidate(player) {
+  const yearsPro = getMaddenYearsProValue(player);
+  if (yearsPro != null) return yearsPro === 0;
   return player.is_rookie === true || isMaddenRawPayloadRookie(player.roster_raw_payload || player.raw_payload || player.roster_raw_payload_text);
 }
 
@@ -18556,7 +18575,7 @@ async function buildMaddenRookieDataProbeEmbed(guildId, leagueId, league, player
     .setTitle(`🔎 Madden Rookie Data Probe • ${league?.league_name || 'Madden League'}`)
     .setDescription(description)
     .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • 7J-7ZR-B Rookie Data Probe' })
+    .setFooter({ text: 'GG Sports • 7J-7ZR-D Rookie/Draft Fix' })
     .setTimestamp();
 }
 
@@ -19351,6 +19370,18 @@ function maddenFindPlayerMetadataValue(player, raw, columnNames, rawKeyPatterns)
   return maddenDeepFindRawValue(raw, rawKeyPatterns);
 }
 
+function maddenCorrectEaDraftDisplayValue(label, value) {
+  if (value == null) return value;
+  if (!['Draft Round', 'Draft Pick'].includes(label)) return value;
+  const n = Number(String(value).replace(/[^0-9.-]/g, ''));
+  if (!Number.isFinite(n)) return value;
+  // EA roster payloads in this import are shifted by +1 for draft round/pick display.
+  // Example verified in test league: Cam Ward imported as draftRound 2 / draftPick 2, but should display Round 1 / Pick 1.
+  if (n > 0) return String(Math.max(1, n - 1));
+  return String(n);
+}
+
+
 function buildMaddenImportedMetadataText(player) {
   const raw = player?.raw_payload && typeof player.raw_payload === 'object' ? player.raw_payload : {};
   const metadata = [
@@ -19362,7 +19393,8 @@ function buildMaddenImportedMetadataText(player) {
   ];
   const lines = metadata.map(([label, columns, patterns]) => {
     const value = maddenFindPlayerMetadataValue(player, raw, columns, patterns);
-    return `**${label}:** ${value ?? 'Not Imported'}`;
+    const displayValue = maddenCorrectEaDraftDisplayValue(label, value);
+    return `**${label}:** ${displayValue ?? 'Not Imported'}`;
   });
   return lines.join('\n');
 }
