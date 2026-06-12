@@ -19426,8 +19426,7 @@ function buildMaddenCareerLeaderSnapshot({ passRows, rushRows, recRows, sackRows
     formatMaddenCareerLeaderLine('Receiving', recRows?.[0], row => `${formatMaddenLeaderNumber(row.career_rec_yards)} RECYDS • ${formatMaddenLeaderNumber(row.career_rec_tds)} RECTD`),
     formatMaddenCareerLeaderLine('Sacks', sackRows?.[0], row => `${formatMaddenLeaderNumber(row.career_sacks)} SACK`),
     formatMaddenCareerLeaderLine('Interceptions', intRows?.[0], row => `${formatMaddenLeaderNumber(row.career_interceptions)} INT`),
-  ].join('
-');
+  ].join('\n');
 }
 
 async function buildMaddenHallOfFameEmbed(guildId, league) {
