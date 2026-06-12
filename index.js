@@ -1334,7 +1334,6 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('disconnect').setDescription('Disconnect your EA Direct Madden connection').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
 
-      .addSubcommand(sc => sc.setName('eaconfig').setDescription('Staff: check EA Direct auth configuration'))
 ,
 
     new SlashCommandBuilder()
