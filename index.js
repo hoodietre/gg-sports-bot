@@ -19322,55 +19322,128 @@ function formatMaddenHallOfFameAwardsLine(label, race, icon) {
 }
 
 async function getMaddenHallOfFameRows(guildId, leagueId) {
+  await ensureMaddenPlayerPersistenceTables();
   await ensureMaddenCareerRecordsFoundationTable();
   const result = await pool.query(
-    `SELECT *,
-       ROUND(
-         (career_pass_yards * 0.02) + (career_pass_tds * 5) +
-         (career_rush_yards * 0.03) + (career_rush_tds * 5) +
-         (career_rec_yards * 0.03) + (career_rec_tds * 5) +
-         (career_sacks * 8) + (career_interceptions * 10)
-       ) AS hof_score
-     FROM madden_career_records
-     WHERE guild_id = $1::text
-       AND league_id = $2::text
+    `WITH enriched AS (
+       SELECT
+         cr.*,
+         COALESCE(NULLIF(cr.team_name, ''), NULLIF(p.team_name, '')) AS resolved_team_name,
+         COALESCE(NULLIF(cr.position, ''), NULLIF(p.position, '')) AS resolved_position,
+         ROUND(
+           (cr.career_pass_yards * 0.02) + (cr.career_pass_tds * 5) +
+           (cr.career_rush_yards * 0.03) + (cr.career_rush_tds * 5) +
+           (cr.career_rec_yards * 0.03) + (cr.career_rec_tds * 5) +
+           (cr.career_sacks * 8) + (cr.career_interceptions * 10)
+         ) AS hof_score
+       FROM madden_career_records cr
+       LEFT JOIN LATERAL (
+         SELECT p.team_name, p.position
+         FROM madden_players p
+         WHERE p.guild_id = cr.guild_id
+           AND p.league_id::text = cr.league_id::text
+           AND (
+             NULLIF(p.roster_id, '') = NULLIF(cr.player_key, '') OR
+             NULLIF(p.presentation_id, '') = NULLIF(cr.player_key, '') OR
+             NULLIF(p.id, '') = NULLIF(cr.player_key, '') OR
+             LOWER(NULLIF(p.full_name, '')) = LOWER(NULLIF(cr.player_name, ''))
+           )
+         ORDER BY p.imported_at DESC NULLS LAST
+         LIMIT 1
+       ) p ON TRUE
+       WHERE cr.guild_id = $1::text
+         AND cr.league_id = $2::text
+     )
+     SELECT *
+     FROM enriched
      ORDER BY hof_score DESC NULLS LAST, player_name ASC
      LIMIT 15`,
     [guildId, leagueId]
-  ).catch(() => ({ rows: [] }));
+  ).catch(error => {
+    console.warn('Madden Hall of Fame rows failed:', error.message);
+    return { rows: [] };
+  });
   return result.rows || [];
 }
 
 async function getMaddenHallOfFameCategoryRows(guildId, leagueId, whereSql, orderSql, limit = 5) {
+  await ensureMaddenPlayerPersistenceTables();
   await ensureMaddenCareerRecordsFoundationTable();
   const result = await pool.query(
-    `SELECT *,
-       ROUND(
-         (career_pass_yards * 0.02) + (career_pass_tds * 5) +
-         (career_rush_yards * 0.03) + (career_rush_tds * 5) +
-         (career_rec_yards * 0.03) + (career_rec_tds * 5) +
-         (career_sacks * 8) + (career_interceptions * 10)
-       ) AS hof_score
-     FROM madden_career_records
-     WHERE guild_id = $1::text
-       AND league_id = $2::text
-       AND (${whereSql})
+    `WITH enriched AS (
+       SELECT
+         cr.*,
+         COALESCE(NULLIF(cr.team_name, ''), NULLIF(p.team_name, '')) AS resolved_team_name,
+         COALESCE(NULLIF(cr.position, ''), NULLIF(p.position, '')) AS resolved_position,
+         ROUND(
+           (cr.career_pass_yards * 0.02) + (cr.career_pass_tds * 5) +
+           (cr.career_rush_yards * 0.03) + (cr.career_rush_tds * 5) +
+           (cr.career_rec_yards * 0.03) + (cr.career_rec_tds * 5) +
+           (cr.career_sacks * 8) + (cr.career_interceptions * 10)
+         ) AS hof_score
+       FROM madden_career_records cr
+       LEFT JOIN LATERAL (
+         SELECT p.team_name, p.position
+         FROM madden_players p
+         WHERE p.guild_id = cr.guild_id
+           AND p.league_id::text = cr.league_id::text
+           AND (
+             NULLIF(p.roster_id, '') = NULLIF(cr.player_key, '') OR
+             NULLIF(p.presentation_id, '') = NULLIF(cr.player_key, '') OR
+             NULLIF(p.id, '') = NULLIF(cr.player_key, '') OR
+             LOWER(NULLIF(p.full_name, '')) = LOWER(NULLIF(cr.player_name, ''))
+           )
+         ORDER BY p.imported_at DESC NULLS LAST
+         LIMIT 1
+       ) p ON TRUE
+       WHERE cr.guild_id = $1::text
+         AND cr.league_id = $2::text
+     )
+     SELECT *
+     FROM enriched
+     WHERE (${whereSql})
      ORDER BY ${orderSql}
      LIMIT $3::int`,
     [guildId, leagueId, limit]
-  ).catch(() => ({ rows: [] }));
+  ).catch(error => {
+    console.warn('Madden Hall of Fame category rows failed:', error.message);
+    return { rows: [] };
+  });
   return result.rows || [];
+}
+
+function formatMaddenCareerLeaderLine(label, row, statText) {
+  if (!row) return `**${label}:** No data yet.`;
+  const team = maddenHallOfFameTeamText(row);
+  const position = maddenHallOfFamePositionText(row);
+  return `**${label}:** ${row.player_name || 'Unknown Player'} (${team} ${position}) — ${statText(row)}`;
+}
+
+function buildMaddenCareerLeaderSnapshot({ passRows, rushRows, recRows, sackRows, intRows }) {
+  return [
+    formatMaddenCareerLeaderLine('Passing', passRows?.[0], row => `${formatMaddenLeaderNumber(row.career_pass_yards)} PYDS • ${formatMaddenLeaderNumber(row.career_pass_tds)} PTD`),
+    formatMaddenCareerLeaderLine('Rushing', rushRows?.[0], row => `${formatMaddenLeaderNumber(row.career_rush_yards)} RYDS • ${formatMaddenLeaderNumber(row.career_rush_tds)} RTD`),
+    formatMaddenCareerLeaderLine('Receiving', recRows?.[0], row => `${formatMaddenLeaderNumber(row.career_rec_yards)} RECYDS • ${formatMaddenLeaderNumber(row.career_rec_tds)} RECTD`),
+    formatMaddenCareerLeaderLine('Sacks', sackRows?.[0], row => `${formatMaddenLeaderNumber(row.career_sacks)} SACK`),
+    formatMaddenCareerLeaderLine('Interceptions', intRows?.[0], row => `${formatMaddenLeaderNumber(row.career_interceptions)} INT`),
+  ].join('
+');
 }
 
 async function buildMaddenHallOfFameEmbed(guildId, league) {
   const leagueId = league.league_id;
   await refreshMaddenCareerRecordsFoundation(guildId, leagueId);
 
-  const [overallRows, qbRows, skillRows, defensiveRows, mvpRace, opoyRace, dpoyRace, oroyRace, droyRace] = await Promise.all([
+  const [overallRows, qbRows, skillRows, defensiveRows, passRows, rushRows, recRows, sackRows, intRows, mvpRace, opoyRace, dpoyRace, oroyRace, droyRace] = await Promise.all([
     getMaddenHallOfFameRows(guildId, leagueId),
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_pass_yards > 0 OR career_pass_tds > 0)`, 'career_pass_tds DESC, career_pass_yards DESC, hof_score DESC', 5),
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_rush_yards > 0 OR career_rec_yards > 0 OR career_rush_tds > 0 OR career_rec_tds > 0)`, '(career_rush_tds + career_rec_tds) DESC, (career_rush_yards + career_rec_yards) DESC, hof_score DESC', 5),
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_sacks > 0 OR career_interceptions > 0)`, '(career_sacks * 8 + career_interceptions * 10) DESC, hof_score DESC', 5),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_pass_yards > 0 OR career_pass_tds > 0)`, 'career_pass_yards DESC, career_pass_tds DESC, hof_score DESC', 1),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_rush_yards > 0 OR career_rush_tds > 0)`, 'career_rush_yards DESC, career_rush_tds DESC, hof_score DESC', 1),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_rec_yards > 0 OR career_rec_tds > 0)`, 'career_rec_yards DESC, career_rec_tds DESC, hof_score DESC', 1),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_sacks > 0)`, 'career_sacks DESC, hof_score DESC', 1),
+    getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_interceptions > 0)`, 'career_interceptions DESC, hof_score DESC', 1),
     getMaddenAwardsRace(guildId, leagueId, 'mvp', 1).catch(() => []),
     getMaddenAwardsRace(guildId, leagueId, 'opoy', 1).catch(() => []),
     getMaddenAwardsRace(guildId, leagueId, 'dpoy', 1).catch(() => []),
@@ -19386,22 +19459,24 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
     formatMaddenHallOfFameAwardsLine('DROY Favorite', droyRace, '🔒'),
   ].join('\n');
 
+  const careerLeaders = buildMaddenCareerLeaderSnapshot({ passRows, rushRows, recRows, sackRows, intRows });
   const topPlayer = overallRows?.[0] || null;
-  const thumb = getMaddenTeamLogoUrl(topPlayer?.team_name);
+  const thumb = getMaddenTeamLogoUrl(topPlayer?.resolved_team_name || topPlayer?.team_name);
   const embed = new EmbedBuilder()
     .setTitle('🏛️ Madden Hall of Fame • ' + (league.league_name || 'Madden League'))
     .setColor(0x9B59B6)
-    .setDescription('Career foundation leaderboard generated from imported Madden stats. This view starts the long-term league legacy system and will grow stronger every season.')
+    .setDescription('Legacy leaderboard generated from imported Madden career foundation data. This is the Hall of Fame foundation and will become more powerful every season.')
     .addFields(
-      { name: '👑 Hall of Fame Score Leaders', value: formatMaddenHallOfFameList(overallRows, 5).slice(0, 1024), inline: false },
+      { name: '🏛️ Career Leaders Snapshot', value: careerLeaders.slice(0, 1024), inline: false },
+      { name: '👑 Legacy Score Leaders', value: formatMaddenHallOfFameList(overallRows, 5).slice(0, 1024), inline: false },
       { name: '🏈 Quarterback Resume', value: formatMaddenHallOfFameList(qbRows, 3).slice(0, 1024), inline: false },
       { name: '⚡ Skill Player Resume', value: formatMaddenHallOfFameList(skillRows, 3).slice(0, 1024), inline: false },
       { name: '🛡️ Defensive Resume', value: formatMaddenHallOfFameList(defensiveRows, 3).slice(0, 1024), inline: false },
       { name: '🏆 Current Awards Watch', value: awardsWatch.slice(0, 1024), inline: false },
-      { name: 'Scoring Model', value: '`Pass/Rush/Rec Yards + TDs + Sacks + INTs` • future seasons can add MVPs, championships, and playoff success.', inline: false },
+      { name: 'Scoring Model', value: '`Career yards + TDs + sacks + INTs` • future seasons can add MVPs, championships, and playoff success.', inline: false },
       { name: 'Command', value: '`/madden franchise view:Hall of Fame`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8B Hall of Fame' })
+    .setFooter({ text: 'GG Sports • 7J-8B-A Hall of Fame Polish' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
