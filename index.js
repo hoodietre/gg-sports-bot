@@ -1264,8 +1264,8 @@ function buildCommands() {
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
         .addStringOption(o => o.setName('probe_player').setDescription('Debug: inspect rookie/experience fields for a player').setRequired(false)))
       .addSubcommand(sc => sc.setName('matchup').setDescription('Preview a Madden matchup with team stats, leaders, and prediction')
-        .addStringOption(o => o.setName('home_team').setDescription('Home team').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('away_team').setDescription('Away team').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('home_team').setDescription('Current-week home team').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('away_team').setDescription('Current-week away team/opponent').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       
 
@@ -3477,6 +3477,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
               interaction.guild.id,
               activeLeague.league_id,
               focused.value
+            );
+
+            await interaction.respond(choices);
+            return;
+          }
+
+if (subcommand === 'matchup' && (focused?.name === 'home_team' || focused?.name === 'away_team')) {
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName
+              ? await getLeagueByName(interaction.guild.id, leagueName)
+              : await getDefaultLeague(interaction.guild.id);
+
+            if (!activeLeague) {
+              await interaction.respond([]);
+              return;
+            }
+
+            const selectedHome = interaction.options.getString('home_team');
+            const selectedAway = interaction.options.getString('away_team');
+            const choices = await getMaddenCurrentWeekMatchupAutocompleteChoices(
+              interaction.guild.id,
+              activeLeague.league_id,
+              focused.name,
+              focused.value,
+              selectedHome,
+              selectedAway
             );
 
             await interaction.respond(choices);
@@ -19141,6 +19167,90 @@ async function findMaddenPlayerFromWeeklyStats(guildId, leagueId, name, team = n
 }
 
 
+
+
+function normalizeMaddenAutocompleteText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function getMaddenCurrentWeekMatchupRows(guildId, leagueId) {
+  const result = await pool.query(
+    `WITH games AS (
+       SELECT *,
+         COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int AS week_num,
+         CASE
+           WHEN LOWER(COALESCE(status, '')) IN ('completed', 'home_win', 'away_win', 'tie', 'completed_with_real_score')
+             OR COALESCE(home_score, 0) <> 0
+             OR COALESCE(away_score, 0) <> 0
+           THEN TRUE ELSE FALSE
+         END AS is_completed
+       FROM madden_imported_games
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+         AND COALESCE(home_team, '') <> ''
+         AND COALESCE(away_team, '') <> ''
+     ), target_week AS (
+       SELECT COALESCE(
+         (SELECT MIN(week_num) FROM games WHERE is_completed = FALSE AND week_num > 0),
+         (SELECT MAX(week_num) FROM games WHERE week_num > 0),
+         0
+       ) AS week_num
+     )
+     SELECT games.*
+     FROM games, target_week
+     WHERE games.week_num = target_week.week_num
+        OR target_week.week_num = 0
+     ORDER BY games.is_completed ASC, games.week_num ASC, games.away_team ASC, games.home_team ASC
+     LIMIT 50`,
+    [guildId, leagueId]
+  );
+  return result.rows || [];
+}
+
+function buildMaddenMatchupAutocompleteChoice(game, focusedName, selectedHome, selectedAway) {
+  const away = String(game.away_team || '').trim();
+  const home = String(game.home_team || '').trim();
+  const week = game.week_label || 'Week TBD';
+  const label = `${away} @ ${home} • ${week}`.slice(0, 100);
+
+  if (focusedName === 'home_team') {
+    return { name: label, value: home.slice(0, 100) };
+  }
+
+  const selectedHomeNorm = normalizeMaddenAutocompleteText(selectedHome);
+  const selectedAwayNorm = normalizeMaddenAutocompleteText(selectedAway);
+  if (selectedHomeNorm) {
+    if (normalizeMaddenAutocompleteText(home) === selectedHomeNorm) return { name: label, value: away.slice(0, 100) };
+    if (normalizeMaddenAutocompleteText(away) === selectedHomeNorm) return { name: label, value: home.slice(0, 100) };
+  }
+  if (selectedAwayNorm) {
+    if (normalizeMaddenAutocompleteText(home) === selectedAwayNorm) return { name: label, value: away.slice(0, 100) };
+    if (normalizeMaddenAutocompleteText(away) === selectedAwayNorm) return { name: label, value: home.slice(0, 100) };
+  }
+  return { name: label, value: away.slice(0, 100) };
+}
+
+async function getMaddenCurrentWeekMatchupAutocompleteChoices(guildId, leagueId, focusedName, focusedValue, selectedHome, selectedAway) {
+  const query = normalizeMaddenAutocompleteText(focusedValue);
+  const rows = await getMaddenCurrentWeekMatchupRows(guildId, leagueId).catch(() => []);
+  const seen = new Set();
+  const choices = [];
+
+  for (const game of rows) {
+    const choice = buildMaddenMatchupAutocompleteChoice(game, focusedName, selectedHome, selectedAway);
+    if (!choice?.value) continue;
+    const searchable = normalizeMaddenAutocompleteText(`${choice.name} ${choice.value}`);
+    if (query && !searchable.includes(query)) continue;
+    const key = normalizeMaddenAutocompleteText(choice.value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    choices.push(choice);
+    if (choices.length >= 25) break;
+  }
+
+  if (choices.length) return choices;
+  return getMaddenTeamAutocompleteChoices(guildId, leagueId, focusedValue);
+}
 
 async function getMaddenTeamAutocompleteChoices(guildId, leagueId, focusedValue) {
   await ensureMaddenPlayerPersistenceTables();
