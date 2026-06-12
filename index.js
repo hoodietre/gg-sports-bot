@@ -1263,6 +1263,10 @@ function buildCommands() {
           ))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
         .addStringOption(o => o.setName('probe_player').setDescription('Debug: inspect rookie/experience fields for a player').setRequired(false)))
+      .addSubcommand(sc => sc.setName('matchup').setDescription('Preview a Madden matchup with team stats, leaders, and prediction')
+        .addStringOption(o => o.setName('home_team').setDescription('Home team').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('away_team').setDescription('Away team').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       
 
       
@@ -5778,6 +5782,32 @@ if (gameSubcommand === 'report') {
 
         const rankings = await recalculateMaddenPowerRankings(interaction.guild.id, activeLeague.league_id);
         await interaction.reply({ embeds: [buildMaddenPowerRankingsEmbed(activeLeague, rankings)] });
+        return;
+      }
+
+      if (maddenSubcommand === 'matchup') {
+        const leagueName = interaction.options.getString('league');
+        const homeTeam = interaction.options.getString('home_team');
+        const awayTeam = interaction.options.getString('away_team');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        if (String(homeTeam || '').toLowerCase() === String(awayTeam || '').toLowerCase()) {
+          await interaction.reply({ content: 'Choose two different teams for the matchup preview.', ephemeral: true });
+          return;
+        }
+
+        const matchup = await getMaddenMatchupPreviewData(interaction.guild.id, activeLeague.league_id, homeTeam, awayTeam);
+        if (!matchup.home || !matchup.away) {
+          await interaction.reply({ content: 'I could not find imported Madden team stats for one or both teams. Try exact team names from `/madden standings` or `/madden teams`.', ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({ embeds: [buildMaddenMatchupPreviewEmbed(activeLeague, matchup)] });
         return;
       }
 
@@ -15053,6 +15083,175 @@ function buildMaddenPowerRankingsEmbed(league, rankings) {
     .setColor(0xFEE75C)
     .setDescription(lines.join(NL + NL).slice(0, 4096))
     .setFooter({ text: 'GG Sports • 7J-7ZQ-R Power Rankings' })
+    .setTimestamp();
+}
+
+
+function maddenTeamNameMatches(candidate, target) {
+  const c = String(candidate || '').trim().toLowerCase();
+  const t = String(target || '').trim().toLowerCase();
+  if (!c || !t) return false;
+  const cAbbr = String(getMaddenTeamAbbrev(candidate) || '').trim().toLowerCase();
+  const tAbbr = String(getMaddenTeamAbbrev(target) || '').trim().toLowerCase();
+  return c === t || (!!cAbbr && cAbbr === t) || (!!tAbbr && c === tAbbr) || (!!cAbbr && !!tAbbr && cAbbr === tAbbr);
+}
+
+function maddenRecordWinPct(row) {
+  const wins = Number(row?.wins || 0);
+  const losses = Number(row?.losses || 0);
+  const ties = Number(row?.ties || 0);
+  const games = wins + losses + ties;
+  return games > 0 ? (wins + (ties * 0.5)) / games : 0;
+}
+
+function maddenTeamGamesPlayed(row) {
+  return Math.max(1, Number(row?.wins || 0) + Number(row?.losses || 0) + Number(row?.ties || 0));
+}
+
+function formatMaddenOneDecimal(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return '0.0';
+  return n.toFixed(1);
+}
+
+async function getMaddenImportedTeamRow(guildId, leagueId, teamName) {
+  const result = await pool.query(
+    `SELECT *
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND (
+         LOWER(team_name) = LOWER($3)
+         OR LOWER(team_name) = LOWER($4)
+       )
+     LIMIT 1`,
+    [guildId, leagueId, teamName, getMaddenTeamAbbrev(teamName)]
+  );
+  return result.rows?.[0] || null;
+}
+
+async function getMaddenTeamSeasonLeader(guildId, leagueId, teamName, categoryKey) {
+  const result = await getMaddenLeagueLeaders(guildId, leagueId, categoryKey, null, 250).catch(() => ({ rows: [] }));
+  return (result.rows || []).find(row => maddenTeamNameMatches(row.resolved_team_name || row.stat_team_name || row.team_name, teamName)) || null;
+}
+
+function formatMaddenMatchupLeader(row, fallback = 'No data') {
+  if (!row) return fallback;
+  const team = getMaddenTeamAbbrev(row.resolved_team_name || row.stat_team_name || row.team_name);
+  const position = row.position ? ` ${String(row.position).toUpperCase()}` : '';
+  const value = row.leader_value != null ? ` — ${formatMaddenLeaderNumber(row.leader_value)}` : '';
+  return `${row.player_name || 'Unknown'}${team ? ` (${team}${position})` : position}${value}`;
+}
+
+function getMaddenMatchupTeamScore(team, powerRow) {
+  const wins = Number(team?.wins || 0);
+  const losses = Number(team?.losses || 0);
+  const ties = Number(team?.ties || 0);
+  const pointDiff = Number(team?.points_for || 0) - Number(team?.points_against || 0);
+  const games = Math.max(1, wins + losses + ties);
+  const winPct = maddenRecordWinPct(team);
+  const offenseRank = Number(powerRow?.offense_rank || 33);
+  const defenseRank = Number(powerRow?.defense_rank || 33);
+  return (winPct * 100) + ((pointDiff / games) * 6) + ((33 - offenseRank) * 4) + ((33 - defenseRank) * 4);
+}
+
+function getMaddenProjectedScore(team, opponent, teamScore, opponentScore) {
+  const games = maddenTeamGamesPlayed(team);
+  const oppGames = maddenTeamGamesPlayed(opponent);
+  const ppg = Number(team?.points_for || 0) / games;
+  const oppPapg = Number(opponent?.points_against || 0) / oppGames;
+  const base = (ppg + oppPapg) / 2;
+  const edge = Math.max(-10, Math.min(10, (teamScore - opponentScore) / 12));
+  return Math.max(0, Math.round(base + edge));
+}
+
+async function getMaddenMatchupPreviewData(guildId, leagueId, homeTeamName, awayTeamName) {
+  const [home, away, rankings] = await Promise.all([
+    getMaddenImportedTeamRow(guildId, leagueId, homeTeamName),
+    getMaddenImportedTeamRow(guildId, leagueId, awayTeamName),
+    recalculateMaddenPowerRankings(guildId, leagueId).catch(() => []),
+  ]);
+
+  const homeName = home?.team_name || homeTeamName;
+  const awayName = away?.team_name || awayTeamName;
+  const homePower = (rankings || []).find(row => maddenTeamNameMatches(row.team_name, homeName)) || null;
+  const awayPower = (rankings || []).find(row => maddenTeamNameMatches(row.team_name, awayName)) || null;
+
+  const [homeQB, awayQB, homeRB, awayRB, homeWR, awayWR] = await Promise.all([
+    getMaddenTeamSeasonLeader(guildId, leagueId, homeName, 'passing'),
+    getMaddenTeamSeasonLeader(guildId, leagueId, awayName, 'passing'),
+    getMaddenTeamSeasonLeader(guildId, leagueId, homeName, 'rushing'),
+    getMaddenTeamSeasonLeader(guildId, leagueId, awayName, 'rushing'),
+    getMaddenTeamSeasonLeader(guildId, leagueId, homeName, 'receiving'),
+    getMaddenTeamSeasonLeader(guildId, leagueId, awayName, 'receiving'),
+  ]);
+
+  const homeScore = getMaddenMatchupTeamScore(home, homePower);
+  const awayScore = getMaddenMatchupTeamScore(away, awayPower);
+  const projectedHome = getMaddenProjectedScore(home, away, homeScore, awayScore);
+  const projectedAway = getMaddenProjectedScore(away, home, awayScore, homeScore);
+  const totalScore = Math.max(1, homeScore + awayScore);
+  const homeProb = Math.max(5, Math.min(95, Math.round((homeScore / totalScore) * 100)));
+  const awayProb = 100 - homeProb;
+
+  return {
+    home,
+    away,
+    homePower,
+    awayPower,
+    leaders: { homeQB, awayQB, homeRB, awayRB, homeWR, awayWR },
+    prediction: { projectedHome, projectedAway, homeProb, awayProb, homeScore, awayScore },
+  };
+}
+
+function buildMaddenMatchupPreviewEmbed(league, matchup) {
+  const home = matchup.home;
+  const away = matchup.away;
+  const homeGames = maddenTeamGamesPlayed(home);
+  const awayGames = maddenTeamGamesPlayed(away);
+  const homePf = Number(home.points_for || 0);
+  const homePa = Number(home.points_against || 0);
+  const awayPf = Number(away.points_for || 0);
+  const awayPa = Number(away.points_against || 0);
+  const homeDiff = homePf - homePa;
+  const awayDiff = awayPf - awayPa;
+  const homeName = home.team_name;
+  const awayName = away.team_name;
+  const favorite = matchup.prediction.projectedHome === matchup.prediction.projectedAway
+    ? 'Even matchup'
+    : (matchup.prediction.projectedHome > matchup.prediction.projectedAway ? homeName : awayName);
+
+  return new EmbedBuilder()
+    .setTitle('🏈 Madden Matchup Preview • ' + (league.league_name || 'Madden League'))
+    .setColor(0x5865F2)
+    .setDescription(`**${awayName} vs ${homeName}**`)
+    .addFields(
+      { name: 'Record', value: `${formatMaddenStandingsRecord(away)} vs ${formatMaddenStandingsRecord(home)}`, inline: true },
+      { name: 'PPG', value: `${formatMaddenOneDecimal(awayPf / awayGames)} vs ${formatMaddenOneDecimal(homePf / homeGames)}`, inline: true },
+      { name: 'PAPG', value: `${formatMaddenOneDecimal(awayPa / awayGames)} vs ${formatMaddenOneDecimal(homePa / homeGames)}`, inline: true },
+      { name: 'Point Differential', value: `${awayDiff >= 0 ? '+' : ''}${awayDiff} vs ${homeDiff >= 0 ? '+' : ''}${homeDiff}`, inline: true },
+      { name: 'Power Rank', value: `#${matchup.awayPower?.rank || 'N/A'} vs #${matchup.homePower?.rank || 'N/A'}`, inline: true },
+      { name: 'Off / Def Rank', value: `OFF #${matchup.awayPower?.offense_rank || 'N/A'} • DEF #${matchup.awayPower?.defense_rank || 'N/A'}
+OFF #${matchup.homePower?.offense_rank || 'N/A'} • DEF #${matchup.homePower?.defense_rank || 'N/A'}`, inline: true },
+      { name: 'Top QB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayQB)}
+vs
+${formatMaddenMatchupLeader(matchup.leaders.homeQB)}`, inline: true },
+      { name: 'Top RB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayRB)}
+vs
+${formatMaddenMatchupLeader(matchup.leaders.homeRB)}`, inline: true },
+      { name: 'Top WR', value: `${formatMaddenMatchupLeader(matchup.leaders.awayWR)}
+vs
+${formatMaddenMatchupLeader(matchup.leaders.homeWR)}`, inline: true },
+      { name: '🤖 GG Sports Prediction', value: `**${awayName} ${matchup.prediction.projectedAway}**
+**${homeName} ${matchup.prediction.projectedHome}**
+
+Favorite: **${favorite}**
+
+Win Probability
+${awayName}: **${matchup.prediction.awayProb}%**
+${homeName}: **${matchup.prediction.homeProb}%**`, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-7ZS Matchup Preview' })
     .setTimestamp();
 }
 
