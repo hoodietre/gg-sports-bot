@@ -15570,8 +15570,18 @@ function maddenGameHasImportedStats(game) {
 function maddenIsGameFinalLike(game) {
   const status = String(game?.status || '').toLowerCase();
   if (status === 'scheduled' || status === 'not_played' || status === 'not played') return false;
-  if (['away_win', 'home_win', 'tie'].includes(status)) return true;
-  return ['final', 'completed', 'complete', 'completed_with_real_score'].includes(status) || maddenGameHasScore(game) || maddenGameHasImportedStats(game);
+
+  // 7J-9B-J: Never treat winner-only zero-score rows as final.
+  // EA schedule rows can expose gameResult/forceWin-style values before kickoff, which previously
+  // produced fake Week 9 finals. A winner status only counts as final when supported by a real
+  // score, imported stat lines, or a trusted played/completed timestamp.
+  const hasCompletionEvidence =
+    maddenGameHasScore(game) ||
+    maddenGameHasImportedStats(game) ||
+    Boolean(game?.played_at || game?.completed_at || game?.finalized_at);
+  if (['away_win', 'home_win', 'tie'].includes(status)) return hasCompletionEvidence;
+
+  return ['final', 'completed', 'complete', 'completed_with_real_score'].includes(status) && hasCompletionEvidence;
 }
 
 function getMaddenGameWinner(game) {
@@ -19117,7 +19127,7 @@ ${formatMaddenAwardStatLine(player, race.type)}${rookieText}`;
     .setTitle(`${race.emoji} Madden ${race.title} • ${league.league_name || 'Madden League'}`)
     .setColor(0xFEE75C)
     .setDescription(lines.slice(0, 3900))
-    .setFooter({ text: 'GG Sports • 7J-9B-I Safe Game Result Detection' })
+    .setFooter({ text: 'GG Sports • 7J-9B-J Zero-Score Game Cleanup' })
     .setTimestamp();
 }
 
@@ -22222,19 +22232,23 @@ async function repairMaddenImportedZeroZeroCompletedGames(guild, league, label =
   const enabled = String(process.env.EA_REPAIR_ZERO_ZERO_COMPLETED_GAMES_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return { repaired: 0, skipped: true };
 
+  // 7J-9B-J: Zero-score winner statuses are not trustworthy.
+  // EA schedule exports can include gameResult/forceWin-style values for unplayed games. If there
+  // is no score at all, push every final-like/winner-like row back to Scheduled so Recent Games,
+  // Game Center, Dynasty Tracker, and matchup autocomplete do not treat future games as results.
   const result = await pool.query(
     `UPDATE madden_imported_games
      SET status = 'scheduled',
          imported_at = NOW()
      WHERE guild_id = $1
        AND league_id = $2
-       AND status IN ('completed', 'final', 'complete', 'completed_with_real_score')
+       AND status IN ('completed', 'final', 'complete', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
        AND COALESCE(home_score, 0) = 0
        AND COALESCE(away_score, 0) = 0`,
     [guild.id, league.league_id]
   );
 
-  console.log('[ZERO ZERO GAME REPAIR 7J-7ZP] ' + JSON.stringify({
+  console.log('[ZERO ZERO GAME REPAIR 7J-9B-J] ' + JSON.stringify({
     label,
     repaired: Number(result.rowCount || 0),
     leagueId: league.league_id,
@@ -24616,7 +24630,23 @@ async function backfillMaddenGameScoresFromRawPayload(guild, league) {
       continue;
     }
 
-    if (winner && String(game.status || '').toLowerCase() !== 'completed_with_real_score') {
+    let raw = game.raw_payload || {};
+    if (typeof raw === 'string') {
+      try { raw = JSON.parse(raw); } catch { raw = {}; }
+    }
+    const rawStatusText = String(getAnyValue(raw, ['status', 'gameStatus', 'statusText', 'gameStatusText'], '') || '').toLowerCase();
+    const playedMarker = getAnyValue(raw, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null);
+    const trustedCompletedMarker =
+      ['final', 'complete', 'completed', 'played', 'finished', 'closed'].includes(rawStatusText) ||
+      rawStatusText.includes('final') ||
+      rawStatusText.includes('complete') ||
+      rawStatusText.includes('played') ||
+      Boolean(playedMarker);
+
+    // 7J-9B-J: Do not backfill winner-only statuses from forceWin/gameResult unless the raw row
+    // also proves the game was actually played. Without this guard, future schedule rows become
+    // fake finals such as 0-0 away_win.
+    if (winner && trustedCompletedMarker && String(game.status || '').toLowerCase() !== 'completed_with_real_score') {
       const winnerStatus = winner === 'home' ? 'home_win' : winner === 'away' ? 'away_win' : 'tie';
       await pool.query(
         `UPDATE madden_imported_games
