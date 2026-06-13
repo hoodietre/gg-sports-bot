@@ -18790,8 +18790,12 @@ function mergeMaddenAwardRow(map, row) {
   if (!current.roster_raw_payload && (row.roster_raw_payload_text || row.roster_raw_payload || row.raw_payload)) current.roster_raw_payload = row.roster_raw_payload_text || row.roster_raw_payload || row.raw_payload;
   current.is_rookie = current.is_rookie || isMaddenRawPayloadRookie(current.roster_raw_payload);
 
+  // 7J-9B-D: Award races may pull multiple leader categories from the same stat type
+  // (ex: passing + passing_tds both contain passYds/passTDs/passInts). These rows are
+  // season-total snapshots, not separate stat events, so adding them double-counts.
+  // Keep the highest season snapshot per field instead.
   for (const field of ['passYds','passTDs','passInts','rushYds','rushTDs','recYds','recTDs','recCatches','defTotalTackles','defSacks','defInts','defForcedFum','defDeflections','defTDs']) {
-    current[field] += Number(row[field] || 0);
+    current[field] = Math.max(Number(current[field] || 0), Number(row[field] || 0));
   }
 
   map.set(key, current);
@@ -19060,7 +19064,7 @@ ${formatMaddenAwardStatLine(player, race.type)}${rookieText}`;
     .setTitle(`${race.emoji} Madden ${race.title} • ${league.league_name || 'Madden League'}`)
     .setColor(0xFEE75C)
     .setDescription(lines.slice(0, 3900))
-    .setFooter({ text: 'GG Sports • Madden Awards Race' })
+    .setFooter({ text: 'GG Sports • 7J-9B-D Awards Double Count Fix' })
     .setTimestamp();
 }
 
