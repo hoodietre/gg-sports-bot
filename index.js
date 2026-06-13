@@ -1336,7 +1336,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' }, { name: 'Results Diagnostics', value: 'results_diag' }, { name: 'EA Endpoint Discovery', value: 'endpoint_discovery' }, { name: 'Raw Payload Deep Scan', value: 'raw_payload_scan' }, { name: 'Schedule Payload Inspector', value: 'schedule_payload_inspector' }, { name: 'Schedule Status Decoder', value: 'schedule_status_decoder' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' }, { name: 'Results Diagnostics', value: 'results_diag' }, { name: 'EA Endpoint Discovery', value: 'endpoint_discovery' }, { name: 'Raw Payload Deep Scan', value: 'raw_payload_scan' }, { name: 'Schedule Payload Inspector', value: 'schedule_payload_inspector' }, { name: 'Schedule Status Decoder', value: 'schedule_status_decoder' }, { name: 'EA Direct Sync Source Audit', value: 'sync_source_audit' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6673,6 +6673,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'schedule_status_decoder') {
           const embed = await buildMaddenScheduleStatusDecoderEmbed(interaction.guild.id, activeLeague);
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'sync_source_audit') {
+          const embed = await buildMaddenEaDirectSyncSourceAuditEmbed(interaction.guild.id, activeLeague);
           await interaction.editReply({ embeds: [embed] });
           return;
         }
@@ -20670,6 +20676,149 @@ function maddenScheduleDecoderExtractGames(payload, limit = 5000) {
 
   walk(payload);
   return games;
+}
+
+
+async function buildMaddenEaDirectSyncSourceAuditEmbed(guildId, league) {
+  const leagueId = String(league?.league_id || '');
+  const NL = String.fromCharCode(10);
+
+  const syncRuns = await pool.query(
+    `SELECT id, status, source, message, week_label, imported_teams, imported_games, imported_players, started_at, completed_at
+     FROM madden_sync_runs
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     ORDER BY started_at DESC NULLS LAST, completed_at DESC NULLS LAST
+     LIMIT 5`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden sync source audit run query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const endpointRows = await pool.query(
+    `SELECT endpoint, payload_type, COUNT(*)::int AS count, MAX(created_at) AS latest_seen
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     GROUP BY endpoint, payload_type
+     ORDER BY count DESC, endpoint ASC
+     LIMIT 20`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden sync source audit endpoint query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const scheduleRows = await pool.query(
+    `WITH payload_rows AS (
+       SELECT endpoint, payload_type, raw_payload
+       FROM madden_sync_payloads
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+         AND endpoint ILIKE '%WeeklySchedules%'
+       ORDER BY created_at DESC
+       LIMIT 200
+     ), schedules AS (
+       SELECT
+         endpoint,
+         payload_type,
+         jsonb_array_elements(
+           CASE
+             WHEN jsonb_typeof(raw_payload->'gameScheduleInfoList') = 'array' THEN raw_payload->'gameScheduleInfoList'
+             WHEN jsonb_typeof(raw_payload->'scheduleInfoList') = 'array' THEN raw_payload->'scheduleInfoList'
+             WHEN jsonb_typeof(raw_payload->'games') = 'array' THEN raw_payload->'games'
+             WHEN jsonb_typeof(raw_payload->'schedule') = 'array' THEN raw_payload->'schedule'
+             ELSE '[]'::jsonb
+           END
+         ) AS game
+       FROM payload_rows
+     )
+     SELECT
+       COALESCE(game->>'weekIndex', game->>'week', 'missing') AS week_index,
+       COALESCE(game->>'status', game->>'gameStatus', 'missing') AS status_value,
+       COUNT(*)::int AS rows,
+       SUM(CASE WHEN COALESCE(NULLIF(game->>'homeScore',''), '0')::numeric <> 0 OR COALESCE(NULLIF(game->>'awayScore',''), '0')::numeric <> 0 THEN 1 ELSE 0 END)::int AS scored_rows,
+       MIN(LEFT(game::text, 220)) AS sample
+     FROM schedules
+     GROUP BY 1, 2
+     ORDER BY rows DESC, week_index ASC
+     LIMIT 20`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden sync source audit schedule query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const gameCoverage = await pool.query(
+    `SELECT
+       COUNT(*)::int AS imported_game_rows,
+       COUNT(DISTINCT COALESCE(week_label, 'Week TBD'))::int AS imported_weeks,
+       SUM(CASE WHEN COALESCE(home_score, 0) <> 0 OR COALESCE(away_score, 0) <> 0 THEN 1 ELSE 0 END)::int AS scored_game_rows,
+       SUM(CASE WHEN LOWER(COALESCE(status, 'scheduled')) = 'scheduled' THEN 1 ELSE 0 END)::int AS scheduled_game_rows,
+       MIN(COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int) AS min_week,
+       MAX(COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int) AS max_week
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden sync source audit game coverage query failed:', error.message);
+    return { rows: [{}] };
+  });
+
+  const sourceCodeClues = [
+    'Sync completion message still references CareerMode_GetStandingsExport and player-stat exports.',
+    'Stored payloads confirm WeeklySchedulesExport exists, but schedule objects are 0-0 and status=1.',
+    'No stored payload sample has proven scored game rows yet.',
+    'Current results/streak systems must stay schedule-safe until scored rows or a trusted completed marker is discovered.'
+  ];
+
+  const runLines = (syncRuns.rows || []).map(row => {
+    return `**${row.status || 'unknown'}** • teams ${row.imported_teams || 0} • games ${row.imported_games || 0} • players ${row.imported_players || 0}\n${String(row.message || '').slice(0, 180)}`;
+  });
+
+  const endpointLines = (endpointRows.rows || []).map(row => {
+    return `**${row.endpoint || 'unknown'}** • ${row.payload_type || 'payload'} • ${row.count} payload(s)`;
+  });
+
+  const scheduleLines = (scheduleRows.rows || []).map(row => {
+    return `weekIndex **${row.week_index}** • status **${row.status_value}** • rows ${row.rows} • scored ${row.scored_rows}`;
+  });
+
+  const coverage = gameCoverage.rows?.[0] || {};
+  const coverageText = [
+    `Imported game rows: **${Number(coverage.imported_game_rows || 0)}**`,
+    `Scored imported game rows: **${Number(coverage.scored_game_rows || 0)}**`,
+    `Scheduled imported game rows: **${Number(coverage.scheduled_game_rows || 0)}**`,
+    `Distinct imported weeks: **${Number(coverage.imported_weeks || 0)}** (${Number(coverage.min_week || 0)}–${Number(coverage.max_week || 0)})`
+  ].join(NL);
+
+  let diagnosis = 'Current sync source audit confirms schedules, standings, roster, and weekly stat sources are present. No scored imported game rows are confirmed yet.';
+  if (Number(coverage.scored_game_rows || 0) === 0) {
+    diagnosis += ' Keep Week 9 and other zero-score rows as Scheduled. Do not use status=1 or gameResult-like values as finals without a non-zero score or trusted completed marker.';
+  }
+
+  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl((scheduleRows.rows || [])[0]?.home_team || (league?.league_name || ''));
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧭 Madden EA Direct Sync Source Audit • ' + (league?.league_name || 'Madden League'))
+    .setColor(0x3498DB)
+    .setDescription('Safe audit of the EA Direct sync source layer. This does not alter sync data.')
+    .addFields(
+      { name: 'Imported Game Coverage', value: coverageText.slice(0, 1024), inline: false },
+      { name: 'Recent Sync Runs', value: (runLines.join(NL + NL) || 'No sync runs found.').slice(0, 1024), inline: false },
+      { name: 'Stored Payload Sources', value: (endpointLines.join(NL) || 'No stored payload endpoints found.').slice(0, 1024), inline: false },
+      { name: 'Weekly Schedule Shape', value: (scheduleLines.join(NL) || 'No WeeklySchedulesExport rows found.').slice(0, 1024), inline: false },
+      { name: 'Source Audit Notes', value: sourceCodeClues.join(NL).slice(0, 1024), inline: false },
+      { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:EA Direct Sync Source Audit`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10A EA Direct Sync Source Audit' })
+    .setTimestamp();
+
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
 }
 
 async function buildMaddenScheduleStatusDecoderEmbed(guildId, league) {
