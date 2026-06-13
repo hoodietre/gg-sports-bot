@@ -6531,28 +6531,36 @@ if (gameSubcommand === 'report') {
         const teamRole = interaction.options.getRole('team');
         const teamName = interaction.options.getString('team_name');
         const user = interaction.options.getUser('user');
+        const franchiseViewIsPrivate = view === 'hub';
+
+        // 7J-8B-D: franchise ecosystem views can run several DB-heavy queries.
+        // Defer immediately so Discord does not expire the interaction before the embed is ready.
+        if (!interaction.deferred && !interaction.replied) {
+          await interaction.deferReply({ ephemeral: franchiseViewIsPrivate });
+        }
+
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
           return;
         }
 
         if (view === 'news') {
           const embed = await buildMaddenNewsFeedEmbed(interaction.guild.id, activeLeague);
-          await interaction.reply({ embeds: [embed] });
+          await interaction.editReply({ embeds: [embed] });
           return;
         }
 
         if (view === 'records') {
           const embed = await buildMaddenLeagueRecordsEmbed(interaction.guild.id, activeLeague);
-          await interaction.reply({ embeds: [embed] });
+          await interaction.editReply({ embeds: [embed] });
           return;
         }
 
         if (view === 'hof') {
           const embed = await buildMaddenHallOfFameEmbed(interaction.guild.id, activeLeague);
-          await interaction.reply({ embeds: [embed] });
+          await interaction.editReply({ embeds: [embed] });
           return;
         }
 
@@ -6576,7 +6584,7 @@ if (gameSubcommand === 'report') {
         }
 
         const embed = await buildMaddenFranchiseEmbed(interaction.guild, activeLeague, resolvedTeamRoleId, resolvedUserId);
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
     }
