@@ -6653,6 +6653,12 @@ if (gameSubcommand === 'report') {
           return;
         }
 
+        if (view === 'endpoint_discovery') {
+          const embed = await buildMaddenEaEndpointDiscoveryEmbed(interaction.guild.id, activeLeague);
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
         let resolvedTeamRoleId = teamRole?.id || null;
         let resolvedUserId = user?.id || interaction.user.id;
 
@@ -20036,6 +20042,195 @@ function formatMaddenSeasonCloseChampionLine(row) {
 }
 
 
+
+function maddenEndpointDiscoveryTopKeys(value, limit = 24) {
+  if (!value || typeof value !== 'object') return [];
+  const keys = new Set();
+  const seen = new Set();
+
+  function walk(node, depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 3 || seen.has(node) || keys.size >= limit) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 8)) walk(item, depth + 1);
+      return;
+    }
+    for (const key of Object.keys(node).slice(0, 40)) {
+      keys.add(key);
+      walk(node[key], depth + 1);
+      if (keys.size >= limit) break;
+    }
+  }
+
+  walk(value);
+  return [...keys];
+}
+
+function maddenEndpointDiscoveryFindGameSignals(value, limit = 12) {
+  const found = [];
+  const seen = new Set();
+  const signalPattern = /(game|score|schedule|week|result|winner|home|away|box|stat)/i;
+
+  function preview(v) {
+    if (v == null) return '';
+    if (typeof v === 'object') return JSON.stringify(v).slice(0, 120);
+    return String(v).slice(0, 120);
+  }
+
+  function walk(node, path = '', depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 5 || seen.has(node) || found.length >= limit) return;
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      if (node.length && node.some(item => item && typeof item === 'object')) {
+        const sample = node.find(item => item && typeof item === 'object');
+        const sampleKeys = sample ? Object.keys(sample).slice(0, 10).join(', ') : '';
+        if (signalPattern.test(path + ' ' + sampleKeys)) found.push(`${path || 'array'} [${node.length}] keys: ${sampleKeys}`);
+      }
+      node.slice(0, 8).forEach((item, idx) => walk(item, `${path}[${idx}]`, depth + 1));
+      return;
+    }
+
+    for (const [key, child] of Object.entries(node).slice(0, 60)) {
+      const childPath = path ? `${path}.${key}` : key;
+      if (signalPattern.test(key)) found.push(`${childPath}: ${preview(child)}`);
+      if (found.length >= limit) return;
+      if (child && typeof child === 'object') walk(child, childPath, depth + 1);
+      if (found.length >= limit) return;
+    }
+  }
+
+  walk(value);
+  return found;
+}
+
+async function buildMaddenEaEndpointDiscoveryEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  const NL = String.fromCharCode(10);
+
+  const endpointRows = await pool.query(
+    `SELECT endpoint,
+            payload_type,
+            COUNT(*)::int AS payload_count,
+            MAX(created_at) AS latest_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     GROUP BY endpoint, payload_type
+     ORDER BY MAX(created_at) DESC NULLS LAST, COUNT(*) DESC
+     LIMIT 12`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden endpoint discovery summary query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const payloadRows = await pool.query(
+    `SELECT endpoint, payload_type, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     ORDER BY created_at DESC
+     LIMIT 20`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden endpoint discovery payload query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const gameRows = await pool.query(
+    `SELECT
+       COUNT(*)::int AS total_games,
+       SUM(CASE WHEN COALESCE(home_score, 0) <> 0 OR COALESCE(away_score, 0) <> 0 THEN 1 ELSE 0 END)::int AS scored_games,
+       COUNT(DISTINCT week_label)::int AS week_count,
+       MIN(COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int) AS min_week,
+       MAX(COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int) AS max_week
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden endpoint discovery game query failed:', error.message);
+    return { rows: [{}] };
+  });
+
+  const endpointLines = (endpointRows.rows || []).map(row => {
+    const endpoint = String(row.endpoint || 'unknown endpoint').replace(/^ea_direct:/, '');
+    const type = row.payload_type ? ` • ${row.payload_type}` : '';
+    return `**${endpoint.slice(0, 70)}**${type} • ${Number(row.payload_count || 0)} payload(s)`;
+  });
+
+  const discoveredSignals = [];
+  const seenSignal = new Set();
+  const payloadKeyLines = [];
+  for (const row of payloadRows.rows || []) {
+    const payload = row.raw_payload || {};
+    const endpoint = String(row.endpoint || 'unknown endpoint').replace(/^ea_direct:/, '').slice(0, 80);
+    const keys = maddenEndpointDiscoveryTopKeys(payload, 14);
+    if (payloadKeyLines.length < 5) payloadKeyLines.push(`**${endpoint}**${NL}${keys.length ? keys.map(k => `\`${String(k).slice(0, 32)}\``).join(' ') : 'No object keys detected.'}`);
+
+    for (const signal of maddenEndpointDiscoveryFindGameSignals(payload, 8)) {
+      const key = `${endpoint}:${signal}`.toLowerCase();
+      if (seenSignal.has(key)) continue;
+      seenSignal.add(key);
+      discoveredSignals.push(`**${endpoint}**${NL}${signal}`);
+      if (discoveredSignals.length >= 8) break;
+    }
+    if (discoveredSignals.length >= 8) break;
+  }
+
+  const imported = gameRows.rows?.[0] || {};
+  const totalGames = Number(imported.total_games || 0);
+  const scoredGames = Number(imported.scored_games || 0);
+  const weekCount = Number(imported.week_count || 0);
+  const minWeek = Number(imported.min_week || 0);
+  const maxWeek = Number(imported.max_week || 0);
+  const gameSummary = [
+    `Imported game rows: **${totalGames}**`,
+    `Scored game rows: **${scoredGames}**`,
+    `Distinct imported weeks: **${weekCount}**${weekCount ? ` (${minWeek}-${maxWeek})` : ''}`,
+  ].join(NL);
+
+  const endpointText = endpointLines.join(NL) || 'No payload endpoints found in `madden_sync_payloads` yet.';
+  const keyText = payloadKeyLines.join(NL + NL) || 'No raw payload samples found.';
+  const signalText = discoveredSignals.join(NL + NL) || 'No obvious game/score/result/schedule signals found in latest stored payloads.';
+
+  let diagnosis = 'Endpoint discovery is ready. Use this after sync to see what EA exports are being stored.';
+  const hasScheduleEndpoint = endpointLines.some(line => /schedule/i.test(line));
+  const hasRosterEndpoint = endpointLines.some(line => /roster/i.test(line));
+  const hasStandingsEndpoint = endpointLines.some(line => /standing/i.test(line));
+  const hasGameResultEndpoint = endpointLines.some(line => /(game|box|result)/i.test(line) && !/schedule/i.test(line));
+
+  if (!scoredGames && hasScheduleEndpoint && !hasGameResultEndpoint) {
+    diagnosis = 'Current stored payloads show schedule data but no scored historical game-result/box-score endpoint yet. Win streaks and momentum should remain disabled until a scored results endpoint is found.';
+  } else if (!scoredGames && !hasScheduleEndpoint) {
+    diagnosis = 'No scored game rows and no clear schedule payload endpoint detected in stored payloads. Sync endpoint discovery should focus on schedule/results exports.';
+  } else if (scoredGames > 0) {
+    diagnosis = 'Scored game rows exist. Historical result logic can be wired to scored rows only.';
+  } else if (hasRosterEndpoint || hasStandingsEndpoint) {
+    diagnosis = 'Roster/standings payloads are present, but game-result payloads are still not confirmed.';
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🛰️ Madden EA Endpoint Discovery • ' + (league.league_name || 'Madden League'))
+    .setColor(0x3498DB)
+    .setDescription('Safe diagnostic view for EA Direct payload endpoints already captured by sync. This does not alter data or finalize anything.')
+    .addFields(
+      { name: 'Imported Game Result Coverage', value: gameSummary.slice(0, 1024), inline: false },
+      { name: 'Stored EA Payload Endpoints', value: endpointText.slice(0, 1024), inline: false },
+      { name: 'Latest Payload Top Keys', value: keyText.slice(0, 1024), inline: false },
+      { name: 'Game/Score/Result Signals', value: signalText.slice(0, 1024), inline: false },
+      { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:EA Endpoint Discovery`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-9C-C EA Endpoint Discovery' })
+    .setTimestamp();
+
+  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
 async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
   const leagueId = league.league_id;
   const NL = String.fromCharCode(10);
@@ -20152,7 +20347,7 @@ async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
       { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Results Diagnostics`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-9C-B Results Diagnostics Runtime Fix' })
+    .setFooter({ text: 'GG Sports • 7J-9C-C Results Diagnostics' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
