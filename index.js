@@ -19715,9 +19715,18 @@ function formatMaddenDynastyWinPct(row) {
   const losses = Number(row?.losses || 0);
   const ties = Number(row?.ties || 0);
   const games = wins + losses + ties;
-  if (!games) return '.000';
-  const pct = ((wins + ties * 0.5) / games).toFixed(3).replace(/^0/, '');
-  return pct;
+  if (!games) return 0;
+  return (wins + ties * 0.5) / games;
+}
+
+function formatMaddenDynastyWinPctText(row) {
+  return `${(formatMaddenDynastyWinPct(row) * 100).toFixed(1)}%`;
+}
+
+function formatMaddenDynastyPowerWatchLine(row) {
+  const move = formatMaddenPowerMovement(row);
+  const movementText = move && move !== '—' ? ` • ${move}` : '';
+  return `👑 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — Power Rank #${row.rank}${movementText} • Score ${formatMaddenPowerScore(row.power_score)}`;
 }
 
 async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
@@ -19815,15 +19824,21 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
     : 'No championship dynasty records yet.';
 
   const mostWinsText = mostWins.length
-    ? mostWins.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${Number(row.wins || 0)} wins • ${formatMaddenStandingsRecord(row)}`)).join('\n')
+    ? mostWins.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${formatMaddenStandingsRecord(row)}`)).join('\n')
     : 'No win totals imported yet.';
 
   const winPctText = highestWinPct.length
-    ? highestWinPct.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${formatMaddenDynastyWinPct(row)} win pct • ${formatMaddenStandingsRecord(row)}`)).join('\n')
+    ? highestWinPct.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${formatMaddenDynastyWinPctText(row)} • ${formatMaddenStandingsRecord(row)}`)).join('\n')
     : 'No win percentage data yet.';
 
-  const streakText = streakRows.length
-    ? streakRows.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${row.streak_type}${row.streak_count}`)).join('\n')
+  const fallbackStreakRows = standings
+    .filter(row => Number(row.losses || 0) === 0 && Number(row.wins || 0) > 0)
+    .sort((a, b) => Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name).localeCompare(String(b.team_name)))
+    .slice(0, 5)
+    .map(row => ({ ...row, streak_type: 'W', streak_count: Number(row.wins || 0) }));
+  const activeStreakRows = streakRows.length ? streakRows : fallbackStreakRows;
+  const streakText = activeStreakRows.length
+    ? activeStreakRows.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${row.streak_type}${row.streak_count}`)).join('\n')
     : 'No current winning streaks recorded yet.';
 
   const playoffText = championshipRows.length
@@ -19835,8 +19850,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
 
   const watchLines = [];
   for (const row of topPowerRows.rows || []) {
-    const move = formatMaddenPowerMovement(row);
-    watchLines.push(`👑 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — Power Rank #${row.rank} • ${move} • Score ${formatMaddenPowerScore(row.power_score)}`);
+    watchLines.push(formatMaddenDynastyPowerWatchLine(row));
   }
   const undefeated = standings.filter(row => Number(row.losses || 0) === 0 && Number(row.wins || 0) >= 2).slice(0, 5);
   for (const row of undefeated) {
@@ -19861,7 +19875,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
       { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8D-B Dynasty Tracker Fix' })
+    .setFooter({ text: 'GG Sports • 7J-8D-C Dynasty Tracker Polish' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
