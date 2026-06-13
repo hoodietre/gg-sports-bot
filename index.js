@@ -19835,7 +19835,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
 
   const watchLines = [];
   for (const row of topPowerRows.rows || []) {
-    const move = maddenPowerMovementText(row.rank, row.previous_rank);
+    const move = formatMaddenPowerMovement(row);
     watchLines.push(`👑 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — Power Rank #${row.rank} • ${move} • Score ${formatMaddenPowerScore(row.power_score)}`);
   }
   const undefeated = standings.filter(row => Number(row.losses || 0) === 0 && Number(row.wins || 0) >= 2).slice(0, 5);
@@ -19861,7 +19861,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
       { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8D-A Dynasty Tracker Fix' })
+    .setFooter({ text: 'GG Sports • 7J-8D-B Dynasty Tracker Fix' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
