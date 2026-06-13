@@ -470,6 +470,34 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_career_records ADD COLUMN IF NOT EXISTS career_interceptions NUMERIC NOT NULL DEFAULT 0`);
 
 
+  // 7J-9A: Madden award history / finalization foundation.
+  // Current award leaders can be stored as projected rows; future season-close automation can mark them finalized.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_award_history (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      season_label TEXT NOT NULL DEFAULT 'Current',
+      award_key TEXT NOT NULL,
+      award_name TEXT NOT NULL,
+      player_key TEXT,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      value_snapshot JSONB,
+      status TEXT NOT NULL DEFAULT 'projected',
+      finalized_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, season_label, award_key, status)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS player_key TEXT`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS value_snapshot JSONB`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'projected'`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+
+
 
 
   // 7I-4 hotfix: ensure visual avatar/profile badge tables exist.
@@ -1277,7 +1305,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, or champions').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6572,6 +6600,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'dynasty') {
           const embed = await buildMaddenDynastyTrackerEmbed(interaction.guild.id, activeLeague);
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'award_history') {
+          const embed = await buildMaddenAwardHistoryEmbed(interaction.guild.id, activeLeague);
           await interaction.editReply({ embeds: [embed] });
           return;
         }
@@ -19783,6 +19817,176 @@ async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
     .filter(row => row.streak_type === 'W')
     .sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || String(a.team_name).localeCompare(String(b.team_name)))
     .slice(0, 5);
+}
+
+
+async function ensureMaddenAwardHistoryTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_award_history (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      season_label TEXT NOT NULL DEFAULT 'Current',
+      award_key TEXT NOT NULL,
+      award_name TEXT NOT NULL,
+      player_key TEXT,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      value_snapshot JSONB,
+      status TEXT NOT NULL DEFAULT 'projected',
+      finalized_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, season_label, award_key, status)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS player_key TEXT`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS value_snapshot JSONB`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'projected'`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+}
+
+function maddenAwardHistorySeasonLabel() {
+  return 'Current';
+}
+
+function maddenAwardDisplayName(awardKey) {
+  return MADDEN_AWARD_RACES?.[awardKey]?.title?.replace(' Race', '') || String(awardKey || '').toUpperCase();
+}
+
+function maddenAwardHistoryPlayerKey(row) {
+  return String(row?.roster_id || row?.grouping_key || `${row?.player_name || 'Unknown'}:${row?.team_name || ''}`).toLowerCase();
+}
+
+function maddenAwardHistorySnapshot(row, awardKey) {
+  const base = {
+    score: Number(row?.award_score || row?.score || 0),
+    stat_line: formatMaddenAwardStatLine(row || {}, MADDEN_AWARD_RACES?.[awardKey]?.type || 'overall'),
+  };
+  for (const key of ['passYds','passTDs','passInts','rushYds','rushTDs','recYds','recTDs','recCatches','defTotalTackles','defSacks','defInts','defForcedFum']) {
+    if (row && row[key] != null) base[key] = Number(row[key] || 0);
+  }
+  return base;
+}
+
+async function refreshMaddenProjectedAwardHistory(guildId, leagueId) {
+  await ensureMaddenAwardHistoryTable();
+  const seasonLabel = maddenAwardHistorySeasonLabel();
+  const awardKeys = ['mvp', 'opoy', 'dpoy', 'oroy', 'droy'];
+  for (const awardKey of awardKeys) {
+    const rows = await getMaddenAwardsRace(guildId, leagueId, awardKey, 1).catch(() => []);
+    const winner = rows?.[0];
+    if (!winner) continue;
+    await pool.query(
+      `INSERT INTO madden_award_history (
+         guild_id, league_id, season_label, award_key, award_name,
+         player_key, player_name, team_name, position, value_snapshot,
+         status, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'projected',NOW())
+       ON CONFLICT (guild_id, league_id, season_label, award_key, status)
+       DO UPDATE SET
+         award_name = EXCLUDED.award_name,
+         player_key = EXCLUDED.player_key,
+         player_name = EXCLUDED.player_name,
+         team_name = EXCLUDED.team_name,
+         position = EXCLUDED.position,
+         value_snapshot = EXCLUDED.value_snapshot,
+         updated_at = NOW()`,
+      [
+        guildId,
+        String(leagueId),
+        seasonLabel,
+        awardKey,
+        maddenAwardDisplayName(awardKey),
+        maddenAwardHistoryPlayerKey(winner),
+        winner.player_name || 'Unknown Player',
+        winner.team_name || '',
+        winner.position || '',
+        JSON.stringify(maddenAwardHistorySnapshot(winner, awardKey)),
+      ]
+    );
+  }
+}
+
+function formatMaddenAwardHistoryLine(row, index = null) {
+  if (!row) return 'No award data yet.';
+  const iconMap = { mvp: '🏆', opoy: '⚡', dpoy: '🛡️', oroy: '🌟', droy: '🔒' };
+  const icon = iconMap[row.award_key] || '🏆';
+  const team = getMaddenTeamAbbrev(row.team_name) || row.team_name || 'FA';
+  const pos = row.position ? ` ${row.position}` : '';
+  const prefix = index == null ? '' : `${index + 1}. `;
+  const statLine = row.value_snapshot?.stat_line ? `\n${String(row.value_snapshot.stat_line).replaceAll(' • ', ' | ')}` : '';
+  const statusText = row.status === 'finalized' ? 'Final' : 'Projected';
+  return `${prefix}${icon} **${row.award_name || maddenAwardDisplayName(row.award_key)}** — **${row.player_name || 'Unknown'}** (${team}${pos}) • ${statusText}${statLine}`;
+}
+
+async function getMaddenAwardHistoryRows(guildId, leagueId, status = null) {
+  await ensureMaddenAwardHistoryTable();
+  const params = [guildId, String(leagueId)];
+  let statusClause = '';
+  if (status) {
+    params.push(status);
+    statusClause = `AND status = $${params.length}`;
+  }
+  const result = await pool.query(
+    `SELECT *
+     FROM madden_award_history
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+       ${statusClause}
+     ORDER BY
+       CASE season_label WHEN 'Current' THEN 9999 ELSE COALESCE(NULLIF(regexp_replace(season_label, '[^0-9]', '', 'g'), '')::int, 0) END DESC,
+       CASE award_key WHEN 'mvp' THEN 1 WHEN 'opoy' THEN 2 WHEN 'dpoy' THEN 3 WHEN 'oroy' THEN 4 WHEN 'droy' THEN 5 ELSE 9 END ASC,
+       updated_at DESC
+     LIMIT 25`,
+    params
+  ).catch(error => {
+    console.warn('Madden award history rows failed:', error.message);
+    return { rows: [] };
+  });
+  return result.rows || [];
+}
+
+function groupMaddenAwardHistoryBySeason(rows) {
+  const groups = new Map();
+  for (const row of rows || []) {
+    const season = row.season_label || 'Current';
+    if (!groups.has(season)) groups.set(season, []);
+    groups.get(season).push(row);
+  }
+  return Array.from(groups.entries());
+}
+
+async function buildMaddenAwardHistoryEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  await refreshMaddenProjectedAwardHistory(guildId, leagueId).catch(error => console.warn('Madden projected awards refresh failed:', error.message));
+  const [finalRows, projectedRows] = await Promise.all([
+    getMaddenAwardHistoryRows(guildId, leagueId, 'finalized'),
+    getMaddenAwardHistoryRows(guildId, leagueId, 'projected'),
+  ]);
+
+  const finalGroups = groupMaddenAwardHistoryBySeason(finalRows);
+  const finalizedText = finalGroups.length
+    ? finalGroups.slice(0, 4).map(([season, rows]) => `**${season}**\n${rows.map((row, index) => formatMaddenAwardHistoryLine(row, index)).join('\n')}`).join('\n\n')
+    : 'No finalized Madden awards have been locked yet. Season-end automation will store permanent winners here.';
+
+  const projectedText = projectedRows.length
+    ? projectedRows.slice(0, 5).map((row, index) => formatMaddenAwardHistoryLine(row, index)).join('\n')
+    : 'No current award projections found yet. Run `/madden sync`, then check `/madden awards`.';
+
+  return new EmbedBuilder()
+    .setTitle('🏆 Madden Award History • ' + (league.league_name || 'Madden League'))
+    .setColor(0xF1C40F)
+    .setDescription('Season award archive and finalization foundation. Projected leaders update from current stats; finalized winners will feed Hall of Fame, News Feed, and Dynasty history.')
+    .addFields(
+      { name: '🏆 Finalized Award Winners', value: finalizedText.slice(0, 1024), inline: false },
+      { name: '📈 Current Award Watch', value: projectedText.slice(0, 1024), inline: false },
+      { name: 'Season-End Flow', value: 'Award winners are now stored in `madden_award_history`. Future season-close automation can flip projected winners to finalized and boost Legacy Score.', inline: false },
+      { name: 'Command', value: '`/madden franchise view:Award History`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-9A Award Finalization' })
+    .setTimestamp();
 }
 
 async function buildMaddenDynastyTrackerEmbed(guildId, league) {
