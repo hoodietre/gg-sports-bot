@@ -6307,7 +6307,7 @@ if (gameSubcommand === 'report') {
              AND league_id::text = $2::text
            ORDER BY
              CASE
-               WHEN LOWER(COALESCE(status, '')) IN ('final', 'completed', 'complete') THEN 0
+               WHEN LOWER(COALESCE(status, '')) IN ('final', 'completed', 'complete', 'played', 'completed_with_real_score', 'away_win', 'home_win', 'tie') THEN 0
                WHEN COALESCE(away_score, 0) > 0 OR COALESCE(home_score, 0) > 0 THEN 0
                ELSE 1
              END,
@@ -15567,19 +15567,34 @@ function maddenGameHasImportedStats(game) {
   return false;
 }
 
+function maddenWinnerSideFromStatus(status) {
+  const text = String(status || '').toLowerCase().replace(/\s+/g, '_');
+  if (['away_win', 'awaywin', 'away_won', 'away'].includes(text)) return 'away';
+  if (['home_win', 'homewin', 'home_won', 'home'].includes(text)) return 'home';
+  if (['tie', 'draw'].includes(text)) return 'tie';
+  return null;
+}
+
 function maddenIsGameFinalLike(game) {
   const status = String(game?.status || '').toLowerCase();
   if (status === 'scheduled' || status === 'not_played' || status === 'not played') return false;
-  return ['final', 'completed', 'complete'].includes(status) || maddenGameHasScore(game) || maddenGameHasImportedStats(game);
+  return ['final', 'completed', 'complete', 'completed_with_real_score', 'played', 'closed', 'away_win', 'home_win', 'tie'].includes(status) || maddenGameHasScore(game) || maddenGameHasImportedStats(game);
 }
 
 function getMaddenGameWinner(game) {
-  if (!maddenIsGameFinalLike(game) || !maddenGameHasScore(game)) return null;
+  if (!maddenIsGameFinalLike(game)) return null;
   const awayScore = Number(game?.away_score || 0);
   const homeScore = Number(game?.home_score || 0);
-  if (awayScore > homeScore) return game.away_team;
-  if (homeScore > awayScore) return game.home_team;
-  return 'Tie';
+  if (maddenGameHasScore(game)) {
+    if (awayScore > homeScore) return game.away_team;
+    if (homeScore > awayScore) return game.home_team;
+    return 'Tie';
+  }
+  const winnerSide = maddenWinnerSideFromStatus(game?.status);
+  if (winnerSide === 'away') return game.away_team;
+  if (winnerSide === 'home') return game.home_team;
+  if (winnerSide === 'tie') return 'Tie';
+  return null;
 }
 
 function formatMaddenGameResultForTeam(game, teamName) {
@@ -15615,14 +15630,16 @@ function formatMaddenRecentGameLine(game) {
   const score = maddenGameHasScore(game)
     ? `${game.away_team} ${awayScore} @ ${game.home_team} ${homeScore}`
     : `${game.away_team} @ ${game.home_team}`;
-  return `**${game.week_label || 'Week TBD'}** — ${score} • ${finalLike ? 'Final' : formatMaddenGameStatus(game)}`;
+  const winner = !maddenGameHasScore(game) ? getMaddenGameWinner(game) : null;
+  const statusText = finalLike ? (winner && winner !== 'Tie' ? `Final • ${winner} won` : 'Final') : formatMaddenGameStatus(game);
+  return `**${game.week_label || 'Week TBD'}** — ${score} • ${statusText}`;
 }
 
 
 function maddenGameHasScore(game) {
   const awayScore = Number(game?.away_score || 0);
   const homeScore = Number(game?.home_score || 0);
-  return awayScore > 0 || homeScore > 0 || String(game?.status || '').toLowerCase() === 'completed';
+  return awayScore > 0 || homeScore > 0 || String(game?.status || '').toLowerCase() === 'completed_with_real_score';
 }
 
 function formatMaddenGameScoreLine(game, hasStats = false) {
@@ -16779,7 +16796,11 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
     const externalGameId = String(getFirstValue(row, ['external_game_id', 'id', 'gameId', 'game_id', 'externalGameId'], homeTeam + '-' + awayTeam + '-' + (weekLabel || getFirstValue(row, ['week_label', 'week', 'weekLabel'], 'unknown'))));
     const homeRoleId = await findMaddenTeamRoleId(league.league_id, homeTeam);
     const awayRoleId = await findMaddenTeamRoleId(league.league_id, awayTeam);
-    const status = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
+    const rawGameResult = parseNumberOrNull(getFirstValue(row, ['gameResult', 'result'], null));
+    let status = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
+    if (rawGameResult === 2) status = 'away_win';
+    if (rawGameResult === 3) status = 'home_win';
+    if (rawGameResult === 4) status = 'tie';
 
     await pool.query(
       `INSERT INTO madden_imported_games (id, guild_id, league_id, external_game_id, week_label, home_team, away_team, home_team_role_id, away_team_role_id, home_score, away_score, status, raw_payload, imported_at)
@@ -16802,8 +16823,8 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
            ELSE $11
          END,
          status = CASE
-           WHEN $12 IN ('completed', 'away_win', 'home_win', 'tie', 'completed_with_real_score') THEN $12
-           WHEN madden_imported_games.status IN ('completed', 'away_win', 'home_win', 'tie', 'completed_with_real_score')
+           WHEN $12 IN ('completed', 'final', 'complete', 'played', 'away_win', 'home_win', 'tie', 'completed_with_real_score') THEN $12
+           WHEN madden_imported_games.status IN ('completed', 'final', 'complete', 'played', 'away_win', 'home_win', 'tie', 'completed_with_real_score')
              AND (COALESCE(madden_imported_games.home_score, 0) > 0 OR COALESCE(madden_imported_games.away_score, 0) > 0)
              THEN madden_imported_games.status
            ELSE $12
@@ -16820,8 +16841,8 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
         awayTeam,
         homeRoleId,
         awayRoleId,
-        Number(getFirstValue(row, ['homeScore', 'home_score', 'homePoints'], 0)),
-        Number(getFirstValue(row, ['awayScore', 'away_score', 'awayPoints'], 0)),
+        Number(getFirstValue(row, ['homeScore', 'home_score', 'homePoints', 'homePts', 'homeTeamScore', 'homeFinalScore', 'homeTeamFinalScore'], 0)),
+        Number(getFirstValue(row, ['awayScore', 'away_score', 'awayPoints', 'awayPts', 'awayTeamScore', 'awayFinalScore', 'awayTeamFinalScore'], 0)),
         status,
         JSON.stringify(row),
       ]
@@ -18224,9 +18245,9 @@ function isMaddenImportedGameActuallyFinal(game) {
   const homeScore = parseNumberOrNull(game.home_score ?? game.homeScore);
   const awayScore = parseNumberOrNull(game.away_score ?? game.awayScore);
   const status = String(game.status || '').toLowerCase();
-
-  if ((homeScore || 0) === 0 && (awayScore || 0) === 0) return false;
-  return ['completed', 'away_win', 'home_win', 'tie', 'completed_with_real_score'].includes(status);
+  const finalStatuses = ['completed', 'final', 'complete', 'played', 'away_win', 'home_win', 'tie', 'completed_with_real_score'];
+  if (finalStatuses.includes(status)) return true;
+  return (homeScore || 0) !== 0 || (awayScore || 0) !== 0;
 }
 
 function formatMaddenRecentGameResultForTeam(game, teamName) {
@@ -18238,13 +18259,20 @@ function formatMaddenRecentGameResultForTeam(game, teamName) {
   const homeScore = parseNumberOrNull(game.home_score ?? game.homeScore) ?? 0;
   const awayScore = parseNumberOrNull(game.away_score ?? game.awayScore) ?? 0;
 
-  if (homeScore === awayScore) return 'T';
-
   const isHome = canonicalTeam && homeTeam && canonicalTeam.toLowerCase() === homeTeam.toLowerCase();
   const isAway = canonicalTeam && awayTeam && canonicalTeam.toLowerCase() === awayTeam.toLowerCase();
+  const hasScore = (homeScore || 0) !== 0 || (awayScore || 0) !== 0;
 
-  if (isHome) return homeScore > awayScore ? 'W' : 'L';
-  if (isAway) return awayScore > homeScore ? 'W' : 'L';
+  if (hasScore) {
+    if (homeScore === awayScore) return 'T';
+    if (isHome) return homeScore > awayScore ? 'W' : 'L';
+    if (isAway) return awayScore > homeScore ? 'W' : 'L';
+  }
+
+  const winnerSide = maddenWinnerSideFromStatus(game.status);
+  if (winnerSide === 'tie') return 'T';
+  if (winnerSide === 'home') return isHome ? 'W' : (isAway ? 'L' : 'completed');
+  if (winnerSide === 'away') return isAway ? 'W' : (isHome ? 'L' : 'completed');
 
   return 'completed';
 }
@@ -18299,28 +18327,18 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
 
     const gameResult = parseNumberOrNull(getAnyValue(game, ['gameResult', 'result'], null) ?? getAnyValue(row, ['gameResult', 'result'], null));
 
-    // 7J-5E2:
-    // WeeklySchedulesExport exposes future/current-week rows that may have misleading isGamePlayed
-    // or win/loss style fields. The export documentation says gameResult is authoritative:
-    // 1 = NOT_PLAYED, 2 = AWAY_WIN, 3 = HOME_WIN, 4 = TIE.
-    // Only score/non-1 gameResult should mark a schedule-export game completed.
+    // 7J-9B-F:
+    // EA schedule exports sometimes carry completed gameResult flags without final scores.
+    // Keep real scores when available, but still preserve winner-only results so Recent Games,
+    // Dynasty streaks, and momentum can work even when box scores are unavailable.
+    // gameResult: 1 = NOT_PLAYED, 2 = AWAY_WIN, 3 = HOME_WIN, 4 = TIE.
     const hasRealScore = awayScore > 0 || homeScore > 0;
+    const winnerOnlyResult = gameResult === 2 || gameResult === 3 || gameResult === 4;
 
-    // 7J-5E3 hard guard:
-    // EA WeeklySchedulesExport can expose force-win/result-looking fields for future games.
-    // If both scores are 0, treat it as scheduled regardless of gameResult/result flags.
-    const isPlayed =
-      hasRealScore &&
-      (gameResult === 2 ||
-        gameResult === 3 ||
-        gameResult === 4 ||
-        gameResult === null);
-
-    let status = isPlayed ? 'completed' : 'scheduled';
-    if (!hasRealScore) status = 'scheduled';
-    if (hasRealScore && gameResult === 2) status = 'away_win';
-    if (hasRealScore && gameResult === 3) status = 'home_win';
-    if (hasRealScore && gameResult === 4) status = 'tie';
+    let status = (hasRealScore || winnerOnlyResult) ? 'completed' : 'scheduled';
+    if (gameResult === 2) status = 'away_win';
+    if (gameResult === 3) status = 'home_win';
+    if (gameResult === 4) status = 'tie';
 
     const externalGameId = String([
       'ea-schedule-export',
@@ -19774,12 +19792,26 @@ async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
     const away = game.away_team;
     const homeScore = Number(game.home_score || 0);
     const awayScore = Number(game.away_score || 0);
-    if (!home || !away || homeScore === awayScore) continue;
+    if (!home || !away) continue;
 
-    const results = [
-      { team_name: home, result: homeScore > awayScore ? 'W' : 'L' },
-      { team_name: away, result: awayScore > homeScore ? 'W' : 'L' },
-    ];
+    let results = [];
+    const hasScore = homeScore !== 0 || awayScore !== 0;
+    if (hasScore && homeScore !== awayScore) {
+      results = [
+        { team_name: home, result: homeScore > awayScore ? 'W' : 'L' },
+        { team_name: away, result: awayScore > homeScore ? 'W' : 'L' },
+      ];
+    } else {
+      const winnerSide = maddenWinnerSideFromStatus(game.status);
+      if (winnerSide === 'home') {
+        results = [{ team_name: home, result: 'W' }, { team_name: away, result: 'L' }];
+      } else if (winnerSide === 'away') {
+        results = [{ team_name: home, result: 'L' }, { team_name: away, result: 'W' }];
+      } else if (winnerSide === 'tie') {
+        results = [{ team_name: home, result: 'T' }, { team_name: away, result: 'T' }];
+      }
+    }
+    if (!results.length) continue;
 
     for (const item of results) {
       const key = String(item.team_name || '').toLowerCase().trim();
@@ -19866,9 +19898,10 @@ function maddenLooksLikeChampionshipGame(row) {
 function maddenCompletedGameHasScores(row) {
   const home = Number(row?.home_score);
   const away = Number(row?.away_score);
+  const status = String(row?.status || '').toLowerCase();
+  if (['away_win', 'home_win', 'tie'].includes(status)) return true;
   if (!Number.isFinite(home) || !Number.isFinite(away)) return false;
   if (home === away) return false;
-  const status = String(row?.status || '').toLowerCase();
   return status.includes('final') || status.includes('complete') || status.includes('played') || status.includes('closed') || home > 0 || away > 0;
 }
 
@@ -20325,7 +20358,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
       { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-9B-E Win Streak Engine' })
+    .setFooter({ text: 'GG Sports • 7J-9B-F Completed Game Import Fix' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
