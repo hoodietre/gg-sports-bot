@@ -18381,7 +18381,11 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
       getAnyValue(row, ['stageIndex', 'stage', 'seasonStage', 'weekType'], null) ??
       stage;
 
-    const weekLabel = 'Week ' + String(weekNumber || rawWeek || 'TBD');
+    // 7J-10B: WeeklySchedulesExport uses zero-based weekIndex in the payload.
+    // When a requested week is not supplied by the caller, display the schedule payload weekIndex + 1.
+    const rawWeekNumber = Number(rawWeek);
+    const inferredWeekNumber = weekNumber || (Number.isFinite(rawWeekNumber) ? rawWeekNumber + 1 : rawWeek);
+    const weekLabel = 'Week ' + String(inferredWeekNumber || 'TBD');
 
     const awayScore = parseNumberOrNull(
       getAnyValue(game, ['awayScore', 'away_score', 'awayTeamScore', 'awayPoints', 'awayPts', 'away_score_total'], null) ??
@@ -18470,6 +18474,30 @@ function guessEaRegularSeasonWeeksFromStandingsRows(standingsRows) {
   return Array.from({ length: limit }, (_, index) => index + 1);
 }
 
+function getEaScheduleExportWeekIndexes(payload) {
+  const rows = extractEaScheduleExportList(payload);
+  const values = [];
+
+  for (const row of rows || []) {
+    const game = row?.seasonGameInfo || row?.gameInfo || row || {};
+    const rawWeek = getAnyValue(game, ['weekIndex', 'week', 'weekNumber', 'seasonWeek'], null) ??
+      getAnyValue(row, ['weekIndex', 'week', 'weekNumber', 'seasonWeek'], null);
+    const n = Number(rawWeek);
+    if (Number.isFinite(n)) values.push(n);
+  }
+
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
+function eaScheduleExportMatchesRequestedWeek(payload, weekNumber) {
+  const indexes = getEaScheduleExportWeekIndexes(payload);
+  if (!indexes.length) return false;
+
+  const targetOneBased = Number(weekNumber);
+  const targetZeroBased = targetOneBased - 1;
+  return indexes.includes(targetZeroBased) || indexes.includes(targetOneBased);
+}
+
 async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage = 'reg') {
   const session = context.activeBlazeSession || context.session || null;
   if (!session?.sessionKey) {
@@ -18482,24 +18510,48 @@ async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage =
     .map(value => value.trim())
     .filter(Boolean);
 
+  const stageIndex = stage === 'pre' ? 0 : 1;
+  const targetWeekIndex = Math.max(0, Number(weekNumber || 1) - 1);
+
+  // 7J-10B: do not accept the first non-empty WeeklySchedulesExport blindly.
+  // The EA endpoint can ignore unsupported week payload shapes and return the current schedule
+  // every time. Try zero-based weekIndex first, then common alternatives, and only import
+  // a payload when the returned schedule rows actually match the requested week.
   const payloads = [
+    { leagueId, weekIndex: targetWeekIndex, stageIndex },
+    { leagueId, weekIndex: targetWeekIndex, stage },
+    { leagueId, weekIndex: targetWeekIndex },
+    { leagueId, week: weekNumber, stageIndex },
     { leagueId, week: weekNumber, stage },
-    { leagueId, weekIndex: weekNumber, stage },
-    { leagueId, weekIndex: weekNumber, stageIndex: stage === 'pre' ? 0 : 1 },
-    { leagueId, week: weekNumber, weekType: stage },
-    { leagueId, seasonWeek: weekNumber, seasonWeekType: stage === 'pre' ? 0 : 1 },
+    { leagueId, seasonWeek: weekNumber, seasonWeekType: stageIndex },
+    { leagueId, seasonWeek: weekNumber },
   ];
 
   const attempts = [];
   let lastError = null;
+  let firstNonMatching = null;
+  const allowMismatch = String(process.env.EA_SCHEDULE_EXPORT_ALLOW_MISMATCH || 'false').toLowerCase() === 'true';
 
   for (const exportType of exportTypes) {
     for (const payload of payloads) {
       try {
         const result = await sendEaBlazeExportRequest(context.token, session, exportType, payload, { maxAttempts: 2 });
         const rows = extractEaScheduleExportList(result);
-        attempts.push({ exportType, payload, success: true, rowCount: rows.length, topKeys: Object.keys(result || {}).slice(0, 40) });
-        if (rows.length) return { payload: result, exportType, requestPayload: payload, attempts };
+        const weekIndexes = getEaScheduleExportWeekIndexes(result);
+        const weekMatches = eaScheduleExportMatchesRequestedWeek(result, weekNumber);
+        attempts.push({
+          exportType,
+          payload,
+          success: true,
+          rowCount: rows.length,
+          weekIndexes,
+          weekMatches,
+          topKeys: Object.keys(result || {}).slice(0, 40),
+        });
+
+        if (!rows.length) continue;
+        if (weekMatches) return { payload: result, exportType, requestPayload: payload, attempts, weekIndexes, weekMatched: true };
+        if (!firstNonMatching) firstNonMatching = { payload: result, exportType, requestPayload: payload, attempts, weekIndexes, weekMatched: false };
       } catch (error) {
         lastError = error;
         attempts.push({ exportType, payload, success: false, error: String(error?.message || error).slice(0, 500) });
@@ -18507,7 +18559,17 @@ async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage =
     }
   }
 
-  return { payload: null, exportType: null, requestPayload: null, attempts, error: lastError };
+  if (allowMismatch && firstNonMatching) return firstNonMatching;
+
+  return {
+    payload: null,
+    exportType: firstNonMatching?.exportType || null,
+    requestPayload: firstNonMatching?.requestPayload || null,
+    attempts,
+    error: lastError || new Error('Schedule export returned rows, but none matched requested Week ' + weekNumber + '.'),
+    skippedMismatchedWeek: Boolean(firstNonMatching),
+    mismatchedWeekIndexes: firstNonMatching?.weekIndexes || [],
+  };
 }
 
 
@@ -23319,11 +23381,19 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
       week: weekNumber,
       exportType: result.exportType,
       requestPayload: result.requestPayload,
+      weekMatched: Boolean(result.weekMatched),
+      returnedWeekIndexes: result.weekIndexes || result.mismatchedWeekIndexes || [],
+      skippedMismatchedWeek: Boolean(result.skippedMismatchedWeek),
       attempts: result.attempts.slice(0, 8),
       error: result.error ? String(result.error?.message || result.error).slice(0, 500) : null,
     });
 
-    if (!result.payload) continue;
+    if (!result.payload) {
+      if (result.skippedMismatchedWeek) {
+        console.warn('[SCHEDULE EXPORT 7J-10B] Skipped mismatched schedule payload for requested Week ' + weekNumber + '. Returned weekIndex values: ' + JSON.stringify(result.mismatchedWeekIndexes || []));
+      }
+      continue;
+    }
 
     const rows = normalizeEaScheduleExportRows(result.payload, weekNumber, 'reg', teamNameMaps);
     allRows.push(...rows);
