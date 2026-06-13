@@ -21529,6 +21529,23 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
   let inserted = 0;
   let updated = 0;
 
+  // 7J-9B-A: Player stats refresh fix. EA weekly stat exports can be re-run after an advance.
+  // Clear the specific league/stat/week/stage bucket before importing fresh rows so old rows do not remain
+  // when EA changes stat IDs/player keys between syncs. This keeps awards, leaders, records, and HOF current.
+  if (Array.isArray(rows) && rows.length) {
+    await pool.query(
+      `DELETE FROM madden_player_weekly_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+         AND stat_type = $3::text
+         AND week_index = $4::int
+         AND stage_index = $5::int`,
+      [guild.id, league.league_id, statType, weekIndex, stageIndex]
+    ).catch(error => {
+      console.error('[MADDEN WEEKLY STAT REFRESH 7J-9B-A] Bucket cleanup failed:', error?.message || error);
+    });
+  }
+
   for (const row of rows || []) {
     if (!row || typeof row !== 'object') continue;
 
@@ -21682,10 +21699,38 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
   const enabled = String(process.env.EA_PLAYER_STAT_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
 
-  const weekIndexes = String(process.env.EA_PLAYER_STAT_DISCOVERY_WEEK_INDEXES || '0,1')
-    .split(',')
-    .map(value => Number(String(value).trim()))
-    .filter(value => Number.isFinite(value) && value >= 0 && value !== 21);
+  // 7J-9B-A: Player stats refresh fix. The old default only discovered weeks 1-2 (indexes 0,1),
+  // which left award races stale after the Madden league advanced. Default now discovers every week
+  // up through the latest imported/scheduled regular-season week, with an env override still available.
+  let weekIndexes = [];
+  if (process.env.EA_PLAYER_STAT_DISCOVERY_WEEK_INDEXES) {
+    weekIndexes = String(process.env.EA_PLAYER_STAT_DISCOVERY_WEEK_INDEXES)
+      .split(',')
+      .map(value => Number(String(value).trim()))
+      .filter(value => Number.isFinite(value) && value >= 0 && value !== 21);
+  } else {
+    const maxWeeks = Math.max(1, Math.min(20, Number(process.env.EA_PLAYER_STAT_DISCOVERY_MAX_WEEK || 18)));
+    try {
+      const weekResult = await pool.query(
+        `SELECT MAX(CASE
+           WHEN week_label ~* 'week[[:space:]]*[0-9]+' THEN NULLIF(regexp_replace(LOWER(week_label), '[^0-9]', '', 'g'), '')::int
+           WHEN week_label ~ '^[0-9]+$' THEN week_label::int
+           ELSE NULL
+         END) AS max_week
+         FROM madden_imported_games
+         WHERE guild_id = $1::text
+           AND league_id::text = $2::text
+           AND week_label IS NOT NULL`,
+        [guild.id, league.league_id]
+      );
+      const maxImportedWeek = Number(weekResult.rows?.[0]?.max_week || 0);
+      const targetWeek = Math.max(2, Math.min(maxWeeks, maxImportedWeek || maxWeeks));
+      weekIndexes = Array.from({ length: targetWeek }, (_, index) => index);
+    } catch (error) {
+      console.error('[PLAYER STAT DISCOVERY 7J-9B-A] Failed to derive imported week range:', error?.message || error);
+      weekIndexes = Array.from({ length: Math.min(maxWeeks, 18) }, (_, index) => index);
+    }
+  }
 
   const stageIndex = Number(process.env.EA_PLAYER_STAT_DISCOVERY_STAGE_INDEX || 1);
 
