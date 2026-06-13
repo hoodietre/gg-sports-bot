@@ -19732,62 +19732,88 @@ function formatMaddenDynastyPowerWatchLine(row) {
   return `👑 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — Power Rank #${row.rank}${movementText} • Score ${formatMaddenPowerScore(row.power_score)}`;
 }
 
+function maddenDynastyWeekNumber(value) {
+  const text = String(value || '').toLowerCase();
+  const match = text.match(/week\s*(\d+)/i) || text.match(/\b(\d{1,2})\b/);
+  if (!match) return 0;
+  const n = Number(match[1]);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function maddenDynastyGameSortValue(game) {
+  const week = maddenDynastyWeekNumber(game?.week_label);
+  const played = game?.played_at ? new Date(game.played_at).getTime() : 0;
+  const imported = game?.imported_at ? new Date(game.imported_at).getTime() : 0;
+  return (week * 10000000000000) + Math.max(played || 0, imported || 0);
+}
+
 async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
   const games = await pool.query(
-    `SELECT home_team, away_team, home_score, away_score, status, played_at, imported_at
+    `SELECT id, external_game_id, week_label, home_team, away_team, home_score, away_score, status, played_at, imported_at
      FROM madden_imported_games
      WHERE guild_id = $1::text
        AND league_id::text = $2::text
        AND home_score IS NOT NULL
        AND away_score IS NOT NULL
-     ORDER BY COALESCE(played_at, imported_at) DESC
-     LIMIT 250`,
+     ORDER BY imported_at DESC
+     LIMIT 500`,
     [guildId, leagueId]
   ).catch(error => {
     console.warn('Madden dynasty streak lookup failed:', error.message);
     return { rows: [] };
   });
 
-  const streaks = new Map();
-  const seenTeams = new Set();
+  const sortedGames = (games.rows || [])
+    .filter(game => maddenCompletedGameHasScores(game))
+    .sort((a, b) => maddenDynastyGameSortValue(b) - maddenDynastyGameSortValue(a));
 
-  for (const game of games.rows || []) {
+  const states = new Map();
+
+  for (const game of sortedGames) {
     const home = game.home_team;
     const away = game.away_team;
     const homeScore = Number(game.home_score || 0);
     const awayScore = Number(game.away_score || 0);
     if (!home || !away || homeScore === awayScore) continue;
 
-    const winner = homeScore > awayScore ? home : away;
-    const loser = homeScore > awayScore ? away : home;
+    const results = [
+      { team_name: home, result: homeScore > awayScore ? 'W' : 'L' },
+      { team_name: away, result: awayScore > homeScore ? 'W' : 'L' },
+    ];
 
-    for (const team of [home, away]) {
-      const key = String(team).toLowerCase();
-      if (seenTeams.has(key)) continue;
-      const won = String(team).toLowerCase() === String(winner).toLowerCase();
-      streaks.set(key, { team_name: team, streak_type: won ? 'W' : 'L', streak_count: 1 });
-      seenTeams.add(key);
-    }
+    for (const item of results) {
+      const key = String(item.team_name || '').toLowerCase().trim();
+      if (!key) continue;
+      if (!states.has(key)) {
+        states.set(key, {
+          team_name: item.team_name,
+          streak_type: null,
+          streak_count: 0,
+          locked: false,
+          last_five: [],
+        });
+      }
 
-    for (const [team, won] of [[winner, true], [loser, false]]) {
-      const key = String(team).toLowerCase();
-      const current = streaks.get(key);
-      if (!current || current.locked) continue;
-      const expectedType = won ? 'W' : 'L';
-      if (current.streak_type === expectedType) {
-        current.streak_count = Number(current.streak_count || 1);
+      const state = states.get(key);
+      if (state.last_five.length < 5) state.last_five.push(item.result);
+
+      if (state.locked) continue;
+      if (!state.streak_type) {
+        state.streak_type = item.result;
+        state.streak_count = 1;
+      } else if (state.streak_type === item.result) {
+        state.streak_count += 1;
       } else {
-        current.locked = true;
+        state.locked = true;
       }
     }
   }
 
-  return Array.from(streaks.values())
-    .filter(row => row.streak_type === 'W')
+  return Array.from(states.values())
+    .filter(row => row.streak_type === 'W' && Number(row.streak_count || 0) > 0)
     .sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || String(a.team_name).localeCompare(String(b.team_name)))
     .slice(0, 5);
 }
-
 
 async function ensureMaddenChampionshipHistoryTable() {
   await pool.query(`
@@ -20299,7 +20325,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
       { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8D-C Dynasty Tracker Polish' })
+    .setFooter({ text: 'GG Sports • 7J-9B-E Win Streak Engine' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
