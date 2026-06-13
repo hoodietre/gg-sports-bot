@@ -497,6 +497,37 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE madden_award_history ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
 
+  // 7J-9B: Madden championship automation foundation.
+  // This table stores confirmed season champions once season-close automation is safely triggered.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_championship_history (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      season_label TEXT NOT NULL DEFAULT 'Current',
+      champion_team TEXT NOT NULL,
+      runner_up_team TEXT,
+      champion_owner_user_id TEXT,
+      championship_game_id TEXT,
+      champion_record TEXT,
+      points_for INTEGER,
+      points_against INTEGER,
+      status TEXT NOT NULL DEFAULT 'detected',
+      value_snapshot JSONB,
+      finalized_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, season_label, status)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS runner_up_team TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS champion_owner_user_id TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS championship_game_id TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS champion_record TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS value_snapshot JSONB`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'detected'`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+
 
 
 
@@ -1305,7 +1336,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6606,6 +6637,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'award_history') {
           const embed = await buildMaddenAwardHistoryEmbed(interaction.guild.id, activeLeague);
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'season_close') {
+          const embed = await buildMaddenSeasonClosePreviewEmbed(interaction.guild.id, activeLeague);
           await interaction.editReply({ embeds: [embed] });
           return;
         }
@@ -19817,6 +19854,257 @@ async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
     .filter(row => row.streak_type === 'W')
     .sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || String(a.team_name).localeCompare(String(b.team_name)))
     .slice(0, 5);
+}
+
+
+async function ensureMaddenChampionshipHistoryTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_championship_history (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      season_label TEXT NOT NULL DEFAULT 'Current',
+      champion_team TEXT NOT NULL,
+      runner_up_team TEXT,
+      champion_owner_user_id TEXT,
+      championship_game_id TEXT,
+      champion_record TEXT,
+      points_for INTEGER,
+      points_against INTEGER,
+      status TEXT NOT NULL DEFAULT 'detected',
+      value_snapshot JSONB,
+      finalized_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, season_label, status)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS runner_up_team TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS champion_owner_user_id TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS championship_game_id TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS champion_record TEXT`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS points_for INTEGER`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS points_against INTEGER`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS value_snapshot JSONB`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'detected'`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+}
+
+function maddenSeasonCloseSeasonLabel() {
+  const now = new Date();
+  return String(now.getUTCFullYear());
+}
+
+function maddenLooksLikeChampionshipGame(row) {
+  const pieces = [
+    row?.week_label,
+    row?.status,
+    row?.external_game_id,
+    row?.raw_payload ? JSON.stringify(row.raw_payload).slice(0, 2000) : '',
+  ].filter(Boolean).join(' ').toLowerCase();
+  return /super\s*bowl|championship|title\s*game|league\s*final|playoff\s*final|finals/.test(pieces);
+}
+
+function maddenCompletedGameHasScores(row) {
+  const home = Number(row?.home_score);
+  const away = Number(row?.away_score);
+  if (!Number.isFinite(home) || !Number.isFinite(away)) return false;
+  if (home === away) return false;
+  const status = String(row?.status || '').toLowerCase();
+  return status.includes('final') || status.includes('complete') || status.includes('played') || status.includes('closed') || home > 0 || away > 0;
+}
+
+function maddenChampionshipCandidateFromGame(row, standingsByTeam = new Map()) {
+  if (!row || !maddenCompletedGameHasScores(row)) return null;
+  const homeScore = Number(row.home_score || 0);
+  const awayScore = Number(row.away_score || 0);
+  const homeTeam = row.home_team || 'Home Team';
+  const awayTeam = row.away_team || 'Away Team';
+  const championTeam = homeScore > awayScore ? homeTeam : awayTeam;
+  const runnerUpTeam = homeScore > awayScore ? awayTeam : homeTeam;
+  const championScore = homeScore > awayScore ? homeScore : awayScore;
+  const runnerUpScore = homeScore > awayScore ? awayScore : homeScore;
+  const standings = standingsByTeam.get(String(championTeam).toLowerCase());
+  return {
+    season_label: maddenSeasonCloseSeasonLabel(),
+    champion_team: championTeam,
+    runner_up_team: runnerUpTeam,
+    championship_game_id: row.external_game_id || row.id || null,
+    champion_record: standings ? formatMaddenStandingsRecord(standings) : null,
+    points_for: championScore,
+    points_against: runnerUpScore,
+    value_snapshot: {
+      week_label: row.week_label || null,
+      status: row.status || null,
+      matchup: `${awayTeam} at ${homeTeam}`,
+      final_score: `${championTeam} ${championScore}, ${runnerUpTeam} ${runnerUpScore}`,
+    },
+  };
+}
+
+async function detectMaddenChampionshipCandidate(guildId, leagueId) {
+  const [gamesResult, standingsResult] = await Promise.all([
+    pool.query(
+      `SELECT id, external_game_id, week_label, home_team, away_team, home_score, away_score, status, played_at, raw_payload, imported_at
+       FROM madden_imported_games
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+       ORDER BY COALESCE(played_at, imported_at) DESC NULLS LAST
+       LIMIT 100`,
+      [guildId, leagueId]
+    ).catch(() => ({ rows: [] })),
+    pool.query(
+      `SELECT team_name, wins, losses, ties, points_for, points_against
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text`,
+      [guildId, leagueId]
+    ).catch(() => ({ rows: [] })),
+  ]);
+
+  const standingsByTeam = new Map((standingsResult.rows || []).map(row => [String(row.team_name || '').toLowerCase(), row]));
+  const games = gamesResult.rows || [];
+  const titleGame = games.find(row => maddenLooksLikeChampionshipGame(row) && maddenCompletedGameHasScores(row));
+  if (titleGame) return maddenChampionshipCandidateFromGame(titleGame, standingsByTeam);
+  return null;
+}
+
+async function getMaddenStoredChampionshipRows(guildId, leagueId) {
+  await ensureMaddenChampionshipHistoryTable();
+  const result = await pool.query(
+    `SELECT *
+     FROM madden_championship_history
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+     ORDER BY
+       CASE season_label WHEN 'Current' THEN 9999 ELSE COALESCE(NULLIF(regexp_replace(season_label, '[^0-9]', '', 'g'), '')::int, 0) END DESC,
+       updated_at DESC
+     LIMIT 10`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden stored championship rows failed:', error.message);
+    return { rows: [] };
+  });
+  return result.rows || [];
+}
+
+async function refreshMaddenDetectedChampionship(guildId, leagueId) {
+  await ensureMaddenChampionshipHistoryTable();
+  const candidate = await detectMaddenChampionshipCandidate(guildId, leagueId);
+  if (!candidate) return null;
+  await pool.query(
+    `INSERT INTO madden_championship_history (
+       guild_id, league_id, season_label, champion_team, runner_up_team,
+       championship_game_id, champion_record, points_for, points_against,
+       value_snapshot, status, updated_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'detected',NOW())
+     ON CONFLICT (guild_id, league_id, season_label, status)
+     DO UPDATE SET
+       champion_team = EXCLUDED.champion_team,
+       runner_up_team = EXCLUDED.runner_up_team,
+       championship_game_id = EXCLUDED.championship_game_id,
+       champion_record = EXCLUDED.champion_record,
+       points_for = EXCLUDED.points_for,
+       points_against = EXCLUDED.points_against,
+       value_snapshot = EXCLUDED.value_snapshot,
+       updated_at = NOW()`,
+    [
+      guildId,
+      String(leagueId),
+      candidate.season_label,
+      candidate.champion_team,
+      candidate.runner_up_team,
+      candidate.championship_game_id,
+      candidate.champion_record,
+      candidate.points_for,
+      candidate.points_against,
+      JSON.stringify(candidate.value_snapshot || {}),
+    ]
+  );
+  return candidate;
+}
+
+function formatMaddenSeasonCloseChampionLine(row) {
+  if (!row) return 'No completed championship game detected yet.';
+  const champion = maddenTeamDisplayNameWithLogo(row.champion_team || row.team_name || 'Unknown Team');
+  const runnerUp = row.runner_up_team ? ` over ${maddenTeamDisplayNameWithLogo(row.runner_up_team)}` : '';
+  const score = row.points_for != null && row.points_against != null ? ` • ${row.points_for}-${row.points_against}` : '';
+  const record = row.champion_record ? ` • ${row.champion_record}` : '';
+  const status = row.status === 'finalized' ? 'Finalized Champion' : 'Detected Champion Candidate';
+  return `**${status}**\n${champion}${runnerUp}${score}${record}`;
+}
+
+async function buildMaddenSeasonClosePreviewEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  await ensureMaddenChampionshipHistoryTable();
+  const detected = await refreshMaddenDetectedChampionship(guildId, leagueId).catch(error => {
+    console.warn('Madden championship detection refresh failed:', error.message);
+    return null;
+  });
+
+  const [storedRows, finalAwards, projectedAwards, topPowerRows, standingsRows] = await Promise.all([
+    getMaddenStoredChampionshipRows(guildId, leagueId),
+    getMaddenAwardHistoryRows(guildId, leagueId, 'finalized').catch(() => []),
+    getMaddenAwardHistoryRows(guildId, leagueId, 'projected').catch(() => []),
+    pool.query(
+      `SELECT team_name, rank, power_score
+       FROM madden_power_rankings
+       WHERE league_id::text = $1::text
+       ORDER BY rank ASC
+       LIMIT 3`,
+      [leagueId]
+    ).catch(() => ({ rows: [] })),
+    pool.query(
+      `SELECT team_name, wins, losses, ties, points_for, points_against
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+       ORDER BY wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC
+       LIMIT 3`,
+      [guildId, leagueId]
+    ).catch(() => ({ rows: [] })),
+  ]);
+
+  const championRows = storedRows.filter(row => row.status === 'finalized' || row.status === 'detected');
+  const championText = championRows.length
+    ? championRows.slice(0, 3).map(row => formatMaddenSeasonCloseChampionLine(row)).join('\n\n')
+    : formatMaddenSeasonCloseChampionLine(detected);
+
+  const awardText = finalAwards.length
+    ? finalAwards.slice(0, 5).map((row, index) => formatMaddenAwardHistoryLine(row, index)).join('\n')
+    : projectedAwards.length
+      ? projectedAwards.slice(0, 5).map((row, index) => formatMaddenAwardHistoryLine(row, index)).join('\n')
+      : 'No award projections stored yet. Open `/madden franchise view:Award History` first to refresh projected awards.';
+
+  const contenders = [];
+  for (const row of topPowerRows.rows || []) contenders.push(`👑 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — Power Rank #${row.rank} • Score ${formatMaddenPowerScore(row.power_score)}`);
+  const powerNames = new Set((topPowerRows.rows || []).map(row => String(row.team_name || '').toLowerCase()));
+  for (const row of (standingsRows.rows || []).filter(row => !powerNames.has(String(row.team_name || '').toLowerCase())).slice(0, Math.max(0, 3 - contenders.length))) {
+    contenders.push(`🔥 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — ${formatMaddenStandingsRecord(row)}`);
+  }
+
+  const automationStatus = detected
+    ? 'A completed championship-style game was detected and stored as `detected`. Future season-close controls can promote it to `finalized`.'
+    : 'No completed championship game detected yet. Keep testing with current Week 2 data; advance later when ready.';
+
+  const thumbTeam = detected?.champion_team || championRows?.[0]?.champion_team || topPowerRows.rows?.[0]?.team_name || standingsRows.rows?.[0]?.team_name;
+  const thumb = getMaddenTeamLogoUrl(thumbTeam);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🏁 Madden Season Close Preview • ' + (league.league_name || 'Madden League'))
+    .setColor(0xF1C40F)
+    .setDescription('Championship automation foundation. This preview is safe to run before advancing the league and does not force-finalize the season.')
+    .addFields(
+      { name: '🏆 Championship Detection', value: championText.slice(0, 1024), inline: false },
+      { name: '🏅 Award Finalization Queue', value: awardText.slice(0, 1024), inline: false },
+      { name: '🔥 Current Title Picture', value: (contenders.join('\n') || 'Run `/madden powerrankings` to build title contender data.').slice(0, 1024), inline: false },
+      { name: 'Automation Status', value: automationStatus.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:Season Close Preview`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-9B Championship Automation Foundation' })
+    .setTimestamp();
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
 }
 
 
