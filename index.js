@@ -1336,7 +1336,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' }, { name: 'Results Diagnostics', value: 'results_diag' }, { name: 'EA Endpoint Discovery', value: 'endpoint_discovery' }, { name: 'Raw Payload Deep Scan', value: 'raw_payload_scan' }, { name: 'Schedule Payload Inspector', value: 'schedule_payload_inspector' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' }, { name: 'Results Diagnostics', value: 'results_diag' }, { name: 'EA Endpoint Discovery', value: 'endpoint_discovery' }, { name: 'Raw Payload Deep Scan', value: 'raw_payload_scan' }, { name: 'Schedule Payload Inspector', value: 'schedule_payload_inspector' }, { name: 'Schedule Status Decoder', value: 'schedule_status_decoder' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6667,6 +6667,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'schedule_payload_inspector') {
           const embed = await buildMaddenSchedulePayloadInspectorEmbed(interaction.guild.id, activeLeague);
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'schedule_status_decoder') {
+          const embed = await buildMaddenScheduleStatusDecoderEmbed(interaction.guild.id, activeLeague);
           await interaction.editReply({ embeds: [embed] });
           return;
         }
@@ -20598,6 +20604,192 @@ async function buildMaddenSchedulePayloadInspectorEmbed(guildId, league) {
       { name: 'Command', value: '`/madden franchise view:Schedule Payload Inspector`', inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-9C-F Schedule Payload Inspector' })
+    .setTimestamp();
+
+  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
+function maddenScheduleDecoderExtractGames(payload, limit = 5000) {
+  const games = [];
+  const candidateArrayNames = /(gamescheduleinfolist|schedule|games|game|matchup|fixture|event)/i;
+
+  function asNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function looksLikeScheduleGame(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+    const keys = Object.keys(obj).map(k => k.toLowerCase());
+    const hasTeams = keys.includes('hometeamid') || keys.includes('awayteamid') || keys.includes('hometeam') || keys.includes('awayteam') || keys.includes('hometeamname') || keys.includes('awayteamname');
+    const hasSchedule = keys.includes('scheduleid') || keys.includes('weekindex') || keys.includes('seasonindex') || keys.includes('stageindex') || keys.includes('isgameoftheweek');
+    const hasScoreStatus = keys.includes('status') || keys.includes('homescore') || keys.includes('awayscore') || keys.includes('gameresult') || keys.includes('result');
+    return hasTeams && (hasSchedule || hasScoreStatus);
+  }
+
+  function addGame(obj, path) {
+    if (!looksLikeScheduleGame(obj) || games.length >= limit) return;
+    games.push({
+      path,
+      status: obj.status ?? obj.gameStatus ?? obj.state ?? obj.statusId ?? null,
+      gameResult: obj.gameResult ?? obj.game_result ?? obj.result ?? obj.resultType ?? null,
+      homeScore: asNumber(obj.homeScore ?? obj.home_score ?? obj.homePoints ?? obj.homePts),
+      awayScore: asNumber(obj.awayScore ?? obj.away_score ?? obj.awayPoints ?? obj.awayPts),
+      weekIndex: obj.weekIndex ?? obj.week_index ?? obj.week ?? obj.weekNum ?? null,
+      seasonIndex: obj.seasonIndex ?? obj.season_index ?? null,
+      stageIndex: obj.stageIndex ?? obj.stage_index ?? null,
+      scheduleId: obj.scheduleId ?? obj.schedule_id ?? obj.id ?? obj.gameId ?? null,
+      homeTeamId: obj.homeTeamId ?? obj.home_team_id ?? null,
+      awayTeamId: obj.awayTeamId ?? obj.away_team_id ?? null,
+      homeTeam: obj.homeTeam ?? obj.home_team ?? obj.homeName ?? null,
+      awayTeam: obj.awayTeam ?? obj.away_team ?? obj.awayName ?? null,
+      isGameOfTheWeek: obj.isGameOfTheWeek ?? null,
+      raw: obj,
+    });
+  }
+
+  function walk(node, path = '', depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 7 || games.length >= limit) return;
+    if (Array.isArray(node)) {
+      const firstObject = node.find(item => item && typeof item === 'object' && !Array.isArray(item));
+      if (firstObject && (candidateArrayNames.test(path) || looksLikeScheduleGame(firstObject))) {
+        for (let i = 0; i < node.length && games.length < limit; i++) addGame(node[i], `${path}[${i}]`);
+      }
+      for (let i = 0; i < Math.min(node.length, 20) && games.length < limit; i++) walk(node[i], `${path}[${i}]`, depth + 1);
+      return;
+    }
+    if (looksLikeScheduleGame(node)) addGame(node, path || 'root');
+    for (const [key, value] of Object.entries(node).slice(0, 100)) {
+      if (games.length >= limit) break;
+      walk(value, path ? `${path}.${key}` : key, depth + 1);
+    }
+  }
+
+  walk(payload);
+  return games;
+}
+
+async function buildMaddenScheduleStatusDecoderEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  const NL = String.fromCharCode(10);
+
+  const payloadRows = await pool.query(
+    `SELECT endpoint, payload_type, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND endpoint ILIKE '%WeeklySchedulesExport%'
+     ORDER BY created_at DESC NULLS LAST
+     LIMIT 80`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden schedule status decoder payload query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const importedRows = await pool.query(
+    `SELECT
+       COUNT(*)::int AS total_games,
+       SUM(CASE WHEN COALESCE(home_score, 0) <> 0 OR COALESCE(away_score, 0) <> 0 THEN 1 ELSE 0 END)::int AS scored_games,
+       SUM(CASE WHEN COALESCE(home_score, 0) = 0 AND COALESCE(away_score, 0) = 0 THEN 1 ELSE 0 END)::int AS zero_zero_games,
+       SUM(CASE WHEN LOWER(COALESCE(status, 'scheduled')) = 'scheduled' THEN 1 ELSE 0 END)::int AS scheduled_games,
+       COUNT(DISTINCT week_label)::int AS week_count
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden schedule status decoder game query failed:', error.message);
+    return { rows: [{}] };
+  });
+
+  const statusCounts = new Map();
+  const statusScoreCounts = new Map();
+  const weekCounts = new Map();
+  const resultCounts = new Map();
+  const scoredSamples = [];
+  const zeroScoreSamples = [];
+  const statusSamples = new Map();
+  let parsedGames = 0;
+
+  for (const row of payloadRows.rows || []) {
+    const endpoint = String(row.endpoint || 'unknown').replace(/^ea_direct:/, '');
+    const games = maddenScheduleDecoderExtractGames(row.raw_payload || {}, 2000);
+    parsedGames += games.length;
+    for (const game of games) {
+      const statusKey = String(game.status ?? 'missing');
+      const resultKey = String(game.gameResult ?? 'missing');
+      const homeScore = Number(game.homeScore || 0);
+      const awayScore = Number(game.awayScore || 0);
+      const hasScore = homeScore !== 0 || awayScore !== 0;
+      const scoreKey = `${statusKey} • ${hasScore ? 'scored' : '0-0'}`;
+      const weekKey = String(game.weekIndex ?? 'missing');
+      statusCounts.set(statusKey, (statusCounts.get(statusKey) || 0) + 1);
+      statusScoreCounts.set(scoreKey, (statusScoreCounts.get(scoreKey) || 0) + 1);
+      weekCounts.set(weekKey, (weekCounts.get(weekKey) || 0) + 1);
+      resultCounts.set(resultKey, (resultCounts.get(resultKey) || 0) + 1);
+      if (!statusSamples.has(statusKey)) {
+        statusSamples.set(statusKey, `${endpoint.slice(0, 58)}${NL}weekIndex:${weekKey} status:${statusKey} result:${resultKey} score:${awayScore}-${homeScore} homeTeamId:${game.homeTeamId ?? 'n/a'} awayTeamId:${game.awayTeamId ?? 'n/a'}`);
+      }
+      const sampleLine = `weekIndex:${weekKey} status:${statusKey} result:${resultKey} score:${awayScore}-${homeScore} scheduleId:${game.scheduleId ?? 'n/a'}`;
+      if (hasScore && scoredSamples.length < 8) scoredSamples.push(sampleLine);
+      if (!hasScore && zeroScoreSamples.length < 8) zeroScoreSamples.push(sampleLine);
+    }
+  }
+
+  function mapLines(map, limit = 10) {
+    return [...map.entries()]
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || String(a[0]).localeCompare(String(b[0])))
+      .slice(0, limit)
+      .map(([key, count]) => `**${String(key).slice(0, 40)}** — ${count}`);
+  }
+
+  const g = importedRows.rows?.[0] || {};
+  const coverageText = [
+    `Schedule payloads scanned: **${(payloadRows.rows || []).length}**`,
+    `Parsed schedule game objects: **${parsedGames}**`,
+    `Imported game rows: **${Number(g.total_games || 0)}**`,
+    `Scored imported rows: **${Number(g.scored_games || 0)}**`,
+    `Zero-zero imported rows: **${Number(g.zero_zero_games || 0)}**`,
+    `Scheduled imported rows: **${Number(g.scheduled_games || 0)}**`,
+    `Distinct imported weeks: **${Number(g.week_count || 0)}**`,
+  ].join(NL);
+
+  const statusText = mapLines(statusCounts, 12).join(NL) || 'No schedule status values found.';
+  const statusScoreText = mapLines(statusScoreCounts, 12).join(NL) || 'No status/score combinations found.';
+  const weekText = mapLines(weekCounts, 12).join(NL) || 'No weekIndex values found.';
+  const resultText = mapLines(resultCounts, 10).join(NL) || 'No gameResult/result values found.';
+  const sampleText = [...statusSamples.values()].slice(0, 5).join(NL + NL) || 'No status samples found.';
+
+  let diagnosis = 'Status decoder completed. Use status/score combinations to map EA schedule values safely.';
+  const scoredTotal = scoredSamples.length;
+  const allZero = parsedGames > 0 && scoredTotal === 0;
+  if (!(payloadRows.rows || []).length) {
+    diagnosis = 'No weekly schedule export payloads found. Run sync first or confirm schedule endpoint capture.';
+  } else if (allZero) {
+    diagnosis = 'All inspected schedule objects are 0-0. Treat these payloads as schedule-only until a non-zero score or trusted completed marker is found.';
+  } else if (scoredTotal > 0) {
+    diagnosis = 'At least one scored schedule object was found. Next step is importing only rows with non-zero scores or a trusted completed marker.';
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧩 Madden Schedule Status Decoder • ' + (league.league_name || 'Madden League'))
+    .setColor(0x95A5A6)
+    .setDescription('Safe decoder for `CareerMode_GetWeeklySchedulesExport` status values. This does not alter sync data.')
+    .addFields(
+      { name: 'Coverage', value: coverageText.slice(0, 1024), inline: false },
+      { name: 'Status Counts', value: statusText.slice(0, 1024), inline: false },
+      { name: 'Status + Score Shape', value: statusScoreText.slice(0, 1024), inline: false },
+      { name: 'WeekIndex Counts', value: weekText.slice(0, 1024), inline: false },
+      { name: 'GameResult Counts', value: resultText.slice(0, 1024), inline: false },
+      { name: 'Status Samples', value: sampleText.slice(0, 1024), inline: false },
+      { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:Schedule Status Decoder`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-9C-G Schedule Status Decoder' })
     .setTimestamp();
 
   const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
