@@ -16794,7 +16794,32 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
     const externalGameId = String(getFirstValue(row, ['external_game_id', 'id', 'gameId', 'game_id', 'externalGameId'], homeTeam + '-' + awayTeam + '-' + (weekLabel || getFirstValue(row, ['week_label', 'week', 'weekLabel'], 'unknown'))));
     const homeRoleId = await findMaddenTeamRoleId(league.league_id, homeTeam);
     const awayRoleId = await findMaddenTeamRoleId(league.league_id, awayTeam);
-    const status = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
+
+    const homeScoreValue = Number(getFirstValue(row, ['homeScore', 'home_score', 'homePoints'], 0));
+    const awayScoreValue = Number(getFirstValue(row, ['awayScore', 'away_score', 'awayPoints'], 0));
+    const rowGameResult = parseNumberOrNull(getFirstValue(row, ['gameResult', 'game_result', 'result', 'resultType'], null));
+    const rowWinner = String(getFirstValue(row, ['winner', 'winnerName', 'winningTeam'], '') || '').toLowerCase();
+    const baseStatus = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
+
+    // 7J-9B-H: Completed game import truth fix.
+    // EA can provide a winner/result without box-score values. Preserve that as a completed result
+    // so Recent Games, Game Center, Dynasty Tracker, and win streaks do not treat finished games as scheduled.
+    let status = baseStatus;
+    if ((Number.isFinite(homeScoreValue) && homeScoreValue > 0) || (Number.isFinite(awayScoreValue) && awayScoreValue > 0)) {
+      status = 'completed_with_real_score';
+    } else if (rowGameResult === 2) {
+      status = 'away_win';
+    } else if (rowGameResult === 3) {
+      status = 'home_win';
+    } else if (rowGameResult === 4) {
+      status = 'tie';
+    } else if (rowWinner) {
+      if (rowWinner.includes(String(homeTeam).toLowerCase())) status = 'home_win';
+      else if (rowWinner.includes(String(awayTeam).toLowerCase())) status = 'away_win';
+      else if (rowWinner.includes('tie') || rowWinner.includes('draw')) status = 'tie';
+    } else if (baseStatus === 'final' || baseStatus === 'complete') {
+      status = 'completed';
+    }
 
     await pool.query(
       `INSERT INTO madden_imported_games (id, guild_id, league_id, external_game_id, week_label, home_team, away_team, home_team_role_id, away_team_role_id, home_score, away_score, status, raw_payload, imported_at)
@@ -16835,8 +16860,8 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
         awayTeam,
         homeRoleId,
         awayRoleId,
-        Number(getFirstValue(row, ['homeScore', 'home_score', 'homePoints'], 0)),
-        Number(getFirstValue(row, ['awayScore', 'away_score', 'awayPoints'], 0)),
+        Number.isFinite(homeScoreValue) ? homeScoreValue : 0,
+        Number.isFinite(awayScoreValue) ? awayScoreValue : 0,
         status,
         JSON.stringify(row),
       ]
@@ -18316,7 +18341,7 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
 
     const gameResult = parseNumberOrNull(getAnyValue(game, ['gameResult', 'result'], null) ?? getAnyValue(row, ['gameResult', 'result'], null));
 
-    // 7J-9B-G: Winner-status preservation fix.
+    // 7J-9B-H: Winner-status preservation fix.
     // EA schedule exports can provide gameResult without real scores. That is still enough for
     // Recent Games, Game Center status, Dynasty win streaks, and momentum.
     // 1 = NOT_PLAYED, 2 = AWAY_WIN, 3 = HOME_WIN, 4 = TIE.
@@ -19072,7 +19097,7 @@ ${formatMaddenAwardStatLine(player, race.type)}${rookieText}`;
     .setTitle(`${race.emoji} Madden ${race.title} • ${league.league_name || 'Madden League'}`)
     .setColor(0xFEE75C)
     .setDescription(lines.slice(0, 3900))
-    .setFooter({ text: 'GG Sports • 7J-9B-G Winner Status Preservation Fix' })
+    .setFooter({ text: 'GG Sports • 7J-9B-H Game Result Import Fix' })
     .setTimestamp();
 }
 
@@ -23843,8 +23868,14 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const scoreInfo = resolveMaddenScoresFromRawGameDeep({ raw: item });
     const homeScore = scoreInfo.homeScore;
     const awayScore = scoreInfo.awayScore;
-    const isPlayed = isGameCompletedFromHubGame(game) || scoreInfo.hasRealScore;
-    const result = getAnyValue(game, ['result', 'gameResult'], null);
+    const result = getAnyValue(game, ['result', 'gameResult', 'game_result'], null);
+    const resultNumber = parseNumberOrNull(result);
+    const hasWinnerOnlyResult = resultNumber === 2 || resultNumber === 3 || resultNumber === 4;
+    const isPlayed = isGameCompletedFromHubGame(game) || scoreInfo.hasRealScore || hasWinnerOnlyResult;
+    let normalizedStatus = isPlayed ? (scoreInfo.hasRealScore ? 'completed_with_real_score' : 'completed') : 'scheduled';
+    if (!scoreInfo.hasRealScore && resultNumber === 2) normalizedStatus = 'away_win';
+    if (!scoreInfo.hasRealScore && resultNumber === 3) normalizedStatus = 'home_win';
+    if (!scoreInfo.hasRealScore && resultNumber === 4) normalizedStatus = 'tie';
 
     const normalized = {
       id: externalGameId,
@@ -23860,8 +23891,9 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
       away_score: awayScore ?? 0,
       homeScore: homeScore ?? 0,
       awayScore: awayScore ?? 0,
-      status: isPlayed ? (scoreInfo.hasRealScore ? 'completed_with_real_score' : 'completed') : 'scheduled',
+      status: normalizedStatus,
       result,
+      gameResult: resultNumber,
       sourceLabel: wrapper.sourceLabel,
       raw: item,
     };
@@ -24465,7 +24497,9 @@ function resolveMaddenWinnerFromRawGame(gameRow, homeTeam, awayTeam) {
   const homeTie = Number(getAnyValue(rawGame, ['homeTie', 'home_tie'], 0));
   const awayTie = Number(getAnyValue(rawGame, ['awayTie', 'away_tie'], 0));
   const forceWin = Number(getAnyValue(rawGame, ['forceWin', 'userForceWin', 'canForceWin'], 0));
-  const result = String(getAnyValue(rawGame, ['result', 'gameResult', 'winner', 'winnerName'], '') || '').toLowerCase();
+  const rawResultValue = getAnyValue(rawGame, ['result', 'gameResult', 'game_result', 'winner', 'winnerName'], '');
+  const resultNumber = parseNumberOrNull(rawResultValue);
+  const result = String(rawResultValue || '').toLowerCase();
 
   const homeUserName = String(getAnyValue(rawGame, ['homeUserName'], '') || '').toLowerCase();
   const awayUserName = String(getAnyValue(rawGame, ['awayUserName'], '') || '').toLowerCase();
@@ -24476,6 +24510,11 @@ function resolveMaddenWinnerFromRawGame(gameRow, homeTeam, awayTeam) {
   if (homeTie === 1 || awayTie === 1) return 'tie';
   if (homeWin === 1 || awayLoss === 1) return 'home';
   if (awayWin === 1 || homeLoss === 1) return 'away';
+
+  // EA schedule exports can encode winner as numeric gameResult: 2=away win, 3=home win, 4=tie.
+  if (resultNumber === 2) return 'away';
+  if (resultNumber === 3) return 'home';
+  if (resultNumber === 4) return 'tie';
 
   // Some payloads encode the winner/result as text.
   if (result) {
@@ -24533,21 +24572,33 @@ async function backfillMaddenGameScoresFromRawPayload(guild, league) {
   let updated = 0;
   for (const game of gamesResult.rows) {
     const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
-    if (!scoreInfo.hasRealScore) continue;
+    const winner = resolveMaddenWinnerFromRawGame(game, game.home_team, game.away_team);
 
-    await pool.query(
-      `UPDATE madden_imported_games
-       SET home_score = $3,
-           away_score = $4,
-           status = CASE
-             WHEN LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score') THEN 'completed_with_real_score'
-             ELSE status
-           END,
-           imported_at = NOW()
-       WHERE id = $1 AND league_id = $2`,
-      [game.id, league.league_id, scoreInfo.homeScore, scoreInfo.awayScore]
-    );
-    updated += 1;
+    if (scoreInfo.hasRealScore) {
+      await pool.query(
+        `UPDATE madden_imported_games
+         SET home_score = $3,
+             away_score = $4,
+             status = 'completed_with_real_score',
+             imported_at = NOW()
+         WHERE id = $1 AND league_id = $2`,
+        [game.id, league.league_id, scoreInfo.homeScore, scoreInfo.awayScore]
+      );
+      updated += 1;
+      continue;
+    }
+
+    if (winner && String(game.status || '').toLowerCase() !== 'completed_with_real_score') {
+      const winnerStatus = winner === 'home' ? 'home_win' : winner === 'away' ? 'away_win' : 'tie';
+      await pool.query(
+        `UPDATE madden_imported_games
+         SET status = $3,
+             imported_at = NOW()
+         WHERE id = $1 AND league_id = $2`,
+        [game.id, league.league_id, winnerStatus]
+      );
+      updated += 1;
+    }
   }
 
   if (updated) {
