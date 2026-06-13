@@ -16800,25 +16800,33 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
     const rowGameResult = parseNumberOrNull(getFirstValue(row, ['gameResult', 'game_result', 'result', 'resultType'], null));
     const rowWinner = String(getFirstValue(row, ['winner', 'winnerName', 'winningTeam'], '') || '').toLowerCase();
     const baseStatus = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
+    const playedMarker = getFirstValue(row, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null);
+    const hasRealScore = (Number.isFinite(homeScoreValue) && homeScoreValue > 0) || (Number.isFinite(awayScoreValue) && awayScoreValue > 0);
+    const hasTrustedCompletedMarker =
+      ['final', 'complete', 'completed', 'played', 'finished', 'closed'].includes(baseStatus) ||
+      baseStatus.includes('final') ||
+      baseStatus.includes('complete') ||
+      baseStatus.includes('played') ||
+      Boolean(playedMarker);
 
-    // 7J-9B-H: Completed game import truth fix.
-    // EA can provide a winner/result without box-score values. Preserve that as a completed result
-    // so Recent Games, Game Center, Dynasty Tracker, and win streaks do not treat finished games as scheduled.
-    let status = baseStatus;
-    if ((Number.isFinite(homeScoreValue) && homeScoreValue > 0) || (Number.isFinite(awayScoreValue) && awayScoreValue > 0)) {
-      status = 'completed_with_real_score';
-    } else if (rowGameResult === 2) {
-      status = 'away_win';
-    } else if (rowGameResult === 3) {
-      status = 'home_win';
-    } else if (rowGameResult === 4) {
-      status = 'tie';
-    } else if (rowWinner) {
-      if (rowWinner.includes(String(homeTeam).toLowerCase())) status = 'home_win';
+    // 7J-9B-I: Safe game result detection.
+    // EA schedule rows can expose force/winner-looking gameResult values before a game is played.
+    // Never mark a zero-score game final from gameResult alone. Require a real score, a trusted
+    // completed status, or a reliable played/completed timestamp first.
+    let status = 'scheduled';
+    if (hasRealScore) {
+      if (rowGameResult === 2) status = 'away_win';
+      else if (rowGameResult === 3) status = 'home_win';
+      else if (rowGameResult === 4) status = 'tie';
+      else status = 'completed_with_real_score';
+    } else if (hasTrustedCompletedMarker) {
+      if (rowGameResult === 2) status = 'away_win';
+      else if (rowGameResult === 3) status = 'home_win';
+      else if (rowGameResult === 4) status = 'tie';
+      else if (rowWinner.includes(String(homeTeam).toLowerCase())) status = 'home_win';
       else if (rowWinner.includes(String(awayTeam).toLowerCase())) status = 'away_win';
       else if (rowWinner.includes('tie') || rowWinner.includes('draw')) status = 'tie';
-    } else if (baseStatus === 'final' || baseStatus === 'complete') {
-      status = 'completed';
+      else status = 'completed';
     }
 
     await pool.query(
@@ -18341,19 +18349,31 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
 
     const gameResult = parseNumberOrNull(getAnyValue(game, ['gameResult', 'result'], null) ?? getAnyValue(row, ['gameResult', 'result'], null));
 
-    // 7J-9B-H: Winner-status preservation fix.
-    // EA schedule exports can provide gameResult without real scores. That is still enough for
-    // Recent Games, Game Center status, Dynasty win streaks, and momentum.
+    // 7J-9B-I: Safe game result detection.
+    // gameResult by itself can appear on unplayed schedule rows. Only mark final when there is
+    // a real score, a trusted completed/final status, or a reliable played/completed timestamp.
     // 1 = NOT_PLAYED, 2 = AWAY_WIN, 3 = HOME_WIN, 4 = TIE.
     const hasRealScore = awayScore > 0 || homeScore > 0;
-    const hasWinnerOnlyResult = gameResult === 2 || gameResult === 3 || gameResult === 4;
-    const isPlayed = hasRealScore || hasWinnerOnlyResult;
+    const rawStatusText = String(
+      getAnyValue(game, ['status', 'gameStatus', 'statusText', 'gameStatusText'], null) ??
+      getAnyValue(row, ['status', 'gameStatus', 'statusText', 'gameStatusText'], '')
+    ).toLowerCase();
+    const playedMarker =
+      getAnyValue(game, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null) ??
+      getAnyValue(row, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null);
+    const hasTrustedCompletedMarker =
+      ['final', 'complete', 'completed', 'played', 'finished', 'closed'].includes(rawStatusText) ||
+      rawStatusText.includes('final') ||
+      rawStatusText.includes('complete') ||
+      rawStatusText.includes('played') ||
+      Boolean(playedMarker);
+    const isPlayed = hasRealScore || hasTrustedCompletedMarker;
 
-    let status = isPlayed ? 'completed' : 'scheduled';
-    if (gameResult === 2) status = 'away_win';
-    if (gameResult === 3) status = 'home_win';
-    if (gameResult === 4) status = 'tie';
-    if (hasRealScore && gameResult === null) status = 'completed';
+    let status = 'scheduled';
+    if (isPlayed && gameResult === 2) status = 'away_win';
+    else if (isPlayed && gameResult === 3) status = 'home_win';
+    else if (isPlayed && gameResult === 4) status = 'tie';
+    else if (isPlayed) status = hasRealScore ? 'completed' : 'completed';
 
     const externalGameId = String([
       'ea-schedule-export',
@@ -19097,7 +19117,7 @@ ${formatMaddenAwardStatLine(player, race.type)}${rookieText}`;
     .setTitle(`${race.emoji} Madden ${race.title} • ${league.league_name || 'Madden League'}`)
     .setColor(0xFEE75C)
     .setDescription(lines.slice(0, 3900))
-    .setFooter({ text: 'GG Sports • 7J-9B-H Game Result Import Fix' })
+    .setFooter({ text: 'GG Sports • 7J-9B-I Safe Game Result Detection' })
     .setTimestamp();
 }
 
@@ -23870,12 +23890,20 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const awayScore = scoreInfo.awayScore;
     const result = getAnyValue(game, ['result', 'gameResult', 'game_result'], null);
     const resultNumber = parseNumberOrNull(result);
-    const hasWinnerOnlyResult = resultNumber === 2 || resultNumber === 3 || resultNumber === 4;
-    const isPlayed = isGameCompletedFromHubGame(game) || scoreInfo.hasRealScore || hasWinnerOnlyResult;
+    const rawStatusText = String(getAnyValue(game, ['status', 'gameStatus', 'statusText', 'gameStatusText'], '') || '').toLowerCase();
+    const playedMarker = getAnyValue(game, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null);
+    const hasTrustedCompletedMarker =
+      isGameCompletedFromHubGame(game) ||
+      ['final', 'complete', 'completed', 'played', 'finished', 'closed'].includes(rawStatusText) ||
+      rawStatusText.includes('final') ||
+      rawStatusText.includes('complete') ||
+      rawStatusText.includes('played') ||
+      Boolean(playedMarker);
+    const isPlayed = scoreInfo.hasRealScore || hasTrustedCompletedMarker;
     let normalizedStatus = isPlayed ? (scoreInfo.hasRealScore ? 'completed_with_real_score' : 'completed') : 'scheduled';
-    if (!scoreInfo.hasRealScore && resultNumber === 2) normalizedStatus = 'away_win';
-    if (!scoreInfo.hasRealScore && resultNumber === 3) normalizedStatus = 'home_win';
-    if (!scoreInfo.hasRealScore && resultNumber === 4) normalizedStatus = 'tie';
+    if (isPlayed && resultNumber === 2) normalizedStatus = 'away_win';
+    if (isPlayed && resultNumber === 3) normalizedStatus = 'home_win';
+    if (isPlayed && resultNumber === 4) normalizedStatus = 'tie';
 
     const normalized = {
       id: externalGameId,
