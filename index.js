@@ -19286,26 +19286,39 @@ async function refreshMaddenCareerRecordsFoundation(guildId, leagueId) {
   await ensureMaddenPlayerPersistenceTables();
   await ensureMaddenCareerRecordsFoundationTable();
   await pool.query(
-    `WITH base AS (
+    `WITH latest_rows AS (
+       SELECT * FROM (
+         SELECT
+           s.*,
+           COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, '')) AS player_key_resolved,
+           ROW_NUMBER() OVER (
+             PARTITION BY COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, '')), s.stat_type
+             ORDER BY s.display_week DESC, s.stage_index DESC, s.imported_at DESC, s.id DESC
+           ) AS rn
+         FROM madden_player_weekly_stats s
+         WHERE s.guild_id = $1::text
+           AND s.league_id = $2::text
+       ) ranked
+       WHERE rn = 1
+     ),
+     base AS (
        SELECT
          s.guild_id,
          s.league_id,
-         COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, '')) AS player_key,
-         COALESCE(NULLIF(s.full_name, ''), 'Unknown Player') AS player_name,
+         s.player_key_resolved AS player_key,
+         COALESCE(NULLIF(MAX(s.full_name), ''), 'Unknown Player') AS player_name,
          MAX(NULLIF(s.team_name, '')) AS team_name,
          MAX(NULLIF(s.position, '')) AS position,
-         SUM(CASE WHEN s.stat_type = 'passing' AND s.raw_payload->>'passYds' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'passYds')::numeric ELSE 0 END) AS pass_yards,
-         SUM(CASE WHEN s.stat_type = 'passing' AND s.raw_payload->>'passTDs' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'passTDs')::numeric ELSE 0 END) AS pass_tds,
-         SUM(CASE WHEN s.stat_type = 'rushing' AND s.raw_payload->>'rushYds' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'rushYds')::numeric ELSE 0 END) AS rush_yards,
-         SUM(CASE WHEN s.stat_type = 'rushing' AND s.raw_payload->>'rushTDs' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'rushTDs')::numeric ELSE 0 END) AS rush_tds,
-         SUM(CASE WHEN s.stat_type = 'receiving' AND s.raw_payload->>'recYds' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'recYds')::numeric ELSE 0 END) AS rec_yards,
-         SUM(CASE WHEN s.stat_type = 'receiving' AND s.raw_payload->>'recTDs' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'recTDs')::numeric ELSE 0 END) AS rec_tds,
-         SUM(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defSacks' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'defSacks')::numeric ELSE 0 END) AS sacks,
-         SUM(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defInts' ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (s.raw_payload->>'defInts')::numeric ELSE 0 END) AS interceptions
-       FROM madden_player_weekly_stats s
-       WHERE s.guild_id = $1::text
-         AND s.league_id = $2::text
-       GROUP BY s.guild_id, s.league_id, COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, '')), COALESCE(NULLIF(s.full_name, ''), 'Unknown Player')
+         MAX(CASE WHEN s.stat_type = 'passing' AND s.raw_payload->>'passYds' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'passYds')::numeric ELSE 0 END) AS pass_yards,
+         MAX(CASE WHEN s.stat_type = 'passing' AND s.raw_payload->>'passTDs' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'passTDs')::numeric ELSE 0 END) AS pass_tds,
+         MAX(CASE WHEN s.stat_type = 'rushing' AND s.raw_payload->>'rushYds' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'rushYds')::numeric ELSE 0 END) AS rush_yards,
+         MAX(CASE WHEN s.stat_type = 'rushing' AND s.raw_payload->>'rushTDs' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'rushTDs')::numeric ELSE 0 END) AS rush_tds,
+         MAX(CASE WHEN s.stat_type = 'receiving' AND s.raw_payload->>'recYds' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'recYds')::numeric ELSE 0 END) AS rec_yards,
+         MAX(CASE WHEN s.stat_type = 'receiving' AND s.raw_payload->>'recTDs' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'recTDs')::numeric ELSE 0 END) AS rec_tds,
+         MAX(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defSacks' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'defSacks')::numeric ELSE 0 END) AS sacks,
+         MAX(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defInts' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'defInts')::numeric ELSE 0 END) AS interceptions
+       FROM latest_rows s
+       GROUP BY s.guild_id, s.league_id, s.player_key_resolved
      )
      INSERT INTO madden_career_records (
        guild_id, league_id, player_key, player_name, team_name, position,
@@ -19591,7 +19604,7 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
       { name: 'Scoring Model', value: '`Career yards + TDs + sacks + INTs` • future seasons can add MVPs, championships, and playoff success.', inline: false },
       { name: 'Command', value: '`/madden franchise view:Hall of Fame`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8B-C Hall of Fame Runtime Fix' })
+    .setFooter({ text: 'GG Sports • 7J-9B-B Season Total Dedup Fix' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
@@ -20101,7 +20114,7 @@ async function buildMaddenSeasonClosePreviewEmbed(guildId, league) {
       { name: 'Automation Status', value: automationStatus.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Season Close Preview`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-9B Championship Automation Foundation' })
+    .setFooter({ text: 'GG Sports • 7J-9B-B Season Total Dedup Fix' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
@@ -20273,7 +20286,7 @@ async function buildMaddenAwardHistoryEmbed(guildId, league) {
       { name: 'Season-End Flow', value: 'Award winners are now stored in `madden_award_history`. Future season-close automation can flip projected winners to finalized and boost Legacy Score.', inline: false },
       { name: 'Command', value: '`/madden franchise view:Award History`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-9A Award Finalization' })
+    .setFooter({ text: 'GG Sports • 7J-9B-B Season Total Dedup Fix' })
     .setTimestamp();
 }
 
@@ -20475,7 +20488,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
       { name: '📈 Record Watch', value: recordWatch.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:League Records`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8A-C Franchise Ecosystem Completion' })
+    .setFooter({ text: 'GG Sports • 7J-9B-B Season Total Dedup Fix' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
@@ -20487,7 +20500,10 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
   const category = MADDEN_LEADER_CATEGORIES[categoryKey] || MADDEN_LEADER_CATEGORIES.passing;
   const metricSql = maddenJsonNumberSql(category.metric);
   const fields = Object.entries(category.fields || {});
-  const fieldSql = fields.map(([alias, jsonKey]) => `SUM(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
+  // 7J-9B-B: EA stat exports are season-total snapshots by week, not isolated weekly box scores.
+  // For season leaderboards/awards, use the latest snapshot per player/stat type and MAX fields,
+  // otherwise Week 1 + Week 2 + Week 8 snapshots get incorrectly added together.
+  const fieldSql = fields.map(([alias, jsonKey]) => `MAX(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
   const groupAliases = fields.map(([alias]) => `, g."${alias}"`).join('');
 
   const params = [guildId, leagueId, category.statType, limit];
@@ -20497,16 +20513,30 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
     weekClause = `AND s.display_week = $${params.length}`;
   }
 
+  const seasonTotalFilter = week != null ? 'TRUE' : 'rn = 1';
   const result = await pool.query(
-    `WITH stat_rows AS (
+    `WITH base_rows AS (
        SELECT
          s.*,
-         COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.full_name, '')) AS grouping_key
+         COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, '')) AS grouping_key
        FROM madden_player_weekly_stats s
        WHERE s.guild_id = $1
          AND s.league_id = $2
          AND s.stat_type = $3
          ${weekClause}
+     ),
+     ranked_rows AS (
+       SELECT
+         b.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY b.grouping_key, b.stat_type
+           ORDER BY b.display_week DESC, b.stage_index DESC, b.imported_at DESC, b.id DESC
+         ) AS rn
+       FROM base_rows b
+     ),
+     stat_rows AS (
+       SELECT * FROM ranked_rows
+       WHERE ${seasonTotalFilter}
      ),
      grouped AS (
        SELECT
@@ -20515,12 +20545,12 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
          COALESCE(NULLIF(MAX(team_name), ''), '') AS stat_team_name,
          COALESCE(NULLIF(MAX(roster_id), ''), '') AS roster_id,
          COALESCE(NULLIF(MAX(team_id), ''), '') AS team_id,
-         SUM(${metricSql}) AS leader_value,
+         MAX(${metricSql}) AS leader_value,
          ${fieldSql},
-         COUNT(*)::int AS games
+         COUNT(*)::int AS snapshots
        FROM stat_rows s
        GROUP BY grouping_key
-       HAVING SUM(${metricSql}) > 0
+       HAVING MAX(${metricSql}) > 0
      )
      SELECT
        g.*,
@@ -20544,7 +20574,7 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
         (g.team_id <> '' AND t.external_team_id::text = g.team_id)
         OR (g.team_id <> '' AND t.team_name = g.stat_team_name)
       )
-     GROUP BY g.grouping_key, g.player_name, g.stat_team_name, g.roster_id, g.team_id, g.leader_value, g.games${groupAliases}
+     GROUP BY g.grouping_key, g.player_name, g.stat_team_name, g.roster_id, g.team_id, g.leader_value, g.snapshots${groupAliases}
      ORDER BY g.leader_value DESC, g.player_name ASC
      LIMIT $4`,
     params
