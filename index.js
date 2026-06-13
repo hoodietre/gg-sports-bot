@@ -20035,6 +20035,129 @@ function formatMaddenSeasonCloseChampionLine(row) {
   return `**${status}**\n${champion}${runnerUp}${score}${record}`;
 }
 
+
+async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  const NL = String.fromCharCode(10);
+
+  const weekRows = await pool.query(
+    `SELECT
+       COALESCE(week_label, 'Week TBD') AS week_label,
+       COUNT(*)::int AS total_games,
+       SUM(CASE WHEN COALESCE(home_score, 0) <> 0 OR COALESCE(away_score, 0) <> 0 THEN 1 ELSE 0 END)::int AS scored_games,
+       SUM(CASE WHEN LOWER(COALESCE(status, '')) IN ('final','completed','complete','played','home_win','away_win','tie','completed_with_real_score') THEN 1 ELSE 0 END)::int AS final_like_games,
+       SUM(CASE WHEN COALESCE(home_score, 0) = 0 AND COALESCE(away_score, 0) = 0 AND LOWER(COALESCE(status, '')) IN ('final','completed','complete','played','home_win','away_win','tie','completed_with_real_score') THEN 1 ELSE 0 END)::int AS zero_score_final_like_games,
+       SUM(CASE WHEN LOWER(COALESCE(status, 'scheduled')) = 'scheduled' THEN 1 ELSE 0 END)::int AS scheduled_games
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     GROUP BY COALESCE(week_label, 'Week TBD')
+     ORDER BY COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int DESC,
+              COALESCE(week_label, 'Week TBD') DESC
+     LIMIT 12`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden results diagnostics week query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const latestGames = await pool.query(
+    `SELECT week_label, away_team, home_team, away_score, home_score, status, imported_at
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     ORDER BY imported_at DESC,
+              COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int DESC
+     LIMIT 10`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden results diagnostics latest games query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const syncRuns = await pool.query(
+    `SELECT id, source, status, message, week_label, imported_teams, imported_games, imported_players, started_at, completed_at
+     FROM madden_sync_runs
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     ORDER BY started_at DESC NULLS LAST, completed_at DESC NULLS LAST
+     LIMIT 5`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden results diagnostics sync query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const payloadRows = await pool.query(
+    `SELECT endpoint, payload_type, jsonb_typeof(raw_payload) AS payload_shape, LEFT(raw_payload::text, 500) AS payload_sample, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     ORDER BY created_at DESC
+     LIMIT 3`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden results diagnostics payload query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const weekLines = (weekRows.rows || []).map(row => {
+    const week = row.week_label || 'Week TBD';
+    const total = Number(row.total_games || 0);
+    const scored = Number(row.scored_games || 0);
+    const finals = Number(row.final_like_games || 0);
+    const zeroFinals = Number(row.zero_score_final_like_games || 0);
+    const scheduled = Number(row.scheduled_games || 0);
+    const warning = zeroFinals ? ` ⚠️ ${zeroFinals} zero-score final-like` : '';
+    return `**${week}** — ${total} rows • ${scored} scored • ${finals} final-like • ${scheduled} scheduled${warning}`;
+  });
+
+  const gameLines = (latestGames.rows || []).map(row => {
+    const score = `${Number(row.away_score || 0)}-${Number(row.home_score || 0)}`;
+    return `**${row.week_label || 'Week TBD'}** — ${row.away_team || 'Away'} @ ${row.home_team || 'Home'} • ${score} • ${row.status || 'scheduled'}`;
+  });
+
+  const syncLines = (syncRuns.rows || []).map(row => {
+    const msg = String(row.message || '').replace(/\s+/g, ' ').slice(0, 120);
+    return `**${row.status || 'unknown'}** • teams ${Number(row.imported_teams || 0)} • games ${Number(row.imported_games || 0)} • players ${Number(row.imported_players || 0)}${msg ? `${NL}${msg}` : ''}`;
+  });
+
+  const payloadLines = (payloadRows.rows || []).map(row => {
+    const endpoint = row.endpoint || 'unknown endpoint';
+    const type = row.payload_type || row.payload_shape || 'payload';
+    const sample = String(row.payload_sample || '').replace(/\s+/g, ' ').slice(0, 220);
+    return `**${endpoint}** • ${type}${sample ? `${NL}\`${sample.replace(/`/g, "'")}\`` : ''}`;
+  });
+
+  const badZeroFinals = (weekRows.rows || []).reduce((sum, row) => sum + Number(row.zero_score_final_like_games || 0), 0);
+  const scoredRows = (weekRows.rows || []).reduce((sum, row) => sum + Number(row.scored_games || 0), 0);
+  const historicalRows = (weekRows.rows || []).filter(row => Number(String(row.week_label || '').replace(/[^0-9]/g, '') || 0) < Math.max(...(weekRows.rows || []).map(r => Number(String(r.week_label || '').replace(/[^0-9]/g, '') || 0)), 0)).reduce((sum, row) => sum + Number(row.total_games || 0), 0);
+
+  let diagnosis = 'Diagnostics are ready. Use this view after sync to confirm whether EA is storing completed historical game rows.';
+  if (badZeroFinals > 0) diagnosis = `⚠️ Found ${badZeroFinals} zero-score final-like row(s). These should be repaired to scheduled before streak/momentum logic uses them.`;
+  else if (!scoredRows) diagnosis = 'No scored game rows found. Current sync appears to import schedule, standings, and player totals, but not historical box-score results yet.';
+  else if (!historicalRows) diagnosis = 'Scored rows exist, but no older-week history was found in the imported game table. Historical game endpoint discovery is still needed.';
+  else diagnosis = 'Scored/historical rows exist. Win streak and momentum logic can safely be wired to completed scored games only.';
+
+  const thumb = getMaddenTeamLogoUrl((latestGames.rows || [])[0]?.home_team || (latestGames.rows || [])[0]?.away_team || (league?.league_name || ''));
+  const embed = new EmbedBuilder()
+    .setTitle('🧪 Madden Results Diagnostics • ' + (league.league_name || 'Madden League'))
+    .setColor(0xE67E22)
+    .setDescription('Safe diagnostic view for imported Madden game-result data. This does not alter sync data or finalize any season history.')
+    .addFields(
+      { name: 'Imported Week Counts', value: (weekLines.join(NL) || 'No imported game rows found.').slice(0, 1024), inline: false },
+      { name: 'Latest Game Row Sample', value: (gameLines.join(NL) || 'No imported game rows found.').slice(0, 1024), inline: false },
+      { name: 'Recent Sync Runs', value: (syncLines.join(NL + NL) || 'No sync runs found.').slice(0, 1024), inline: false },
+      { name: 'Latest Raw Payload Samples', value: (payloadLines.join(NL + NL) || 'No raw payload samples found.').slice(0, 1024), inline: false },
+      { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:Results Diagnostics`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-9C-B Results Diagnostics Runtime Fix' })
+    .setTimestamp();
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
 async function buildMaddenSeasonClosePreviewEmbed(guildId, league) {
   const leagueId = league.league_id;
   await ensureMaddenChampionshipHistoryTable();
