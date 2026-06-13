@@ -19299,13 +19299,24 @@ function maddenHallOfFameStatLine(row) {
   return parts.length ? parts.join('\n') : 'No career stats imported yet.';
 }
 
+
+function maddenHallOfFameTeamText(row) {
+  const rawTeam = row?.resolved_team_name || row?.stat_team_name || row?.team_name || '';
+  const abbrev = getMaddenTeamAbbrev(rawTeam);
+  return abbrev || rawTeam || 'FA';
+}
+
+function maddenHallOfFamePositionText(row) {
+  return row?.resolved_position || row?.position || 'UNK';
+}
+
 function formatMaddenHallOfFameRow(row, index) {
   if (!row) return 'No data yet.';
   const medal = maddenRecordMedal(index);
-  const team = getMaddenTeamAbbrev(row.team_name) || row.team_name || 'FA';
-  const position = row.position || 'UNK';
+  const team = maddenHallOfFameTeamText(row);
+  const position = maddenHallOfFamePositionText(row);
   const score = formatMaddenLeaderNumber(row.hof_score ?? maddenHallOfFameScore(row));
-  return `${medal} **${row.player_name || 'Unknown Player'}** (${team} ${position}) — **${score} HOF Score**\n${maddenHallOfFameStatLine(row)}`;
+  return `${medal} **${row.player_name || 'Unknown Player'}** (${team} ${position}) — **${score} Legacy Score**\n${maddenHallOfFameStatLine(row)}`;
 }
 
 function formatMaddenHallOfFameList(rows, limit = 5) {
@@ -19475,7 +19486,7 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
       { name: 'Scoring Model', value: '`Career yards + TDs + sacks + INTs` • future seasons can add MVPs, championships, and playoff success.', inline: false },
       { name: 'Command', value: '`/madden franchise view:Hall of Fame`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8B-A Hall of Fame Polish' })
+    .setFooter({ text: 'GG Sports • 7J-8B-C Hall of Fame Runtime Fix' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
