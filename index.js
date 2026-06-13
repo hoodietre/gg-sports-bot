@@ -15251,6 +15251,20 @@ function getMaddenTeamLogoUrl(teamName) {
   return slug ? `https://a.espncdn.com/i/teamlogos/nfl/500/${slug}.png` : null;
 }
 
+
+function maddenTeamDisplayNameWithLogo(teamName) {
+  const name = String(teamName || '').trim() || 'Unknown Team';
+  const abbr = getMaddenTeamAbbrev(name);
+  const emojiMap = {
+    SF: '🔴', CHI: '🐻', CIN: '🐅', BUF: '🦬', DEN: '🐴', CLE: '🟤', TB: '🏴‍☠️', ARI: '🐦',
+    LAC: '⚡', KC: '🏹', IND: '🐴', WAS: '🟡', DAL: '⭐', MIA: '🐬', PHI: '🦅', ATL: '🐦‍⬛',
+    NYG: '🔵', JAX: '🐆', NYJ: '✈️', DET: '🦁', GB: '🧀', CAR: '🐾', NE: '🇺🇸', LV: '☠️',
+    LAR: '🐏', BAL: '🐦‍⬛', NO: '⚜️', SEA: '🟢', PIT: '⚫', HOU: '🐂', TEN: '⚔️', MIN: '🟣',
+  };
+  const emoji = emojiMap[String(abbr || '').toUpperCase()] || '';
+  return `${emoji ? emoji + ' ' : ''}${name}`;
+}
+
 function buildMaddenMatchupStoryline(homeName, awayName, home, away, homePower, awayPower) {
   const homeWins = Number(home?.wins || 0);
   const homeLosses = Number(home?.losses || 0);
@@ -19847,7 +19861,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
       { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8D Dynasty Tracker' })
+    .setFooter({ text: 'GG Sports • 7J-8D-A Dynasty Tracker Fix' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
