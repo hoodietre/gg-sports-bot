@@ -1277,7 +1277,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, or champions').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, or champions').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6566,6 +6566,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'championships') {
           const embed = await buildMaddenChampionshipHistoryEmbed(interaction.guild.id, activeLeague);
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'dynasty') {
+          const embed = await buildMaddenDynastyTrackerEmbed(interaction.guild.id, activeLeague);
           await interaction.editReply({ embeds: [embed] });
           return;
         }
@@ -19676,6 +19682,172 @@ async function buildMaddenChampionshipHistoryEmbed(guildId, league) {
       { name: 'Command', value: '`/madden franchise view:Championship History`', inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-8C Championship History' })
+    .setTimestamp();
+
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
+
+function formatMaddenDynastyRecordLine(row, index, valueText) {
+  const medal = maddenRecordMedal(index);
+  const teamName = row?.team_name || row?.franchise_name || 'Unknown Team';
+  const logoName = maddenTeamDisplayNameWithLogo ? maddenTeamDisplayNameWithLogo(teamName) : teamName;
+  return `${medal} **${logoName}** — ${valueText}`;
+}
+
+function formatMaddenDynastyWinPct(row) {
+  const wins = Number(row?.wins || 0);
+  const losses = Number(row?.losses || 0);
+  const ties = Number(row?.ties || 0);
+  const games = wins + losses + ties;
+  if (!games) return '.000';
+  const pct = ((wins + ties * 0.5) / games).toFixed(3).replace(/^0/, '');
+  return pct;
+}
+
+async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
+  const games = await pool.query(
+    `SELECT home_team, away_team, home_score, away_score, status, played_at, imported_at
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND home_score IS NOT NULL
+       AND away_score IS NOT NULL
+     ORDER BY COALESCE(played_at, imported_at) DESC
+     LIMIT 250`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden dynasty streak lookup failed:', error.message);
+    return { rows: [] };
+  });
+
+  const streaks = new Map();
+  const seenTeams = new Set();
+
+  for (const game of games.rows || []) {
+    const home = game.home_team;
+    const away = game.away_team;
+    const homeScore = Number(game.home_score || 0);
+    const awayScore = Number(game.away_score || 0);
+    if (!home || !away || homeScore === awayScore) continue;
+
+    const winner = homeScore > awayScore ? home : away;
+    const loser = homeScore > awayScore ? away : home;
+
+    for (const team of [home, away]) {
+      const key = String(team).toLowerCase();
+      if (seenTeams.has(key)) continue;
+      const won = String(team).toLowerCase() === String(winner).toLowerCase();
+      streaks.set(key, { team_name: team, streak_type: won ? 'W' : 'L', streak_count: 1 });
+      seenTeams.add(key);
+    }
+
+    for (const [team, won] of [[winner, true], [loser, false]]) {
+      const key = String(team).toLowerCase();
+      const current = streaks.get(key);
+      if (!current || current.locked) continue;
+      const expectedType = won ? 'W' : 'L';
+      if (current.streak_type === expectedType) {
+        current.streak_count = Number(current.streak_count || 1);
+      } else {
+        current.locked = true;
+      }
+    }
+  }
+
+  return Array.from(streaks.values())
+    .filter(row => row.streak_type === 'W')
+    .sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || String(a.team_name).localeCompare(String(b.team_name)))
+    .slice(0, 5);
+}
+
+async function buildMaddenDynastyTrackerEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  const [championshipRows, standingsRows, streakRows, topPowerRows] = await Promise.all([
+    getMaddenDynastyRows(guildId, leagueId),
+    pool.query(
+      `SELECT team_name, wins, losses, ties, points_for, points_against
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+       ORDER BY wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC
+       LIMIT 32`,
+      [guildId, leagueId]
+    ).catch(() => ({ rows: [] })),
+    getMaddenDynastyCurrentStreakRows(guildId, leagueId),
+    pool.query(
+      `SELECT team_name, rank, previous_rank, power_score
+       FROM madden_power_rankings
+       WHERE league_id::text = $1::text
+       ORDER BY rank ASC
+       LIMIT 5`,
+      [leagueId]
+    ).catch(() => ({ rows: [] })),
+  ]);
+
+  const standings = standingsRows.rows || [];
+  const mostWins = standings
+    .slice()
+    .sort((a, b) => Number(b.wins || 0) - Number(a.wins || 0) || Number(a.losses || 0) - Number(b.losses || 0) || String(a.team_name).localeCompare(String(b.team_name)))
+    .slice(0, 5);
+  const highestWinPct = standings
+    .filter(row => (Number(row.wins || 0) + Number(row.losses || 0) + Number(row.ties || 0)) > 0)
+    .sort((a, b) => Number(formatMaddenDynastyWinPct(b)) - Number(formatMaddenDynastyWinPct(a)) || Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name).localeCompare(String(b.team_name)))
+    .slice(0, 5);
+
+  const championshipText = championshipRows.length
+    ? championshipRows.map((row, index) => formatMaddenDynastyTeamLine(row, index)).join('\n')
+    : 'No championship dynasty records yet.';
+
+  const mostWinsText = mostWins.length
+    ? mostWins.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${Number(row.wins || 0)} wins • ${formatMaddenStandingsRecord(row)}`)).join('\n')
+    : 'No win totals imported yet.';
+
+  const winPctText = highestWinPct.length
+    ? highestWinPct.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${formatMaddenDynastyWinPct(row)} win pct • ${formatMaddenStandingsRecord(row)}`)).join('\n')
+    : 'No win percentage data yet.';
+
+  const streakText = streakRows.length
+    ? streakRows.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${row.streak_type}${row.streak_count}`)).join('\n')
+    : 'No current winning streaks recorded yet.';
+
+  const playoffText = championshipRows.length
+    ? championshipRows.map((row, index) => {
+        const appearances = Number(row?.finals_appearances || row?.playoff_appearances || 0);
+        return formatMaddenDynastyRecordLine(row, index, `${appearances} playoff/finals appearances`);
+      }).join('\n')
+    : 'No playoff history has been recorded yet.';
+
+  const watchLines = [];
+  for (const row of topPowerRows.rows || []) {
+    const move = maddenPowerMovementText(row.rank, row.previous_rank);
+    watchLines.push(`👑 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — Power Rank #${row.rank} • ${move} • Score ${formatMaddenPowerScore(row.power_score)}`);
+  }
+  const undefeated = standings.filter(row => Number(row.losses || 0) === 0 && Number(row.wins || 0) >= 2).slice(0, 5);
+  for (const row of undefeated) {
+    if (watchLines.length >= 8) break;
+    if (watchLines.some(line => line.toLowerCase().includes(String(row.team_name).toLowerCase()))) continue;
+    watchLines.push(`🔥 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — undefeated at ${formatMaddenStandingsRecord(row)}`);
+  }
+
+  const thumbTeam = championshipRows?.[0]?.team_name || championshipRows?.[0]?.franchise_name || topPowerRows.rows?.[0]?.team_name || standings?.[0]?.team_name;
+  const thumb = getMaddenTeamLogoUrl(thumbTeam);
+
+  const embed = new EmbedBuilder()
+    .setTitle('👑 Madden Dynasty Tracker • ' + (league.league_name || 'Madden League'))
+    .setColor(0x9B59B6)
+    .setDescription('Long-term dynasty board for championships, wins, win percentage, streaks, playoff history, and current dynasty watch. This view lives inside `/madden franchise` so no new subcommands are used.')
+    .addFields(
+      { name: '🏆 Championships Leaderboard', value: championshipText.slice(0, 1024), inline: false },
+      { name: '🔥 Most Wins', value: mostWinsText.slice(0, 1024), inline: false },
+      { name: '📈 Highest Win %', value: winPctText.slice(0, 1024), inline: false },
+      { name: '⚡ Longest Current Win Streak', value: streakText.slice(0, 1024), inline: false },
+      { name: '🏈 Playoff History', value: playoffText.slice(0, 1024), inline: false },
+      { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-8D Dynasty Tracker' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
