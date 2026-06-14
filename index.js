@@ -21321,6 +21321,15 @@ async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
 
 
 
+
+// 7J-10W Playoff Score Verification Runtime Fix
+// The route for /madden franchise view:Playoff Score Verification Audit calls this
+// function. Keep it safe/read-only by reusing the postseason result promotion audit
+// preview builder, which does not write to the database.
+async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
+  return buildMaddenPostseasonResultPromotionAuditEmbed(guildId, league);
+}
+
 async function buildMaddenPostseasonResultPromotionAuditEmbed(guildId, league) {
   const embed = await buildMaddenPostseasonResultMatcherEmbed(guildId, league);
   embed
