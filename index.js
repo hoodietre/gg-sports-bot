@@ -19892,6 +19892,133 @@ function formatMaddenDynastyWinPctText(row) {
   return `${(formatMaddenDynastyWinPct(row) * 100).toFixed(1)}%`;
 }
 
+
+function isMaddenDynastyScoredGame(game) {
+  const homeScore = Number(game?.home_score ?? 0);
+  const awayScore = Number(game?.away_score ?? 0);
+  return Number.isFinite(homeScore) && Number.isFinite(awayScore) && (homeScore !== 0 || awayScore !== 0);
+}
+
+function getMaddenDynastyGameWinner(game) {
+  const home = String(game?.home_team || '').trim();
+  const away = String(game?.away_team || '').trim();
+  const homeScore = Number(game?.home_score ?? 0);
+  const awayScore = Number(game?.away_score ?? 0);
+  if (!home || !away || !isMaddenDynastyScoredGame(game)) return null;
+  if (homeScore > awayScore) return { winner: home, loser: away, isTie: false };
+  if (awayScore > homeScore) return { winner: away, loser: home, isTie: false };
+  return { winner: null, loser: null, isTie: true, home, away };
+}
+
+function getMaddenDynastyGameSortValue(game) {
+  return maddenWeekSortValue(game?.week_label) * 1000000000000 + Number(new Date(game?.played_at || game?.imported_at || 0).getTime() || 0);
+}
+
+async function getMaddenDynastyGameHistoryRows(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT home_team, away_team, home_score, away_score, status, week_label, played_at, imported_at
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND COALESCE(home_team, '') <> ''
+       AND COALESCE(away_team, '') <> ''
+       AND home_score IS NOT NULL
+       AND away_score IS NOT NULL
+       AND (COALESCE(home_score, 0) <> 0 OR COALESCE(away_score, 0) <> 0)
+     ORDER BY
+       COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int ASC,
+       COALESCE(played_at, imported_at) ASC`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden dynasty game-history lookup failed:', error.message);
+    return { rows: [] };
+  });
+  return result.rows || [];
+}
+
+function buildMaddenDynastyRecordsFromGames(games) {
+  const teams = new Map();
+  const sortedAsc = [...(games || [])].filter(isMaddenDynastyScoredGame).sort((a, b) => getMaddenDynastyGameSortValue(a) - getMaddenDynastyGameSortValue(b));
+
+  function ensureTeam(teamName) {
+    const key = String(teamName || '').toLowerCase();
+    if (!key) return null;
+    if (!teams.has(key)) {
+      teams.set(key, {
+        team_name: teamName,
+        wins: 0,
+        losses: 0,
+        ties: 0,
+        points_for: 0,
+        points_against: 0,
+        current_streak_type: null,
+        current_streak_count: 0,
+        longest_win_streak: 0,
+        recent_results: [],
+      });
+    }
+    return teams.get(key);
+  }
+
+  for (const game of sortedAsc) {
+    const home = String(game.home_team || '').trim();
+    const away = String(game.away_team || '').trim();
+    const homeScore = Number(game.home_score || 0);
+    const awayScore = Number(game.away_score || 0);
+    if (!home || !away || !isMaddenDynastyScoredGame(game)) continue;
+
+    const homeRow = ensureTeam(home);
+    const awayRow = ensureTeam(away);
+    if (!homeRow || !awayRow) continue;
+
+    homeRow.points_for += homeScore;
+    homeRow.points_against += awayScore;
+    awayRow.points_for += awayScore;
+    awayRow.points_against += homeScore;
+
+    let homeResult = 'T';
+    let awayResult = 'T';
+    if (homeScore > awayScore) {
+      homeResult = 'W';
+      awayResult = 'L';
+      homeRow.wins += 1;
+      awayRow.losses += 1;
+    } else if (awayScore > homeScore) {
+      homeResult = 'L';
+      awayResult = 'W';
+      awayRow.wins += 1;
+      homeRow.losses += 1;
+    } else {
+      homeRow.ties += 1;
+      awayRow.ties += 1;
+    }
+
+    for (const [row, result] of [[homeRow, homeResult], [awayRow, awayResult]]) {
+      row.recent_results.push(result);
+      if (result === 'W') {
+        row.current_streak_count = row.current_streak_type === 'W' ? row.current_streak_count + 1 : 1;
+        row.current_streak_type = 'W';
+        row.longest_win_streak = Math.max(Number(row.longest_win_streak || 0), Number(row.current_streak_count || 0));
+      } else if (result === 'L') {
+        row.current_streak_count = row.current_streak_type === 'L' ? row.current_streak_count + 1 : 1;
+        row.current_streak_type = 'L';
+      } else {
+        row.current_streak_count = row.current_streak_type === 'T' ? row.current_streak_count + 1 : 1;
+        row.current_streak_type = 'T';
+      }
+    }
+  }
+
+  return Array.from(teams.values()).map(row => ({
+    ...row,
+    ties: Number(row.ties || 0),
+    games_played: Number(row.wins || 0) + Number(row.losses || 0) + Number(row.ties || 0),
+    recent_form: row.recent_results.slice(-5).join('-') || 'No recent form',
+    streak_type: row.current_streak_type,
+    streak_count: row.current_streak_count,
+  }));
+}
+
 function formatMaddenDynastyPowerWatchLine(row) {
   const move = formatMaddenPowerMovement(row);
   const movementText = move && move !== '—' ? ` • ${move}` : '';
@@ -19899,58 +20026,10 @@ function formatMaddenDynastyPowerWatchLine(row) {
 }
 
 async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
-  const games = await pool.query(
-    `SELECT home_team, away_team, home_score, away_score, status, played_at, imported_at
-     FROM madden_imported_games
-     WHERE guild_id = $1::text
-       AND league_id::text = $2::text
-       AND home_score IS NOT NULL
-       AND away_score IS NOT NULL
-     ORDER BY COALESCE(played_at, imported_at) DESC
-     LIMIT 250`,
-    [guildId, leagueId]
-  ).catch(error => {
-    console.warn('Madden dynasty streak lookup failed:', error.message);
-    return { rows: [] };
-  });
-
-  const streaks = new Map();
-  const seenTeams = new Set();
-
-  for (const game of games.rows || []) {
-    const home = game.home_team;
-    const away = game.away_team;
-    const homeScore = Number(game.home_score || 0);
-    const awayScore = Number(game.away_score || 0);
-    if (!home || !away || homeScore === awayScore) continue;
-
-    const winner = homeScore > awayScore ? home : away;
-    const loser = homeScore > awayScore ? away : home;
-
-    for (const team of [home, away]) {
-      const key = String(team).toLowerCase();
-      if (seenTeams.has(key)) continue;
-      const won = String(team).toLowerCase() === String(winner).toLowerCase();
-      streaks.set(key, { team_name: team, streak_type: won ? 'W' : 'L', streak_count: 1 });
-      seenTeams.add(key);
-    }
-
-    for (const [team, won] of [[winner, true], [loser, false]]) {
-      const key = String(team).toLowerCase();
-      const current = streaks.get(key);
-      if (!current || current.locked) continue;
-      const expectedType = won ? 'W' : 'L';
-      if (current.streak_type === expectedType) {
-        current.streak_count = Number(current.streak_count || 1);
-      } else {
-        current.locked = true;
-      }
-    }
-  }
-
-  return Array.from(streaks.values())
-    .filter(row => row.streak_type === 'W')
-    .sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || String(a.team_name).localeCompare(String(b.team_name)))
+  const games = await getMaddenDynastyGameHistoryRows(guildId, leagueId);
+  return buildMaddenDynastyRecordsFromGames(games)
+    .filter(row => row.streak_type === 'W' && Number(row.streak_count || 0) > 0)
+    .sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name).localeCompare(String(b.team_name)))
     .slice(0, 5);
 }
 
@@ -21380,7 +21459,7 @@ async function buildMaddenAwardHistoryEmbed(guildId, league) {
 
 async function buildMaddenDynastyTrackerEmbed(guildId, league) {
   const leagueId = league.league_id;
-  const [championshipRows, standingsRows, streakRows, topPowerRows] = await Promise.all([
+  const [championshipRows, standingsRows, gameHistoryRows, topPowerRows] = await Promise.all([
     getMaddenDynastyRows(guildId, leagueId),
     pool.query(
       `SELECT team_name, wins, losses, ties, points_for, points_against
@@ -21391,7 +21470,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
        LIMIT 32`,
       [guildId, leagueId]
     ).catch(() => ({ rows: [] })),
-    getMaddenDynastyCurrentStreakRows(guildId, leagueId),
+    getMaddenDynastyGameHistoryRows(guildId, leagueId),
     pool.query(
       `SELECT team_name, rank, previous_rank, power_score
        FROM madden_power_rankings
@@ -21402,7 +21481,9 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
     ).catch(() => ({ rows: [] })),
   ]);
 
-  const standings = standingsRows.rows || [];
+  const gameDerivedStandings = buildMaddenDynastyRecordsFromGames(gameHistoryRows);
+  const standings = gameDerivedStandings.length ? gameDerivedStandings : (standingsRows.rows || []);
+  const usingGameHistory = gameDerivedStandings.length > 0;
   const mostWins = standings
     .slice()
     .sort((a, b) => Number(b.wins || 0) - Number(a.wins || 0) || Number(a.losses || 0) - Number(b.losses || 0) || String(a.team_name).localeCompare(String(b.team_name)))
@@ -21429,7 +21510,8 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
     .sort((a, b) => Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name).localeCompare(String(b.team_name)))
     .slice(0, 5)
     .map(row => ({ ...row, streak_type: 'W', streak_count: Number(row.wins || 0) }));
-  const activeStreakRows = streakRows.length ? streakRows : fallbackStreakRows;
+  const gameStreakRows = standings.filter(row => row.streak_type === 'W' && Number(row.streak_count || 0) > 0).sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name).localeCompare(String(b.team_name))).slice(0, 5);
+  const activeStreakRows = gameStreakRows.length ? gameStreakRows : fallbackStreakRows;
   const streakText = activeStreakRows.length
     ? activeStreakRows.map((row, index) => formatMaddenDynastyRecordLine(row, index, `${row.streak_type}${row.streak_count}`)).join('\n')
     : 'No current winning streaks recorded yet.';
@@ -21458,17 +21540,18 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle('👑 Madden Dynasty Tracker • ' + (league.league_name || 'Madden League'))
     .setColor(0x9B59B6)
-    .setDescription('Long-term dynasty board for championships, wins, win percentage, streaks, playoff history, and current dynasty watch. This view lives inside `/madden franchise` so no new subcommands are used.')
+    .setDescription('Long-term dynasty board for championships, wins, win percentage, streaks, playoff history, and current dynasty watch. Season results now rebuild from imported game history when scored games are available. This view lives inside `/madden franchise` so no new subcommands are used.')
     .addFields(
       { name: '🏆 Championships Leaderboard', value: championshipText.slice(0, 1024), inline: false },
       { name: '🔥 Most Wins', value: mostWinsText.slice(0, 1024), inline: false },
       { name: '📈 Highest Win %', value: winPctText.slice(0, 1024), inline: false },
       { name: '⚡ Longest Current Win Streak', value: streakText.slice(0, 1024), inline: false },
       { name: '🏈 Playoff History', value: playoffText.slice(0, 1024), inline: false },
+      { name: '📊 Recent Form Source', value: usingGameHistory ? 'Using scored rows from `madden_imported_games`.' : 'No scored game rows found yet; using standings snapshot fallback.', inline: false },
       { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-8D-C Dynasty Tracker Polish' })
+    .setFooter({ text: 'GG Sports • 7J-10D Dynasty Rebuild Engine' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
