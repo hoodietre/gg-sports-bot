@@ -21322,9 +21322,9 @@ async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
 
 
 
-// 7J-10X Real Playoff Score Verification Audit
-// Read-only audit. This intentionally does NOT reuse the promotion audit because
-// some candidate scores looked plausible but did not match Madden itself.
+// 7J-10Y Postseason-Only Score Verification Audit
+// Read-only audit. This deliberately excludes regular-season scored schedule rows.
+// It only considers scored candidates from payloads that carry postseason-specific source keys.
 async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
   const leagueId = String(league?.league_id || '');
   const NL = String.fromCharCode(10);
@@ -21338,13 +21338,27 @@ async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
     return cleanTeam(value).toLowerCase();
   }
 
+  function endpointPostseasonStage(endpoint) {
+    const s = String(endpoint || '');
+    const match = s.match(/postseason[_-]?stage[:=_-]?(\d+)/i) || s.match(/playoff[_-]?stage[:=_-]?(\d+)/i);
+    return match ? Number(match[1]) : null;
+  }
+
+  function objectPostseasonStage(game) {
+    const value = game?.postseasonStage ?? game?.postseason_stage ?? game?.playoffStage ?? game?.playoff_stage ?? null;
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : value;
+  }
+
   function sourceSignature(candidate) {
     const endpoint = String(candidate.endpoint || '').replace(/^ea_direct:/, '');
     const stage = candidate.postseasonStage ?? 'n/a';
     const st = candidate.stageIndex ?? 'n/a';
     const wk = candidate.weekIndex ?? 'n/a';
     const status = candidate.status ?? 'n/a';
-    return `${endpoint.split(':').slice(0, 2).join(':')} • ps:${stage} • st:${st} • wk:${wk} • status:${status}`;
+    const scheduleId = candidate.scheduleId ?? 'n/a';
+    return `${endpoint.split(':').slice(0, 4).join(':')} • ps:${stage} • st:${st} • wk:${wk} • status:${status} • sched:${scheduleId}`;
   }
 
   const playoffRows = await pool.query(
@@ -21362,7 +21376,7 @@ async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
        ELSE 9 END, away_team, home_team`,
     [guildId, leagueId, playoffLabels]
   ).catch(error => {
-    console.warn('Madden playoff score verification playoff query failed:', error.message);
+    console.warn('Madden postseason-only score verification playoff query failed:', error.message);
     return { rows: [] };
   });
 
@@ -21374,27 +21388,54 @@ async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
      WHERE guild_id = $1::text
        AND league_id::text = $2::text
      ORDER BY created_at DESC
-     LIMIT 500`,
+     LIMIT 700`,
     [guildId, leagueId]
   ).catch(error => {
-    console.warn('Madden playoff score verification payload query failed:', error.message);
+    console.warn('Madden postseason-only score verification payload query failed:', error.message);
     return { rows: [] };
   });
 
   const candidates = [];
+  let skippedRegularSeason = 0;
+  let skippedNoPostseasonKey = 0;
+  let skippedZeroScore = 0;
+
   for (const payloadRow of payloadRows.rows || []) {
     const endpoint = String(payloadRow.endpoint || '');
     if (!endpoint.includes('SchedulesExport')) continue;
-    const games = maddenScheduleDecoderExtractGames(payloadRow.raw_payload || {}, 1200);
+
+    const endpointStage = endpointPostseasonStage(endpoint);
+    const endpointHasPostseasonKey = endpointStage !== null || /postseason|playoff|bracket/i.test(endpoint);
+    const games = maddenScheduleDecoderExtractGames(payloadRow.raw_payload || {}, 1500);
+
     for (const game of games) {
       const awayScore = Number(game.awayScore || 0);
       const homeScore = Number(game.homeScore || 0);
-      if (!(awayScore > 0 || homeScore > 0)) continue;
+      if (!(awayScore > 0 || homeScore > 0)) {
+        skippedZeroScore += 1;
+        continue;
+      }
+
+      const gameStage = objectPostseasonStage(game);
+      const resolvedPostseasonStage = gameStage ?? endpointStage;
+      const hasPostseasonKey = resolvedPostseasonStage !== null || endpointHasPostseasonKey;
+      if (!hasPostseasonKey) {
+        skippedNoPostseasonKey += 1;
+        continue;
+      }
+
+      // Regular season rows can still appear inside generic schedule exports.  Exclude them unless
+      // the source itself is explicitly marked as a postseason-stage payload.
+      const wk = Number(game.weekIndex ?? -1);
+      if (Number.isFinite(wk) && wk > 0 && endpointStage === null && gameStage === null) {
+        skippedRegularSeason += 1;
+        continue;
+      }
+
       const awayId = game.awayTeamId !== undefined && game.awayTeamId !== null ? String(game.awayTeamId) : '';
       const homeId = game.homeTeamId !== undefined && game.homeTeamId !== null ? String(game.homeTeamId) : '';
       const awayName = cleanTeam(teamTableMap.get(awayId) || 'UNKNOWN');
       const homeName = cleanTeam(teamTableMap.get(homeId) || 'UNKNOWN');
-      const postseasonStage = game.postseasonStage ?? game.postseason_stage ?? game.playoffStage ?? game.playoff_stage;
       candidates.push({
         awayId,
         homeId,
@@ -21407,7 +21448,7 @@ async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
         weekIndex: game.weekIndex,
         scheduleId: game.scheduleId ?? game.scheduleID ?? game.id ?? 'n/a',
         seasonIndex: game.seasonIndex,
-        postseasonStage,
+        postseasonStage: resolvedPostseasonStage,
         endpoint,
         createdAt: payloadRow.created_at
       });
@@ -21436,16 +21477,15 @@ async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
       const direct = ca === dbAway && ch === dbHome;
       const reverse = ca === dbHome && ch === dbAway;
       const overlap = [dbAway, dbHome].filter(t => t && (t === ca || t === ch)).length;
-      const stageScore = String(c.postseasonStage ?? '').length ? 1 : 0;
-      return { c, direct, reverse, overlap, stageScore };
+      return { c, direct, reverse, overlap };
     }).filter(x => x.overlap > 0 || x.direct || x.reverse)
-      .sort((a, b) => (b.direct - a.direct) || (b.reverse - a.reverse) || (b.overlap - a.overlap) || (b.stageScore - a.stageScore));
+      .sort((a, b) => (b.direct - a.direct) || (b.reverse - a.reverse) || (b.overlap - a.overlap));
 
     const best = ranked[0];
     const label = `**${row.week_label}** — ${row.away_team} @ ${row.home_team}`;
     if (!best) {
       noMatches += 1;
-      verificationLines.push(`${label} → **NO MATCH**`);
+      verificationLines.push(`${label} → **NO POSTSEASON MATCH**`);
       continue;
     }
 
@@ -21461,10 +21501,10 @@ async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
     }
 
     const c = best.c;
-    const finalScore = best.reverse
+    const scoreText = best.reverse
       ? `${c.homeName} ${c.homeScore} @ ${c.awayName} ${c.awayScore}`
       : `${c.awayName} ${c.awayScore} @ ${c.homeName} ${c.homeScore}`;
-    verificationLines.push(`${label} → **${tag}** ${finalScore} • ps:${c.postseasonStage ?? 'n/a'} st:${c.stageIndex ?? 'n/a'} wk:${c.weekIndex ?? 'n/a'} sched:${c.scheduleId ?? 'n/a'}`);
+    verificationLines.push(`${label} → **${tag}** ${scoreText} • ps:${c.postseasonStage ?? 'n/a'} st:${c.stageIndex ?? 'n/a'} wk:${c.weekIndex ?? 'n/a'} sched:${c.scheduleId ?? 'n/a'}`);
   }
 
   for (const c of candidates.slice(0, 14)) {
@@ -21477,31 +21517,33 @@ async function buildMaddenPlayoffScoreVerificationAuditEmbed(guildId, league) {
     .map(([sig, count]) => `**${sig}** — ${count}`);
 
   const diagnosis = [
-    'This is read-only. Do not promote results unless candidate scores match Madden exactly.',
+    'Read-only. This audit intentionally excludes regular-season candidate matches.',
+    `True postseason candidates found: **${candidates.length}**.`,
     directMatches || reversedMatches
-      ? `Found ${directMatches} direct and ${reversedMatches} reversed full-team matches, but scores still require manual verification before writes.`
-      : 'No full-team matches found. Do not promote playoff scores.',
-    partialMatches ? `${partialMatches} partial match(es) were found and should be treated as unsafe.` : 'No partial-only matches were counted as safe.'
+      ? `Found ${directMatches} direct and ${reversedMatches} reversed postseason-only match(es). Compare these scores against Madden before any write build.`
+      : 'No full-team postseason-only matches found. Do not promote playoff scores yet.',
+    partialMatches ? `${partialMatches} partial postseason match(es) were found and should be treated as unsafe.` : 'No partial-only postseason matches were counted as safe.'
   ].join(NL);
 
   const thumb = getMaddenTeamLogoUrl((playoffRows.rows || [])[0]?.home_team || (playoffRows.rows || [])[0]?.away_team || league?.league_name || 'NFL');
   const embed = new EmbedBuilder()
-    .setTitle('🧪 Madden Playoff Score Verification Audit • ' + (league?.league_name || 'Madden League'))
+    .setTitle('🧪 Madden Postseason-Only Score Verification Audit • ' + (league?.league_name || 'Madden League'))
     .setColor(0xF1C40F)
-    .setDescription('Safe read-only audit for playoff score candidates. This does not write to the database or promote results.')
+    .setDescription('Safe read-only audit that ignores regular-season score candidates and only inspects postseason-stage payload signals.')
     .addFields(
-      { name: 'Coverage', value: [`Playoff rows: **${(playoffRows.rows || []).length}**`, `Scored candidates: **${candidates.length}**`, `Direct matches: **${directMatches}**`, `Reversed matches: **${reversedMatches}**`, `Partial matches: **${partialMatches}**`, `No matches: **${noMatches}**`, `Team-table entries: **${teamTableMap.size}**`].join(NL), inline: false },
-      { name: 'Verification Match Preview', value: (verificationLines.join(NL) || 'No playoff bracket rows found.').slice(0, 1024), inline: false },
-      { name: 'Candidate Source Signatures', value: (sourceLines.join(NL) || 'No candidate source signatures found.').slice(0, 1024), inline: false },
-      { name: 'Candidate Samples', value: (candidateDetailLines.join(NL) || 'No scored candidates found.').slice(0, 1024), inline: false },
+      { name: 'Coverage', value: [`Playoff rows: **${(playoffRows.rows || []).length}**`, `True postseason candidates: **${candidates.length}**`, `Direct matches: **${directMatches}**`, `Reversed matches: **${reversedMatches}**`, `Partial matches: **${partialMatches}**`, `No matches: **${noMatches}**`, `Team-table entries: **${teamTableMap.size}**`, `Skipped regular-season rows: **${skippedRegularSeason}**`, `Skipped no-postseason-key rows: **${skippedNoPostseasonKey}**`].join(NL).slice(0, 1024), inline: false },
+      { name: 'Postseason Match Preview', value: (verificationLines.join(NL) || 'No playoff bracket rows found.').slice(0, 1024), inline: false },
+      { name: 'Postseason Source Signatures', value: (sourceLines.join(NL) || 'No postseason source signatures found.').slice(0, 1024), inline: false },
+      { name: 'Postseason Candidate Samples', value: (candidateDetailLines.join(NL) || 'No scored postseason candidates found.').slice(0, 1024), inline: false },
       { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Playoff Score Verification Audit`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10X Real Playoff Score Verification Audit' })
+    .setFooter({ text: 'GG Sports • 7J-10Y Postseason-Only Score Verification Audit' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
+
 
 async function buildMaddenPostseasonResultPromotionAuditEmbed(guildId, league) {
   const embed = await buildMaddenPostseasonResultMatcherEmbed(guildId, league);
