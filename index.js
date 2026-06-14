@@ -21272,6 +21272,167 @@ async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
 
 
 
+
+async function buildMaddenPostseasonMatchKeyAuditEmbed(guildId, league) {
+  const leagueId = String(league?.league_id || '');
+  const NL = String.fromCharCode(10);
+  const playoffLabels = ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Pro Bowl', 'Super Bowl'];
+
+  function cleanTeam(value) {
+    return canonicalMaddenTeamNameFromAny(value || '') || String(value || '').trim();
+  }
+
+  function sameTeam(a, b) {
+    const aa = cleanTeam(a).toLowerCase();
+    const bb = cleanTeam(b).toLowerCase();
+    return aa && bb && aa === bb;
+  }
+
+  const playoffRows = await pool.query(
+    `SELECT week_label, away_team, home_team, away_score, home_score, status, raw_payload, imported_at
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND week_label = ANY($3::text[])
+     ORDER BY
+       CASE week_label
+         WHEN 'Wild Card' THEN 1
+         WHEN 'Div. Playoff' THEN 2
+         WHEN 'Conf. Playoff' THEN 3
+         WHEN 'Pro Bowl' THEN 4
+         WHEN 'Super Bowl' THEN 5
+         ELSE 9
+       END,
+       away_team ASC,
+       home_team ASC`,
+    [guildId, leagueId, playoffLabels]
+  ).catch(error => {
+    console.warn('Madden postseason match key audit playoff row query failed:', error.message);
+    return { rows: [] };
+  });
+
+  // Build a conservative teamId -> team name map from scored/imported regular season rows.
+  // These rows carry EA schedule raw_payload IDs and already known display team names.
+  const idRows = await pool.query(
+    `SELECT home_team, away_team, raw_payload
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND raw_payload IS NOT NULL
+     ORDER BY imported_at DESC
+     LIMIT 500`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden postseason match key audit team-id map query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const idToTeam = new Map();
+  for (const row of idRows.rows || []) {
+    const raw = row.raw_payload || {};
+    const homeId = raw.homeTeamId ?? raw.home_team_id ?? raw.homeTeamLogoId ?? raw.homeTeam;
+    const awayId = raw.awayTeamId ?? raw.away_team_id ?? raw.awayTeamLogoId ?? raw.awayTeam;
+    if (homeId !== undefined && homeId !== null && String(homeId).trim()) idToTeam.set(String(homeId), cleanTeam(row.home_team));
+    if (awayId !== undefined && awayId !== null && String(awayId).trim()) idToTeam.set(String(awayId), cleanTeam(row.away_team));
+  }
+
+  const payloadRows = await pool.query(
+    `SELECT endpoint, payload_type, created_at, raw_payload
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND endpoint ILIKE '%SchedulesExport%'
+     ORDER BY created_at DESC
+     LIMIT 120`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden postseason match key audit payload query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const candidates = [];
+  for (const payloadRow of payloadRows.rows || []) {
+    const endpoint = String(payloadRow.endpoint || 'unknown');
+    const games = maddenScheduleDecoderExtractGames(payloadRow.raw_payload || {}, 500);
+    for (const game of games) {
+      const awayScore = Number(game.awayScore || 0);
+      const homeScore = Number(game.homeScore || 0);
+      if (!(awayScore > 0 || homeScore > 0)) continue;
+      const awayId = game.awayTeamId !== undefined && game.awayTeamId !== null ? String(game.awayTeamId) : '';
+      const homeId = game.homeTeamId !== undefined && game.homeTeamId !== null ? String(game.homeTeamId) : '';
+      const awayTeam = cleanTeam(game.awayTeam || idToTeam.get(awayId) || awayId);
+      const homeTeam = cleanTeam(game.homeTeam || idToTeam.get(homeId) || homeId);
+      candidates.push({
+        endpoint,
+        stageIndex: game.stageIndex,
+        weekIndex: game.weekIndex,
+        status: game.status,
+        awayScore,
+        homeScore,
+        awayId,
+        homeId,
+        awayTeam,
+        homeTeam,
+        scheduleId: game.scheduleId,
+      });
+    }
+  }
+
+  const matchLines = [];
+  for (const row of playoffRows.rows || []) {
+    const rowAway = cleanTeam(row.away_team);
+    const rowHome = cleanTeam(row.home_team);
+    let best = null;
+    for (const candidate of candidates) {
+      const direct = sameTeam(rowAway, candidate.awayTeam) && sameTeam(rowHome, candidate.homeTeam);
+      const reversed = sameTeam(rowAway, candidate.homeTeam) && sameTeam(rowHome, candidate.awayTeam);
+      if (direct || reversed) {
+        best = { candidate, type: direct ? 'DIRECT' : 'REVERSED' };
+        break;
+      }
+    }
+    if (best) {
+      const c = best.candidate;
+      matchLines.push(`**${row.week_label}** — ${rowAway} @ ${rowHome} → **${best.type}** ${c.awayTeam} ${c.awayScore} @ ${c.homeTeam} ${c.homeScore} • stage:${c.stageIndex ?? 'n/a'} weekIndex:${c.weekIndex ?? 'n/a'}`);
+    } else {
+      matchLines.push(`**${row.week_label}** — ${rowAway} @ ${rowHome} → **NO MATCH**`);
+    }
+    if (matchLines.length >= 12) break;
+  }
+
+  const candidateLines = candidates.slice(0, 12).map(c => {
+    const source = String(c.endpoint || '').split(':').slice(-2).join(':');
+    return `**${c.awayTeam || c.awayId} ${c.awayScore} @ ${c.homeTeam || c.homeId} ${c.homeScore}** • stage:${c.stageIndex ?? 'n/a'} weekIndex:${c.weekIndex ?? 'n/a'} ids:${c.awayId || '?'}@${c.homeId || '?'} • ${source}`;
+  });
+
+  const directCount = matchLines.filter(line => line.includes('**DIRECT**')).length;
+  const reverseCount = matchLines.filter(line => line.includes('**REVERSED**')).length;
+  const noMatchCount = matchLines.filter(line => line.includes('**NO MATCH**')).length;
+  const diagnosis = candidates.length
+    ? `Found ${candidates.length} scored schedule candidate(s). Match results: direct ${directCount}, reversed ${reverseCount}, no-match ${noMatchCount}. If NO MATCH remains high, the postseason repair needs a stronger teamId map or stage-to-round filter.`
+    : 'No scored schedule candidates found in stored schedule payloads. Re-sync or inspect postseason stage exports before attempting playoff result promotion.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('🔑 Madden Postseason Match Key Audit • ' + (league?.league_name || 'Madden League'))
+    .setColor(0x57F287)
+    .setDescription('Safe audit comparing imported playoff bracket rows against scored EA schedule payload candidates. This does not alter sync data.')
+    .addFields(
+      { name: 'Coverage', value: [`Imported playoff rows: **${(playoffRows.rows || []).length}**`, `Scored payload candidates: **${candidates.length}**`, `Team ID map entries: **${idToTeam.size}**`].join(NL), inline: false },
+      { name: 'Match Results', value: (matchLines.join(NL) || 'No playoff rows found.').slice(0, 1024), inline: false },
+      { name: 'Scored Payload Candidates', value: (candidateLines.join(NL) || 'No scored payload candidates found.').slice(0, 1024), inline: false },
+      { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:Postseason Match Key Audit`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10M Postseason Match Key Audit Runtime Fix' })
+    .setTimestamp();
+
+  const thumbTeam = (playoffRows.rows || [])[0]?.home_team || (playoffRows.rows || [])[0]?.away_team || league?.league_name || 'NFL';
+  const thumb = getMaddenTeamLogoUrl(thumbTeam);
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
+
 async function buildMaddenPostseasonStageImportAuditEmbed(guildId, league) {
   const leagueId = league?.league_id;
   const NL = String.fromCharCode(10);
