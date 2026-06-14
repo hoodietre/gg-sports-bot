@@ -21337,7 +21337,7 @@ async function buildMaddenPostseasonStageImportAuditEmbed(guildId, league) {
       { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Postseason Stage Import Audit`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10I Postseason Stage Import Audit' })
+    .setFooter({ text: 'GG Sports • 7J-10J Postseason Result Mapping Repair' })
     .setTimestamp();
 
   const thumb = getMaddenTeamLogoUrl((importedRows.rows || [])[0]?.home_team || (importedRows.rows || [])[0]?.away_team || league?.league_name || 'NFL');
@@ -23934,6 +23934,101 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
 
 
 
+async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'postseason-result-promotion') {
+  const playoffLabels = ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Pro Bowl', 'Super Bowl'];
+  let promoted = 0;
+  const promotedRows = [];
+
+  for (const row of rows || []) {
+    const homeTeam = canonicalMaddenTeamNameFromAny(row.home_team || row.homeTeam);
+    const awayTeam = canonicalMaddenTeamNameFromAny(row.away_team || row.awayTeam);
+    const homeScore = parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0;
+    const awayScore = parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0;
+    if (!homeTeam || !awayTeam) continue;
+    if (homeScore <= 0 && awayScore <= 0) continue;
+
+    let status = 'tie';
+    if (awayScore > homeScore) status = 'away_win';
+    else if (homeScore > awayScore) status = 'home_win';
+
+    const rawPayload = JSON.stringify({
+      ...(row.raw && typeof row.raw === 'object' ? row.raw : {}),
+      _gg_postseason_promotion: {
+        source: label,
+        scheduleId: row.scheduleId || row.schedule_id || null,
+        stageIndex: row.stageIndex ?? row.stage_index ?? null,
+        requestedStage: row.stage ?? null,
+        awayTeam,
+        homeTeam,
+        awayScore,
+        homeScore,
+        status,
+      },
+    });
+
+    // 7J-10J: Postseason result mapping repair.
+    // EA postseason stage exports can return scored rows with raw stageIndex=0/weekIndex=0,
+    // while the bracket rows already live in madden_imported_games as Wild Card/Div./Conf.
+    // Match by matchup first and preserve the existing playoff label instead of forcing Week 1
+    // or inventing a stage label from the request.
+    let result = await pool.query(
+      `UPDATE madden_imported_games
+       SET home_score = $5,
+           away_score = $6,
+           status = $7,
+           raw_payload = $8::jsonb,
+           imported_at = NOW()
+       WHERE guild_id = $1
+         AND league_id = $2
+         AND week_label = ANY($3::text[])
+         AND LOWER(home_team) = LOWER($4)
+         AND LOWER(away_team) = LOWER($9)
+         AND (COALESCE(home_score, 0) = 0 AND COALESCE(away_score, 0) = 0 OR status = 'scheduled')
+       RETURNING week_label, home_team, away_team, home_score, away_score, status`,
+      [guild.id, league.league_id, playoffLabels, homeTeam, homeScore, awayScore, status, rawPayload, awayTeam]
+    );
+
+    // If EA gives the matchup reversed from our bracket row, still promote safely.
+    if (!result.rows.length) {
+      let reverseStatus = 'tie';
+      if (homeScore > awayScore) reverseStatus = 'away_win';
+      else if (awayScore > homeScore) reverseStatus = 'home_win';
+      result = await pool.query(
+        `UPDATE madden_imported_games
+         SET home_score = $5,
+             away_score = $6,
+             status = $7,
+             raw_payload = $8::jsonb,
+             imported_at = NOW()
+         WHERE guild_id = $1
+           AND league_id = $2
+           AND week_label = ANY($3::text[])
+           AND LOWER(home_team) = LOWER($4)
+           AND LOWER(away_team) = LOWER($9)
+           AND (COALESCE(home_score, 0) = 0 AND COALESCE(away_score, 0) = 0 OR status = 'scheduled')
+         RETURNING week_label, home_team, away_team, home_score, away_score, status`,
+        [guild.id, league.league_id, playoffLabels, awayTeam, awayScore, homeScore, reverseStatus, rawPayload, homeTeam]
+      );
+    }
+
+    if (result.rows.length) {
+      promoted += Number(result.rowCount || result.rows.length || 0);
+      promotedRows.push(...result.rows);
+    }
+  }
+
+  if (promotedRows.length) {
+    console.log('[POSTSEASON RESULT PROMOTION 7J-10J] ' + JSON.stringify({
+      label,
+      promoted,
+      sample: promotedRows.slice(0, 20),
+    }).slice(0, 10000));
+  }
+
+  return { promoted, rows: promotedRows };
+}
+
+
 async function importEaPostseasonScheduleExportsForLeague(context, guild, league, runId = null, teamNameMaps = {}) {
   const enabled = String(process.env.EA_POSTSEASON_SCHEDULE_EXPORT_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return { imported: 0, rows: [], attempts: [], skipped: true };
@@ -23977,19 +24072,26 @@ async function importEaPostseasonScheduleExportsForLeague(context, guild, league
       });
     }
 
-    const rows = normalizeEaScheduleExportRows(result.payload, null, stageIndex, teamNameMaps)
-      .filter(row => {
-        const rowStage = parseNumberOrNull(row.stageIndex);
-        const label = String(row.week_label || '');
-        return rowStage === stageIndex || ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Pro Bowl', 'Super Bowl'].includes(label);
-      });
+    const candidateRows = normalizeEaScheduleExportRows(result.payload, null, stageIndex, teamNameMaps);
+    const scoredCandidates = candidateRows.filter(row => {
+      const homeScore = parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0;
+      const awayScore = parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0;
+      return homeScore > 0 || awayScore > 0;
+    });
 
-    if (!rows.length) continue;
-    allRows.push(...rows);
-    imported += await importMaddenGamesFromArray(guild, league, rows, null);
+    const promotion = await promoteMaddenPostseasonScoredRows(guild, league, scoredCandidates, 'postseason_stage:' + stageIndex);
+    imported += Number(promotion.promoted || 0);
+
+    const rows = candidateRows.filter(row => {
+      const rowStage = parseNumberOrNull(row.stageIndex);
+      const label = String(row.week_label || '');
+      return rowStage === stageIndex || ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Pro Bowl', 'Super Bowl'].includes(label);
+    });
+
+    allRows.push(...(rows.length ? rows : scoredCandidates));
   }
 
-  console.log('[POSTSEASON SCHEDULE EXPORT 7J-10I] ' + JSON.stringify({
+  console.log('[POSTSEASON SCHEDULE EXPORT 7J-10J] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     imported,
     rowCount: allRows.length,
