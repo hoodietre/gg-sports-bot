@@ -20356,6 +20356,8 @@ async function buildMaddenEaEndpointDiscoveryEmbed(guildId, league) {
     return { rows: [] };
   });
 
+  const teamTableMap = await buildMaddenTeamIdNameMapFromTeamStats(guildId, leagueId);
+
   const payloadRows = await pool.query(
     `SELECT endpoint, payload_type, raw_payload, created_at
      FROM madden_sync_payloads
@@ -21032,6 +21034,8 @@ async function buildMaddenScheduleStatusDecoderEmbed(guildId, league) {
   const leagueId = league.league_id;
   const NL = String.fromCharCode(10);
 
+  const teamTableMap = await buildMaddenTeamIdNameMapFromTeamStats(guildId, leagueId);
+
   const payloadRows = await pool.query(
     `SELECT endpoint, payload_type, raw_payload, created_at
      FROM madden_sync_payloads
@@ -21376,6 +21380,8 @@ async function buildMaddenPostseasonTeamIdResolverAuditEmbed(guildId, league) {
     addMap(gameMap, raw.awayTeamId ?? raw.away_team_id ?? raw.awayTeamLogoId, row.away_team, 'imported_games.away');
   }
 
+  const teamTableMap = await buildMaddenTeamIdNameMapFromTeamStats(guildId, leagueId);
+
   const payloadRows = await pool.query(
     `SELECT endpoint, payload_type, raw_payload, created_at
      FROM madden_sync_payloads
@@ -21417,8 +21423,9 @@ async function buildMaddenPostseasonTeamIdResolverAuditEmbed(guildId, league) {
   const idLines = [...neededIds].slice(0, 20).map(id => {
     const gameHit = gameMap.get(id);
     const payloadHit = payloadMap.get(id);
-    const merged = gameHit?.name || payloadHit?.name || 'UNKNOWN';
-    const sources = [...(gameHit?.sources || []), ...(payloadHit?.sources || [])].slice(0, 3).join(', ') || 'none';
+    const teamTableHit = teamTableMap.get(id);
+    const merged = teamTableHit || gameHit?.name || payloadHit?.name || 'UNKNOWN';
+    const sources = [teamTableHit ? 'madden_imported_team_stats' : null, ...(gameHit?.sources || []), ...(payloadHit?.sources || [])].filter(Boolean).slice(0, 3).join(', ') || 'none';
     return `**${id}** → ${merged} • ${sources}`;
   });
 
@@ -21429,13 +21436,13 @@ async function buildMaddenPostseasonTeamIdResolverAuditEmbed(guildId, league) {
   }
 
   const candidateLines = candidates.slice(0, 12).map(c => {
-    const awayName = gameMap.get(c.awayId)?.name || payloadMap.get(c.awayId)?.name || 'UNKNOWN';
-    const homeName = gameMap.get(c.homeId)?.name || payloadMap.get(c.homeId)?.name || 'UNKNOWN';
+    const awayName = teamTableMap.get(c.awayId) || gameMap.get(c.awayId)?.name || payloadMap.get(c.awayId)?.name || 'UNKNOWN';
+    const homeName = teamTableMap.get(c.homeId) || gameMap.get(c.homeId)?.name || payloadMap.get(c.homeId)?.name || 'UNKNOWN';
     return `**${c.awayId} ${c.awayScore} @ ${c.homeId} ${c.homeScore}** → ${awayName} @ ${homeName} • status:${c.status ?? 'n/a'} stage:${c.stageIndex ?? 'n/a'} weekIndex:${c.weekIndex ?? 'n/a'}`;
   });
 
   const bracketLines = [...playoffTeamNames].sort().slice(0, 20).map(name => `• ${name}`);
-  const knownCount = [...neededIds].filter(id => gameMap.has(id) || payloadMap.has(id)).length;
+  const knownCount = [...neededIds].filter(id => teamTableMap.has(id) || gameMap.has(id) || payloadMap.has(id)).length;
   const diagnosis = neededIds.size
     ? `Resolved ${knownCount}/${neededIds.size} unique scored candidate team IDs. If IDs remain UNKNOWN or resolved names do not match bracket teams, the postseason result repair must use the playoff/bracket team table instead of regular-season schedule IDs.`
     : 'No scored schedule candidate team IDs were found. Re-run sync or inspect schedule payloads before result promotion.';
@@ -21446,14 +21453,14 @@ async function buildMaddenPostseasonTeamIdResolverAuditEmbed(guildId, league) {
     .setColor(0x57F287)
     .setDescription('Safe audit that resolves scored EA schedule team IDs against imported game rows and stored EA payload team tables. This does not alter sync data.')
     .addFields(
-      { name: 'Coverage', value: [`Playoff bracket rows: **${(playoffRows.rows || []).length}**`, `Scored payload candidates: **${candidates.length}**`, `Unique candidate team IDs: **${neededIds.size}**`, `Imported-game map entries: **${gameMap.size}**`, `Payload map entries: **${payloadMap.size}**`].join(NL), inline: false },
+      { name: 'Coverage', value: [`Playoff bracket rows: **${(playoffRows.rows || []).length}**`, `Scored payload candidates: **${candidates.length}**`, `Unique candidate team IDs: **${neededIds.size}**`, `Imported-game map entries: **${gameMap.size}**`, `Team-table map entries: **${teamTableMap.size}**`, `Payload map entries: **${payloadMap.size}**`].join(NL), inline: false },
       { name: 'Candidate ID Resolution', value: (idLines.join(NL) || 'No candidate IDs found.').slice(0, 1024), inline: false },
       { name: 'Scored Candidate Translation', value: (candidateLines.join(NL) || 'No scored candidates found.').slice(0, 1024), inline: false },
       { name: 'Bracket Team Names', value: (bracketLines.join(NL) || 'No playoff bracket team names found.').slice(0, 1024), inline: false },
       { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Postseason Team ID Resolver Audit`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10O Postseason Resolver Audit Registration Fix' })
+    .setFooter({ text: 'GG Sports • 7J-10P Postseason Team Table Resolver Repair' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
@@ -21702,6 +21709,8 @@ async function buildMaddenPostseasonStageImportAuditEmbed(guildId, league) {
 async function buildMaddenPostseasonWeekIndexDecoderEmbed(guildId, league) {
   const leagueId = String(league?.league_id || '');
   const NL = String.fromCharCode(10);
+
+  const teamTableMap = await buildMaddenTeamIdNameMapFromTeamStats(guildId, leagueId);
 
   const payloadRows = await pool.query(
     `SELECT endpoint, payload_type, raw_payload, created_at
@@ -24288,6 +24297,40 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
 
 
 
+
+async function buildMaddenTeamIdNameMapFromTeamStats(guildId, leagueId) {
+  const byId = new Map();
+
+  const result = await pool.query(
+    `SELECT external_team_id, team_name, raw_payload
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1
+       AND league_id::text = $2::text
+       AND COALESCE(team_name, '') <> ''
+     ORDER BY imported_at DESC`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('[POSTSEASON TEAM TABLE MAP 7J-10P] Team stats map query failed:', error?.message || error);
+    return { rows: [] };
+  });
+
+  function put(id, name) {
+    if (id === null || id === undefined || !String(id).trim()) return;
+    const teamName = canonicalMaddenTeamNameFromAny(name);
+    if (!teamName) return;
+    byId.set(String(id), teamName);
+  }
+
+  for (const row of result.rows || []) {
+    put(row.external_team_id, row.team_name);
+    const raw = row.raw_payload && typeof row.raw_payload === 'object' ? row.raw_payload : {};
+    put(getAnyValue(raw, ['teamId', 'teamID', 'id', 'team_id', 'externalTeamId', 'external_team_id'], null), row.team_name);
+    put(getAnyValue(raw, ['teamLogoId', 'logoId', 'teamLogo', 'teamAbbrId'], null), row.team_name);
+  }
+
+  return byId;
+}
+
 async function buildMaddenTeamIdNameMapFromImportedGames(guildId, leagueId) {
   const byId = new Map();
 
@@ -24471,8 +24514,12 @@ async function importEaPostseasonScheduleExportsForLeague(context, guild, league
   // 7J-10K: postseason stage exports often contain only numeric team IDs.
   // Build a fallback ID -> team-name map from already imported regular-season games,
   // then merge it with LeagueHub-derived IDs before normalizing postseason rows.
+  const dbTeamTableMap = await buildMaddenTeamIdNameMapFromTeamStats(guild.id, league.league_id);
   const dbTeamIdMap = await buildMaddenTeamIdNameMapFromImportedGames(guild.id, league.league_id);
-  const enhancedTeamNameMaps = mergeMaddenTeamIdNameMaps(teamNameMaps, dbTeamIdMap);
+  const enhancedTeamNameMaps = mergeMaddenTeamIdNameMaps(
+    mergeMaddenTeamIdNameMaps(teamNameMaps, dbTeamTableMap),
+    dbTeamIdMap
+  );
 
   for (const stageIndex of stages) {
     const result = await requestEaScheduleExportWithFallbacks(context, 1, stageIndex).catch(error => ({ error, payload: null, rows: [], attempts: [] }));
