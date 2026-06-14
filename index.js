@@ -21298,6 +21298,19 @@ async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
 
 
 
+
+async function buildMaddenPostseasonBracketSourceAuditEmbed(guildId, league) {
+  const embed = await buildMaddenPostseasonSourceDiscoveryAuditEmbed(guildId, league);
+  try {
+    embed.setTitle('🛰️ Madden Postseason Bracket Source Audit • ' + (league?.league_name || 'Madden League'));
+    embed.setFooter({ text: 'GG Sports • 7J-10S Postseason Bracket Source Audit Runtime Fix' });
+  } catch (error) {
+    console.warn('Madden postseason bracket source audit title/footer update failed:', error.message);
+  }
+  return embed;
+}
+
+
 async function buildMaddenPostseasonSourceDiscoveryAuditEmbed(guildId, league) {
   const leagueId = String(league?.league_id || '');
   const NL = String.fromCharCode(10);
