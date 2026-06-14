@@ -15797,6 +15797,11 @@ async function findMaddenGameCenterGame(guildId, leagueId, teamName, week = null
 
   const weekFilter = normalizeMaddenWeekFilterInput(week) || week;
 
+  // 7J-10F: Game Center current-playoff lookup fix.
+  // When no exact week is requested, Game Center should prefer the current/upcoming
+  // matchup for those teams, especially playoff rows like Conf./Div. Playoff.
+  // Previously it prioritized old completed rows, so a scheduled Ravens @ Bills
+  // conference title game could display an older Ravens/Bills final instead.
   const result = await pool.query(
     `SELECT *
      FROM madden_imported_games
@@ -15816,9 +15821,21 @@ async function findMaddenGameCenterGame(guildId, leagueId, teamName, week = null
          OR LOWER(away_team) = ANY($5::text[])
        )
      ORDER BY
-       CASE WHEN LOWER(status) = 'completed' THEN 0 ELSE 1 END,
-       COALESCE(NULLIF(regexp_replace(week_label, '[^0-9]', '', 'g'), ''), '0')::int DESC,
-       imported_at DESC
+       CASE
+         WHEN $4::text IS NULL AND LOWER(COALESCE(status, 'scheduled')) = 'scheduled' THEN 0
+         WHEN $4::text IS NULL THEN 1
+         WHEN LOWER(COALESCE(status, '')) IN ('final', 'completed', 'complete', 'home_win', 'away_win', 'tie', 'completed_with_real_score') THEN 0
+         ELSE 1
+       END,
+       CASE
+         WHEN LOWER(COALESCE(week_label, '')) LIKE '%super%' THEN 1000
+         WHEN LOWER(COALESCE(week_label, '')) LIKE '%conf%' THEN 900
+         WHEN LOWER(COALESCE(week_label, '')) LIKE '%div%' THEN 800
+         WHEN LOWER(COALESCE(week_label, '')) LIKE '%wild%' THEN 700
+         ELSE COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int
+       END DESC,
+       imported_at DESC,
+       COALESCE(home_score, 0) + COALESCE(away_score, 0) DESC
      LIMIT 1`,
     [guildId, leagueId, teamKeys, weekFilter || null, oppKeys.length ? oppKeys : null]
   );
