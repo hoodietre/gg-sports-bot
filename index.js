@@ -21337,7 +21337,7 @@ async function buildMaddenPostseasonStageImportAuditEmbed(guildId, league) {
       { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Postseason Stage Import Audit`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10J Postseason Result Mapping Repair' })
+    .setFooter({ text: 'GG Sports • 7J-10K Postseason Team ID Mapping Repair' })
     .setTimestamp();
 
   const thumb = getMaddenTeamLogoUrl((importedRows.rows || [])[0]?.home_team || (importedRows.rows || [])[0]?.away_team || league?.league_name || 'NFL');
@@ -23934,6 +23934,78 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
 
 
 
+async function buildMaddenTeamIdNameMapFromImportedGames(guildId, leagueId) {
+  const byId = new Map();
+
+  const result = await pool.query(
+    `SELECT home_team, away_team, raw_payload
+     FROM madden_imported_games
+     WHERE guild_id = $1
+       AND league_id = $2
+       AND raw_payload IS NOT NULL
+       AND (COALESCE(home_team, '') <> '' OR COALESCE(away_team, '') <> '')
+     ORDER BY imported_at DESC
+     LIMIT 1000`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('[POSTSEASON TEAM ID MAP 7J-10K] Imported game map query failed:', error?.message || error);
+    return { rows: [] };
+  });
+
+  for (const gameRow of result.rows || []) {
+    const raw = gameRow.raw_payload && typeof gameRow.raw_payload === 'object' ? gameRow.raw_payload : {};
+    const homeName = canonicalMaddenTeamNameFromAny(gameRow.home_team);
+    const awayName = canonicalMaddenTeamNameFromAny(gameRow.away_team);
+    const homeId = getAnyValue(raw, ['homeTeamId', 'homeTeamLogoId', 'homeTeam', 'home_team_id'], null);
+    const awayId = getAnyValue(raw, ['awayTeamId', 'awayTeamLogoId', 'awayTeam', 'away_team_id'], null);
+
+    if (homeId !== null && homeId !== undefined && homeName) byId.set(String(homeId), homeName);
+    if (awayId !== null && awayId !== undefined && awayName) byId.set(String(awayId), awayName);
+
+    const nested = raw.seasonGameInfo || raw.gameInfo || null;
+    if (nested && typeof nested === 'object') {
+      const nestedHomeId = getAnyValue(nested, ['homeTeamId', 'homeTeamLogoId', 'homeTeam', 'home_team_id'], null);
+      const nestedAwayId = getAnyValue(nested, ['awayTeamId', 'awayTeamLogoId', 'awayTeam', 'away_team_id'], null);
+      if (nestedHomeId !== null && nestedHomeId !== undefined && homeName) byId.set(String(nestedHomeId), homeName);
+      if (nestedAwayId !== null && nestedAwayId !== undefined && awayName) byId.set(String(nestedAwayId), awayName);
+    }
+  }
+
+  return byId;
+}
+
+function mergeMaddenTeamIdNameMaps(primary = {}, extraById = new Map()) {
+  const byId = new Map();
+  const byName = new Map();
+
+  if (primary?.byId && typeof primary.byId.forEach === 'function') {
+    primary.byId.forEach((value, key) => {
+      if (key !== null && key !== undefined && value) byId.set(String(key), canonicalMaddenTeamNameFromAny(value));
+    });
+  }
+
+  if (extraById && typeof extraById.forEach === 'function') {
+    extraById.forEach((value, key) => {
+      if (key !== null && key !== undefined && value && !byId.has(String(key))) {
+        byId.set(String(key), canonicalMaddenTeamNameFromAny(value));
+      }
+    });
+  }
+
+  if (primary?.byName && typeof primary.byName.forEach === 'function') {
+    primary.byName.forEach((value, key) => {
+      if (key && value) byName.set(String(key).toLowerCase(), canonicalMaddenTeamNameFromAny(value));
+    });
+  }
+
+  byId.forEach(value => {
+    if (value) byName.set(String(value).toLowerCase(), value);
+  });
+
+  return { byId, byName };
+}
+
+
 async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'postseason-result-promotion') {
   const playoffLabels = ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Pro Bowl', 'Super Bowl'];
   let promoted = 0;
@@ -23966,7 +24038,7 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
       },
     });
 
-    // 7J-10J: Postseason result mapping repair.
+    // 7J-10K: Postseason team ID mapping repair.
     // EA postseason stage exports can return scored rows with raw stageIndex=0/weekIndex=0,
     // while the bracket rows already live in madden_imported_games as Wild Card/Div./Conf.
     // Match by matchup first and preserve the existing playoff label instead of forcing Week 1
@@ -24018,7 +24090,7 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
   }
 
   if (promotedRows.length) {
-    console.log('[POSTSEASON RESULT PROMOTION 7J-10J] ' + JSON.stringify({
+    console.log('[POSTSEASON RESULT PROMOTION 7J-10K] ' + JSON.stringify({
       label,
       promoted,
       sample: promotedRows.slice(0, 20),
@@ -24041,6 +24113,12 @@ async function importEaPostseasonScheduleExportsForLeague(context, guild, league
   let imported = 0;
   const allRows = [];
   const attempts = [];
+
+  // 7J-10K: postseason stage exports often contain only numeric team IDs.
+  // Build a fallback ID -> team-name map from already imported regular-season games,
+  // then merge it with LeagueHub-derived IDs before normalizing postseason rows.
+  const dbTeamIdMap = await buildMaddenTeamIdNameMapFromImportedGames(guild.id, league.league_id);
+  const enhancedTeamNameMaps = mergeMaddenTeamIdNameMaps(teamNameMaps, dbTeamIdMap);
 
   for (const stageIndex of stages) {
     const result = await requestEaScheduleExportWithFallbacks(context, 1, stageIndex).catch(error => ({ error, payload: null, rows: [], attempts: [] }));
@@ -24072,7 +24150,7 @@ async function importEaPostseasonScheduleExportsForLeague(context, guild, league
       });
     }
 
-    const candidateRows = normalizeEaScheduleExportRows(result.payload, null, stageIndex, teamNameMaps);
+    const candidateRows = normalizeEaScheduleExportRows(result.payload, null, stageIndex, enhancedTeamNameMaps);
     const scoredCandidates = candidateRows.filter(row => {
       const homeScore = parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0;
       const awayScore = parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0;
@@ -24091,7 +24169,7 @@ async function importEaPostseasonScheduleExportsForLeague(context, guild, league
     allRows.push(...(rows.length ? rows : scoredCandidates));
   }
 
-  console.log('[POSTSEASON SCHEDULE EXPORT 7J-10J] ' + JSON.stringify({
+  console.log('[POSTSEASON SCHEDULE EXPORT 7J-10K] ' + JSON.stringify({
     leagueId: context.externalLeagueId,
     imported,
     rowCount: allRows.length,
