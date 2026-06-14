@@ -1336,7 +1336,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
       .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' }, { name: 'Results Diagnostics', value: 'results_diag' }, { name: 'EA Endpoint Discovery', value: 'endpoint_discovery' }, { name: 'Raw Payload Deep Scan', value: 'raw_payload_scan' }, { name: 'Schedule Payload Inspector', value: 'schedule_payload_inspector' }, { name: 'Schedule Status Decoder', value: 'schedule_status_decoder' }, { name: 'EA Direct Sync Source Audit', value: 'sync_source_audit' }, { name: 'Playoff Result Promotion Audit', value: 'playoff_result_audit' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View a Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' }, { name: 'Results Diagnostics', value: 'results_diag' }, { name: 'EA Endpoint Discovery', value: 'endpoint_discovery' }, { name: 'Raw Payload Deep Scan', value: 'raw_payload_scan' }, { name: 'Schedule Payload Inspector', value: 'schedule_payload_inspector' }, { name: 'Schedule Status Decoder', value: 'schedule_status_decoder' }, { name: 'EA Direct Sync Source Audit', value: 'sync_source_audit' }, { name: 'Playoff Result Promotion Audit', value: 'playoff_result_audit' }, { name: 'Postseason Week Index Decoder', value: 'postseason_week_decoder' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
       .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
@@ -6685,6 +6685,12 @@ if (gameSubcommand === 'report') {
 
         if (view === 'playoff_result_audit') {
           const embed = await buildMaddenPlayoffResultPromotionAuditEmbed(interaction.guild.id, activeLeague);
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
+        if (view === 'postseason_week_decoder') {
+          const embed = await buildMaddenPostseasonWeekIndexDecoderEmbed(interaction.guild.id, activeLeague);
           await interaction.editReply({ embeds: [embed] });
           return;
         }
@@ -21237,6 +21243,131 @@ async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
   return embed;
 }
 
+
+
+async function buildMaddenPostseasonWeekIndexDecoderEmbed(guildId, league) {
+  const leagueId = String(league?.league_id || '');
+  const NL = String.fromCharCode(10);
+
+  const payloadRows = await pool.query(
+    `SELECT endpoint, payload_type, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND endpoint ILIKE '%WeeklySchedulesExport%'
+     ORDER BY created_at DESC NULLS LAST
+     LIMIT 250`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden postseason week decoder payload query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const importedRows = await pool.query(
+    `SELECT week_label, away_team, home_team, away_score, home_score, status, raw_payload, imported_at
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND (
+         COALESCE(NULLIF(regexp_replace(COALESCE(week_label, ''), '[^0-9]', '', 'g'), ''), '0')::int >= 19
+         OR LOWER(COALESCE(week_label, '')) LIKE '%playoff%'
+         OR LOWER(COALESCE(week_label, '')) LIKE '%super%'
+         OR LOWER(COALESCE(week_label, '')) LIKE '%bowl%'
+       )
+     ORDER BY imported_at DESC NULLS LAST
+     LIMIT 20`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden postseason week decoder imported query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const byWeek = new Map();
+  const byEndpoint = new Map();
+  const scoredSamples = [];
+  const scheduledSamples = [];
+  let totalGames = 0;
+  let postseasonGames = 0;
+  let scoredPostseasonGames = 0;
+
+  function endpointWeek(endpoint) {
+    const m = String(endpoint || '').match(/week:?([0-9]+)/i);
+    return m ? Number(m[1]) : null;
+  }
+
+  for (const row of payloadRows.rows || []) {
+    const endpoint = String(row.endpoint || 'unknown').replace(/^ea_direct:/, '');
+    const epWeek = endpointWeek(endpoint);
+    const games = maddenScheduleDecoderExtractGames(row.raw_payload || {}, 3000);
+    totalGames += games.length;
+    for (const game of games) {
+      const wi = Number(game.weekIndex ?? -1);
+      const stage = String(game.stageIndex ?? 'missing');
+      const season = String(game.seasonIndex ?? 'missing');
+      const status = String(game.status ?? 'missing');
+      const awayScore = Number(game.awayScore || 0);
+      const homeScore = Number(game.homeScore || 0);
+      const hasScore = awayScore !== 0 || homeScore !== 0;
+      const isPostseasonCandidate = wi >= 18 || (epWeek !== null && epWeek >= 19) || stage !== '1';
+      if (!isPostseasonCandidate) continue;
+      postseasonGames += 1;
+      if (hasScore) scoredPostseasonGames += 1;
+      const key = `weekIndex ${wi} • endpointWeek ${epWeek ?? 'n/a'} • stage ${stage} • season ${season} • status ${status} • ${hasScore ? 'scored' : '0-0'}`;
+      byWeek.set(key, (byWeek.get(key) || 0) + 1);
+      const epKey = `${endpoint.slice(0, 90)} • weekIndex ${wi}`;
+      byEndpoint.set(epKey, (byEndpoint.get(epKey) || 0) + 1);
+      const sample = `endpointWeek:${epWeek ?? 'n/a'} weekIndex:${wi} stage:${stage} season:${season} status:${status} score:${awayScore}-${homeScore} teams:${game.awayTeamId ?? game.awayTeam ?? '?'}@${game.homeTeamId ?? game.homeTeam ?? '?'} scheduleId:${game.scheduleId ?? 'n/a'}`;
+      if (hasScore && scoredSamples.length < 8) scoredSamples.push(sample);
+      if (!hasScore && scheduledSamples.length < 8) scheduledSamples.push(sample);
+    }
+  }
+
+  function mapLines(map, limit = 12) {
+    return [...map.entries()]
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || String(a[0]).localeCompare(String(b[0])))
+      .slice(0, limit)
+      .map(([key, count]) => `**${String(key).slice(0, 95)}** — ${count}`);
+  }
+
+  const importedLines = (importedRows.rows || []).slice(0, 10).map(row => {
+    return `**${row.week_label || 'Week TBD'}** — ${row.away_team || 'Away'} ${Number(row.away_score || 0)} @ ${row.home_team || 'Home'} ${Number(row.home_score || 0)} • ${row.status || 'scheduled'}`;
+  });
+
+  const coverageText = [
+    `Schedule payloads scanned: **${(payloadRows.rows || []).length}**`,
+    `Parsed schedule game objects: **${totalGames}**`,
+    `Postseason candidates inspected: **${postseasonGames}**`,
+    `Scored postseason candidates: **${scoredPostseasonGames}**`,
+    `Imported postseason/playoff rows: **${(importedRows.rows || []).length}**`,
+  ].join(NL);
+
+  const diagnosis = scoredPostseasonGames > 0
+    ? 'Scored postseason candidates were found. The next patch should promote weekIndex >= 18 / endpoint week >= 19 rows into playoff-labeled imported games.'
+    : postseasonGames > 0
+      ? 'Postseason schedule candidates exist, but no scored postseason candidates were found yet. This likely means the current playoff round has not exported final scores yet.'
+      : 'No weekIndex >= 18 or endpoint week >= 19 schedule objects were found in stored payloads yet.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧭 Madden Postseason Week Index Decoder • ' + (league?.league_name || 'Madden League'))
+    .setColor(0x2ECC71)
+    .setDescription('Safe decoder for postseason WeeklySchedulesExport rows. Week 18 is regular season; this view focuses on weekIndex >= 18 and endpoint week >= 19.')
+    .addFields(
+      { name: 'Coverage', value: coverageText.slice(0, 1024), inline: false },
+      { name: 'Postseason Week/Stage Shapes', value: (mapLines(byWeek, 12).join(NL) || 'No postseason candidate shapes found.').slice(0, 1024), inline: false },
+      { name: 'Postseason Endpoint Samples', value: (mapLines(byEndpoint, 8).join(NL) || 'No postseason endpoint samples found.').slice(0, 1024), inline: false },
+      { name: 'Scored Candidate Samples', value: (scoredSamples.join(NL) || 'No scored postseason candidates found.').slice(0, 1024), inline: false },
+      { name: 'Scheduled Candidate Samples', value: (scheduledSamples.join(NL) || 'No scheduled postseason candidates found.').slice(0, 1024), inline: false },
+      { name: 'Imported Postseason Rows', value: (importedLines.join(NL) || 'No imported playoff/postseason rows found yet.').slice(0, 1024), inline: false },
+      { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/madden franchise view:Postseason Week Index Decoder`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10H Postseason Week Index Decoder' })
+    .setTimestamp();
+
+  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
 
 async function buildMaddenPlayoffResultPromotionAuditEmbed(guildId, league) {
   const NL = String.fromCharCode(10);
