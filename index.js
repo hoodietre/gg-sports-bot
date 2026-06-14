@@ -19689,7 +19689,7 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
       { name: 'Scoring Model', value: '`Career yards + TDs + sacks + INTs` • future seasons can add MVPs, championships, and playoff success.', inline: false },
       { name: 'Command', value: '`/madden franchise view:Hall of Fame`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-9B-C Unified Stat Source' })
+    .setFooter({ text: 'GG Sports • 7J-10E Unified Franchise Stat Source' })
     .setTimestamp();
   if (thumb) embed.setThumbnail(thumb);
   return embed;
@@ -21217,6 +21217,12 @@ async function buildMaddenHistoricalResultsDiagnosticsEmbed(guildId, league) {
 async function buildMaddenSeasonClosePreviewEmbed(guildId, league) {
   const leagueId = league.league_id;
   await ensureMaddenChampionshipHistoryTable();
+  // 7J-10E: refresh projected awards from the same live award/stat source used by /madden awards
+  // before Season Close reads madden_award_history. This prevents stale Week 2/old projection rows
+  // from appearing after a later Madden sync.
+  await refreshMaddenProjectedAwardHistory(guildId, leagueId).catch(error => {
+    console.warn('Madden season-close award projection refresh failed:', error.message);
+  });
   const detected = await refreshMaddenDetectedChampionship(guildId, leagueId).catch(error => {
     console.warn('Madden championship detection refresh failed:', error.message);
     return null;
