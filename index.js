@@ -16855,16 +16855,14 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
       baseStatus.includes('played') ||
       Boolean(playedMarker);
 
-    // 7J-9B-I: Safe game result detection.
-    // EA schedule rows can expose force/winner-looking gameResult values before a game is played.
-    // Never mark a zero-score game final from gameResult alone. Require a real score, a trusted
-    // completed status, or a reliable played/completed timestamp first.
+    // 7J-10C: Scored schedule import repair.
+    // Winner-looking fields are only safe when a real score or trusted completed marker exists.
+    // For scored schedule rows, derive the winner from the score instead of gameResult/status.
     let status = 'scheduled';
     if (hasRealScore) {
-      if (rowGameResult === 2) status = 'away_win';
-      else if (rowGameResult === 3) status = 'home_win';
-      else if (rowGameResult === 4) status = 'tie';
-      else status = 'completed_with_real_score';
+      if (awayScoreValue > homeScoreValue) status = 'away_win';
+      else if (homeScoreValue > awayScoreValue) status = 'home_win';
+      else status = 'tie';
     } else if (hasTrustedCompletedMarker) {
       if (rowGameResult === 2) status = 'away_win';
       else if (rowGameResult === 3) status = 'home_win';
@@ -18399,15 +18397,17 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
 
     const gameResult = parseNumberOrNull(getAnyValue(game, ['gameResult', 'result'], null) ?? getAnyValue(row, ['gameResult', 'result'], null));
 
-    // 7J-9B-I: Safe game result detection.
-    // gameResult by itself can appear on unplayed schedule rows. Only mark final when there is
-    // a real score, a trusted completed/final status, or a reliable played/completed timestamp.
-    // 1 = NOT_PLAYED, 2 = AWAY_WIN, 3 = HOME_WIN, 4 = TIE.
+    // 7J-10C: Scored schedule import repair.
+    // The schedule decoder proved EA WeeklySchedulesExport uses numeric status=1 for scheduled 0-0 rows,
+    // while status=2/status=3 rows can carry real scores. Do not trust numeric status by itself.
+    // If real scores exist, derive the winner directly from the score so scored games are saved.
+    // If no real score exists, keep the row scheduled even if status/gameResult looks winner-like.
     const hasRealScore = awayScore > 0 || homeScore > 0;
-    const rawStatusText = String(
+    const rawStatusValue =
       getAnyValue(game, ['status', 'gameStatus', 'statusText', 'gameStatusText'], null) ??
-      getAnyValue(row, ['status', 'gameStatus', 'statusText', 'gameStatusText'], '')
-    ).toLowerCase();
+      getAnyValue(row, ['status', 'gameStatus', 'statusText', 'gameStatusText'], '');
+    const rawStatusText = String(rawStatusValue || '').toLowerCase();
+    const numericStatus = parseNumberOrNull(rawStatusValue);
     const playedMarker =
       getAnyValue(game, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null) ??
       getAnyValue(row, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null);
@@ -18417,13 +18417,18 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
       rawStatusText.includes('complete') ||
       rawStatusText.includes('played') ||
       Boolean(playedMarker);
-    const isPlayed = hasRealScore || hasTrustedCompletedMarker;
 
     let status = 'scheduled';
-    if (isPlayed && gameResult === 2) status = 'away_win';
-    else if (isPlayed && gameResult === 3) status = 'home_win';
-    else if (isPlayed && gameResult === 4) status = 'tie';
-    else if (isPlayed) status = hasRealScore ? 'completed' : 'completed';
+    if (hasRealScore) {
+      if (awayScore > homeScore) status = 'away_win';
+      else if (homeScore > awayScore) status = 'home_win';
+      else status = 'tie';
+    } else if (hasTrustedCompletedMarker) {
+      if (gameResult === 2 || numericStatus === 2) status = 'away_win';
+      else if (gameResult === 3 || numericStatus === 3) status = 'home_win';
+      else if (gameResult === 4 || numericStatus === 4) status = 'tie';
+      else status = 'completed';
+    }
 
     const externalGameId = String([
       'ea-schedule-export',
@@ -20876,7 +20881,7 @@ async function buildMaddenEaDirectSyncSourceAuditEmbed(guildId, league) {
       { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:EA Direct Sync Source Audit`', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10A EA Direct Sync Source Audit' })
+    .setFooter({ text: 'GG Sports • 7J-10C Scored Schedule Import Repair' })
     .setTimestamp();
 
   if (thumb) embed.setThumbnail(thumb);
@@ -23360,7 +23365,7 @@ async function repairMaddenImportedZeroZeroCompletedGames(guild, league, label =
 }
 
 
-async function importEaScheduleExportForLeague(context, guild, league, runId = null, standingsRows = [], label = 'schedule-export') {
+async function importEaScheduleExportForLeague(context, guild, league, runId = null, standingsRows = [], label = 'schedule-export', hubPayload = null) {
   const enabled = String(process.env.EA_SCHEDULE_EXPORT_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return { imported: 0, rows: [], skipped: true };
 
@@ -23370,7 +23375,7 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
     .filter(value => Number.isFinite(value) && value > 0);
 
   const targetWeeks = weeks.length ? weeks : guessEaRegularSeasonWeeksFromStandingsRows(standingsRows);
-  const teamNameMaps = {};
+  const teamNameMaps = hubPayload ? buildEaTeamNameMaps(hubPayload) : {};
   let imported = 0;
   const allRows = [];
   const attemptSummaries = [];
@@ -28887,7 +28892,7 @@ async function recalculateMaddenTeamPointsFromImportedGames(guild, league) {
     const gamesResult = await pool.query(
       `SELECT * FROM madden_imported_games
        WHERE guild_id = $1 AND league_id = $2
-         AND LOWER(COALESCE(status, '')) IN ('completed', 'final')
+         AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'complete', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
          AND (LOWER(home_team) = LOWER($3) OR LOWER(away_team) = LOWER($3))`,
       [guild.id, league.league_id, teamName]
     );
@@ -29049,7 +29054,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       console.error('[Madden Sync] Standings export endpoint failed:', error?.message || error);
       return { imported: 0, rows: [], error: error?.message || String(error) };
     });
-    await importEaScheduleExportForLeague(context, guild, league, runId, standingsExportResult?.rows || [], 'post-standings-export').catch(error => {
+    await importEaScheduleExportForLeague(context, guild, league, runId, standingsExportResult?.rows || [], 'post-standings-export', hub).catch(error => {
       console.error('[Madden Sync] Schedule export import failed:', error?.message || error);
     });
     await repairMaddenImportedZeroZeroCompletedGames(guild, league, 'post-schedule-export').catch(error => {
