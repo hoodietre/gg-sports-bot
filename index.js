@@ -22680,6 +22680,222 @@ async function buildMaddenWeekIndexCoverageAuditEmbed(guildId, league) {
 }
 
 
+async function buildMaddenPlayoffEndpointEnumeratorEmbed(guildId, league) {
+  const leagueId = String(league?.league_id || '');
+  const NL = String.fromCharCode(10);
+
+  const payloadRows = await pool.query(
+    `SELECT endpoint, payload_type, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+     ORDER BY created_at DESC NULLS LAST
+     LIMIT 5000`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden playoff endpoint enumerator payload query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const importedRows = await pool.query(
+    `SELECT week_label, away_team, home_team, away_score, home_score, status, raw_payload, imported_at
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND week_label IN ('Wild Card','Div. Playoff','Conf. Playoff','Pro Bowl','Super Bowl')
+     ORDER BY
+       CASE week_label
+         WHEN 'Wild Card' THEN 1
+         WHEN 'Div. Playoff' THEN 2
+         WHEN 'Conf. Playoff' THEN 3
+         WHEN 'Pro Bowl' THEN 4
+         WHEN 'Super Bowl' THEN 5
+         ELSE 9
+       END,
+       imported_at DESC NULLS LAST`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.warn('Madden playoff endpoint enumerator imported query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const markerWords = [
+    'playoff', 'postseason', 'wildcard', 'wild_card', 'wild card', 'divisional', 'division',
+    'conference', 'championship', 'superbowl', 'super_bowl', 'super bowl', 'bowl', 'bracket',
+    'tournament', 'seed', 'round'
+  ];
+
+  const truthSet = [
+    { label: 'Ravens 23 Bills 20', teams: ['ravens', 'bills'], scores: ['23', '20'] },
+    { label: 'Packers 21 Seahawks 14', teams: ['packers', 'seahawks'], scores: ['21', '14'] },
+    { label: 'Bills 34 Patriots 21', teams: ['bills', 'patriots'], scores: ['34', '21'] },
+    { label: 'Ravens 17 Jaguars 3', teams: ['ravens', 'jaguars'], scores: ['17', '3'] },
+    { label: 'Packers 35 Eagles 21', teams: ['packers', 'eagles'], scores: ['35', '21'] },
+    { label: 'Seahawks 21 Rams 13', teams: ['seahawks', 'rams'], scores: ['21', '13'] },
+    { label: 'Jaguars 27 Colts 24', teams: ['jaguars', 'colts'], scores: ['27', '24'] },
+    { label: 'Patriots 20 Broncos 10', teams: ['patriots', 'broncos'], scores: ['20', '10'] },
+    { label: 'Ravens 33 Bengals 29', teams: ['ravens', 'bengals'], scores: ['33', '29'] },
+    { label: 'Eagles 31 Bears 21', teams: ['eagles', 'bears'], scores: ['31', '21'] },
+    { label: 'Packers 24 49ers 17', teams: ['packers', '49ers'], scores: ['24', '17'] },
+    { label: 'Seahawks 41 Buccaneers 10', teams: ['seahawks', 'buccaneers'], scores: ['41', '10'] },
+  ];
+
+  const playoffScheduleIds = new Set();
+  for (const row of importedRows.rows || []) {
+    const raw = row.raw_payload || {};
+    const sid = raw.scheduleId ?? raw.schedule_id ?? raw.external_game_id ?? raw.externalGameId ?? raw.id ?? null;
+    if (sid !== null && sid !== undefined && String(sid).trim() !== '') playoffScheduleIds.add(String(sid));
+  }
+
+  function inc(map, key, by = 1) {
+    const clean = String(key || 'missing');
+    map.set(clean, (map.get(clean) || 0) + by);
+  }
+
+  function short(value, max = 260) {
+    try { return JSON.stringify(value).slice(0, max); } catch { return String(value).slice(0, max); }
+  }
+
+  function hasNumberToken(text, n) {
+    return new RegExp(`(^|[^0-9])${String(n).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^0-9]|$)`).test(text);
+  }
+
+  const endpointStats = new Map();
+  const markerEndpointStats = new Map();
+  const endpointWeekStats = new Map();
+  const markerSamples = [];
+  const scoreSamples = [];
+  const scheduleIdSamples = [];
+  const objectKeySamples = [];
+  let objectsScanned = 0;
+  let markerObjects = 0;
+  let scoreObjects = 0;
+  let scheduleIdObjects = 0;
+
+  function endpointStat(endpoint) {
+    const key = String(endpoint || 'unknown');
+    if (!endpointStats.has(key)) endpointStats.set(key, { payloads: 0, objects: 0, markers: 0, scores: 0, scheduleIds: 0, keys: new Set() });
+    return endpointStats.get(key);
+  }
+
+  function scanObject(obj, endpoint, path = '$', depth = 0, budget = { count: 0 }) {
+    if (!obj || depth > 12 || budget.count > 26000) return;
+    budget.count += 1;
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length && i < 260; i++) scanObject(obj[i], endpoint, `${path}[${i}]`, depth + 1, budget);
+      return;
+    }
+    if (typeof obj !== 'object') return;
+
+    objectsScanned += 1;
+    const stat = endpointStat(endpoint);
+    stat.objects += 1;
+    const keys = Object.keys(obj);
+    for (const k of keys.slice(0, 24)) stat.keys.add(k);
+
+    const objectText = short(obj, 1400).toLowerCase();
+    const keyText = keys.join(' ').toLowerCase();
+    let markerHit = null;
+    for (const word of markerWords) {
+      if (keyText.includes(word) || objectText.includes(word)) {
+        markerHit = word;
+        break;
+      }
+    }
+    if (markerHit) {
+      markerObjects += 1;
+      stat.markers += 1;
+      inc(markerEndpointStats, endpoint);
+      if (markerSamples.length < 22) markerSamples.push(`${String(endpoint).slice(0, 75)} • ${path} • ${markerHit} • keys:${keys.slice(0, 12).join(',')}`);
+      if (objectKeySamples.length < 14) objectKeySamples.push(`${String(endpoint).slice(0, 75)} • ${path} • keys:${keys.slice(0, 18).join(',')}`);
+    }
+
+    const wi = obj.weekIndex ?? obj.week_index ?? obj.week ?? null;
+    if (wi !== null && wi !== undefined && Number.isFinite(Number(wi))) inc(endpointWeekStats, `${endpoint} • weekIndex:${Number(wi)}`);
+
+    const sid = obj.scheduleId ?? obj.schedule_id ?? obj.external_game_id ?? obj.externalGameId ?? obj.gameId ?? obj.game_id ?? null;
+    if (sid !== null && sid !== undefined && playoffScheduleIds.has(String(sid))) {
+      scheduleIdObjects += 1;
+      stat.scheduleIds += 1;
+      if (scheduleIdSamples.length < 18) scheduleIdSamples.push(`${String(endpoint).slice(0, 75)} • ${path} • sid:${sid} • ${short(obj, 240)}`);
+    }
+
+    if (scoreSamples.length < 20) {
+      for (const item of truthSet) {
+        const hasTeams = item.teams.every(team => objectText.includes(String(team).toLowerCase()));
+        const hasScores = item.scores.every(score => hasNumberToken(objectText, score));
+        if (hasTeams && hasScores) {
+          scoreObjects += 1;
+          stat.scores += 1;
+          scoreSamples.push(`${item.label} → ${String(endpoint).slice(0, 75)} • ${path} • ${short(obj, 300)}`);
+          break;
+        }
+      }
+    }
+
+    for (const key of keys) {
+      const child = obj[key];
+      if (child && typeof child === 'object') scanObject(child, endpoint, path === '$' ? key : `${path}.${key}`, depth + 1, budget);
+    }
+  }
+
+  for (const row of payloadRows.rows || []) {
+    const endpoint = String(row.endpoint || 'unknown');
+    const stat = endpointStat(endpoint);
+    stat.payloads += 1;
+    scanObject(row.raw_payload || {}, endpoint);
+  }
+
+  function topEndpointLines(limit = 12) {
+    return [...endpointStats.entries()]
+      .sort((a, b) => (b[1].markers + b[1].scores + b[1].scheduleIds) - (a[1].markers + a[1].scores + a[1].scheduleIds) || b[1].payloads - a[1].payloads)
+      .slice(0, limit)
+      .map(([endpoint, stat]) => `**${endpoint.slice(0, 82)}** • payloads ${stat.payloads} • obj ${stat.objects} • marker ${stat.markers} • score ${stat.scores} • sid ${stat.scheduleIds}`);
+  }
+
+  function topMapLines(map, limit = 10) {
+    return [...map.entries()]
+      .sort((a, b) => Number(b[1]) - Number(a[1]))
+      .slice(0, limit)
+      .map(([k, v]) => `**${String(k).slice(0, 90)}** — ${v}`);
+  }
+
+  const importedLines = (importedRows.rows || []).slice(0, 12).map(row => {
+    const raw = row.raw_payload || {};
+    const sid = raw.scheduleId ?? raw.schedule_id ?? raw.external_game_id ?? raw.externalGameId ?? raw.id ?? 'n/a';
+    return `**${row.week_label}** ${row.away_team} ${Number(row.away_score || 0)} @ ${row.home_team} ${Number(row.home_score || 0)} • ${row.status || 'scheduled'} • sid:${sid}`;
+  });
+
+  const diagnosis = [
+    scoreSamples.length ? `Found ${scoreSamples.length} verified playoff score signature sample(s). Use those endpoint/path values as the true result source.` : 'No verified playoff score signature samples found in stored payload objects.',
+    scheduleIdSamples.length ? `Found ${scheduleIdSamples.length} object(s) containing imported playoff schedule IDs.` : 'No object samples contained imported playoff schedule IDs.',
+    'If score samples are still zero, the real Madden playoff result endpoint is not currently being persisted into madden_sync_payloads.'
+  ].join(NL);
+
+  const thumb = getMaddenTeamLogoUrl((importedRows.rows || [])[0]?.home_team || (importedRows.rows || [])[0]?.away_team || league?.league_name || 'NFL');
+  const embed = new EmbedBuilder()
+    .setTitle('🧭 Madden Playoff Endpoint Enumerator • ' + (league?.league_name || 'Madden League'))
+    .setColor(0x9B59B6)
+    .setDescription('Safe read-only endpoint inventory for playoff/bracket/result payloads. This groups stored EA payloads and searches for verified Madden playoff score signatures.')
+    .addFields(
+      { name: 'Coverage', value: [`Payloads scanned: **${(payloadRows.rows || []).length}**`, `Distinct endpoints: **${endpointStats.size}**`, `Objects scanned: **${objectsScanned}**`, `Marker objects: **${markerObjects}**`, `Verified score objects: **${scoreObjects}**`, `Imported playoff rows: **${(importedRows.rows || []).length}**`, `Playoff schedule IDs checked: **${playoffScheduleIds.size}**`, `Schedule-ID objects: **${scheduleIdObjects}**`].join(NL), inline: false },
+      { name: 'Top Marker / Score Endpoints', value: (topEndpointLines(12).join(NL) || 'No endpoint rows found.').slice(0, 1024), inline: false },
+      { name: 'Marker Endpoint Counts', value: (topMapLines(markerEndpointStats, 10).join(NL) || 'No playoff/bracket marker endpoint hits.').slice(0, 1024), inline: false },
+      { name: 'Verified Score Samples', value: (scoreSamples.join(NL) || 'No verified playoff score signatures found.').slice(0, 1024), inline: false },
+      { name: 'Imported Playoff Schedule ID Samples', value: (scheduleIdSamples.join(NL) || 'No payload objects found with imported playoff schedule IDs.').slice(0, 1024), inline: false },
+      { name: 'Object Key Samples', value: (objectKeySamples.join(NL) || 'No playoff/bracket object key samples found.').slice(0, 1024), inline: false },
+      { name: 'Endpoint WeekIndex Samples', value: (topMapLines(endpointWeekStats, 10).join(NL) || 'No weekIndex samples found.').slice(0, 1024), inline: false },
+      { name: 'Imported Playoff Rows', value: (importedLines.join(NL) || 'No imported playoff rows found.').slice(0, 1024), inline: false },
+      { name: 'Diagnosis', value: diagnosis.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/maddendebug view:Playoff Endpoint Enumerator`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10AK Playoff Endpoint Enumerator Runtime Fix' })
+    .setTimestamp();
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
+
 async function buildMaddenPlayoffPayloadPresenceAuditEmbed(guildId, league) {
   const leagueId = String(league?.league_id || '');
   const NL = String.fromCharCode(10);
