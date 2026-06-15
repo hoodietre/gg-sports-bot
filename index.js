@@ -6395,7 +6395,15 @@ if (gameSubcommand === 'report') {
                WHEN COALESCE(away_score, 0) > 0 OR COALESCE(home_score, 0) > 0 THEN 0
                ELSE 1
              END,
-             COALESCE(NULLIF(regexp_replace(week_label, '[^0-9]', '', 'g'), ''), '0')::int DESC,
+             CASE
+               WHEN LOWER(COALESCE(week_label, '')) = 'super bowl' THEN 23
+               WHEN LOWER(COALESCE(week_label, '')) = 'conf. playoff' THEN 21
+               WHEN LOWER(COALESCE(week_label, '')) = 'conference championship' THEN 21
+               WHEN LOWER(COALESCE(week_label, '')) = 'div. playoff' THEN 20
+               WHEN LOWER(COALESCE(week_label, '')) = 'divisional' THEN 20
+               WHEN LOWER(COALESCE(week_label, '')) = 'wild card' THEN 19
+               ELSE COALESCE(NULLIF(regexp_replace(week_label, '[^0-9]', '', 'g'), ''), '0')::int
+             END DESC,
              imported_at DESC
            LIMIT $3`,
           [interaction.guild.id, activeLeague.league_id, limit]
@@ -26228,6 +26236,8 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
   const allRows = [];
   const attemptSummaries = [];
 
+  await cleanupMaddenPostseasonSyntheticScheduleRows(guild, league, 'schedule-export-start');
+
   for (const weekNumber of targetWeeks) {
     const result = await requestEaScheduleExportWithFallbacks(context, weekNumber, 'reg');
     attemptSummaries.push({
@@ -26268,17 +26278,17 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
       });
     }
 
-    // 7J-10AO: Let normalized schedule rows provide their own week labels.
-    // This is required for Madden playoff display weeks 19/20/21/23, which normalize to
-    // Wild Card, Div. Playoff, Conf. Playoff, and Super Bowl instead of Week 19+.
-    imported += await importMaddenGamesFromArray(guild, league, rows, null);
+    // 7J-10AP: Do not insert playoff weekly export rows as brand-new synthetic games.
+    // The Madden playoff bracket rows already exist in madden_imported_games with EA scheduleId
+    // values. Inserting these rows first created duplicate schedule lines; playoff rows should
+    // only promote/update the existing bracket rows by scheduleId.
+    const playoffLabels = ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Super Bowl'];
+    const playoffRows = rows.filter(row => playoffLabels.includes(String(row.week_label || row.weekLabel || row.week || '')));
+    const regularRows = rows.filter(row => !playoffLabels.includes(String(row.week_label || row.weekLabel || row.week || '')));
 
-    // 7J-10AO: The playoff weekly schedule fetch now returns the real Madden playoff
-    // result rows with the same scheduleId values as the already-created playoff bracket rows.
-    // Promote scored playoff rows directly into those bracket rows after importing/storing the
-    // raw schedule payload so schedule/game/recentgames views stop showing 0-0 scheduled.
-    const playoffScoredRows = rows.filter(row =>
-      ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Super Bowl'].includes(String(row.week_label || row.weekLabel || row.week || '')) &&
+    imported += await importMaddenGamesFromArray(guild, league, regularRows, null);
+
+    const playoffScoredRows = playoffRows.filter(row =>
       ((parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) > 0 || (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0) > 0)
     );
     if (playoffScoredRows.length) {
@@ -26417,6 +26427,35 @@ function mergeMaddenTeamIdNameMaps(primary = {}, extraById = new Map()) {
 }
 
 
+
+async function cleanupMaddenPostseasonSyntheticScheduleRows(guild, league, label = 'postseason-synthetic-cleanup') {
+  // 7J-10AP: Earlier builds inserted fetched playoff WeeklySchedulesExport rows using synthetic
+  // external ids like ea-schedule-export:reg:20:... while the real bracket rows already existed
+  // with external_game_id = EA scheduleId. Remove only those synthetic playoff duplicates.
+  const result = await pool.query(
+    `DELETE FROM madden_imported_games
+     WHERE guild_id = $1
+       AND league_id = $2
+       AND week_label = ANY($3::text[])
+       AND external_game_id LIKE 'ea-schedule-export:%'`,
+    [guild.id, league.league_id, ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Super Bowl']]
+  ).catch(error => {
+    console.warn('[POSTSEASON SYNTHETIC CLEANUP 7J-10AP] Failed:', error?.message || error);
+    return { rowCount: 0 };
+  });
+
+  if (Number(result.rowCount || 0) > 0) {
+    console.log('[POSTSEASON SYNTHETIC CLEANUP 7J-10AP] ' + JSON.stringify({
+      label,
+      deleted: Number(result.rowCount || 0),
+      leagueId: league.league_id,
+      leagueName: league.league_name,
+    }));
+  }
+
+  return { deleted: Number(result.rowCount || 0) };
+}
+
 async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'postseason-result-promotion') {
   const playoffLabels = ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Pro Bowl', 'Super Bowl'];
   let promoted = 0;
@@ -26449,7 +26488,7 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
       },
     });
 
-    // 7J-10AO: Prefer exact EA scheduleId promotion now that weekly playoff schedule
+    // 7J-10AP: Prefer exact EA scheduleId promotion now that weekly playoff schedule
     // exports are fetched correctly. The imported playoff bracket rows already store these
     // schedule IDs in external_game_id, so this avoids unsafe team-name guessing.
     let result = { rows: [], rowCount: 0 };
