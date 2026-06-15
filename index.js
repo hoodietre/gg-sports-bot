@@ -26268,7 +26268,23 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
       });
     }
 
-    imported += await importMaddenGamesFromArray(guild, league, rows, 'Week ' + weekNumber);
+    // 7J-10AO: Let normalized schedule rows provide their own week labels.
+    // This is required for Madden playoff display weeks 19/20/21/23, which normalize to
+    // Wild Card, Div. Playoff, Conf. Playoff, and Super Bowl instead of Week 19+.
+    imported += await importMaddenGamesFromArray(guild, league, rows, null);
+
+    // 7J-10AO: The playoff weekly schedule fetch now returns the real Madden playoff
+    // result rows with the same scheduleId values as the already-created playoff bracket rows.
+    // Promote scored playoff rows directly into those bracket rows after importing/storing the
+    // raw schedule payload so schedule/game/recentgames views stop showing 0-0 scheduled.
+    const playoffScoredRows = rows.filter(row =>
+      ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Super Bowl'].includes(String(row.week_label || row.weekLabel || row.week || '')) &&
+      ((parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) > 0 || (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0) > 0)
+    );
+    if (playoffScoredRows.length) {
+      const promotion = await promoteMaddenPostseasonScoredRows(guild, league, playoffScoredRows, 'weekly_schedule_week:' + weekNumber);
+      imported += Number(promotion?.promoted || 0);
+    }
   }
 
   console.log('[SCHEDULE EXPORT 7J-7ZP] ' + JSON.stringify({
@@ -26433,12 +26449,36 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
       },
     });
 
+    // 7J-10AO: Prefer exact EA scheduleId promotion now that weekly playoff schedule
+    // exports are fetched correctly. The imported playoff bracket rows already store these
+    // schedule IDs in external_game_id, so this avoids unsafe team-name guessing.
+    let result = { rows: [], rowCount: 0 };
+    const scheduleId = row.scheduleId || row.schedule_id || getAnyValue(row.raw || {}, ['scheduleId', 'id', 'gameId'], null);
+    if (scheduleId !== null && scheduleId !== undefined && String(scheduleId).trim()) {
+      result = await pool.query(
+        `UPDATE madden_imported_games
+         SET home_score = $5,
+             away_score = $6,
+             status = $7,
+             raw_payload = $8::jsonb,
+             imported_at = NOW()
+         WHERE guild_id = $1
+           AND league_id = $2
+           AND week_label = ANY($3::text[])
+           AND external_game_id = $4
+           AND (COALESCE(home_score, 0) = 0 AND COALESCE(away_score, 0) = 0 OR status = 'scheduled')
+         RETURNING week_label, home_team, away_team, home_score, away_score, status`,
+        [guild.id, league.league_id, playoffLabels, String(scheduleId), homeScore, awayScore, status, rawPayload]
+      );
+    }
+
     // 7J-10K: Postseason team ID mapping repair.
     // EA postseason stage exports can return scored rows with raw stageIndex=0/weekIndex=0,
     // while the bracket rows already live in madden_imported_games as Wild Card/Div./Conf.
     // Match by matchup first and preserve the existing playoff label instead of forcing Week 1
     // or inventing a stage label from the request.
-    let result = await pool.query(
+    if (!result.rows.length) {
+      result = await pool.query(
       `UPDATE madden_imported_games
        SET home_score = $5,
            away_score = $6,
@@ -26454,6 +26494,7 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
        RETURNING week_label, home_team, away_team, home_score, away_score, status`,
       [guild.id, league.league_id, playoffLabels, homeTeam, homeScore, awayScore, status, rawPayload, awayTeam]
     );
+    }
 
     // If EA gives the matchup reversed from our bracket row, still promote safely.
     if (!result.rows.length) {
