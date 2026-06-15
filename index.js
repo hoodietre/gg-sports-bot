@@ -18584,6 +18584,20 @@ function getMaddenEaPostseasonStageLabel(stageIndex) {
   return null;
 }
 
+// 7J-10AN: Snallapa confirmed playoff scores live in CareerMode_GetWeeklySchedulesExport,
+// not in the older postseason_stage probe payloads. EA uses display weeks 19, 20, 21,
+// skips Pro Bowl week 22, then uses week 23 for the Super Bowl. The export request is
+// still zero-based internally, but week labels should be playoff labels when these rows import.
+function getMaddenPlayoffWeekLabelFromDisplayWeek(weekNumber) {
+  const n = Number(weekNumber);
+  if (n === 19) return 'Wild Card';
+  if (n === 20) return 'Div. Playoff';
+  if (n === 21) return 'Conf. Playoff';
+  if (n === 22) return 'Pro Bowl';
+  if (n === 23) return 'Super Bowl';
+  return null;
+}
+
 function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg', teamNameMaps = {}) {
   const rows = extractEaScheduleExportList(payload);
   const normalized = [];
@@ -18625,7 +18639,8 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
     const numericStageForLabel = parseNumberOrNull(rawStage);
     const postseasonStageLabel = getMaddenEaPostseasonStageLabel(numericStageForLabel);
     const inferredWeekNumber = weekNumber || (Number.isFinite(rawWeekNumber) ? rawWeekNumber + 1 : rawWeek);
-    const weekLabel = postseasonStageLabel || ('Week ' + String(inferredWeekNumber || 'TBD'));
+    const playoffWeekLabel = getMaddenPlayoffWeekLabelFromDisplayWeek(inferredWeekNumber);
+    const weekLabel = postseasonStageLabel || playoffWeekLabel || ('Week ' + String(inferredWeekNumber || 'TBD'));
 
     const awayScore = parseNumberOrNull(
       getAnyValue(game, ['awayScore', 'away_score', 'awayTeamScore', 'awayPoints', 'awayPts', 'away_score_total'], null) ??
@@ -18714,11 +18729,26 @@ function guessEaRegularSeasonWeeksFromStandingsRows(standingsRows) {
     ...((standingsRows || []).map(row => Number(row.weekIndex || row.week_index || 0)).filter(Number.isFinite))
   );
 
-  // The standings export often carries current week context; include a safe window.
+  // 7J-10AN: Keep the normal regular-season safety window, but always include Madden's
+  // playoff schedule display weeks by default. Snallapa's repo notes playoffs export as
+  // weeks 19, 20, 21, and 23, with Week 22 being Pro Bowl/no useful data.
   const configured = Number(process.env.EA_SCHEDULE_EXPORT_MAX_WEEK || 0);
-  const limit = configured || Math.max(3, Math.min(18, maxWeek + 3));
+  const includePlayoffWeeks = String(process.env.EA_SCHEDULE_EXPORT_INCLUDE_PLAYOFF_WEEKS || 'true').toLowerCase() !== 'false';
+  const includeProBowl = String(process.env.EA_SCHEDULE_EXPORT_INCLUDE_PRO_BOWL || 'false').toLowerCase() === 'true';
+  const baseLimit = configured || Math.max(3, Math.min(18, maxWeek + 3));
+  const weeks = Array.from({ length: baseLimit }, (_, index) => index + 1);
 
-  return Array.from({ length: limit }, (_, index) => index + 1);
+  if (includePlayoffWeeks) {
+    const playoffWeeks = String(process.env.EA_SCHEDULE_EXPORT_PLAYOFF_WEEKS || '19,20,21,23')
+      .split(',')
+      .map(value => Number(String(value).trim()))
+      .filter(value => Number.isFinite(value) && value > 0);
+    weeks.push(...playoffWeeks);
+  }
+
+  return [...new Set(weeks)]
+    .filter(week => includeProBowl || week !== 22)
+    .sort((a, b) => a - b);
 }
 
 function getEaScheduleExportWeekIndexes(payload) {
@@ -26467,7 +26497,10 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
 
 
 async function importEaPostseasonScheduleExportsForLeague(context, guild, league, runId = null, teamNameMaps = {}) {
-  const enabled = String(process.env.EA_POSTSEASON_SCHEDULE_EXPORT_ENABLED || 'true').toLowerCase() !== 'false';
+  // 7J-10AN: Disable the old postseason_stage probe path by default. Multiple audits proved
+  // these payloads contain a different schedule universe and can produce unsafe partial matches.
+  // Real playoff scores should now come from normal WeeklySchedulesExport weeks 19/20/21/23.
+  const enabled = String(process.env.EA_POSTSEASON_SCHEDULE_EXPORT_ENABLED || 'false').toLowerCase() !== 'false';
   if (!enabled) return { imported: 0, rows: [], attempts: [], skipped: true };
 
   const stages = String(process.env.EA_POSTSEASON_SCHEDULE_EXPORT_STAGES || '2,3,4,5,6')
