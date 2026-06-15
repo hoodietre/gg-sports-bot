@@ -1440,6 +1440,7 @@ function buildCommands() {
         { name: 'Playoff Payload Presence Audit', value: 'playoff_payload_presence_audit' },
         { name: 'Playoff Endpoint Enumerator', value: 'playoff_endpoint_enumerator' },
         { name: 'Live Endpoint Capture Audit', value: 'live_endpoint_capture_audit' },
+        { name: 'Weekly Schedule Coverage Audit', value: 'weekly_schedule_coverage_audit' },
         { name: 'Playoff Schedule ID Origin Audit', value: 'playoff_schedule_id_origin_audit' },
         { name: 'Postseason Stage Import Audit', value: 'postseason_stage_import_audit' },
         { name: 'Postseason Match Key Audit', value: 'postseason_match_key_audit' },
@@ -5760,6 +5761,7 @@ if (gameSubcommand === 'report') {
         playoff_payload_presence_audit: buildMaddenPlayoffPayloadPresenceAuditEmbed,
         playoff_endpoint_enumerator: buildMaddenPlayoffEndpointEnumeratorEmbed,
         live_endpoint_capture_audit: buildMaddenLiveEndpointCaptureAuditEmbed,
+        weekly_schedule_coverage_audit: buildMaddenWeeklyScheduleCoverageAuditEmbed,
         playoff_schedule_id_origin_audit: buildMaddenPlayoffScheduleIdOriginAuditEmbed,
         postseason_stage_import_audit: buildMaddenPostseasonStageImportAuditEmbed,
         postseason_match_key_audit: buildMaddenPostseasonMatchKeyAuditEmbed,
@@ -22896,6 +22898,182 @@ async function buildMaddenLiveEndpointCaptureAuditEmbed(guildId, league) {
       { name: 'Command', value: '`/maddendebug view:Live Endpoint Capture Audit`', inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-10AL Live Endpoint Capture Audit' })
+    .setTimestamp();
+
+  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
+
+async function buildMaddenWeeklyScheduleCoverageAuditEmbed(guildId, league) {
+  const leagueId = String(league?.league_id || '');
+  const NL = String.fromCharCode(10);
+  const safe = value => String(value ?? '').slice(0, 1024);
+  const inc = (map, key, amount = 1) => map.set(String(key), (map.get(String(key)) || 0) + amount);
+
+  const payloadRows = await pool.query(
+    `SELECT endpoint, payload_type, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND LOWER(COALESCE(endpoint, '') || ' ' || COALESCE(payload_type, '')) LIKE '%weeklyschedulesexport%'
+     ORDER BY created_at DESC
+     LIMIT 2500`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+
+  const rowCountByEndpointWeek = new Map();
+  const objectCountByWeek = new Map();
+  const scoredCountByWeek = new Map();
+  const statusCountByWeek = new Map();
+  const stageCountByWeek = new Map();
+  const endpointStageWeek = new Map();
+  const targetSamples = [];
+  const allSamples = [];
+  const truthHits = [];
+
+  const truthPatterns = [
+    { label: 'Jaguars 27 Colts 24', a: 'jaguars', b: 'colts', scores: ['27', '24'] },
+    { label: 'Patriots 20 Broncos 10', a: 'patriots', b: 'broncos', scores: ['20', '10'] },
+    { label: 'Ravens 33 Bengals 29', a: 'ravens', b: 'bengals', scores: ['33', '29'] },
+    { label: 'Eagles 31 Bears 21', a: 'eagles', b: 'bears', scores: ['31', '21'] },
+    { label: 'Packers 24 49ers 17', a: 'packers', b: '49ers', scores: ['24', '17'] },
+    { label: 'Seahawks 41 Buccaneers 10', a: 'seahawks', b: 'buccaneers', scores: ['41', '10'] },
+    { label: 'Bills 34 Patriots 21', a: 'bills', b: 'patriots', scores: ['34', '21'] },
+    { label: 'Ravens 17 Jaguars 3', a: 'ravens', b: 'jaguars', scores: ['17', '3'] },
+    { label: 'Ravens 23 Bills 20', a: 'ravens', b: 'bills', scores: ['23', '20'] },
+    { label: 'Seahawks 21 Rams 13', a: 'seahawks', b: 'rams', scores: ['21', '13'] },
+    { label: 'Packers 35 Eagles 21', a: 'packers', b: 'eagles', scores: ['35', '21'] },
+    { label: 'Packers 21 Seahawks 14', a: 'packers', b: 'seahawks', scores: ['21', '14'] },
+  ];
+
+  function endpointLabel(row) {
+    return String(row.endpoint || row.payload_type || 'unknown');
+  }
+
+  function endpointWeek(endpoint) {
+    const m = String(endpoint || '').match(/week(?:Index)?[:=_-]?(\d+)/i);
+    return m ? Number(m[1]) : null;
+  }
+
+  function getScheduleRows(payload) {
+    const top = extractEaScheduleExportList(payload);
+    if (Array.isArray(top) && top.length) return top.map((obj, idx) => ({ obj, path: `extractEaScheduleExportList[${idx}]` }));
+    const out = [];
+    function walk(value, path = '', depth = 0) {
+      if (!value || depth > 7 || out.length > 3000) return;
+      if (Array.isArray(value)) {
+        const scheduleish = value.some(item => item && typeof item === 'object' && (
+          Object.prototype.hasOwnProperty.call(item, 'homeTeamId') ||
+          Object.prototype.hasOwnProperty.call(item, 'awayTeamId') ||
+          Object.prototype.hasOwnProperty.call(item, 'homeScore') ||
+          Object.prototype.hasOwnProperty.call(item, 'awayScore') ||
+          Object.prototype.hasOwnProperty.call(item, 'scheduleId')
+        ));
+        if (scheduleish) {
+          for (let i = 0; i < Math.min(value.length, 80); i++) {
+            if (value[i] && typeof value[i] === 'object') out.push({ obj: value[i], path: `${path}[${i}]` });
+          }
+          return;
+        }
+        for (let i = 0; i < Math.min(value.length, 40); i++) walk(value[i], `${path}[${i}]`, depth + 1);
+        return;
+      }
+      if (typeof value !== 'object') return;
+      for (const [k, v] of Object.entries(value)) {
+        if (v && typeof v === 'object') walk(v, path ? `${path}.${k}` : k, depth + 1);
+      }
+    }
+    walk(payload);
+    return out;
+  }
+
+  for (const row of payloadRows.rows || []) {
+    const endpoint = endpointLabel(row);
+    const epWeek = endpointWeek(endpoint);
+    const raw = row.raw_payload || {};
+    const rawText = JSON.stringify(raw).slice(0, 300000).toLowerCase();
+    for (const truth of truthPatterns) {
+      if (truthHits.length < 12 && rawText.includes(truth.a) && rawText.includes(truth.b) && truth.scores.every(s => rawText.includes(s))) {
+        truthHits.push(`${truth.label} • ${endpoint}`);
+      }
+    }
+
+    const schedules = getScheduleRows(raw);
+    if (epWeek !== null) inc(rowCountByEndpointWeek, epWeek, schedules.length || 1);
+
+    for (const { obj, path } of schedules) {
+      const wiRaw = obj.weekIndex ?? obj.week_index ?? obj.week ?? obj.weekNum ?? obj.weekNumber ?? epWeek;
+      const wi = Number(wiRaw);
+      const wiKey = Number.isFinite(wi) ? String(wi) : 'n/a';
+      const stage = obj.stageIndex ?? obj.stage_index ?? obj.stage ?? 'n/a';
+      const status = obj.status ?? obj.gameStatus ?? obj.game_status ?? 'n/a';
+      const hs = Number(obj.homeScore ?? obj.home_score ?? 0);
+      const as = Number(obj.awayScore ?? obj.away_score ?? 0);
+      const sid = obj.scheduleId ?? obj.schedule_id ?? obj.gameId ?? obj.id ?? 'n/a';
+      const ht = obj.homeTeamId ?? obj.home_team_id ?? obj.homeTeam ?? obj.home_team ?? 'n/a';
+      const at = obj.awayTeamId ?? obj.away_team_id ?? obj.awayTeam ?? obj.away_team ?? 'n/a';
+
+      inc(objectCountByWeek, wiKey);
+      inc(statusCountByWeek, `${wiKey} status:${status}`);
+      inc(stageCountByWeek, `${wiKey} stage:${stage}`);
+      inc(endpointStageWeek, `epWeek:${epWeek ?? 'n/a'} objWeek:${wiKey} stage:${stage}`);
+      if (hs !== 0 || as !== 0) inc(scoredCountByWeek, wiKey);
+
+      const line = `${endpoint} • ${path} • epWeek:${epWeek ?? 'n/a'} objWeek:${wiKey} stage:${stage} status:${status} sid:${sid} score:${as}-${hs} teams:${at}@${ht}`;
+      if ((Number.isFinite(wi) && wi >= 18) || (epWeek !== null && epWeek >= 19)) {
+        if (targetSamples.length < 16) targetSamples.push(line);
+      }
+      if (allSamples.length < 10) allSamples.push(line);
+    }
+  }
+
+  const topLines = (map, limit = 16, numeric = false) => Array.from(map.entries())
+    .sort((a, b) => numeric ? (Number(a[0]) - Number(b[0])) : (b[1] - a[1] || String(a[0]).localeCompare(String(b[0]))))
+    .slice(0, limit)
+    .map(([k, v]) => `${k} — ${v}`);
+
+  const weeksWanted = ['18', '19', '20', '21', '22'];
+  const wantedLines = weeksWanted.map(w => `weekIndex ${w}: objects ${objectCountByWeek.get(w) || 0} • scored ${scoredCountByWeek.get(w) || 0}`);
+  const maxObjWeek = Array.from(objectCountByWeek.keys()).map(Number).filter(Number.isFinite).sort((a, b) => b - a)[0];
+  const maxEpWeek = Array.from(rowCountByEndpointWeek.keys()).map(Number).filter(Number.isFinite).sort((a, b) => b - a)[0];
+
+  let diagnosis = '';
+  if ((objectCountByWeek.get('18') || 0) === 0 && (objectCountByWeek.get('19') || 0) === 0 && (objectCountByWeek.get('20') || 0) === 0 && (objectCountByWeek.get('22') || 0) === 0) {
+    diagnosis = 'Stored WeeklySchedulesExport payloads still do not contain playoff target object weekIndex values 18/19/20/22. The sync likely is not requesting/persisting playoff schedule weeks yet.';
+  } else if (!truthHits.length) {
+    diagnosis = 'Playoff target weekIndex objects exist, but none matched the verified Madden playoff score signatures. Inspect target samples and request params next.';
+  } else {
+    diagnosis = 'Verified playoff score signatures were found in WeeklySchedulesExport. The importer should be pointed at these schedule rows.';
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧾 Madden Weekly Schedule Coverage Audit • ' + (league?.league_name || 'Madden League'))
+    .setColor(0x2ECC71)
+    .setDescription('Read-only audit focused only on CareerMode_GetWeeklySchedulesExport payload coverage. Confirms whether playoff weeks are actually persisted in schedule exports.')
+    .addFields(
+      { name: 'Coverage', value: safe([
+        `Weekly schedule payloads: ${(payloadRows.rows || []).length}`,
+        `Parsed schedule objects: ${Array.from(objectCountByWeek.values()).reduce((a, b) => a + b, 0)}`,
+        `Scored schedule objects: ${Array.from(scoredCountByWeek.values()).reduce((a, b) => a + b, 0)}`,
+        `Highest endpoint week param: ${maxEpWeek ?? 'n/a'}`,
+        `Highest object weekIndex: ${maxObjWeek ?? 'n/a'}`,
+        `Verified playoff score hits: ${truthHits.length}`,
+        `Playoff target samples: ${targetSamples.length}`,
+      ].join(NL)), inline: false },
+      { name: 'Target Playoff WeekIndex Check', value: safe(wantedLines.join(NL)), inline: false },
+      { name: 'Object WeekIndex Coverage', value: safe(topLines(objectCountByWeek, 24, true).join(NL) || 'No object weekIndex fields found.'), inline: false },
+      { name: 'Endpoint Week Param Coverage', value: safe(topLines(rowCountByEndpointWeek, 24, true).join(NL) || 'No endpoint week params found.'), inline: false },
+      { name: 'Endpoint/Object/Stage Shapes', value: safe(topLines(endpointStageWeek, 14).join(NL) || 'No stage shapes found.'), inline: false },
+      { name: 'Status Shapes', value: safe(topLines(statusCountByWeek, 14).join(NL) || 'No status shapes found.'), inline: false },
+      { name: 'Playoff Target Samples', value: safe(targetSamples.join(NL + NL) || 'No schedule samples for object weekIndex 18+ or endpoint week 19+ found.'), inline: false },
+      { name: 'Verified Score Signature Samples', value: safe(truthHits.join(NL) || 'No verified Madden playoff score signatures found in WeeklySchedulesExport.'), inline: false },
+      { name: 'Newest Schedule Samples', value: safe(allSamples.join(NL + NL) || 'No schedule samples found.'), inline: false },
+      { name: 'Diagnosis', value: safe(diagnosis), inline: false },
+      { name: 'Command', value: '`/maddendebug view:Weekly Schedule Coverage Audit`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10AM Weekly Schedule Coverage Audit' })
     .setTimestamp();
 
   const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
