@@ -1541,18 +1541,10 @@ function buildCommands() {
         .addStringOption(o => o.setName('side_a_player_3').setDescription('Side A player 3; locked to Side A player 1 team').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('side_b_player_2').setDescription('Side B player 2; locked to Side B player 1 team').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('side_b_player_3').setDescription('Side B player 3; locked to Side B player 1 team').setRequired(false).setAutocomplete(true))
-        .addStringOption(o => o.setName('side_a_pick_1').setDescription('Side A draft pick 1').setRequired(false).addChoices(
-          ...buildMaddenDraftPickCommandChoices()
-        ))
-        .addStringOption(o => o.setName('side_a_pick_2').setDescription('Side A draft pick 2').setRequired(false).addChoices(
-          ...buildMaddenDraftPickCommandChoices()
-        ))
-        .addStringOption(o => o.setName('side_b_pick_1').setDescription('Side B draft pick 1').setRequired(false).addChoices(
-          ...buildMaddenDraftPickCommandChoices()
-        ))
-        .addStringOption(o => o.setName('side_b_pick_2').setDescription('Side B draft pick 2').setRequired(false).addChoices(
-          ...buildMaddenDraftPickCommandChoices()
-        ))
+        .addStringOption(o => o.setName('side_a_pick_1').setDescription('Side A draft pick 1').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_a_pick_2').setDescription('Side A draft pick 2').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_b_pick_1').setDescription('Side B draft pick 1').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_b_pick_2').setDescription('Side B draft pick 2').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('label_a').setDescription('Optional Side A label/team').setRequired(false))
         .addStringOption(o => o.setName('label_b').setDescription('Optional Side B label/team').setRequired(false)))
       .addSubcommand(sc => sc
@@ -3715,6 +3707,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
               return;
             }
             const choices = await getMaddenTeamAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+
+          const tradePickFields = new Set(['side_a_pick_1', 'side_a_pick_2', 'side_b_pick_1', 'side_b_pick_2']);
+          if (tradePickFields.has(focused?.name)) {
+            const choices = buildMaddenDraftPickAutocompleteChoices(focused.value);
             await interaction.respond((choices || []).slice(0, 25));
             return;
           }
@@ -16853,15 +16852,27 @@ const MADDEN_DRAFT_PICK_VALUE_TABLE = {
 };
 
 function buildMaddenDraftPickCommandChoices() {
+  return buildMaddenDraftPickAutocompleteChoices('');
+}
+
+function buildMaddenDraftPickAutocompleteChoices(input = '') {
+  const query = String(input || '').toLowerCase().trim();
   const years = [2026, 2027, 2028];
   const choices = [];
   for (const year of years) {
     for (let round = 1; round <= 7; round++) {
-      const suffix = round === 1 ? 'st' : round === 2 ? 'nd' : round === 3 ? 'rd' : 'th';
-      choices.push({ name: `${year} ${round}${suffix}`, value: `${year} ${round}` });
+      const value = `${year} ${round}`;
+      const label = `${year} Round ${round} Pick`;
+      const pick = parseMaddenDraftPickAsset(value);
+      const suffix = pick ? ` • Value ${Number(pick.valueScore || 0).toFixed(1)}` : '';
+      choices.push({ name: `${label}${suffix}`.slice(0, 100), value });
     }
   }
-  return choices;
+  if (!query) return choices;
+  return choices.filter(choice =>
+    String(choice.name || '').toLowerCase().includes(query) ||
+    String(choice.value || '').toLowerCase().includes(query)
+  );
 }
 
 function maddenDraftPickRoundMedianValue(round) {
@@ -16907,12 +16918,12 @@ function parseMaddenDraftPickAsset(input) {
   const multiplier = maddenDraftPickFutureMultiplier(year);
   const valueScore = Number((base * multiplier).toFixed(1));
   const suffix = round === 1 ? 'st' : round === 2 ? 'nd' : round === 3 ? 'rd' : 'th';
-  const label = pick ? `${year} Round ${round}, Pick ${pick}` : `${year} ${round}${suffix}`;
+  const label = pick ? `${year} Round ${round}, Pick ${pick}` : `${year} Round ${round} Pick`;
   return { raw, year, round, pick, base, multiplier, valueScore, label, tradeTier: 'Draft Pick' };
 }
 
 function maddenDraftPickAssetLine(pick, index = 0) {
-  return `${index + 1}. **${pick.label}** — Draft Pick • **${Number(pick.valueScore || 0).toFixed(1)}**${Number(pick.multiplier || 1) !== 1 ? ` • ${pick.multiplier}x future` : ''}`;
+  return `${index + 1}. **${pick.label}** — Trade Value **${Number(pick.valueScore || 0).toFixed(1)}**${Number(pick.multiplier || 1) !== 1 ? ` • ${pick.multiplier}x future` : ''}`;
 }
 
 function maddenTradeFinderPickPool() {
@@ -17005,7 +17016,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
         .setTitle('Madden Trade Finder')
         .setColor(0xED4245)
         .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-        .setFooter({ text: 'GG Sports • 7J-10BH Trade Finder Pagination + Filters' })
+        .setFooter({ text: 'GG Sports • 7J-10BI Draft Pick Autocomplete + Filters' })
         .setTimestamp()
     };
   }
@@ -17090,7 +17101,7 @@ Filters: ${filterText}`)
         { name: 'Page', value: pageText, inline: false },
         { name: 'Notes', value: 'Packages compare one player plus an optional draft pick against the target player value. Same-team players are excluded unless a team filter is used. Position-similar matches receive a small realism boost.', inline: false }
       )
-      .setFooter({ text: 'GG Sports • 7J-10BH Trade Finder Pagination + Filters' })
+      .setFooter({ text: 'GG Sports • 7J-10BI Draft Pick Autocomplete + Filters' })
       .setTimestamp()
   };
 }
