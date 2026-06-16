@@ -1524,6 +1524,20 @@ function buildCommands() {
 ,
 
     new SlashCommandBuilder()
+      .setName('maddentrade')
+      .setDescription('Analyze Madden trade value between two asset groups')
+      .addSubcommand(sc => sc
+        .setName('analyze')
+        .setDescription('Compare two sides of a Madden trade using player value')
+        .addStringOption(o => o.setName('side_a').setDescription('Side A players, separated by commas').setRequired(true))
+        .addStringOption(o => o.setName('side_b').setDescription('Side B players, separated by commas').setRequired(true))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+        .addStringOption(o => o.setName('label_a').setDescription('Optional Side A label/team').setRequired(false))
+        .addStringOption(o => o.setName('label_b').setDescription('Optional Side B label/team').setRequired(false)))
+
+,
+
+    new SlashCommandBuilder()
       .setName('setup')
       .setDescription('Interactive GG Sports setup dashboard')
       .addSubcommand(sc => sc.setName('panel').setDescription('Open the interactive setup dashboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
@@ -5899,6 +5913,47 @@ if (gameSubcommand === 'report') {
 
       const embed = await builder(interaction.guild.id, activeLeague);
       await interaction.editReply({ embeds: [embed] });
+      return;
+    }
+
+    if (interaction.commandName === 'maddentrade') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+
+      const tradeSubcommand = interaction.options.getSubcommand(false);
+      if (tradeSubcommand !== 'analyze') {
+        await interaction.editReply({ content: 'Unknown Madden trade command.' });
+        return;
+      }
+
+      const leagueName = interaction.options.getString('league');
+      const sideAInput = interaction.options.getString('side_a');
+      const sideBInput = interaction.options.getString('side_b');
+      const labelA = interaction.options.getString('label_a') || 'Side A';
+      const labelB = interaction.options.getString('label_b') || 'Side B';
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
+        return;
+      }
+
+      try {
+        await ensureMaddenPlayerPersistenceTables();
+        const [sideA, sideB] = await Promise.all([
+          resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideAInput),
+          resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideBInput),
+        ]);
+
+        await interaction.editReply({
+          embeds: [buildMaddenTradeAnalyzerEmbed(activeLeague, { labelA, labelB, sideAInput, sideBInput, sideA, sideB })],
+        });
+      } catch (error) {
+        console.error('[MADDEN TRADE ANALYZER] command failed:', error?.stack || error?.message || error);
+        await interaction.editReply({ content: `Madden trade analyzer failed: ${String(error?.message || error).slice(0, 180)}` });
+      }
       return;
     }
 
@@ -16615,6 +16670,90 @@ function maddenPlayerMini(player) {
   const age = player.age ? ` • Age ${player.age}` : '';
   const ovr = player.overall !== null && player.overall !== undefined ? `${player.overall} OVR` : 'OVR N/A';
   return `**${name}**\n${abbr} • ${player.position || 'POS'} • ${ovr} • ${maddenPlayerDevBadge(player.dev_trait)}${age}`;
+}
+
+
+function parseMaddenTradeAssetInput(input) {
+  return String(input || '')
+    .split(/[\n,;+]+/)
+    .map(part => part.trim())
+    .filter(Boolean)
+    .slice(0, 10);
+}
+
+async function resolveMaddenTradeAnalyzerSide(guildId, leagueId, input) {
+  const assetNames = parseMaddenTradeAssetInput(input);
+  const resolved = [];
+  const missing = [];
+  for (const assetName of assetNames) {
+    let player = await findMaddenImportedPlayer(guildId, leagueId, assetName, null)
+      || await findMaddenPlayerFromWeeklyStats(guildId, leagueId, assetName, null);
+    if (!player) {
+      missing.push(assetName);
+      continue;
+    }
+    const value = calculateMaddenPlayerValue(player);
+    resolved.push({ assetName, player, value });
+  }
+  const totalValue = resolved.reduce((sum, item) => sum + Number(item.value?.valueScore || 0), 0);
+  return { input, assetNames, resolved, missing, totalValue };
+}
+
+function maddenTradeAnalyzerAssetLine(item, index = 0) {
+  const player = item.player || {};
+  const value = item.value || calculateMaddenPlayerValue(player);
+  const team = getMaddenTeamAbbrev(player.resolved_team_name || player.team_name) || player.resolved_team_name || player.team_name || 'FA';
+  const dev = maddenPlayerDevEmojiOnly(player.dev_trait) || '';
+  return `${index + 1}. **${maddenValuePlayerName(player)}** — ${team} ${player.position || 'POS'} • ${player.overall || 'N/A'} OVR${dev ? ` • ${dev}` : ''} • **${Number(value.valueScore || 0).toFixed(1)}** • ${value.tradeTier}`;
+}
+
+function buildMaddenTradeAnalyzerSideText(side, label) {
+  const lines = [];
+  if (side.resolved?.length) {
+    lines.push(...side.resolved.map((item, index) => maddenTradeAnalyzerAssetLine(item, index)));
+  }
+  if (side.missing?.length) {
+    lines.push('', `⚠️ Not found: ${side.missing.map(name => `\`${name}\``).join(', ')}`);
+  }
+  if (!lines.length) lines.push('No valid players found. Separate player names with commas.');
+  lines.push('', `**${label} Total:** ${Number(side.totalValue || 0).toFixed(1)}`);
+  return maddenSafeEmbedText(lines.join('\n'), 1024);
+}
+
+function buildMaddenTradeAnalyzerEmbed(league, data) {
+  const { labelA = 'Side A', labelB = 'Side B', sideA, sideB } = data || {};
+  const valueA = Number(sideA?.totalValue || 0);
+  const valueB = Number(sideB?.totalValue || 0);
+  const diff = valueA - valueB;
+  const leader = diff >= 0 ? labelA : labelB;
+  const totalAssets = Number(sideA?.resolved?.length || 0) + Number(sideB?.resolved?.length || 0);
+  const color = Math.abs(diff) < 100 ? 0x57F287 : Math.abs(diff) < 900 ? 0xFEE75C : 0xED4245;
+  const diffText = diff >= 0 ? `+${diff.toFixed(1)} ${labelA}` : `+${Math.abs(diff).toFixed(1)} ${labelB}`;
+  const verdict = maddenTradeValueVerdict(diff, labelA, labelB);
+
+  const recommendation = [
+    `**${labelA}:** ${valueA.toFixed(1)}`,
+    `**${labelB}:** ${valueB.toFixed(1)}`,
+    `**Difference:** ${diffText}`,
+    `**Verdict:** ${verdict}`,
+    '',
+    Math.abs(diff) < 100
+      ? 'This trade is close enough to be considered even by the current value model.'
+      : `${leader} receives the stronger value package by the current model.`,
+  ].join('\n');
+
+  return new EmbedBuilder()
+    .setTitle('Madden Trade Analyzer')
+    .setDescription(`${league?.league_name || 'Madden League'} • ${totalAssets} resolved player asset(s)\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`)
+    .setColor(color)
+    .addFields(
+      { name: labelA, value: buildMaddenTradeAnalyzerSideText(sideA || {}, labelA), inline: false },
+      { name: labelB, value: buildMaddenTradeAnalyzerSideText(sideB || {}, labelB), inline: false },
+      { name: 'Trade Result', value: maddenSafeEmbedText(recommendation, 1024), inline: false },
+      { name: 'Notes', value: 'Foundation version supports player assets. Draft pick and multi-team asset support can be added next.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10AY Madden Trade Analyzer Foundation' })
+    .setTimestamp();
 }
 
 function buildMaddenPlayerCompareLines(a, b, statsA = [], statsB = []) {
