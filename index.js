@@ -1494,8 +1494,31 @@ function buildCommands() {
       .setName('maddenvalues')
       .setDescription('View Madden player value rankings')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
-      .addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false).setAutocomplete(true))
-      .addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false))
+      .addStringOption(o => o.setName('team').setDescription('Team name filter; type exact team name like Bills, Ravens, or 49ers').setRequired(false))
+      .addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false)
+        .addChoices(
+          { name: 'QB', value: 'QB' },
+          { name: 'HB', value: 'HB' },
+          { name: 'FB', value: 'FB' },
+          { name: 'WR', value: 'WR' },
+          { name: 'TE', value: 'TE' },
+          { name: 'LT', value: 'LT' },
+          { name: 'LG', value: 'LG' },
+          { name: 'C', value: 'C' },
+          { name: 'RG', value: 'RG' },
+          { name: 'RT', value: 'RT' },
+          { name: 'LE', value: 'LE' },
+          { name: 'RE', value: 'RE' },
+          { name: 'DT', value: 'DT' },
+          { name: 'LOLB', value: 'LOLB' },
+          { name: 'MLB', value: 'MLB' },
+          { name: 'ROLB', value: 'ROLB' },
+          { name: 'CB', value: 'CB' },
+          { name: 'FS', value: 'FS' },
+          { name: 'SS', value: 'SS' },
+          { name: 'K', value: 'K' },
+          { name: 'P', value: 'P' }
+        ))
       .addIntegerOption(o => o.setName('limit').setDescription('Max players to include across pages').setRequired(false))
 
 ,
@@ -25717,7 +25740,7 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
     .setDescription(maddenSafeEmbedText(`${league.league_name || 'Madden League'}\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`, 4096))
     .setColor(0xD4AF37)
     .addFields(fields.slice(0, 25))
-    .setFooter({ text: 'GG Sports • 7J-10AT Madden Values Pagination' })
+    .setFooter({ text: 'GG Sports • 7J-10AU Madden Values Filter Choices Fix' })
     .setTimestamp();
 }
 
