@@ -64,6 +64,8 @@ const TEAM_ROLE_NAMES = [
 ];
 
 const pendingOfferTargets = new Map();
+const maddenValuesPaginationSessions = new Map();
+const MADDEN_VALUES_PAGE_SIZE = 25;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -1494,7 +1496,7 @@ function buildCommands() {
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
       .addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false).setAutocomplete(true))
       .addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false))
-      .addIntegerOption(o => o.setName('limit').setDescription('Number of players to show').setRequired(false))
+      .addIntegerOption(o => o.setName('limit').setDescription('Max players to include across pages').setRequired(false))
 
 ,
 
@@ -4560,6 +4562,32 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
 
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddenvalues_page:')) {
+      const [, token, direction] = interaction.customId.split(':');
+      const session = maddenValuesPaginationSessions.get(token);
+      if (!session) {
+        await interaction.reply({ content: 'This Madden values page has expired. Run `/maddenvalues` again.', ephemeral: true });
+        return;
+      }
+      if (session.userId !== interaction.user.id) {
+        await interaction.reply({ content: 'Only the user who opened these Madden value rankings can change pages.', ephemeral: true });
+        return;
+      }
+
+      const totalPages = Math.max(1, Math.ceil((session.rows || []).length / MADDEN_VALUES_PAGE_SIZE));
+      if (direction === 'next') session.page = Math.min(totalPages - 1, Number(session.page || 0) + 1);
+      if (direction === 'prev') session.page = Math.max(0, Number(session.page || 0) - 1);
+      session.updatedAt = Date.now();
+      maddenValuesPaginationSessions.set(token, session);
+
+      await interaction.update({
+        embeds: [buildMaddenPlayerValueRankingsEmbed(session.league, session.rows, { ...session.filters, page: session.page, pageSize: MADDEN_VALUES_PAGE_SIZE })],
+        components: buildMaddenValuesPaginationComponents(token, session.page, totalPages),
+      });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('madden_ea_accept:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -5836,7 +5864,7 @@ if (gameSubcommand === 'report') {
       const leagueName = interaction.options.getString('league');
       const team = interaction.options.getString('team');
       const position = interaction.options.getString('position');
-      const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 25, 5), 25);
+      const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 250, 25), 750);
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
       if (!activeLeague) {
@@ -5848,7 +5876,24 @@ if (gameSubcommand === 'report') {
         await ensureMaddenPlayerPersistenceTables();
         const rows = await getMaddenPlayerValueRankings(interaction.guild.id, activeLeague.league_id, { team, position, limit });
         await upsertMaddenPlayerValues(interaction.guild.id, activeLeague.league_id, rows);
-        await interaction.editReply({ embeds: [buildMaddenPlayerValueRankingsEmbed(activeLeague, rows, { team, position, limit })] });
+        const token = randomBytes(6).toString('hex');
+        const page = 0;
+        const totalPages = Math.max(1, Math.ceil((rows || []).length / MADDEN_VALUES_PAGE_SIZE));
+        const filters = { team, position, limit };
+        maddenValuesPaginationSessions.set(token, {
+          userId: interaction.user.id,
+          guildId: interaction.guild.id,
+          league: activeLeague,
+          filters,
+          rows,
+          page,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        await interaction.editReply({
+          embeds: [buildMaddenPlayerValueRankingsEmbed(activeLeague, rows, { ...filters, page, pageSize: MADDEN_VALUES_PAGE_SIZE })],
+          components: buildMaddenValuesPaginationComponents(token, page, totalPages),
+        });
       } catch (error) {
         console.error('[MADDEN VALUES] command failed:', error?.stack || error?.message || error);
         await interaction.editReply({ content: `Madden value rankings failed: ${String(error?.message || error).slice(0, 180)}` });
@@ -25523,7 +25568,7 @@ async function getMaddenPlayerValueRankings(guildId, leagueId, filters = {}) {
   return (result.rows || [])
     .map(row => ({ ...row, value: calculateMaddenPlayerValue(row) }))
     .sort((a, b) => Number(b.value?.valueScore || 0) - Number(a.value?.valueScore || 0) || Number(b.overall || 0) - Number(a.overall || 0))
-    .slice(0, Math.min(Math.max(Number(filters.limit || 25), 1), 25));
+    .slice(0, Math.min(Math.max(Number(filters.limit || 250), 1), 750));
 }
 
 async function upsertMaddenPlayerValues(guildId, leagueId, rows = []) {
@@ -25605,25 +25650,61 @@ function maddenChunkLines(lines = [], limit = 950) {
   return chunks.length ? chunks.slice(0, 4) : ['No Madden players found. Run `/madden sync` first.'];
 }
 
+function buildMaddenValuesPaginationComponents(token, page = 0, totalPages = 1) {
+  if (totalPages <= 1) return [];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`maddenvalues_page:${token}:prev`)
+        .setLabel('Previous')
+        .setEmoji('⬅️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page <= 0),
+      new ButtonBuilder()
+        .setCustomId(`maddenvalues_page:${token}:next`)
+        .setLabel('Next')
+        .setEmoji('➡️')
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(page >= totalPages - 1)
+    ),
+  ];
+}
+
 function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
   const titleBits = ['Madden Player Value Rankings'];
   if (filters.team) titleBits.push(filters.team);
   if (filters.position) titleBits.push(String(filters.position).toUpperCase());
 
-  const rankingLines = rows.length
-    ? rows.map((row, index) => {
+  const pageSize = Math.min(Math.max(Number(filters.pageSize || MADDEN_VALUES_PAGE_SIZE || 25), 5), 25);
+  const totalRows = (rows || []).length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+  const page = Math.min(Math.max(Number(filters.page || 0), 0), totalPages - 1);
+  const startIndex = page * pageSize;
+  const pageRows = (rows || []).slice(startIndex, startIndex + pageSize);
+
+  const rankingLines = pageRows.length
+    ? pageRows.map((row, localIndex) => {
         const value = row.value || calculateMaddenPlayerValue(row);
+        const rank = startIndex + localIndex + 1;
         const team = getMaddenTeamAbbrev(row.resolved_team_name || row.team_name) || row.resolved_team_name || row.team_name || 'FA';
         const dev = maddenPlayerDevEmojiOnly(row.dev_trait) || '';
-        return `${index + 1}. **${maddenValuePlayerName(row)}** — ${team} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${dev ? ` • ${dev}` : ''} • Value **${Number(value.valueScore || 0).toFixed(1)}** • ${value.tradeTier}`;
+        return `${rank}. **${maddenValuePlayerName(row)}** — ${team} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${dev ? ` • ${dev}` : ''} • Value **${Number(value.valueScore || 0).toFixed(1)}** • ${value.tradeTier}`;
       })
     : [];
 
   const fields = maddenChunkLines(rankingLines, 950).map((chunk, index) => ({
-    name: index === 0 ? 'Top Player Values' : `Top Player Values ${index + 1}`,
+    name: index === 0 ? 'Player Values' : `Player Values ${index + 1}`,
     value: maddenSafeEmbedText(chunk, 1024),
     inline: false,
   }));
+
+  fields.push({
+    name: 'Page',
+    value: totalRows
+      ? `Page **${page + 1}/${totalPages}** • Showing **${startIndex + 1}-${Math.min(startIndex + pageSize, totalRows)}** of **${totalRows}** players.`
+      : 'No players found for these filters.',
+    inline: false,
+  });
 
   fields.push({
     name: 'Notes',
@@ -25636,7 +25717,7 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
     .setDescription(maddenSafeEmbedText(`${league.league_name || 'Madden League'}\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`, 4096))
     .setColor(0xD4AF37)
     .addFields(fields.slice(0, 25))
-    .setFooter({ text: 'GG Sports • 7J-10AS Player Value Rankings Embed Fix' })
+    .setFooter({ text: 'GG Sports • 7J-10AT Madden Values Pagination' })
     .setTimestamp();
 }
 
