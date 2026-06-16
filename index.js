@@ -25452,16 +25452,14 @@ function calculateMaddenPlayerValue(player) {
   const overall = Number(player?.overall || 0);
   const baseOverallValue = maddenOverallBaseValue(overall);
   const age = maddenValueRawNumber(player, ['age'], null);
-  const speed = maddenValueRawNumber(player, ['speed', 'speedRating', 'spd'], null);
   const yearsLeft = maddenValueRawNumber(player, ['years_left', 'yearsLeft', 'contractYearsLeft', 'contractLength', 'contractYears'], null);
   const capHit = maddenValueRawNumber(player, ['cap_hit', 'capHit', 'capHitValue', 'currentYearSalary', 'salary'], null);
   const positionComponent = maddenValuePositionComponent(player?.position);
   const ageComponent = maddenValueAgeComponent(age);
   const devComponent = maddenValueDevComponent(player?.dev_trait);
-  const speedComponent = maddenValueSpeedComponent(speed);
   const yearsComponent = maddenValueYearsComponent(yearsLeft);
   const capComponent = maddenValueCapComponent(capHit);
-  const multiplier = 1.0 + positionComponent + ageComponent + devComponent + speedComponent + yearsComponent + capComponent;
+  const multiplier = 1.0 + positionComponent + ageComponent + devComponent + yearsComponent + capComponent;
   const valueScore = baseOverallValue ? Math.max(0, baseOverallValue * multiplier) : 0;
   let tier = 'Depth';
   if (valueScore >= 3500) tier = 'Untouchable';
@@ -25474,13 +25472,13 @@ function calculateMaddenPlayerValue(player) {
     overall,
     baseOverallValue,
     age,
-    speed,
+    speed: null,
     yearsLeft,
     capHit,
     positionComponent,
     ageComponent,
     devComponent,
-    speedComponent,
+    speedComponent: 0,
     yearsComponent,
     capComponent,
     multiplier,
@@ -25584,29 +25582,61 @@ async function upsertMaddenPlayerValues(guildId, leagueId, rows = []) {
   }
 }
 
+function maddenSafeEmbedText(value, limit = 1024) {
+  const text = String(value ?? '').trim();
+  if (!text) return 'No data.';
+  return text.length > limit ? text.slice(0, Math.max(0, limit - 3)) + '...' : text;
+}
+
+function maddenChunkLines(lines = [], limit = 950) {
+  const chunks = [];
+  let current = '';
+  for (const rawLine of lines) {
+    const line = String(rawLine || '').trim();
+    if (!line) continue;
+    if ((current + (current ? '\n' : '') + line).length > limit) {
+      if (current) chunks.push(current);
+      current = line.slice(0, limit);
+    } else {
+      current += (current ? '\n' : '') + line;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.length ? chunks.slice(0, 4) : ['No Madden players found. Run `/madden sync` first.'];
+}
+
 function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
   const titleBits = ['Madden Player Value Rankings'];
   if (filters.team) titleBits.push(filters.team);
   if (filters.position) titleBits.push(String(filters.position).toUpperCase());
 
-  const lines = rows.length
+  const rankingLines = rows.length
     ? rows.map((row, index) => {
         const value = row.value || calculateMaddenPlayerValue(row);
         const team = getMaddenTeamAbbrev(row.resolved_team_name || row.team_name) || row.resolved_team_name || row.team_name || 'FA';
-        const dev = maddenPlayerDevEmojiOnly(row.dev_trait);
-        return `${index + 1}. **${maddenValuePlayerName(row)}** — ${team} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${dev} • Value **${value.valueScore.toFixed(1)}** • ${value.tradeTier}`;
-      }).join('\n')
-    : 'No Madden players found. Run `/madden sync` first.';
+        const dev = maddenPlayerDevEmojiOnly(row.dev_trait) || '';
+        return `${index + 1}. **${maddenValuePlayerName(row)}** — ${team} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${dev ? ` • ${dev}` : ''} • Value **${Number(value.valueScore || 0).toFixed(1)}** • ${value.tradeTier}`;
+      })
+    : [];
+
+  const fields = maddenChunkLines(rankingLines, 950).map((chunk, index) => ({
+    name: index === 0 ? 'Top Player Values' : `Top Player Values ${index + 1}`,
+    value: maddenSafeEmbedText(chunk, 1024),
+    inline: false,
+  }));
+
+  fields.push({
+    name: 'Notes',
+    value: 'Uses the configured Overall/Position/Age/Dev/Years/Cap value tables. Speed is intentionally excluded; missing years-left is treated as 0 years.',
+    inline: false,
+  });
 
   return new EmbedBuilder()
-    .setTitle(titleBits.join(' • '))
-    .setDescription(`${league.league_name || 'Madden League'}\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Speed + Years Left + Cap Hit)`)
+    .setTitle(maddenSafeEmbedText(titleBits.join(' • '), 256))
+    .setDescription(maddenSafeEmbedText(`${league.league_name || 'Madden League'}\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`, 4096))
     .setColor(0xD4AF37)
-    .addFields(
-      { name: 'Top Player Values', value: lines.slice(0, 4000), inline: false },
-      { name: 'Notes', value: 'Uses the configured Overall/Position/Age/Dev/Years/Cap value tables. Missing speed defaults to neutral; missing years-left is treated as 0 years.', inline: false }
-    )
-    .setFooter({ text: 'GG Sports • 7J-10AR Player Value Formula Table Fix' })
+    .addFields(fields.slice(0, 25))
+    .setFooter({ text: 'GG Sports • 7J-10AS Player Value Rankings Embed Fix' })
     .setTimestamp();
 }
 
@@ -25657,7 +25687,7 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
         `**Trade Tier:** ${valueInfo.tradeTier}`,
         `**Base Overall Value:** ${valueInfo.baseOverallValue.toFixed(1)}`,
         `**Multiplier:** ${valueInfo.multiplier.toFixed(2)}x`,
-        `**Components:** POS ${valueInfo.positionComponent.toFixed(2)} • AGE ${valueInfo.ageComponent.toFixed(2)} • DEV ${valueInfo.devComponent.toFixed(2)} • SPD ${valueInfo.speedComponent.toFixed(2)} • YRS ${valueInfo.yearsComponent.toFixed(2)} • CAP ${valueInfo.capComponent.toFixed(2)}`,
+        `**Components:** POS ${valueInfo.positionComponent.toFixed(2)} • AGE ${valueInfo.ageComponent.toFixed(2)} • DEV ${valueInfo.devComponent.toFixed(2)} • YRS ${valueInfo.yearsComponent.toFixed(2)} • CAP ${valueInfo.capComponent.toFixed(2)}`,
       ].join('\n'),
       inline: false,
     });
