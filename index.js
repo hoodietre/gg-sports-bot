@@ -16656,6 +16656,33 @@ function buildMaddenPlayerCompareLines(a, b, statsA = [], statsB = []) {
   return lines;
 }
 
+function maddenTradeValueVerdict(diff, nameA, nameB) {
+  const amount = Math.abs(Number(diff || 0));
+  const leader = diff >= 0 ? nameA : nameB;
+  if (amount < 100) return 'Even value';
+  if (amount < 350) return `Slight advantage ${leader}`;
+  if (amount < 900) return `Clear advantage ${leader}`;
+  if (amount < 2000) return `Heavy advantage ${leader}`;
+  return `Massive advantage ${leader}`;
+}
+
+function buildMaddenPlayerValueCompareText(a, b) {
+  const nameA = a.player_name || maddenPlayerDisplayName(a);
+  const nameB = b.player_name || maddenPlayerDisplayName(b);
+  const valueA = calculateMaddenPlayerValue(a);
+  const valueB = calculateMaddenPlayerValue(b);
+  const diff = Number(valueA.valueScore || 0) - Number(valueB.valueScore || 0);
+  const diffText = diff >= 0 ? `+${diff.toFixed(1)} ${nameA}` : `+${Math.abs(diff).toFixed(1)} ${nameB}`;
+  return [
+    `**${nameA}:** ${Number(valueA.valueScore || 0).toFixed(1)} • ${valueA.tradeTier}`,
+    `**${nameB}:** ${Number(valueB.valueScore || 0).toFixed(1)} • ${valueB.tradeTier}`,
+    `**Difference:** ${diffText}`,
+    `**Trade Verdict:** ${maddenTradeValueVerdict(diff, nameA, nameB)}`,
+    '',
+    'Formula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)',
+  ].join('\n');
+}
+
 function buildMaddenPlayerCompareEmbed(league, a, b, statsA = [], statsB = [], ranksA = [], ranksB = []) {
   const nameA = a.player_name || maddenPlayerDisplayName(a);
   const nameB = b.player_name || maddenPlayerDisplayName(b);
@@ -16664,18 +16691,21 @@ function buildMaddenPlayerCompareEmbed(league, a, b, statsA = [], statsB = [], r
 
   return new EmbedBuilder()
     .setTitle('Madden Player Compare')
-    .setDescription(`**${nameA}** vs **${nameB}**\n${league.league_name || 'Madden League'}`)
+    .setDescription(`**${nameA}** vs **${nameB}**
+${league.league_name || 'Madden League'}`)
     .setColor(color)
     .addFields(
       { name: nameA, value: maddenPlayerMini(a), inline: true },
       { name: nameB, value: maddenPlayerMini(b), inline: true },
-      { name: 'Comparison', value: buildMaddenPlayerCompareLines(a, b, statsA, statsB).join('\n').slice(0, 1024), inline: false },
+      { name: 'Trade Value', value: buildMaddenPlayerValueCompareText(a, b).slice(0, 1024), inline: false },
+      { name: 'Stat Comparison', value: buildMaddenPlayerCompareLines(a, b, statsA, statsB).join('\n').slice(0, 1024), inline: false },
       { name: `${nameA} League Ranks`, value: (ranksA?.length ? ranksA.slice(0, 5).join('\n') : 'No top-10 ranks found.').slice(0, 1024), inline: true },
       { name: `${nameB} League Ranks`, value: (ranksB?.length ? ranksB.slice(0, 5).join('\n') : 'No top-10 ranks found.').slice(0, 1024), inline: true }
     )
-    .setFooter({ text: 'GG Sports • Madden Compare' })
+    .setFooter({ text: 'GG Sports • Madden Compare + Trade Value' })
     .setTimestamp();
 }
+
 
 async function getMaddenTeamCompareRow(guildId, leagueId, teamName) {
   const result = await pool.query(
@@ -16707,8 +16737,19 @@ async function getMaddenRosterRowsForCompare(guildId, leagueId, teamName) {
   return result.rows || [];
 }
 
+function maddenRosterValueSummary(rows = []) {
+  const values = (rows || []).map(row => ({ row, value: calculateMaddenPlayerValue(row) }));
+  const totalValue = values.reduce((sum, item) => sum + Number(item.value.valueScore || 0), 0);
+  const topAssets = values
+    .sort((a, b) => Number(b.value.valueScore || 0) - Number(a.value.valueScore || 0))
+    .slice(0, 3)
+    .map(item => `${maddenValuePlayerName(item.row)} (${Number(item.value.valueScore || 0).toFixed(0)})`);
+  return { totalValue, topAssets };
+}
+
 function maddenRosterCompareSummary(teamName, rows = []) {
   const summary = summarizeMaddenRosterRows(rows);
+  const valueSummary = maddenRosterValueSummary(rows);
   const top = [...rows].sort((a, b) =>
     getMaddenDevTraitSortValue(b.dev_trait) - getMaddenDevTraitSortValue(a.dev_trait) ||
     Number(b.overall || 0) - Number(a.overall || 0)
@@ -16718,10 +16759,13 @@ function maddenRosterCompareSummary(teamName, rows = []) {
     `**${teamName}**`,
     `Players: ${summary.total}`,
     `Avg OVR: ${summary.avgOvr}`,
+    `Roster Value: ${Number(valueSummary.totalValue || 0).toFixed(1)}`,
+    valueSummary.topAssets.length ? `Top Assets: ${valueSummary.topAssets.join(', ')}` : 'Top Assets: N/A',
     `${DEV_EMOJIS.xfactor} ${summary.counts.xfactor} | ${DEV_EMOJIS.superstar} ${summary.counts.superstar} | ${DEV_EMOJIS.star} ${summary.counts.star} | ${DEV_EMOJIS.hidden} ${summary.counts.hidden} | ${DEV_EMOJIS.normal} ${summary.counts.normal}`,
-    top ? `Best: ${top.player_name || maddenPlayerDisplayName(top)} — ${top.position || 'POS'} • ${top.overall || 'N/A'} OVR • ${maddenPlayerDevEmojiOnly(top.dev_trait)}` : 'Best: N/A',
+    top ? `Best OVR: ${top.player_name || maddenPlayerDisplayName(top)} — ${top.position || 'POS'} • ${top.overall || 'N/A'} OVR • ${maddenPlayerDevEmojiOnly(top.dev_trait)}` : 'Best OVR: N/A',
   ].join('\n');
 }
+
 
 function buildMaddenTeamCompareEmbed(league, type, a, b, ranksA, ranksB, leadersA = [], leadersB = [], rosterA = [], rosterB = []) {
   const diffA = Number(a.points_for || 0) - Number(a.points_against || 0);
@@ -16737,6 +16781,15 @@ function buildMaddenTeamCompareEmbed(league, type, a, b, ranksA, ranksB, leaders
 
   const leadersTextA = leadersA.length ? leadersA.slice(0, 4).map(item => `**${item.label}:** ${item.text}`).join('\n') : 'No leaders found.';
   const leadersTextB = leadersB.length ? leadersB.slice(0, 4).map(item => `**${item.label}:** ${item.text}`).join('\n') : 'No leaders found.';
+  const valueA = maddenRosterValueSummary(rosterA);
+  const valueB = maddenRosterValueSummary(rosterB);
+  const valueDiff = Number(valueA.totalValue || 0) - Number(valueB.totalValue || 0);
+  const valueLines = [
+    `**${a.team_name}:** ${Number(valueA.totalValue || 0).toFixed(1)}`,
+    `**${b.team_name}:** ${Number(valueB.totalValue || 0).toFixed(1)}`,
+    `**Difference:** ${valueDiff >= 0 ? '+' + valueDiff.toFixed(1) + ' ' + a.team_name : '+' + Math.abs(valueDiff).toFixed(1) + ' ' + b.team_name}`,
+    `**Roster Value Edge:** ${maddenTradeValueVerdict(valueDiff, a.team_name, b.team_name)}`,
+  ];
 
   return new EmbedBuilder()
     .setTitle(type === 'roster' ? 'Madden Roster Compare' : 'Madden Team Compare')
@@ -16744,12 +16797,13 @@ function buildMaddenTeamCompareEmbed(league, type, a, b, ranksA, ranksB, leaders
     .setColor(0x5865F2)
     .addFields(
       { name: 'Team Comparison', value: lines.join('\n').slice(0, 1024), inline: false },
+      { name: 'Roster Value', value: valueLines.join('\n').slice(0, 1024), inline: false },
       { name: `${a.team_name} Leaders`, value: leadersTextA.slice(0, 1024), inline: true },
       { name: `${b.team_name} Leaders`, value: leadersTextB.slice(0, 1024), inline: true },
       { name: `${a.team_name} Roster`, value: maddenRosterCompareSummary(a.team_name, rosterA).slice(0, 1024), inline: true },
       { name: `${b.team_name} Roster`, value: maddenRosterCompareSummary(b.team_name, rosterB).slice(0, 1024), inline: true }
     )
-    .setFooter({ text: 'GG Sports • Madden Compare' })
+    .setFooter({ text: 'GG Sports • Madden Compare + Value' })
     .setTimestamp();
 }
 
@@ -34334,3 +34388,5 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
 
 
 
+
+// 7J-10AX Madden Compare Value + Trade Foundation
