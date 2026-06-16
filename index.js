@@ -66,6 +66,8 @@ const TEAM_ROLE_NAMES = [
 const pendingOfferTargets = new Map();
 const maddenValuesPaginationSessions = new Map();
 const MADDEN_VALUES_PAGE_SIZE = 25;
+const maddenTradeFinderPaginationSessions = new Map();
+const MADDEN_TRADE_FINDER_PAGE_SIZE = 8;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -1559,7 +1561,8 @@ function buildCommands() {
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('player').setDescription('Player to match').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('team').setDescription('Optional team to search packages from').setRequired(false).setAutocomplete(true))
-        .addIntegerOption(o => o.setName('limit').setDescription('Number of matches to show').setRequired(false)))
+        .addStringOption(o => o.setName('exclude_team').setDescription('Optional team to exclude from package suggestions').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of matches to load').setRequired(false)))
 
 ,
 
@@ -3666,7 +3669,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const commandName = interaction.commandName;
         if (commandName === 'maddenvalues') {
           const focused = interaction.options.getFocused(true);
-          if (focused?.name === 'team') {
+          if (focused?.name === 'team' || focused?.name === 'exclude_team') {
             const leagueName = interaction.options.getString('league');
             const activeLeague = leagueName
               ? await getLeagueByName(interaction.guild.id, leagueName)
@@ -3704,7 +3707,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             'player',
           ]);
 
-          if (focused?.name === 'team') {
+          if (focused?.name === 'team' || focused?.name === 'exclude_team') {
             const leagueName = interaction.options.getString('league');
             const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
             if (!activeLeague) {
@@ -4732,6 +4735,38 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       await interaction.update({
         embeds: [buildMaddenPlayerValueRankingsEmbed(session.league, session.rows, { ...session.filters, page: session.page, pageSize: MADDEN_VALUES_PAGE_SIZE })],
         components: buildMaddenValuesPaginationComponents(token, session.page, totalPages),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentradefind_page:')) {
+      const [, token, direction] = interaction.customId.split(':');
+      const session = maddenTradeFinderPaginationSessions.get(token);
+      if (!session) {
+        await interaction.reply({ content: 'This trade finder page has expired. Run `/maddentrade find` again.', ephemeral: true });
+        return;
+      }
+      if (session.userId !== interaction.user.id) {
+        await interaction.reply({ content: 'Only the user who opened this trade finder can change pages.', ephemeral: true });
+        return;
+      }
+
+      const totalPages = Math.max(1, Math.ceil(Number(session.totalMatches || 0) / MADDEN_TRADE_FINDER_PAGE_SIZE));
+      if (direction === 'next') session.page = Math.min(totalPages - 1, Number(session.page || 0) + 1);
+      if (direction === 'prev') session.page = Math.max(0, Number(session.page || 0) - 1);
+      session.updatedAt = Date.now();
+
+      const payload = await buildMaddenTradeFinderPayload(session.guildId, session.league, session.playerName, {
+        ...session.filters,
+        page: session.page,
+        pageSize: MADDEN_TRADE_FINDER_PAGE_SIZE,
+      });
+      session.totalMatches = payload.totalMatches;
+      maddenTradeFinderPaginationSessions.set(token, session);
+
+      await interaction.update({
+        embeds: [payload.embed],
+        components: buildMaddenTradeFinderPaginationComponents(token, session.page, Math.max(1, Math.ceil(Number(payload.totalMatches || 0) / MADDEN_TRADE_FINDER_PAGE_SIZE))),
       });
       return;
     }
@@ -6051,9 +6086,28 @@ if (gameSubcommand === 'report') {
         if (tradeSubcommand === 'find') {
           const playerName = interaction.options.getString('player');
           const teamFilter = interaction.options.getString('team');
-          const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 10, 5), 20);
-          const embed = await buildMaddenTradeFinderEmbed(interaction.guild.id, activeLeague, playerName, { teamFilter, limit });
-          await interaction.editReply({ embeds: [embed] });
+          const excludeTeam = interaction.options.getString('exclude_team');
+          const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 120, 10), 250);
+          const page = 0;
+          const filters = { teamFilter, excludeTeam, limit, page, pageSize: MADDEN_TRADE_FINDER_PAGE_SIZE };
+          const payload = await buildMaddenTradeFinderPayload(interaction.guild.id, activeLeague, playerName, filters);
+          const token = randomBytes(6).toString('hex');
+          const totalPages = Math.max(1, Math.ceil(Number(payload.totalMatches || 0) / MADDEN_TRADE_FINDER_PAGE_SIZE));
+          maddenTradeFinderPaginationSessions.set(token, {
+            userId: interaction.user.id,
+            guildId: interaction.guild.id,
+            league: activeLeague,
+            playerName,
+            filters: { teamFilter, excludeTeam, limit },
+            page,
+            totalMatches: payload.totalMatches,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          });
+          await interaction.editReply({
+            embeds: [payload.embed],
+            components: buildMaddenTradeFinderPaginationComponents(token, page, totalPages),
+          });
           return;
         }
 
@@ -16916,17 +16970,44 @@ async function getMaddenTradeFinderPlayerRows(guildId, leagueId, teamFilter = nu
   return result.rows || [];
 }
 
-async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options = {}) {
+function maddenTradeFinderTeamFilterLabel(teamFilter, excludeTeam) {
+  const bits = [];
+  if (teamFilter) bits.push(`From ${maddenTeamDisplayName(teamFilter)}`);
+  if (excludeTeam) bits.push(`Excluding ${maddenTeamDisplayName(excludeTeam)}`);
+  return bits.length ? bits.join(' • ') : 'All Teams';
+}
+
+function maddenTradeFinderSamePositionBonus(candidate, target) {
+  const a = String(candidate?.position || '').toUpperCase();
+  const b = String(target?.position || '').toUpperCase();
+  if (!a || !b) return 0;
+  if (a === b) return 150;
+  const groups = [
+    ['QB'],
+    ['HB', 'FB'],
+    ['WR', 'TE'],
+    ['LT', 'LG', 'C', 'RG', 'RT'],
+    ['LEDGE', 'REDGE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'MIKE', 'WILL', 'SAM'],
+    ['CB', 'FS', 'SS'],
+    ['K', 'P'],
+  ];
+  return groups.some(group => group.includes(a) && group.includes(b)) ? 60 : 0;
+}
+
+async function buildMaddenTradeFinderPayload(guildId, league, playerName, options = {}) {
   const target = await findMaddenImportedPlayer(guildId, league.league_id, playerName, null)
     || await findMaddenPlayerFromWeeklyStats(guildId, league.league_id, playerName, null);
 
   if (!target) {
-    return new EmbedBuilder()
-      .setTitle('Madden Trade Finder')
-      .setColor(0xED4245)
-      .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-      .setFooter({ text: 'GG Sports • 7J-10BG Trade Finder UX Fix' })
-      .setTimestamp();
+    return {
+      totalMatches: 0,
+      embed: new EmbedBuilder()
+        .setTitle('Madden Trade Finder')
+        .setColor(0xED4245)
+        .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
+        .setFooter({ text: 'GG Sports • 7J-10BH Trade Finder Pagination + Filters' })
+        .setTimestamp()
+    };
   }
 
   const targetValue = calculateMaddenPlayerValue(target);
@@ -16934,6 +17015,10 @@ async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options 
   const targetTeamKey = maddenTradeAnalyzerTeamKey(target);
   const targetKey = maddenTradeFinderPlayerKey(target);
   const rows = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, options.teamFilter || null);
+  const excludeKey = String(options.excludeTeam || '').trim()
+    ? String(maddenTeamDisplayName(options.excludeTeam) || options.excludeTeam).toLowerCase()
+    : '';
+  const excludeAbbr = options.excludeTeam ? String(getMaddenTeamAbbrev(options.excludeTeam) || '').toLowerCase() : '';
   const pickPool = maddenTradeFinderPickPool();
   const candidates = [];
 
@@ -16941,48 +17026,98 @@ async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options 
     const key = maddenTradeFinderPlayerKey(row);
     if (!key || key === targetKey) continue;
     const rowTeamKey = maddenTradeAnalyzerTeamKey(row);
+    const rowTeamText = String(row.resolved_team_name || row.team_name || '').toLowerCase();
+    const rowTeamAbbr = String(getMaddenTeamAbbrev(row.resolved_team_name || row.team_name) || '').toLowerCase();
     if (!options.teamFilter && targetTeamKey && rowTeamKey === targetTeamKey) continue;
+    if (excludeKey && (rowTeamText.includes(excludeKey) || rowTeamAbbr === excludeAbbr || rowTeamKey === excludeKey)) continue;
 
     const value = calculateMaddenPlayerValue(row);
     const baseTotal = Number(value.valueScore || 0);
     if (!baseTotal) continue;
 
-    candidates.push({ player: row, value, pick: null, total: baseTotal, diff: baseTotal - targetScore, absDiff: Math.abs(baseTotal - targetScore) });
+    const baseDiff = baseTotal - targetScore;
+    const baseBonus = maddenTradeFinderSamePositionBonus(row, target);
+    candidates.push({ player: row, value, pick: null, total: baseTotal, diff: baseDiff, absDiff: Math.abs(baseDiff), matchScore: Math.abs(baseDiff) - baseBonus });
 
     if (baseTotal < targetScore) {
       for (const pick of pickPool) {
         const total = baseTotal + Number(pick.valueScore || 0);
-        candidates.push({ player: row, value, pick, total, diff: total - targetScore, absDiff: Math.abs(total - targetScore) });
+        const diff = total - targetScore;
+        candidates.push({ player: row, value, pick, total, diff, absDiff: Math.abs(diff), matchScore: Math.abs(diff) - baseBonus + 25 });
       }
     }
   }
 
   const seen = new Set();
-  const matches = candidates
-    .sort((a, b) => a.absDiff - b.absDiff || b.total - a.total)
+  const maxMatches = Math.min(Math.max(Number(options.limit || 120), 10), 250);
+  const allMatches = candidates
+    .sort((a, b) => a.matchScore - b.matchScore || a.absDiff - b.absDiff || b.total - a.total)
     .filter(candidate => {
       const key = `${maddenTradeFinderPlayerKey(candidate.player)}:${candidate.pick?.label || 'nopick'}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     })
-    .slice(0, Math.min(Math.max(Number(options.limit || 10), 5), 20));
+    .slice(0, maxMatches);
+
+  const pageSize = Math.min(Math.max(Number(options.pageSize || MADDEN_TRADE_FINDER_PAGE_SIZE || 8), 5), 10);
+  const totalPages = Math.max(1, Math.ceil(allMatches.length / pageSize));
+  const page = Math.min(Math.max(Number(options.page || 0), 0), totalPages - 1);
+  const startIndex = page * pageSize;
+  const matches = allMatches.slice(startIndex, startIndex + pageSize);
 
   const targetTeam = getMaddenTeamAbbrev(target.resolved_team_name || target.team_name) || target.resolved_team_name || target.team_name || 'FA';
   const lines = matches.length
-    ? matches.map((candidate, index) => maddenTradeFinderCandidateLine(candidate, index))
+    ? matches.map((candidate, index) => maddenTradeFinderCandidateLine(candidate, startIndex + index))
     : ['No close trade matches found with the current filters.'];
 
-  return new EmbedBuilder()
-    .setTitle('Madden Trade Finder')
-    .setColor(0xFEE75C)
-    .setDescription(`${league?.league_name || 'Madden League'}\nTarget: **${maddenValuePlayerName(target)}** — ${targetTeam} ${target.position || 'POS'} • ${target.overall || 'N/A'} OVR\nTarget Value: **${targetScore.toFixed(1)}** • ${targetValue.tradeTier}`)
-    .addFields(
-      { name: options.teamFilter ? `Closest Packages • ${options.teamFilter}` : 'Closest Packages', value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false },
-      { name: 'Notes', value: 'Packages compare one player plus an optional draft pick against the target player value. Same-team players are excluded unless a team filter is used. Use Trade Analyzer to test exact multi-player packages.', inline: false }
-    )
-    .setFooter({ text: 'GG Sports • 7J-10BG Trade Finder UX Fix' })
-    .setTimestamp();
+  const filterText = maddenTradeFinderTeamFilterLabel(options.teamFilter, options.excludeTeam);
+  const pageText = allMatches.length
+    ? `Page **${page + 1}/${totalPages}** • Showing **${startIndex + 1}-${Math.min(startIndex + pageSize, allMatches.length)}** of **${allMatches.length}** packages.`
+    : 'No packages found for these filters.';
+
+  return {
+    totalMatches: allMatches.length,
+    embed: new EmbedBuilder()
+      .setTitle('Madden Trade Finder')
+      .setColor(0xFEE75C)
+      .setDescription(`${league?.league_name || 'Madden League'}
+Target: **${maddenValuePlayerName(target)}** — ${targetTeam} ${target.position || 'POS'} • ${target.overall || 'N/A'} OVR
+Target Value: **${targetScore.toFixed(1)}** • ${targetValue.tradeTier}
+Filters: ${filterText}`)
+      .addFields(
+        { name: 'Closest Packages', value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false },
+        { name: 'Page', value: pageText, inline: false },
+        { name: 'Notes', value: 'Packages compare one player plus an optional draft pick against the target player value. Same-team players are excluded unless a team filter is used. Position-similar matches receive a small realism boost.', inline: false }
+      )
+      .setFooter({ text: 'GG Sports • 7J-10BH Trade Finder Pagination + Filters' })
+      .setTimestamp()
+  };
+}
+
+async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options = {}) {
+  const payload = await buildMaddenTradeFinderPayload(guildId, league, playerName, options);
+  return payload.embed;
+}
+
+function buildMaddenTradeFinderPaginationComponents(token, page = 0, totalPages = 1) {
+  if (totalPages <= 1) return [];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`maddentradefind_page:${token}:prev`)
+        .setLabel('Previous')
+        .setEmoji('⬅️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page <= 0),
+      new ButtonBuilder()
+        .setCustomId(`maddentradefind_page:${token}:next`)
+        .setLabel('Next')
+        .setEmoji('➡️')
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(page >= totalPages - 1)
+    ),
+  ];
 }
 
 function parseMaddenTradeAssetInput(input) {
