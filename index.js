@@ -439,6 +439,38 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_power_rankings ADD COLUMN IF NOT EXISTS power_score NUMERIC NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE madden_power_rankings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
 
+
+  // 7J-10AQ: Madden Player Value Engine storage.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_player_values (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_id TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      age INTEGER,
+      dev_trait TEXT,
+      speed INTEGER,
+      years_left NUMERIC,
+      cap_hit NUMERIC,
+      position_component NUMERIC NOT NULL DEFAULT 0,
+      age_component NUMERIC NOT NULL DEFAULT 0,
+      dev_component NUMERIC NOT NULL DEFAULT 0,
+      speed_component NUMERIC NOT NULL DEFAULT 0,
+      years_component NUMERIC NOT NULL DEFAULT 0,
+      cap_component NUMERIC NOT NULL DEFAULT 0,
+      value_score NUMERIC NOT NULL DEFAULT 0,
+      trade_tier TEXT,
+      raw_components JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_id)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_player_values ADD COLUMN IF NOT EXISTS trade_tier TEXT`);
+  await pool.query(`ALTER TABLE madden_player_values ADD COLUMN IF NOT EXISTS raw_components JSONB DEFAULT '{}'::jsonb`);
+
   // 7J-8A-B: Madden career records foundation. This is hidden for now and is refreshed idempotently from imported stats.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_career_records (
@@ -1453,6 +1485,16 @@ function buildCommands() {
         { name: 'Postseason Result Promotion Audit', value: 'postseason_result_promotion_audit' }
       ))
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+
+,
+
+    new SlashCommandBuilder()
+      .setName('maddenvalues')
+      .setDescription('View Madden player value rankings')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+      .addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false).setAutocomplete(true))
+      .addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false))
+      .addIntegerOption(o => o.setName('limit').setDescription('Number of players to show').setRequired(false))
 
 ,
 
@@ -5782,6 +5824,24 @@ if (gameSubcommand === 'report') {
 
       const embed = await builder(interaction.guild.id, activeLeague);
       await interaction.editReply({ embeds: [embed] });
+      return;
+    }
+
+    if (interaction.commandName === 'maddenvalues') {
+      const leagueName = interaction.options.getString('league');
+      const team = interaction.options.getString('team');
+      const position = interaction.options.getString('position');
+      const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 25, 5), 25);
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+        return;
+      }
+
+      const rows = await getMaddenPlayerValueRankings(interaction.guild.id, activeLeague.league_id, { team, position, limit });
+      await upsertMaddenPlayerValues(interaction.guild.id, activeLeague.league_id, rows);
+      await interaction.reply({ embeds: [buildMaddenPlayerValueRankingsEmbed(activeLeague, rows, { team, position, limit })], ephemeral: true });
       return;
     }
 
@@ -25265,6 +25325,239 @@ function buildMaddenImportedMetadataText(player) {
   return lines.join('\n');
 }
 
+
+function maddenValueRawNumber(player, keys = [], fallback = null) {
+  const raw = player?.raw_payload && typeof player.raw_payload === 'object' ? player.raw_payload : {};
+  for (const key of keys) {
+    const direct = player?.[key];
+    if (direct !== undefined && direct !== null && direct !== '') {
+      const n = Number(String(direct).replace(/[$,]/g, ''));
+      if (Number.isFinite(n)) return n;
+    }
+    const rawValue = raw?.[key];
+    if (rawValue !== undefined && rawValue !== null && rawValue !== '') {
+      const n = Number(String(rawValue).replace(/[$,]/g, ''));
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return fallback;
+}
+
+function maddenValuePositionComponent(position) {
+  const pos = String(position || '').toUpperCase().replace(/[^A-Z]/g, '');
+  if (['QB'].includes(pos)) return 0.35;
+  if (['WR', 'HB', 'RB', 'CB', 'LT', 'EDGE'].includes(pos)) return 0.20;
+  if (['TE', 'FS', 'SS', 'RE', 'LE', 'ROLB', 'LOLB', 'MLB'].includes(pos)) return 0.16;
+  if (['RT', 'LG', 'RG', 'C', 'DT'].includes(pos)) return 0.12;
+  if (['K', 'P'].includes(pos)) return 0.04;
+  return 0.10;
+}
+
+function maddenValueAgeComponent(age) {
+  const n = Number(age || 0);
+  if (!n) return 0;
+  if (n <= 22) return 0.25;
+  if (n <= 24) return 0.20;
+  if (n <= 26) return 0.14;
+  if (n <= 28) return 0.08;
+  if (n <= 30) return 0.02;
+  if (n <= 32) return -0.05;
+  if (n <= 34) return -0.12;
+  return -0.20;
+}
+
+function maddenValueDevComponent(devTrait) {
+  const dev = String(devTrait || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (dev.includes('xfactor') || dev.includes('superstarx')) return 0.35;
+  if (dev.includes('superstar')) return 0.25;
+  if (dev.includes('star')) return 0.15;
+  if (dev.includes('hidden')) return 0.12;
+  if (dev.includes('normal')) return 0;
+  const n = Number(devTrait);
+  if (n === 3) return 0.35;
+  if (n === 2) return 0.25;
+  if (n === 1) return 0.15;
+  return 0;
+}
+
+function maddenValueSpeedComponent(speed) {
+  const n = Number(speed || 0);
+  if (!n) return 0;
+  return Math.max(-0.05, Math.min(0.18, (n - 85) / 100));
+}
+
+function maddenValueYearsComponent(yearsLeft) {
+  const n = Number(yearsLeft || 0);
+  if (!n) return 0;
+  return Math.max(0, Math.min(0.10, n * 0.025));
+}
+
+function maddenValueCapComponent(capHit) {
+  const n = Number(capHit || 0);
+  if (!n) return 0;
+  const millions = n > 100000 ? n / 1000000 : n;
+  return Math.max(-0.20, Math.min(0.04, -millions / 250));
+}
+
+function calculateMaddenPlayerValue(player) {
+  const overall = Number(player?.overall || 0);
+  const age = maddenValueRawNumber(player, ['age'], null);
+  const speed = maddenValueRawNumber(player, ['speed', 'speedRating', 'spd'], null);
+  const yearsLeft = maddenValueRawNumber(player, ['years_left', 'yearsLeft', 'contractYearsLeft', 'contractLength', 'contractYears'], null);
+  const capHit = maddenValueRawNumber(player, ['cap_hit', 'capHit', 'capHitValue', 'currentYearSalary', 'salary'], null);
+  const positionComponent = maddenValuePositionComponent(player?.position);
+  const ageComponent = maddenValueAgeComponent(age);
+  const devComponent = maddenValueDevComponent(player?.dev_trait);
+  const speedComponent = maddenValueSpeedComponent(speed);
+  const yearsComponent = maddenValueYearsComponent(yearsLeft);
+  const capComponent = maddenValueCapComponent(capHit);
+  const multiplier = 1.0 + positionComponent + ageComponent + devComponent + speedComponent + yearsComponent + capComponent;
+  const valueScore = overall ? Math.max(0, overall * multiplier) : 0;
+  let tier = 'Depth';
+  if (valueScore >= 150) tier = 'Franchise';
+  else if (valueScore >= 130) tier = 'Elite';
+  else if (valueScore >= 112) tier = 'High Value';
+  else if (valueScore >= 95) tier = 'Starter';
+  else if (valueScore >= 75) tier = 'Role Player';
+  return {
+    overall,
+    age,
+    speed,
+    yearsLeft,
+    capHit,
+    positionComponent,
+    ageComponent,
+    devComponent,
+    speedComponent,
+    yearsComponent,
+    capComponent,
+    multiplier,
+    valueScore: Number(valueScore.toFixed(2)),
+    tradeTier: tier,
+  };
+}
+
+function maddenValuePlayerName(row) {
+  return row?.player_name || row?.full_name || [row?.first_name, row?.last_name].filter(Boolean).join(' ') || 'Unknown Player';
+}
+
+async function getMaddenPlayerValueRankings(guildId, leagueId, filters = {}) {
+  const params = [guildId, String(leagueId)];
+  const clauses = [`p.guild_id = $1::text`, `p.league_id::text = $2::text`, `p.overall IS NOT NULL`];
+  if (filters.team) {
+    params.push(filters.team);
+    params.push(getMaddenTeamAbbrev(filters.team) || filters.team);
+    clauses.push(`(LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER('%' || $${params.length - 1} || '%') OR LOWER(COALESCE(t.team_name, p.team_name, '')) = LOWER($${params.length}))`);
+  }
+  if (filters.position) {
+    params.push(filters.position);
+    clauses.push(`LOWER(COALESCE(p.position, '')) = LOWER($${params.length})`);
+  }
+
+  const result = await pool.query(
+    `SELECT p.*,
+            COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
+            COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name
+     FROM madden_players p
+     LEFT JOIN madden_imported_team_stats t
+       ON t.guild_id = p.guild_id::text
+      AND t.league_id::text = p.league_id::text
+      AND p.team_id IS NOT NULL
+      AND t.external_team_id::text = p.team_id
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY p.overall DESC NULLS LAST, player_name ASC
+     LIMIT 750`,
+    params
+  );
+
+  return (result.rows || [])
+    .map(row => ({ ...row, value: calculateMaddenPlayerValue(row) }))
+    .sort((a, b) => Number(b.value?.valueScore || 0) - Number(a.value?.valueScore || 0) || Number(b.overall || 0) - Number(a.overall || 0))
+    .slice(0, Math.min(Math.max(Number(filters.limit || 25), 1), 25));
+}
+
+async function upsertMaddenPlayerValues(guildId, leagueId, rows = []) {
+  for (const row of rows || []) {
+    const value = row.value || calculateMaddenPlayerValue(row);
+    const playerId = row.id || row.roster_id || row.presentation_id || maddenValuePlayerName(row);
+    await pool.query(
+      `INSERT INTO madden_player_values (
+        guild_id, league_id, player_id, player_name, team_name, position, overall, age, dev_trait, speed, years_left, cap_hit,
+        position_component, age_component, dev_component, speed_component, years_component, cap_component, value_score, trade_tier, raw_components, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb,NOW())
+      ON CONFLICT (guild_id, league_id, player_id) DO UPDATE SET
+        player_name = EXCLUDED.player_name,
+        team_name = EXCLUDED.team_name,
+        position = EXCLUDED.position,
+        overall = EXCLUDED.overall,
+        age = EXCLUDED.age,
+        dev_trait = EXCLUDED.dev_trait,
+        speed = EXCLUDED.speed,
+        years_left = EXCLUDED.years_left,
+        cap_hit = EXCLUDED.cap_hit,
+        position_component = EXCLUDED.position_component,
+        age_component = EXCLUDED.age_component,
+        dev_component = EXCLUDED.dev_component,
+        speed_component = EXCLUDED.speed_component,
+        years_component = EXCLUDED.years_component,
+        cap_component = EXCLUDED.cap_component,
+        value_score = EXCLUDED.value_score,
+        trade_tier = EXCLUDED.trade_tier,
+        raw_components = EXCLUDED.raw_components,
+        updated_at = NOW()`,
+      [
+        guildId,
+        String(leagueId),
+        String(playerId),
+        maddenValuePlayerName(row),
+        row.resolved_team_name || row.team_name || null,
+        row.position || null,
+        value.overall || null,
+        value.age || null,
+        row.dev_trait || null,
+        value.speed || null,
+        value.yearsLeft || null,
+        value.capHit || null,
+        value.positionComponent,
+        value.ageComponent,
+        value.devComponent,
+        value.speedComponent,
+        value.yearsComponent,
+        value.capComponent,
+        value.valueScore,
+        value.tradeTier,
+        JSON.stringify(value),
+      ]
+    ).catch(error => console.error('[MADDEN VALUES] upsert failed:', error.message));
+  }
+}
+
+function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
+  const titleBits = ['Madden Player Value Rankings'];
+  if (filters.team) titleBits.push(filters.team);
+  if (filters.position) titleBits.push(String(filters.position).toUpperCase());
+
+  const lines = rows.length
+    ? rows.map((row, index) => {
+        const value = row.value || calculateMaddenPlayerValue(row);
+        const team = getMaddenTeamAbbrev(row.resolved_team_name || row.team_name) || row.resolved_team_name || row.team_name || 'FA';
+        const dev = maddenPlayerDevEmojiOnly(row.dev_trait);
+        return `${index + 1}. **${maddenValuePlayerName(row)}** — ${team} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${dev} • Value **${value.valueScore.toFixed(1)}** • ${value.tradeTier}`;
+      }).join('\n')
+    : 'No Madden players found. Run `/madden sync` first.';
+
+  return new EmbedBuilder()
+    .setTitle(titleBits.join(' • '))
+    .setDescription(`${league.league_name || 'Madden League'}\nFormula: OVERALL × (1.0 + Position + Age + Dev Trait + Speed + Years Left + Cap Hit)`)
+    .setColor(0xD4AF37)
+    .addFields(
+      { name: 'Top Player Values', value: lines.slice(0, 4000), inline: false },
+      { name: 'Notes', value: 'Cap hit is treated as a value modifier, so expensive contracts can reduce value. Missing speed/contract fields default to neutral.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10AQ Player Value Engine' })
+    .setTimestamp();
+}
+
 function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []) {
   const displayName = maddenPlayerDisplayName(player);
   const teamName = player.resolved_team_name || player.team_name || 'Free Agent';
@@ -25302,6 +25595,20 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
     fields.push({ name: 'Bio', value: physical, inline: false });
   }
 
+
+  const valueInfo = calculateMaddenPlayerValue(player);
+  if (valueInfo.valueScore > 0) {
+    fields.push({
+      name: 'Player Value',
+      value: [
+        `**Value Score:** ${valueInfo.valueScore.toFixed(1)}`,
+        `**Trade Tier:** ${valueInfo.tradeTier}`,
+        `**Multiplier:** ${valueInfo.multiplier.toFixed(2)}x`,
+        `**Components:** POS ${valueInfo.positionComponent.toFixed(2)} • AGE ${valueInfo.ageComponent.toFixed(2)} • DEV ${valueInfo.devComponent.toFixed(2)} • SPD ${valueInfo.speedComponent.toFixed(2)} • YRS ${valueInfo.yearsComponent.toFixed(2)} • CAP ${valueInfo.capComponent.toFixed(2)}`,
+      ].join('\n'),
+      inline: false,
+    });
+  }
 
   fields.push({
     name: 'Imported Metadata',
