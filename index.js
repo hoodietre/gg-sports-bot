@@ -1553,6 +1553,13 @@ function buildCommands() {
         ))
         .addStringOption(o => o.setName('label_a').setDescription('Optional Side A label/team').setRequired(false))
         .addStringOption(o => o.setName('label_b').setDescription('Optional Side B label/team').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('find')
+        .setDescription('Find close trade packages for one Madden player')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('player').setDescription('Player to match').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Optional team to search packages from').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of matches to show').setRequired(false)))
 
 ,
 
@@ -3693,7 +3700,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
           const tradePlayerFields = new Set([
             'side_a_player_1', 'side_a_player_2', 'side_a_player_3',
             'side_b_player_1', 'side_b_player_2', 'side_b_player_3',
+            'player',
           ]);
+
+          if (focused?.name === 'team') {
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+            if (!activeLeague) {
+              await interaction.respond([{ name: 'Select league first', value: 'Select league first' }]);
+              return;
+            }
+            const choices = await getMaddenTeamAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
 
           if (tradePlayerFields.has(focused?.name)) {
             const leagueName = interaction.options.getString('league');
@@ -5980,7 +6000,7 @@ if (gameSubcommand === 'report') {
       }
 
       const tradeSubcommand = interaction.options.getSubcommand(false);
-      if (tradeSubcommand !== 'analyze') {
+      if (!['analyze', 'find'].includes(tradeSubcommand)) {
         await interaction.editReply({ content: 'Unknown Madden trade command.' });
         return;
       }
@@ -6017,6 +6037,16 @@ if (gameSubcommand === 'report') {
 
       try {
         await ensureMaddenPlayerPersistenceTables();
+
+        if (tradeSubcommand === 'find') {
+          const playerName = interaction.options.getString('player');
+          const teamFilter = interaction.options.getString('team');
+          const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 10, 5), 20);
+          const embed = await buildMaddenTradeFinderEmbed(interaction.guild.id, activeLeague, playerName, { teamFilter, limit });
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+
         const [sideA, sideB] = await Promise.all([
           resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideAInput, sideAPicks),
           resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideBInput, sideBPicks),
@@ -16819,6 +16849,130 @@ function parseMaddenDraftPickAsset(input) {
 
 function maddenDraftPickAssetLine(pick, index = 0) {
   return `${index + 1}. **${pick.label}** — Draft Pick • **${Number(pick.valueScore || 0).toFixed(1)}**${Number(pick.multiplier || 1) !== 1 ? ` • ${pick.multiplier}x future` : ''}`;
+}
+
+function maddenTradeFinderPickPool() {
+  const picks = [];
+  for (const year of [2026, 2027, 2028]) {
+    for (let round = 1; round <= 7; round++) {
+      const pick = parseMaddenDraftPickAsset(`${year} ${round}`);
+      if (pick) picks.push(pick);
+    }
+  }
+  return picks;
+}
+
+function maddenTradeFinderPlayerKey(player) {
+  return String(player?.roster_id || player?.external_player_id || player?.id || maddenPlayerDisplayName(player)).toLowerCase();
+}
+
+function maddenTradeFinderCandidateLine(candidate, index) {
+  const player = candidate.player || {};
+  const value = candidate.value || calculateMaddenPlayerValue(player);
+  const team = getMaddenTeamAbbrev(player.resolved_team_name || player.team_name) || player.resolved_team_name || player.team_name || 'FA';
+  const pickText = candidate.pick ? ` + ${candidate.pick.label}` : '';
+  const diffText = candidate.diff >= 0 ? `+${candidate.diff.toFixed(1)}` : `-${Math.abs(candidate.diff).toFixed(1)}`;
+  return `${index + 1}. **${maddenValuePlayerName(player)}** (${team} ${player.position || 'POS'} • ${player.overall || 'N/A'} OVR)${pickText}\nValue: **${candidate.total.toFixed(1)}** • Difference: **${diffText}**`;
+}
+
+async function getMaddenTradeFinderPlayerRows(guildId, leagueId, teamFilter = null) {
+  await ensureMaddenPlayerPersistenceTables();
+  const teamText = String(teamFilter || '').trim();
+  const teamLike = teamText ? `%${teamText}%` : null;
+  const teamAbbr = teamText ? getMaddenTeamAbbrev(teamText) : '';
+
+  const result = await pool.query(
+    `SELECT p.*,
+            COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name
+     FROM madden_players p
+     LEFT JOIN madden_imported_team_stats t
+       ON t.guild_id = p.guild_id::text
+      AND t.league_id::text = p.league_id::text
+      AND p.team_id IS NOT NULL
+      AND t.external_team_id::text = p.team_id
+     WHERE p.guild_id = $1::text
+       AND p.league_id::text = $2::text
+       AND COALESCE(p.overall, 0) > 0
+       AND (
+         $3::text IS NULL
+         OR LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER($3)
+         OR LOWER(COALESCE(p.team_name, t.team_name, '')) = LOWER($4)
+       )
+     ORDER BY p.overall DESC NULLS LAST, p.full_name ASC
+     LIMIT 900`,
+    [guildId, leagueId, teamLike, teamAbbr || teamText || '']
+  );
+
+  return result.rows || [];
+}
+
+async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options = {}) {
+  const target = await findMaddenImportedPlayer(guildId, league.league_id, playerName, null)
+    || await findMaddenPlayerFromWeeklyStats(guildId, league.league_id, playerName, null);
+
+  if (!target) {
+    return new EmbedBuilder()
+      .setTitle('Madden Trade Finder')
+      .setColor(0xED4245)
+      .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
+      .setFooter({ text: 'GG Sports • 7J-10BF Trade Finder' })
+      .setTimestamp();
+  }
+
+  const targetValue = calculateMaddenPlayerValue(target);
+  const targetScore = Number(targetValue.valueScore || 0);
+  const targetTeamKey = maddenTradeAnalyzerTeamKey(target);
+  const targetKey = maddenTradeFinderPlayerKey(target);
+  const rows = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, options.teamFilter || null);
+  const pickPool = maddenTradeFinderPickPool();
+  const candidates = [];
+
+  for (const row of rows) {
+    const key = maddenTradeFinderPlayerKey(row);
+    if (!key || key === targetKey) continue;
+    const rowTeamKey = maddenTradeAnalyzerTeamKey(row);
+    if (!options.teamFilter && targetTeamKey && rowTeamKey === targetTeamKey) continue;
+
+    const value = calculateMaddenPlayerValue(row);
+    const baseTotal = Number(value.valueScore || 0);
+    if (!baseTotal) continue;
+
+    candidates.push({ player: row, value, pick: null, total: baseTotal, diff: baseTotal - targetScore, absDiff: Math.abs(baseTotal - targetScore) });
+
+    if (baseTotal < targetScore) {
+      for (const pick of pickPool) {
+        const total = baseTotal + Number(pick.valueScore || 0);
+        candidates.push({ player: row, value, pick, total, diff: total - targetScore, absDiff: Math.abs(total - targetScore) });
+      }
+    }
+  }
+
+  const seen = new Set();
+  const matches = candidates
+    .sort((a, b) => a.absDiff - b.absDiff || b.total - a.total)
+    .filter(candidate => {
+      const key = `${maddenTradeFinderPlayerKey(candidate.player)}:${candidate.pick?.label || 'nopick'}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, Math.min(Math.max(Number(options.limit || 10), 5), 20));
+
+  const targetTeam = getMaddenTeamAbbrev(target.resolved_team_name || target.team_name) || target.resolved_team_name || target.team_name || 'FA';
+  const lines = matches.length
+    ? matches.map((candidate, index) => maddenTradeFinderCandidateLine(candidate, index))
+    : ['No close trade matches found with the current filters.'];
+
+  return new EmbedBuilder()
+    .setTitle('Madden Trade Finder')
+    .setColor(0xFEE75C)
+    .setDescription(`${league?.league_name || 'Madden League'}\nTarget: **${maddenValuePlayerName(target)}** — ${targetTeam} ${target.position || 'POS'} • ${target.overall || 'N/A'} OVR\nTarget Value: **${targetScore.toFixed(1)}** • ${targetValue.tradeTier}`)
+    .addFields(
+      { name: options.teamFilter ? `Closest Packages • ${options.teamFilter}` : 'Closest Packages', value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false },
+      { name: 'Notes', value: 'Packages compare one player plus an optional draft pick against the target player value. Same-team players are excluded unless a team filter is used. Use Trade Analyzer to test exact multi-player packages.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BF Trade Finder' })
+    .setTimestamp();
 }
 
 function parseMaddenTradeAssetInput(input) {
