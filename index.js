@@ -1523,6 +1523,9 @@ function buildCommands() {
 
 ,
 
+    // 7J-10BD: draft pick value choices for Madden trade analyzer.
+    // Discord allows 25 choices per option, so this supports current/future/beyond years by round.
+
     new SlashCommandBuilder()
       .setName('maddentrade')
       .setDescription('Analyze Madden trade value between two asset groups')
@@ -1536,6 +1539,18 @@ function buildCommands() {
         .addStringOption(o => o.setName('side_a_player_3').setDescription('Side A player 3; locked to Side A player 1 team').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('side_b_player_2').setDescription('Side B player 2; locked to Side B player 1 team').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('side_b_player_3').setDescription('Side B player 3; locked to Side B player 1 team').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_a_pick_1').setDescription('Side A draft pick 1').setRequired(false).addChoices(
+          ...buildMaddenDraftPickCommandChoices()
+        ))
+        .addStringOption(o => o.setName('side_a_pick_2').setDescription('Side A draft pick 2').setRequired(false).addChoices(
+          ...buildMaddenDraftPickCommandChoices()
+        ))
+        .addStringOption(o => o.setName('side_b_pick_1').setDescription('Side B draft pick 1').setRequired(false).addChoices(
+          ...buildMaddenDraftPickCommandChoices()
+        ))
+        .addStringOption(o => o.setName('side_b_pick_2').setDescription('Side B draft pick 2').setRequired(false).addChoices(
+          ...buildMaddenDraftPickCommandChoices()
+        ))
         .addStringOption(o => o.setName('label_a').setDescription('Optional Side A label/team').setRequired(false))
         .addStringOption(o => o.setName('label_b').setDescription('Optional Side B label/team').setRequired(false)))
 
@@ -5981,6 +5996,14 @@ if (gameSubcommand === 'report') {
         interaction.options.getString('side_b_player_2'),
         interaction.options.getString('side_b_player_3'),
       ].map(value => String(value || '').trim()).filter(Boolean);
+      const sideAPicks = [
+        interaction.options.getString('side_a_pick_1'),
+        interaction.options.getString('side_a_pick_2'),
+      ].map(value => String(value || '').trim()).filter(Boolean);
+      const sideBPicks = [
+        interaction.options.getString('side_b_pick_1'),
+        interaction.options.getString('side_b_pick_2'),
+      ].map(value => String(value || '').trim()).filter(Boolean);
       const sideAInput = sideAPlayers.join(', ');
       const sideBInput = sideBPlayers.join(', ');
       const labelA = interaction.options.getString('label_a') || 'Side A';
@@ -5995,8 +6018,8 @@ if (gameSubcommand === 'report') {
       try {
         await ensureMaddenPlayerPersistenceTables();
         const [sideA, sideB] = await Promise.all([
-          resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideAInput),
-          resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideBInput),
+          resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideAInput, sideAPicks),
+          resolveMaddenTradeAnalyzerSide(interaction.guild.id, activeLeague.league_id, sideBInput, sideBPicks),
         ]);
 
         await interaction.editReply({
@@ -16725,6 +16748,79 @@ function maddenPlayerMini(player) {
 }
 
 
+const MADDEN_DRAFT_PICK_VALUE_TABLE = {
+  1: [3000, 2600, 2200, 1800, 1700, 1600, 1500, 1400, 1350, 1300, 1250, 1200, 1150, 1100, 1050, 1000, 950, 900, 875, 850, 800, 780, 760, 740, 720, 700, 680, 660, 640, 620, 600, 590],
+  2: [580, 560, 550, 540, 530, 520, 510, 500, 490, 480, 470, 460, 450, 440, 430, 420, 410, 400, 390, 380, 370, 360, 350, 340, 330, 320, 310, 300, 292, 294, 276, 270],
+  3: [265, 260, 255, 250, 245, 240, 235, 230, 225, 220, 215, 210, 205, 200, 195, 190, 185, 180, 175, 170, 165, 160, 155, 150, 145, 140, 136, 132, 128, 124, 120, 116],
+  4: [112, 108, 104, 100, 96, 92, 88, 86, 84, 82, 80, 78, 76, 74, 72, 70, 68, 66, 64, 62, 60, 58, 56, 54, 52, 50, 49, 48, 47, 46, 45, 44],
+  5: [43, 42, 41, 40, 39.5, 39, 38.5, 38, 37.5, 37, 36.5, 36, 35.5, 35, 34.5, 34, 33.5, 33, 32.6, 32.2, 31.8, 31.4, 31, 30.6, 30.2, 29.8, 29.4, 29, 28.6, 28.2, 27.8, 27.4],
+  6: [27, 26.6, 26.2, 25.8, 25.4, 25, 24.6, 24.2, 23.8, 23.4, 23, 22.6, 22.2, 21.8, 21.4, 21, 20.6, 20.2, 19.8, 19.4, 19, 18, 18.2, 17.8, 17.4, 17, 16.6, 16.2, 15.8, 15.4, 15, 14.6],
+  7: [14.2, 13.8, 13.4, 13, 12.6, 12.2, 11.8, 11.4, 11, 10.6, 10.2, 9.8, 9.4, 9, 8.6, 8.2, 7.8, 7.4, 7, 6.6, 6.2, 5.8, 5.4, 5, 4.6, 4.2, 3.8, 3.4, 3, 2.6, 2.2, 1.8],
+};
+
+function buildMaddenDraftPickCommandChoices() {
+  const years = [2026, 2027, 2028];
+  const choices = [];
+  for (const year of years) {
+    for (let round = 1; round <= 7; round++) {
+      const suffix = round === 1 ? 'st' : round === 2 ? 'nd' : round === 3 ? 'rd' : 'th';
+      choices.push({ name: `${year} ${round}${suffix}`, value: `${year} ${round}` });
+    }
+  }
+  return choices;
+}
+
+function maddenDraftPickRoundMedianValue(round) {
+  const values = MADDEN_DRAFT_PICK_VALUE_TABLE[Number(round)] || [];
+  if (!values.length) return 0;
+  const sorted = [...values].map(Number).sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function maddenDraftPickFutureMultiplier(year) {
+  const y = Number(year || 0);
+  if (!y || y <= 2026) return 1;
+  if (y === 2027) return 0.5;
+  return 0.5;
+}
+
+function parseMaddenDraftPickAsset(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+
+  // Supports dropdown values like "2027 1", plus manual future formats like "2027 1.05" or "2027 1st pick 5" if added later.
+  const yearMatch = raw.match(/20\d{2}/);
+  const year = yearMatch ? Number(yearMatch[0]) : 2026;
+
+  let round = null;
+  let pick = null;
+
+  const slotMatch = raw.match(/(?:20\d{2})?\s*([1-7])\s*[.\-:]\s*(\d{1,2})/);
+  if (slotMatch) {
+    round = Number(slotMatch[1]);
+    pick = Math.max(1, Math.min(32, Number(slotMatch[2])));
+  } else {
+    const roundMatch = raw.match(/\b([1-7])(?:st|nd|rd|th)?\b/i);
+    round = roundMatch ? Number(roundMatch[1]) : null;
+  }
+
+  if (!round || round < 1 || round > 7) return null;
+
+  const base = pick
+    ? Number((MADDEN_DRAFT_PICK_VALUE_TABLE[round] || [])[pick - 1] || maddenDraftPickRoundMedianValue(round))
+    : maddenDraftPickRoundMedianValue(round);
+  const multiplier = maddenDraftPickFutureMultiplier(year);
+  const valueScore = Number((base * multiplier).toFixed(1));
+  const suffix = round === 1 ? 'st' : round === 2 ? 'nd' : round === 3 ? 'rd' : 'th';
+  const label = pick ? `${year} Round ${round}, Pick ${pick}` : `${year} ${round}${suffix}`;
+  return { raw, year, round, pick, base, multiplier, valueScore, label, tradeTier: 'Draft Pick' };
+}
+
+function maddenDraftPickAssetLine(pick, index = 0) {
+  return `${index + 1}. **${pick.label}** — Draft Pick • **${Number(pick.valueScore || 0).toFixed(1)}**${Number(pick.multiplier || 1) !== 1 ? ` • ${pick.multiplier}x future` : ''}`;
+}
+
 function parseMaddenTradeAssetInput(input) {
   return String(input || '')
     .split(/[\n,;+]+/)
@@ -16743,7 +16839,7 @@ function maddenTradeAnalyzerTeamLabel(player) {
   return abbr && abbr !== team ? `${team} (${abbr})` : team;
 }
 
-async function resolveMaddenTradeAnalyzerSide(guildId, leagueId, input) {
+async function resolveMaddenTradeAnalyzerSide(guildId, leagueId, input, pickInputs = []) {
   const assetNames = parseMaddenTradeAssetInput(input);
   const resolved = [];
   const missing = [];
@@ -16780,8 +16876,11 @@ async function resolveMaddenTradeAnalyzerSide(guildId, leagueId, input) {
     resolved.push({ assetName, player, value });
   }
 
-  const totalValue = resolved.reduce((sum, item) => sum + Number(item.value?.valueScore || 0), 0);
-  return { input, assetNames, resolved, missing, totalValue, lockedTeamName };
+  const picks = (pickInputs || []).map(parseMaddenDraftPickAsset).filter(Boolean);
+  const playerTotal = resolved.reduce((sum, item) => sum + Number(item.value?.valueScore || 0), 0);
+  const pickTotal = picks.reduce((sum, item) => sum + Number(item.valueScore || 0), 0);
+  const totalValue = playerTotal + pickTotal;
+  return { input, assetNames, resolved, missing, picks, playerTotal, pickTotal, totalValue, lockedTeamName };
 }
 
 function maddenTradeAnalyzerAssetLine(item, index = 0) {
@@ -16797,10 +16896,15 @@ function buildMaddenTradeAnalyzerSideText(side, label) {
   if (side.resolved?.length) {
     lines.push(...side.resolved.map((item, index) => maddenTradeAnalyzerAssetLine(item, index)));
   }
+  if (side.picks?.length) {
+    if (lines.length) lines.push('');
+    const startIndex = Number(side.resolved?.length || 0);
+    lines.push(...side.picks.map((pick, index) => maddenDraftPickAssetLine(pick, startIndex + index)));
+  }
   if (side.missing?.length) {
     lines.push('', `⚠️ Not found: ${side.missing.map(name => `\`${name}\``).join(', ')}`);
   }
-  if (!lines.length) lines.push('No valid players found. Use the autocomplete player slots for best results.');
+  if (!lines.length) lines.push('No valid assets found. Use autocomplete player slots and optional draft pick fields for best results.');
   lines.push('', `**${label} Total:** ${Number(side.totalValue || 0).toFixed(1)}`);
   return maddenSafeEmbedText(lines.join('\n'), 1024);
 }
@@ -16811,7 +16915,7 @@ function buildMaddenTradeAnalyzerEmbed(league, data) {
   const valueB = Number(sideB?.totalValue || 0);
   const diff = valueA - valueB;
   const leader = diff >= 0 ? labelA : labelB;
-  const totalAssets = Number(sideA?.resolved?.length || 0) + Number(sideB?.resolved?.length || 0);
+  const totalAssets = Number(sideA?.resolved?.length || 0) + Number(sideB?.resolved?.length || 0) + Number(sideA?.picks?.length || 0) + Number(sideB?.picks?.length || 0);
   const color = Math.abs(diff) < 100 ? 0x57F287 : Math.abs(diff) < 900 ? 0xFEE75C : 0xED4245;
   const diffText = diff >= 0 ? `+${diff.toFixed(1)} ${labelA}` : `+${Math.abs(diff).toFixed(1)} ${labelB}`;
   const verdict = maddenTradeValueVerdict(diff, labelA, labelB);
@@ -16829,15 +16933,15 @@ function buildMaddenTradeAnalyzerEmbed(league, data) {
 
   return new EmbedBuilder()
     .setTitle('Madden Trade Analyzer')
-    .setDescription(`${league?.league_name || 'Madden League'} • ${totalAssets} resolved player asset(s)\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`)
+    .setDescription(`${league?.league_name || 'Madden League'} • ${totalAssets} resolved asset(s)\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`)
     .setColor(color)
     .addFields(
       { name: labelA, value: buildMaddenTradeAnalyzerSideText(sideA || {}, labelA), inline: false },
       { name: labelB, value: buildMaddenTradeAnalyzerSideText(sideB || {}, labelB), inline: false },
       { name: 'Trade Result', value: maddenSafeEmbedText(recommendation, 1024), inline: false },
-      { name: 'Notes', value: 'Use autocomplete player slots for best results. Draft pick and multi-team asset support can be added next.', inline: false }
+      { name: 'Notes', value: 'Draft pick values use your configured draft-pick value table. Future picks are multiplied by 0.5. Multi-team support can be added next.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BB Team-Locked Trade Analyzer' })
+    .setFooter({ text: 'GG Sports • 7J-10BD Draft Pick Trade Analyzer' })
     .setTimestamp();
 }
 
