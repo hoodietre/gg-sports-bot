@@ -16909,6 +16909,27 @@ function buildMaddenTradeAnalyzerSideText(side, label) {
   return maddenSafeEmbedText(lines.join('\n'), 1024);
 }
 
+function maddenTradeGradeLetters(diff, valueA, valueB) {
+  const a = Math.max(0, Number(valueA || 0));
+  const b = Math.max(0, Number(valueB || 0));
+  const higher = Math.max(a, b);
+  const lower = Math.min(a, b);
+  if (!higher) return { gradeA: 'N/A', gradeB: 'N/A', pct: 0 };
+
+  const pct = ((higher - lower) / higher) * 100;
+  const highGrade = pct < 5 ? 'A' : pct < 10 ? 'A' : pct < 20 ? 'A' : pct < 35 ? 'A+' : 'A+';
+  const lowGrade = pct < 5 ? 'A' : pct < 10 ? 'B+' : pct < 20 ? 'C' : pct < 35 ? 'D' : 'F';
+
+  if (a >= b) return { gradeA: highGrade, gradeB: lowGrade, pct };
+  return { gradeA: lowGrade, gradeB: highGrade, pct };
+}
+
+function maddenTradeGradeLine(label, grade) {
+  const g = String(grade || 'N/A');
+  const emoji = g.startsWith('A') ? '🟢' : g.startsWith('B') ? '🟡' : g.startsWith('C') ? '🟠' : g === 'N/A' ? '⚪' : '🔴';
+  return `${emoji} **${label}:** ${g}`;
+}
+
 function buildMaddenTradeAnalyzerEmbed(league, data) {
   const { labelA = 'Side A', labelB = 'Side B', sideA, sideB } = data || {};
   const valueA = Number(sideA?.totalValue || 0);
@@ -16916,32 +16937,39 @@ function buildMaddenTradeAnalyzerEmbed(league, data) {
   const diff = valueA - valueB;
   const leader = diff >= 0 ? labelA : labelB;
   const totalAssets = Number(sideA?.resolved?.length || 0) + Number(sideB?.resolved?.length || 0) + Number(sideA?.picks?.length || 0) + Number(sideB?.picks?.length || 0);
-  const color = Math.abs(diff) < 100 ? 0x57F287 : Math.abs(diff) < 900 ? 0xFEE75C : 0xED4245;
-  const diffText = diff >= 0 ? `+${diff.toFixed(1)} ${labelA}` : `+${Math.abs(diff).toFixed(1)} ${labelB}`;
+  const absDiff = Math.abs(diff);
+  const color = absDiff < 100 ? 0x57F287 : absDiff < 900 ? 0xFEE75C : 0xED4245;
+  const diffText = diff >= 0 ? `+${diff.toFixed(1)} ${labelA}` : `+${absDiff.toFixed(1)} ${labelB}`;
   const verdict = maddenTradeValueVerdict(diff, labelA, labelB);
+  const grades = maddenTradeGradeLetters(diff, valueA, valueB);
+  const pctText = Number(grades.pct || 0).toFixed(1);
 
-  const recommendation = [
+  const resultLines = [
     `**${labelA}:** ${valueA.toFixed(1)}`,
     `**${labelB}:** ${valueB.toFixed(1)}`,
     `**Difference:** ${diffText}`,
+    `**Value Gap:** ${pctText}%`,
     `**Verdict:** ${verdict}`,
     '',
-    Math.abs(diff) < 100
+    maddenTradeGradeLine(labelA, grades.gradeA),
+    maddenTradeGradeLine(labelB, grades.gradeB),
+    '',
+    absDiff < 100
       ? 'This trade is close enough to be considered even by the current value model.'
       : `${leader} receives the stronger value package by the current model.`,
-  ].join('\n');
+  ];
 
   return new EmbedBuilder()
     .setTitle('Madden Trade Analyzer')
     .setDescription(`${league?.league_name || 'Madden League'} • ${totalAssets} resolved asset(s)\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`)
     .setColor(color)
     .addFields(
-      { name: labelA, value: buildMaddenTradeAnalyzerSideText(sideA || {}, labelA), inline: false },
-      { name: labelB, value: buildMaddenTradeAnalyzerSideText(sideB || {}, labelB), inline: false },
-      { name: 'Trade Result', value: maddenSafeEmbedText(recommendation, 1024), inline: false },
-      { name: 'Notes', value: 'Draft pick values use your configured draft-pick value table. Future picks are multiplied by 0.5. Multi-team support can be added next.', inline: false }
+      { name: `📦 ${labelA} Package`, value: buildMaddenTradeAnalyzerSideText(sideA || {}, labelA), inline: false },
+      { name: `📦 ${labelB} Package`, value: buildMaddenTradeAnalyzerSideText(sideB || {}, labelB), inline: false },
+      { name: 'Trade Result + Grades', value: maddenSafeEmbedText(resultLines.join('\n'), 1024), inline: false },
+      { name: 'Notes', value: 'Grades are based on package value gap percentage. Draft pick values use your configured draft-pick table. Future picks are multiplied by 0.5.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BD Draft Pick Trade Analyzer' })
+    .setFooter({ text: 'GG Sports • 7J-10BE Trade Grades' })
     .setTimestamp();
 }
 
