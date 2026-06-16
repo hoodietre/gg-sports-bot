@@ -3684,10 +3684,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
               return;
             }
 
-            const choices = await getMaddenPlayerAutocompleteChoices(
+            const choices = await getMaddenTradeAnalyzerPlayerAutocompleteChoices(
               interaction.guild.id,
               activeLeague.league_id,
-              focused.value
+              focused.name,
+              focused.value,
+              interaction
             );
 
             await interaction.respond(choices);
@@ -16724,22 +16726,55 @@ function parseMaddenTradeAssetInput(input) {
     .slice(0, 10);
 }
 
+function maddenTradeAnalyzerTeamKey(player) {
+  return String(player?.resolved_team_name || player?.team_name || '').trim().toLowerCase();
+}
+
+function maddenTradeAnalyzerTeamLabel(player) {
+  const team = String(player?.resolved_team_name || player?.team_name || 'Unknown Team').trim();
+  const abbr = getMaddenTeamAbbrev(team);
+  return abbr && abbr !== team ? `${team} (${abbr})` : team;
+}
+
 async function resolveMaddenTradeAnalyzerSide(guildId, leagueId, input) {
   const assetNames = parseMaddenTradeAssetInput(input);
   const resolved = [];
   const missing = [];
+  let lockedTeamName = null;
+  let lockedTeamKey = null;
+
   for (const assetName of assetNames) {
-    let player = await findMaddenImportedPlayer(guildId, leagueId, assetName, null)
-      || await findMaddenPlayerFromWeeklyStats(guildId, leagueId, assetName, null);
+    const teamFilter = lockedTeamName || null;
+    let player = await findMaddenImportedPlayer(guildId, leagueId, assetName, teamFilter)
+      || await findMaddenPlayerFromWeeklyStats(guildId, leagueId, assetName, teamFilter);
+
+    if (!player && !lockedTeamName) {
+      player = await findMaddenImportedPlayer(guildId, leagueId, assetName, null)
+        || await findMaddenPlayerFromWeeklyStats(guildId, leagueId, assetName, null);
+    }
+
     if (!player) {
       missing.push(assetName);
       continue;
     }
+
+    const teamKey = maddenTradeAnalyzerTeamKey(player);
+    if (!lockedTeamKey && teamKey) {
+      lockedTeamKey = teamKey;
+      lockedTeamName = player.resolved_team_name || player.team_name || null;
+    }
+
+    if (lockedTeamKey && teamKey && teamKey !== lockedTeamKey) {
+      const expected = lockedTeamName || 'the first selected team';
+      throw new Error(`${assetName} is on ${maddenTradeAnalyzerTeamLabel(player)}, but this side is locked to ${expected}. Use one side per team.`);
+    }
+
     const value = calculateMaddenPlayerValue(player);
     resolved.push({ assetName, player, value });
   }
+
   const totalValue = resolved.reduce((sum, item) => sum + Number(item.value?.valueScore || 0), 0);
-  return { input, assetNames, resolved, missing, totalValue };
+  return { input, assetNames, resolved, missing, totalValue, lockedTeamName };
 }
 
 function maddenTradeAnalyzerAssetLine(item, index = 0) {
@@ -16795,7 +16830,7 @@ function buildMaddenTradeAnalyzerEmbed(league, data) {
       { name: 'Trade Result', value: maddenSafeEmbedText(recommendation, 1024), inline: false },
       { name: 'Notes', value: 'Use autocomplete player slots for best results. Draft pick and multi-team asset support can be added next.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10AZ Madden Trade Analyzer Autocomplete UX' })
+    .setFooter({ text: 'GG Sports • 7J-10BB Team-Locked Trade Analyzer' })
     .setTimestamp();
 }
 
@@ -25272,6 +25307,96 @@ async function getMaddenTeamAutocompleteChoices(guildId, leagueId, focusedValue)
     })
     .filter(choice => {
       const key = choice.value.toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 25);
+}
+
+
+async function getMaddenTradeAnalyzerPlayerAutocompleteChoices(guildId, leagueId, focusedName, focusedValue, interaction) {
+  const side = String(focusedName || '').startsWith('side_b_') ? 'side_b' : 'side_a';
+  const firstField = `${side}_player_1`;
+  const sameSideFields = [`${side}_player_1`, `${side}_player_2`, `${side}_player_3`];
+  const selected = sameSideFields
+    .map(name => String(interaction?.options?.getString(name) || '').trim())
+    .filter(Boolean);
+  const selectedSet = new Set(selected.map(value => value.toLowerCase()));
+  let teamFilter = null;
+
+  if (focusedName !== firstField) {
+    const anchorName = String(interaction?.options?.getString(firstField) || '').trim();
+    if (anchorName) {
+      const anchor = await findMaddenImportedPlayer(guildId, leagueId, anchorName, null)
+        || await findMaddenPlayerFromWeeklyStats(guildId, leagueId, anchorName, null);
+      teamFilter = anchor?.resolved_team_name || anchor?.team_name || null;
+    }
+  }
+
+  let choices = [];
+  if (teamFilter) {
+    choices = await getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focusedValue, teamFilter);
+  } else {
+    choices = await getMaddenPlayerAutocompleteChoices(guildId, leagueId, focusedValue);
+  }
+
+  return (choices || [])
+    .filter(choice => {
+      const value = String(choice?.value || '').toLowerCase();
+      return value && !(focusedName !== firstField && selectedSet.has(value));
+    })
+    .slice(0, 25);
+}
+
+async function getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focusedValue, teamName) {
+  await ensureMaddenPlayerPersistenceTables();
+
+  const query = String(focusedValue || '').trim();
+  const like = `%${query}%`;
+  const teamLike = `%${String(teamName || '').trim()}%`;
+
+  const result = await pool.query(
+    `SELECT p.*,
+            COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
+            CASE
+              WHEN LOWER(p.full_name) = LOWER($3) THEN 0
+              WHEN LOWER(CONCAT_WS(' ', p.first_name, p.last_name)) = LOWER($3) THEN 1
+              WHEN LOWER(p.last_name) = LOWER($3) THEN 2
+              WHEN LOWER(p.full_name) LIKE LOWER($4) THEN 3
+              WHEN LOWER(CONCAT_WS(' ', p.first_name, p.last_name)) LIKE LOWER($4) THEN 4
+              ELSE 8
+            END AS match_rank
+     FROM madden_players p
+     LEFT JOIN madden_imported_team_stats t
+       ON t.guild_id = p.guild_id::text
+      AND t.league_id::text = p.league_id::text
+      AND p.team_id IS NOT NULL
+      AND t.external_team_id::text = p.team_id
+     WHERE p.guild_id = $1::text
+       AND p.league_id::text = $2::text
+       AND LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER($5)
+       AND (
+         $3::text = ''
+         OR LOWER(COALESCE(p.full_name, '')) LIKE LOWER($4)
+         OR LOWER(CONCAT_WS(' ', p.first_name, p.last_name)) LIKE LOWER($4)
+         OR LOWER(COALESCE(p.first_name, '')) LIKE LOWER($4)
+         OR LOWER(COALESCE(p.last_name, '')) LIKE LOWER($4)
+         OR LOWER(COALESCE(p.position, '')) = LOWER($3)
+       )
+     ORDER BY match_rank ASC, p.overall DESC NULLS LAST, p.full_name ASC
+     LIMIT 25`,
+    [guildId, leagueId, query, like, teamLike]
+  );
+
+  const seen = new Set();
+  return (result.rows || [])
+    .map(row => ({
+      name: maddenAutocompletePlayerLabel(row).slice(0, 100),
+      value: maddenPlayerDisplayName(row).slice(0, 100),
+    }))
+    .filter(choice => {
+      const key = String(choice.value || '').toLowerCase();
       if (!key || seen.has(key)) return false;
       seen.add(key);
       return true;
