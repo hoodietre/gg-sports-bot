@@ -1494,7 +1494,7 @@ function buildCommands() {
       .setName('maddenvalues')
       .setDescription('View Madden player value rankings')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
-      .addStringOption(o => o.setName('team').setDescription('Team name filter; type exact team name like Bills, Ravens, or 49ers').setRequired(false))
+      .addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false).setAutocomplete(true))
       .addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false)
         .addChoices(
           { name: 'QB', value: 'QB' },
@@ -3624,6 +3624,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isAutocomplete()) {
       try {
         const commandName = interaction.commandName;
+        if (commandName === 'maddenvalues') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'team') {
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName
+              ? await getLeagueByName(interaction.guild.id, leagueName)
+              : await getDefaultLeague(interaction.guild.id);
+
+            if (!activeLeague) {
+              await interaction.respond([]);
+              return;
+            }
+
+            const choices = await getMaddenTeamAutocompleteChoices(
+              interaction.guild.id,
+              activeLeague.league_id,
+              focused.value
+            );
+
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
         if (commandName === 'madden') {
           const subcommand = interaction.options.getSubcommand(false);
           const focused = interaction.options.getFocused(true);
@@ -25713,14 +25737,16 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
         const dev = maddenPlayerDevEmojiOnly(row.dev_trait) || '';
         return `${rank}. **${maddenValuePlayerName(row)}** — ${team} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${dev ? ` • ${dev}` : ''} • Value **${Number(value.valueScore || 0).toFixed(1)}** • ${value.tradeTier}`;
       })
-    : [];
+    : ['No Madden players found. Run `/madden sync` first or adjust the filters.'];
 
-  const fields = maddenChunkLines(rankingLines, 950).map((chunk, index) => ({
-    name: index === 0 ? 'Player Values' : `Player Values ${index + 1}`,
-    value: maddenSafeEmbedText(chunk, 1024),
-    inline: false,
-  }));
+  const header = [
+    `${league.league_name || 'Madden League'}`,
+    'Formula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)',
+    '',
+    ...rankingLines,
+  ].join('\n');
 
+  const fields = [];
   fields.push({
     name: 'Page',
     value: totalRows
@@ -25737,10 +25763,10 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
 
   return new EmbedBuilder()
     .setTitle(maddenSafeEmbedText(titleBits.join(' • '), 256))
-    .setDescription(maddenSafeEmbedText(`${league.league_name || 'Madden League'}\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Years Left + Cap Hit)`, 4096))
+    .setDescription(maddenSafeEmbedText(header, 4096))
     .setColor(0xD4AF37)
     .addFields(fields.slice(0, 25))
-    .setFooter({ text: 'GG Sports • 7J-10AU Madden Values Filter Choices Fix' })
+    .setFooter({ text: 'GG Sports • 7J-10AV Madden Values UX Polish' })
     .setTimestamp();
 }
 
