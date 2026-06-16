@@ -1554,6 +1554,7 @@ function buildCommands() {
         .addStringOption(o => o.setName('player').setDescription('Player to match').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('team').setDescription('Optional team to search packages from').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('exclude_team').setDescription('Optional team to exclude from package suggestions').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('max_assets').setDescription('Maximum assets per package, 1-3').setRequired(false).setMinValue(1).setMaxValue(3))
         .addIntegerOption(o => o.setName('limit').setDescription('Number of matches to load').setRequired(false)))
 
 ,
@@ -6118,8 +6119,9 @@ if (gameSubcommand === 'report') {
           const teamFilter = interaction.options.getString('team');
           const excludeTeam = interaction.options.getString('exclude_team');
           const limit = Math.min(Math.max(interaction.options.getInteger('limit') || 120, 10), 250);
+          const maxAssets = Math.min(Math.max(interaction.options.getInteger('max_assets') || 3, 1), 3);
           const page = 0;
-          const filters = { teamFilter, excludeTeam, limit, page, pageSize: MADDEN_TRADE_FINDER_PAGE_SIZE };
+          const filters = { teamFilter, excludeTeam, limit, maxAssets, page, pageSize: MADDEN_TRADE_FINDER_PAGE_SIZE };
           const payload = await buildMaddenTradeFinderPayload(interaction.guild.id, activeLeague, playerName, filters);
           const token = randomBytes(6).toString('hex');
           const totalPages = Math.max(1, Math.ceil(Number(payload.totalMatches || 0) / MADDEN_TRADE_FINDER_PAGE_SIZE));
@@ -6128,7 +6130,7 @@ if (gameSubcommand === 'report') {
             guildId: interaction.guild.id,
             league: activeLeague,
             playerName,
-            filters: { teamFilter, excludeTeam, limit },
+            filters: { teamFilter, excludeTeam, limit, maxAssets },
             page,
             totalMatches: payload.totalMatches,
             createdAt: Date.now(),
@@ -17128,13 +17130,28 @@ function maddenTradeFinderPlayerKey(player) {
   return String(player?.roster_id || player?.external_player_id || player?.id || maddenPlayerDisplayName(player)).toLowerCase();
 }
 
-function maddenTradeFinderCandidateLine(candidate, index) {
-  const player = candidate.player || {};
-  const value = candidate.value || calculateMaddenPlayerValue(player);
+function maddenTradeFinderPackagePlayers(candidate) {
+  if (Array.isArray(candidate?.players) && candidate.players.length) return candidate.players;
+  return candidate?.player ? [candidate.player] : [];
+}
+
+function maddenTradeFinderPackageKey(candidate) {
+  const playerKeys = maddenTradeFinderPackagePlayers(candidate).map(maddenTradeFinderPlayerKey).sort().join('+');
+  return `${playerKeys}:${candidate.pick?.label || 'nopick'}`;
+}
+
+function maddenTradeFinderAssetLabel(player) {
   const team = getMaddenTeamAbbrev(player.resolved_team_name || player.team_name) || player.resolved_team_name || player.team_name || 'FA';
+  return `**${maddenValuePlayerName(player)}** (${team} ${player.position || 'POS'} • ${player.overall || 'N/A'} OVR)`;
+}
+
+function maddenTradeFinderCandidateLine(candidate, index) {
+  const players = maddenTradeFinderPackagePlayers(candidate);
+  const playerText = players.map(maddenTradeFinderAssetLabel).join(' + ');
   const pickText = candidate.pick ? ` + ${candidate.pick.label}` : '';
   const diffText = candidate.diff >= 0 ? `+${candidate.diff.toFixed(1)}` : `-${Math.abs(candidate.diff).toFixed(1)}`;
-  return `${index + 1}. **${maddenValuePlayerName(player)}** (${team} ${player.position || 'POS'} • ${player.overall || 'N/A'} OVR)${pickText}\nValue: **${candidate.total.toFixed(1)}** • Difference: **${diffText}**`;
+  const assets = Number(candidate.assetCount || players.length + (candidate.pick ? 1 : 0));
+  return `${index + 1}. ${playerText}${pickText}\nValue: **${candidate.total.toFixed(1)}** • Difference: **${diffText}** • Assets: **${assets}**`;
 }
 
 async function getMaddenTradeFinderPlayerRows(guildId, leagueId, teamFilter = null) {
@@ -17203,7 +17220,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
         .setTitle('Madden Trade Finder')
         .setColor(0xED4245)
         .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-        .setFooter({ text: 'GG Sports • 7J-10BJ Dynamic Draft Pick Values' })
+        .setFooter({ text: 'GG Sports • 7J-10BK Trade Finder Multi-Asset Generator' })
         .setTimestamp()
     };
   }
@@ -17212,6 +17229,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
   const targetScore = Number(targetValue.valueScore || 0);
   const targetTeamKey = maddenTradeAnalyzerTeamKey(target);
   const targetKey = maddenTradeFinderPlayerKey(target);
+  const maxAssets = Math.min(Math.max(Number(options.maxAssets || 3), 1), 3);
   const rows = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, options.teamFilter || null);
   const excludeKey = String(options.excludeTeam || '').trim()
     ? String(maddenTeamDisplayName(options.excludeTeam) || options.excludeTeam).toLowerCase()
@@ -17219,6 +17237,30 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
   const excludeAbbr = options.excludeTeam ? String(getMaddenTeamAbbrev(options.excludeTeam) || '').toLowerCase() : '';
   const slotMap = await getMaddenProjectedDraftSlotMap(guildId, league.league_id);
   const candidates = [];
+  const eligible = [];
+
+  const pushCandidate = (players, pick = null, realismBonus = 0) => {
+    const cleanPlayers = (players || []).filter(Boolean);
+    if (!cleanPlayers.length) return;
+    const assetCount = cleanPlayers.length + (pick ? 1 : 0);
+    if (assetCount > maxAssets) return;
+    const total = cleanPlayers.reduce((sum, player) => sum + Number(calculateMaddenPlayerValue(player).valueScore || 0), 0) + Number(pick?.valueScore || 0);
+    if (!total) return;
+    const diff = total - targetScore;
+    const primaryValue = calculateMaddenPlayerValue(cleanPlayers[0]);
+    const packageBonus = Math.max(0, realismBonus) + (assetCount === 1 ? 60 : assetCount === 2 ? 20 : 0);
+    candidates.push({
+      player: cleanPlayers[0],
+      players: cleanPlayers,
+      value: primaryValue,
+      pick,
+      total,
+      diff,
+      absDiff: Math.abs(diff),
+      assetCount,
+      matchScore: Math.abs(diff) - packageBonus + ((assetCount - 1) * 35),
+    });
+  };
 
   for (const row of rows) {
     const key = maddenTradeFinderPlayerKey(row);
@@ -17232,17 +17274,45 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
     const value = calculateMaddenPlayerValue(row);
     const baseTotal = Number(value.valueScore || 0);
     if (!baseTotal) continue;
+    const samePositionBonus = maddenTradeFinderSamePositionBonus(row, target);
+    eligible.push({ row, key, teamKey: rowTeamKey, total: baseTotal, bonus: samePositionBonus });
 
-    const baseDiff = baseTotal - targetScore;
-    const baseBonus = maddenTradeFinderSamePositionBonus(row, target);
-    candidates.push({ player: row, value, pick: null, total: baseTotal, diff: baseDiff, absDiff: Math.abs(baseDiff), matchScore: Math.abs(baseDiff) - baseBonus });
+    pushCandidate([row], null, samePositionBonus);
 
-    if (baseTotal < targetScore) {
+    if (maxAssets >= 2 && baseTotal < targetScore) {
       const rowPickPool = maddenTradeFinderPickPool(row.resolved_team_name || row.team_name, slotMap);
-      for (const pick of rowPickPool) {
-        const total = baseTotal + Number(pick.valueScore || 0);
-        const diff = total - targetScore;
-        candidates.push({ player: row, value, pick, total, diff, absDiff: Math.abs(diff), matchScore: Math.abs(diff) - baseBonus + 25 });
+      for (const pick of rowPickPool) pushCandidate([row], pick, samePositionBonus);
+    }
+  }
+
+  if (maxAssets >= 2) {
+    const byTeam = new Map();
+    for (const item of eligible) {
+      const key = item.teamKey || 'unknown';
+      if (!byTeam.has(key)) byTeam.set(key, []);
+      byTeam.get(key).push(item);
+    }
+
+    for (const group of byTeam.values()) {
+      const teamTop = group
+        .sort((a, b) => Math.abs(a.total - targetScore) - Math.abs(b.total - targetScore) || b.total - a.total)
+        .slice(0, 35);
+      for (let i = 0; i < teamTop.length; i++) {
+        for (let j = i + 1; j < teamTop.length; j++) {
+          const a = teamTop[i];
+          const b = teamTop[j];
+          const comboTotal = a.total + b.total;
+          const comboBonus = Math.max(a.bonus || 0, b.bonus || 0) + 25;
+          pushCandidate([a.row, b.row], null, comboBonus);
+
+          if (maxAssets >= 3 && comboTotal < targetScore) {
+            const pickTeam = a.row.resolved_team_name || a.row.team_name;
+            const picks = maddenTradeFinderPickPool(pickTeam, slotMap)
+              .sort((x, y) => Math.abs((comboTotal + Number(x.valueScore || 0)) - targetScore) - Math.abs((comboTotal + Number(y.valueScore || 0)) - targetScore))
+              .slice(0, 5);
+            for (const pick of picks) pushCandidate([a.row, b.row], pick, comboBonus);
+          }
+        }
       }
     }
   }
@@ -17250,9 +17320,9 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
   const seen = new Set();
   const maxMatches = Math.min(Math.max(Number(options.limit || 120), 10), 250);
   const allMatches = candidates
-    .sort((a, b) => a.matchScore - b.matchScore || a.absDiff - b.absDiff || b.total - a.total)
+    .sort((a, b) => a.matchScore - b.matchScore || a.absDiff - b.absDiff || a.assetCount - b.assetCount || b.total - a.total)
     .filter(candidate => {
-      const key = `${maddenTradeFinderPlayerKey(candidate.player)}:${candidate.pick?.label || 'nopick'}`;
+      const key = maddenTradeFinderPackageKey(candidate);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -17270,7 +17340,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
     ? matches.map((candidate, index) => maddenTradeFinderCandidateLine(candidate, startIndex + index))
     : ['No close trade matches found with the current filters.'];
 
-  const filterText = maddenTradeFinderTeamFilterLabel(options.teamFilter, options.excludeTeam);
+  const filterText = `${maddenTradeFinderTeamFilterLabel(options.teamFilter, options.excludeTeam)} • Max assets ${maxAssets}`;
   const pageText = allMatches.length
     ? `Page **${page + 1}/${totalPages}** • Showing **${startIndex + 1}-${Math.min(startIndex + pageSize, allMatches.length)}** of **${allMatches.length}** packages.`
     : 'No packages found for these filters.';
@@ -17287,9 +17357,9 @@ Filters: ${filterText}`)
       .addFields(
         { name: 'Closest Packages', value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false },
         { name: 'Page', value: pageText, inline: false },
-        { name: 'Notes', value: 'Packages compare one player plus an optional draft pick against the target player value. Same-team players are excluded unless a team filter is used. Position-similar matches receive a small realism boost.', inline: false }
+        { name: 'Notes', value: 'Packages can include one player, player + pick, two players, or two players + pick depending on the max assets setting. Same-team packages are generated together and position-similar matches receive a small realism boost.', inline: false }
       )
-      .setFooter({ text: 'GG Sports • 7J-10BJ Dynamic Draft Pick Values' })
+      .setFooter({ text: 'GG Sports • 7J-10BK Trade Finder Multi-Asset Generator' })
       .setTimestamp()
   };
 }
