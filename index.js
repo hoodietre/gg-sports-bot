@@ -1529,8 +1529,12 @@ function buildCommands() {
       .addSubcommand(sc => sc
         .setName('analyze')
         .setDescription('Compare two sides of a Madden trade using player value')
-        .addStringOption(o => o.setName('side_a').setDescription('Side A players, separated by commas').setRequired(true))
-        .addStringOption(o => o.setName('side_b').setDescription('Side B players, separated by commas').setRequired(true))
+        .addStringOption(o => o.setName('side_a_player_1').setDescription('Side A player 1').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_a_player_2').setDescription('Side A player 2').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_a_player_3').setDescription('Side A player 3').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_b_player_1').setDescription('Side B player 1').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_b_player_2').setDescription('Side B player 2').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_b_player_3').setDescription('Side B player 3').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
         .addStringOption(o => o.setName('label_a').setDescription('Optional Side A label/team').setRequired(false))
         .addStringOption(o => o.setName('label_b').setDescription('Optional Side B label/team').setRequired(false)))
@@ -3658,6 +3662,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
 
             await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
+        if (commandName === 'maddentrade') {
+          const focused = interaction.options.getFocused(true);
+          const tradePlayerFields = new Set([
+            'side_a_player_1', 'side_a_player_2', 'side_a_player_3',
+            'side_b_player_1', 'side_b_player_2', 'side_b_player_3',
+          ]);
+
+          if (tradePlayerFields.has(focused?.name)) {
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName
+              ? await getLeagueByName(interaction.guild.id, leagueName)
+              : await getDefaultLeague(interaction.guild.id);
+
+            if (!activeLeague) {
+              await interaction.respond([]);
+              return;
+            }
+
+            const choices = await getMaddenPlayerAutocompleteChoices(
+              interaction.guild.id,
+              activeLeague.league_id,
+              focused.value
+            );
+
+            await interaction.respond(choices);
             return;
           }
         }
@@ -5929,8 +5962,18 @@ if (gameSubcommand === 'report') {
       }
 
       const leagueName = interaction.options.getString('league');
-      const sideAInput = interaction.options.getString('side_a');
-      const sideBInput = interaction.options.getString('side_b');
+      const sideAPlayers = [
+        interaction.options.getString('side_a_player_1'),
+        interaction.options.getString('side_a_player_2'),
+        interaction.options.getString('side_a_player_3'),
+      ].map(value => String(value || '').trim()).filter(Boolean);
+      const sideBPlayers = [
+        interaction.options.getString('side_b_player_1'),
+        interaction.options.getString('side_b_player_2'),
+        interaction.options.getString('side_b_player_3'),
+      ].map(value => String(value || '').trim()).filter(Boolean);
+      const sideAInput = sideAPlayers.join(', ');
+      const sideBInput = sideBPlayers.join(', ');
       const labelA = interaction.options.getString('label_a') || 'Side A';
       const labelB = interaction.options.getString('label_b') || 'Side B';
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
@@ -16715,7 +16758,7 @@ function buildMaddenTradeAnalyzerSideText(side, label) {
   if (side.missing?.length) {
     lines.push('', `⚠️ Not found: ${side.missing.map(name => `\`${name}\``).join(', ')}`);
   }
-  if (!lines.length) lines.push('No valid players found. Separate player names with commas.');
+  if (!lines.length) lines.push('No valid players found. Use the autocomplete player slots for best results.');
   lines.push('', `**${label} Total:** ${Number(side.totalValue || 0).toFixed(1)}`);
   return maddenSafeEmbedText(lines.join('\n'), 1024);
 }
@@ -16750,9 +16793,9 @@ function buildMaddenTradeAnalyzerEmbed(league, data) {
       { name: labelA, value: buildMaddenTradeAnalyzerSideText(sideA || {}, labelA), inline: false },
       { name: labelB, value: buildMaddenTradeAnalyzerSideText(sideB || {}, labelB), inline: false },
       { name: 'Trade Result', value: maddenSafeEmbedText(recommendation, 1024), inline: false },
-      { name: 'Notes', value: 'Foundation version supports player assets. Draft pick and multi-team asset support can be added next.', inline: false }
+      { name: 'Notes', value: 'Use autocomplete player slots for best results. Draft pick and multi-team asset support can be added next.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10AY Madden Trade Analyzer Foundation' })
+    .setFooter({ text: 'GG Sports • 7J-10AZ Madden Trade Analyzer Autocomplete UX' })
     .setTimestamp();
 }
 
