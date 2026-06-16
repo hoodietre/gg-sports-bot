@@ -5828,6 +5828,11 @@ if (gameSubcommand === 'report') {
     }
 
     if (interaction.commandName === 'maddenvalues') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+
       const leagueName = interaction.options.getString('league');
       const team = interaction.options.getString('team');
       const position = interaction.options.getString('position');
@@ -5835,13 +5840,19 @@ if (gameSubcommand === 'report') {
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
       if (!activeLeague) {
-        await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+        await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
         return;
       }
 
-      const rows = await getMaddenPlayerValueRankings(interaction.guild.id, activeLeague.league_id, { team, position, limit });
-      await upsertMaddenPlayerValues(interaction.guild.id, activeLeague.league_id, rows);
-      await interaction.reply({ embeds: [buildMaddenPlayerValueRankingsEmbed(activeLeague, rows, { team, position, limit })], ephemeral: true });
+      try {
+        await ensureMaddenPlayerPersistenceTables();
+        const rows = await getMaddenPlayerValueRankings(interaction.guild.id, activeLeague.league_id, { team, position, limit });
+        await upsertMaddenPlayerValues(interaction.guild.id, activeLeague.league_id, rows);
+        await interaction.editReply({ embeds: [buildMaddenPlayerValueRankingsEmbed(activeLeague, rows, { team, position, limit })] });
+      } catch (error) {
+        console.error('[MADDEN VALUES] command failed:', error?.stack || error?.message || error);
+        await interaction.editReply({ content: `Madden value rankings failed: ${String(error?.message || error).slice(0, 180)}` });
+      }
       return;
     }
 
@@ -25343,64 +25354,103 @@ function maddenValueRawNumber(player, keys = [], fallback = null) {
   return fallback;
 }
 
+const MADDEN_VALUE_OVERALL_TABLE = new Map([
+  [67, 70], [68, 77.5], [69, 84.8], [70, 93.2], [71, 102.9], [72, 112.8], [73, 123], [74, 133.4],
+  [75, 144.3], [76, 155.5], [77, 167.3], [78, 179.4], [79, 192.8], [80, 207.2], [81, 224.1], [82, 246.6],
+  [83, 270], [84, 300.4], [85, 335.4], [86, 376.6], [87, 419.3], [88, 463.9], [89, 522.7], [90, 596.7],
+  [91, 664.1], [92, 735.2], [93, 871.3], [94, 989.2], [95, 1118.4], [96, 1316.3], [97, 1505.7], [98, 1790.7], [99, 2293.6],
+]);
+
+const MADDEN_VALUE_POSITION_TABLE = new Map([
+  ['C', 0.13], ['K', -0.85], ['P', -0.90], ['CB', 0.29], ['DT', 0.22], ['FB', -0.65], ['FS', 0.19],
+  ['HB', 0.25], ['RB', 0.25], ['LG', 0.10], ['LT', 0.17], ['QB', 1.60], ['RG', 0.10], ['RT', 0.10],
+  ['SS', 0.21], ['TE', 0.21], ['WR', 0.27], ['SAM', 0.22], ['MIKE', 0.29], ['MLB', 0.29], ['WILL', 0.27],
+  ['LEDGE', 0.27], ['LE', 0.27], ['LOLB', 0.27], ['REDGE', 0.29], ['RE', 0.29], ['ROLB', 0.29],
+]);
+
+const MADDEN_VALUE_AGE_TABLE = new Map([
+  [20, 4.2], [21, 3.7], [22, 3.3], [23, 2.4], [24, 1.5], [25, 0.6], [26, 0.3], [27, 0.2], [28, 0.1], [29, 0],
+  [30, -0.1], [31, -0.25], [32, -0.5], [33, -0.7], [34, -0.8], [35, -1], [36, -1.4], [37, -1.5], [38, -1.55],
+  [39, -1.6], [40, -1.63], [41, -1.64], [42, -1.65], [43, -1.66], [44, -1.67], [45, -1.68], [46, -1.69], [47, -1.7], [48, -1.71],
+]);
+
+const MADDEN_VALUE_DEV_TABLE = new Map([
+  ['normal', -0.20], ['star', 0.05], ['superstar', 0.30], ['xfactor', 0.60], ['x-factor', 0.60], ['hidden', -0.20],
+]);
+
+function maddenOverallBaseValue(overall) {
+  const n = Number(overall || 0);
+  if (!n) return 0;
+  const rounded = Math.round(n);
+  if (MADDEN_VALUE_OVERALL_TABLE.has(rounded)) return MADDEN_VALUE_OVERALL_TABLE.get(rounded);
+  if (rounded < 67) return Math.max(0, rounded);
+  if (rounded > 99) return MADDEN_VALUE_OVERALL_TABLE.get(99);
+  return n;
+}
+
 function maddenValuePositionComponent(position) {
   const pos = String(position || '').toUpperCase().replace(/[^A-Z]/g, '');
-  if (['QB'].includes(pos)) return 0.35;
-  if (['WR', 'HB', 'RB', 'CB', 'LT', 'EDGE'].includes(pos)) return 0.20;
-  if (['TE', 'FS', 'SS', 'RE', 'LE', 'ROLB', 'LOLB', 'MLB'].includes(pos)) return 0.16;
-  if (['RT', 'LG', 'RG', 'C', 'DT'].includes(pos)) return 0.12;
-  if (['K', 'P'].includes(pos)) return 0.04;
-  return 0.10;
+  return MADDEN_VALUE_POSITION_TABLE.has(pos) ? MADDEN_VALUE_POSITION_TABLE.get(pos) : 0;
 }
 
 function maddenValueAgeComponent(age) {
-  const n = Number(age || 0);
+  const n = Math.round(Number(age || 0));
   if (!n) return 0;
-  if (n <= 22) return 0.25;
-  if (n <= 24) return 0.20;
-  if (n <= 26) return 0.14;
-  if (n <= 28) return 0.08;
-  if (n <= 30) return 0.02;
-  if (n <= 32) return -0.05;
-  if (n <= 34) return -0.12;
-  return -0.20;
+  if (MADDEN_VALUE_AGE_TABLE.has(n)) return MADDEN_VALUE_AGE_TABLE.get(n);
+  if (n < 20) return MADDEN_VALUE_AGE_TABLE.get(20);
+  if (n > 48) return MADDEN_VALUE_AGE_TABLE.get(48);
+  return 0;
 }
 
 function maddenValueDevComponent(devTrait) {
-  const dev = String(devTrait || '').toLowerCase().replace(/[^a-z]/g, '');
-  if (dev.includes('xfactor') || dev.includes('superstarx')) return 0.35;
-  if (dev.includes('superstar')) return 0.25;
-  if (dev.includes('star')) return 0.15;
-  if (dev.includes('hidden')) return 0.12;
-  if (dev.includes('normal')) return 0;
+  const dev = String(devTrait || '').toLowerCase().replace(/superstarx/g, 'xfactor').replace(/[^a-z-]/g, '');
+  if (dev.includes('xfactor') || dev.includes('x-factor')) return 0.60;
+  if (dev.includes('superstar')) return 0.30;
+  if (dev.includes('star')) return 0.05;
+  if (dev.includes('hidden')) return -0.20;
+  if (dev.includes('normal')) return -0.20;
   const n = Number(devTrait);
-  if (n === 3) return 0.35;
-  if (n === 2) return 0.25;
-  if (n === 1) return 0.15;
-  return 0;
+  if (n === 3) return 0.60;
+  if (n === 2) return 0.30;
+  if (n === 1) return 0.05;
+  return -0.20;
 }
 
 function maddenValueSpeedComponent(speed) {
   const n = Number(speed || 0);
   if (!n) return 0;
-  return Math.max(-0.05, Math.min(0.18, (n - 85) / 100));
+  return Math.max(-0.10, Math.min(0.35, (n - 80) / 100));
 }
 
 function maddenValueYearsComponent(yearsLeft) {
-  const n = Number(yearsLeft || 0);
-  if (!n) return 0;
-  return Math.max(0, Math.min(0.10, n * 0.025));
+  const n = Math.round(Number(yearsLeft || 0));
+  if (n <= 0) return -0.20;
+  if (n === 1) return -0.10;
+  if (n === 2) return 0;
+  if (n === 3) return 0.10;
+  if (n === 4) return 0.15;
+  if (n === 5) return 0.20;
+  if (n === 6) return 0.25;
+  if (n === 7) return 0.30;
+  return 0.35;
 }
 
 function maddenValueCapComponent(capHit) {
   const n = Number(capHit || 0);
   if (!n) return 0;
   const millions = n > 100000 ? n / 1000000 : n;
-  return Math.max(-0.20, Math.min(0.04, -millions / 250));
+  if (millions < 1) return 0.25;
+  if (millions < 2) return 0.20;
+  if (millions < 4) return 0.10;
+  if (millions < 7) return 0;
+  if (millions < 10) return -0.10;
+  if (millions <= 15) return -0.20;
+  return -0.30;
 }
 
 function calculateMaddenPlayerValue(player) {
   const overall = Number(player?.overall || 0);
+  const baseOverallValue = maddenOverallBaseValue(overall);
   const age = maddenValueRawNumber(player, ['age'], null);
   const speed = maddenValueRawNumber(player, ['speed', 'speedRating', 'spd'], null);
   const yearsLeft = maddenValueRawNumber(player, ['years_left', 'yearsLeft', 'contractYearsLeft', 'contractLength', 'contractYears'], null);
@@ -25412,15 +25462,17 @@ function calculateMaddenPlayerValue(player) {
   const yearsComponent = maddenValueYearsComponent(yearsLeft);
   const capComponent = maddenValueCapComponent(capHit);
   const multiplier = 1.0 + positionComponent + ageComponent + devComponent + speedComponent + yearsComponent + capComponent;
-  const valueScore = overall ? Math.max(0, overall * multiplier) : 0;
+  const valueScore = baseOverallValue ? Math.max(0, baseOverallValue * multiplier) : 0;
   let tier = 'Depth';
-  if (valueScore >= 150) tier = 'Franchise';
-  else if (valueScore >= 130) tier = 'Elite';
-  else if (valueScore >= 112) tier = 'High Value';
-  else if (valueScore >= 95) tier = 'Starter';
-  else if (valueScore >= 75) tier = 'Role Player';
+  if (valueScore >= 3500) tier = 'Untouchable';
+  else if (valueScore >= 2500) tier = 'Franchise';
+  else if (valueScore >= 1800) tier = 'Elite';
+  else if (valueScore >= 1100) tier = 'High Value';
+  else if (valueScore >= 650) tier = 'Starter';
+  else if (valueScore >= 300) tier = 'Role Player';
   return {
     overall,
+    baseOverallValue,
     age,
     speed,
     yearsLeft,
@@ -25548,13 +25600,13 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
 
   return new EmbedBuilder()
     .setTitle(titleBits.join(' • '))
-    .setDescription(`${league.league_name || 'Madden League'}\nFormula: OVERALL × (1.0 + Position + Age + Dev Trait + Speed + Years Left + Cap Hit)`)
+    .setDescription(`${league.league_name || 'Madden League'}\nFormula: Overall Value Table × (1.0 + Position + Age + Dev Trait + Speed + Years Left + Cap Hit)`)
     .setColor(0xD4AF37)
     .addFields(
       { name: 'Top Player Values', value: lines.slice(0, 4000), inline: false },
-      { name: 'Notes', value: 'Cap hit is treated as a value modifier, so expensive contracts can reduce value. Missing speed/contract fields default to neutral.', inline: false }
+      { name: 'Notes', value: 'Uses the configured Overall/Position/Age/Dev/Years/Cap value tables. Missing speed defaults to neutral; missing years-left is treated as 0 years.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10AQ Player Value Engine' })
+    .setFooter({ text: 'GG Sports • 7J-10AR Player Value Formula Table Fix' })
     .setTimestamp();
 }
 
@@ -25603,6 +25655,7 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
       value: [
         `**Value Score:** ${valueInfo.valueScore.toFixed(1)}`,
         `**Trade Tier:** ${valueInfo.tradeTier}`,
+        `**Base Overall Value:** ${valueInfo.baseOverallValue.toFixed(1)}`,
         `**Multiplier:** ${valueInfo.multiplier.toFixed(2)}x`,
         `**Components:** POS ${valueInfo.positionComponent.toFixed(2)} • AGE ${valueInfo.ageComponent.toFixed(2)} • DEV ${valueInfo.devComponent.toFixed(2)} • SPD ${valueInfo.speedComponent.toFixed(2)} • YRS ${valueInfo.yearsComponent.toFixed(2)} • CAP ${valueInfo.capComponent.toFixed(2)}`,
       ].join('\n'),
