@@ -1529,13 +1529,13 @@ function buildCommands() {
       .addSubcommand(sc => sc
         .setName('analyze')
         .setDescription('Compare two sides of a Madden trade using player value')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('side_a_player_1').setDescription('Side A player 1').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('side_b_player_1').setDescription('Side B player 1').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('side_a_player_2').setDescription('Side A player 2').setRequired(false).setAutocomplete(true))
-        .addStringOption(o => o.setName('side_a_player_3').setDescription('Side A player 3').setRequired(false).setAutocomplete(true))
-        .addStringOption(o => o.setName('side_b_player_2').setDescription('Side B player 2').setRequired(false).setAutocomplete(true))
-        .addStringOption(o => o.setName('side_b_player_3').setDescription('Side B player 3').setRequired(false).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+        .addStringOption(o => o.setName('side_a_player_2').setDescription('Side A player 2; locked to Side A player 1 team').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_a_player_3').setDescription('Side A player 3; locked to Side A player 1 team').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_b_player_2').setDescription('Side B player 2; locked to Side B player 1 team').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('side_b_player_3').setDescription('Side B player 3; locked to Side B player 1 team').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('label_a').setDescription('Optional Side A label/team').setRequired(false))
         .addStringOption(o => o.setName('label_b').setDescription('Optional Side B label/team').setRequired(false)))
 
@@ -3668,6 +3668,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (commandName === 'maddentrade') {
           const focused = interaction.options.getFocused(true);
+
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+
           const tradePlayerFields = new Set([
             'side_a_player_1', 'side_a_player_2', 'side_a_player_3',
             'side_b_player_1', 'side_b_player_2', 'side_b_player_3',
@@ -3677,10 +3684,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const leagueName = interaction.options.getString('league');
             const activeLeague = leagueName
               ? await getLeagueByName(interaction.guild.id, leagueName)
-              : await getDefaultLeague(interaction.guild.id);
+              : null;
 
             if (!activeLeague) {
-              await interaction.respond([]);
+              await interaction.respond([{ name: 'Select league first', value: 'Select league first' }]);
               return;
             }
 
@@ -3692,7 +3699,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               interaction
             );
 
-            await interaction.respond(choices);
+            await interaction.respond((choices || []).slice(0, 25));
             return;
           }
         }
@@ -25315,6 +25322,36 @@ async function getMaddenTeamAutocompleteChoices(guildId, leagueId, focusedValue)
 }
 
 
+async function getMaddenLeagueAutocompleteChoices(guildId, focusedValue, gameKey = null) {
+  const query = String(focusedValue || '').trim();
+  const like = `%${query}%`;
+  const params = [guildId, like];
+  let gameWhere = '';
+  if (gameKey) {
+    params.push(gameKey);
+    gameWhere = `AND LOWER(game_key) = LOWER($3)`;
+  }
+
+  const result = await pool.query(
+    `SELECT league_name, game_key
+     FROM leagues
+     WHERE guild_id = $1::text
+       AND is_active = TRUE
+       ${gameWhere}
+       AND ($2::text = '%%' OR LOWER(league_name) LIKE LOWER($2))
+     ORDER BY
+       CASE WHEN LOWER(league_name) = LOWER(REPLACE($2, '%', '')) THEN 0 ELSE 1 END,
+       league_name ASC
+     LIMIT 25`,
+    params
+  ).catch(() => ({ rows: [] }));
+
+  return (result.rows || []).map(row => ({
+    name: String(row.league_name || 'League').slice(0, 100),
+    value: String(row.league_name || '').slice(0, 100),
+  })).filter(choice => choice.value);
+}
+
 async function getMaddenTradeAnalyzerPlayerAutocompleteChoices(guildId, leagueId, focusedName, focusedValue, interaction) {
   const side = String(focusedName || '').startsWith('side_b_') ? 'side_b' : 'side_a';
   const firstField = `${side}_player_1`;
@@ -25323,20 +25360,27 @@ async function getMaddenTradeAnalyzerPlayerAutocompleteChoices(guildId, leagueId
     .map(name => String(interaction?.options?.getString(name) || '').trim())
     .filter(Boolean);
   const selectedSet = new Set(selected.map(value => value.toLowerCase()));
-  let teamFilter = null;
+  let anchor = null;
 
   if (focusedName !== firstField) {
     const anchorName = String(interaction?.options?.getString(firstField) || '').trim();
-    if (anchorName) {
-      const anchor = await findMaddenImportedPlayer(guildId, leagueId, anchorName, null)
-        || await findMaddenPlayerFromWeeklyStats(guildId, leagueId, anchorName, null);
-      teamFilter = anchor?.resolved_team_name || anchor?.team_name || null;
+    if (!anchorName) {
+      return [{ name: `Select ${side === 'side_a' ? 'Side A' : 'Side B'} player 1 first`, value: `Select ${side === 'side_a' ? 'Side A' : 'Side B'} player 1 first` }];
+    }
+
+    anchor = await findMaddenImportedPlayer(guildId, leagueId, anchorName, null)
+      || await findMaddenPlayerFromWeeklyStats(guildId, leagueId, anchorName, null);
+
+    if (!anchor) {
+      return [];
     }
   }
 
   let choices = [];
-  if (teamFilter) {
-    choices = await getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focusedValue, teamFilter);
+  if (anchor) {
+    const anchorTeamName = anchor?.resolved_team_name || anchor?.team_name || anchor?.stat_team_name || '';
+    const anchorTeamId = anchor?.team_id || anchor?.external_team_id || anchor?.teamId || '';
+    choices = await getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focusedValue, anchorTeamName, anchorTeamId);
   } else {
     choices = await getMaddenPlayerAutocompleteChoices(guildId, leagueId, focusedValue);
   }
@@ -25349,12 +25393,15 @@ async function getMaddenTradeAnalyzerPlayerAutocompleteChoices(guildId, leagueId
     .slice(0, 25);
 }
 
-async function getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focusedValue, teamName) {
+async function getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focusedValue, teamName, teamId = '') {
   await ensureMaddenPlayerPersistenceTables();
 
   const query = String(focusedValue || '').trim();
   const like = `%${query}%`;
-  const teamLike = `%${String(teamName || '').trim()}%`;
+  const cleanTeam = String(teamName || '').trim();
+  const teamLike = `%${cleanTeam}%`;
+  const teamAbbr = getMaddenTeamAbbrev(cleanTeam);
+  const cleanTeamId = String(teamId || '').trim();
 
   const result = await pool.query(
     `SELECT p.*,
@@ -25375,7 +25422,14 @@ async function getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focus
       AND t.external_team_id::text = p.team_id
      WHERE p.guild_id = $1::text
        AND p.league_id::text = $2::text
-       AND LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER($5)
+       AND (
+         LOWER(COALESCE(p.team_name, '')) LIKE LOWER($5)
+         OR LOWER(COALESCE(t.team_name, '')) LIKE LOWER($5)
+         OR LOWER(COALESCE(p.team_name, '')) = LOWER($6)
+         OR LOWER(COALESCE(t.team_name, '')) = LOWER($6)
+         OR ($7::text <> '' AND p.team_id::text = $7::text)
+         OR ($7::text <> '' AND t.external_team_id::text = $7::text)
+       )
        AND (
          $3::text = ''
          OR LOWER(COALESCE(p.full_name, '')) LIKE LOWER($4)
@@ -25386,7 +25440,7 @@ async function getMaddenPlayerAutocompleteChoicesByTeam(guildId, leagueId, focus
        )
      ORDER BY match_rank ASC, p.overall DESC NULLS LAST, p.full_name ASC
      LIMIT 25`,
-    [guildId, leagueId, query, like, teamLike]
+    [guildId, leagueId, query, like, teamLike, teamAbbr, cleanTeamId]
   );
 
   const seen = new Set();
