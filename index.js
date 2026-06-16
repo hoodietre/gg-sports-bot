@@ -3713,7 +3713,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
           const tradePickFields = new Set(['side_a_pick_1', 'side_a_pick_2', 'side_b_pick_1', 'side_b_pick_2']);
           if (tradePickFields.has(focused?.name)) {
-            const choices = buildMaddenDraftPickAutocompleteChoices(focused.value);
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName
+              ? await getLeagueByName(interaction.guild.id, leagueName)
+              : null;
+
+            if (!activeLeague) {
+              await interaction.respond([]);
+              return;
+            }
+
+            const primaryField = String(focused.name || '').startsWith('side_a_')
+              ? 'side_a_player_1'
+              : 'side_b_player_1';
+            const primaryPlayerName = interaction.options.getString(primaryField);
+            const primaryPlayer = primaryPlayerName
+              ? (await findMaddenImportedPlayer(interaction.guild.id, activeLeague.league_id, primaryPlayerName, null)
+                || await findMaddenPlayerFromWeeklyStats(interaction.guild.id, activeLeague.league_id, primaryPlayerName, null))
+              : null;
+
+            if (!primaryPlayer) {
+              await interaction.respond([]);
+              return;
+            }
+
+            const choices = await buildMaddenDraftPickAutocompleteChoices(
+              focused.value,
+              {
+                guildId: interaction.guild.id,
+                leagueId: activeLeague.league_id,
+                teamName: primaryPlayer.resolved_team_name || primaryPlayer.team_name,
+              }
+            );
             await interaction.respond((choices || []).slice(0, 25));
             return;
           }
@@ -16852,20 +16883,163 @@ const MADDEN_DRAFT_PICK_VALUE_TABLE = {
 };
 
 function buildMaddenDraftPickCommandChoices() {
-  return buildMaddenDraftPickAutocompleteChoices('');
+  return [];
 }
 
-function buildMaddenDraftPickAutocompleteChoices(input = '') {
+function maddenDraftPickTeamKeys(teamName) {
+  const raw = String(teamName || '').trim();
+  const abbr = getMaddenTeamAbbrev(raw) || raw;
+  const keys = new Set();
+  if (raw) keys.add(raw.toLowerCase());
+  if (abbr) keys.add(String(abbr).toLowerCase());
+  return [...keys].filter(Boolean);
+}
+
+function maddenDraftPickOrderSort(a, b) {
+  const aw = Number(a.wins || 0);
+  const bw = Number(b.wins || 0);
+  if (aw !== bw) return aw - bw;
+  const al = Number(a.losses || 0);
+  const bl = Number(b.losses || 0);
+  if (al !== bl) return bl - al;
+  const apd = Number(a.points_for || 0) - Number(a.points_against || 0);
+  const bpd = Number(b.points_for || 0) - Number(b.points_against || 0);
+  if (apd !== bpd) return apd - bpd;
+  return String(a.team_name || '').localeCompare(String(b.team_name || ''));
+}
+
+async function getMaddenProjectedDraftSlotMap(guildId, leagueId) {
+  const map = new Map();
+  const put = (teamName, slot) => {
+    if (!teamName || !slot) return;
+    for (const key of maddenDraftPickTeamKeys(teamName)) map.set(key, Number(slot));
+  };
+
+  const teamsResult = await pool.query(
+    `SELECT team_name, wins, losses, ties, points_for, points_against
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1::text AND league_id::text = $2::text
+     ORDER BY wins ASC, losses DESC, (points_for - points_against) ASC, team_name ASC`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+
+  const teams = (teamsResult.rows || []).map(row => ({ ...row, team_name: row.team_name }));
+  if (!teams.length) return map;
+
+  const teamByKey = new Map();
+  for (const team of teams) {
+    for (const key of maddenDraftPickTeamKeys(team.team_name)) teamByKey.set(key, team);
+  }
+
+  const playoffResult = await pool.query(
+    `SELECT week_label, home_team, away_team, home_score, away_score, status
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND week_label IN ('Wild Card','Div. Playoff','Conf. Playoff','Super Bowl')
+       AND LOWER(COALESCE(status, '')) IN ('final','completed','home_win','away_win')
+       AND home_score IS NOT NULL
+       AND away_score IS NOT NULL`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+
+  const playoffTeams = new Set();
+  const losersByRound = { 'Wild Card': [], 'Div. Playoff': [], 'Conf. Playoff': [], 'Super Bowl': [] };
+  let superBowlWinner = null;
+  let superBowlLoser = null;
+
+  for (const game of playoffResult.rows || []) {
+    const home = game.home_team;
+    const away = game.away_team;
+    if (home) playoffTeams.add(home);
+    if (away) playoffTeams.add(away);
+    const hs = Number(game.home_score || 0);
+    const as = Number(game.away_score || 0);
+    if (hs === as) continue;
+    const winner = hs > as ? home : away;
+    const loser = hs > as ? away : home;
+    if (game.week_label === 'Super Bowl') {
+      superBowlWinner = winner;
+      superBowlLoser = loser;
+    } else if (losersByRound[game.week_label]) {
+      losersByRound[game.week_label].push(loser);
+    }
+  }
+
+  const assigned = new Set();
+  const assignTeams = (teamNames, startSlot) => {
+    const rows = teamNames
+      .map(name => teamByKey.get(String(name || '').toLowerCase()) || teams.find(t => String(t.team_name || '').toLowerCase() === String(name || '').toLowerCase()) || { team_name: name })
+      .filter(row => row && row.team_name)
+      .sort(maddenDraftPickOrderSort);
+    rows.forEach((row, idx) => {
+      put(row.team_name, startSlot + idx);
+      assigned.add(String(row.team_name || '').toLowerCase());
+    });
+  };
+
+  const sbPlayed = Boolean(superBowlWinner && superBowlLoser);
+  if (sbPlayed) {
+    put(superBowlLoser, 31);
+    put(superBowlWinner, 32);
+    assigned.add(String(superBowlLoser).toLowerCase());
+    assigned.add(String(superBowlWinner).toLowerCase());
+  }
+
+  // Completed playoff loser ranges. These naturally lock in as rounds complete.
+  assignTeams(losersByRound['Wild Card'], 19);
+  assignTeams(losersByRound['Div. Playoff'], 25);
+  assignTeams(losersByRound['Conf. Playoff'], 29);
+
+  const nonAssignedPlayoff = [...playoffTeams].filter(name => !assigned.has(String(name || '').toLowerCase()));
+  if (!sbPlayed && nonAssignedPlayoff.length) {
+    const start = Math.max(19, 33 - nonAssignedPlayoff.length);
+    assignTeams(nonAssignedPlayoff, start);
+  }
+
+  const nonPlayoff = teams
+    .filter(team => !playoffTeams.has(team.team_name) && !assigned.has(String(team.team_name || '').toLowerCase()))
+    .sort(maddenDraftPickOrderSort);
+  nonPlayoff.forEach((team, idx) => put(team.team_name, idx + 1));
+
+  // Fallback for any teams that did not receive a postseason-aware slot.
+  let nextSlot = 1;
+  for (const team of teams.sort(maddenDraftPickOrderSort)) {
+    const keys = maddenDraftPickTeamKeys(team.team_name);
+    if (keys.some(key => map.has(key))) continue;
+    while ([...map.values()].includes(nextSlot) && nextSlot <= 32) nextSlot += 1;
+    put(team.team_name, Math.min(nextSlot, 32));
+    nextSlot += 1;
+  }
+
+  return map;
+}
+
+function getMaddenProjectedDraftSlot(slotMap, teamName) {
+  if (!slotMap || !teamName) return null;
+  for (const key of maddenDraftPickTeamKeys(teamName)) {
+    if (slotMap.has(key)) return Number(slotMap.get(key));
+  }
+  return null;
+}
+
+async function buildMaddenDraftPickAutocompleteChoices(input = '', context = {}) {
   const query = String(input || '').toLowerCase().trim();
+  const teamName = context.teamName || '';
+  if (!teamName) return [];
+  const slotMap = context.slotMap || await getMaddenProjectedDraftSlotMap(context.guildId, context.leagueId);
+  const slot = getMaddenProjectedDraftSlot(slotMap, teamName);
+  if (!slot) return [];
   const years = [2026, 2027, 2028];
+  const teamLabel = maddenTeamDisplayName(teamName);
+  const abbr = getMaddenTeamAbbrev(teamName) || teamName;
   const choices = [];
   for (const year of years) {
     for (let round = 1; round <= 7; round++) {
-      const value = `${year} ${round}`;
-      const label = `${year} Round ${round} Pick`;
+      const value = `${year}|${abbr}|${round}|${slot}`;
       const pick = parseMaddenDraftPickAsset(value);
-      const suffix = pick ? ` • Value ${Number(pick.valueScore || 0).toFixed(1)}` : '';
-      choices.push({ name: `${label}${suffix}`.slice(0, 100), value });
+      const name = `${year} ${teamLabel} Round ${round} Pick ${slot} • Value ${Number(pick?.valueScore || 0).toFixed(1)}`;
+      choices.push({ name: name.slice(0, 100), value });
     }
   }
   if (!query) return choices;
@@ -16894,20 +17068,28 @@ function parseMaddenDraftPickAsset(input) {
   const raw = String(input || '').trim();
   if (!raw) return null;
 
-  // Supports dropdown values like "2027 1", plus manual future formats like "2027 1.05" or "2027 1st pick 5" if added later.
-  const yearMatch = raw.match(/20\d{2}/);
-  const year = yearMatch ? Number(yearMatch[0]) : 2026;
-
+  let year = 2026;
   let round = null;
   let pick = null;
+  let team = null;
 
-  const slotMatch = raw.match(/(?:20\d{2})?\s*([1-7])\s*[.\-:]\s*(\d{1,2})/);
-  if (slotMatch) {
-    round = Number(slotMatch[1]);
-    pick = Math.max(1, Math.min(32, Number(slotMatch[2])));
+  if (raw.includes('|')) {
+    const parts = raw.split('|').map(part => part.trim()).filter(Boolean);
+    year = Number(parts[0] || 2026);
+    team = parts[1] || null;
+    round = Number(parts[2] || 0);
+    pick = Math.max(1, Math.min(32, Number(parts[3] || 0)));
   } else {
-    const roundMatch = raw.match(/\b([1-7])(?:st|nd|rd|th)?\b/i);
-    round = roundMatch ? Number(roundMatch[1]) : null;
+    const yearMatch = raw.match(/20\d{2}/);
+    year = yearMatch ? Number(yearMatch[0]) : 2026;
+    const slotMatch = raw.match(/(?:20\d{2})?\s*([1-7])\s*[.\-:]\s*(\d{1,2})/);
+    if (slotMatch) {
+      round = Number(slotMatch[1]);
+      pick = Math.max(1, Math.min(32, Number(slotMatch[2])));
+    } else {
+      const roundMatch = raw.match(/\b([1-7])(?:st|nd|rd|th)?\b/i);
+      round = roundMatch ? Number(roundMatch[1]) : null;
+    }
   }
 
   if (!round || round < 1 || round > 7) return null;
@@ -16917,20 +17099,25 @@ function parseMaddenDraftPickAsset(input) {
     : maddenDraftPickRoundMedianValue(round);
   const multiplier = maddenDraftPickFutureMultiplier(year);
   const valueScore = Number((base * multiplier).toFixed(1));
-  const suffix = round === 1 ? 'st' : round === 2 ? 'nd' : round === 3 ? 'rd' : 'th';
-  const label = pick ? `${year} Round ${round}, Pick ${pick}` : `${year} Round ${round} Pick`;
-  return { raw, year, round, pick, base, multiplier, valueScore, label, tradeTier: 'Draft Pick' };
+  const teamText = team ? `${maddenTeamDisplayName(team)} ` : '';
+  const slotText = pick ? ` Pick ${pick}` : '';
+  const label = `${year} ${teamText}Round ${round}${slotText} Pick`.replace(/\s+/g, ' ').trim();
+  return { raw, year, round, pick, team, base, multiplier, valueScore, label, tradeTier: 'Draft Pick' };
 }
 
 function maddenDraftPickAssetLine(pick, index = 0) {
-  return `${index + 1}. **${pick.label}** — Trade Value **${Number(pick.valueScore || 0).toFixed(1)}**${Number(pick.multiplier || 1) !== 1 ? ` • ${pick.multiplier}x future` : ''}`;
+  const baseText = pick.pick ? ` • Base ${Number(pick.base || 0).toFixed(1)}` : '';
+  return `${index + 1}. **${pick.label}** — Trade Value **${Number(pick.valueScore || 0).toFixed(1)}**${baseText}${Number(pick.multiplier || 1) !== 1 ? ` • ${pick.multiplier}x future` : ''}`;
 }
 
-function maddenTradeFinderPickPool() {
+function maddenTradeFinderPickPool(teamName = null, slotMap = null) {
   const picks = [];
+  const slot = getMaddenProjectedDraftSlot(slotMap, teamName) || null;
+  const abbr = teamName ? (getMaddenTeamAbbrev(teamName) || teamName) : null;
   for (const year of [2026, 2027, 2028]) {
     for (let round = 1; round <= 7; round++) {
-      const pick = parseMaddenDraftPickAsset(`${year} ${round}`);
+      const raw = slot && abbr ? `${year}|${abbr}|${round}|${slot}` : `${year} ${round}`;
+      const pick = parseMaddenDraftPickAsset(raw);
       if (pick) picks.push(pick);
     }
   }
@@ -17016,7 +17203,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
         .setTitle('Madden Trade Finder')
         .setColor(0xED4245)
         .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-        .setFooter({ text: 'GG Sports • 7J-10BI Draft Pick Autocomplete + Filters' })
+        .setFooter({ text: 'GG Sports • 7J-10BJ Dynamic Draft Pick Values' })
         .setTimestamp()
     };
   }
@@ -17030,7 +17217,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
     ? String(maddenTeamDisplayName(options.excludeTeam) || options.excludeTeam).toLowerCase()
     : '';
   const excludeAbbr = options.excludeTeam ? String(getMaddenTeamAbbrev(options.excludeTeam) || '').toLowerCase() : '';
-  const pickPool = maddenTradeFinderPickPool();
+  const slotMap = await getMaddenProjectedDraftSlotMap(guildId, league.league_id);
   const candidates = [];
 
   for (const row of rows) {
@@ -17051,7 +17238,8 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
     candidates.push({ player: row, value, pick: null, total: baseTotal, diff: baseDiff, absDiff: Math.abs(baseDiff), matchScore: Math.abs(baseDiff) - baseBonus });
 
     if (baseTotal < targetScore) {
-      for (const pick of pickPool) {
+      const rowPickPool = maddenTradeFinderPickPool(row.resolved_team_name || row.team_name, slotMap);
+      for (const pick of rowPickPool) {
         const total = baseTotal + Number(pick.valueScore || 0);
         const diff = total - targetScore;
         candidates.push({ player: row, value, pick, total, diff, absDiff: Math.abs(diff), matchScore: Math.abs(diff) - baseBonus + 25 });
@@ -17101,7 +17289,7 @@ Filters: ${filterText}`)
         { name: 'Page', value: pageText, inline: false },
         { name: 'Notes', value: 'Packages compare one player plus an optional draft pick against the target player value. Same-team players are excluded unless a team filter is used. Position-similar matches receive a small realism boost.', inline: false }
       )
-      .setFooter({ text: 'GG Sports • 7J-10BI Draft Pick Autocomplete + Filters' })
+      .setFooter({ text: 'GG Sports • 7J-10BJ Dynamic Draft Pick Values' })
       .setTimestamp()
   };
 }
