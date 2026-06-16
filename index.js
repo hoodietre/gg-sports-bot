@@ -6308,7 +6308,8 @@ if (gameSubcommand === 'report') {
 
         const statRows = await getMaddenPlayerSeasonStatSummary(interaction.guild.id, activeLeague.league_id, player);
         const ranks = await getMaddenPlayerLeagueRanks(interaction.guild.id, activeLeague.league_id, player);
-        await interaction.reply({ embeds: [buildMaddenPlayerProfileEmbed(activeLeague, player, statRows, ranks)], ephemeral: true });
+        const valueRankContext = await getMaddenPlayerValueRankContext(interaction.guild.id, activeLeague.league_id, player);
+        await interaction.reply({ embeds: [buildMaddenPlayerProfileEmbed(activeLeague, player, statRows, ranks, valueRankContext)], ephemeral: true });
         return;
       }
 
@@ -19355,6 +19356,14 @@ function getMaddenTeamAbbrev(teamName) {
   return NFL_TEAM_ABBREVIATIONS[key] || String(teamName).trim();
 }
 
+function maddenTeamDisplayName(teamName, options = {}) {
+  const clean = String(teamName || '').trim();
+  if (!clean) return options.fallback || 'FA';
+  const abbr = getMaddenTeamAbbrev(clean);
+  if (!abbr || abbr === clean) return clean;
+  return `${clean} (${abbr})`;
+}
+
 function getMaddenRankMedal(index) {
   if (index === 0) return '🥇';
   if (index === 1) return '🥈';
@@ -25020,10 +25029,8 @@ async function getMaddenTeamAutocompleteChoices(guildId, leagueId, focusedValue)
   const seen = new Set();
   return orderedRows
     .map(row => {
-      const abbr = getMaddenTeamAbbrev(row.team_name);
-      const record = maddenTeamRecordText(row);
       return {
-        name: `${row.team_name}${abbr ? ` (${abbr})` : ''} • ${record}`.slice(0, 100),
+        name: maddenTeamDisplayName(row.team_name).slice(0, 100),
         value: String(row.team_name || '').slice(0, 100),
       };
     })
@@ -25618,6 +25625,49 @@ async function getMaddenPlayerValueRankings(guildId, leagueId, filters = {}) {
     .slice(0, Math.min(Math.max(Number(filters.limit || 250), 1), 750));
 }
 
+function maddenPlayerValueIdentity(row) {
+  const raw = row?.raw_payload && typeof row.raw_payload === 'object' ? row.raw_payload : {};
+  return [
+    row?.id,
+    row?.external_player_id,
+    row?.roster_id,
+    row?.presentation_id,
+    raw?.rosterId,
+    raw?.presentationId,
+    `${maddenValuePlayerName(row)}:${row?.resolved_team_name || row?.team_name || ''}:${row?.position || ''}`,
+  ].filter(Boolean).map(value => String(value).trim().toLowerCase());
+}
+
+function maddenSameValuePlayer(a, b) {
+  const aIds = new Set(maddenPlayerValueIdentity(a));
+  for (const id of maddenPlayerValueIdentity(b)) {
+    if (aIds.has(id)) return true;
+  }
+  return false;
+}
+
+async function getMaddenPlayerValueRankContext(guildId, leagueId, player) {
+  const allRows = await getMaddenPlayerValueRankings(guildId, leagueId, { limit: 750 }).catch(() => []);
+  const leagueIndex = allRows.findIndex(row => maddenSameValuePlayer(row, player));
+
+  const position = String(player?.position || '').trim();
+  let positionIndex = -1;
+  let positionTotal = 0;
+  if (position) {
+    const positionRows = allRows.filter(row => String(row.position || '').trim().toLowerCase() === position.toLowerCase());
+    positionTotal = positionRows.length;
+    positionIndex = positionRows.findIndex(row => maddenSameValuePlayer(row, player));
+  }
+
+  return {
+    leagueRank: leagueIndex >= 0 ? leagueIndex + 1 : null,
+    leagueTotal: allRows.length,
+    positionRank: positionIndex >= 0 ? positionIndex + 1 : null,
+    positionTotal,
+    position,
+  };
+}
+
 async function upsertMaddenPlayerValues(guildId, leagueId, rows = []) {
   for (const row of rows || []) {
     const value = row.value || calculateMaddenPlayerValue(row);
@@ -25719,7 +25769,7 @@ function buildMaddenValuesPaginationComponents(token, page = 0, totalPages = 1) 
 
 function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
   const titleBits = ['Madden Player Value Rankings'];
-  if (filters.team) titleBits.push(filters.team);
+  if (filters.team) titleBits.push(maddenTeamDisplayName(filters.team));
   if (filters.position) titleBits.push(String(filters.position).toUpperCase());
 
   const pageSize = Math.min(Math.max(Number(filters.pageSize || MADDEN_VALUES_PAGE_SIZE || 25), 5), 25);
@@ -25766,11 +25816,11 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
     .setDescription(maddenSafeEmbedText(header, 4096))
     .setColor(0xD4AF37)
     .addFields(fields.slice(0, 25))
-    .setFooter({ text: 'GG Sports • 7J-10AV Madden Values UX Polish' })
+    .setFooter({ text: 'GG Sports • 7J-10AW Madden Values Display + Rank Context' })
     .setTimestamp();
 }
 
-function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []) {
+function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = [], valueRankContext = {}) {
   const displayName = maddenPlayerDisplayName(player);
   const teamName = player.resolved_team_name || player.team_name || 'Free Agent';
   const teamAbbrev = getMaddenTeamAbbrev(teamName);
@@ -25814,11 +25864,13 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
       name: 'Player Value',
       value: [
         `**Value Score:** ${valueInfo.valueScore.toFixed(1)}`,
+        valueRankContext?.leagueRank ? `**League Rank:** #${valueRankContext.leagueRank} Overall${valueRankContext.leagueTotal ? ` of ${valueRankContext.leagueTotal}` : ''}` : null,
+        valueRankContext?.positionRank ? `**Position Rank:** #${valueRankContext.positionRank} ${valueRankContext.position || posText}${valueRankContext.positionTotal ? ` of ${valueRankContext.positionTotal}` : ''}` : null,
         `**Trade Tier:** ${valueInfo.tradeTier}`,
         `**Base Overall Value:** ${valueInfo.baseOverallValue.toFixed(1)}`,
         `**Multiplier:** ${valueInfo.multiplier.toFixed(2)}x`,
         `**Components:** POS ${valueInfo.positionComponent.toFixed(2)} • AGE ${valueInfo.ageComponent.toFixed(2)} • DEV ${valueInfo.devComponent.toFixed(2)} • YRS ${valueInfo.yearsComponent.toFixed(2)} • CAP ${valueInfo.capComponent.toFixed(2)}`,
-      ].join('\n'),
+      ].filter(Boolean).join('\n'),
       inline: false,
     });
   }
