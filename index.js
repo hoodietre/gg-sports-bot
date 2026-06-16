@@ -3690,6 +3690,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (commandName === 'maddentrade') {
           const focused = interaction.options.getFocused(true);
+          const tradeSubcommand = interaction.options.getSubcommand(false);
 
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
@@ -3707,7 +3708,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const leagueName = interaction.options.getString('league');
             const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
             if (!activeLeague) {
-              await interaction.respond([{ name: 'Select league first', value: 'Select league first' }]);
+              await interaction.respond([]);
               return;
             }
             const choices = await getMaddenTeamAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
@@ -3722,17 +3723,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
               : null;
 
             if (!activeLeague) {
-              await interaction.respond([{ name: 'Select league first', value: 'Select league first' }]);
+              await interaction.respond([]);
               return;
             }
 
-            const choices = await getMaddenTradeAnalyzerPlayerAutocompleteChoices(
-              interaction.guild.id,
-              activeLeague.league_id,
-              focused.name,
-              focused.value,
-              interaction
-            );
+            let choices = [];
+            if (tradeSubcommand === 'find' && focused?.name === 'player') {
+              choices = await getMaddenPlayerAutocompleteChoices(
+                interaction.guild.id,
+                activeLeague.league_id,
+                focused.value
+              );
+            } else {
+              choices = await getMaddenTradeAnalyzerPlayerAutocompleteChoices(
+                interaction.guild.id,
+                activeLeague.league_id,
+                focused.name,
+                focused.value,
+                interaction
+              );
+            }
 
             await interaction.respond((choices || []).slice(0, 25));
             return;
@@ -16915,7 +16925,7 @@ async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options 
       .setTitle('Madden Trade Finder')
       .setColor(0xED4245)
       .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-      .setFooter({ text: 'GG Sports • 7J-10BF Trade Finder' })
+      .setFooter({ text: 'GG Sports • 7J-10BG Trade Finder UX Fix' })
       .setTimestamp();
   }
 
@@ -16971,7 +16981,7 @@ async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options 
       { name: options.teamFilter ? `Closest Packages • ${options.teamFilter}` : 'Closest Packages', value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false },
       { name: 'Notes', value: 'Packages compare one player plus an optional draft pick against the target player value. Same-team players are excluded unless a team filter is used. Use Trade Analyzer to test exact multi-player packages.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BF Trade Finder' })
+    .setFooter({ text: 'GG Sports • 7J-10BG Trade Finder UX Fix' })
     .setTimestamp();
 }
 
@@ -25651,7 +25661,7 @@ async function getMaddenTradeAnalyzerPlayerAutocompleteChoices(guildId, leagueId
   if (focusedName !== firstField) {
     const anchorName = String(interaction?.options?.getString(firstField) || '').trim();
     if (!anchorName) {
-      return [{ name: `Select ${side === 'side_a' ? 'Side A' : 'Side B'} player 1 first`, value: `Select ${side === 'side_a' ? 'Side A' : 'Side B'} player 1 first` }];
+      return [];
     }
 
     anchor = await findMaddenImportedPlayer(guildId, leagueId, anchorName, null)
