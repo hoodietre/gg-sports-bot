@@ -1587,6 +1587,7 @@ function buildCommands() {
         .addBooleanOption(o => o.setName('prioritize_need').setDescription('Prioritize teams that need the target player position').setRequired(false))
         .addBooleanOption(o => o.setName('contenders_only').setDescription('Only show likely contenders/playoff teams').setRequired(false))
         .addBooleanOption(o => o.setName('rebuilders_only').setDescription('Only show likely rebuilding teams').setRequired(false))
+        .addBooleanOption(o => o.setName('trade_block_only').setDescription('Only use owner-listed trade block assets in packages').setRequired(false))
         .addIntegerOption(o => o.setName('limit').setDescription('Number of matches to load').setRequired(false)))
       .addSubcommand(sc => sc
         .setName('needs')
@@ -6303,8 +6304,9 @@ if (gameSubcommand === 'report') {
           const prioritizeNeed = Boolean(interaction.options.getBoolean('prioritize_need'));
           const contendersOnly = Boolean(interaction.options.getBoolean('contenders_only'));
           const rebuildersOnly = Boolean(interaction.options.getBoolean('rebuilders_only'));
+          const tradeBlockOnly = Boolean(interaction.options.getBoolean('trade_block_only'));
           const page = 0;
-          const filters = { teamFilter, excludeTeam, limit, maxAssets, prioritizeNeed, contendersOnly, rebuildersOnly, page, pageSize: MADDEN_TRADE_FINDER_PAGE_SIZE };
+          const filters = { teamFilter, excludeTeam, limit, maxAssets, prioritizeNeed, contendersOnly, rebuildersOnly, tradeBlockOnly, page, pageSize: MADDEN_TRADE_FINDER_PAGE_SIZE };
           const payload = await buildMaddenTradeFinderPayload(interaction.guild.id, activeLeague, playerName, filters);
           const token = randomBytes(6).toString('hex');
           const totalPages = Math.max(1, Math.ceil(Number(payload.totalMatches || 0) / MADDEN_TRADE_FINDER_PAGE_SIZE));
@@ -6313,7 +6315,7 @@ if (gameSubcommand === 'report') {
             guildId: interaction.guild.id,
             league: activeLeague,
             playerName,
-            filters: { teamFilter, excludeTeam, limit, maxAssets },
+            filters: { teamFilter, excludeTeam, limit, maxAssets, prioritizeNeed, contendersOnly, rebuildersOnly, tradeBlockOnly },
             page,
             totalMatches: payload.totalMatches,
             createdAt: Date.now(),
@@ -18026,7 +18028,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BV Suggested Trade Packages' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' }).setTimestamp();
   }
 
   const formatNeed = (row, index) => maddenTeamNeedUserLine(row, index, true);
@@ -18057,7 +18059,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
       { name: 'Suggested Targets', value: maddenSafeEmbedText(targets || 'No realistic outside targets found for top needs.', 1024), inline: false },
       { name: 'GM Notes', value: `Surplus groups: **${surplus}**\nNeeds are based on starter quality, depth quality, missing bodies, and positional importance. Suggested targets are grouped by need position, then paired with suggested offers using movable chips and dynamic draft picks.`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BV Suggested Trade Packages' })
+    .setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' })
     .setTimestamp();
 }
 
@@ -18093,11 +18095,119 @@ async function ensureMaddenTradeBlockTables() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_block_entries_league_active ON madden_trade_block_entries (guild_id, league_id, is_active, team_name)`);
 }
 
+
+async function cleanupMaddenTradeBlockAfterRosterSync(guildId, leagueId) {
+  await ensureMaddenTradeBlockTables();
+  try {
+    const result = await pool.query(
+      `UPDATE madden_trade_block_entries b
+       SET is_active = FALSE, updated_at = NOW()
+       WHERE b.guild_id = $1::text
+         AND b.league_id = $2::text
+         AND b.is_active = TRUE
+         AND NOT EXISTS (
+           SELECT 1
+           FROM madden_players p
+           WHERE p.guild_id = b.guild_id
+             AND p.league_id = b.league_id
+             AND LOWER(COALESCE(p.full_name, '')) = LOWER(b.player_name)
+             AND (
+               LOWER(COALESCE(p.team_name, '')) = LOWER(b.team_name)
+               OR LOWER(b.team_name) LIKE LOWER('%' || COALESCE(p.team_name, '') || '%')
+               OR LOWER(COALESCE(p.team_name, '')) LIKE LOWER('%' || b.team_name || '%')
+             )
+         )
+       RETURNING b.player_name, b.team_name`,
+      [guildId, leagueId]
+    );
+    if (result.rows?.length) {
+      console.log('[MADDEN TRADE BLOCK CLEANUP 7J-10BW-A] Removed stale listings:', JSON.stringify(result.rows).slice(0, 4000));
+    }
+    return result.rows || [];
+  } catch (error) {
+    console.error('[MADDEN TRADE BLOCK CLEANUP 7J-10BW-A] Failed:', error?.message || error);
+    return [];
+  }
+}
+
 function maddenTradeBlockPlayerKey(player) {
   const rosterId = player?.roster_id || player?.external_player_id || player?.id;
   const team = player?.resolved_team_name || player?.team_name || player?.team_id || 'unknown-team';
   const name = maddenValuePlayerName(player);
   return String(rosterId || `${name}:${team}`).toLowerCase().replace(/\s+/g, '-').slice(0, 180);
+}
+
+
+async function getMaddenActiveTradeBlockRows(guildId, leagueId, filters = {}) {
+  await ensureMaddenTradeBlockTables();
+  const params = [guildId, leagueId];
+  let where = `guild_id = $1::text AND league_id = $2::text AND is_active = TRUE`;
+  if (filters.teamName) {
+    params.push(`%${filters.teamName}%`, getMaddenTeamAbbrev(filters.teamName) || filters.teamName);
+    where += ` AND (LOWER(team_name) LIKE LOWER($${params.length - 1}) OR LOWER(team_name) = LOWER($${params.length}))`;
+  }
+  if (filters.position) {
+    params.push(String(filters.position || '').toUpperCase());
+    where += ` AND UPPER(position) = UPPER($${params.length})`;
+  }
+  const result = await pool.query(
+    `SELECT * FROM madden_trade_block_entries
+     WHERE ${where}
+     ORDER BY team_name ASC, value_score DESC NULLS LAST, overall DESC NULLS LAST, player_name ASC`,
+    params
+  );
+  return result.rows || [];
+}
+
+function maddenTradeBlockMatchKeyForRow(row) {
+  const name = String(maddenValuePlayerName(row) || row?.player_name || row?.full_name || '').trim().toLowerCase();
+  const team = maddenTradeNormalizeTeamKey(row?.resolved_team_name || row?.team_name || row?.team || '');
+  return `${team}:${name}`;
+}
+
+function maddenTradeBlockEntryMatchesPlayer(entry, player) {
+  if (!entry || !player) return false;
+  const playerKey = String(maddenTradeBlockPlayerKey(player) || '').toLowerCase();
+  const entryKey = String(entry.player_key || '').toLowerCase();
+  if (entryKey && playerKey && entryKey === playerKey) return true;
+  const entryName = String(entry.player_name || '').trim().toLowerCase();
+  const playerName = String(maddenValuePlayerName(player) || '').trim().toLowerCase();
+  const entryTeam = maddenTradeNormalizeTeamKey(entry.team_name || '');
+  const playerTeam = maddenTradeNormalizeTeamKey(player.resolved_team_name || player.team_name || '');
+  return Boolean(entryName && playerName && entryName === playerName && (!entryTeam || !playerTeam || entryTeam === playerTeam));
+}
+
+function findMaddenTradeBlockEntryForPlayer(entries = [], player = null) {
+  return (entries || []).find(entry => maddenTradeBlockEntryMatchesPlayer(entry, player)) || null;
+}
+
+function applyMaddenUserListedAvailability(player, availability, tradeBlockEntries = []) {
+  const listed = findMaddenTradeBlockEntryForPlayer(tradeBlockEntries, player);
+  if (!listed) return availability;
+  return {
+    ...(availability || {}),
+    score: 100,
+    label: 'User Listed',
+    hideAsTarget: false,
+    marketClass: 'Owner Listed',
+    reasons: ['user listed', ...((availability?.reasons || []).filter(reason => reason !== 'user listed'))],
+    tradeBlockEntry: listed,
+  };
+}
+
+function maddenUserListedAssetLine(item, index = 0) {
+  const row = item.row || item;
+  const entry = item.tradeBlockEntry || item.availability?.tradeBlockEntry || {};
+  const seeking = entry.seeking ? `\n   Seeking: **${entry.seeking}**` : '';
+  const notes = entry.notes ? `\n   Notes: ${entry.notes}` : '';
+  return `${index + 1}. 📢 **${maddenValuePlayerName(row)}** — ${row.position || entry.position || 'POS'} • ${row.overall || entry.overall || 'N/A'} OVR • ${Number(item.value?.valueScore || entry.value_score || 0).toFixed(0)} • **User Listed**${seeking}${notes}`;
+}
+
+function maddenTradeBlockRichPlayerText(row, index = 0) {
+  const icon = Number(row.value_score || 0) >= 850 || Number(row.overall || 0) >= 85 ? '⭐' : '🔄';
+  const seeking = row.seeking ? `\n\nSeeking:\n${row.seeking}` : '';
+  const notes = row.notes ? `\n\nNotes:\n${row.notes}` : '';
+  return `${icon} **${row.player_name}**\n${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${seeking}${notes}`;
 }
 
 function maddenTradeBlockLine(row, index = 0) {
@@ -18270,15 +18380,17 @@ async function buildMaddenTradeBlockTeamEmbed(guildId, league, member, teamName 
   );
 
   const rows = result.rows || [];
+  const description = rows.length
+    ? `**Actively Shopping**\n\n${rows.map((row, index) => maddenTradeBlockRichPlayerText(row, index)).join('\n\n────────────────\n\n')}\n\n────────────────\n\nAvailable Assets: **${rows.length}**`
+    : 'No active players listed for this team yet.';
   const embed = new EmbedBuilder()
     .setTitle(`Madden Trade Block • ${maddenTeamDisplayName(resolvedTeam)}`)
     .setColor(0xFEE75C)
-    .setDescription(rows.length ? maddenSafeEmbedText(rows.map(maddenTradeBlockLine).join('\n\n'), 4000) : 'No active players listed for this team yet.')
-    .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+    .setDescription(maddenSafeEmbedText(description, 4000))
+    .setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' })
     .setTimestamp();
   return embed;
 }
-
 async function buildMaddenTradeBlockLeagueEmbed(guildId, league, filters = {}) {
   await ensureMaddenTradeBlockTables();
   const teamName = String(filters.teamName || '').trim();
@@ -18324,9 +18436,10 @@ async function buildMaddenTradeBlockLeagueEmbed(guildId, league, filters = {}) {
   for (const [team, teamRows] of [...grouped.entries()].slice(0, 12)) {
     const lines = teamRows.slice(0, 6).map((row, index) => {
       const value = Number(row.value_score || 0) > 0 ? ` • ${Number(row.value_score || 0).toFixed(0)} value` : '';
+      const icon = Number(row.value_score || 0) >= 850 || Number(row.overall || 0) >= 85 ? '⭐' : '🔄';
       const seeking = row.seeking ? `\nSeeking: ${row.seeking}` : '';
       const notes = row.notes ? `\nNotes: ${row.notes}` : '';
-      return `${index + 1}. **${row.player_name}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${value}${seeking}${notes}`;
+      return `${index + 1}. ${icon} **${row.player_name}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${value}${seeking}${notes}`;
     });
     embed.addFields({ name: maddenTeamDisplayName(team), value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false });
   }
@@ -18343,7 +18456,7 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BV Suggested Trade Packages' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' }).setTimestamp();
   }
 
   const allPlayers = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, null).catch(() => []);
@@ -18354,8 +18467,34 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
   const needGroups = new Set(topNeeds.map(row => row.position));
   const surplusGroups = new Set(topStrengths.slice(0, 3).map(row => row.position));
 
-  const tradableItems = maddenBuildTradeChipItems(roster, teamNeed, 12);
-  const tradableText = maddenTradeChipSectionText(tradableItems);
+  const tradeBlockRows = await getMaddenActiveTradeBlockRows(guildId, league.league_id, { teamName: teamNeed.teamName }).catch(() => []);
+  const rawTradableItems = maddenBuildTradeChipItems(roster, teamNeed, 12);
+  const userListedItems = tradeBlockRows
+    .map(entry => {
+      const row = roster.find(player => maddenTradeBlockEntryMatchesPlayer(entry, player));
+      if (!row) return null;
+      const value = calculateMaddenPlayerValue(row);
+      return {
+        row,
+        value,
+        category: 'user_listed',
+        tradeBlockEntry: entry,
+        availability: applyMaddenUserListedAvailability(row, maddenPlayerAvailability(row, teamNeed), [entry]),
+        reasons: ['user listed'],
+        score: 999,
+        protected: false,
+      };
+    })
+    .filter(Boolean);
+  const userListedKeys = new Set(userListedItems.map(item => maddenTradeFinderPlayerKey(item.row)));
+  const tradableItems = [
+    ...userListedItems,
+    ...rawTradableItems.filter(item => !userListedKeys.has(maddenTradeFinderPlayerKey(item.row)))
+  ];
+  tradableItems.debug = rawTradableItems.debug || {};
+  tradableItems.debug.userListedCount = userListedItems.length;
+  const userListedText = userListedItems.length ? `**📢 User Listed Assets**\n${userListedItems.map((item, index) => maddenUserListedAssetLine(item, index)).join('\n')}` : '';
+  const tradableText = [userListedText, maddenTradeChipSectionText(tradableItems.filter(item => item.category !== 'user_listed'))].filter(Boolean).join('\n\n');
 
   const allNeedsModel = await buildMaddenTeamNeedsModel(guildId, league.league_id, null).catch(() => new Map());
   const slotMap = await getMaddenProjectedDraftSlotMap(guildId, league.league_id).catch(() => new Map());
@@ -18376,7 +18515,7 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
       { name: 'Possible Trade Chips', value: maddenSafeEmbedText(tradableText || 'No obvious trade chips found.', 1024), inline: false },
       { name: 'Notes', value: 'GM Assistant hides unrealistic franchise/core targets, ranks realistic needs, and now suggests trade packages from movable chips and dynamic draft picks.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BV Suggested Trade Packages' })
+    .setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' })
     .setTimestamp();
 }
 
@@ -18478,7 +18617,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
         .setTitle('Madden Trade Finder')
         .setColor(0xED4245)
         .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-        .setFooter({ text: 'GG Sports • 7J-10BV Suggested Trade Packages' })
+        .setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' })
         .setTimestamp()
     };
   }
@@ -18488,7 +18627,13 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
   const targetTeamKey = maddenTradeAnalyzerTeamKey(target);
   const targetKey = maddenTradeFinderPlayerKey(target);
   const maxAssets = Math.min(Math.max(Number(options.maxAssets || 3), 1), 3);
-  const rows = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, options.teamFilter || null);
+  const rawRows = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, options.teamFilter || null);
+  const tradeBlockRows = await getMaddenActiveTradeBlockRows(guildId, league.league_id, {
+    teamName: options.teamFilter || null,
+  }).catch(() => []);
+  const rows = options.tradeBlockOnly
+    ? rawRows.filter(row => findMaddenTradeBlockEntryForPlayer(tradeBlockRows, row))
+    : rawRows;
   const excludeKey = String(options.excludeTeam || '').trim()
     ? String(maddenTeamDisplayName(options.excludeTeam) || options.excludeTeam).toLowerCase()
     : '';
@@ -18511,7 +18656,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
     const teamKey = maddenTradeAnalyzerTeamKey(cleanPlayers[0]);
     const teamNeed = needsModel.get(teamKey);
     const needInfo = maddenTeamNeedScore(teamNeed, target.position);
-    const availabilityScores = cleanPlayers.map(player => maddenPlayerAvailability(player, teamNeed));
+    const availabilityScores = cleanPlayers.map(player => applyMaddenUserListedAvailability(player, maddenPlayerAvailability(player, teamNeed), tradeBlockRows));
     const avgAvailability = availabilityScores.reduce((sum, item) => sum + Number(item.score || 0), 0) / Math.max(1, availabilityScores.length);
     const lowAvailabilityPenalty = availabilityScores.some(item => item.score < 30) ? 120 : availabilityScores.some(item => item.score < 45) ? 45 : 0;
     const fitScore = Math.max(0, Math.min(100, Math.round(100 - Math.min(Math.abs(diff) / Math.max(1, targetScore) * 100, 80) + Math.min(25, needInfo.score || 0) + Math.min(12, avgAvailability / 8) - ((assetCount - 1) * 3))));
@@ -18616,6 +18761,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
   if (options.prioritizeNeed) filterBits.push('Prioritize need');
   if (options.contendersOnly) filterBits.push('Contenders only');
   if (options.rebuildersOnly) filterBits.push('Rebuilders only');
+  if (options.tradeBlockOnly) filterBits.push('Trade block only');
   const filterText = filterBits.join(' • ');
   const pageText = allMatches.length
     ? `Page **${page + 1}/${totalPages}** • Showing **${startIndex + 1}-${Math.min(startIndex + pageSize, allMatches.length)}** of **${allMatches.length}** packages.`
@@ -18633,9 +18779,9 @@ Filters: ${filterText}`)
       .addFields(
         { name: 'Closest Packages', value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false },
         { name: 'Page', value: pageText, inline: false },
-        { name: 'Notes', value: 'Packages can include one player, player + pick, two players, or two players + pick depending on the max assets setting. Same-team packages are generated together and position-similar matches receive a small realism boost.', inline: false }
+        { name: 'Notes', value: options.tradeBlockOnly ? 'Trade block only is enabled, so every suggested package is built from players owners actively listed. Packages may also include dynamic draft picks.' : 'Packages can include one player, player + pick, two players, or two players + pick depending on the max assets setting. Same-team packages are generated together and position-similar matches receive a small realism boost.', inline: false }
       )
-      .setFooter({ text: 'GG Sports • 7J-10BV Suggested Trade Packages' })
+      .setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' })
       .setTimestamp()
   };
 }
@@ -35296,6 +35442,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
+    await cleanupMaddenTradeBlockAfterRosterSync(guild.id, league.league_id).catch(() => null);
 
     const message =
       'EA Direct sync completed for ' + context.externalLeagueName +
@@ -36355,6 +36502,7 @@ async function runMaddenExternalFetchSync(guild, league, options = {}) {
 
   // Always keep local Discord team bridge updated too.
   await syncMaddenFranchises(guild, league).catch(error => errors.push('local team bridge: ' + error.message));
+  await cleanupMaddenTradeBlockAfterRosterSync(guild.id, league.league_id).catch(error => errors.push('trade block cleanup: ' + error.message));
 
   const status = successfulEndpoints > 0 ? 'completed' : 'failed';
   const message = successfulEndpoints > 0
