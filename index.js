@@ -17523,72 +17523,115 @@ function maddenRosterGroupRankMap(roster = []) {
 // Score every roster player into premium chips, movable veterans, and depth assets.
 function maddenBuildTradeChipItems(roster = [], teamNeed = null, limit = 12) {
   const rankMap = maddenRosterGroupRankMap(roster);
-  const items = (roster || [])
-    .map(row => {
-      const group = maddenPositionNeedGroup(row.position);
-      if (!group || ['IGNORE', 'OTHER', 'K/P'].includes(group)) return null;
-      const value = calculateMaddenPlayerValue(row);
-      const availability = maddenPlayerAvailability(row, teamNeed);
-      const groupRank = rankMap.get(maddenTradeFinderPlayerKey(row)) || { group, rank: 99, count: 0 };
-      const needRank = teamNeed ? ((teamNeed.weaknesses || []).findIndex(item => item.position === group) + 1) : 0;
-      const strengthRank = teamNeed ? ((teamNeed.strengths || []).findIndex(item => item.position === group) + 1) : 0;
-      const config = MADDEN_NEED_GROUP_CONFIG[group] || { starters: 1, depth: 1 };
-      const safeStarterCount = Number(config.starters || 1);
-      const safeDepthCount = Number(config.depth || 1);
-      const rank = Number(groupRank.rank || 99);
-      const age = Number(row.age || 0);
-      const overall = Number(row.overall || 0);
-      const valueScore = Number(value.valueScore || 0);
-      const devSort = getMaddenDevTraitSortValue(row.dev_trait);
-      const isYoungCore = overall >= 94 && age && age <= 27 && devSort >= 4;
-      const isStarter = rank <= safeStarterCount;
-      const isNeedStarter = needRank > 0 && needRank <= 4 && isStarter;
-      const isDepthAsset = rank > safeStarterCount;
-      const isDeepDepth = rank > safeStarterCount + safeDepthCount;
-      const isSurplus = strengthRank > 0 && strengthRank <= 4;
+  const weaknessGroups = new Set((teamNeed?.weaknesses || []).slice(0, 4).map(row => row.position));
+  const strengthGroups = new Set((teamNeed?.strengths || []).slice(0, 5).map(row => row.position));
+  const evaluated = [];
+  let protectedCount = 0;
+  let needExcludedCount = 0;
+  let surplusCount = 0;
 
-      let score = 20;
-      score += Math.min(40, valueScore / 110);
-      score += Number(availability.score || 0) * 0.45;
-      if (isSurplus) score += 24;
-      if (isDepthAsset) score += 14;
-      if (isDeepDepth) score += 18;
-      if (age >= 32) score += 18;
-      else if (age >= 29) score += 10;
-      if (overall >= 90 && age >= 29) score += 8;
-      if (isNeedStarter) score -= 34;
-      if (needRank === 1) score -= 12;
-      if (isYoungCore) score -= 42;
-      if (valueScore < 150) score -= 18;
+  for (const row of roster || []) {
+    const group = maddenPositionNeedGroup(row.position);
+    if (!group || ['IGNORE', 'OTHER', 'K/P'].includes(group)) continue;
 
-      const reasons = [];
-      if (isSurplus) reasons.push('surplus');
-      if (isDeepDepth) reasons.push('deep depth');
-      else if (isDepthAsset) reasons.push('depth');
-      if (age >= 29) reasons.push('veteran');
-      if (availability.reasons?.[0]) reasons.push(availability.reasons[0]);
-      if (isNeedStarter) reasons.push('need starter');
+    const value = calculateMaddenPlayerValue(row);
+    const availability = maddenPlayerAvailability(row, teamNeed);
+    const groupRank = rankMap.get(maddenTradeFinderPlayerKey(row)) || { group, rank: 99, count: 0 };
+    const config = MADDEN_NEED_GROUP_CONFIG[group] || { starters: 1, depth: 1 };
+    const rank = Number(groupRank.rank || 99);
+    const count = Number(groupRank.count || 0);
+    const age = Number(row.age || 0);
+    const overall = Number(row.overall || 0);
+    const valueScore = Number(value.valueScore || 0);
+    const devSort = getMaddenDevTraitSortValue(row.dev_trait);
+    const isStarter = rank <= Number(config.starters || 1);
+    const isDepthAsset = rank > Number(config.starters || 1);
+    const isDeepDepth = rank > Number(config.starters || 1) + Number(config.depth || 1);
+    const isNeedGroup = weaknessGroups.has(group);
+    const isSurplus = strengthGroups.has(group) || count > Number(config.starters || 1) + Number(config.depth || 1) + 1;
+    const isFranchiseQb = group === 'QB' && (overall >= 88 || valueScore >= 1500);
+    const isYoungElite = overall >= 93 && age > 0 && age <= 27 && devSort >= 4;
+    const isTopNeedPlayer = isNeedGroup && rank === 1;
+    const isProtected = isFranchiseQb || isYoungElite || isTopNeedPlayer;
 
-      let category = 'depth';
-      if (valueScore >= 1200 || overall >= 88) category = 'premium';
-      else if (age >= 29 || Number(availability.score || 0) >= 65) category = 'veteran';
+    if (isProtected) protectedCount += 1;
+    if (isNeedGroup && isStarter) needExcludedCount += 1;
+    if (isSurplus) surplusCount += 1;
 
-      return {
-        row,
-        group,
-        value,
-        availability,
-        groupRank,
-        score: Math.round(score),
-        category,
-        reasons: [...new Set(reasons)].slice(0, 3),
-      };
-    })
-    .filter(Boolean)
-    .filter(item => Number(item.score || 0) >= 30)
-    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || Number(b.value.valueScore || 0) - Number(a.value.valueScore || 0));
+    let score = 12;
+    score += Math.min(34, valueScore / 120);
+    score += Number(availability.score || 0) * 0.5;
+    if (isSurplus) score += 28;
+    if (isDepthAsset) score += 18;
+    if (isDeepDepth) score += 18;
+    if (age >= 32) score += 22;
+    else if (age >= 29) score += 12;
+    if (overall >= 88 && age >= 29) score += 10;
+    if (valueScore >= 900 && !isNeedGroup) score += 10;
+    if (isNeedGroup && isStarter) score -= 28;
+    if (isTopNeedPlayer) score -= 30;
+    if (isProtected) score -= 45;
+    if (valueScore < 120 && !isDeepDepth) score -= 10;
 
-  return items.slice(0, limit);
+    const reasons = [];
+    if (isSurplus) reasons.push('surplus');
+    if (isDeepDepth) reasons.push('deep depth');
+    else if (isDepthAsset) reasons.push('depth');
+    if (age >= 29) reasons.push('veteran');
+    if (availability.reasons?.[0]) reasons.push(availability.reasons[0]);
+    if (isNeedGroup && isStarter) reasons.push('need starter');
+    if (isProtected) reasons.push('protected core');
+
+    let category = 'depth';
+    if (valueScore >= 1000 || (overall >= 87 && !isNeedGroup)) category = 'premium';
+    else if (age >= 29 || Number(availability.score || 0) >= 62) category = 'veteran';
+
+    evaluated.push({
+      row,
+      group,
+      value,
+      availability,
+      groupRank,
+      score: Math.max(0, Math.round(score)),
+      category,
+      protected: isProtected,
+      isNeedGroup,
+      isSurplus,
+      reasons: [...new Set(reasons)].slice(0, 3),
+    });
+  }
+
+  let items = evaluated
+    .filter(item => !item.protected)
+    .filter(item => Number(item.score || 0) >= 24)
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || Number(b.value.valueScore || 0) - Number(a.value.valueScore || 0))
+    .slice(0, limit);
+
+  let fallbackUsed = false;
+  if (!items.length) {
+    fallbackUsed = true;
+    items = evaluated
+      .filter(item => !item.protected)
+      .sort((a, b) => {
+        const aScore = Number(a.value?.valueScore || 0) + (a.isSurplus ? 350 : 0) + (a.groupRank?.rank > 1 ? 175 : 0) + Number(a.availability?.score || 0) * 8;
+        const bScore = Number(b.value?.valueScore || 0) + (b.isSurplus ? 350 : 0) + (b.groupRank?.rank > 1 ? 175 : 0) + Number(b.availability?.score || 0) * 8;
+        return bScore - aScore;
+      })
+      .slice(0, Math.min(limit, 8))
+      .map(item => ({ ...item, category: item.category || 'depth', fallback: true }));
+  }
+
+  items.debug = {
+    playersEvaluated: evaluated.length,
+    protectedCount,
+    needExcludedCount,
+    surplusCount,
+    premiumCount: items.filter(item => item.category === 'premium').length,
+    veteranCount: items.filter(item => item.category === 'veteran').length,
+    depthCount: items.filter(item => item.category === 'depth').length,
+    fallbackUsed,
+  };
+  return items;
 }
 
 function maddenTradeChipLine(item, index) {
@@ -17597,16 +17640,34 @@ function maddenTradeChipLine(item, index) {
   return `${index + 1}. **${maddenValuePlayerName(row)}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${Number(item.value?.valueScore || 0).toFixed(0)} • ${item.availability?.label || 'Medium'} availability${reason}`;
 }
 
+function maddenTradeChipDebugText(items = []) {
+  const debug = items.debug || {};
+  return [
+    `Players Evaluated: ${Number(debug.playersEvaluated || 0)}`,
+    `Protected Players: ${Number(debug.protectedCount || 0)}`,
+    `Need Position Exclusions: ${Number(debug.needExcludedCount || 0)}`,
+    `Surplus Position Players: ${Number(debug.surplusCount || 0)}`,
+    `Premium Chips: ${Number(debug.premiumCount || 0)}`,
+    `Veteran Chips: ${Number(debug.veteranCount || 0)}`,
+    `Depth Chips: ${Number(debug.depthCount || 0)}`,
+    `Fallback Used: ${debug.fallbackUsed ? 'YES' : 'NO'}`,
+  ].join('\n');
+}
+
 function maddenTradeChipSectionText(items = []) {
-  if (!items.length) return 'No obvious trade chips found.';
+  const debugText = maddenTradeChipDebugText(items);
+  if (!items.length) return `**🔍 Trade Chip Debug**\n${debugText}\n\nNo movable assets found after fallback.`;
   const premium = items.filter(item => item.category === 'premium').slice(0, 4);
   const veterans = items.filter(item => item.category === 'veteran').slice(0, 4);
   const depth = items.filter(item => item.category === 'depth').slice(0, 4);
+  const fallback = items.filter(item => item.fallback).slice(0, 6);
   const sections = [];
   if (premium.length) sections.push(`**💰 Premium Chips**\n${premium.map((item, index) => maddenTradeChipLine(item, index)).join('\n')}`);
   if (veterans.length) sections.push(`**🔄 Movable Veterans**\n${veterans.map((item, index) => maddenTradeChipLine(item, index)).join('\n')}`);
   if (depth.length) sections.push(`**📦 Depth Assets**\n${depth.map((item, index) => maddenTradeChipLine(item, index)).join('\n')}`);
+  if (!sections.length && fallback.length) sections.push(`**📦 Most Movable Assets**\n${fallback.map((item, index) => maddenTradeChipLine(item, index)).join('\n')}`);
   if (!sections.length) sections.push(items.slice(0, 8).map((item, index) => maddenTradeChipLine(item, index)).join('\n'));
+  sections.push(`**🔍 Trade Chip Debug**\n${debugText}`);
   return sections.join('\n\n');
 }
 
@@ -17627,7 +17688,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BQ Trade Chip Engine 2.0' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' }).setTimestamp();
   }
 
   const formatNeed = (row, index) => {
@@ -17659,7 +17720,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
       { name: 'Suggested Targets', value: maddenSafeEmbedText(targets || 'No realistic outside targets found for top needs.', 1024), inline: false },
       { name: 'GM Notes', value: `Surplus groups: **${surplus}**\nNeeds are based on starter quality, depth quality, missing bodies, and positional importance. Suggested targets are grouped by need position, then ranked by upgrade, availability, and value fit.`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BQ Trade Chip Engine 2.0' })
+    .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
     .setTimestamp();
 }
 
@@ -17669,7 +17730,7 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BQ Trade Chip Engine 2.0' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' }).setTimestamp();
   }
 
   const allPlayers = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, null).catch(() => []);
@@ -17701,7 +17762,7 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
       { name: 'Possible Trade Chips', value: maddenSafeEmbedText(tradableText || 'No obvious trade chips found.', 1024), inline: false },
       { name: 'Notes', value: 'GM Assistant groups targets by priority need position, then ranks by starter upgrade, value, availability, and fit. Trade chips favor surplus, depth, veteran, and movable assets.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BQ Trade Chip Engine 2.0' })
+    .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
     .setTimestamp();
 }
 
@@ -17803,7 +17864,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
         .setTitle('Madden Trade Finder')
         .setColor(0xED4245)
         .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-        .setFooter({ text: 'GG Sports • 7J-10BQ Trade Chip Engine 2.0' })
+        .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
         .setTimestamp()
     };
   }
@@ -17960,7 +18021,7 @@ Filters: ${filterText}`)
         { name: 'Page', value: pageText, inline: false },
         { name: 'Notes', value: 'Packages can include one player, player + pick, two players, or two players + pick depending on the max assets setting. Same-team packages are generated together and position-similar matches receive a small realism boost.', inline: false }
       )
-      .setFooter({ text: 'GG Sports • 7J-10BQ Trade Chip Engine 2.0' })
+      .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
       .setTimestamp()
   };
 }
