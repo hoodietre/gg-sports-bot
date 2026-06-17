@@ -17476,6 +17476,98 @@ function maddenGmTieredTargetText(scoredTargets, maxTotal = 9) {
   return sections.join('\n\n');
 }
 
+// 7J-10BP: Position-aware GM target display and trade-chip engine.
+// Keep targets separated by the actual need group so a QB target is not ranked beside an IOL target.
+function maddenGmTargetSectionTitle(group, items = []) {
+  const bestTier = items.some(item => item.tier === '⭐ Franchise Target')
+    ? '⭐'
+    : items.some(item => item.tier === '🔥 Major Upgrade')
+      ? '🔥'
+      : '✅';
+  return `${bestTier} ${group} Targets`;
+}
+
+function maddenGmPositionAwareTargetText(scoredTargets, needRows = [], maxGroups = 4, perGroup = 3) {
+  const rows = (needRows || []).filter(row => row && row.position && !['IGNORE', 'OTHER', 'K/P'].includes(row.position));
+  const sections = [];
+  for (const need of rows.slice(0, maxGroups)) {
+    const group = need.position;
+    const items = (scoredTargets || [])
+      .filter(item => item.group === group)
+      .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || Number(b.value?.valueScore || 0) - Number(a.value?.valueScore || 0))
+      .slice(0, perGroup);
+    if (!items.length) continue;
+    sections.push(`**${maddenGmTargetSectionTitle(group, items)}**\n${items.map((item, index) => maddenGmTargetLine(item, index)).join('\n')}`);
+  }
+  if (!sections.length) return maddenGmTieredTargetText(scoredTargets || [], maxGroups * perGroup);
+  return sections.join('\n\n');
+}
+
+function maddenRosterGroupRankMap(roster = []) {
+  const grouped = new Map();
+  for (const row of roster || []) {
+    const group = maddenPositionNeedGroup(row.position);
+    if (!group || ['IGNORE', 'OTHER', 'K/P'].includes(group)) continue;
+    if (!grouped.has(group)) grouped.set(group, []);
+    grouped.get(group).push(row);
+  }
+  const rankMap = new Map();
+  for (const [group, rows] of grouped.entries()) {
+    rows.sort((a, b) => Number(b.overall || 0) - Number(a.overall || 0) || Number(calculateMaddenPlayerValue(b).valueScore || 0) - Number(calculateMaddenPlayerValue(a).valueScore || 0));
+    rows.forEach((row, index) => rankMap.set(maddenTradeFinderPlayerKey(row), { group, rank: index + 1, count: rows.length }));
+  }
+  return rankMap;
+}
+
+function maddenBuildTradeChipItems(roster = [], teamNeed = null, limit = 8) {
+  const rankMap = maddenRosterGroupRankMap(roster);
+  return (roster || [])
+    .map(row => {
+      const group = maddenPositionNeedGroup(row.position);
+      const value = calculateMaddenPlayerValue(row);
+      const availability = maddenPlayerAvailability(row, teamNeed);
+      const groupRank = rankMap.get(maddenTradeFinderPlayerKey(row)) || { group, rank: 99, count: 0 };
+      const needRank = teamNeed ? ((teamNeed.weaknesses || []).findIndex(item => item.position === group) + 1) : 0;
+      const strengthRank = teamNeed ? ((teamNeed.strengths || []).findIndex(item => item.position === group) + 1) : 0;
+      const config = MADDEN_NEED_GROUP_CONFIG[group] || { starters: 1, depth: 1 };
+      const safeStarterCount = Number(config.starters || 1);
+      const safeDepthCount = Number(config.depth || 1);
+      const age = Number(row.age || 0);
+      const overall = Number(row.overall || 0);
+      const valueScore = Number(value.valueScore || 0);
+      const devSort = getMaddenDevTraitSortValue(row.dev_trait);
+      const isCore = overall >= 94 && age && age <= 27 && devSort >= 4;
+      const isStarterAtNeed = needRank > 0 && needRank <= 4 && Number(groupRank.rank || 99) <= safeStarterCount;
+      const depthAsset = Number(groupRank.rank || 99) > safeStarterCount + safeDepthCount;
+      const surplusAsset = strengthRank > 0 && strengthRank <= 4;
+      let score = Number(availability.score || 0);
+      score += Math.min(24, valueScore / 180);
+      if (surplusAsset) score += 22;
+      if (depthAsset) score += 18;
+      if (age >= 31) score += 16;
+      else if (age >= 29) score += 10;
+      if (isStarterAtNeed) score -= 30;
+      if (isCore) score -= 45;
+      if (valueScore < 250) score -= 8;
+      const reasons = [];
+      if (surplusAsset) reasons.push('surplus');
+      if (depthAsset) reasons.push('depth');
+      if (age >= 29) reasons.push('veteran');
+      if (availability.reasons?.[0]) reasons.push(availability.reasons[0]);
+      return { row, group, value, availability, groupRank, score, reasons: [...new Set(reasons)].slice(0, 2) };
+    })
+    .filter(item => Number(item.score || 0) >= 45)
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || Number(b.value.valueScore || 0) - Number(a.value.valueScore || 0))
+    .slice(0, limit);
+}
+
+function maddenTradeChipLine(item, index) {
+  const row = item.row;
+  const reason = item.reasons?.length ? ` • ${item.reasons.join(', ')}` : '';
+  return `${index + 1}. **${maddenValuePlayerName(row)}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${Number(item.value?.valueScore || 0).toFixed(0)} • ${item.availability?.label || 'Medium'} availability${reason}`;
+}
+
+
 function maddenBuildGmTargetList(allPlayers, teamKey, needGroups, targetTeamNeed, allNeedsModel, limit = 12) {
   return (allPlayers || [])
     .filter(row => maddenTradeAnalyzerTeamKey(row) !== teamKey)
@@ -17492,7 +17584,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BO Availability Engine' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BP Position-Aware GM' }).setTimestamp();
   }
 
   const formatNeed = (row, index) => {
@@ -17510,7 +17602,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
   const topNeedGroups = new Set((teamNeed.weaknesses || []).slice(0, 3).map(row => row.position));
   const allNeedsModel = await buildMaddenTeamNeedsModel(guildId, league.league_id, null).catch(() => new Map());
   const scoredTargets = maddenBuildGmTargetList(allRows, teamKey, topNeedGroups, teamNeed, allNeedsModel, 9);
-  const targets = maddenGmTieredTargetText(scoredTargets, 9);
+  const targets = maddenGmPositionAwareTargetText(scoredTargets, teamNeed.weaknesses || [], 3, 3);
 
   const surplus = (teamNeed.strengths || []).slice(0, 3).map(row => row.position).join(', ') || 'None detected';
   const abbr = getMaddenTeamAbbrev(teamNeed.teamName) || teamNeed.teamName;
@@ -17522,9 +17614,9 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
       { name: 'Biggest Needs', value: maddenSafeEmbedText(weaknessLines.join('\n') || 'No needs found.', 1024), inline: false },
       { name: 'Biggest Strengths', value: maddenSafeEmbedText(strengthLines.join('\n') || 'No strengths found.', 1024), inline: false },
       { name: 'Suggested Targets', value: maddenSafeEmbedText(targets || 'No realistic outside targets found for top needs.', 1024), inline: false },
-      { name: 'GM Notes', value: `Surplus groups: **${surplus}**\nNeeds are based on starter quality, depth quality, missing bodies, and positional importance. Suggested targets rank true roster upgrades first, then availability and value fit.`, inline: false }
+      { name: 'GM Notes', value: `Surplus groups: **${surplus}**\nNeeds are based on starter quality, depth quality, missing bodies, and positional importance. Suggested targets are grouped by need position, then ranked by upgrade, availability, and value fit.`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BO Availability Engine' })
+    .setFooter({ text: 'GG Sports • 7J-10BP Position-Aware GM' })
     .setTimestamp();
 }
 
@@ -17534,7 +17626,7 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BO GM Assistant 2.0' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BP Position-Aware GM' }).setTimestamp();
   }
 
   const allPlayers = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, null).catch(() => []);
@@ -17545,16 +17637,12 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
   const needGroups = new Set(topNeeds.map(row => row.position));
   const surplusGroups = new Set(topStrengths.slice(0, 3).map(row => row.position));
 
-  const tradable = roster
-    .map(row => ({ row, availability: maddenPlayerAvailability(row, teamNeed), value: calculateMaddenPlayerValue(row) }))
-    .filter(item => item.availability.score >= 45 || surplusGroups.has(maddenPositionNeedGroup(item.row.position)) || Number(item.row.age || 0) >= 29)
-    .sort((a, b) => b.availability.score - a.availability.score || Number(b.value.valueScore || 0) - Number(a.value.valueScore || 0))
-    .slice(0, 6)
-    .map((item, index) => `${index + 1}. **${maddenValuePlayerName(item.row)}** — ${item.row.position || 'POS'} • ${item.row.overall || 'N/A'} OVR • ${Number(item.value.valueScore || 0).toFixed(0)} • ${item.availability.label} availability`);
+  const tradable = maddenBuildTradeChipItems(roster, teamNeed, 8)
+    .map((item, index) => maddenTradeChipLine(item, index));
 
   const allNeedsModel = await buildMaddenTeamNeedsModel(guildId, league.league_id, null).catch(() => new Map());
   const scoredTargets = maddenBuildGmTargetList(allPlayers, teamKey, needGroups, teamNeed, allNeedsModel, 12);
-  const targets = maddenGmTieredTargetText(scoredTargets, 10);
+  const targets = maddenGmPositionAwareTargetText(scoredTargets, topNeeds, 4, 3);
 
   const needLines = topNeeds.map((row, index) => `${index + 1}. ${maddenTeamNeedEmoji(row.needScore)} **${row.position}** — Need ${row.needScore} • ${Number(row.starterAvg || 0).toFixed(1)} starter`);
   const strengthLines = topStrengths.map((row, index) => `${index + 1}. **${row.position}** — ${Number(row.starterAvg || 0).toFixed(1)} starter`);
@@ -17568,9 +17656,9 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
       { name: 'Roster Strengths / Surplus', value: maddenSafeEmbedText(strengthLines.join('\n') || 'No strengths found.', 1024), inline: false },
       { name: 'Suggested Targets', value: maddenSafeEmbedText(targets || 'No realistic target suggestions found.', 1024), inline: false },
       { name: 'Possible Trade Chips', value: maddenSafeEmbedText(tradable.join('\n') || 'No obvious trade chips found.', 1024), inline: false },
-      { name: 'Notes', value: 'GM Assistant 2.0 ranks targets by need fit, starter upgrade, value, and availability. Untouchable young stars are down-ranked or hidden from realistic targets.', inline: false }
+      { name: 'Notes', value: 'GM Assistant groups targets by priority need position, then ranks by starter upgrade, value, availability, and fit. Trade chips favor surplus, depth, veteran, and movable assets.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BO GM Assistant 2.0' })
+    .setFooter({ text: 'GG Sports • 7J-10BP Position-Aware GM' })
     .setTimestamp();
 }
 
@@ -17672,7 +17760,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
         .setTitle('Madden Trade Finder')
         .setColor(0xED4245)
         .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-        .setFooter({ text: 'GG Sports • 7J-10BO Availability Engine' })
+        .setFooter({ text: 'GG Sports • 7J-10BP Position-Aware GM' })
         .setTimestamp()
     };
   }
@@ -17829,7 +17917,7 @@ Filters: ${filterText}`)
         { name: 'Page', value: pageText, inline: false },
         { name: 'Notes', value: 'Packages can include one player, player + pick, two players, or two players + pick depending on the max assets setting. Same-team packages are generated together and position-similar matches receive a small realism boost.', inline: false }
       )
-      .setFooter({ text: 'GG Sports • 7J-10BO Availability Engine' })
+      .setFooter({ text: 'GG Sports • 7J-10BP Position-Aware GM' })
       .setTimestamp()
   };
 }
