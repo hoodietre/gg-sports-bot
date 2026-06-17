@@ -519,12 +519,18 @@ async function initDatabase() {
       offer_text TEXT,
       message TEXT,
       thread_id TEXT,
+      selected_package_json JSONB,
+      selected_package_index INTEGER,
+      committee_offer_id TEXT,
       status TEXT NOT NULL DEFAULT 'open',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS thread_id TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_json JSONB`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_index INTEGER`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS committee_offer_id TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_negotiations_lookup ON madden_trade_negotiations (guild_id, league_id, status, player_name)`);
 
   // 7J-8A-B: Madden career records foundation. This is hidden for now and is refreshed idempotently from imported stats.
@@ -2222,36 +2228,44 @@ async function buildTradeCountEmbed(league = null) {
 }
 
 function buildCommitteeEmbed(offer, approveCount, denyCount) {
-  return new EmbedBuilder()
+  const details = offer.offer_details || '';
+  const hasScreenshot = Boolean(offer.screenshot_url);
+  const embed = new EmbedBuilder()
     .setTitle('Trade Committee Vote')
     .setColor(0x5865F2)
     .addFields(
       { name: 'Offering Team', value: offer.sender_team || 'Unknown Team', inline: true },
       { name: 'Receiving Team', value: offer.target_team, inline: true },
       { name: 'Sent By', value: `<@${offer.sender_user_id}>`, inline: true },
-      { name: 'Screenshot', value: offer.screenshot_url || 'No screenshot', inline: false },
+      { name: 'Trade Details', value: maddenSafeEmbedText(details || 'No structured trade details were provided.', 1024), inline: false },
+      { name: 'Screenshot', value: hasScreenshot ? offer.screenshot_url : 'No screenshot required — submitted from Trade Negotiation Hub.', inline: false },
       { name: 'Approve Votes', value: String(approveCount), inline: true },
       { name: 'Deny Votes', value: String(denyCount), inline: true },
       { name: 'Status', value: offer.status || 'pending', inline: true }
     )
-    .setImage(offer.screenshot_url || null)
     .setFooter({ text: 'GG Sports • Trade Committee' })
     .setTimestamp();
+  if (hasScreenshot) embed.setImage(offer.screenshot_url);
+  return embed;
 }
 
 function buildFinalTradeEmbed(title, color, offer) {
-  return new EmbedBuilder()
+  const details = offer.offer_details || '';
+  const hasScreenshot = Boolean(offer.screenshot_url);
+  const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(color)
     .addFields(
       { name: 'Offering Team', value: offer.sender_team || 'Unknown Team', inline: true },
       { name: 'Receiving Team', value: offer.target_team || 'Unknown Team', inline: true },
       { name: 'Sent By', value: `<@${offer.sender_user_id}>`, inline: true },
-      { name: 'Screenshot', value: offer.screenshot_url || 'No screenshot', inline: false }
+      { name: 'Trade Details', value: maddenSafeEmbedText(details || 'No structured trade details were provided.', 1024), inline: false },
+      { name: 'Screenshot', value: hasScreenshot ? offer.screenshot_url : 'No screenshot required — submitted from Trade Negotiation Hub.', inline: false }
     )
-    .setImage(offer.screenshot_url || null)
     .setFooter({ text: 'GG Sports • Trade Result' })
     .setTimestamp();
+  if (hasScreenshot) embed.setImage(offer.screenshot_url);
+  return embed;
 }
 
 function buildTradeHistoryEmbed(league, rows, title = 'Trade History') {
@@ -5034,18 +5048,148 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_thread_tools:')) {
       const [, negotiationId, action] = interaction.customId.split(':');
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      if (!negotiation) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      const league = await getLeagueById(negotiation.league_id);
+      if (!league) {
+        await interaction.reply({ content: 'The league for this negotiation could not be found.', ephemeral: true });
+        return;
+      }
+
       if (action === 'packages') {
-        await interaction.reply({ content: 'Use the **📦 Find Packages** button from the negotiation hub to generate updated packages. Full in-thread package regeneration will be expanded in the next polish pass.', ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        const filters = {
+          teamFilter: negotiation.requesting_team || null,
+          excludeTeam: negotiation.listing_team || null,
+          maxAssets: 3,
+          prioritizeNeed: true,
+          contendersOnly: false,
+          rebuildersOnly: false,
+          tradeBlockOnly: false,
+          page: 0,
+          pageSize: 5,
+          limit: 60,
+        };
+        const payload = await buildMaddenTradeFinderPayload(negotiation.guild_id, league, negotiation.player_name, filters);
+        const packages = (payload.allMatches || payload.matches || []).slice(0, 5).map((candidate, index) => maddenTradeNegotiationPackageToJson(candidate, index));
+        if (!packages.length) {
+          await interaction.editReply({ content: 'No generated packages were found for this negotiation. Try adding more movable assets or draft picks.' });
+          return;
+        }
+        for (const pkg of packages) {
+          await interaction.channel.send({
+            embeds: [buildMaddenNegotiationPackageEmbed(league, negotiation, pkg)],
+            components: [buildMaddenNegotiationPackageButtons(negotiationId, pkg.index)],
+          }).catch(() => null);
+        }
+        await interaction.editReply({ content: `Generated **${packages.length}** package option(s) in this negotiation thread. Use **Select Package**, **Analyze**, or **Submit** on the package you want.` });
         return;
       }
+
       if (action === 'analyze') {
-        await interaction.showModal(buildMaddenTradeNegotiationAnalyzeModal(negotiationId));
+        const pkg = parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json);
+        if (!pkg) {
+          await interaction.reply({ content: 'No package selected yet. Press **Generate Packages**, then **Select Package** on one of the package embeds.', ephemeral: true });
+          return;
+        }
+        await interaction.deferReply();
+        await interaction.editReply({ embeds: [await analyzeMaddenNegotiationPackage(interaction.guild.id, league, negotiation, pkg)] });
         return;
       }
+
       if (action === 'submit') {
-        await interaction.reply({ content: 'To submit the official trade for approval, use your existing **Offer a Trade** panel and upload the in-game trade screenshot. BX links the negotiation; final approval still uses the current committee workflow.', ephemeral: true });
+        const pkg = parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json);
+        if (!pkg) {
+          await interaction.reply({ content: 'No package selected yet. Press **Generate Packages**, then **Select Package** before submitting.', ephemeral: true });
+          return;
+        }
+        await interaction.reply({ embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)], components: [buildMaddenNegotiationSubmitConfirmButtons(negotiationId)], ephemeral: true });
         return;
       }
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_pkg_select:')) {
+      const [, negotiationId, packageIndex] = interaction.customId.split(':');
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      const league = negotiation ? await getLeagueById(negotiation.league_id) : null;
+      if (!negotiation || !league) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      const embed = interaction.message.embeds?.[0];
+      const pkg = await rebuildMaddenNegotiationPackageByIndex(negotiation.guild_id, league, negotiation, Number(packageIndex));
+      if (!pkg) {
+        await interaction.reply({ content: 'That generated package could not be rebuilt. Press Generate Packages again.', ephemeral: true });
+        return;
+      }
+      await saveMaddenNegotiationSelectedPackage(negotiationId, pkg);
+      await interaction.reply({ content: `Selected **Package #${Number(packageIndex) + 1}** for this negotiation.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_pkg_analyze:')) {
+      const [, negotiationId, packageIndex] = interaction.customId.split(':');
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      const league = negotiation ? await getLeagueById(negotiation.league_id) : null;
+      if (!negotiation || !league) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply();
+      const pkg = await rebuildMaddenNegotiationPackageByIndex(negotiation.guild_id, league, negotiation, Number(packageIndex));
+      if (!pkg) {
+        await interaction.editReply({ content: 'That generated package could not be rebuilt. Press Generate Packages again.' });
+        return;
+      }
+      await saveMaddenNegotiationSelectedPackage(negotiationId, pkg);
+      await interaction.editReply({ embeds: [await analyzeMaddenNegotiationPackage(interaction.guild.id, league, negotiation, pkg)] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_pkg_submit:')) {
+      const [, negotiationId, packageIndex] = interaction.customId.split(':');
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      const league = negotiation ? await getLeagueById(negotiation.league_id) : null;
+      if (!negotiation || !league) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      const pkg = await rebuildMaddenNegotiationPackageByIndex(negotiation.guild_id, league, negotiation, Number(packageIndex));
+      if (!pkg) {
+        await interaction.reply({ content: 'That generated package could not be rebuilt. Press Generate Packages again.', ephemeral: true });
+        return;
+      }
+      await saveMaddenNegotiationSelectedPackage(negotiationId, pkg);
+      await interaction.reply({ embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)], components: [buildMaddenNegotiationSubmitConfirmButtons(negotiationId)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_submit_confirm:')) {
+      const [, negotiationId, decision] = interaction.customId.split(':');
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      const league = negotiation ? await getLeagueById(negotiation.league_id) : null;
+      if (!negotiation || !league) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      if (decision === 'no') {
+        await interaction.update({ content: 'Official trade submission cancelled.', embeds: [], components: [] });
+        return;
+      }
+      const pkg = parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json);
+      if (!pkg) {
+        await interaction.update({ content: 'No selected package found. Generate and select a package before submitting.', embeds: [], components: [] });
+        return;
+      }
+      const result = await submitMaddenNegotiationPackageToCommittee(interaction, negotiation, league, pkg);
+      await interaction.update({ content: result.message, embeds: [], components: [] });
+      if (interaction.channel?.send) {
+        await interaction.channel.send({ content: result.ok ? `✅ Official trade submitted to committee for **${negotiation.player_name}**.` : `⚠️ ${result.message}` }).catch(() => null);
+      }
+      return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('maddenvalues_page:')) {
@@ -18313,6 +18457,9 @@ async function ensureMaddenTradeNegotiationTables() {
       offer_text TEXT,
       message TEXT,
       thread_id TEXT,
+      selected_package_json JSONB,
+      selected_package_index INTEGER,
+      committee_offer_id TEXT,
       status TEXT NOT NULL DEFAULT 'open',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -18321,6 +18468,9 @@ async function ensureMaddenTradeNegotiationTables() {
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS offer_text TEXT`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS message TEXT`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS thread_id TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_json JSONB`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_index INTEGER`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS committee_offer_id TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_negotiations_lookup ON madden_trade_negotiations (guild_id, league_id, status, player_name)`);
 }
 
@@ -18412,7 +18562,7 @@ function buildMaddenTradeNegotiationHubEmbed(league, listing, negotiation, reque
       { name: 'Opened By', value: requesterUserId ? `<@${requesterUserId}>` : 'Unknown GM', inline: true },
       { name: 'Negotiation ID', value: shortGameId(negotiation.id), inline: true }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX-A Trade Negotiation Hub' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-B Trade Negotiation Hub' })
     .setTimestamp();
 }
 
@@ -18427,7 +18577,7 @@ function buildMaddenTradeNegotiationProposalEmbed(negotiation) {
       { name: 'Offer', value: maddenSafeEmbedText(negotiation.offer_text || 'No offer text provided.', 1024), inline: false },
       { name: 'Message', value: maddenSafeEmbedText(negotiation.message || 'No message provided.', 1024), inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX-A Trade Negotiation Hub' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-B Trade Negotiation Hub' })
     .setTimestamp();
 }
 
@@ -18437,7 +18587,7 @@ async function createMaddenTradeNegotiationHub(guildId, league, member, userId, 
   if (!listing) {
     return {
       ok: false,
-      embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription('That player is not currently listed on the Madden trade block.').setFooter({ text: 'GG Sports • 7J-10BX-A Trade Negotiation Hub' }).setTimestamp(),
+      embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription('That player is not currently listed on the Madden trade block.').setFooter({ text: 'GG Sports • 7J-10BX-B Trade Negotiation Hub' }).setTimestamp(),
       components: [],
     };
   }
@@ -18610,6 +18760,249 @@ async function createMaddenTradeNegotiationThread(negotiation, discordClient, fa
   }));
 
   return { ok: true, message: `Interest registered and negotiation thread created: <#${thread.id}>` };
+}
+
+
+// 7J-10BX-B: Button-based negotiation package workflow.
+function maddenTradeNegotiationPackageToJson(candidate, index = 0) {
+  const players = (candidate?.players || []).filter(Boolean).map(player => ({
+    player_name: maddenValuePlayerName(player),
+    team_name: player.resolved_team_name || player.team_name || null,
+    position: player.position || null,
+    overall: player.overall || null,
+    value_score: Number(calculateMaddenPlayerValue(player).valueScore || 0),
+  }));
+  const pick = candidate?.pick ? {
+    raw: candidate.pick.raw || candidate.pick.label || null,
+    label: candidate.pick.label || String(candidate.pick.raw || 'Draft Pick'),
+    year: candidate.pick.year || null,
+    round: candidate.pick.round || null,
+    pick: candidate.pick.pick || null,
+    team: candidate.pick.team || null,
+    value_score: Number(candidate.pick.valueScore || 0),
+  } : null;
+  return {
+    index,
+    players,
+    picks: pick ? [pick] : [],
+    total: Number(candidate?.total || 0),
+    diff: Number(candidate?.diff || 0),
+    fit_score: Number(candidate?.fitScore || 0),
+    asset_count: Number(candidate?.assetCount || players.length + (pick ? 1 : 0)),
+    availability: candidate?.availability || null,
+    need: candidate?.needInfo || null,
+    generated_at: new Date().toISOString(),
+  };
+}
+
+function maddenTradeNegotiationPackageTitle(pkg) {
+  const playerText = (pkg.players || []).map(p => p.player_name).filter(Boolean).join(' + ');
+  const pickText = (pkg.picks || []).map(p => p.label).filter(Boolean).join(' + ');
+  return [playerText, pickText].filter(Boolean).join(' + ') || 'Trade Package';
+}
+
+function buildMaddenNegotiationPackageEmbed(league, negotiation, pkg) {
+  const playerLines = (pkg.players || []).length
+    ? pkg.players.map((p, i) => `${i + 1}. **${p.player_name}** — ${getMaddenTeamAbbrev(p.team_name) || p.team_name || 'FA'} ${p.position || 'POS'} • ${p.overall || 'N/A'} OVR • ${Number(p.value_score || 0).toFixed(0)}`).join('\n')
+    : 'No players in this package.';
+  const pickLines = (pkg.picks || []).length
+    ? pkg.picks.map((p, i) => `${i + 1}. **${p.label}** — ${Number(p.value_score || 0).toFixed(1)}`).join('\n')
+    : 'No picks in this package.';
+  const diffText = Number(pkg.diff || 0) >= 0 ? `+${Number(pkg.diff || 0).toFixed(1)} offer side` : `${Number(pkg.diff || 0).toFixed(1)} offer side`;
+  return new EmbedBuilder()
+    .setTitle(`Generated Trade Package #${Number(pkg.index || 0) + 1}`)
+    .setColor(0xFEE75C)
+    .setDescription(`${league?.league_name || 'Madden League'} • Target: **${negotiation.player_name}**`)
+    .addFields(
+      { name: 'Offering Team Package', value: maddenSafeEmbedText(playerLines, 1024), inline: false },
+      { name: 'Draft Picks', value: maddenSafeEmbedText(pickLines, 1024), inline: false },
+      { name: 'Package Summary', value: `Value: **${Number(pkg.total || 0).toFixed(1)}** • Difference: **${diffText}** • Fit: **${Number(pkg.fit_score || 0)}** • Assets: **${Number(pkg.asset_count || 0)}**`, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BX-B Button-Based Negotiation' })
+    .setTimestamp();
+}
+
+function buildMaddenNegotiationPackageButtons(negotiationId, packageIndex, selected = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`maddentrade_neg_pkg_select:${negotiationId}:${packageIndex}`)
+      .setLabel(selected ? 'Selected Package' : 'Select Package')
+      .setEmoji(selected ? '✅' : '📌')
+      .setStyle(selected ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`maddentrade_neg_pkg_analyze:${negotiationId}:${packageIndex}`)
+      .setLabel('Analyze')
+      .setEmoji('⚖️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`maddentrade_neg_pkg_submit:${negotiationId}:${packageIndex}`)
+      .setLabel('Submit')
+      .setEmoji('📨')
+      .setStyle(ButtonStyle.Success)
+  );
+}
+
+async function saveMaddenNegotiationSelectedPackage(negotiationId, pkg) {
+  await ensureMaddenTradeNegotiationTables();
+  await pool.query(
+    `UPDATE madden_trade_negotiations
+     SET selected_package_json = $1::jsonb, selected_package_index = $2, updated_at = NOW()
+     WHERE id = $3`,
+    [JSON.stringify(pkg || {}), Number(pkg?.index || 0), negotiationId]
+  );
+}
+
+function parseMaddenNegotiationSelectedPackage(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function analyzeMaddenNegotiationPackage(guildId, league, negotiation, pkg) {
+  const playerInput = (pkg.players || []).map(p => p.player_name).filter(Boolean).join('\n');
+  const pickInputs = (pkg.picks || []).map(p => p.raw || p.label).filter(Boolean);
+  const sideA = await resolveMaddenTradeAnalyzerSide(guildId, league.league_id, playerInput, pickInputs);
+  const sideB = await resolveMaddenTradeAnalyzerSide(guildId, league.league_id, negotiation.player_name, []);
+  return buildMaddenTradeAnalyzerEmbed(league, {
+    labelA: negotiation.requesting_team || 'Offering Team',
+    labelB: negotiation.listing_team || 'Listed Team',
+    sideAInput: playerInput,
+    sideBInput: negotiation.player_name,
+    sideA,
+    sideB,
+  }).setFooter({ text: 'GG Sports • 7J-10BX-B Package Analysis' });
+}
+
+function buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg) {
+  return new EmbedBuilder()
+    .setTitle('Confirm Official Trade Submission')
+    .setColor(0xED4245)
+    .setDescription('This will send the selected package directly to the trade committee for voting. No screenshot will be requested because the negotiation hub already has the trade data.')
+    .addFields(
+      { name: 'League', value: league?.league_name || 'Madden League', inline: true },
+      { name: 'Target', value: `**${negotiation.player_name}**`, inline: true },
+      { name: 'From', value: `${maddenTeamDisplayName(negotiation.requesting_team || 'Offering Team')} • <@${negotiation.requesting_user_id}>`, inline: false },
+      { name: 'To', value: `${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')} • <@${negotiation.listing_user_id}>`, inline: false },
+      { name: 'Selected Package', value: maddenSafeEmbedText(maddenTradeNegotiationPackageTitle(pkg), 1024), inline: false },
+      { name: 'Value Summary', value: `Package: **${Number(pkg.total || 0).toFixed(1)}** • Difference: **${Number(pkg.diff || 0).toFixed(1)}** • Fit: **${Number(pkg.fit_score || 0)}**`, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BX-B Confirm Submission' })
+    .setTimestamp();
+}
+
+function buildMaddenNegotiationSubmitConfirmButtons(negotiationId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`maddentrade_neg_submit_confirm:${negotiationId}:yes`).setLabel('Confirm Submit').setEmoji('✅').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`maddentrade_neg_submit_confirm:${negotiationId}:no`).setLabel('Cancel').setEmoji('❌').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function getMaddenLeagueTeamRoleIdByName(leagueId, teamName) {
+  if (!leagueId || !teamName) return null;
+  const display = String(maddenTeamDisplayName(teamName) || teamName).toLowerCase();
+  const abbr = String(getMaddenTeamAbbrev(teamName) || '').toLowerCase();
+  const result = await pool.query(
+    `SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1`,
+    [leagueId]
+  );
+  const row = (result.rows || []).find(r => {
+    const name = String(r.role_name || '').toLowerCase();
+    return name === display || name.includes(display) || display.includes(name) || (abbr && name.includes(abbr));
+  });
+  return row?.role_id || null;
+}
+
+function buildMaddenNegotiationOfferDetails(negotiation, pkg) {
+  const players = (pkg.players || []).map(p => `${p.player_name} (${p.position || 'POS'} • ${p.overall || 'N/A'} OVR)`).join('\n') || 'None';
+  const picks = (pkg.picks || []).map(p => p.label).join('\n') || 'None';
+  return [
+    `Trade Negotiation Hub Submission`,
+    `Target: ${negotiation.player_name}`,
+    `From: ${maddenTeamDisplayName(negotiation.requesting_team || 'Offering Team')}`,
+    `To: ${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')}`,
+    ``,
+    `Offering Team Sends:`,
+    players,
+    picks !== 'None' ? `\nDraft Picks:\n${picks}` : '',
+    ``,
+    `Listed Team Sends:`,
+    negotiation.player_name,
+    ``,
+    `Package Value: ${Number(pkg.total || 0).toFixed(1)}`,
+    `Difference: ${Number(pkg.diff || 0).toFixed(1)}`,
+    `Fit Score: ${Number(pkg.fit_score || 0)}`,
+  ].filter(line => line !== '').join('\n');
+}
+
+
+async function rebuildMaddenNegotiationPackageByIndex(guildId, league, negotiation, packageIndex = 0) {
+  const filters = {
+    teamFilter: negotiation.requesting_team || null,
+    excludeTeam: negotiation.listing_team || null,
+    maxAssets: 3,
+    prioritizeNeed: true,
+    contendersOnly: false,
+    rebuildersOnly: false,
+    tradeBlockOnly: false,
+    page: 0,
+    pageSize: 5,
+    limit: 60,
+  };
+  const payload = await buildMaddenTradeFinderPayload(guildId, league, negotiation.player_name, filters);
+  const candidate = (payload.allMatches || payload.matches || [])[Number(packageIndex || 0)];
+  return candidate ? maddenTradeNegotiationPackageToJson(candidate, Number(packageIndex || 0)) : null;
+}
+
+async function submitMaddenNegotiationPackageToCommittee(interaction, negotiation, league, pkg) {
+  const existingOfferId = negotiation.committee_offer_id;
+  if (existingOfferId) {
+    return { ok: true, message: `This negotiation has already been submitted to committee as trade offer **${shortGameId(existingOfferId)}**.` };
+  }
+
+  const committeeChannelId = league?.trade_committee_channel_id || league?.committee_channel_id || COMMITTEE_CHANNEL_ID;
+  const committeeRoleId = league?.trade_committee_role_id || league?.committee_role_id || COMMITTEE_ROLE_ID;
+  const committeeChannel = await interaction.client.channels.fetch(committeeChannelId).catch(() => null);
+  if (!committeeChannel || !committeeChannel.isTextBased?.()) {
+    return { ok: false, message: 'Committee channel not found. Set the trade committee channel before submitting official negotiation trades.' };
+  }
+
+  const offerId = randomUUID();
+  const senderRoleId = await getMaddenLeagueTeamRoleIdByName(league?.league_id, negotiation.requesting_team);
+  const targetRoleId = await getMaddenLeagueTeamRoleIdByName(league?.league_id, negotiation.listing_team);
+  const details = buildMaddenNegotiationOfferDetails(negotiation, pkg);
+
+  await pool.query(
+    `INSERT INTO trade_offers (
+       id, guild_id, league_id, sender_user_id, sender_team, sender_team_role_id,
+       target_team, target_team_role_id, target_owner_user_id, offer_details, screenshot_url, status
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', 'owner_accepted')`,
+    [offerId, interaction.guild.id, league?.league_id || null, negotiation.requesting_user_id, negotiation.requesting_team || 'Offering Team', senderRoleId, negotiation.listing_team || 'Listing Team', targetRoleId, negotiation.listing_user_id, details]
+  );
+
+  const offerRow = {
+    id: offerId,
+    guild_id: interaction.guild.id,
+    league_id: league?.league_id || null,
+    sender_user_id: negotiation.requesting_user_id,
+    sender_team: negotiation.requesting_team || 'Offering Team',
+    sender_team_role_id: senderRoleId,
+    target_team: negotiation.listing_team || 'Listing Team',
+    target_team_role_id: targetRoleId,
+    target_owner_user_id: negotiation.listing_user_id,
+    offer_details: details,
+    screenshot_url: '',
+    status: 'owner_accepted',
+  };
+
+  const committeeMessage = await committeeChannel.send({
+    content: committeeRoleId ? `<@&${committeeRoleId}>` : undefined,
+    embeds: [buildCommitteeEmbed(offerRow, 0, 0)],
+    components: [buildCommitteeVoteButtons(offerId)],
+    allowedMentions: { roles: committeeRoleId ? [committeeRoleId] : [], users: [] },
+  });
+  await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
+  await pool.query(`UPDATE madden_trade_negotiations SET committee_offer_id = $1, status = 'proposal_sent', updated_at = NOW() WHERE id = $2`, [offerId, negotiation.id]);
+  return { ok: true, message: `Official trade submitted to committee: <#${committeeChannel.id}>` };
 }
 
 async function cleanupMaddenTradeBlockAfterRosterSync(guildId, leagueId) {
@@ -19285,6 +19678,11 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
 
   return {
     totalMatches: allMatches.length,
+    allMatches,
+    matches,
+    target,
+    targetValue,
+    targetScore,
     embed: new EmbedBuilder()
       .setTitle('Madden Trade Finder')
       .setColor(0xFEE75C)
