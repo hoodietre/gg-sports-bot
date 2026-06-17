@@ -17688,7 +17688,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden Team Needs').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BRA Trade Chip Roster Data Fix' }).setTimestamp();
   }
 
   const formatNeed = (row, index) => {
@@ -17720,7 +17720,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
       { name: 'Suggested Targets', value: maddenSafeEmbedText(targets || 'No realistic outside targets found for top needs.', 1024), inline: false },
       { name: 'GM Notes', value: `Surplus groups: **${surplus}**\nNeeds are based on starter quality, depth quality, missing bodies, and positional importance. Suggested targets are grouped by need position, then ranked by upgrade, availability, and value fit.`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
+    .setFooter({ text: 'GG Sports • 7J-10BRA Trade Chip Roster Data Fix' })
     .setTimestamp();
 }
 
@@ -17730,7 +17730,7 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
   const wanted = maddenTradeNormalizeTeamKey(teamName);
   let teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
   if (!teamNeed) {
-    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' }).setTimestamp();
+    return new EmbedBuilder().setTitle('Madden GM Assistant').setColor(0xED4245).setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`).setFooter({ text: 'GG Sports • 7J-10BRA Trade Chip Roster Data Fix' }).setTimestamp();
   }
 
   const allPlayers = await getMaddenTradeFinderPlayerRows(guildId, league.league_id, null).catch(() => []);
@@ -17762,7 +17762,7 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
       { name: 'Possible Trade Chips', value: maddenSafeEmbedText(tradableText || 'No obvious trade chips found.', 1024), inline: false },
       { name: 'Notes', value: 'GM Assistant groups targets by priority need position, then ranks by starter upgrade, value, availability, and fit. Trade chips favor surplus, depth, veteran, and movable assets.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
+    .setFooter({ text: 'GG Sports • 7J-10BRA Trade Chip Roster Data Fix' })
     .setTimestamp();
 }
 
@@ -17864,7 +17864,7 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
         .setTitle('Madden Trade Finder')
         .setColor(0xED4245)
         .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}. Use autocomplete for best results.`)
-        .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
+        .setFooter({ text: 'GG Sports • 7J-10BRA Trade Chip Roster Data Fix' })
         .setTimestamp()
     };
   }
@@ -18021,7 +18021,7 @@ Filters: ${filterText}`)
         { name: 'Page', value: pageText, inline: false },
         { name: 'Notes', value: 'Packages can include one player, player + pick, two players, or two players + pick depending on the max assets setting. Same-team packages are generated together and position-similar matches receive a small realism boost.', inline: false }
       )
-      .setFooter({ text: 'GG Sports • 7J-10BR Trade Chip Debug + Fallback' })
+      .setFooter({ text: 'GG Sports • 7J-10BRA Trade Chip Roster Data Fix' })
       .setTimestamp()
   };
 }
@@ -18060,7 +18060,10 @@ function parseMaddenTradeAssetInput(input) {
 }
 
 function maddenTradeAnalyzerTeamKey(player) {
-  return String(player?.resolved_team_name || player?.team_name || '').trim().toLowerCase();
+  // 7J-10BRA: normalize team keys the same way the Needs/GM model does.
+  // The chip engine compares against teamNeed.teamKey (abbr-normalized like "kc", "buf").
+  // Returning a raw team name like "Chiefs" caused roster filtering to produce 0 players.
+  return maddenTradeNormalizeTeamKey(player?.resolved_team_name || player?.team_name || player?.team_abbr || '');
 }
 
 function maddenTradeAnalyzerTeamLabel(player) {
