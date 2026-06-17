@@ -522,6 +522,10 @@ async function initDatabase() {
       selected_package_json JSONB,
       selected_package_index INTEGER,
       committee_offer_id TEXT,
+      requesting_confirmed_by TEXT,
+      requesting_confirmed_at TIMESTAMPTZ,
+      listing_confirmed_by TEXT,
+      listing_confirmed_at TIMESTAMPTZ,
       status TEXT NOT NULL DEFAULT 'open',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -531,6 +535,10 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_json JSONB`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_index INTEGER`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS committee_offer_id TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS requesting_confirmed_by TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS requesting_confirmed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_by TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_at TIMESTAMPTZ`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_negotiations_lookup ON madden_trade_negotiations (guild_id, league_id, status, player_name)`);
 
   // 7J-8A-B: Madden career records foundation. This is hidden for now and is refreshed idempotently from imported stats.
@@ -4861,6 +4869,34 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       }
     }
 
+
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('maddentrade_neg_edit_')) {
+      const [prefix, negotiationId] = interaction.customId.split(':');
+      const action = prefix.replace('maddentrade_neg_edit_', '');
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      const league = negotiation ? await getLeagueById(negotiation.league_id) : null;
+      if (!negotiation || !league) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      if (![negotiation.requesting_user_id, negotiation.listing_user_id].map(String).includes(String(interaction.user.id))) {
+        await interaction.reply({ content: 'Only the two GMs in this negotiation can edit this package.', ephemeral: true });
+        return;
+      }
+      await interaction.deferUpdate();
+      const selectedValue = interaction.values?.[0];
+      const pkg = await applyMaddenNegotiationPackageEdit(negotiation, league, action, selectedValue);
+      if (!pkg) {
+        await interaction.followUp({ content: 'No selected package found. Select a generated package before editing.', ephemeral: true });
+        return;
+      }
+      const refreshed = await getMaddenTradeNegotiationById(negotiationId);
+      const panel = await buildMaddenNegotiationEditPanel(interaction, refreshed, league, pkg);
+      await interaction.editReply({ embeds: [panel.embed], components: panel.components });
+      await interaction.followUp({ content: 'Package updated. Both owner confirmations were reset because the package changed.', ephemeral: true });
+      return;
+    }
     
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_select_setting:')) {
       const leagueId = interaction.customId.split(':')[1];
@@ -5149,6 +5185,39 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_pkg_edit:')) {
+      const [, negotiationId, packageIndex] = interaction.customId.split(':');
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      const league = negotiation ? await getLeagueById(negotiation.league_id) : null;
+      if (!negotiation || !league) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      if (![negotiation.requesting_user_id, negotiation.listing_user_id].map(String).includes(String(interaction.user.id))) {
+        await interaction.reply({ content: 'Only the two GMs in this negotiation can edit this package.', ephemeral: true });
+        return;
+      }
+      let pkg = parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json);
+      if (!pkg || Number(pkg.index) !== Number(packageIndex)) {
+        pkg = await rebuildMaddenNegotiationPackageByIndex(negotiation.guild_id, league, negotiation, Number(packageIndex));
+        if (!pkg) {
+          await interaction.reply({ content: 'That generated package could not be rebuilt. Press Generate Packages again.', ephemeral: true });
+          return;
+        }
+        await saveMaddenNegotiationSelectedPackage(negotiationId, pkg, true);
+      }
+      const refreshed = await getMaddenTradeNegotiationById(negotiationId);
+      const panel = await buildMaddenNegotiationEditPanel(interaction, refreshed, league, pkg);
+      await interaction.reply({ embeds: [panel.embed], components: panel.components, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_edit_done:')) {
+      await interaction.update({ content: 'Finished editing this package. Use **Analyze** to review it or **Submit** to start dual confirmation.', embeds: [], components: [] });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_pkg_submit:')) {
       const [, negotiationId, packageIndex] = interaction.customId.split(':');
       const negotiation = await getMaddenTradeNegotiationById(negotiationId);
@@ -5169,7 +5238,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_submit_confirm:')) {
       const [, negotiationId, decision] = interaction.customId.split(':');
-      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      let negotiation = await getMaddenTradeNegotiationById(negotiationId);
       const league = negotiation ? await getLeagueById(negotiation.league_id) : null;
       if (!negotiation || !league) {
         await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
@@ -5179,15 +5248,40 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await interaction.update({ content: 'Official trade submission cancelled.', embeds: [], components: [] });
         return;
       }
+      if (![negotiation.requesting_user_id, negotiation.listing_user_id].map(String).includes(String(interaction.user.id))) {
+        await interaction.reply({ content: 'Only the two GMs in this negotiation can confirm the trade package.', ephemeral: true });
+        return;
+      }
       const pkg = parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json);
       if (!pkg) {
         await interaction.update({ content: 'No selected package found. Generate and select a package before submitting.', embeds: [], components: [] });
         return;
       }
+
+      const side = await recordMaddenNegotiationConfirmation(negotiation, interaction.user.id);
+      negotiation = await getMaddenTradeNegotiationById(negotiationId);
+
+      if (!maddenNegotiationBothConfirmed(negotiation)) {
+        await interaction.update({ embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)], components: [buildMaddenNegotiationSubmitConfirmButtons(negotiationId)] });
+        const waitingFor = side === 'requesting' ? negotiation.listing_user_id : negotiation.requesting_user_id;
+        if (interaction.channel?.send) {
+          await interaction.channel.send({
+            content: `✅ <@${interaction.user.id}> confirmed this package. Waiting for <@${waitingFor}> to confirm before committee submission.`,
+            embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)],
+            components: [buildMaddenNegotiationSubmitConfirmButtons(negotiationId)],
+            allowedMentions: { users: [waitingFor, interaction.user.id], roles: [] },
+          }).catch(() => null);
+        }
+        return;
+      }
+
+      await interaction.update({ embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)], components: [] });
       const result = await submitMaddenNegotiationPackageToCommittee(interaction, negotiation, league, pkg);
-      await interaction.update({ content: result.message, embeds: [], components: [] });
       if (interaction.channel?.send) {
-        await interaction.channel.send({ content: result.ok ? `✅ Official trade submitted to committee for **${negotiation.player_name}**.` : `⚠️ ${result.message}` }).catch(() => null);
+        await interaction.channel.send({ content: result.ok ? `✅ Both GMs confirmed. Official trade submitted to committee for **${negotiation.player_name}**.` : `⚠️ ${result.message}` }).catch(() => null);
+      }
+      if (!result.ok) {
+        await interaction.followUp({ content: result.message, ephemeral: true }).catch(() => null);
       }
       return;
     }
@@ -18460,6 +18554,10 @@ async function ensureMaddenTradeNegotiationTables() {
       selected_package_json JSONB,
       selected_package_index INTEGER,
       committee_offer_id TEXT,
+      requesting_confirmed_by TEXT,
+      requesting_confirmed_at TIMESTAMPTZ,
+      listing_confirmed_by TEXT,
+      listing_confirmed_at TIMESTAMPTZ,
       status TEXT NOT NULL DEFAULT 'open',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -18471,6 +18569,10 @@ async function ensureMaddenTradeNegotiationTables() {
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_json JSONB`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS selected_package_index INTEGER`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS committee_offer_id TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS requesting_confirmed_by TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS requesting_confirmed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_by TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_at TIMESTAMPTZ`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_negotiations_lookup ON madden_trade_negotiations (guild_id, league_id, status, player_name)`);
 }
 
@@ -18562,7 +18664,7 @@ function buildMaddenTradeNegotiationHubEmbed(league, listing, negotiation, reque
       { name: 'Opened By', value: requesterUserId ? `<@${requesterUserId}>` : 'Unknown GM', inline: true },
       { name: 'Negotiation ID', value: shortGameId(negotiation.id), inline: true }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX-B Trade Negotiation Hub' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-C Trade Negotiation Hub' })
     .setTimestamp();
 }
 
@@ -18577,7 +18679,7 @@ function buildMaddenTradeNegotiationProposalEmbed(negotiation) {
       { name: 'Offer', value: maddenSafeEmbedText(negotiation.offer_text || 'No offer text provided.', 1024), inline: false },
       { name: 'Message', value: maddenSafeEmbedText(negotiation.message || 'No message provided.', 1024), inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX-B Trade Negotiation Hub' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-C Trade Negotiation Hub' })
     .setTimestamp();
 }
 
@@ -18587,7 +18689,7 @@ async function createMaddenTradeNegotiationHub(guildId, league, member, userId, 
   if (!listing) {
     return {
       ok: false,
-      embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription('That player is not currently listed on the Madden trade block.').setFooter({ text: 'GG Sports • 7J-10BX-B Trade Negotiation Hub' }).setTimestamp(),
+      embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription('That player is not currently listed on the Madden trade block.').setFooter({ text: 'GG Sports • 7J-10BX-C Trade Negotiation Hub' }).setTimestamp(),
       components: [],
     };
   }
@@ -18763,7 +18865,7 @@ async function createMaddenTradeNegotiationThread(negotiation, discordClient, fa
 }
 
 
-// 7J-10BX-B: Button-based negotiation package workflow.
+// 7J-10BX-C: Button-based negotiation package workflow.
 function maddenTradeNegotiationPackageToJson(candidate, index = 0) {
   const players = (candidate?.players || []).filter(Boolean).map(player => ({
     player_name: maddenValuePlayerName(player),
@@ -18818,7 +18920,7 @@ function buildMaddenNegotiationPackageEmbed(league, negotiation, pkg) {
       { name: 'Draft Picks', value: maddenSafeEmbedText(pickLines, 1024), inline: false },
       { name: 'Package Summary', value: `Value: **${Number(pkg.total || 0).toFixed(1)}** • Difference: **${diffText}** • Fit: **${Number(pkg.fit_score || 0)}** • Assets: **${Number(pkg.asset_count || 0)}**`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX-B Button-Based Negotiation' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-C Edit Package + Dual Confirm' })
     .setTimestamp();
 }
 
@@ -18835,6 +18937,11 @@ function buildMaddenNegotiationPackageButtons(negotiationId, packageIndex, selec
       .setEmoji('⚖️')
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
+      .setCustomId(`maddentrade_neg_pkg_edit:${negotiationId}:${packageIndex}`)
+      .setLabel('Edit Package')
+      .setEmoji('🛠️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
       .setCustomId(`maddentrade_neg_pkg_submit:${negotiationId}:${packageIndex}`)
       .setLabel('Submit')
       .setEmoji('📨')
@@ -18842,8 +18949,23 @@ function buildMaddenNegotiationPackageButtons(negotiationId, packageIndex, selec
   );
 }
 
-async function saveMaddenNegotiationSelectedPackage(negotiationId, pkg) {
+async function saveMaddenNegotiationSelectedPackage(negotiationId, pkg, resetConfirmations = true) {
   await ensureMaddenTradeNegotiationTables();
+  if (resetConfirmations) {
+    await pool.query(
+      `UPDATE madden_trade_negotiations
+       SET selected_package_json = $1::jsonb,
+           selected_package_index = $2,
+           requesting_confirmed_by = NULL,
+           requesting_confirmed_at = NULL,
+           listing_confirmed_by = NULL,
+           listing_confirmed_at = NULL,
+           updated_at = NOW()
+       WHERE id = $3`,
+      [JSON.stringify(pkg || {}), Number(pkg?.index || 0), negotiationId]
+    );
+    return;
+  }
   await pool.query(
     `UPDATE madden_trade_negotiations
      SET selected_package_json = $1::jsonb, selected_package_index = $2, updated_at = NOW()
@@ -18870,29 +18992,32 @@ async function analyzeMaddenNegotiationPackage(guildId, league, negotiation, pkg
     sideBInput: negotiation.player_name,
     sideA,
     sideB,
-  }).setFooter({ text: 'GG Sports • 7J-10BX-B Package Analysis' });
+  }).setFooter({ text: 'GG Sports • 7J-10BX-C Package Analysis' });
 }
 
 function buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg) {
+  const requestingConfirmed = negotiation?.requesting_confirmed_by ? `✅ <@${negotiation.requesting_confirmed_by}>` : '⏳ Waiting';
+  const listingConfirmed = negotiation?.listing_confirmed_by ? `✅ <@${negotiation.listing_confirmed_by}>` : '⏳ Waiting';
   return new EmbedBuilder()
-    .setTitle('Confirm Official Trade Submission')
+    .setTitle('Dual Confirmation Required')
     .setColor(0xED4245)
-    .setDescription('This will send the selected package directly to the trade committee for voting. No screenshot will be requested because the negotiation hub already has the trade data.')
+    .setDescription('Both owners must confirm this package before it is sent to the trade committee. No screenshot will be requested because the negotiation hub already has the trade data.')
     .addFields(
       { name: 'League', value: league?.league_name || 'Madden League', inline: true },
       { name: 'Target', value: `**${negotiation.player_name}**`, inline: true },
       { name: 'From', value: `${maddenTeamDisplayName(negotiation.requesting_team || 'Offering Team')} • <@${negotiation.requesting_user_id}>`, inline: false },
       { name: 'To', value: `${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')} • <@${negotiation.listing_user_id}>`, inline: false },
       { name: 'Selected Package', value: maddenSafeEmbedText(maddenTradeNegotiationPackageTitle(pkg), 1024), inline: false },
-      { name: 'Value Summary', value: `Package: **${Number(pkg.total || 0).toFixed(1)}** • Difference: **${Number(pkg.diff || 0).toFixed(1)}** • Fit: **${Number(pkg.fit_score || 0)}**`, inline: false }
+      { name: 'Value Summary', value: `Package: **${Number(pkg.total || 0).toFixed(1)}** • Difference: **${Number(pkg.diff || 0).toFixed(1)}** • Fit: **${Number(pkg.fit_score || 0)}**`, inline: false },
+      { name: 'Confirmations', value: `Requesting Owner: ${requestingConfirmed}\nListing Owner: ${listingConfirmed}`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX-B Confirm Submission' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-C Dual Confirmation' })
     .setTimestamp();
 }
 
 function buildMaddenNegotiationSubmitConfirmButtons(negotiationId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`maddentrade_neg_submit_confirm:${negotiationId}:yes`).setLabel('Confirm Submit').setEmoji('✅').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`maddentrade_neg_submit_confirm:${negotiationId}:yes`).setLabel('Confirm My Side').setEmoji('✅').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`maddentrade_neg_submit_confirm:${negotiationId}:no`).setLabel('Cancel').setEmoji('❌').setStyle(ButtonStyle.Secondary)
   );
 }
@@ -18932,6 +19057,170 @@ function buildMaddenNegotiationOfferDetails(negotiation, pkg) {
     `Difference: ${Number(pkg.diff || 0).toFixed(1)}`,
     `Fit Score: ${Number(pkg.fit_score || 0)}`,
   ].filter(line => line !== '').join('\n');
+}
+
+
+function recalculateMaddenNegotiationPackage(pkg) {
+  const clean = { ...(pkg || {}) };
+  clean.players = Array.isArray(clean.players) ? clean.players : [];
+  clean.picks = Array.isArray(clean.picks) ? clean.picks : [];
+  const playerTotal = clean.players.reduce((sum, p) => sum + Number(p.value_score || p.valueScore || 0), 0);
+  const pickTotal = clean.picks.reduce((sum, p) => sum + Number(p.value_score || p.valueScore || 0), 0);
+  const oldTargetValue = Number(clean.target_value || (Number(clean.total || 0) - Number(clean.diff || 0)) || 0);
+  clean.target_value = oldTargetValue;
+  clean.total = Number((playerTotal + pickTotal).toFixed(1));
+  clean.diff = Number((clean.total - oldTargetValue).toFixed(1));
+  clean.asset_count = clean.players.length + clean.picks.length;
+  clean.edited_at = new Date().toISOString();
+  clean.is_edited = true;
+  return clean;
+}
+
+async function getMaddenNegotiationEditablePlayers(guildId, leagueId, teamName, existingNames = []) {
+  const existing = new Set((existingNames || []).map(v => String(v || '').toLowerCase()));
+  const result = await pool.query(
+    `SELECT player_id, player_name, team_name, position, overall, value_score, trade_tier
+     FROM madden_player_values
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+       AND LOWER(COALESCE(team_name, '')) = LOWER($3::text)
+       AND NOT (LOWER(player_name) = ANY($4::text[]))
+     ORDER BY value_score DESC NULLS LAST, overall DESC NULLS LAST, player_name ASC
+     LIMIT 25`,
+    [guildId, leagueId, teamName || '', Array.from(existing)]
+  );
+  return result.rows || [];
+}
+
+function buildMaddenNegotiationEditPackageComponents(negotiationId, pkg, addablePlayers = [], addablePicks = []) {
+  const rows = [];
+  const assetOptions = [];
+  for (const [index, player] of (pkg.players || []).entries()) {
+    assetOptions.push({
+      label: String(player.player_name || 'Player').slice(0, 100),
+      description: `${player.position || 'POS'} • ${player.overall || 'N/A'} OVR • ${Number(player.value_score || 0).toFixed(0)}`.slice(0, 100),
+      value: `player:${index}`,
+    });
+  }
+  for (const [index, pick] of (pkg.picks || []).entries()) {
+    assetOptions.push({
+      label: String(pick.label || 'Draft Pick').slice(0, 100),
+      description: `Pick value ${Number(pick.value_score || 0).toFixed(1)}`.slice(0, 100),
+      value: `pick:${index}`,
+    });
+  }
+  if (assetOptions.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`maddentrade_neg_edit_remove:${negotiationId}`)
+        .setPlaceholder('Remove an asset from this package')
+        .addOptions(assetOptions.slice(0, 25))
+    ));
+  }
+  if (addablePlayers.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`maddentrade_neg_edit_add_player:${negotiationId}`)
+        .setPlaceholder('Add a player from your team')
+        .addOptions(addablePlayers.slice(0, 25).map(p => ({
+          label: String(p.player_name || 'Player').slice(0, 100),
+          description: `${p.position || 'POS'} • ${p.overall || 'N/A'} OVR • ${Number(p.value_score || 0).toFixed(0)}`.slice(0, 100),
+          value: String(p.player_id || p.player_name).slice(0, 100),
+        })))
+    ));
+  }
+  if (addablePicks.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`maddentrade_neg_edit_add_pick:${negotiationId}`)
+        .setPlaceholder('Add a draft pick')
+        .addOptions(addablePicks.slice(0, 25).map(pick => ({
+          label: String(pick.label || 'Draft Pick').slice(0, 100),
+          description: `Value ${Number(pick.valueScore || pick.value_score || 0).toFixed(1)}`.slice(0, 100),
+          value: String(pick.raw || pick.label).slice(0, 100),
+        })))
+    ));
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`maddentrade_neg_edit_done:${negotiationId}`).setLabel('Done Editing').setEmoji('✅').setStyle(ButtonStyle.Success)
+  ));
+  return rows.slice(0, 5);
+}
+
+async function buildMaddenNegotiationEditPanel(interaction, negotiation, league, pkg) {
+  const existingNames = (pkg.players || []).map(p => p.player_name);
+  const addablePlayers = await getMaddenNegotiationEditablePlayers(negotiation.guild_id, league.league_id, negotiation.requesting_team, existingNames);
+  const slotMap = null;
+  const addablePicks = maddenTradeFinderPickPool(negotiation.requesting_team, slotMap).slice(0, 21);
+  const embed = buildMaddenNegotiationPackageEmbed(league, negotiation, pkg)
+    .setTitle('Edit Selected Trade Package')
+    .setDescription('Use the dropdowns below to remove assets or add players/picks. Any edit resets both owner confirmations.');
+  return { embed, components: buildMaddenNegotiationEditPackageComponents(negotiation.id, pkg, addablePlayers, addablePicks) };
+}
+
+async function applyMaddenNegotiationPackageEdit(negotiation, league, action, value) {
+  let pkg = parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json);
+  if (!pkg) return null;
+  pkg.players = Array.isArray(pkg.players) ? pkg.players : [];
+  pkg.picks = Array.isArray(pkg.picks) ? pkg.picks : [];
+
+  if (action === 'remove') {
+    const [type, rawIndex] = String(value || '').split(':');
+    const index = Number(rawIndex);
+    if (type === 'player' && Number.isFinite(index)) pkg.players.splice(index, 1);
+    if (type === 'pick' && Number.isFinite(index)) pkg.picks.splice(index, 1);
+  }
+
+  if (action === 'add_player') {
+    const result = await pool.query(
+      `SELECT player_id, player_name, team_name, position, overall, value_score, trade_tier
+       FROM madden_player_values
+       WHERE guild_id = $1::text AND league_id = $2::text
+         AND (player_id = $3::text OR LOWER(player_name) = LOWER($3::text))
+       ORDER BY value_score DESC NULLS LAST
+       LIMIT 1`,
+      [negotiation.guild_id, league.league_id, value]
+    );
+    const player = result.rows?.[0];
+    if (player && !pkg.players.some(p => String(p.player_name).toLowerCase() === String(player.player_name).toLowerCase())) {
+      pkg.players.push({
+        player_id: player.player_id,
+        player_name: player.player_name,
+        team_name: player.team_name,
+        position: player.position,
+        overall: player.overall,
+        value_score: Number(player.value_score || 0),
+        trade_tier: player.trade_tier,
+      });
+    }
+  }
+
+  if (action === 'add_pick') {
+    const pick = parseMaddenDraftPickAsset(value);
+    if (pick && !pkg.picks.some(p => String(p.label).toLowerCase() === String(pick.label).toLowerCase())) {
+      pkg.picks.push({ raw: pick.raw, label: pick.label, value_score: Number(pick.valueScore || 0), year: pick.year, round: pick.round, pick: pick.pick, team: pick.team });
+    }
+  }
+
+  pkg = recalculateMaddenNegotiationPackage(pkg);
+  await saveMaddenNegotiationSelectedPackage(negotiation.id, pkg, true);
+  return pkg;
+}
+
+async function recordMaddenNegotiationConfirmation(negotiation, userId) {
+  if (String(userId) === String(negotiation.requesting_user_id)) {
+    await pool.query(`UPDATE madden_trade_negotiations SET requesting_confirmed_by = $1, requesting_confirmed_at = NOW(), updated_at = NOW() WHERE id = $2`, [userId, negotiation.id]);
+    return 'requesting';
+  }
+  if (String(userId) === String(negotiation.listing_user_id)) {
+    await pool.query(`UPDATE madden_trade_negotiations SET listing_confirmed_by = $1, listing_confirmed_at = NOW(), updated_at = NOW() WHERE id = $2`, [userId, negotiation.id]);
+    return 'listing';
+  }
+  return null;
+}
+
+function maddenNegotiationBothConfirmed(negotiation) {
+  return Boolean(negotiation?.requesting_confirmed_by && negotiation?.listing_confirmed_by);
 }
 
 
