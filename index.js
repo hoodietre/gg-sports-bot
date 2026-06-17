@@ -5027,7 +5027,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       await interaction.deferReply({ ephemeral: true });
       await pool.query(`UPDATE madden_trade_negotiations SET status = 'interested', updated_at = NOW() WHERE id = $1`, [negotiationId]);
       const updated = await getMaddenTradeNegotiationById(negotiationId);
-      const result = await createMaddenTradeNegotiationThread(updated, interaction.client);
+      const result = await createMaddenTradeNegotiationThread(updated, interaction.client, interaction.channelId);
       await interaction.editReply({ content: result?.message || 'Interest registered.' });
       return;
     }
@@ -18412,7 +18412,7 @@ function buildMaddenTradeNegotiationHubEmbed(league, listing, negotiation, reque
       { name: 'Opened By', value: requesterUserId ? `<@${requesterUserId}>` : 'Unknown GM', inline: true },
       { name: 'Negotiation ID', value: shortGameId(negotiation.id), inline: true }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX Trade Negotiation Hub' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-A Trade Negotiation Hub' })
     .setTimestamp();
 }
 
@@ -18427,7 +18427,7 @@ function buildMaddenTradeNegotiationProposalEmbed(negotiation) {
       { name: 'Offer', value: maddenSafeEmbedText(negotiation.offer_text || 'No offer text provided.', 1024), inline: false },
       { name: 'Message', value: maddenSafeEmbedText(negotiation.message || 'No message provided.', 1024), inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BX Trade Negotiation Hub' })
+    .setFooter({ text: 'GG Sports • 7J-10BX-A Trade Negotiation Hub' })
     .setTimestamp();
 }
 
@@ -18437,7 +18437,7 @@ async function createMaddenTradeNegotiationHub(guildId, league, member, userId, 
   if (!listing) {
     return {
       ok: false,
-      embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription('That player is not currently listed on the Madden trade block.').setFooter({ text: 'GG Sports • 7J-10BX Trade Negotiation Hub' }).setTimestamp(),
+      embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription('That player is not currently listed on the Madden trade block.').setFooter({ text: 'GG Sports • 7J-10BX-A Trade Negotiation Hub' }).setTimestamp(),
       components: [],
     };
   }
@@ -18506,23 +18506,58 @@ function buildMaddenTradeNegotiationProposalModal(negotiationId) {
     );
 }
 
-async function createMaddenTradeNegotiationThread(negotiation, discordClient) {
+async function createMaddenTradeNegotiationThread(negotiation, discordClient, fallbackChannelId = null) {
   if (!negotiation) return { ok: false, message: 'Negotiation not found.' };
+
+  if (negotiation.thread_id) {
+    return { ok: true, message: `Interest already registered. Negotiation thread: <#${negotiation.thread_id}>` };
+  }
+
   const guild = await discordClient.guilds.fetch(negotiation.guild_id).catch(() => null);
   if (!guild) return { ok: false, message: 'Interest registered, but I could not access the server to create a thread.' };
+
   const league = await getLeagueById(negotiation.league_id).catch(() => null);
-  const channelId = league?.trade_block_channel_id || league?.offer_a_trade_channel_id || league?.committee_channel_id || league?.approved_channel_id;
-  const channel = channelId ? await guild.channels.fetch(channelId).catch(() => null) : null;
-  if (!channel || !channel.isTextBased()) {
-    return { ok: false, message: 'Interest registered, but no trade/offer channel is configured for negotiation threads.' };
+  const candidateChannelIds = [
+    league?.trade_block_channel_id,
+    league?.offer_a_trade_channel_id,
+    league?.trade_offer_channel_id,
+    league?.committee_channel_id,
+    league?.approved_channel_id,
+    fallbackChannelId,
+  ].filter(Boolean);
+
+  let channel = null;
+  let chosenChannelId = null;
+  for (const channelId of candidateChannelIds) {
+    const possible = await guild.channels.fetch(channelId).catch(() => null);
+    if (possible && possible.isTextBased?.()) {
+      channel = possible;
+      chosenChannelId = channelId;
+      break;
+    }
   }
+
+  if (!channel) {
+    console.warn('[7J-10BX-A NEGOTIATION THREAD] No valid channel found ' + JSON.stringify({
+      league: league?.league_name || negotiation.league_id,
+      player: negotiation.player_name,
+      candidateChannelIds,
+      fallbackChannelId,
+    }));
+    return { ok: false, message: 'Interest registered, but I could not find a valid text channel for the negotiation thread. Set a trade block or offer-a-trade channel, then try again.' };
+  }
+
   const safeName = String(negotiation.player_name || 'trade').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'trade';
   let thread = null;
-  if (channel.threads?.create) {
+
+  if (channel.isThread?.()) {
+    thread = channel;
+  } else if (channel.threads?.create) {
     thread = await channel.threads.create({
       name: `trade-negotiation-${safeName}`.slice(0, 90),
       type: ChannelType.PrivateThread,
       invitable: false,
+      autoArchiveDuration: 1440,
       reason: 'GG Sports trade negotiation hub',
     }).catch(async () => channel.threads.create({
       name: `trade-negotiation-${safeName}`.slice(0, 90),
@@ -18530,16 +18565,50 @@ async function createMaddenTradeNegotiationThread(negotiation, discordClient) {
       reason: 'GG Sports trade negotiation hub',
     }).catch(() => null));
   }
-  if (!thread) return { ok: false, message: 'Interest registered, but I could not create the negotiation thread.' };
-  await thread.members.add(negotiation.listing_user_id).catch(() => null);
-  await thread.members.add(negotiation.requesting_user_id).catch(() => null);
-  await pool.query(`UPDATE madden_trade_negotiations SET thread_id = $1, updated_at = NOW() WHERE id = $2`, [thread.id, negotiation.id]);
+
+  if (!thread && channel.send) {
+    const starter = await channel.send({
+      content: `Trade negotiation interest registered for **${negotiation.player_name}**.`,
+      allowedMentions: { users: [], roles: [] },
+    }).catch(() => null);
+    if (starter?.startThread) {
+      thread = await starter.startThread({
+        name: `trade-negotiation-${safeName}`.slice(0, 90),
+        autoArchiveDuration: 1440,
+        reason: 'GG Sports trade negotiation hub',
+      }).catch(() => null);
+    }
+  }
+
+  if (!thread) {
+    console.warn('[7J-10BX-A NEGOTIATION THREAD] Thread create failed ' + JSON.stringify({
+      league: league?.league_name || negotiation.league_id,
+      player: negotiation.player_name,
+      chosenChannelId,
+      channelType: channel?.type,
+    }));
+    return { ok: false, message: `Interest registered, but I could not create a thread in <#${chosenChannelId}>. Check bot permissions: View Channel, Send Messages, Create Private Threads, and Send Messages in Threads.` };
+  }
+
+  await thread.members?.add?.(negotiation.listing_user_id).catch(() => null);
+  await thread.members?.add?.(negotiation.requesting_user_id).catch(() => null);
+  await pool.query(`UPDATE madden_trade_negotiations SET thread_id = $1, status = 'interested', updated_at = NOW() WHERE id = $2`, [thread.id, negotiation.id]);
   await thread.send({
     content: `<@${negotiation.listing_user_id}> <@${negotiation.requesting_user_id}> trade negotiation opened for **${negotiation.player_name}**.`,
     embeds: [buildMaddenTradeNegotiationProposalEmbed(negotiation)],
     components: buildMaddenTradeNegotiationThreadButtons(negotiation.id),
     allowedMentions: { users: [negotiation.listing_user_id, negotiation.requesting_user_id], roles: [] },
   }).catch(() => null);
+
+  console.log('[7J-10BX-A NEGOTIATION THREAD] ' + JSON.stringify({
+    league: league?.league_name || negotiation.league_id,
+    player: negotiation.player_name,
+    chosenChannelId,
+    fallbackChannelId,
+    threadId: thread.id,
+    result: 'created',
+  }));
+
   return { ok: true, message: `Interest registered and negotiation thread created: <#${thread.id}>` };
 }
 
