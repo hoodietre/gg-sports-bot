@@ -475,6 +475,35 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_player_values ADD COLUMN IF NOT EXISTS trade_tier TEXT`);
   await pool.query(`ALTER TABLE madden_player_values ADD COLUMN IF NOT EXISTS raw_components JSONB DEFAULT '{}'::jsonb`);
 
+  // 7J-10BW: User-controlled Madden trade block storage.
+  // GMs can list their own roster players, remove them, and browse team/league-wide blocks.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_trade_block_entries (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_key TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      position TEXT,
+      overall INTEGER,
+      value_score NUMERIC NOT NULL DEFAULT 0,
+      trade_tier TEXT,
+      seeking TEXT,
+      notes TEXT,
+      submitted_by TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_key)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS value_score NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS trade_tier TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS seeking TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS notes TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_block_entries_league_active ON madden_trade_block_entries (guild_id, league_id, is_active, team_name)`);
+
   // 7J-8A-B: Madden career records foundation. This is hidden for now and is refreshed idempotently from imported stats.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_career_records (
@@ -1569,6 +1598,41 @@ function buildCommands() {
         .setDescription('Show Madden GM assistant report for one team')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('team').setDescription('Team to inspect').setRequired(true).setAutocomplete(true)))
+      .addSubcommandGroup(group => group
+        .setName('block')
+        .setDescription('User-controlled Madden trade block')
+        .addSubcommand(sc => sc
+          .setName('add')
+          .setDescription('Add one of your Madden players to the trade block')
+          .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+          .addStringOption(o => o.setName('player').setDescription('Player from your team').setRequired(true).setAutocomplete(true))
+          .addStringOption(o => o.setName('seeking').setDescription('What you are looking for, like QB, LB, Picks').setRequired(false))
+          .addStringOption(o => o.setName('notes').setDescription('Optional trade notes').setRequired(false)))
+        .addSubcommand(sc => sc
+          .setName('remove')
+          .setDescription('Remove a player from your Madden trade block')
+          .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+          .addStringOption(o => o.setName('player').setDescription('Player already on your block').setRequired(true).setAutocomplete(true)))
+        .addSubcommand(sc => sc
+          .setName('view')
+          .setDescription('View your team trade block or another team block')
+          .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+          .addStringOption(o => o.setName('team').setDescription('Team to view; blank shows your team').setRequired(false).setAutocomplete(true)))
+        .addSubcommand(sc => sc
+          .setName('league')
+          .setDescription('View the league-wide Madden trade block')
+          .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+          .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false).setAutocomplete(true))
+          .addStringOption(o => o.setName('position').setDescription('Optional position filter').setRequired(false)
+            .addChoices(
+              { name: 'QB', value: 'QB' }, { name: 'HB', value: 'HB' }, { name: 'FB', value: 'FB' },
+              { name: 'WR', value: 'WR' }, { name: 'TE', value: 'TE' },
+              { name: 'LT', value: 'LT' }, { name: 'LG', value: 'LG' }, { name: 'C', value: 'C' }, { name: 'RG', value: 'RG' }, { name: 'RT', value: 'RT' },
+              { name: 'LE', value: 'LE' }, { name: 'RE', value: 'RE' }, { name: 'DT', value: 'DT' },
+              { name: 'LOLB', value: 'LOLB' }, { name: 'MLB', value: 'MLB' }, { name: 'ROLB', value: 'ROLB' },
+              { name: 'CB', value: 'CB' }, { name: 'FS', value: 'FS' }, { name: 'SS', value: 'SS' },
+              { name: 'K', value: 'K' }, { name: 'P', value: 'P' }
+            ))))
 
 ,
 
@@ -3705,6 +3769,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
             await interaction.respond((choices || []).slice(0, 25));
             return;
+          }
+
+          const tradeSubcommandGroup = interaction.options.getSubcommandGroup(false);
+          if (tradeSubcommandGroup === 'block') {
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+            if (!activeLeague) {
+              await interaction.respond([]);
+              return;
+            }
+
+            if (focused?.name === 'team') {
+              const choices = await getMaddenTeamAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+              await interaction.respond((choices || []).slice(0, 25));
+              return;
+            }
+
+            if (focused?.name === 'player') {
+              const blockSubcommand = interaction.options.getSubcommand(false);
+              if (blockSubcommand === 'remove') {
+                const choices = await getMaddenTradeBlockRemoveAutocompleteChoices(interaction.guild.id, activeLeague.league_id, interaction.user.id, focused.value);
+                await interaction.respond((choices || []).slice(0, 25));
+                return;
+              }
+
+              const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+              const userTeam = member ? await getMemberTeamForLeague(member, activeLeague) : null;
+              const choices = userTeam?.name
+                ? await getMaddenPlayerAutocompleteChoicesByTeam(interaction.guild.id, activeLeague.league_id, focused.value, userTeam.name)
+                : await getMaddenPlayerAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+              await interaction.respond((choices || []).slice(0, 25));
+              return;
+            }
           }
 
           const tradePlayerFields = new Set([
@@ -6089,6 +6186,62 @@ if (gameSubcommand === 'report') {
       }
 
       const tradeSubcommand = interaction.options.getSubcommand(false);
+      const tradeSubcommandGroup = interaction.options.getSubcommandGroup(false);
+
+      if (tradeSubcommandGroup === 'block') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+          return;
+        }
+
+        try {
+          await ensureMaddenTradeBlockTables();
+
+          if (tradeSubcommand === 'add') {
+            const playerName = interaction.options.getString('player');
+            const seeking = interaction.options.getString('seeking') || '';
+            const notes = interaction.options.getString('notes') || '';
+            const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+            const result = await addMaddenTradeBlockEntry(interaction.guild.id, activeLeague, member, interaction.user.id, playerName, seeking, notes);
+            await interaction.editReply({ embeds: [result.embed] });
+            return;
+          }
+
+          if (tradeSubcommand === 'remove') {
+            const playerName = interaction.options.getString('player');
+            const result = await removeMaddenTradeBlockEntry(interaction.guild.id, activeLeague, interaction.user.id, playerName);
+            await interaction.editReply({ embeds: [result.embed] });
+            return;
+          }
+
+          if (tradeSubcommand === 'view') {
+            const teamName = interaction.options.getString('team');
+            const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+            const embed = await buildMaddenTradeBlockTeamEmbed(interaction.guild.id, activeLeague, member, teamName);
+            await interaction.editReply({ embeds: [embed] });
+            return;
+          }
+
+          if (tradeSubcommand === 'league') {
+            const teamName = interaction.options.getString('team');
+            const position = interaction.options.getString('position');
+            const embed = await buildMaddenTradeBlockLeagueEmbed(interaction.guild.id, activeLeague, { teamName, position });
+            await interaction.editReply({ embeds: [embed] });
+            return;
+          }
+
+          await interaction.editReply({ content: 'Unknown Madden trade block command.' });
+          return;
+        } catch (error) {
+          console.error('[MADDEN TRADE BLOCK 7J-10BW] command failed:', error?.stack || error?.message || error);
+          await interaction.editReply({ content: `Madden trade block failed: ${String(error?.message || error).slice(0, 180)}` });
+          return;
+        }
+      }
+
       if (!['analyze', 'find', 'needs', 'gm'].includes(tradeSubcommand)) {
         await interaction.editReply({ content: 'Unknown Madden trade command.' });
         return;
@@ -17908,6 +18061,282 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
     .setTimestamp();
 }
 
+
+
+async function ensureMaddenTradeBlockTables() {
+  await ensureMaddenPlayerPersistenceTables();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_trade_block_entries (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_key TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      position TEXT,
+      overall INTEGER,
+      value_score NUMERIC NOT NULL DEFAULT 0,
+      trade_tier TEXT,
+      seeking TEXT,
+      notes TEXT,
+      submitted_by TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_key)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS value_score NUMERIC NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS trade_tier TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS seeking TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS notes TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_block_entries ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_block_entries_league_active ON madden_trade_block_entries (guild_id, league_id, is_active, team_name)`);
+}
+
+function maddenTradeBlockPlayerKey(player) {
+  const rosterId = player?.roster_id || player?.external_player_id || player?.id;
+  const team = player?.resolved_team_name || player?.team_name || player?.team_id || 'unknown-team';
+  const name = maddenValuePlayerName(player);
+  return String(rosterId || `${name}:${team}`).toLowerCase().replace(/\s+/g, '-').slice(0, 180);
+}
+
+function maddenTradeBlockLine(row, index = 0) {
+  const value = Number(row.value_score || 0) > 0 ? ` • Value: **${Number(row.value_score || 0).toFixed(0)}**` : '';
+  const tier = row.trade_tier ? ` • ${row.trade_tier}` : '';
+  const seek = row.seeking ? `\nSeeking: ${row.seeking}` : '';
+  const notes = row.notes ? `\nNotes: ${row.notes}` : '';
+  const submitter = row.submitted_by ? `\nGM: <@${row.submitted_by}>` : '';
+  return `${index + 1}. **${row.player_name}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${value}${tier}${seek}${notes}${submitter}`;
+}
+
+async function addMaddenTradeBlockEntry(guildId, league, member, userId, playerName, seeking = '', notes = '') {
+  await ensureMaddenTradeBlockTables();
+  const userTeam = member ? await getMemberTeamForLeague(member, league) : null;
+  if (!userTeam?.name) {
+    return {
+      ok: false,
+      embed: new EmbedBuilder()
+        .setTitle('Madden Trade Block')
+        .setColor(0xED4245)
+        .setDescription('I could not detect your Madden team role for this league. Make sure your team role is registered with `/league teamrole` and assigned to you.')
+        .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+        .setTimestamp(),
+    };
+  }
+
+  const player = await findMaddenImportedPlayer(guildId, league.league_id, playerName, userTeam.name)
+    || await findMaddenImportedPlayer(guildId, league.league_id, playerName, null)
+    || await findMaddenPlayerFromWeeklyStats(guildId, league.league_id, playerName, userTeam.name);
+
+  if (!player) {
+    return {
+      ok: false,
+      embed: new EmbedBuilder()
+        .setTitle('Madden Trade Block')
+        .setColor(0xED4245)
+        .setDescription(`Could not find **${String(playerName || '').slice(0, 80)}** on your Madden roster.`)
+        .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+        .setTimestamp(),
+    };
+  }
+
+  const resolvedTeam = player.resolved_team_name || player.team_name || userTeam.name;
+  const playerTeamKey = maddenTradeNormalizeTeamKey(resolvedTeam);
+  const userTeamKey = maddenTradeNormalizeTeamKey(userTeam.name);
+  if (playerTeamKey && userTeamKey && playerTeamKey !== userTeamKey) {
+    return {
+      ok: false,
+      embed: new EmbedBuilder()
+        .setTitle('Madden Trade Block')
+        .setColor(0xED4245)
+        .setDescription(`**${maddenValuePlayerName(player)}** appears to be on **${maddenTeamDisplayName(resolvedTeam)}**, not **${maddenTeamDisplayName(userTeam.name)}**.`)
+        .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+        .setTimestamp(),
+    };
+  }
+
+  const value = calculateMaddenPlayerValue(player);
+  const playerKey = maddenTradeBlockPlayerKey(player);
+  const cleanSeeking = String(seeking || '').trim().slice(0, 500);
+  const cleanNotes = String(notes || '').trim().slice(0, 500);
+
+  await pool.query(
+    `INSERT INTO madden_trade_block_entries (
+       guild_id, league_id, player_key, player_name, team_name, position, overall,
+       value_score, trade_tier, seeking, notes, submitted_by, is_active, created_at, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE, NOW(), NOW())
+     ON CONFLICT (guild_id, league_id, player_key)
+     DO UPDATE SET
+       player_name = EXCLUDED.player_name,
+       team_name = EXCLUDED.team_name,
+       position = EXCLUDED.position,
+       overall = EXCLUDED.overall,
+       value_score = EXCLUDED.value_score,
+       trade_tier = EXCLUDED.trade_tier,
+       seeking = EXCLUDED.seeking,
+       notes = EXCLUDED.notes,
+       submitted_by = EXCLUDED.submitted_by,
+       is_active = TRUE,
+       updated_at = NOW()`,
+    [guildId, league.league_id, playerKey, maddenValuePlayerName(player), userTeam.name, player.position || null, value.overall || player.overall || null, value.valueScore || 0, value.tradeTier || null, cleanSeeking || null, cleanNotes || null, userId]
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Added to Trade Block • ${maddenTeamDisplayName(userTeam.name)}`)
+    .setColor(0x57F287)
+    .setDescription(`**${maddenValuePlayerName(player)}** is now available on the ${league.league_name} trade block.`)
+    .addFields(
+      { name: 'Player', value: `${player.position || 'POS'} • ${value.overall || player.overall || 'N/A'} OVR • ${value.tradeTier || 'Value Tier N/A'}`, inline: false },
+      { name: 'Seeking', value: cleanSeeking || 'Not specified', inline: false },
+      { name: 'Notes', value: cleanNotes || 'None', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+    .setTimestamp();
+  return { ok: true, embed };
+}
+
+async function removeMaddenTradeBlockEntry(guildId, league, userId, playerName) {
+  await ensureMaddenTradeBlockTables();
+  const target = String(playerName || '').trim();
+  const result = await pool.query(
+    `UPDATE madden_trade_block_entries
+     SET is_active = FALSE, updated_at = NOW()
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+       AND submitted_by = $3::text
+       AND is_active = TRUE
+       AND (LOWER(player_name) = LOWER($4) OR LOWER(player_name) LIKE LOWER($5) OR LOWER(player_key) = LOWER($4))
+     RETURNING *`,
+    [guildId, league.league_id, userId, target, `%${target}%`]
+  );
+
+  const row = result.rows?.[0];
+  const embed = new EmbedBuilder()
+    .setTitle(row ? 'Removed from Trade Block' : 'Madden Trade Block')
+    .setColor(row ? 0x57F287 : 0xED4245)
+    .setDescription(row ? `Removed **${row.player_name}** from your trade block.` : `Could not find **${target.slice(0, 80)}** on your active trade block.`)
+    .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+    .setTimestamp();
+  return { ok: Boolean(row), embed };
+}
+
+async function getMaddenTradeBlockRemoveAutocompleteChoices(guildId, leagueId, userId, focusedValue) {
+  await ensureMaddenTradeBlockTables();
+  const query = String(focusedValue || '').trim();
+  const result = await pool.query(
+    `SELECT player_name, team_name, position, overall
+     FROM madden_trade_block_entries
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+       AND submitted_by = $3::text
+       AND is_active = TRUE
+       AND ($4::text = '' OR LOWER(player_name) LIKE LOWER($5) OR LOWER(position) = LOWER($4))
+     ORDER BY updated_at DESC, player_name ASC
+     LIMIT 25`,
+    [guildId, leagueId, userId, query, `%${query}%`]
+  );
+  return (result.rows || []).map(row => ({
+    name: `${row.player_name} (${getMaddenTeamAbbrev(row.team_name) || row.team_name} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR)`.slice(0, 100),
+    value: String(row.player_name || '').slice(0, 100),
+  }));
+}
+
+async function buildMaddenTradeBlockTeamEmbed(guildId, league, member, teamName = null) {
+  await ensureMaddenTradeBlockTables();
+  let resolvedTeam = String(teamName || '').trim();
+  if (!resolvedTeam) {
+    const userTeam = member ? await getMemberTeamForLeague(member, league) : null;
+    resolvedTeam = userTeam?.name || '';
+  }
+
+  if (!resolvedTeam) {
+    return new EmbedBuilder()
+      .setTitle('Madden Trade Block')
+      .setColor(0xED4245)
+      .setDescription('Choose a team, or make sure you have a registered Madden team role.')
+      .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+      .setTimestamp();
+  }
+
+  const result = await pool.query(
+    `SELECT * FROM madden_trade_block_entries
+     WHERE guild_id = $1::text
+       AND league_id = $2::text
+       AND is_active = TRUE
+       AND (LOWER(team_name) LIKE LOWER($3) OR LOWER(team_name) = LOWER($4))
+     ORDER BY value_score DESC NULLS LAST, overall DESC NULLS LAST, player_name ASC
+     LIMIT 20`,
+    [guildId, league.league_id, `%${resolvedTeam}%`, getMaddenTeamAbbrev(resolvedTeam) || resolvedTeam]
+  );
+
+  const rows = result.rows || [];
+  const embed = new EmbedBuilder()
+    .setTitle(`Madden Trade Block • ${maddenTeamDisplayName(resolvedTeam)}`)
+    .setColor(0xFEE75C)
+    .setDescription(rows.length ? maddenSafeEmbedText(rows.map(maddenTradeBlockLine).join('\n\n'), 4000) : 'No active players listed for this team yet.')
+    .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+    .setTimestamp();
+  return embed;
+}
+
+async function buildMaddenTradeBlockLeagueEmbed(guildId, league, filters = {}) {
+  await ensureMaddenTradeBlockTables();
+  const teamName = String(filters.teamName || '').trim();
+  const position = String(filters.position || '').trim().toUpperCase();
+  const params = [guildId, league.league_id];
+  let where = `guild_id = $1::text AND league_id = $2::text AND is_active = TRUE`;
+  if (teamName) {
+    params.push(`%${teamName}%`, getMaddenTeamAbbrev(teamName) || teamName);
+    where += ` AND (LOWER(team_name) LIKE LOWER($${params.length - 1}) OR LOWER(team_name) = LOWER($${params.length}))`;
+  }
+  if (position) {
+    params.push(position);
+    where += ` AND UPPER(position) = UPPER($${params.length})`;
+  }
+
+  const result = await pool.query(
+    `SELECT * FROM madden_trade_block_entries
+     WHERE ${where}
+     ORDER BY team_name ASC, value_score DESC NULLS LAST, overall DESC NULLS LAST, player_name ASC
+     LIMIT 50`,
+    params
+  );
+
+  const rows = result.rows || [];
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!grouped.has(row.team_name)) grouped.set(row.team_name, []);
+    grouped.get(row.team_name).push(row);
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Madden League Trade Block • ${league.league_name}`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • 7J-10BW Trade Block' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    const filterText = [teamName ? `Team: ${maddenTeamDisplayName(teamName)}` : '', position ? `Position: ${position}` : ''].filter(Boolean).join(' • ');
+    embed.setDescription(filterText ? `No active trade block listings found for ${filterText}.` : 'No active Madden trade block listings yet.');
+    return embed;
+  }
+
+  for (const [team, teamRows] of [...grouped.entries()].slice(0, 12)) {
+    const lines = teamRows.slice(0, 6).map((row, index) => {
+      const value = Number(row.value_score || 0) > 0 ? ` • ${Number(row.value_score || 0).toFixed(0)} value` : '';
+      const seeking = row.seeking ? `\nSeeking: ${row.seeking}` : '';
+      const notes = row.notes ? `\nNotes: ${row.notes}` : '';
+      return `${index + 1}. **${row.player_name}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${value}${seeking}${notes}`;
+    });
+    embed.addFields({ name: maddenTeamDisplayName(team), value: maddenSafeEmbedText(lines.join('\n\n'), 1024), inline: false });
+  }
+
+  if (rows.length >= 50) {
+    embed.addFields({ name: 'Note', value: 'Showing the first 50 listings. Use team or position filters to narrow the board.', inline: false });
+  }
+
+  return embed;
+}
 
 async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
   const model = await buildMaddenTeamNeedsModel(guildId, league.league_id, teamName);
