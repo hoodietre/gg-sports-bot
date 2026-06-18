@@ -23940,65 +23940,224 @@ async function getMaddenGameWeekAutocompleteChoices(guildId, leagueId, focusedVa
     .map(label => ({ name: label.slice(0, 100), value: label.slice(0, 100) }));
 }
 
+function maddenGameThreadWeekSlug(game, weekLabel = '') {
+  const raw = String(weekLabel || game?.week_label || '').trim();
+  const numberMatch = raw.match(/(\d+)/);
+  const weekNumber = numberMatch ? Number(numberMatch[1]) : null;
+  const lower = raw.toLowerCase();
+
+  if (lower.includes('super') || weekNumber === 23) return 'super-bowl';
+  if (lower.includes('conference') || weekNumber === 21) return 'conference';
+  if (lower.includes('divisional') || weekNumber === 20) return 'divisional';
+  if (lower.includes('wild') || weekNumber === 19) return 'wild-card';
+  if (Number.isFinite(weekNumber)) return `wk${String(weekNumber).padStart(2, '0')}`;
+  return raw.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'madden';
+}
+
 function maddenGameThreadSafeName(game, weekLabel = '') {
-  const away = getMaddenTeamAbbrev(game.away_team) || game.away_team || 'Away';
-  const home = getMaddenTeamAbbrev(game.home_team) || game.home_team || 'Home';
-  const week = String(weekLabel || game.week_label || '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  return `${week ? week + '-' : ''}${away}-at-${home}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').slice(0, 90) || 'madden-game-thread';
+  const away = String(game?.away_team || 'away').replace(/\([^)]*\)/g, '').trim();
+  const home = String(game?.home_team || 'home').replace(/\([^)]*\)/g, '').trim();
+  const week = maddenGameThreadWeekSlug(game, weekLabel);
+  return `${week}-${away}-${home}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 90) || 'madden-game-thread';
 }
 
 async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId = null) {
   if (!guild) return null;
+
+  const normalized = String(teamName || '').trim().toLowerCase();
+  const abbr = String(getMaddenTeamAbbrev(teamName) || '').trim().toLowerCase();
+
+  // 1. Prefer imported owner_user_id from Madden sync data.
+  if (league?.league_id) {
+    const importedOwner = await pool.query(
+      `SELECT owner_user_id
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+         AND owner_user_id IS NOT NULL
+         AND TRIM(owner_user_id) <> ''
+         AND (
+           LOWER(team_name) = LOWER($3)
+           OR LOWER(team_name) = LOWER($4)
+         )
+       LIMIT 1`,
+      [guild.id, String(league.league_id), teamName, getMaddenTeamAbbrev(teamName)]
+    ).catch(() => ({ rows: [] }));
+    const ownerId = importedOwner.rows?.[0]?.owner_user_id;
+    if (ownerId) {
+      const member = await guild.members.fetch(ownerId).catch(() => null);
+      if (member && !member.user.bot) return member;
+    }
+  }
+
+  // 2. Then use explicit madden_franchises ownership mappings.
+  if (league?.league_id) {
+    const franchiseOwner = await pool.query(
+      `SELECT owner_user_id, team_role_id
+       FROM madden_franchises
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+         AND (
+           LOWER(team_name) = LOWER($3)
+           OR LOWER(team_name) = LOWER($4)
+         )
+       LIMIT 1`,
+      [guild.id, String(league.league_id), teamName, getMaddenTeamAbbrev(teamName)]
+    ).catch(() => ({ rows: [] }));
+    const row = franchiseOwner.rows?.[0];
+    if (row?.owner_user_id) {
+      const member = await guild.members.fetch(row.owner_user_id).catch(() => null);
+      if (member && !member.user.bot) return member;
+    }
+    if (row?.team_role_id) {
+      const owner = await findTeamOwnerByRoleId(guild, row.team_role_id).catch(() => null);
+      if (owner) return owner;
+    }
+  }
+
+  // 3. Use the game row role id if EA/imported schedule saved one.
   if (roleId) {
     const owner = await findTeamOwnerByRoleId(guild, roleId).catch(() => null);
     if (owner) return owner;
   }
+
+  // 4. Match league team roles by full name or abbreviation.
   const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id).catch(() => []) : [];
-  const normalized = String(teamName || '').trim().toLowerCase();
-  const abbr = String(getMaddenTeamAbbrev(teamName) || '').trim().toLowerCase();
   const match = (teamRoles || []).find(team => {
     const roleName = String(team.role_name || '').trim().toLowerCase();
     const roleAbbr = String(getMaddenTeamAbbrev(team.role_name) || '').trim().toLowerCase();
-    return roleName === normalized || roleAbbr === abbr || roleName.includes(normalized) || normalized.includes(roleName);
+    return roleName === normalized || roleAbbr === abbr || (!!roleName && normalized.includes(roleName)) || (!!normalized && roleName.includes(normalized));
   });
   if (match?.role_id) {
     const owner = await findTeamOwnerByRoleId(guild, match.role_id).catch(() => null);
     if (owner) return owner;
   }
+
+  // 5. Last fallback: role by team name.
   return await findTeamOwnerByRoleName(guild, teamName).catch(() => null);
+}
+
+function maddenGameHasRealScore(game) {
+  const status = String(game?.status || '').toLowerCase();
+  const away = game?.away_score;
+  const home = game?.home_score;
+  const hasBoth = away !== null && away !== undefined && home !== null && home !== undefined;
+  if (!hasBoth) return false;
+  if (status.includes('final') || status.includes('complete') || status.includes('played')) return true;
+  return Number(away || 0) !== 0 || Number(home || 0) !== 0;
 }
 
 function buildMaddenGameThreadButtons(gameId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`maddengame_thread_game:${gameId}`).setLabel('Game Center').setEmoji('📊').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`maddengame_thread_game:${gameId}`).setLabel('Game Center').setEmoji('🏈').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`maddengame_thread_preview:${gameId}`).setLabel('Matchup Preview').setEmoji('🔍').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Post Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`maddengame_thread_compare:${gameId}`).setLabel('Team Comparison').setEmoji('📊').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`maddengame_thread_issue:${gameId}`).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger)
   );
+}
+
+function formatMaddenGameStatus(game) {
+  const status = String(game?.status || 'scheduled').replace(/_/g, ' ');
+  return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
 function buildMaddenGameThreadEmbed(league, game, owners = {}) {
   const awayLogo = getMaddenTeamLogoUrl(game.away_team);
   const homeLogo = getMaddenTeamLogoUrl(game.home_team);
-  const status = String(game.status || 'scheduled').replace(/_/g, ' ');
-  const scoreLine = (game.away_score !== null && game.away_score !== undefined && game.home_score !== null && game.home_score !== undefined)
-    ? `${maddenTeamDisplayName(game.away_team)} **${game.away_score}** @ ${maddenTeamDisplayName(game.home_team)} **${game.home_score}**`
-    : 'No score reported yet.';
+  const hasScore = maddenGameHasRealScore(game);
+  const scoreLine = hasScore
+    ? `${maddenTeamDisplayNameWithLogo(game.away_team)} **${game.away_score}** @ ${maddenTeamDisplayNameWithLogo(game.home_team)} **${game.home_score}**`
+    : `Status: **${formatMaddenGameStatus(game)}**`;
   const embed = new EmbedBuilder()
     .setTitle(`🏈 ${game.week_label || 'Madden'} Game Thread`)
-    .setColor(0x57F287)
-    .setDescription(`**${maddenTeamDisplayName(game.away_team || 'Away')} @ ${maddenTeamDisplayName(game.home_team || 'Home')}**`)
+    .setColor(hasScore ? 0x5865F2 : 0x57F287)
+    .setDescription(`**${maddenTeamDisplayNameWithLogo(game.away_team || 'Away')} @ ${maddenTeamDisplayNameWithLogo(game.home_team || 'Home')}**`)
     .addFields(
-      { name: 'Away Team', value: `${maddenTeamDisplayName(game.away_team || 'Away')}${owners.away ? `\nOwner: <@${owners.away.id}>` : '\nOwner: Not found'}`, inline: true },
-      { name: 'Home Team', value: `${maddenTeamDisplayName(game.home_team || 'Home')}${owners.home ? `\nOwner: <@${owners.home.id}>` : '\nOwner: Not found'}`, inline: true },
-      { name: 'Status', value: status.charAt(0).toUpperCase() + status.slice(1), inline: true },
-      { name: 'Score', value: scoreLine, inline: false },
-      { name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for game tools.', inline: false }
+      { name: 'Away Team', value: `${maddenTeamDisplayNameWithLogo(game.away_team || 'Away')}${owners.away ? `\nOwner: <@${owners.away.id}>` : '\nOwner: Not found'}`, inline: true },
+      { name: 'Home Team', value: `${maddenTeamDisplayNameWithLogo(game.home_team || 'Home')}${owners.home ? `\nOwner: <@${owners.home.id}>` : '\nOwner: Not found'}`, inline: true },
+      { name: 'Game Status', value: scoreLine, inline: false },
+      { name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for matchup tools.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-B Auto Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA Auto Game Threads' })
     .setTimestamp();
   if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(game.away_team) || game.away_team} at ${getMaddenTeamAbbrev(game.home_team) || game.home_team}`, iconURL: awayLogo });
   if (homeLogo) embed.setThumbnail(homeLogo);
+  return embed;
+}
+
+function formatMaddenThreadTeamSnapshot(team, powerRow) {
+  if (!team) return 'No imported team snapshot found.';
+  const games = maddenTeamGamesPlayed(team);
+  const ppg = Number(team.points_for || 0) / games;
+  const papg = Number(team.points_against || 0) / games;
+  const diff = Number(team.points_for || 0) - Number(team.points_against || 0);
+  return [
+    `Record: **${team.wins || 0}-${team.losses || 0}${Number(team.ties || 0) ? '-' + team.ties : ''}**`,
+    `Point Diff: **${diff >= 0 ? '+' : ''}${diff}**`,
+    `PPG / PAPG: **${ppg.toFixed(1)} / ${papg.toFixed(1)}**`,
+    powerRow?.rank ? `Power Rank: **#${powerRow.rank}**` : 'Power Rank: Not calculated',
+  ].join('\n');
+}
+
+function buildMaddenGameCenterEmbed(league, game, matchup = null, owners = {}) {
+  const awayLogo = getMaddenTeamLogoUrl(game.away_team);
+  const homeLogo = getMaddenTeamLogoUrl(game.home_team);
+  const hasScore = maddenGameHasRealScore(game);
+  const scoreText = hasScore
+    ? `${maddenTeamDisplayNameWithLogo(game.away_team)} **${game.away_score}** @ ${maddenTeamDisplayNameWithLogo(game.home_team)} **${game.home_score}**`
+    : `Scheduled / Not Final`;
+  const awaySnapshot = matchup?.away ? formatMaddenThreadTeamSnapshot(matchup.away, matchup.awayPower) : 'No matchup data found yet.';
+  const homeSnapshot = matchup?.home ? formatMaddenThreadTeamSnapshot(matchup.home, matchup.homePower) : 'No matchup data found yet.';
+  const prediction = matchup?.prediction
+    ? `Projected: **${game.away_team} ${matchup.prediction.projectedAway}** @ **${game.home_team} ${matchup.prediction.projectedHome}**\nWin Prob: **${game.away_team} ${matchup.prediction.awayProb}%** / **${game.home_team} ${matchup.prediction.homeProb}%**`
+    : 'Run Madden sync/power rankings for prediction data.';
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏈 Game Center • ${league?.league_name || 'Madden League'}`)
+    .setColor(hasScore ? 0x5865F2 : 0x57F287)
+    .setDescription(`**${maddenTeamDisplayNameWithLogo(game.away_team)} @ ${maddenTeamDisplayNameWithLogo(game.home_team)}**`)
+    .addFields(
+      { name: 'Week', value: game.week_label || 'Unknown week', inline: true },
+      { name: 'Status', value: formatMaddenGameStatus(game), inline: true },
+      { name: 'Score', value: scoreText, inline: false },
+      { name: `${maddenTeamDisplayNameWithLogo(game.away_team)} Snapshot`, value: awaySnapshot, inline: true },
+      { name: `${maddenTeamDisplayNameWithLogo(game.home_team)} Snapshot`, value: homeSnapshot, inline: true },
+      { name: 'Owners', value: `${game.away_team}: ${owners.away ? `<@${owners.away.id}>` : 'Not found'}\n${game.home_team}: ${owners.home ? `<@${owners.home.id}>` : 'Not found'}`, inline: false },
+      { name: 'Projection', value: prediction, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA Game Center' })
+    .setTimestamp();
+  if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(game.away_team) || game.away_team} at ${getMaddenTeamAbbrev(game.home_team) || game.home_team}`, iconURL: awayLogo });
+  if (homeLogo) embed.setThumbnail(homeLogo);
+  return embed;
+}
+
+function buildMaddenTeamComparisonEmbed(league, game, matchup = null) {
+  const away = matchup?.away;
+  const home = matchup?.home;
+  const awayPower = matchup?.awayPower;
+  const homePower = matchup?.homePower;
+  const awayText = formatMaddenThreadTeamSnapshot(away, awayPower);
+  const homeText = formatMaddenThreadTeamSnapshot(home, homePower);
+  const embed = new EmbedBuilder()
+    .setTitle(`📊 Team Comparison • ${league?.league_name || 'Madden League'}`)
+    .setColor(0xFEE75C)
+    .setDescription(`**${maddenTeamDisplayNameWithLogo(game.away_team)} @ ${maddenTeamDisplayNameWithLogo(game.home_team)}**`)
+    .addFields(
+      { name: maddenTeamDisplayNameWithLogo(game.away_team), value: awayText, inline: true },
+      { name: maddenTeamDisplayNameWithLogo(game.home_team), value: homeText, inline: true },
+      { name: 'Notes', value: 'Comparison uses imported team stats and current power rankings. Future versions can add team OVR once salary/attribute imports are expanded.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA Team Comparison' })
+    .setTimestamp();
+  const logo = getMaddenTeamLogoUrl(game.home_team) || getMaddenTeamLogoUrl(game.away_team);
+  if (logo) embed.setThumbnail(logo);
   return embed;
 }
 
@@ -24015,7 +24174,7 @@ function buildMaddenGameThreadsSummaryEmbed(league, week, result = {}) {
     .setTitle(`🏈 ${league?.league_name || 'Madden'} • ${week} Game Threads`)
     .setColor(failed.length ? 0xFEE75C : 0x57F287)
     .setDescription(lines.join('\n\n').slice(0, 4096))
-    .setFooter({ text: 'GG Sports • 7J-10BY-B Auto Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA Auto Game Threads' })
     .setTimestamp();
 }
 
@@ -24089,7 +24248,7 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
       }
       const mentionIds = [owners.away?.id, owners.home?.id].filter(Boolean);
       await thread.send({
-        content: mentionIds.length ? `${mentionIds.map(id => `<@${id}>`).join(' ')} game thread created for **${label}**.` : `Game thread created for **${label}**.`,
+        content: mentionIds.length ? `${mentionIds.map(id => `<@${id}>`).join(' ')} your **${game.week_label || weekLabel}** game thread is ready: **${label}**.` : `Game thread created for **${label}**.`,
         embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
         components: [buildMaddenGameThreadButtons(game.id)],
         allowedMentions: { users: mentionIds, roles: [] },
@@ -24100,7 +24259,7 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
       );
       out.created.push({ label, threadId: thread.id });
     } catch (error) {
-      console.error('[7J-10BY-B GAME THREAD] create failed:', error?.stack || error?.message || error);
+      console.error('[7J-10BY-BA GAME THREAD] create failed:', error?.stack || error?.message || error);
       out.failed.push({ label, reason: String(error?.message || error).slice(0, 140) });
     }
   }
@@ -24134,12 +24293,12 @@ async function handleMaddenGameThreadButton(interaction) {
     away: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.away_team, game.away_team_role_id),
     home: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id),
   };
+  const matchup = await getMaddenMatchupPreviewData(interaction.guild.id, league.league_id, game.home_team, game.away_team).catch(() => null);
   if (action === 'game') {
-    await interaction.reply({ embeds: [buildMaddenGameThreadEmbed(league, game, owners)], ephemeral: true });
+    await interaction.reply({ embeds: [buildMaddenGameCenterEmbed(league, game, matchup, owners)], ephemeral: true });
     return;
   }
   if (action === 'preview') {
-    const matchup = await getMaddenMatchupPreviewData(interaction.guild.id, league.league_id, game.home_team, game.away_team).catch(() => null);
     if (matchup?.home && matchup?.away) {
       await interaction.reply({ embeds: [buildMaddenMatchupPreviewEmbed(league, matchup)], ephemeral: true });
     } else {
@@ -24147,11 +24306,15 @@ async function handleMaddenGameThreadButton(interaction) {
     }
     return;
   }
+  if (action === 'compare') {
+    await interaction.reply({ embeds: [buildMaddenTeamComparisonEmbed(league, game, matchup)], ephemeral: true });
+    return;
+  }
   if (action === 'stream') {
     const result = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
     const url = result.rows[0]?.stream_url;
     if (!url) {
-      await interaction.reply({ content: 'No saved stream link found. Use `/linkstream` first, then press Post Stream again.', ephemeral: true });
+      await interaction.reply({ content: 'No saved stream link found. Save one with `/linkstream url:<your stream link>`, then press **Stream Hub** again.', ephemeral: true });
       return;
     }
     await interaction.reply({ content: `📺 <@${interaction.user.id}> is streaming this matchup: ${url}`, allowedMentions: { users: [interaction.user.id], roles: [] } });
@@ -24274,7 +24437,7 @@ function buildMaddenNewsEventEmbed(league, event) {
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-B Madden News + Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA Madden News + Game Threads' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
   const playerLine = event.player_name ? `**${event.player_name}**${event.team_name ? ` • ${maddenTeamDisplayName(event.team_name)}` : ''}` : (event.team_name ? `**${maddenTeamDisplayName(event.team_name)}**` : league?.league_name || 'Madden League');
@@ -24365,7 +24528,7 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-B Madden News + Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA Madden News + Game Threads' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved Madden news events found yet. New trade block activity, committee submissions, approved trades, and future sync changes will appear here.');
