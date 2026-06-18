@@ -24062,11 +24062,6 @@ function buildMaddenGameThreadButtons(gameId) {
   );
 }
 
-function formatMaddenGameStatus(game) {
-  const status = String(game?.status || 'scheduled').replace(/_/g, ' ');
-  return status.charAt(0).toUpperCase() + status.slice(1);
-}
-
 function buildMaddenGameThreadEmbed(league, game, owners = {}) {
   const awayLogo = getMaddenTeamLogoUrl(game.away_team);
   const homeLogo = getMaddenTeamLogoUrl(game.home_team);
