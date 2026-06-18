@@ -1732,7 +1732,7 @@ function buildCommands() {
 
     new SlashCommandBuilder()
       .setName('maddenteam')
-      .setDescription('Expanded Madden team rankings')
+      .setDescription('Expanded Madden team rankings and profiles')
       .addSubcommand(sc => sc
         .setName('rankings')
         .setDescription('Rank teams by imported attributes and roster strengths')
@@ -1745,7 +1745,12 @@ function buildCommands() {
             { name: 'Strongest Offensive Line', value: 'offensive_line' },
             { name: 'Best QB Room', value: 'qb' },
             { name: 'Highest OVR Roster', value: 'overall' }
-          ))),
+          )))
+      .addSubcommand(sc => sc
+        .setName('profile')
+        .setDescription('Show an expanded Madden team profile with cap, rankings, and top players')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))),
 
 
     new SlashCommandBuilder()
@@ -7762,6 +7767,12 @@ if (gameSubcommand === 'report') {
       if (subcommand === 'rankings') {
         const category = interaction.options.getString('category');
         await interaction.editReply({ embeds: [await buildMaddenTeamAttributeRankingsEmbed(interaction.guild.id, activeLeague, category)] });
+        return;
+      }
+      if (subcommand === 'profile') {
+        const team = interaction.options.getString('team');
+        await refreshMaddenTeamCapFromExpandedPlayers(interaction.guild.id, activeLeague.league_id).catch(() => null);
+        await interaction.editReply({ embeds: [await buildMaddenTeamProfileEmbed(interaction.guild.id, activeLeague, team)] });
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden team command.' });
@@ -25720,6 +25731,60 @@ function formatMaddenMoney(value) {
   return `${num < 0 ? '-' : ''}$${abs.toFixed(0)}`;
 }
 
+
+// 7J-10BY-DE: resolve EA numeric team IDs into normal NFL team names/logos for franchise data views.
+async function getMaddenBydeTeamContext(guildId, leagueId, teamInput) {
+  const raw = String(teamInput || '').trim();
+  if (!raw) return { rawTeamName: raw, teamName: 'FA', displayName: 'FA', externalTeamId: null };
+  const result = await pool.query(
+    `SELECT external_team_id, team_name, team_role_id, owner_user_id
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND (
+         LOWER(COALESCE(team_name, '')) = LOWER($3)
+         OR LOWER(COALESCE(external_team_id, '')) = LOWER($3)
+         OR LOWER(COALESCE(team_name, '')) = LOWER($4)
+         OR LOWER(COALESCE(team_name, '')) LIKE LOWER($5)
+       )
+     ORDER BY CASE
+       WHEN LOWER(COALESCE(external_team_id, '')) = LOWER($3) THEN 0
+       WHEN LOWER(COALESCE(team_name, '')) = LOWER($3) THEN 1
+       ELSE 2
+     END
+     LIMIT 1`,
+    [String(guildId), String(leagueId), raw, getMaddenTeamAbbrev(raw), `%${raw}%`]
+  ).catch(() => ({ rows: [] }));
+  const row = result.rows?.[0] || null;
+  const teamName = row?.team_name || raw;
+  return {
+    rawTeamName: raw,
+    teamName,
+    displayName: maddenTeamDisplayName(teamName),
+    externalTeamId: row?.external_team_id || (raw.match(/^\d+$/) ? raw : null),
+    teamRoleId: row?.team_role_id || null,
+    ownerUserId: row?.owner_user_id || null,
+  };
+}
+
+function maddenBydeTeamMatches(rowTeam, ctx) {
+  const raw = String(rowTeam || '').trim().toLowerCase();
+  const names = [ctx?.rawTeamName, ctx?.teamName, ctx?.externalTeamId, getMaddenTeamAbbrev(ctx?.teamName)]
+    .filter(Boolean)
+    .map(v => String(v).trim().toLowerCase());
+  return names.includes(raw);
+}
+
+async function maddenBydeTeamDisplayName(guildId, leagueId, teamName) {
+  const ctx = await getMaddenBydeTeamContext(guildId, leagueId, teamName);
+  return ctx.displayName || maddenTeamDisplayName(teamName);
+}
+
+async function maddenBydeTeamLogoUrl(guildId, leagueId, teamName) {
+  const ctx = await getMaddenBydeTeamContext(guildId, leagueId, teamName);
+  return getMaddenTeamLogoUrl(ctx.teamName) || getMaddenTeamLogoUrl(teamName);
+}
+
 async function getMaddenExpandedPlayerRow(guildId, leagueId, playerInput) {
   await ensureMaddenFranchiseDataTables();
   const q = String(playerInput || '').trim();
@@ -25765,21 +25830,22 @@ async function buildMaddenPlayerAttributesEmbed(guildId, league, playerInput) {
   const embed = new EmbedBuilder()
     .setTitle(`🧬 Player Attributes • ${league.league_name}`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DD Player Attributes' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DE Player Attributes' })
     .setTimestamp();
   if (!row) {
     embed.setDescription(`No expanded attribute record found for **${playerInput}** yet. Run Madden sync, then try again.`);
     return embed;
   }
   const attrs = maddenBydRaw(row.attributes);
+  const teamCtx = await getMaddenBydeTeamContext(guildId, league.league_id, row.team_name || 'Free Agent');
   embed.setTitle(`🧬 ${row.player_name}`);
-  embed.setDescription(`**${maddenTeamDisplayName(row.team_name || 'Free Agent')}** • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
+  embed.setDescription(`**${teamCtx.displayName || maddenTeamDisplayName(row.team_name || 'Free Agent')}** • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
   embed.addFields(
     { name: 'Core Info', value: [`Dev: **${row.dev_trait || 'Unknown'}**`, `Archetype: **${row.archetype || 'Unknown'}**`, `Age: **${row.age ?? 'N/A'}**`].join('\n'), inline: true },
     { name: 'Contract', value: [`Status: **${row.contract_status || 'Unknown'}**`, `Years Left: **${row.years_left ?? 'N/A'}**`, `Cap Hit: **${formatMaddenMoney(row.cap_hit || 0)}**`].join('\n'), inline: true },
     { name: 'Top Attributes', value: maddenSafeEmbedText(maddenBydTopAttributesLine(attrs, 18, row.position), 1024), inline: false }
   );
-  const logo = getMaddenTeamLogoUrl(row.team_name);
+  const logo = getMaddenTeamLogoUrl(teamCtx.teamName) || getMaddenTeamLogoUrl(row.team_name);
   if (logo) embed.setThumbnail(logo);
   return embed;
 }
@@ -25789,7 +25855,7 @@ async function buildMaddenPlayerProgressionEmbed(guildId, league, playerInput) {
   const embed = new EmbedBuilder()
     .setTitle(`📈 ${playerInput} • Progression`)
     .setColor(0x57F287)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DD Player Progression' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DE Player Progression' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved progression entries found yet. Progression is created by roster sync comparisons from 7J-10BY-C.');
@@ -25802,33 +25868,74 @@ async function buildMaddenPlayerProgressionEmbed(guildId, league, playerInput) {
 
 async function buildMaddenTeamCapEmbed(guildId, league, teamInput) {
   await ensureMaddenFranchiseDataTables();
-  const team = normalizeMaddenTeamName(teamInput);
+  const ctx = await getMaddenBydeTeamContext(guildId, league.league_id, teamInput);
+  const candidates = [ctx.rawTeamName, ctx.teamName, ctx.externalTeamId, getMaddenTeamAbbrev(ctx.teamName)]
+    .filter(Boolean)
+    .map(v => String(v).trim().toLowerCase());
   const result = await pool.query(
     `SELECT * FROM madden_team_cap
-     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3)
+     WHERE guild_id = $1 AND league_id = $2
+       AND LOWER(team_name) = ANY($3::text[])
+     ORDER BY CASE WHEN LOWER(team_name) = LOWER($4) THEN 0 ELSE 1 END
      LIMIT 1`,
-    [String(guildId), String(league.league_id), team]
+    [String(guildId), String(league.league_id), candidates, ctx.rawTeamName || ctx.teamName]
   );
-  const row = result.rows[0];
+  let row = result.rows[0];
+  if (!row) {
+    const p = await pool.query(
+      `SELECT COUNT(*)::int AS player_count, COALESCE(SUM(COALESCE(cap_hit, salary, 0)), 0) AS active_cap, COALESCE(SUM(COALESCE(penalty, 0)), 0) AS dead_cap
+       FROM madden_player_attributes
+       WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = ANY($3::text[])`,
+      [String(guildId), String(league.league_id), candidates]
+    ).catch(() => ({ rows: [] }));
+    const pr = p.rows?.[0];
+    if (pr && Number(pr.player_count || 0) > 0) {
+      const capLimit = Number(process.env.MADDEN_LEAGUE_CAP_LIMIT || 255000000);
+      const activeCap = Number(pr.active_cap || 0);
+      const deadCap = Number(pr.dead_cap || 0);
+      row = { team_name: ctx.teamName, cap_space: capLimit - activeCap - deadCap, active_cap: activeCap, dead_cap: deadCap, player_count: pr.player_count, raw_payload: { cap_limit: capLimit } };
+    }
+  }
+  const topContracts = await pool.query(
+    `SELECT player_name, position, overall, cap_hit, years_left
+     FROM madden_player_attributes
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = ANY($3::text[])
+     ORDER BY cap_hit DESC NULLS LAST, overall DESC NULLS LAST
+     LIMIT 5`,
+    [String(guildId), String(league.league_id), candidates]
+  ).catch(() => ({ rows: [] }));
+  const expiring = await pool.query(
+    `SELECT player_name, position, overall, cap_hit, years_left
+     FROM madden_player_attributes
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = ANY($3::text[])
+       AND COALESCE(years_left, 99) <= 1
+     ORDER BY overall DESC NULLS LAST
+     LIMIT 5`,
+    [String(guildId), String(league.league_id), candidates]
+  ).catch(() => ({ rows: [] }));
   const embed = new EmbedBuilder()
-    .setTitle(`💰 Salary Cap • ${maddenTeamDisplayName(team)}`)
+    .setTitle(`💰 Salary Cap • ${ctx.displayName || maddenTeamDisplayName(teamInput)}`)
     .setColor(row && Number(row.cap_space || 0) < 0 ? 0xED4245 : 0x57F287)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DD Salary Cap' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DE Salary Cap' })
     .setTimestamp();
   if (!row) {
     embed.setDescription('No cap snapshot found yet. This will populate when imported player payloads include salary/cap fields.');
   } else {
     const capLimit = maddenBydRaw(row.raw_payload)?.cap_limit || process.env.MADDEN_LEAGUE_CAP_LIMIT || '255000000';
+    const topText = (topContracts.rows || []).map((p, i) => `**${i + 1}. ${p.player_name}** — ${p.position || 'POS'} • ${p.overall || 'N/A'} OVR • ${formatMaddenMoney(p.cap_hit || 0)}${p.years_left != null ? ` • ${p.years_left} yrs` : ''}`).join('\n') || 'No contract rows found.';
+    const expiringText = (expiring.rows || []).map((p, i) => `**${i + 1}. ${p.player_name}** — ${p.position || 'POS'} • ${p.overall || 'N/A'} OVR • ${formatMaddenMoney(p.cap_hit || 0)}`).join('\n') || 'No key expiring contracts detected.';
     embed.addFields(
       { name: 'Cap Space', value: `**${formatMaddenMoney(row.cap_space)}**`, inline: true },
       { name: 'Active Cap', value: formatMaddenMoney(row.active_cap), inline: true },
       { name: 'Dead Cap', value: formatMaddenMoney(row.dead_cap), inline: true },
       { name: 'Players Counted', value: String(row.player_count || 0), inline: true },
       { name: 'League Cap Limit', value: formatMaddenMoney(capLimit), inline: true },
-      { name: 'Status', value: Number(row.cap_space || 0) < 0 ? '🚨 Over Cap' : '✅ Under Cap', inline: true }
+      { name: 'Status', value: Number(row.cap_space || 0) < 0 ? '🚨 Over Cap' : '✅ Under Cap', inline: true },
+      { name: 'Top Cap Hits', value: maddenSafeEmbedText(topText, 1024), inline: false },
+      { name: 'Expiring / 1-Year Deals', value: maddenSafeEmbedText(expiringText, 1024), inline: false }
     );
   }
-  const logo = getMaddenTeamLogoUrl(team);
+  const logo = getMaddenTeamLogoUrl(ctx.teamName) || getMaddenTeamLogoUrl(teamInput);
   if (logo) embed.setThumbnail(logo);
   return embed;
 }
@@ -25839,19 +25946,23 @@ async function buildMaddenLeagueCapEmbed(guildId, league) {
     `SELECT * FROM madden_team_cap WHERE guild_id = $1 AND league_id = $2 ORDER BY cap_space DESC, team_name ASC`,
     [String(guildId), String(league.league_id)]
   );
-  const rows = result.rows || [];
+  const rows = [];
+  for (const row of result.rows || []) {
+    const ctx = await getMaddenBydeTeamContext(guildId, league.league_id, row.team_name);
+    rows.push({ ...row, display_team_name: ctx.displayName || maddenTeamDisplayName(row.team_name), resolved_team_name: ctx.teamName });
+  }
   const embed = new EmbedBuilder()
     .setTitle(`💰 ${league.league_name} • League Cap Snapshot`)
     .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DD League Cap' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DE League Cap' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No league cap snapshots found yet. Cap data appears after Madden imports include salary/cap fields.');
     return embed;
   }
-  const mostSpace = rows.slice(0, 8).map((row, i) => `**${i + 1}. ${maddenTeamDisplayName(row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`).join('\n');
-  const leastSpace = [...rows].reverse().slice(0, 8).map((row, i) => `**${i + 1}. ${maddenTeamDisplayName(row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`).join('\n');
-  const violations = rows.filter(row => Number(row.cap_space || 0) < 0).map(row => `🚨 **${maddenTeamDisplayName(row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`).join('\n') || 'No cap violations detected.';
+  const mostSpace = rows.slice(0, 8).map((row, i) => `**${i + 1}. ${row.display_team_name}** — ${formatMaddenMoney(row.cap_space)}`).join('\n');
+  const leastSpace = [...rows].reverse().slice(0, 8).map((row, i) => `**${i + 1}. ${row.display_team_name}** — ${formatMaddenMoney(row.cap_space)}`).join('\n');
+  const violations = rows.filter(row => Number(row.cap_space || 0) < 0).map(row => `🚨 **${row.display_team_name}** — ${formatMaddenMoney(row.cap_space)}`).join('\n') || 'No cap violations detected.';
   embed.addFields(
     { name: 'Most Cap Space', value: mostSpace || 'No data.', inline: true },
     { name: 'Least Cap Space', value: leastSpace || 'No data.', inline: true },
@@ -25890,22 +26001,30 @@ async function buildMaddenTeamAttributeRankingsEmbed(guildId, league, category =
     [String(guildId), String(league.league_id)]
   );
   const teamMap = new Map();
+  const ctxCache = new Map();
   for (const row of result.rows || []) {
     const score = maddenTeamRankingScoreForCategory(row, category);
     if (!Number.isFinite(score) || score <= 0) continue;
-    const team = row.team_name;
-    if (!teamMap.has(team)) teamMap.set(team, []);
-    teamMap.get(team).push({ row, score });
+    const rawTeam = row.team_name || 'FA';
+    const cacheKey = String(rawTeam).toLowerCase();
+    let ctx = ctxCache.get(cacheKey);
+    if (!ctx) {
+      ctx = await getMaddenBydeTeamContext(guildId, league.league_id, rawTeam);
+      ctxCache.set(cacheKey, ctx);
+    }
+    const teamKey = ctx.teamName || rawTeam;
+    if (!teamMap.has(teamKey)) teamMap.set(teamKey, { ctx, entries: [] });
+    teamMap.get(teamKey).entries.push({ row, score });
   }
-  const rankings = [...teamMap.entries()].map(([team, entries]) => {
+  const rankings = [...teamMap.values()].map(({ ctx, entries }) => {
     const sorted = entries.sort((a, b) => b.score - a.score).slice(0, category === 'overall' ? 22 : 8);
     const avg = sorted.reduce((sum, item) => sum + item.score, 0) / Math.max(1, sorted.length);
-    return { team, avg, top: sorted.slice(0, 3) };
+    return { team: ctx.teamName, displayName: ctx.displayName, avg, top: sorted.slice(0, 3) };
   }).sort((a, b) => b.avg - a.avg).slice(0, 12);
   const embed = new EmbedBuilder()
     .setTitle(`📊 ${league.league_name} • ${maddenTeamRankingCategoryLabel(category)}`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DD Team Attribute Rankings' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DE Team Attribute Rankings' })
     .setTimestamp();
   if (!rankings.length) {
     embed.setDescription('No attribute ranking data found yet. This fills in when Madden sync/import payloads include detailed ratings.');
@@ -25913,8 +26032,59 @@ async function buildMaddenTeamAttributeRankingsEmbed(guildId, league, category =
   }
   embed.setDescription(rankings.map((item, index) => {
     const topPlayers = item.top.map(t => `${t.row.player_name} (${Number(t.score).toFixed(0)})`).join(', ');
-    return `**${index + 1}. ${maddenTeamDisplayName(item.team)}** — ${item.avg.toFixed(1)} avg\n${topPlayers}`;
+    return `**${index + 1}. ${item.displayName || maddenTeamDisplayName(item.team)}** — ${item.avg.toFixed(1)} avg\n${topPlayers}`;
   }).join('\n\n').slice(0, 4096));
+  const topLogo = rankings[0] ? getMaddenTeamLogoUrl(rankings[0].team) : null;
+  if (topLogo) embed.setThumbnail(topLogo);
+  return embed;
+}
+
+async function buildMaddenTeamProfileEmbed(guildId, league, teamInput) {
+  await ensureMaddenFranchiseDataTables();
+  const ctx = await getMaddenBydeTeamContext(guildId, league.league_id, teamInput);
+  const candidates = [ctx.rawTeamName, ctx.teamName, ctx.externalTeamId, getMaddenTeamAbbrev(ctx.teamName)]
+    .filter(Boolean)
+    .map(v => String(v).trim().toLowerCase());
+  const players = await pool.query(
+    `SELECT * FROM madden_player_attributes
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = ANY($3::text[])
+     ORDER BY overall DESC NULLS LAST, cap_hit DESC NULLS LAST
+     LIMIT 12`,
+    [String(guildId), String(league.league_id), candidates]
+  ).catch(() => ({ rows: [] }));
+  const cap = await pool.query(
+    `SELECT * FROM madden_team_cap
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = ANY($3::text[])
+     ORDER BY updated_at DESC NULLS LAST
+     LIMIT 1`,
+    [String(guildId), String(league.league_id), candidates]
+  ).catch(() => ({ rows: [] }));
+  const power = await pool.query(
+    `SELECT * FROM madden_power_rankings
+     WHERE league_id::text = $1::text AND (LOWER(team_name) = LOWER($2) OR LOWER(team_name) = LOWER($3))
+     LIMIT 1`,
+    [String(league.league_id), ctx.teamName, ctx.rawTeamName]
+  ).catch(() => ({ rows: [] }));
+  const rows = players.rows || [];
+  const capRow = cap.rows?.[0] || null;
+  const avgOverall = rows.length ? rows.reduce((sum, p) => sum + Number(p.overall || 0), 0) / rows.length : 0;
+  const topPlayers = rows.slice(0, 6).map((p, i) => `**${i + 1}. ${p.player_name}** — ${p.position || 'POS'} • ${p.overall || 'N/A'} OVR • ${formatMaddenMoney(p.cap_hit || 0)}`).join('\n') || 'No expanded player rows found yet.';
+  const speedAvg = rows.length ? rows.reduce((sum, p) => sum + Number(maddenBydRaw(p.attributes).speed || 0), 0) / rows.length : 0;
+  const capText = capRow ? [`Cap Space: **${formatMaddenMoney(capRow.cap_space)}**`, `Active Cap: **${formatMaddenMoney(capRow.active_cap)}**`, `Players Counted: **${capRow.player_count || rows.length}**`].join('\n') : 'No cap snapshot found yet.';
+  const powerText = power.rows?.[0]?.rank ? `#${power.rows[0].rank} • Score ${Number(power.rows[0].power_score || 0).toFixed(1)}` : 'Not calculated yet.';
+  const embed = new EmbedBuilder()
+    .setTitle(`🏈 ${ctx.displayName || maddenTeamDisplayName(teamInput)} • Team Profile`)
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Roster Snapshot', value: [`Players: **${rows.length}**`, `Avg Top OVR: **${avgOverall.toFixed(1)}**`, `Avg Speed: **${speedAvg.toFixed(1)}**`].join('\n'), inline: true },
+      { name: 'Power Ranking', value: powerText, inline: true },
+      { name: 'Salary Cap', value: capText, inline: true },
+      { name: 'Top Players', value: maddenSafeEmbedText(topPlayers, 1024), inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DE Team Profile' })
+    .setTimestamp();
+  const logo = getMaddenTeamLogoUrl(ctx.teamName) || getMaddenTeamLogoUrl(teamInput);
+  if (logo) embed.setThumbnail(logo);
   return embed;
 }
 
