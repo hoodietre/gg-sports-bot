@@ -1646,6 +1646,26 @@ function buildCommands() {
 
 ,
 
+
+
+    new SlashCommandBuilder()
+      .setName('maddenseason')
+      .setDescription('Madden season checkpoints, offseason readiness, and draft/cap validation')
+      .addSubcommand(sc => sc
+        .setName('readiness')
+        .setDescription('Check whether the league is safe to advance into the offseason')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('draftorder')
+        .setDescription('Preview estimated offseason draft order from imported standings')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('expiring')
+        .setDescription('Preview expiring contracts before offseason')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false).setAutocomplete(true)))
+
+,
     new SlashCommandBuilder()
       .setName('maddennews')
       .setDescription('Madden news feed setup, recent events, and weekly recaps')
@@ -2130,6 +2150,162 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true))),
   ].map(cmd => cmd.toJSON());
+}
+
+
+
+// 7J-10BY-DF: Offseason readiness, draft order, and cap validation helpers.
+async function getMaddenLatestSyncRun(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT * FROM madden_sync_runs
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     ORDER BY completed_at DESC NULLS LAST, started_at DESC
+     LIMIT 1`,
+    [guildId, String(leagueId)]
+  );
+  return result.rows[0] || null;
+}
+
+async function getMaddenEstimatedDraftOrderRows(guildId, leagueId, limit = 32) {
+  const result = await pool.query(
+    `SELECT team_name, wins, losses, ties, points_for, points_against
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     ORDER BY wins ASC, losses DESC, ties ASC, (points_for - points_against) ASC, team_name ASC
+     LIMIT $3`,
+    [guildId, String(leagueId), Number(limit || 32)]
+  );
+  return result.rows || [];
+}
+
+async function getMaddenExpiringContractRows(guildId, leagueId, team = null, limit = 15) {
+  const params = [guildId, String(leagueId)];
+  let teamSql = '';
+  if (team) {
+    params.push(String(team));
+    teamSql = ` AND (LOWER(team_name) = LOWER($3) OR LOWER(team_name) = LOWER($3::text) OR LOWER(team_name) LIKE LOWER('%' || $3::text || '%'))`;
+  }
+  params.push(Number(limit || 15));
+  const limitIndex = params.length;
+  const result = await pool.query(
+    `SELECT player_name, team_name, position, overall, years_left, cap_hit, salary
+     FROM madden_player_attributes
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND COALESCE(years_left, 99) <= 1
+       ${teamSql}
+     ORDER BY overall DESC NULLS LAST, cap_hit DESC NULLS LAST, player_name ASC
+     LIMIT $${limitIndex}`,
+    params
+  );
+  return result.rows || [];
+}
+
+async function buildMaddenDraftOrderPreviewEmbed(guildId, league) {
+  const rows = await getMaddenEstimatedDraftOrderRows(guildId, league.league_id, 32);
+  const embed = new EmbedBuilder()
+    .setTitle(`🧾 ${league?.league_name || 'Madden'} • Estimated Draft Order`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • 7J-10BY-DF Draft Order Preview' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription('No imported standings found yet. Run Madden sync before checking draft order.');
+    return embed;
+  }
+  const lines = rows.slice(0, 16).map((row, index) => {
+    const diff = Number(row.points_for || 0) - Number(row.points_against || 0);
+    return `**${index + 1}. ${maddenTeamDisplayName(row.team_name)}** — ${row.wins || 0}-${row.losses || 0}${Number(row.ties || 0) ? '-' + row.ties : ''} • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
+  });
+  embed.setDescription(lines.join('\n'));
+  embed.addFields({ name: 'Note', value: 'This is an estimated pre-offseason order from imported standings. If Madden locks playoff/Super Bowl draft order differently after advance, sync again after the offseason transition.', inline: false });
+  const logo = getMaddenTeamLogoUrl(rows[0]?.team_name);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function buildMaddenExpiringContractsEmbed(guildId, league, team = null) {
+  const rows = await getMaddenExpiringContractRows(guildId, league.league_id, team, 20);
+  const titleTeam = team ? ` • ${maddenTeamDisplayName(team)}` : '';
+  const embed = new EmbedBuilder()
+    .setTitle(`⏳ ${league?.league_name || 'Madden'}${titleTeam} • Expiring Contracts`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • 7J-10BY-DF Expiring Contracts' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription('No expiring 0-1 year contracts found from the current imported player attributes.');
+    return embed;
+  }
+  embed.setDescription(rows.map((row, index) => {
+    const cap = Number(row.cap_hit || row.salary || 0) / 1000000;
+    return `**${index + 1}. ${row.player_name}** — ${maddenTeamDisplayName(row.team_name)} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${Number(row.years_left || 0).toFixed(0)} yr • $${cap.toFixed(1)}M`;
+  }).join('\n').slice(0, 4096));
+  const logo = getMaddenTeamLogoUrl(team || rows[0]?.team_name);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function buildMaddenOffseasonReadinessEmbed(guildId, league) {
+  await backfillMaddenExpandedPlayerDataForLeague(guildId, league.league_id).catch(() => null);
+  await refreshMaddenTeamCapFromExpandedPlayers(guildId, league.league_id).catch(() => null);
+
+  const [latestSync, teamCountResult, playerCountResult, capResult, changesResult, gameResult, expiringRows, draftRows] = await Promise.all([
+    getMaddenLatestSyncRun(guildId, league.league_id),
+    pool.query(`SELECT COUNT(*)::int AS count FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`, [guildId, String(league.league_id)]),
+    pool.query(`SELECT COUNT(*)::int AS count FROM madden_player_attributes WHERE guild_id = $1 AND league_id::text = $2::text`, [guildId, String(league.league_id)]),
+    pool.query(`SELECT COUNT(*)::int AS count, SUM(CASE WHEN cap_space < 0 THEN 1 ELSE 0 END)::int AS violations FROM madden_team_cap WHERE guild_id = $1 AND league_id::text = $2::text`, [guildId, String(league.league_id)]),
+    pool.query(`SELECT COUNT(*)::int AS count FROM madden_change_log WHERE guild_id = $1 AND league_id::text = $2::text`, [guildId, String(league.league_id)]),
+    pool.query(`SELECT week_label, status, home_team, away_team, home_score, away_score, played_at FROM madden_imported_games WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY imported_at DESC LIMIT 5`, [guildId, String(league.league_id)]),
+    getMaddenExpiringContractRows(guildId, league.league_id, null, 5),
+    getMaddenEstimatedDraftOrderRows(guildId, league.league_id, 5),
+  ]);
+
+  const importedTeams = Number(teamCountResult.rows[0]?.count || 0);
+  const importedPlayers = Number(playerCountResult.rows[0]?.count || 0);
+  const capTeams = Number(capResult.rows[0]?.count || 0);
+  const capViolations = Number(capResult.rows[0]?.violations || 0);
+  const changeCount = Number(changesResult.rows[0]?.count || 0);
+  const games = gameResult.rows || [];
+  const latestWeek = latestSync?.week_label || games[0]?.week_label || 'Not specified';
+  const latestGame = games[0];
+  const maybeSuperBowl = String(latestWeek || latestGame?.week_label || '').toLowerCase().includes('super') || String(latestGame?.week_label || '').toLowerCase().includes('23');
+  const hasCoreData = importedTeams >= 32 && importedPlayers >= 1500;
+  const hasCapData = capTeams >= 20;
+  const capOk = capViolations === 0;
+  const ready = hasCoreData && hasCapData;
+  const status = ready ? (capOk ? '✅ Ready for controlled offseason advance' : '⚠️ Ready, but cap violations exist') : '🚨 Not ready — missing core imported data';
+
+  const checklist = [
+    `${hasCoreData ? '✅' : '❌'} Imported teams/players: **${importedTeams} teams / ${importedPlayers} players**`,
+    `${hasCapData ? '✅' : '❌'} Cap snapshots: **${capTeams} teams**`,
+    `${capOk ? '✅' : '⚠️'} Cap violations: **${capViolations}**`,
+    `${draftRows.length ? '✅' : '❌'} Draft order preview: **${draftRows.length ? 'available' : 'missing'}**`,
+    `${expiringRows.length ? '✅' : '⚠️'} Expiring contract preview: **${expiringRows.length} top expiring players found**`,
+    `${changeCount ? '✅' : '⏳'} Change logs: **${changeCount} saved changes**`,
+  ].join('\n');
+
+  const draftPreview = draftRows.length
+    ? draftRows.map((row, index) => `**${index + 1}.** ${maddenTeamDisplayName(row.team_name)} (${row.wins || 0}-${row.losses || 0})`).join('\n')
+    : 'No draft order data found.';
+
+  const expiringPreview = expiringRows.length
+    ? expiringRows.map((row, index) => `**${index + 1}.** ${row.player_name} — ${maddenTeamDisplayName(row.team_name)} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`).join('\n')
+    : 'No expiring contracts found.';
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🧭 ${league?.league_name || 'Madden'} • Offseason Readiness Check`)
+    .setColor(ready ? (capOk ? 0x57F287 : 0xFEE75C) : 0xED4245)
+    .addFields(
+      { name: 'Status', value: status, inline: false },
+      { name: 'Latest Sync', value: `Source: **${latestSync?.source || 'Unknown'}**\nWeek: **${latestWeek}**\nImported: **${latestSync?.imported_teams ?? importedTeams} teams / ${latestSync?.imported_players ?? importedPlayers} players**`, inline: false },
+      { name: 'Checklist', value: checklist, inline: false },
+      { name: 'Estimated Draft Order Top 5', value: draftPreview.slice(0, 1024), inline: true },
+      { name: 'Top Expiring Contracts', value: expiringPreview.slice(0, 1024), inline: true },
+      { name: 'Recommendation', value: maybeSuperBowl ? 'You are in or near Super Bowl week. Run this check, save screenshots of awards/power rankings/cap, then advance only after the Super Bowl result is final and synced.' : 'If the Super Bowl/final week is complete and synced, you can advance after saving this checkpoint.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DF Offseason Readiness' })
+    .setTimestamp();
+  const logo = getMaddenTeamLogoUrl(draftRows[0]?.team_name || expiringRows[0]?.team_name);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
 }
 
 function getRegisteredCommands() {
@@ -7776,6 +7952,39 @@ if (gameSubcommand === 'report') {
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden team command.' });
+      return;
+    }
+
+
+
+    if (interaction.commandName === 'maddenseason') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      if (subcommand === 'readiness') {
+        await interaction.editReply({ embeds: [await buildMaddenOffseasonReadinessEmbed(interaction.guild.id, activeLeague)] });
+        return;
+      }
+      if (subcommand === 'draftorder') {
+        await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
+        await interaction.editReply({ embeds: [await buildMaddenDraftOrderPreviewEmbed(interaction.guild.id, activeLeague)] });
+        return;
+      }
+      if (subcommand === 'expiring') {
+        const team = interaction.options.getString('team') || null;
+        await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
+        await interaction.editReply({ embeds: [await buildMaddenExpiringContractsEmbed(interaction.guild.id, activeLeague, team)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden season command.' });
       return;
     }
 
