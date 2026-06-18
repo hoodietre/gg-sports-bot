@@ -2093,8 +2093,14 @@ async function memberHasStaff(member, league) {
 async function memberHasCommittee(member, league) {
   if (!member) return false;
   const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
-  const hasCommitteeRole = league?.committee_role_id ? member.roles.cache.has(league.committee_role_id) : false;
-  return Boolean(isAdmin || hasCommitteeRole);
+  const canManageServer = member.permissions.has(PermissionFlagsBits.ManageGuild);
+  const possibleRoleIds = [
+    league?.trade_committee_role_id,
+    league?.committee_role_id,
+    COMMITTEE_ROLE_ID,
+  ].filter(Boolean).map(String);
+  const hasCommitteeRole = possibleRoleIds.some(roleId => member.roles.cache.has(roleId));
+  return Boolean(isAdmin || canManageServer || hasCommitteeRole);
 }
 
 async function userCanUseLeagueSetup(interaction, league = null) {
@@ -6832,20 +6838,13 @@ if (gameSubcommand === 'report') {
             const result = await addMaddenTradeBlockEntry(interaction.guild.id, activeLeague, member, interaction.user.id, playerName, seeking, notes);
             if (result.ok) {
               const listing = await findMaddenTradeBlockListing(interaction.guild.id, activeLeague.league_id, playerName).catch(() => null);
-              await recordMaddenNewsEvent(interaction.guild, activeLeague, {
-                event_type: 'trade_block_added',
-                player_id: listing?.player_key || null,
-                player_name: listing?.player_name || playerName,
-                team_name: listing?.team_name || result.team_name || null,
-                metadata: {
-                  position: listing?.position || null,
-                  overall: listing?.overall || null,
-                  value_score: listing?.value_score || null,
-                  seeking: listing?.seeking || seeking || null,
-                  notes: listing?.notes || notes || null,
-                  submitted_by: interaction.user.id,
-                },
-              }).catch(error => console.warn('[7J-10BY-A NEWS] trade block add event failed:', error?.message || error));
+              await recordMaddenTradeBlockNewsEvent(interaction.guild, activeLeague, 'added', listing, {
+                player_name: playerName,
+                team_name: result.team_name || null,
+                seeking,
+                notes,
+                submitted_by: interaction.user.id,
+              }).catch(error => console.warn('[7J-10BY-A1 NEWS] trade block add event failed:', error?.message || error));
             }
             await interaction.editReply({ embeds: [result.embed] });
             return;
@@ -6855,12 +6854,10 @@ if (gameSubcommand === 'report') {
             const playerName = interaction.options.getString('player');
             const result = await removeMaddenTradeBlockEntry(interaction.guild.id, activeLeague, interaction.user.id, playerName);
             if (result.ok) {
-              await recordMaddenNewsEvent(interaction.guild, activeLeague, {
-                event_type: 'trade_block_removed',
-                player_name: result.row?.player_name || playerName,
-                team_name: result.row?.team_name || null,
-                metadata: { submitted_by: interaction.user.id },
-              }).catch(error => console.warn('[7J-10BY-A NEWS] trade block remove event failed:', error?.message || error));
+              await recordMaddenTradeBlockNewsEvent(interaction.guild, activeLeague, 'removed', result.row || null, {
+                player_name: playerName,
+                submitted_by: interaction.user.id,
+              }).catch(error => console.warn('[7J-10BY-A1 NEWS] trade block remove event failed:', error?.message || error));
             }
             await interaction.editReply({ embeds: [result.embed] });
             return;
@@ -23887,8 +23884,40 @@ async function setMaddenNewsChannel(leagueId, channelId) {
 
 async function getMaddenNewsChannelId(leagueId) {
   await ensureMaddenNewsTables();
-  const result = await pool.query(`SELECT madden_news_channel_id FROM league_settings WHERE league_id = $1 LIMIT 1`, [leagueId]);
+  if (!leagueId) return null;
+  const result = await pool.query(
+    `SELECT madden_news_channel_id
+     FROM league_settings
+     WHERE league_id::text = $1::text
+     LIMIT 1`,
+    [String(leagueId)]
+  );
   return result.rows[0]?.madden_news_channel_id || null;
+}
+
+async function postMaddenNewsEventToConfiguredChannel(guild, league, row) {
+  if (!guild || !league?.league_id || !row) return null;
+  const channelId = await getMaddenNewsChannelId(league.league_id);
+  if (!channelId) {
+    console.warn('[7J-10BY-A1 NEWS FEED] No madden_news_channel_id configured for league ' + String(league.league_id));
+    return null;
+  }
+  const channel = await guild.channels.fetch(channelId).catch(error => {
+    console.warn('[7J-10BY-A1 NEWS FEED] Channel fetch failed:', channelId, error?.message || error);
+    return null;
+  });
+  if (!channel?.isTextBased?.()) {
+    console.warn('[7J-10BY-A1 NEWS FEED] Configured channel is not text based:', channelId);
+    return null;
+  }
+  const msg = await channel.send({ embeds: [buildMaddenNewsEventEmbed(league, row)] }).catch(error => {
+    console.warn('[7J-10BY-A1 NEWS FEED] post failed:', error?.message || error);
+    return null;
+  });
+  if (msg?.id) {
+    await pool.query(`UPDATE madden_news_events SET posted_channel_id = $1, posted_message_id = $2 WHERE id = $3`, [channel.id, msg.id, row.id]).catch(() => null);
+  }
+  return msg || null;
 }
 
 function maddenNewsEventTitle(eventType) {
@@ -23923,7 +23952,7 @@ function buildMaddenNewsEventEmbed(league, event) {
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-A Madden News Feed' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-A1 Madden News Feed' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
   const playerLine = event.player_name ? `**${event.player_name}**${event.team_name ? ` • ${maddenTeamDisplayName(event.team_name)}` : ''}` : (event.team_name ? `**${maddenTeamDisplayName(event.team_name)}**` : league?.league_name || 'Madden League');
@@ -23958,20 +23987,32 @@ async function recordMaddenNewsEvent(guild, league, event) {
     [id, guild.id, String(league.league_id), event.event_type, event.player_id || null, event.player_name || null, event.team_name || null, event.old_value || null, event.new_value || null, event.week_label || null, JSON.stringify(metadata)]
   );
   const row = result.rows[0];
-  const channelId = await getMaddenNewsChannelId(league.league_id);
-  if (channelId) {
-    const channel = await guild.channels.fetch(channelId).catch(() => null);
-    if (channel?.isTextBased?.()) {
-      const msg = await channel.send({ embeds: [buildMaddenNewsEventEmbed(league, row)] }).catch(error => {
-        console.warn('[7J-10BY-A NEWS FEED] post failed:', error?.message || error);
-        return null;
-      });
-      if (msg?.id) {
-        await pool.query(`UPDATE madden_news_events SET posted_channel_id = $1, posted_message_id = $2 WHERE id = $3`, [channel.id, msg.id, id]).catch(() => null);
-      }
-    }
-  }
+  await postMaddenNewsEventToConfiguredChannel(guild, league, row);
   return row;
+}
+
+async function recordMaddenTradeBlockNewsEvent(guild, league, action, listing, fallback = {}) {
+  if (!guild || !league?.league_id) return null;
+  const eventType = action === 'removed' ? 'trade_block_removed' : 'trade_block_added';
+  const playerName = listing?.player_name || fallback.player_name || fallback.playerName || 'Unknown Player';
+  const teamName = listing?.team_name || fallback.team_name || fallback.teamName || null;
+  return await recordMaddenNewsEvent(guild, league, {
+    event_type: eventType,
+    player_id: listing?.player_key || listing?.player_id || fallback.player_id || null,
+    player_name: playerName,
+    team_name: teamName,
+    metadata: {
+      position: listing?.position || fallback.position || null,
+      overall: listing?.overall || fallback.overall || null,
+      value_score: listing?.value_score || fallback.value_score || null,
+      seeking: listing?.seeking || fallback.seeking || null,
+      notes: listing?.notes || fallback.notes || null,
+      submitted_by: fallback.submitted_by || null,
+      summary: action === 'removed'
+        ? `${playerName} was removed from the trade block${teamName ? ` by ${maddenTeamDisplayName(teamName)}` : ''}.`
+        : `${playerName} was added to the trade block${teamName ? ` by ${maddenTeamDisplayName(teamName)}` : ''}.`,
+    },
+  });
 }
 
 async function getMaddenNewsEvents(guildId, leagueId, { category = null, week = null, limit = 25 } = {}) {
@@ -24002,7 +24043,7 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-A Madden News Feed' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-A1 Madden News Feed' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved Madden news events found yet. New trade block activity, committee submissions, approved trades, and future sync changes will appear here.');
