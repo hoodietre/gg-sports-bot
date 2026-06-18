@@ -22280,12 +22280,12 @@ async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = nul
       position: nextPosition,
       overall: nextOverall,
       raw_payload: row,
-    }).catch(error => console.warn('[7J-10BY-DA] expanded player capture failed:', error?.message || error));
+    }).catch(error => console.warn('[7J-10BY-DD] expanded player capture failed:', error?.message || error));
 
     imported += 1;
   }
 
-  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(error => console.warn('[7J-10BY-DA] cap snapshot refresh failed:', error?.message || error));
+  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(error => console.warn('[7J-10BY-DD] cap snapshot refresh failed:', error?.message || error));
   return imported;
 }
 
@@ -25116,18 +25116,18 @@ function normalizeMaddenInjuryValue(value) {
 function getMaddenChangeAttributeMap(rawPayload) {
   const raw = typeof rawPayload === 'string' ? (() => { try { return JSON.parse(rawPayload); } catch { return {}; } })() : (rawPayload || {});
   const keys = [
-    ['speed', ['speed', 'spd', 'SpeedRating', 'speedRating', 'playerSpeed', 'ratingSpeed']],
-    ['strength', ['strength', 'str', 'StrengthRating', 'strengthRating', 'ratingStrength']],
-    ['awareness', ['awareness', 'awr', 'AwarenessRating', 'awarenessRating', 'ratingAwareness']],
-    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating', 'accelerationRating', 'ratingAcceleration']],
-    ['agility', ['agility', 'agi', 'AgilityRating', 'agilityRating', 'ratingAgility']],
-    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating', 'throwPowerRating', 'ratingThrowPower']],
+    ['speed', ['speed', 'spd', 'speedRating', 'SpeedRating', 'playerSpeed', 'ratingSpeed', 'playerBestOvr', 'playerBestOverall']],
+    ['strength', ['strength', 'str', 'strengthRating', 'StrengthRating', 'ratingStrength']],
+    ['awareness', ['awareness', 'awareRating', 'awr', 'AwarenessRating', 'awarenessRating', 'ratingAwareness']],
+    ['acceleration', ['acceleration', 'accel', 'acc', 'accelRating', 'AccelerationRating', 'accelerationRating', 'ratingAcceleration']],
+    ['agility', ['agility', 'agi', 'agilityRating', 'AgilityRating', 'ratingAgility']],
+    ['throw_power', ['throwPower', 'throwPowerRating', 'throw_power', 'thp', 'ThrowPowerRating', 'ratingThrowPower']],
     ['throw_accuracy_short', ['throwAccuracyShort', 'throw_accuracy_short', 'tas', 'ThrowAccuracyShortRating']],
     ['throw_accuracy_mid', ['throwAccuracyMid', 'throw_accuracy_mid', 'tam', 'ThrowAccuracyMidRating']],
     ['throw_accuracy_deep', ['throwAccuracyDeep', 'throw_accuracy_deep', 'tad', 'ThrowAccuracyDeepRating']],
     ['catching', ['catching', 'cth', 'CatchingRating']],
     ['route_running', ['routeRunning', 'route_running', 'rr', 'RouteRunningRating']],
-    ['carrying', ['carrying', 'carry', 'car', 'CarryingRating', 'ratingCarrying']],
+    ['carrying', ['carrying', 'carryRating', 'carry', 'car', 'CarryingRating', 'ratingCarrying']],
     ['break_tackle', ['breakTackle', 'break_tackle', 'btk', 'BreakTackleRating']],
     ['tackle', ['tackle', 'tak', 'TackleRating', 'ratingTackle']],
     ['block_shed', ['blockShed', 'block_shed', 'bsh', 'BlockShedRating']],
@@ -25538,24 +25538,24 @@ function maddenBydFirst(raw, aliases = [], fallback = null) {
 function getMaddenBydAttributeMap(rawPayload) {
   const raw = maddenBydRaw(rawPayload);
   const specs = [
-    ['speed', ['speed', 'spd', 'SpeedRating', 'speedRating', 'playerSpeed', 'ratingSpeed']],
-    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating', 'accelerationRating', 'ratingAcceleration']],
-    ['agility', ['agility', 'agi', 'AgilityRating', 'agilityRating', 'ratingAgility']],
-    ['strength', ['strength', 'str', 'StrengthRating', 'strengthRating', 'ratingStrength']],
-    ['awareness', ['awareness', 'awr', 'AwarenessRating', 'awarenessRating', 'ratingAwareness']],
-    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating', 'throwPowerRating', 'ratingThrowPower']],
+    ['speed', ['speed', 'spd', 'speedRating', 'SpeedRating', 'playerSpeed', 'ratingSpeed', 'playerBestOvr', 'playerBestOverall']],
+    ['acceleration', ['acceleration', 'accel', 'acc', 'accelRating', 'AccelerationRating', 'accelerationRating', 'ratingAcceleration']],
+    ['agility', ['agility', 'agi', 'agilityRating', 'AgilityRating', 'ratingAgility']],
+    ['strength', ['strength', 'str', 'strengthRating', 'StrengthRating', 'ratingStrength']],
+    ['awareness', ['awareness', 'awareRating', 'awr', 'AwarenessRating', 'awarenessRating', 'ratingAwareness']],
+    ['throw_power', ['throwPower', 'throwPowerRating', 'throw_power', 'thp', 'ThrowPowerRating', 'ratingThrowPower']],
     ['short_accuracy', ['throwAccuracyShort', 'shortAccuracy', 'throw_accuracy_short', 'tas', 'ThrowAccuracyShortRating', 'throwAccShort', 'shortAcc', 'ratingThrowAccuracyShort']],
     ['medium_accuracy', ['throwAccuracyMid', 'throwAccuracyMedium', 'mediumAccuracy', 'medAccuracy', 'throw_accuracy_mid', 'tam', 'ThrowAccuracyMidRating', 'throwAccMid', 'ratingThrowAccuracyMid']],
     ['deep_accuracy', ['throwAccuracyDeep', 'deepAccuracy', 'throw_accuracy_deep', 'tad', 'ThrowAccuracyDeepRating', 'throwAccDeep', 'ratingThrowAccuracyDeep']],
-    ['throw_under_pressure', ['throwUnderPressure', 'tup', 'ThrowUnderPressureRating', 'ratingThrowUnderPressure']],
-    ['throw_on_run', ['throwOnRun', 'tor', 'ThrowOnRunRating', 'ratingThrowOnRun']],
+    ['throw_under_pressure', ['throwUnderPressure', 'throwUnderPressureRating', 'tup', 'ThrowUnderPressureRating', 'ratingThrowUnderPressure']],
+    ['throw_on_run', ['throwOnRun', 'throwOnRunRating', 'tor', 'ThrowOnRunRating', 'ratingThrowOnRun']],
     ['play_action', ['playAction', 'pac', 'PlayActionRating', 'ratingPlayAction']],
-    ['carrying', ['carrying', 'carry', 'car', 'CarryingRating', 'ratingCarrying']],
-    ['break_tackle', ['breakTackle', 'btk', 'BreakTackleRating', 'ratingBreakTackle']],
+    ['carrying', ['carrying', 'carryRating', 'carry', 'car', 'CarryingRating', 'ratingCarrying']],
+    ['break_tackle', ['breakTackle', 'breakTackleRating', 'btk', 'BreakTackleRating', 'ratingBreakTackle']],
     ['truck', ['trucking', 'truck', 'trk', 'TruckingRating', 'ratingTrucking']],
-    ['juke', ['jukeMove', 'juke', 'juk', 'JukeMoveRating', 'ratingJukeMove']],
+    ['juke', ['jukeMove', 'jukeMoveRating', 'juke', 'juk', 'JukeMoveRating', 'ratingJukeMove']],
     ['spin', ['spinMove', 'spin', 'spm', 'SpinMoveRating', 'ratingSpinMove']],
-    ['catching', ['catching', 'catch', 'cth', 'CatchingRating', 'ratingCatching']],
+    ['catching', ['catching', 'catchRating', 'catch', 'cth', 'CatchingRating', 'ratingCatching']],
     ['catch_in_traffic', ['catchInTraffic', 'cit', 'CatchInTrafficRating', 'ratingCatchInTraffic']],
     ['spectacular_catch', ['spectacularCatch', 'specCatch', 'spc', 'SpectacularCatchRating', 'ratingSpectacularCatch']],
     ['route_running', ['routeRunning', 'rr', 'RouteRunningRating', 'shortRouteRunning', 'mediumRouteRunning', 'deepRouteRunning', 'srr', 'mrr', 'drr', 'ratingShortRouteRunning', 'ratingMediumRouteRunning', 'ratingDeepRouteRunning']],
@@ -25567,7 +25567,7 @@ function getMaddenBydAttributeMap(rawPayload) {
     ['lead_block', ['leadBlock', 'lbk', 'LeadBlockRating', 'ratingLeadBlock']],
     ['power_moves', ['powerMoves', 'pmv', 'PowerMovesRating', 'ratingPowerMoves']],
     ['finesse_moves', ['finesseMoves', 'fmv', 'FinesseMovesRating', 'ratingFinesseMoves']],
-    ['block_shed', ['blockShed', 'bsh', 'BlockShedRating', 'ratingBlockShed']],
+    ['block_shed', ['blockShed', 'blockShedRating', 'bsh', 'BlockShedRating', 'ratingBlockShed']],
     ['pursuit', ['pursuit', 'pur', 'PursuitRating', 'ratingPursuit']],
     ['tackle', ['tackle', 'tak', 'TackleRating', 'ratingTackle']],
     ['play_recognition', ['playRecognition', 'prc', 'PlayRecognitionRating', 'ratingPlayRecognition']],
@@ -25734,8 +25734,28 @@ async function getMaddenExpandedPlayerRow(guildId, leagueId, playerInput) {
   return result.rows[0] || null;
 }
 
-function maddenBydTopAttributesLine(attributes, limit = 12) {
-  const entries = Object.entries(attributes || {}).filter(([, value]) => Number.isFinite(Number(value))).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, limit);
+function maddenBydPositionAttributeKeys(position) {
+  const pos = String(position || '').toUpperCase();
+  if (pos === 'QB') return ['throw_power','short_accuracy','medium_accuracy','deep_accuracy','throw_under_pressure','throw_on_run','play_action','awareness','speed','acceleration'];
+  if (['HB','RB','FB'].includes(pos)) return ['speed','acceleration','agility','carrying','break_tackle','truck','juke','spin','awareness','strength'];
+  if (['WR','TE'].includes(pos)) return ['speed','acceleration','agility','catching','catch_in_traffic','spectacular_catch','release','route_running','juke','spin','break_tackle','awareness'];
+  if (['LT','LG','C','RG','RT'].includes(pos)) return ['pass_block','pass_block_power','pass_block_finesse','run_block','lead_block','strength','awareness'];
+  if (['LE','RE','DT','EDGE'].includes(pos)) return ['power_moves','finesse_moves','block_shed','pursuit','tackle','strength','speed','acceleration','play_recognition'];
+  if (['LOLB','MLB','ROLB','WILL','MIKE','SAM'].includes(pos)) return ['speed','acceleration','tackle','pursuit','play_recognition','block_shed','hit_power','zone_coverage','man_coverage'];
+  if (['CB','FS','SS','DB'].includes(pos)) return ['speed','acceleration','agility','man_coverage','zone_coverage','press','play_recognition','tackle','hit_power','catching'];
+  return ['speed','acceleration','agility','strength','awareness','catching','tackle','block_shed','carrying','break_tackle'];
+}
+
+function maddenBydTopAttributesLine(attributes, limit = 12, position = null) {
+  const attrs = attributes || {};
+  const keys = maddenBydPositionAttributeKeys(position);
+  const lines = [];
+  for (const key of keys) {
+    const value = Number(attrs[key]);
+    if (Number.isFinite(value) && value > 0) lines.push(`**${maddenBydAttributeLabel(key)}:** ${value.toFixed(0)}`);
+  }
+  if (lines.length) return lines.slice(0, limit).join('\n');
+  const entries = Object.entries(attrs).filter(([key, value]) => !['age','height','weight'].includes(key) && Number.isFinite(Number(value)) && Number(value) > 0).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, limit);
   if (!entries.length) return 'No detailed attributes found in the current import payload yet.';
   return entries.map(([key, value]) => `**${maddenBydAttributeLabel(key)}:** ${Number(value).toFixed(0)}`).join('\n');
 }
@@ -25745,7 +25765,7 @@ async function buildMaddenPlayerAttributesEmbed(guildId, league, playerInput) {
   const embed = new EmbedBuilder()
     .setTitle(`🧬 Player Attributes • ${league.league_name}`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DA Player Attributes' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DD Player Attributes' })
     .setTimestamp();
   if (!row) {
     embed.setDescription(`No expanded attribute record found for **${playerInput}** yet. Run Madden sync, then try again.`);
@@ -25757,7 +25777,7 @@ async function buildMaddenPlayerAttributesEmbed(guildId, league, playerInput) {
   embed.addFields(
     { name: 'Core Info', value: [`Dev: **${row.dev_trait || 'Unknown'}**`, `Archetype: **${row.archetype || 'Unknown'}**`, `Age: **${row.age ?? 'N/A'}**`].join('\n'), inline: true },
     { name: 'Contract', value: [`Status: **${row.contract_status || 'Unknown'}**`, `Years Left: **${row.years_left ?? 'N/A'}**`, `Cap Hit: **${formatMaddenMoney(row.cap_hit || 0)}**`].join('\n'), inline: true },
-    { name: 'Top Attributes', value: maddenSafeEmbedText(maddenBydTopAttributesLine(attrs, 18), 1024), inline: false }
+    { name: 'Top Attributes', value: maddenSafeEmbedText(maddenBydTopAttributesLine(attrs, 18, row.position), 1024), inline: false }
   );
   const logo = getMaddenTeamLogoUrl(row.team_name);
   if (logo) embed.setThumbnail(logo);
@@ -25769,7 +25789,7 @@ async function buildMaddenPlayerProgressionEmbed(guildId, league, playerInput) {
   const embed = new EmbedBuilder()
     .setTitle(`📈 ${playerInput} • Progression`)
     .setColor(0x57F287)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DA Player Progression' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DD Player Progression' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved progression entries found yet. Progression is created by roster sync comparisons from 7J-10BY-C.');
@@ -25793,7 +25813,7 @@ async function buildMaddenTeamCapEmbed(guildId, league, teamInput) {
   const embed = new EmbedBuilder()
     .setTitle(`💰 Salary Cap • ${maddenTeamDisplayName(team)}`)
     .setColor(row && Number(row.cap_space || 0) < 0 ? 0xED4245 : 0x57F287)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DA Salary Cap' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DD Salary Cap' })
     .setTimestamp();
   if (!row) {
     embed.setDescription('No cap snapshot found yet. This will populate when imported player payloads include salary/cap fields.');
@@ -25823,7 +25843,7 @@ async function buildMaddenLeagueCapEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle(`💰 ${league.league_name} • League Cap Snapshot`)
     .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DA League Cap' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DD League Cap' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No league cap snapshots found yet. Cap data appears after Madden imports include salary/cap fields.');
@@ -25849,6 +25869,7 @@ function maddenTeamRankingScoreForCategory(row, category) {
   if (category === 'secondary') return Math.max(get('man_coverage'), get('zone_coverage'), get('press'));
   if (category === 'offensive_line') return Math.max(get('pass_block'), get('run_block'), get('pass_block_power'), get('pass_block_finesse'));
   if (category === 'qb') return String(row.position || '').toUpperCase() === 'QB' ? overall : 0;
+  if (category === 'skill_positions') return ['WR','TE','HB','RB'].includes(String(row.position || '').toUpperCase()) ? Math.max(get('speed'), get('catching'), get('break_tackle'), overall) : 0;
   return overall;
 }
 
@@ -25858,6 +25879,7 @@ function maddenTeamRankingCategoryLabel(category) {
   if (category === 'secondary') return 'Best Secondary';
   if (category === 'offensive_line') return 'Strongest Offensive Line';
   if (category === 'qb') return 'Best QB Room';
+  if (category === 'skill_positions') return 'Best Skill Positions';
   return 'Highest OVR Roster';
 }
 
@@ -25883,7 +25905,7 @@ async function buildMaddenTeamAttributeRankingsEmbed(guildId, league, category =
   const embed = new EmbedBuilder()
     .setTitle(`📊 ${league.league_name} • ${maddenTeamRankingCategoryLabel(category)}`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DA Team Attribute Rankings' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DD Team Attribute Rankings' })
     .setTimestamp();
   if (!rankings.length) {
     embed.setDescription('No attribute ranking data found yet. This fills in when Madden sync/import payloads include detailed ratings.');
