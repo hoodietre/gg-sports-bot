@@ -24542,7 +24542,7 @@ function maddenRawValueFromPayload(payload, keys = []) {
   return null;
 }
 
-function normalizeMaddenDevTrait(value) {
+function normalizeMaddenDevTraitForChangeLog(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
   const lower = raw.toLowerCase();
@@ -24705,8 +24705,8 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
     }));
   }
 
-  const oldDev = normalizeMaddenDevTrait(maddenRawValueFromPayload(prevRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
-  const newDev = normalizeMaddenDevTrait(maddenRawValueFromPayload(nextRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
+  const oldDev = normalizeMaddenDevTraitForChangeLog(maddenRawValueFromPayload(prevRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
+  const newDev = normalizeMaddenDevTraitForChangeLog(maddenRawValueFromPayload(nextRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
   if (oldDev && newDev && oldDev !== newDev) {
     changes.push(await recordMaddenChangeLogEvent(guild, league, {
       change_type: 'dev_trait_change', player_id: playerId, player_name: playerName, team_name: teamName,
