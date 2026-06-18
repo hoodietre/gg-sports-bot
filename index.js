@@ -358,6 +358,9 @@ async function initDatabase() {
       UNIQUE (league_id, external_game_id)
     )
   `);
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_id TEXT`);
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_created_at TIMESTAMPTZ`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_imported_games_thread_lookup ON madden_imported_games (guild_id, league_id, week_label, thread_id)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_team_stats (
@@ -1550,6 +1553,22 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('connect').setDescription('Start Discord-native EA Direct connection wizard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
       .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('disconnect').setDescription('Disconnect your EA Direct Madden connection').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
+
+,
+
+    new SlashCommandBuilder()
+      .setName('maddengames')
+      .setDescription('Madden game thread automation and matchup hubs')
+      .addSubcommand(sc => sc
+        .setName('threads')
+        .setDescription('Staff: create Madden weekly game threads from imported schedule')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('week').setDescription('Week label, for example Week 9').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('visibility').setDescription('Thread visibility').setRequired(false)
+          .addChoices(
+            { name: 'Private', value: 'private' },
+            { name: 'Public', value: 'public' }
+          )))
 
 ,
 
@@ -3920,6 +3939,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isAutocomplete()) {
       try {
         const commandName = interaction.commandName;
+        if (commandName === 'maddengames') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          if (focused?.name === 'week') {
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+            if (!activeLeague) { await interaction.respond([]); return; }
+            const choices = await getMaddenGameWeekAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
         if (commandName === 'maddenvalues') {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'team' || focused?.name === 'exclude_team') {
@@ -4459,6 +4495,11 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('maddengame_thread_')) {
+        await handleMaddenGameThreadButton(interaction);
+        return;
+      }
+
       if (interaction.customId.startsWith('tournament_join:')) {
         if (!interaction.guild) return;
         const tournamentId = interaction.customId.split(':')[1];
@@ -6993,6 +7034,33 @@ if (gameSubcommand === 'report') {
         console.error('[MADDEN TRADE ANALYZER] command failed:', error?.stack || error?.message || error);
         await interaction.editReply({ content: `Madden trade analyzer failed: ${String(error?.message || error).slice(0, 180)}` });
       }
+      return;
+    }
+
+    if (interaction.commandName === 'maddengames') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+        await interaction.editReply({ content: 'You do not have permission to create Madden game threads.' });
+        return;
+      }
+      if (subcommand === 'threads') {
+        const week = interaction.options.getString('week');
+        const visibility = interaction.options.getString('visibility') || 'private';
+        const result = await createMaddenWeeklyGameThreads(interaction, activeLeague, week, visibility);
+        await interaction.editReply({ embeds: [buildMaddenGameThreadsSummaryEmbed(activeLeague, week, result)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden games command.' });
       return;
     }
 
@@ -23844,6 +23912,258 @@ function addMaddenNewsHeadline(bucket, text) {
 }
 
 
+
+async function ensureMaddenGameThreadColumns() {
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_id TEXT`);
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_created_at TIMESTAMPTZ`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_imported_games_thread_lookup ON madden_imported_games (guild_id, league_id, week_label, thread_id)`);
+}
+
+async function getMaddenGameWeekAutocompleteChoices(guildId, leagueId, focusedValue = '') {
+  const q = String(focusedValue || '').toLowerCase();
+  const result = await pool.query(
+    `SELECT DISTINCT week_label
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND week_label IS NOT NULL
+       AND TRIM(week_label) <> ''
+     ORDER BY week_label ASC
+     LIMIT 50`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  return (result.rows || [])
+    .map(row => String(row.week_label || '').trim())
+    .filter(Boolean)
+    .filter(label => !q || label.toLowerCase().includes(q))
+    .slice(0, 25)
+    .map(label => ({ name: label.slice(0, 100), value: label.slice(0, 100) }));
+}
+
+function maddenGameThreadSafeName(game, weekLabel = '') {
+  const away = getMaddenTeamAbbrev(game.away_team) || game.away_team || 'Away';
+  const home = getMaddenTeamAbbrev(game.home_team) || game.home_team || 'Home';
+  const week = String(weekLabel || game.week_label || '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return `${week ? week + '-' : ''}${away}-at-${home}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').slice(0, 90) || 'madden-game-thread';
+}
+
+async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId = null) {
+  if (!guild) return null;
+  if (roleId) {
+    const owner = await findTeamOwnerByRoleId(guild, roleId).catch(() => null);
+    if (owner) return owner;
+  }
+  const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id).catch(() => []) : [];
+  const normalized = String(teamName || '').trim().toLowerCase();
+  const abbr = String(getMaddenTeamAbbrev(teamName) || '').trim().toLowerCase();
+  const match = (teamRoles || []).find(team => {
+    const roleName = String(team.role_name || '').trim().toLowerCase();
+    const roleAbbr = String(getMaddenTeamAbbrev(team.role_name) || '').trim().toLowerCase();
+    return roleName === normalized || roleAbbr === abbr || roleName.includes(normalized) || normalized.includes(roleName);
+  });
+  if (match?.role_id) {
+    const owner = await findTeamOwnerByRoleId(guild, match.role_id).catch(() => null);
+    if (owner) return owner;
+  }
+  return await findTeamOwnerByRoleName(guild, teamName).catch(() => null);
+}
+
+function buildMaddenGameThreadButtons(gameId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`maddengame_thread_game:${gameId}`).setLabel('Game Center').setEmoji('📊').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`maddengame_thread_preview:${gameId}`).setLabel('Matchup Preview').setEmoji('🔍').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Post Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`maddengame_thread_issue:${gameId}`).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger)
+  );
+}
+
+function buildMaddenGameThreadEmbed(league, game, owners = {}) {
+  const awayLogo = getMaddenTeamLogoUrl(game.away_team);
+  const homeLogo = getMaddenTeamLogoUrl(game.home_team);
+  const status = String(game.status || 'scheduled').replace(/_/g, ' ');
+  const scoreLine = (game.away_score !== null && game.away_score !== undefined && game.home_score !== null && game.home_score !== undefined)
+    ? `${maddenTeamDisplayName(game.away_team)} **${game.away_score}** @ ${maddenTeamDisplayName(game.home_team)} **${game.home_score}**`
+    : 'No score reported yet.';
+  const embed = new EmbedBuilder()
+    .setTitle(`🏈 ${game.week_label || 'Madden'} Game Thread`)
+    .setColor(0x57F287)
+    .setDescription(`**${maddenTeamDisplayName(game.away_team || 'Away')} @ ${maddenTeamDisplayName(game.home_team || 'Home')}**`)
+    .addFields(
+      { name: 'Away Team', value: `${maddenTeamDisplayName(game.away_team || 'Away')}${owners.away ? `\nOwner: <@${owners.away.id}>` : '\nOwner: Not found'}`, inline: true },
+      { name: 'Home Team', value: `${maddenTeamDisplayName(game.home_team || 'Home')}${owners.home ? `\nOwner: <@${owners.home.id}>` : '\nOwner: Not found'}`, inline: true },
+      { name: 'Status', value: status.charAt(0).toUpperCase() + status.slice(1), inline: true },
+      { name: 'Score', value: scoreLine, inline: false },
+      { name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for game tools.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-B Auto Game Threads' })
+    .setTimestamp();
+  if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(game.away_team) || game.away_team} at ${getMaddenTeamAbbrev(game.home_team) || game.home_team}`, iconURL: awayLogo });
+  if (homeLogo) embed.setThumbnail(homeLogo);
+  return embed;
+}
+
+function buildMaddenGameThreadsSummaryEmbed(league, week, result = {}) {
+  const created = result.created || [];
+  const skipped = result.skipped || [];
+  const failed = result.failed || [];
+  const lines = [];
+  if (created.length) lines.push(`✅ **Created:** ${created.length}\n${created.slice(0, 10).map(item => `• ${item.label}${item.threadId ? ` — <#${item.threadId}>` : ''}`).join('\n')}`);
+  if (skipped.length) lines.push(`↩️ **Skipped existing:** ${skipped.length}\n${skipped.slice(0, 8).map(item => `• ${item.label}${item.threadId ? ` — <#${item.threadId}>` : ''}`).join('\n')}`);
+  if (failed.length) lines.push(`⚠️ **Failed:** ${failed.length}\n${failed.slice(0, 8).map(item => `• ${item.label} — ${item.reason || 'Unknown error'}`).join('\n')}`);
+  if (!lines.length) lines.push('No scheduled games were found for that week.');
+  return new EmbedBuilder()
+    .setTitle(`🏈 ${league?.league_name || 'Madden'} • ${week} Game Threads`)
+    .setColor(failed.length ? 0xFEE75C : 0x57F287)
+    .setDescription(lines.join('\n\n').slice(0, 4096))
+    .setFooter({ text: 'GG Sports • 7J-10BY-B Auto Game Threads' })
+    .setTimestamp();
+}
+
+async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, visibility = 'private') {
+  await ensureMaddenGameThreadColumns();
+  const guild = interaction.guild;
+  const result = await pool.query(
+    `SELECT *
+     FROM madden_imported_games
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND LOWER(COALESCE(week_label, '')) = LOWER($3)
+     ORDER BY away_team ASC, home_team ASC`,
+    [guild.id, String(league.league_id), String(weekLabel || '')]
+  );
+  const games = result.rows || [];
+  const out = { created: [], skipped: [], failed: [] };
+  let baseChannel = interaction.channel;
+  if (!baseChannel?.isTextBased?.() || baseChannel?.isThread?.()) {
+    const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+    baseChannel = newsChannelId ? await guild.channels.fetch(newsChannelId).catch(() => null) : null;
+  }
+  if (!baseChannel?.isTextBased?.()) {
+    out.failed.push({ label: 'All games', reason: 'No valid text channel found. Run this command in the channel where threads should be created, or configure /maddennews setup.' });
+    return out;
+  }
+
+  for (const game of games) {
+    const label = `${maddenTeamDisplayName(game.away_team)} @ ${maddenTeamDisplayName(game.home_team)}`;
+    if (game.thread_id) {
+      const existing = await guild.channels.fetch(game.thread_id).catch(() => null);
+      if (existing) {
+        out.skipped.push({ label, threadId: existing.id });
+        continue;
+      }
+    }
+    const owners = {
+      away: await getMaddenTeamOwnerForGameThread(guild, league, game.away_team, game.away_team_role_id),
+      home: await getMaddenTeamOwnerForGameThread(guild, league, game.home_team, game.home_team_role_id),
+    };
+    const threadName = maddenGameThreadSafeName(game, weekLabel);
+    let thread = null;
+    try {
+      if (baseChannel.threads?.create) {
+        thread = await baseChannel.threads.create({
+          name: threadName,
+          type: String(visibility || 'private') === 'public' ? ChannelType.PublicThread : ChannelType.PrivateThread,
+          invitable: false,
+          autoArchiveDuration: 10080,
+          reason: 'GG Sports Madden weekly game thread',
+        }).catch(async () => baseChannel.threads.create({
+          name: threadName,
+          autoArchiveDuration: 10080,
+          reason: 'GG Sports Madden weekly game thread fallback',
+        }).catch(() => null));
+      }
+      if (!thread && baseChannel.send) {
+        const starter = await baseChannel.send({
+          embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
+          components: [buildMaddenGameThreadButtons(game.id)],
+          allowedMentions: { users: [], roles: [] },
+        });
+        thread = await starter.startThread({ name: threadName, autoArchiveDuration: 10080, reason: 'GG Sports Madden weekly game thread' }).catch(() => null);
+      }
+      if (!thread) {
+        out.failed.push({ label, reason: 'Could not create thread. Check bot Create Threads permissions.' });
+        continue;
+      }
+      for (const owner of [owners.away, owners.home].filter(Boolean)) {
+        await thread.members?.add(owner.id).catch(() => null);
+      }
+      const mentionIds = [owners.away?.id, owners.home?.id].filter(Boolean);
+      await thread.send({
+        content: mentionIds.length ? `${mentionIds.map(id => `<@${id}>`).join(' ')} game thread created for **${label}**.` : `Game thread created for **${label}**.`,
+        embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
+        components: [buildMaddenGameThreadButtons(game.id)],
+        allowedMentions: { users: mentionIds, roles: [] },
+      }).catch(() => null);
+      await pool.query(
+        `UPDATE madden_imported_games SET thread_id = $1, thread_created_at = NOW() WHERE id = $2`,
+        [thread.id, game.id]
+      );
+      out.created.push({ label, threadId: thread.id });
+    } catch (error) {
+      console.error('[7J-10BY-B GAME THREAD] create failed:', error?.stack || error?.message || error);
+      out.failed.push({ label, reason: String(error?.message || error).slice(0, 140) });
+    }
+  }
+  if (out.created.length) {
+    await recordMaddenNewsEvent(guild, league, {
+      event_type: 'game_threads_created',
+      week_label: weekLabel,
+      metadata: { summary: `${out.created.length} Madden game thread(s) created for ${weekLabel}.`, created: out.created },
+    }).catch(() => null);
+  }
+  return out;
+}
+
+async function getMaddenImportedGameById(gameId) {
+  const result = await pool.query(`SELECT * FROM madden_imported_games WHERE id = $1 LIMIT 1`, [gameId]).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
+async function handleMaddenGameThreadButton(interaction) {
+  if (!interaction.guild) return;
+  const parts = String(interaction.customId || '').split(':');
+  const action = parts[0].replace('maddengame_thread_', '');
+  const gameId = parts[1];
+  const game = await getMaddenImportedGameById(gameId);
+  const league = game?.league_id ? await getLeagueById(game.league_id) : null;
+  if (!game || !league) {
+    await interaction.reply({ content: 'That Madden game could not be found.', ephemeral: true });
+    return;
+  }
+  const owners = {
+    away: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.away_team, game.away_team_role_id),
+    home: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id),
+  };
+  if (action === 'game') {
+    await interaction.reply({ embeds: [buildMaddenGameThreadEmbed(league, game, owners)], ephemeral: true });
+    return;
+  }
+  if (action === 'preview') {
+    const matchup = await getMaddenMatchupPreviewData(interaction.guild.id, league.league_id, game.home_team, game.away_team).catch(() => null);
+    if (matchup?.home && matchup?.away) {
+      await interaction.reply({ embeds: [buildMaddenMatchupPreviewEmbed(league, matchup)], ephemeral: true });
+    } else {
+      await interaction.reply({ content: 'No matchup preview data found yet. Run Madden sync or check imported team stats.', ephemeral: true });
+    }
+    return;
+  }
+  if (action === 'stream') {
+    const result = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
+    const url = result.rows[0]?.stream_url;
+    if (!url) {
+      await interaction.reply({ content: 'No saved stream link found. Use `/linkstream` first, then press Post Stream again.', ephemeral: true });
+      return;
+    }
+    await interaction.reply({ content: `📺 <@${interaction.user.id}> is streaming this matchup: ${url}`, allowedMentions: { users: [interaction.user.id], roles: [] } });
+    return;
+  }
+  if (action === 'issue') {
+    await interaction.reply({ content: 'Use `/ticket game` in this thread to report a Madden game issue. Future versions will open this ticket automatically from the button.', ephemeral: true });
+    return;
+  }
+  await interaction.reply({ content: 'Unknown game thread action.', ephemeral: true });
+}
+
 async function ensureMaddenNewsTables() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_news_channel_id TEXT`);
   await pool.query(`
@@ -23933,6 +24253,7 @@ function maddenNewsEventTitle(eventType) {
   if (key === 'overall_change') return '📊 Ratings Update';
   if (key === 'attribute_change') return '📈 Player Development';
   if (key === 'transaction') return '✂️ Transaction';
+  if (key === 'game_threads_created') return '🏈 Game Threads Created';
   return '📰 Madden News';
 }
 
@@ -23944,6 +24265,7 @@ function maddenNewsCategoryForEventType(eventType) {
   if (key.includes('injury')) return 'injury';
   if (key.includes('transaction')) return 'transaction';
   if (key.includes('position')) return 'position';
+  if (key.includes('game_thread')) return 'games';
   return 'general';
 }
 
@@ -23952,7 +24274,7 @@ function buildMaddenNewsEventEmbed(league, event) {
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-A1 Madden News Feed' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-B Madden News + Game Threads' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
   const playerLine = event.player_name ? `**${event.player_name}**${event.team_name ? ` • ${maddenTeamDisplayName(event.team_name)}` : ''}` : (event.team_name ? `**${maddenTeamDisplayName(event.team_name)}**` : league?.league_name || 'Madden League');
@@ -24043,7 +24365,7 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-A1 Madden News Feed' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-B Madden News + Game Threads' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved Madden news events found yet. New trade block activity, committee submissions, approved trades, and future sync changes will appear here.');
