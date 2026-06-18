@@ -503,6 +503,28 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_news_events ADD COLUMN IF NOT EXISTS posted_message_id TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_news_events_league_created ON madden_news_events (guild_id, league_id, created_at DESC)`);
 
+  // 7J-10BY-C: Weekly Franchise Change Logs storage.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_change_log (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_id TEXT,
+      player_name TEXT,
+      team_name TEXT,
+      change_type TEXT NOT NULL,
+      old_value TEXT,
+      new_value TEXT,
+      week_label TEXT,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_change_log ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_lookup ON madden_change_log (guild_id, league_id, week_label, change_type, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_player ON madden_change_log (guild_id, league_id, player_id, created_at DESC)`);
+
+
   // 7J-10BW: User-controlled Madden trade block storage.
   // GMs can list their own roster players, remove them, and browse team/league-wide blocks.
   await pool.query(`
@@ -1598,6 +1620,36 @@ function buildCommands() {
         .setDescription('Show a Madden weekly news recap')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('week').setDescription('Week label, for example Week 8').setRequired(true))),
+
+    new SlashCommandBuilder()
+      .setName('maddenchanges')
+      .setDescription('Madden weekly franchise change logs')
+      .addSubcommand(sc => sc
+        .setName('week')
+        .setDescription('Show league-wide Madden changes for a week')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('week').setDescription('Week label, for example Week 10').setRequired(false).setAutocomplete(true))
+        .addStringOption(o => o.setName('type').setDescription('Optional change type filter').setRequired(false)
+          .addChoices(
+            { name: 'OVR Changes', value: 'overall_change' },
+            { name: 'Attribute Changes', value: 'attribute_change' },
+            { name: 'Dev Trait Changes', value: 'dev_trait_change' },
+            { name: 'Position Changes', value: 'position_change' },
+            { name: 'Injuries', value: 'injury' },
+            { name: 'Transactions', value: 'transaction' },
+            { name: 'Team Movement', value: 'team_change' }
+          )))
+      .addSubcommand(sc => sc
+        .setName('team')
+        .setDescription('Show Madden changes for one team')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('player')
+        .setDescription('Show recent Madden changes for one player')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('maddendebug')
@@ -4132,6 +4184,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
+        if (commandName === 'maddenchanges') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          const leagueName = interaction.options.getString('league');
+          const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+          if (!activeLeague) { await interaction.respond([]); return; }
+          if (focused?.name === 'team') {
+            const choices = await getMaddenTeamAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          if (focused?.name === 'player') {
+            const choices = await getMaddenPlayerAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          if (focused?.name === 'week') {
+            const choices = await getMaddenChangeWeekAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
             await interaction.respond((choices || []).slice(0, 25));
             return;
           }
@@ -7110,6 +7189,40 @@ if (gameSubcommand === 'report') {
       return;
     }
 
+    if (interaction.commandName === 'maddenchanges') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      await ensureMaddenChangeLogTables();
+      if (subcommand === 'week') {
+        const week = interaction.options.getString('week') || null;
+        const type = interaction.options.getString('type') || null;
+        await interaction.editReply({ embeds: [await buildMaddenWeeklyChangesEmbed(interaction.guild.id, activeLeague, { week, type })] });
+        return;
+      }
+      if (subcommand === 'team') {
+        const team = interaction.options.getString('team');
+        const week = interaction.options.getString('week') || null;
+        await interaction.editReply({ embeds: [await buildMaddenTeamChangesEmbed(interaction.guild.id, activeLeague, team, { week })] });
+        return;
+      }
+      if (subcommand === 'player') {
+        const player = interaction.options.getString('player');
+        await interaction.editReply({ embeds: [await buildMaddenPlayerChangesEmbed(interaction.guild.id, activeLeague, player)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden changes command.' });
+      return;
+    }
+
     if (interaction.commandName === 'maddenvalues') {
       if (!interaction.guild) return;
       if (!interaction.deferred && !interaction.replied) {
@@ -7891,7 +8004,7 @@ if (gameSubcommand === 'report') {
 
         try {
           const rows = parseMaddenJsonInput(json);
-          const imported = await importMaddenPlayersFromArray(interaction.guild, activeLeague, rows);
+          const imported = await importMaddenPlayersFromArray(interaction.guild, activeLeague, rows, weekLabel || null);
           const run = await logMaddenImportRun(interaction.guild, activeLeague, 'manual_import_players', 'Imported Madden players from JSON.', { players: imported });
           await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
         } catch (error) {
@@ -21567,14 +21680,35 @@ function extractMaddenPlayerRowsFromPayload(payload) {
 }
 
 
-async function importMaddenPlayersFromArray(guild, league, rows) {
+async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = null) {
   let imported = 0;
+  await ensureMaddenChangeLogTables().catch(() => null);
 
   for (const row of rows) {
     const playerName = String(getFirstValue(row, ['playerName', 'player_name', 'name', 'fullName'], '')).trim();
     if (!playerName) continue;
 
     const externalPlayerId = String(getFirstValue(row, ['id', 'playerId', 'player_id', 'externalPlayerId'], playerName));
+    const nextTeam = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'team'], null));
+    const nextPosition = getFirstValue(row, ['position', 'pos'], null);
+    const nextOverall = getFirstValue(row, ['overall', 'ovr', 'rating'], null);
+
+    const previousResult = await pool.query(
+      `SELECT * FROM madden_imported_players WHERE guild_id = $1 AND league_id::text = $2::text AND external_player_id = $3 LIMIT 1`,
+      [guild.id, String(league.league_id), externalPlayerId]
+    ).catch(() => ({ rows: [] }));
+    const previousPlayer = previousResult.rows[0] || null;
+
+    if (previousPlayer) {
+      await detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer, {
+        external_player_id: externalPlayerId,
+        player_name: playerName,
+        team_name: nextTeam,
+        position: nextPosition,
+        overall: nextOverall,
+        raw_payload: row,
+      }, weekLabel).catch(error => console.warn('[7J-10BY-C] change detection failed:', error?.message || error));
+    }
 
     await pool.query(
       `INSERT INTO madden_imported_players (id, guild_id, league_id, external_player_id, player_name, team_name, position, overall, raw_payload, imported_at)
@@ -21587,9 +21721,9 @@ async function importMaddenPlayersFromArray(guild, league, rows) {
         league.league_id,
         externalPlayerId,
         playerName,
-        getFirstValue(row, ['teamName', 'team_name', 'team'], null),
-        getFirstValue(row, ['position', 'pos'], null),
-        getFirstValue(row, ['overall', 'ovr', 'rating'], null),
+        nextTeam,
+        nextPosition,
+        nextOverall,
         JSON.stringify(row),
       ]
     );
@@ -24373,6 +24507,365 @@ async function handleMaddenGameThreadButton(interaction) {
     return;
   }
   await interaction.reply({ content: 'Unknown game thread action.', ephemeral: true });
+}
+
+
+async function ensureMaddenChangeLogTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_change_log (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_id TEXT,
+      player_name TEXT,
+      team_name TEXT,
+      change_type TEXT NOT NULL,
+      old_value TEXT,
+      new_value TEXT,
+      week_label TEXT,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_change_log ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_lookup ON madden_change_log (guild_id, league_id, week_label, change_type, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_player ON madden_change_log (guild_id, league_id, player_id, created_at DESC)`);
+}
+
+function maddenRawValueFromPayload(payload, keys = []) {
+  if (!payload) return null;
+  const raw = typeof payload === 'string' ? (() => { try { return JSON.parse(payload); } catch { return {}; } })() : payload;
+  for (const key of keys) {
+    const value = getFirstValue(raw, [key], null);
+    if (value !== null && value !== undefined && String(value).trim() !== '') return value;
+  }
+  return null;
+}
+
+function normalizeMaddenDevTrait(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (['xfactor', 'x-factor', 'x factor', 'superstar x factor', 'superstar_xfactor'].includes(lower)) return 'X-Factor';
+  if (lower.includes('superstar')) return 'Superstar';
+  if (lower.includes('star')) return 'Star';
+  if (lower.includes('hidden')) return 'Hidden';
+  if (lower.includes('normal')) return 'Normal';
+  return raw;
+}
+
+function normalizeMaddenInjuryValue(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (['none', 'healthy', 'false', '0', 'no', 'null', 'n/a'].includes(lower)) return null;
+  return raw;
+}
+
+function getMaddenChangeAttributeMap(rawPayload) {
+  const raw = typeof rawPayload === 'string' ? (() => { try { return JSON.parse(rawPayload); } catch { return {}; } })() : (rawPayload || {});
+  const keys = [
+    ['speed', ['speed', 'spd', 'SpeedRating']],
+    ['strength', ['strength', 'str', 'StrengthRating']],
+    ['awareness', ['awareness', 'awr', 'AwarenessRating']],
+    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating']],
+    ['agility', ['agility', 'agi', 'AgilityRating']],
+    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating']],
+    ['throw_accuracy_short', ['throwAccuracyShort', 'throw_accuracy_short', 'tas', 'ThrowAccuracyShortRating']],
+    ['throw_accuracy_mid', ['throwAccuracyMid', 'throw_accuracy_mid', 'tam', 'ThrowAccuracyMidRating']],
+    ['throw_accuracy_deep', ['throwAccuracyDeep', 'throw_accuracy_deep', 'tad', 'ThrowAccuracyDeepRating']],
+    ['catching', ['catching', 'cth', 'CatchingRating']],
+    ['route_running', ['routeRunning', 'route_running', 'rr', 'RouteRunningRating']],
+    ['carrying', ['carrying', 'car', 'CarryingRating']],
+    ['break_tackle', ['breakTackle', 'break_tackle', 'btk', 'BreakTackleRating']],
+    ['tackle', ['tackle', 'tak', 'TackleRating']],
+    ['block_shed', ['blockShed', 'block_shed', 'bsh', 'BlockShedRating']],
+    ['power_moves', ['powerMoves', 'power_moves', 'pmv', 'PowerMovesRating']],
+    ['finesse_moves', ['finesseMoves', 'finesse_moves', 'fmv', 'FinesseMovesRating']],
+    ['man_coverage', ['manCoverage', 'man_coverage', 'mcv', 'ManCoverageRating']],
+    ['zone_coverage', ['zoneCoverage', 'zone_coverage', 'zcv', 'ZoneCoverageRating']],
+    ['press', ['press', 'prs', 'PressRating']],
+  ];
+  const out = {};
+  for (const [label, aliases] of keys) {
+    const value = getFirstValue(raw, aliases, null);
+    const num = Number(value);
+    if (Number.isFinite(num)) out[label] = num;
+  }
+  return out;
+}
+
+function maddenChangeTypeLabel(type) {
+  const key = String(type || '').toLowerCase();
+  if (key === 'overall_change') return 'OVR Changes';
+  if (key === 'attribute_change') return 'Attribute Changes';
+  if (key === 'dev_trait_change') return 'Dev Trait Changes';
+  if (key === 'position_change') return 'Position Changes';
+  if (key === 'injury_new') return 'New Injuries';
+  if (key === 'injury_recovered') return 'Recovered Injuries';
+  if (key === 'team_change') return 'Player Movement';
+  if (key === 'transaction') return 'Transactions';
+  return 'Franchise Changes';
+}
+
+function maddenChangeIcon(type) {
+  const key = String(type || '').toLowerCase();
+  if (key === 'overall_change') return '📊';
+  if (key === 'attribute_change') return '📈';
+  if (key === 'dev_trait_change') return '💎';
+  if (key === 'position_change') return '🔄';
+  if (key.includes('injury')) return '🏥';
+  if (key === 'team_change') return '🔁';
+  if (key === 'transaction') return '✂️';
+  return '📰';
+}
+
+async function recordMaddenChangeLogEvent(guild, league, change) {
+  if (!guild || !league?.league_id || !change?.change_type) return null;
+  await ensureMaddenChangeLogTables();
+  const playerId = change.player_id || null;
+  const playerName = change.player_name || null;
+  const teamName = change.team_name || null;
+  const oldValue = change.old_value === undefined || change.old_value === null ? null : String(change.old_value);
+  const newValue = change.new_value === undefined || change.new_value === null ? null : String(change.new_value);
+  const weekLabel = change.week_label || null;
+
+  const duplicate = await pool.query(
+    `SELECT id FROM madden_change_log
+     WHERE guild_id = $1 AND league_id = $2 AND COALESCE(player_id, '') = COALESCE($3, '')
+       AND change_type = $4 AND COALESCE(old_value, '') = COALESCE($5, '') AND COALESCE(new_value, '') = COALESCE($6, '')
+       AND COALESCE(week_label, '') = COALESCE($7, '')
+     LIMIT 1`,
+    [guild.id, String(league.league_id), playerId, change.change_type, oldValue, newValue, weekLabel]
+  );
+  if (duplicate.rows.length) return null;
+
+  const result = await pool.query(
+    `INSERT INTO madden_change_log (id, guild_id, league_id, player_id, player_name, team_name, change_type, old_value, new_value, week_label, metadata, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW()) RETURNING *`,
+    [randomUUID(), guild.id, String(league.league_id), playerId, playerName, teamName, change.change_type, oldValue, newValue, weekLabel, JSON.stringify(change.metadata || {})]
+  );
+  const row = result.rows[0];
+  const newsType = change.change_type === 'team_change' ? 'transaction' : change.change_type;
+  await recordMaddenNewsEvent(guild, league, {
+    event_type: newsType,
+    player_id: playerId,
+    player_name: playerName,
+    team_name: teamName,
+    old_value: oldValue,
+    new_value: newValue,
+    week_label: weekLabel,
+    metadata: {
+      ...(change.metadata || {}),
+      summary: change.summary || `${playerName || 'A player'} changed: ${oldValue || 'N/A'} → ${newValue || 'N/A'}.`,
+    },
+  }).catch(error => console.warn('[7J-10BY-C] news event failed:', error?.message || error));
+  return row;
+}
+
+async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer, nextPlayer, weekLabel = null) {
+  if (!previousPlayer || !nextPlayer) return [];
+  const changes = [];
+  const playerId = nextPlayer.external_player_id || previousPlayer.external_player_id || previousPlayer.id;
+  const playerName = nextPlayer.player_name || previousPlayer.player_name;
+  const teamName = nextPlayer.team_name || previousPlayer.team_name || null;
+  const prevRaw = previousPlayer.raw_payload || {};
+  const nextRaw = nextPlayer.raw_payload || {};
+
+  const oldOvr = Number(previousPlayer.overall);
+  const newOvr = Number(nextPlayer.overall);
+  if (Number.isFinite(oldOvr) && Number.isFinite(newOvr) && oldOvr !== newOvr) {
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'overall_change', player_id: playerId, player_name: playerName, team_name: teamName,
+      old_value: `${oldOvr} OVR`, new_value: `${newOvr} OVR`, week_label: weekLabel,
+      metadata: { delta: newOvr - oldOvr, position: nextPlayer.position || previousPlayer.position || null, overall: newOvr },
+      summary: `${playerName} moved from ${oldOvr} OVR to ${newOvr} OVR (${newOvr > oldOvr ? '+' : ''}${newOvr - oldOvr}).`,
+    }));
+  }
+
+  const oldPos = String(previousPlayer.position || '').trim();
+  const newPos = String(nextPlayer.position || '').trim();
+  if (oldPos && newPos && oldPos !== newPos) {
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'position_change', player_id: playerId, player_name: playerName, team_name: teamName,
+      old_value: oldPos, new_value: newPos, week_label: weekLabel,
+      metadata: { old_position: oldPos, new_position: newPos, overall: nextPlayer.overall || null },
+      summary: `${playerName} changed position from ${oldPos} to ${newPos}.`,
+    }));
+  }
+
+  const oldTeam = normalizeMaddenTeamName(previousPlayer.team_name || null);
+  const newTeam = normalizeMaddenTeamName(nextPlayer.team_name || null);
+  if (oldTeam && newTeam && oldTeam !== newTeam) {
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'team_change', player_id: playerId, player_name: playerName, team_name: newTeam,
+      old_value: oldTeam, new_value: newTeam, week_label: weekLabel,
+      metadata: { old_team: oldTeam, new_team: newTeam, position: newPos || oldPos || null, overall: nextPlayer.overall || null },
+      summary: `${playerName} moved from ${maddenTeamDisplayName(oldTeam)} to ${maddenTeamDisplayName(newTeam)}.`,
+    }));
+  }
+
+  const oldDev = normalizeMaddenDevTrait(maddenRawValueFromPayload(prevRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
+  const newDev = normalizeMaddenDevTrait(maddenRawValueFromPayload(nextRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
+  if (oldDev && newDev && oldDev !== newDev) {
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'dev_trait_change', player_id: playerId, player_name: playerName, team_name: teamName,
+      old_value: oldDev, new_value: newDev, week_label: weekLabel,
+      metadata: { old_dev_trait: oldDev, new_dev_trait: newDev, position: newPos || oldPos || null, overall: nextPlayer.overall || null },
+      summary: `${playerName} development trait changed from ${oldDev} to ${newDev}.`,
+    }));
+  }
+
+  const oldInjury = normalizeMaddenInjuryValue(maddenRawValueFromPayload(prevRaw, ['injury', 'injuryType', 'injury_type', 'injuryStatus', 'injury_status']));
+  const newInjury = normalizeMaddenInjuryValue(maddenRawValueFromPayload(nextRaw, ['injury', 'injuryType', 'injury_type', 'injuryStatus', 'injury_status']));
+  if (!oldInjury && newInjury) {
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'injury_new', player_id: playerId, player_name: playerName, team_name: teamName,
+      old_value: 'Healthy', new_value: newInjury, week_label: weekLabel,
+      metadata: { injury: newInjury, return_weeks: maddenRawValueFromPayload(nextRaw, ['injuryLength', 'injury_length', 'weeksOut', 'weeks_out']) || null },
+      summary: `${playerName} is now injured: ${newInjury}.`,
+    }));
+  } else if (oldInjury && !newInjury) {
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'injury_recovered', player_id: playerId, player_name: playerName, team_name: teamName,
+      old_value: oldInjury, new_value: 'Healthy', week_label: weekLabel,
+      metadata: { recovered_from: oldInjury },
+      summary: `${playerName} has recovered from ${oldInjury}.`,
+    }));
+  } else if (oldInjury && newInjury && oldInjury !== newInjury) {
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'injury_new', player_id: playerId, player_name: playerName, team_name: teamName,
+      old_value: oldInjury, new_value: newInjury, week_label: weekLabel,
+      metadata: { injury: newInjury },
+      summary: `${playerName} injury status changed from ${oldInjury} to ${newInjury}.`,
+    }));
+  }
+
+  const oldAttrs = getMaddenChangeAttributeMap(prevRaw);
+  const newAttrs = getMaddenChangeAttributeMap(nextRaw);
+  for (const [attr, newValue] of Object.entries(newAttrs)) {
+    const oldValue = oldAttrs[attr];
+    if (!Number.isFinite(oldValue) || !Number.isFinite(newValue)) continue;
+    const delta = newValue - oldValue;
+    if (Math.abs(delta) < 2) continue;
+    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+      change_type: 'attribute_change', player_id: playerId, player_name: playerName, team_name: teamName,
+      old_value: `${attr.replace(/_/g, ' ')} ${oldValue}`, new_value: `${attr.replace(/_/g, ' ')} ${newValue}`, week_label: weekLabel,
+      metadata: { attribute: attr, old_rating: oldValue, new_rating: newValue, delta, position: newPos || oldPos || null, overall: nextPlayer.overall || null },
+      summary: `${playerName} ${attr.replace(/_/g, ' ')} changed ${oldValue} → ${newValue} (${delta > 0 ? '+' : ''}${delta}).`,
+    }));
+  }
+
+  return changes.filter(Boolean);
+}
+
+async function getMaddenChangeLogRows(guildId, leagueId, { week = null, team = null, player = null, type = null, limit = 50 } = {}) {
+  await ensureMaddenChangeLogTables();
+  const values = [guildId, String(leagueId)];
+  const where = [`guild_id = $1`, `league_id = $2`];
+  if (week) { values.push(String(week)); where.push(`LOWER(COALESCE(week_label, '')) = LOWER($${values.length})`); }
+  if (team) { values.push(`%${String(team).toLowerCase()}%`); where.push(`LOWER(COALESCE(team_name, '')) LIKE $${values.length}`); }
+  if (player) { values.push(`%${String(player).toLowerCase()}%`); where.push(`LOWER(COALESCE(player_name, '')) LIKE $${values.length}`); }
+  if (type) {
+    if (type === 'injury') where.push(`change_type IN ('injury_new', 'injury_recovered')`);
+    else if (type === 'transaction') where.push(`change_type IN ('transaction', 'team_change')`);
+    else { values.push(type); where.push(`change_type = $${values.length}`); }
+  }
+  const result = await pool.query(
+    `SELECT * FROM madden_change_log WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ${Math.max(1, Math.min(Number(limit || 50), 100))}`,
+    values
+  );
+  return result.rows || [];
+}
+
+function maddenChangeLogLine(row) {
+  const icon = maddenChangeIcon(row.change_type);
+  const player = row.player_name ? `**${row.player_name}**` : '**Unknown Player**';
+  const team = row.team_name ? ` • ${getMaddenTeamAbbrev(row.team_name) || row.team_name}` : '';
+  const change = row.old_value || row.new_value ? ` — ${row.old_value || 'N/A'} → **${row.new_value || 'N/A'}**` : '';
+  return `${icon} ${player}${team}${change}`;
+}
+
+function groupMaddenChangesByType(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const label = `${maddenChangeIcon(row.change_type)} ${maddenChangeTypeLabel(row.change_type)}`;
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(row);
+  }
+  return groups;
+}
+
+async function buildMaddenWeeklyChangesEmbed(guildId, league, { week = null, type = null } = {}) {
+  const rows = await getMaddenChangeLogRows(guildId, league.league_id, { week, type, limit: 75 });
+  const title = `📋 ${league.league_name} • ${week || 'Recent'} Franchise Changes`;
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • 7J-10BY-C Weekly Franchise Change Logs' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription('No franchise changes found yet. Run Madden sync after a roster/week advance; OVR, attribute, dev trait, position, injury, and movement changes will appear here.');
+    return embed;
+  }
+  const groups = groupMaddenChangesByType(rows);
+  for (const [label, groupRows] of groups.entries()) {
+    embed.addFields({ name: label, value: groupRows.slice(0, 8).map(maddenChangeLogLine).join('\n').slice(0, 1024), inline: false });
+  }
+  embed.addFields({ name: 'Total Changes', value: String(rows.length), inline: true });
+  if (week) embed.addFields({ name: 'Week', value: week, inline: true });
+  return embed;
+}
+
+async function buildMaddenTeamChangesEmbed(guildId, league, team, { week = null } = {}) {
+  const rows = await getMaddenChangeLogRows(guildId, league.league_id, { week, team, limit: 75 });
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 ${maddenTeamDisplayName(team)} Franchise Report`)
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • 7J-10BY-C Team Change Log' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription(`No saved changes found for **${maddenTeamDisplayName(team)}**${week ? ` in ${week}` : ''}.`);
+  } else {
+    embed.setDescription(rows.slice(0, 25).map(maddenChangeLogLine).join('\n').slice(0, 4096));
+    embed.addFields({ name: 'Total Changes', value: String(rows.length), inline: true });
+  }
+  if (week) embed.addFields({ name: 'Week', value: week, inline: true });
+  const logo = getMaddenTeamLogoUrl(team);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function buildMaddenPlayerChangesEmbed(guildId, league, player) {
+  const rows = await getMaddenChangeLogRows(guildId, league.league_id, { player, limit: 25 });
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 ${player} • Change History`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • 7J-10BY-C Player Change Log' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription(`No saved changes found for **${player}** yet.`);
+    return embed;
+  }
+  embed.setDescription(rows.map(row => `${row.week_label ? `**${row.week_label}** — ` : ''}${maddenChangeLogLine(row)}`).join('\n').slice(0, 4096));
+  return embed;
+}
+
+async function getMaddenChangeWeekAutocompleteChoices(guildId, leagueId, focused = '') {
+  await ensureMaddenChangeLogTables();
+  const result = await pool.query(
+    `SELECT DISTINCT week_label FROM madden_change_log
+     WHERE guild_id = $1 AND league_id = $2 AND week_label IS NOT NULL
+     ORDER BY week_label DESC LIMIT 50`,
+    [guildId, String(leagueId)]
+  );
+  const q = String(focused || '').toLowerCase();
+  return (result.rows || [])
+    .map(row => String(row.week_label || ''))
+    .filter(Boolean)
+    .filter(label => !q || label.toLowerCase().includes(q))
+    .slice(0, 25)
+    .map(label => ({ name: label, value: label }));
 }
 
 async function ensureMaddenNewsTables() {
