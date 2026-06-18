@@ -23969,79 +23969,132 @@ function maddenGameThreadSafeName(game, weekLabel = '') {
 async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId = null) {
   if (!guild) return null;
 
-  const normalized = String(teamName || '').trim().toLowerCase();
-  const abbr = String(getMaddenTeamAbbrev(teamName) || '').trim().toLowerCase();
+  const normalizeTeamOwnerLookup = (value = '') => String(value || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[^a-zA-Z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 
-  // 1. Prefer imported owner_user_id from Madden sync data.
-  if (league?.league_id) {
-    const importedOwner = await pool.query(
-      `SELECT owner_user_id
-       FROM madden_imported_team_stats
-       WHERE guild_id = $1::text
-         AND league_id::text = $2::text
-         AND owner_user_id IS NOT NULL
-         AND TRIM(owner_user_id) <> ''
-         AND (
-           LOWER(team_name) = LOWER($3)
-           OR LOWER(team_name) = LOWER($4)
-         )
-       LIMIT 1`,
-      [guild.id, String(league.league_id), teamName, getMaddenTeamAbbrev(teamName)]
-    ).catch(() => ({ rows: [] }));
-    const ownerId = importedOwner.rows?.[0]?.owner_user_id;
-    if (ownerId) {
-      const member = await guild.members.fetch(ownerId).catch(() => null);
-      if (member && !member.user.bot) return member;
-    }
-  }
+  const rawTeamName = String(teamName || '').trim();
+  const teamAbbr = String(getMaddenTeamAbbrev(rawTeamName) || '').trim();
+  const normalized = normalizeTeamOwnerLookup(rawTeamName);
+  const normalizedAbbr = normalizeTeamOwnerLookup(teamAbbr);
+  const lookupNames = [...new Set([
+    rawTeamName,
+    teamAbbr,
+    rawTeamName.replace(/\([^)]*\)/g, '').trim(),
+    maddenTeamDisplayName(rawTeamName),
+  ].filter(Boolean))];
 
-  // 2. Then use explicit madden_franchises ownership mappings.
-  if (league?.league_id) {
-    const franchiseOwner = await pool.query(
-      `SELECT owner_user_id, team_role_id
-       FROM madden_franchises
-       WHERE guild_id = $1::text
-         AND league_id::text = $2::text
-         AND (
-           LOWER(team_name) = LOWER($3)
-           OR LOWER(team_name) = LOWER($4)
-         )
-       LIMIT 1`,
-      [guild.id, String(league.league_id), teamName, getMaddenTeamAbbrev(teamName)]
-    ).catch(() => ({ rows: [] }));
-    const row = franchiseOwner.rows?.[0];
-    if (row?.owner_user_id) {
-      const member = await guild.members.fetch(row.owner_user_id).catch(() => null);
-      if (member && !member.user.bot) return member;
-    }
-    if (row?.team_role_id) {
-      const owner = await findTeamOwnerByRoleId(guild, row.team_role_id).catch(() => null);
-      if (owner) return owner;
-    }
-  }
+  const isTeamNameMatch = (candidate = '') => {
+    const c = normalizeTeamOwnerLookup(candidate);
+    const cAbbr = normalizeTeamOwnerLookup(getMaddenTeamAbbrev(candidate) || '');
+    if (!c) return false;
+    return c === normalized
+      || c === normalizedAbbr
+      || cAbbr === normalized
+      || cAbbr === normalizedAbbr
+      || (!!normalized && (c.includes(normalized) || normalized.includes(c)))
+      || (!!normalizedAbbr && (c.includes(normalizedAbbr) || normalizedAbbr.includes(c)));
+  };
 
-  // 3. Use the game row role id if EA/imported schedule saved one.
+  // 1. Prefer the exact role id saved on the imported game row.
+  // This is the same path used during thread creation and is the most reliable for Game Center button clicks.
   if (roleId) {
     const owner = await findTeamOwnerByRoleId(guild, roleId).catch(() => null);
     if (owner) return owner;
   }
 
-  // 4. Match league team roles by full name or abbreviation.
+  // 2. Use imported Madden team stats ownership if sync stored owner_user_id.
+  if (league?.league_id) {
+    const importedOwner = await pool.query(
+      `SELECT owner_user_id, team_role_id, team_name, external_team_id
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+         AND (
+           LOWER(team_name) = ANY($3::text[])
+           OR LOWER(COALESCE(external_team_id, '')) = ANY($3::text[])
+           OR LOWER(team_name) LIKE $4
+           OR LOWER(team_name) LIKE $5
+         )
+       ORDER BY owner_user_id IS NULL ASC
+       LIMIT 5`,
+      [
+        guild.id,
+        String(league.league_id),
+        lookupNames.map(name => String(name).toLowerCase()),
+        `%${normalized}%`,
+        normalizedAbbr ? `%${normalizedAbbr}%` : `%${normalized}%`,
+      ]
+    ).catch(() => ({ rows: [] }));
+
+    for (const row of importedOwner.rows || []) {
+      if (!isTeamNameMatch(row.team_name) && !isTeamNameMatch(row.external_team_id)) continue;
+      if (row.owner_user_id) {
+        const member = await guild.members.fetch(row.owner_user_id).catch(() => null);
+        if (member && !member.user.bot) return member;
+      }
+      if (row.team_role_id) {
+        const owner = await findTeamOwnerByRoleId(guild, row.team_role_id).catch(() => null);
+        if (owner) return owner;
+      }
+    }
+  }
+
+  // 3. Use explicit madden_franchises ownership mappings.
+  if (league?.league_id) {
+    const franchiseOwner = await pool.query(
+      `SELECT owner_user_id, team_role_id, team_name
+       FROM madden_franchises
+       WHERE guild_id = $1::text
+         AND league_id::text = $2::text
+         AND (
+           LOWER(team_name) = ANY($3::text[])
+           OR LOWER(team_name) LIKE $4
+           OR LOWER(team_name) LIKE $5
+         )
+       ORDER BY owner_user_id IS NULL ASC
+       LIMIT 5`,
+      [
+        guild.id,
+        String(league.league_id),
+        lookupNames.map(name => String(name).toLowerCase()),
+        `%${normalized}%`,
+        normalizedAbbr ? `%${normalizedAbbr}%` : `%${normalized}%`,
+      ]
+    ).catch(() => ({ rows: [] }));
+
+    for (const row of franchiseOwner.rows || []) {
+      if (!isTeamNameMatch(row.team_name)) continue;
+      if (row.owner_user_id) {
+        const member = await guild.members.fetch(row.owner_user_id).catch(() => null);
+        if (member && !member.user.bot) return member;
+      }
+      if (row.team_role_id) {
+        const owner = await findTeamOwnerByRoleId(guild, row.team_role_id).catch(() => null);
+        if (owner) return owner;
+      }
+    }
+  }
+
+  // 4. Match configured league team roles by full name, abbreviation, or cleaned Madden display name.
   const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id).catch(() => []) : [];
-  const match = (teamRoles || []).find(team => {
-    const roleName = String(team.role_name || '').trim().toLowerCase();
-    const roleAbbr = String(getMaddenTeamAbbrev(team.role_name) || '').trim().toLowerCase();
-    return roleName === normalized || roleAbbr === abbr || (!!roleName && normalized.includes(roleName)) || (!!normalized && roleName.includes(normalized));
-  });
+  const match = (teamRoles || []).find(team => isTeamNameMatch(team.role_name));
   if (match?.role_id) {
     const owner = await findTeamOwnerByRoleId(guild, match.role_id).catch(() => null);
     if (owner) return owner;
   }
 
-  // 5. Last fallback: role by team name.
-  return await findTeamOwnerByRoleName(guild, teamName).catch(() => null);
-}
+  // 5. Last fallback: Discord role by team name/display name/abbr.
+  for (const name of lookupNames) {
+    const owner = await findTeamOwnerByRoleName(guild, name).catch(() => null);
+    if (owner) return owner;
+  }
 
+  return null;
+}
 function maddenGameHasRealScore(game) {
   const status = String(game?.status || '').toLowerCase();
   const away = game?.away_score;
@@ -24074,12 +24127,12 @@ function buildMaddenGameThreadEmbed(league, game, owners = {}) {
     .setColor(hasScore ? 0x5865F2 : 0x57F287)
     .setDescription(`**${maddenTeamDisplayNameWithLogo(game.away_team || 'Away')} @ ${maddenTeamDisplayNameWithLogo(game.home_team || 'Home')}**`)
     .addFields(
-      { name: 'Away Team', value: `${maddenTeamDisplayNameWithLogo(game.away_team || 'Away')}${owners.away ? `\nOwner: <@${owners.away.id}>` : '\nOwner: Not found'}`, inline: true },
-      { name: 'Home Team', value: `${maddenTeamDisplayNameWithLogo(game.home_team || 'Home')}${owners.home ? `\nOwner: <@${owners.home.id}>` : '\nOwner: Not found'}`, inline: true },
+      { name: 'Away Team', value: `${maddenTeamDisplayNameWithLogo(game.away_team || 'Away')}${owners.away ? `\nOwner: <@${owners.away.id}>` : '\nOwner: Unassigned'}`, inline: true },
+      { name: 'Home Team', value: `${maddenTeamDisplayNameWithLogo(game.home_team || 'Home')}${owners.home ? `\nOwner: <@${owners.home.id}>` : '\nOwner: Unassigned'}`, inline: true },
       { name: 'Game Status', value: scoreLine, inline: false },
       { name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for matchup tools.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-BA Auto Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA1 Auto Game Threads' })
     .setTimestamp();
   if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(game.away_team) || game.away_team} at ${getMaddenTeamAbbrev(game.home_team) || game.home_team}`, iconURL: awayLogo });
   if (homeLogo) embed.setThumbnail(homeLogo);
@@ -24123,10 +24176,10 @@ function buildMaddenGameThreadCenterEmbed(league, game, matchup = null, owners =
       { name: 'Score', value: scoreText, inline: false },
       { name: `${maddenTeamDisplayNameWithLogo(game.away_team)} Snapshot`, value: awaySnapshot, inline: true },
       { name: `${maddenTeamDisplayNameWithLogo(game.home_team)} Snapshot`, value: homeSnapshot, inline: true },
-      { name: 'Owners', value: `${game.away_team}: ${owners.away ? `<@${owners.away.id}>` : 'Not found'}\n${game.home_team}: ${owners.home ? `<@${owners.home.id}>` : 'Not found'}`, inline: false },
+      { name: 'Owners', value: `${game.away_team}: ${owners.away ? `<@${owners.away.id}>` : 'Not found'}\n${game.home_team}: ${owners.home ? `<@${owners.home.id}>` : 'Unassigned'}`, inline: false },
       { name: 'Projection', value: prediction, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-BA Game Center' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA1 Game Center' })
     .setTimestamp();
   if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(game.away_team) || game.away_team} at ${getMaddenTeamAbbrev(game.home_team) || game.home_team}`, iconURL: awayLogo });
   if (homeLogo) embed.setThumbnail(homeLogo);
@@ -24149,7 +24202,7 @@ function buildMaddenTeamComparisonEmbed(league, game, matchup = null) {
       { name: maddenTeamDisplayNameWithLogo(game.home_team), value: homeText, inline: true },
       { name: 'Notes', value: 'Comparison uses imported team stats and current power rankings. Future versions can add team OVR once salary/attribute imports are expanded.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-BA Team Comparison' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA1 Team Comparison' })
     .setTimestamp();
   const logo = getMaddenTeamLogoUrl(game.home_team) || getMaddenTeamLogoUrl(game.away_team);
   if (logo) embed.setThumbnail(logo);
@@ -24169,7 +24222,7 @@ function buildMaddenGameThreadsSummaryEmbed(league, week, result = {}) {
     .setTitle(`🏈 ${league?.league_name || 'Madden'} • ${week} Game Threads`)
     .setColor(failed.length ? 0xFEE75C : 0x57F287)
     .setDescription(lines.join('\n\n').slice(0, 4096))
-    .setFooter({ text: 'GG Sports • 7J-10BY-BA Auto Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-BA1 Auto Game Threads' })
     .setTimestamp();
 }
 
@@ -24254,7 +24307,7 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
       );
       out.created.push({ label, threadId: thread.id });
     } catch (error) {
-      console.error('[7J-10BY-BA GAME THREAD] create failed:', error?.stack || error?.message || error);
+      console.error('[7J-10BY-BA1 GAME THREAD] create failed:', error?.stack || error?.message || error);
       out.failed.push({ label, reason: String(error?.message || error).slice(0, 140) });
     }
   }
