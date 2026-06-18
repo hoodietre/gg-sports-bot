@@ -24100,7 +24100,7 @@ function formatMaddenThreadTeamSnapshot(team, powerRow) {
   ].join('\n');
 }
 
-function buildMaddenGameCenterEmbed(league, game, matchup = null, owners = {}) {
+function buildMaddenGameThreadCenterEmbed(league, game, matchup = null, owners = {}) {
   const awayLogo = getMaddenTeamLogoUrl(game.away_team);
   const homeLogo = getMaddenTeamLogoUrl(game.home_team);
   const hasScore = maddenGameHasRealScore(game);
@@ -24290,7 +24290,7 @@ async function handleMaddenGameThreadButton(interaction) {
   };
   const matchup = await getMaddenMatchupPreviewData(interaction.guild.id, league.league_id, game.home_team, game.away_team).catch(() => null);
   if (action === 'game') {
-    await interaction.reply({ embeds: [buildMaddenGameCenterEmbed(league, game, matchup, owners)], ephemeral: true });
+    await interaction.reply({ embeds: [buildMaddenGameThreadCenterEmbed(league, game, matchup, owners)], ephemeral: true });
     return;
   }
   if (action === 'preview') {
