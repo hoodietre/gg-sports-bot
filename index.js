@@ -524,6 +524,58 @@ async function initDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_lookup ON madden_change_log (guild_id, league_id, week_label, change_type, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_player ON madden_change_log (guild_id, league_id, player_id, created_at DESC)`);
 
+  // 7J-10BY-D: Player Attributes, Contracts, and Salary Cap foundation.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_player_attributes (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_id TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      dev_trait TEXT,
+      archetype TEXT,
+      age INTEGER,
+      years_left NUMERIC,
+      salary NUMERIC,
+      cap_hit NUMERIC,
+      bonus NUMERIC,
+      penalty NUMERIC,
+      contract_status TEXT,
+      attributes JSONB DEFAULT '{}'::jsonb,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_id)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS attributes JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS archetype TEXT`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS years_left NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS salary NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS cap_hit NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS bonus NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS penalty NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS contract_status TEXT`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_player_attributes_league_team ON madden_player_attributes (guild_id, league_id, team_name, overall DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_team_cap (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      cap_space NUMERIC NOT NULL DEFAULT 0,
+      active_cap NUMERIC NOT NULL DEFAULT 0,
+      dead_cap NUMERIC NOT NULL DEFAULT 0,
+      player_count INTEGER NOT NULL DEFAULT 0,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, team_name)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_team_cap ADD COLUMN IF NOT EXISTS player_count INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_team_cap_league_space ON madden_team_cap (guild_id, league_id, cap_space DESC)`);
+
 
   // 7J-10BW: User-controlled Madden trade block storage.
   // GMs can list their own roster players, remove them, and browse team/league-wide blocks.
@@ -1650,6 +1702,50 @@ function buildCommands() {
         .setDescription('Show recent Madden changes for one player')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))),
+
+    new SlashCommandBuilder()
+      .setName('maddencap')
+      .setDescription('Madden salary cap tools')
+      .addSubcommand(sc => sc
+        .setName('team')
+        .setDescription('Show one team salary cap snapshot')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('league')
+        .setDescription('Show league-wide salary cap rankings')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
+
+    new SlashCommandBuilder()
+      .setName('maddenplayer')
+      .setDescription('Expanded Madden player attribute and progression tools')
+      .addSubcommand(sc => sc
+        .setName('attributes')
+        .setDescription('Show full imported attributes and contract data for a player')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('progression')
+        .setDescription('Show saved progression/change history for a player')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))),
+
+    new SlashCommandBuilder()
+      .setName('maddenteam')
+      .setDescription('Expanded Madden team rankings')
+      .addSubcommand(sc => sc
+        .setName('rankings')
+        .setDescription('Rank teams by imported attributes and roster strengths')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('category').setDescription('Ranking category').setRequired(true)
+          .addChoices(
+            { name: 'Fastest Teams', value: 'speed' },
+            { name: 'Best Pass Rush', value: 'pass_rush' },
+            { name: 'Best Secondary', value: 'secondary' },
+            { name: 'Strongest Offensive Line', value: 'offensive_line' },
+            { name: 'Best QB Room', value: 'qb' },
+            { name: 'Highest OVR Roster', value: 'overall' }
+          ))),
 
     new SlashCommandBuilder()
       .setName('maddendebug')
@@ -4003,6 +4099,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
             if (!activeLeague) { await interaction.respond([]); return; }
             const choices = await getMaddenGameWeekAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
+        if (['maddencap', 'maddenplayer', 'maddenteam'].includes(commandName)) {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          const leagueName = interaction.options.getString('league');
+          const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+          if (!activeLeague) { await interaction.respond([]); return; }
+          if (focused?.name === 'team') {
+            const choices = await getMaddenTeamAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          if (focused?.name === 'player') {
+            const choices = await getMaddenPlayerAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
             await interaction.respond((choices || []).slice(0, 25));
             return;
           }
@@ -7220,6 +7338,80 @@ if (gameSubcommand === 'report') {
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden changes command.' });
+      return;
+    }
+
+    if (interaction.commandName === 'maddencap') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      await refreshMaddenTeamCapFromExpandedPlayers(interaction.guild.id, activeLeague.league_id).catch(() => null);
+      if (subcommand === 'team') {
+        const team = interaction.options.getString('team');
+        await interaction.editReply({ embeds: [await buildMaddenTeamCapEmbed(interaction.guild.id, activeLeague, team)] });
+        return;
+      }
+      if (subcommand === 'league') {
+        await interaction.editReply({ embeds: [await buildMaddenLeagueCapEmbed(interaction.guild.id, activeLeague)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden cap command.' });
+      return;
+    }
+
+    if (interaction.commandName === 'maddenplayer') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      const player = interaction.options.getString('player');
+      await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
+      if (subcommand === 'attributes') {
+        await interaction.editReply({ embeds: [await buildMaddenPlayerAttributesEmbed(interaction.guild.id, activeLeague, player)] });
+        return;
+      }
+      if (subcommand === 'progression') {
+        await interaction.editReply({ embeds: [await buildMaddenPlayerProgressionEmbed(interaction.guild.id, activeLeague, player)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden player command.' });
+      return;
+    }
+
+    if (interaction.commandName === 'maddenteam') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
+      if (subcommand === 'rankings') {
+        const category = interaction.options.getString('category');
+        await interaction.editReply({ embeds: [await buildMaddenTeamAttributeRankingsEmbed(interaction.guild.id, activeLeague, category)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden team command.' });
       return;
     }
 
@@ -21728,6 +21920,15 @@ async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = nul
       ]
     );
 
+    await upsertMaddenExpandedPlayerData(guild.id, league.league_id, {
+      player_id: externalPlayerId,
+      player_name: playerName,
+      team_name: nextTeam,
+      position: nextPosition,
+      overall: nextOverall,
+      raw_payload: row,
+    }).catch(error => console.warn('[7J-10BY-D] expanded player capture failed:', error?.message || error));
+
     imported += 1;
   }
 
@@ -24866,6 +25067,421 @@ async function getMaddenChangeWeekAutocompleteChoices(guildId, leagueId, focused
     .filter(label => !q || label.toLowerCase().includes(q))
     .slice(0, 25)
     .map(label => ({ name: label, value: label }));
+}
+
+
+async function ensureMaddenFranchiseDataTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_player_attributes (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_id TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      dev_trait TEXT,
+      archetype TEXT,
+      age INTEGER,
+      years_left NUMERIC,
+      salary NUMERIC,
+      cap_hit NUMERIC,
+      bonus NUMERIC,
+      penalty NUMERIC,
+      contract_status TEXT,
+      attributes JSONB DEFAULT '{}'::jsonb,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_id)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS archetype TEXT`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS age INTEGER`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS years_left NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS salary NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS cap_hit NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS bonus NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS penalty NUMERIC`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS contract_status TEXT`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS attributes JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE madden_player_attributes ADD COLUMN IF NOT EXISTS raw_payload JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_player_attributes_league_team ON madden_player_attributes (guild_id, league_id, team_name, overall DESC)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_team_cap (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      cap_space NUMERIC NOT NULL DEFAULT 0,
+      active_cap NUMERIC NOT NULL DEFAULT 0,
+      dead_cap NUMERIC NOT NULL DEFAULT 0,
+      player_count INTEGER NOT NULL DEFAULT 0,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, team_name)
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_team_cap ADD COLUMN IF NOT EXISTS player_count INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE madden_team_cap ADD COLUMN IF NOT EXISTS raw_payload JSONB DEFAULT '{}'::jsonb`);
+}
+
+function maddenBydRaw(rawPayload) {
+  if (!rawPayload) return {};
+  if (typeof rawPayload === 'string') {
+    try { return JSON.parse(rawPayload); } catch { return {}; }
+  }
+  return rawPayload || {};
+}
+
+function maddenBydNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const cleaned = String(value).replace(/[$,]/g, '').replace(/M$/i, '');
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+function maddenBydFirst(raw, aliases = [], fallback = null) {
+  const value = getFirstValue(raw || {}, aliases, null);
+  if (value === null || value === undefined || String(value).trim() === '') return fallback;
+  return value;
+}
+
+function getMaddenBydAttributeMap(rawPayload) {
+  const raw = maddenBydRaw(rawPayload);
+  const specs = [
+    ['speed', ['speed', 'spd', 'SpeedRating']],
+    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating']],
+    ['agility', ['agility', 'agi', 'AgilityRating']],
+    ['strength', ['strength', 'str', 'StrengthRating']],
+    ['awareness', ['awareness', 'awr', 'AwarenessRating']],
+    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating']],
+    ['short_accuracy', ['throwAccuracyShort', 'shortAccuracy', 'throw_accuracy_short', 'tas', 'ThrowAccuracyShortRating']],
+    ['medium_accuracy', ['throwAccuracyMid', 'mediumAccuracy', 'throw_accuracy_mid', 'tam', 'ThrowAccuracyMidRating']],
+    ['deep_accuracy', ['throwAccuracyDeep', 'deepAccuracy', 'throw_accuracy_deep', 'tad', 'ThrowAccuracyDeepRating']],
+    ['throw_under_pressure', ['throwUnderPressure', 'tup', 'ThrowUnderPressureRating']],
+    ['throw_on_run', ['throwOnRun', 'tor', 'ThrowOnRunRating']],
+    ['play_action', ['playAction', 'pac', 'PlayActionRating']],
+    ['carrying', ['carrying', 'car', 'CarryingRating']],
+    ['break_tackle', ['breakTackle', 'btk', 'BreakTackleRating']],
+    ['truck', ['trucking', 'truck', 'trk', 'TruckingRating']],
+    ['juke', ['jukeMove', 'juke', 'juk', 'JukeMoveRating']],
+    ['spin', ['spinMove', 'spin', 'spm', 'SpinMoveRating']],
+    ['catching', ['catching', 'catch', 'cth', 'CatchingRating']],
+    ['catch_in_traffic', ['catchInTraffic', 'cit', 'CatchInTrafficRating']],
+    ['spectacular_catch', ['spectacularCatch', 'specCatch', 'spc', 'SpectacularCatchRating']],
+    ['route_running', ['routeRunning', 'rr', 'RouteRunningRating']],
+    ['release', ['release', 'rel', 'ReleaseRating']],
+    ['pass_block', ['passBlock', 'pbk', 'PassBlockRating']],
+    ['pass_block_power', ['passBlockPower', 'pbp', 'PassBlockPowerRating']],
+    ['pass_block_finesse', ['passBlockFinesse', 'pbf', 'PassBlockFinesseRating']],
+    ['run_block', ['runBlock', 'rbk', 'RunBlockRating']],
+    ['lead_block', ['leadBlock', 'lbk', 'LeadBlockRating']],
+    ['power_moves', ['powerMoves', 'pmv', 'PowerMovesRating']],
+    ['finesse_moves', ['finesseMoves', 'fmv', 'FinesseMovesRating']],
+    ['block_shed', ['blockShed', 'bsh', 'BlockShedRating']],
+    ['pursuit', ['pursuit', 'pur', 'PursuitRating']],
+    ['tackle', ['tackle', 'tak', 'TackleRating']],
+    ['play_recognition', ['playRecognition', 'prc', 'PlayRecognitionRating']],
+    ['man_coverage', ['manCoverage', 'mcv', 'ManCoverageRating']],
+    ['zone_coverage', ['zoneCoverage', 'zcv', 'ZoneCoverageRating']],
+    ['press', ['press', 'prs', 'PressRating']],
+  ];
+  const out = {};
+  for (const [key, aliases] of specs) {
+    const num = maddenBydNumber(maddenBydFirst(raw, aliases, null));
+    if (num !== null) out[key] = num;
+  }
+  return out;
+}
+
+function maddenBydAttributeLabel(key) {
+  return String(key || '')
+    .split('_')
+    .map(part => part ? part[0].toUpperCase() + part.slice(1) : part)
+    .join(' ')
+    .replace('Qb', 'QB')
+    .replace('Ovr', 'OVR');
+}
+
+function extractMaddenBydContractStatus(rawPayload) {
+  const raw = maddenBydRaw(rawPayload);
+  const status = maddenBydFirst(raw, ['contractStatus', 'contract_status', 'rosterStatus', 'status'], null);
+  if (status) return String(status);
+  const years = maddenBydNumber(maddenBydFirst(raw, ['yearsLeft', 'years_left', 'contractYearsLeft', 'contractLength', 'yearsRemaining'], null));
+  if (years === 0) return 'Expiring / Free Agent';
+  if (years === 1) return 'Expiring Soon';
+  if (years !== null) return `${years} years left`;
+  return 'Unknown';
+}
+
+async function upsertMaddenExpandedPlayerData(guildId, leagueId, player) {
+  await ensureMaddenFranchiseDataTables();
+  const raw = maddenBydRaw(player.raw_payload || player.raw || {});
+  const playerId = String(player.player_id || player.external_player_id || player.id || player.player_name || randomUUID());
+  const playerName = String(player.player_name || player.playerName || maddenBydFirst(raw, ['playerName', 'name', 'fullName'], 'Unknown Player'));
+  const teamName = normalizeMaddenTeamName(player.team_name || maddenBydFirst(raw, ['teamName', 'team_name', 'team'], null));
+  const position = player.position || maddenBydFirst(raw, ['position', 'pos'], null);
+  const overall = maddenBydNumber(player.overall ?? maddenBydFirst(raw, ['overall', 'ovr', 'rating'], null));
+  const age = maddenBydNumber(maddenBydFirst(raw, ['age', 'playerAge'], null));
+  const devTrait = normalizeMaddenDevTrait(maddenBydFirst(raw, ['devTrait', 'dev_trait', 'developmentTrait', 'trait'], null));
+  const archetype = maddenBydFirst(raw, ['archetype', 'playerArchetype', 'schemeArchetype'], null);
+  const yearsLeft = maddenBydNumber(maddenBydFirst(raw, ['yearsLeft', 'years_left', 'contractYearsLeft', 'yearsRemaining'], null));
+  const salary = maddenBydNumber(maddenBydFirst(raw, ['salary', 'contractSalary', 'currentSalary'], null));
+  const capHit = maddenBydNumber(maddenBydFirst(raw, ['capHit', 'cap_hit', 'capNumber', 'currentCapHit'], null));
+  const bonus = maddenBydNumber(maddenBydFirst(raw, ['bonus', 'signingBonus', 'bonusAmount'], null));
+  const penalty = maddenBydNumber(maddenBydFirst(raw, ['penalty', 'releasePenalty', 'capPenalty'], null));
+  const attributes = getMaddenBydAttributeMap(raw);
+  const contractStatus = extractMaddenBydContractStatus(raw);
+
+  await pool.query(
+    `INSERT INTO madden_player_attributes (guild_id, league_id, player_id, player_name, team_name, position, overall, dev_trait, archetype, age, years_left, salary, cap_hit, bonus, penalty, contract_status, attributes, raw_payload, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, NOW())
+     ON CONFLICT (guild_id, league_id, player_id)
+     DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall,
+       dev_trait = EXCLUDED.dev_trait, archetype = EXCLUDED.archetype, age = EXCLUDED.age, years_left = EXCLUDED.years_left,
+       salary = EXCLUDED.salary, cap_hit = EXCLUDED.cap_hit, bonus = EXCLUDED.bonus, penalty = EXCLUDED.penalty,
+       contract_status = EXCLUDED.contract_status, attributes = EXCLUDED.attributes, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
+    [String(guildId), String(leagueId), playerId, playerName, teamName, position, overall, devTrait, archetype, age, yearsLeft, salary, capHit, bonus, penalty, contractStatus, JSON.stringify(attributes), JSON.stringify(raw)]
+  );
+  return { playerId, teamName, capHit };
+}
+
+async function backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId) {
+  await ensureMaddenFranchiseDataTables();
+  const existing = await pool.query(`SELECT COUNT(*)::int AS count FROM madden_player_attributes WHERE guild_id = $1 AND league_id = $2`, [String(guildId), String(leagueId)]).catch(() => ({ rows: [{ count: 0 }] }));
+  if (Number(existing.rows[0]?.count || 0) > 0) return;
+  const players = await pool.query(
+    `SELECT external_player_id, player_name, team_name, position, overall, raw_payload
+     FROM madden_imported_players
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     LIMIT 2500`,
+    [String(guildId), String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  for (const row of players.rows || []) {
+    await upsertMaddenExpandedPlayerData(guildId, leagueId, {
+      player_id: row.external_player_id || row.player_name,
+      player_name: row.player_name,
+      team_name: row.team_name,
+      position: row.position,
+      overall: row.overall,
+      raw_payload: row.raw_payload,
+    }).catch(() => null);
+  }
+  await refreshMaddenTeamCapFromExpandedPlayers(guildId, leagueId).catch(() => null);
+}
+
+async function refreshMaddenTeamCapFromExpandedPlayers(guildId, leagueId) {
+  await ensureMaddenFranchiseDataTables();
+  const capLimit = Number(process.env.MADDEN_LEAGUE_CAP_LIMIT || 255000000);
+  const result = await pool.query(
+    `SELECT team_name, COUNT(*)::int AS player_count, COALESCE(SUM(COALESCE(cap_hit, salary, 0)), 0) AS active_cap, COALESCE(SUM(COALESCE(penalty, 0)), 0) AS dead_cap
+     FROM madden_player_attributes
+     WHERE guild_id = $1 AND league_id = $2 AND team_name IS NOT NULL AND LOWER(team_name) NOT IN ('free agent', 'free agents', 'fa')
+     GROUP BY team_name`,
+    [String(guildId), String(leagueId)]
+  );
+  for (const row of result.rows || []) {
+    const activeCap = Number(row.active_cap || 0);
+    const deadCap = Number(row.dead_cap || 0);
+    const capSpace = capLimit - activeCap - deadCap;
+    await pool.query(
+      `INSERT INTO madden_team_cap (guild_id, league_id, team_name, cap_space, active_cap, dead_cap, player_count, raw_payload, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW())
+       ON CONFLICT (guild_id, league_id, team_name)
+       DO UPDATE SET cap_space = EXCLUDED.cap_space, active_cap = EXCLUDED.active_cap, dead_cap = EXCLUDED.dead_cap, player_count = EXCLUDED.player_count, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
+      [String(guildId), String(leagueId), row.team_name, capSpace, activeCap, deadCap, row.player_count || 0, JSON.stringify({ cap_limit: capLimit, source: 'player_contract_rollup' })]
+    );
+  }
+}
+
+function formatMaddenMoney(value) {
+  const num = Number(value || 0);
+  const abs = Math.abs(num);
+  if (abs >= 1000000) return `${num < 0 ? '-' : ''}$${(abs / 1000000).toFixed(1)}M`;
+  if (abs >= 1000) return `${num < 0 ? '-' : ''}$${(abs / 1000).toFixed(1)}K`;
+  return `${num < 0 ? '-' : ''}$${abs.toFixed(0)}`;
+}
+
+async function getMaddenExpandedPlayerRow(guildId, leagueId, playerInput) {
+  await ensureMaddenFranchiseDataTables();
+  const q = String(playerInput || '').trim();
+  const result = await pool.query(
+    `SELECT * FROM madden_player_attributes
+     WHERE guild_id = $1 AND league_id = $2
+       AND (LOWER(player_name) = LOWER($3) OR player_id = $3 OR LOWER(player_name) LIKE LOWER($4))
+     ORDER BY CASE WHEN LOWER(player_name) = LOWER($3) THEN 0 ELSE 1 END, overall DESC NULLS LAST
+     LIMIT 1`,
+    [String(guildId), String(leagueId), q, `%${q}%`]
+  );
+  return result.rows[0] || null;
+}
+
+function maddenBydTopAttributesLine(attributes, limit = 12) {
+  const entries = Object.entries(attributes || {}).filter(([, value]) => Number.isFinite(Number(value))).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, limit);
+  if (!entries.length) return 'No detailed attributes found in the current import payload yet.';
+  return entries.map(([key, value]) => `**${maddenBydAttributeLabel(key)}:** ${Number(value).toFixed(0)}`).join('\n');
+}
+
+async function buildMaddenPlayerAttributesEmbed(guildId, league, playerInput) {
+  const row = await getMaddenExpandedPlayerRow(guildId, league.league_id, playerInput);
+  const embed = new EmbedBuilder()
+    .setTitle(`🧬 Player Attributes • ${league.league_name}`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • 7J-10BY-D Player Attributes' })
+    .setTimestamp();
+  if (!row) {
+    embed.setDescription(`No expanded attribute record found for **${playerInput}** yet. Run Madden sync, then try again.`);
+    return embed;
+  }
+  const attrs = maddenBydRaw(row.attributes);
+  embed.setTitle(`🧬 ${row.player_name}`);
+  embed.setDescription(`**${maddenTeamDisplayName(row.team_name || 'Free Agent')}** • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
+  embed.addFields(
+    { name: 'Core Info', value: [`Dev: **${row.dev_trait || 'Unknown'}**`, `Archetype: **${row.archetype || 'Unknown'}**`, `Age: **${row.age ?? 'N/A'}**`].join('\n'), inline: true },
+    { name: 'Contract', value: [`Status: **${row.contract_status || 'Unknown'}**`, `Years Left: **${row.years_left ?? 'N/A'}**`, `Cap Hit: **${formatMaddenMoney(row.cap_hit || 0)}**`].join('\n'), inline: true },
+    { name: 'Top Attributes', value: maddenSafeEmbedText(maddenBydTopAttributesLine(attrs, 18), 1024), inline: false }
+  );
+  const logo = getMaddenTeamLogoUrl(row.team_name);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function buildMaddenPlayerProgressionEmbed(guildId, league, playerInput) {
+  const rows = await getMaddenChangeLogRows(guildId, league.league_id, { player: playerInput, limit: 50 });
+  const embed = new EmbedBuilder()
+    .setTitle(`📈 ${playerInput} • Progression`)
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • 7J-10BY-D Player Progression' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription('No saved progression entries found yet. Progression is created by roster sync comparisons from 7J-10BY-C.');
+    return embed;
+  }
+  const progressionRows = rows.filter(row => ['overall_change', 'attribute_change', 'dev_trait_change', 'position_change'].includes(String(row.change_type || '')));
+  embed.setDescription((progressionRows.length ? progressionRows : rows).slice(0, 25).map(row => `${row.week_label ? `**${row.week_label}** — ` : ''}${maddenChangeLogLine(row)}`).join('\n').slice(0, 4096));
+  return embed;
+}
+
+async function buildMaddenTeamCapEmbed(guildId, league, teamInput) {
+  await ensureMaddenFranchiseDataTables();
+  const team = normalizeMaddenTeamName(teamInput);
+  const result = await pool.query(
+    `SELECT * FROM madden_team_cap
+     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3)
+     LIMIT 1`,
+    [String(guildId), String(league.league_id), team]
+  );
+  const row = result.rows[0];
+  const embed = new EmbedBuilder()
+    .setTitle(`💰 Salary Cap • ${maddenTeamDisplayName(team)}`)
+    .setColor(row && Number(row.cap_space || 0) < 0 ? 0xED4245 : 0x57F287)
+    .setFooter({ text: 'GG Sports • 7J-10BY-D Salary Cap' })
+    .setTimestamp();
+  if (!row) {
+    embed.setDescription('No cap snapshot found yet. This will populate when imported player payloads include salary/cap fields.');
+  } else {
+    const capLimit = maddenBydRaw(row.raw_payload)?.cap_limit || process.env.MADDEN_LEAGUE_CAP_LIMIT || '255000000';
+    embed.addFields(
+      { name: 'Cap Space', value: `**${formatMaddenMoney(row.cap_space)}**`, inline: true },
+      { name: 'Active Cap', value: formatMaddenMoney(row.active_cap), inline: true },
+      { name: 'Dead Cap', value: formatMaddenMoney(row.dead_cap), inline: true },
+      { name: 'Players Counted', value: String(row.player_count || 0), inline: true },
+      { name: 'League Cap Limit', value: formatMaddenMoney(capLimit), inline: true },
+      { name: 'Status', value: Number(row.cap_space || 0) < 0 ? '🚨 Over Cap' : '✅ Under Cap', inline: true }
+    );
+  }
+  const logo = getMaddenTeamLogoUrl(team);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function buildMaddenLeagueCapEmbed(guildId, league) {
+  await ensureMaddenFranchiseDataTables();
+  const result = await pool.query(
+    `SELECT * FROM madden_team_cap WHERE guild_id = $1 AND league_id = $2 ORDER BY cap_space DESC, team_name ASC`,
+    [String(guildId), String(league.league_id)]
+  );
+  const rows = result.rows || [];
+  const embed = new EmbedBuilder()
+    .setTitle(`💰 ${league.league_name} • League Cap Snapshot`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • 7J-10BY-D League Cap' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription('No league cap snapshots found yet. Cap data appears after Madden imports include salary/cap fields.');
+    return embed;
+  }
+  const mostSpace = rows.slice(0, 8).map((row, i) => `**${i + 1}. ${maddenTeamDisplayName(row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`).join('\n');
+  const leastSpace = [...rows].reverse().slice(0, 8).map((row, i) => `**${i + 1}. ${maddenTeamDisplayName(row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`).join('\n');
+  const violations = rows.filter(row => Number(row.cap_space || 0) < 0).map(row => `🚨 **${maddenTeamDisplayName(row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`).join('\n') || 'No cap violations detected.';
+  embed.addFields(
+    { name: 'Most Cap Space', value: mostSpace || 'No data.', inline: true },
+    { name: 'Least Cap Space', value: leastSpace || 'No data.', inline: true },
+    { name: 'Cap Violations', value: maddenSafeEmbedText(violations, 1024), inline: false }
+  );
+  return embed;
+}
+
+function maddenTeamRankingScoreForCategory(row, category) {
+  const attrs = maddenBydRaw(row.attributes);
+  const get = key => Number(attrs[key] || 0);
+  const overall = Number(row.overall || 0);
+  if (category === 'speed') return get('speed') || 0;
+  if (category === 'pass_rush') return Math.max(get('power_moves'), get('finesse_moves'), get('block_shed'));
+  if (category === 'secondary') return Math.max(get('man_coverage'), get('zone_coverage'), get('press'));
+  if (category === 'offensive_line') return Math.max(get('pass_block'), get('run_block'), get('pass_block_power'), get('pass_block_finesse'));
+  if (category === 'qb') return String(row.position || '').toUpperCase() === 'QB' ? overall : 0;
+  return overall;
+}
+
+function maddenTeamRankingCategoryLabel(category) {
+  if (category === 'speed') return 'Fastest Teams';
+  if (category === 'pass_rush') return 'Best Pass Rush';
+  if (category === 'secondary') return 'Best Secondary';
+  if (category === 'offensive_line') return 'Strongest Offensive Line';
+  if (category === 'qb') return 'Best QB Room';
+  return 'Highest OVR Roster';
+}
+
+async function buildMaddenTeamAttributeRankingsEmbed(guildId, league, category = 'overall') {
+  await ensureMaddenFranchiseDataTables();
+  const result = await pool.query(
+    `SELECT * FROM madden_player_attributes WHERE guild_id = $1 AND league_id = $2 AND team_name IS NOT NULL`,
+    [String(guildId), String(league.league_id)]
+  );
+  const teamMap = new Map();
+  for (const row of result.rows || []) {
+    const score = maddenTeamRankingScoreForCategory(row, category);
+    if (!Number.isFinite(score) || score <= 0) continue;
+    const team = row.team_name;
+    if (!teamMap.has(team)) teamMap.set(team, []);
+    teamMap.get(team).push({ row, score });
+  }
+  const rankings = [...teamMap.entries()].map(([team, entries]) => {
+    const sorted = entries.sort((a, b) => b.score - a.score).slice(0, category === 'overall' ? 22 : 8);
+    const avg = sorted.reduce((sum, item) => sum + item.score, 0) / Math.max(1, sorted.length);
+    return { team, avg, top: sorted.slice(0, 3) };
+  }).sort((a, b) => b.avg - a.avg).slice(0, 12);
+  const embed = new EmbedBuilder()
+    .setTitle(`📊 ${league.league_name} • ${maddenTeamRankingCategoryLabel(category)}`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • 7J-10BY-D Team Attribute Rankings' })
+    .setTimestamp();
+  if (!rankings.length) {
+    embed.setDescription('No attribute ranking data found yet. This fills in when Madden sync/import payloads include detailed ratings.');
+    return embed;
+  }
+  embed.setDescription(rankings.map((item, index) => {
+    const topPlayers = item.top.map(t => `${t.row.player_name} (${Number(t.score).toFixed(0)})`).join(', ');
+    return `**${index + 1}. ${maddenTeamDisplayName(item.team)}** — ${item.avg.toFixed(1)} avg\n${topPlayers}`;
+  }).join('\n\n').slice(0, 4096));
+  return embed;
+}
+
+function estimateMaddenTradeCapImpactForPackage(packageData = {}) {
+  const sendCap = [...(packageData.players || []), ...(packageData.picks || [])].reduce((sum, item) => sum + Number(item.cap_hit || item.capHit || 0), 0);
+  const receiveCap = [...(packageData.target_players || []), ...(packageData.target_picks || [])].reduce((sum, item) => sum + Number(item.cap_hit || item.capHit || 0), 0);
+  return { sendCap, receiveCap, netCap: receiveCap - sendCap };
 }
 
 async function ensureMaddenNewsTables() {
