@@ -7353,6 +7353,7 @@ if (gameSubcommand === 'report') {
         await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
         return;
       }
+      await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
       await refreshMaddenTeamCapFromExpandedPlayers(interaction.guild.id, activeLeague.league_id).catch(() => null);
       if (subcommand === 'team') {
         const team = interaction.options.getString('team');
@@ -21927,11 +21928,12 @@ async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = nul
       position: nextPosition,
       overall: nextOverall,
       raw_payload: row,
-    }).catch(error => console.warn('[7J-10BY-D] expanded player capture failed:', error?.message || error));
+    }).catch(error => console.warn('[7J-10BY-DA] expanded player capture failed:', error?.message || error));
 
     imported += 1;
   }
 
+  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(error => console.warn('[7J-10BY-DA] cap snapshot refresh failed:', error?.message || error));
   return imported;
 }
 
@@ -24736,11 +24738,7 @@ async function ensureMaddenChangeLogTables() {
 function maddenRawValueFromPayload(payload, keys = []) {
   if (!payload) return null;
   const raw = typeof payload === 'string' ? (() => { try { return JSON.parse(payload); } catch { return {}; } })() : payload;
-  for (const key of keys) {
-    const value = getFirstValue(raw, [key], null);
-    if (value !== null && value !== undefined && String(value).trim() !== '') return value;
-  }
-  return null;
+  return maddenBydaDeepFirst(raw, keys, null);
 }
 
 function normalizeMaddenDevTraitForChangeLog(value) {
@@ -24766,31 +24764,31 @@ function normalizeMaddenInjuryValue(value) {
 function getMaddenChangeAttributeMap(rawPayload) {
   const raw = typeof rawPayload === 'string' ? (() => { try { return JSON.parse(rawPayload); } catch { return {}; } })() : (rawPayload || {});
   const keys = [
-    ['speed', ['speed', 'spd', 'SpeedRating']],
-    ['strength', ['strength', 'str', 'StrengthRating']],
-    ['awareness', ['awareness', 'awr', 'AwarenessRating']],
-    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating']],
-    ['agility', ['agility', 'agi', 'AgilityRating']],
-    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating']],
+    ['speed', ['speed', 'spd', 'SpeedRating', 'speedRating', 'playerSpeed', 'ratingSpeed']],
+    ['strength', ['strength', 'str', 'StrengthRating', 'strengthRating', 'ratingStrength']],
+    ['awareness', ['awareness', 'awr', 'AwarenessRating', 'awarenessRating', 'ratingAwareness']],
+    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating', 'accelerationRating', 'ratingAcceleration']],
+    ['agility', ['agility', 'agi', 'AgilityRating', 'agilityRating', 'ratingAgility']],
+    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating', 'throwPowerRating', 'ratingThrowPower']],
     ['throw_accuracy_short', ['throwAccuracyShort', 'throw_accuracy_short', 'tas', 'ThrowAccuracyShortRating']],
     ['throw_accuracy_mid', ['throwAccuracyMid', 'throw_accuracy_mid', 'tam', 'ThrowAccuracyMidRating']],
     ['throw_accuracy_deep', ['throwAccuracyDeep', 'throw_accuracy_deep', 'tad', 'ThrowAccuracyDeepRating']],
     ['catching', ['catching', 'cth', 'CatchingRating']],
     ['route_running', ['routeRunning', 'route_running', 'rr', 'RouteRunningRating']],
-    ['carrying', ['carrying', 'car', 'CarryingRating']],
+    ['carrying', ['carrying', 'carry', 'car', 'CarryingRating', 'ratingCarrying']],
     ['break_tackle', ['breakTackle', 'break_tackle', 'btk', 'BreakTackleRating']],
-    ['tackle', ['tackle', 'tak', 'TackleRating']],
+    ['tackle', ['tackle', 'tak', 'TackleRating', 'ratingTackle']],
     ['block_shed', ['blockShed', 'block_shed', 'bsh', 'BlockShedRating']],
     ['power_moves', ['powerMoves', 'power_moves', 'pmv', 'PowerMovesRating']],
     ['finesse_moves', ['finesseMoves', 'finesse_moves', 'fmv', 'FinesseMovesRating']],
     ['man_coverage', ['manCoverage', 'man_coverage', 'mcv', 'ManCoverageRating']],
     ['zone_coverage', ['zoneCoverage', 'zone_coverage', 'zcv', 'ZoneCoverageRating']],
-    ['press', ['press', 'prs', 'PressRating']],
+    ['press', ['press', 'prs', 'PressRating', 'ratingPress']],
   ];
   const out = {};
   for (const [label, aliases] of keys) {
-    const value = getFirstValue(raw, aliases, null);
-    const num = Number(value);
+    const value = maddenBydaDeepFirst(raw, aliases, null);
+    const num = maddenBydNumber(value);
     if (Number.isFinite(num)) out[label] = num;
   }
   return out;
@@ -25135,13 +25133,52 @@ function maddenBydRaw(rawPayload) {
 
 function maddenBydNumber(value) {
   if (value === null || value === undefined || value === '') return null;
-  const cleaned = String(value).replace(/[$,]/g, '').replace(/M$/i, '');
-  const num = Number(cleaned);
-  return Number.isFinite(num) ? num : null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  let text = String(value).trim();
+  if (!text) return null;
+  const isMillion = /m$/i.test(text);
+  const isThousand = /k$/i.test(text);
+  text = text.replace(/[$,]/g, '').replace(/[mMkK]$/g, '');
+  const num = Number(text);
+  if (!Number.isFinite(num)) return null;
+  if (isMillion) return num * 1000000;
+  if (isThousand) return num * 1000;
+  return num;
+}
+
+function maddenBydaKeyNorm(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function maddenBydaIsPlainObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function maddenBydaDeepFirst(raw, aliases = [], fallback = null) {
+  const root = maddenBydRaw(raw);
+  const wanted = new Set((aliases || []).map(maddenBydaKeyNorm));
+  if (!wanted.size) return fallback;
+  const queue = [root];
+  const seen = new Set();
+  while (queue.length) {
+    const obj = queue.shift();
+    if (!obj || typeof obj !== 'object') continue;
+    if (seen.has(obj)) continue;
+    seen.add(obj);
+    if (Array.isArray(obj)) {
+      for (const item of obj) if (item && typeof item === 'object') queue.push(item);
+      continue;
+    }
+    for (const [key, value] of Object.entries(obj)) {
+      if (wanted.has(maddenBydaKeyNorm(key)) && value !== null && value !== undefined && String(value).trim() !== '') return value;
+      if (value && typeof value === 'object') queue.push(value);
+    }
+  }
+  return fallback;
 }
 
 function maddenBydFirst(raw, aliases = [], fallback = null) {
-  const value = getFirstValue(raw || {}, aliases, null);
+  const value = maddenBydaDeepFirst(raw || {}, aliases, null);
   if (value === null || value === undefined || String(value).trim() === '') return fallback;
   return value;
 }
@@ -25149,42 +25186,42 @@ function maddenBydFirst(raw, aliases = [], fallback = null) {
 function getMaddenBydAttributeMap(rawPayload) {
   const raw = maddenBydRaw(rawPayload);
   const specs = [
-    ['speed', ['speed', 'spd', 'SpeedRating']],
-    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating']],
-    ['agility', ['agility', 'agi', 'AgilityRating']],
-    ['strength', ['strength', 'str', 'StrengthRating']],
-    ['awareness', ['awareness', 'awr', 'AwarenessRating']],
-    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating']],
-    ['short_accuracy', ['throwAccuracyShort', 'shortAccuracy', 'throw_accuracy_short', 'tas', 'ThrowAccuracyShortRating']],
-    ['medium_accuracy', ['throwAccuracyMid', 'mediumAccuracy', 'throw_accuracy_mid', 'tam', 'ThrowAccuracyMidRating']],
-    ['deep_accuracy', ['throwAccuracyDeep', 'deepAccuracy', 'throw_accuracy_deep', 'tad', 'ThrowAccuracyDeepRating']],
-    ['throw_under_pressure', ['throwUnderPressure', 'tup', 'ThrowUnderPressureRating']],
-    ['throw_on_run', ['throwOnRun', 'tor', 'ThrowOnRunRating']],
-    ['play_action', ['playAction', 'pac', 'PlayActionRating']],
-    ['carrying', ['carrying', 'car', 'CarryingRating']],
-    ['break_tackle', ['breakTackle', 'btk', 'BreakTackleRating']],
-    ['truck', ['trucking', 'truck', 'trk', 'TruckingRating']],
-    ['juke', ['jukeMove', 'juke', 'juk', 'JukeMoveRating']],
-    ['spin', ['spinMove', 'spin', 'spm', 'SpinMoveRating']],
-    ['catching', ['catching', 'catch', 'cth', 'CatchingRating']],
-    ['catch_in_traffic', ['catchInTraffic', 'cit', 'CatchInTrafficRating']],
-    ['spectacular_catch', ['spectacularCatch', 'specCatch', 'spc', 'SpectacularCatchRating']],
-    ['route_running', ['routeRunning', 'rr', 'RouteRunningRating']],
-    ['release', ['release', 'rel', 'ReleaseRating']],
-    ['pass_block', ['passBlock', 'pbk', 'PassBlockRating']],
-    ['pass_block_power', ['passBlockPower', 'pbp', 'PassBlockPowerRating']],
-    ['pass_block_finesse', ['passBlockFinesse', 'pbf', 'PassBlockFinesseRating']],
-    ['run_block', ['runBlock', 'rbk', 'RunBlockRating']],
-    ['lead_block', ['leadBlock', 'lbk', 'LeadBlockRating']],
-    ['power_moves', ['powerMoves', 'pmv', 'PowerMovesRating']],
-    ['finesse_moves', ['finesseMoves', 'fmv', 'FinesseMovesRating']],
-    ['block_shed', ['blockShed', 'bsh', 'BlockShedRating']],
-    ['pursuit', ['pursuit', 'pur', 'PursuitRating']],
-    ['tackle', ['tackle', 'tak', 'TackleRating']],
-    ['play_recognition', ['playRecognition', 'prc', 'PlayRecognitionRating']],
-    ['man_coverage', ['manCoverage', 'mcv', 'ManCoverageRating']],
-    ['zone_coverage', ['zoneCoverage', 'zcv', 'ZoneCoverageRating']],
-    ['press', ['press', 'prs', 'PressRating']],
+    ['speed', ['speed', 'spd', 'SpeedRating', 'speedRating', 'playerSpeed', 'ratingSpeed']],
+    ['acceleration', ['acceleration', 'accel', 'acc', 'AccelerationRating', 'accelerationRating', 'ratingAcceleration']],
+    ['agility', ['agility', 'agi', 'AgilityRating', 'agilityRating', 'ratingAgility']],
+    ['strength', ['strength', 'str', 'StrengthRating', 'strengthRating', 'ratingStrength']],
+    ['awareness', ['awareness', 'awr', 'AwarenessRating', 'awarenessRating', 'ratingAwareness']],
+    ['throw_power', ['throwPower', 'throw_power', 'thp', 'ThrowPowerRating', 'throwPowerRating', 'ratingThrowPower']],
+    ['short_accuracy', ['throwAccuracyShort', 'shortAccuracy', 'throw_accuracy_short', 'tas', 'ThrowAccuracyShortRating', 'throwAccShort', 'shortAcc', 'ratingThrowAccuracyShort']],
+    ['medium_accuracy', ['throwAccuracyMid', 'throwAccuracyMedium', 'mediumAccuracy', 'medAccuracy', 'throw_accuracy_mid', 'tam', 'ThrowAccuracyMidRating', 'throwAccMid', 'ratingThrowAccuracyMid']],
+    ['deep_accuracy', ['throwAccuracyDeep', 'deepAccuracy', 'throw_accuracy_deep', 'tad', 'ThrowAccuracyDeepRating', 'throwAccDeep', 'ratingThrowAccuracyDeep']],
+    ['throw_under_pressure', ['throwUnderPressure', 'tup', 'ThrowUnderPressureRating', 'ratingThrowUnderPressure']],
+    ['throw_on_run', ['throwOnRun', 'tor', 'ThrowOnRunRating', 'ratingThrowOnRun']],
+    ['play_action', ['playAction', 'pac', 'PlayActionRating', 'ratingPlayAction']],
+    ['carrying', ['carrying', 'carry', 'car', 'CarryingRating', 'ratingCarrying']],
+    ['break_tackle', ['breakTackle', 'btk', 'BreakTackleRating', 'ratingBreakTackle']],
+    ['truck', ['trucking', 'truck', 'trk', 'TruckingRating', 'ratingTrucking']],
+    ['juke', ['jukeMove', 'juke', 'juk', 'JukeMoveRating', 'ratingJukeMove']],
+    ['spin', ['spinMove', 'spin', 'spm', 'SpinMoveRating', 'ratingSpinMove']],
+    ['catching', ['catching', 'catch', 'cth', 'CatchingRating', 'ratingCatching']],
+    ['catch_in_traffic', ['catchInTraffic', 'cit', 'CatchInTrafficRating', 'ratingCatchInTraffic']],
+    ['spectacular_catch', ['spectacularCatch', 'specCatch', 'spc', 'SpectacularCatchRating', 'ratingSpectacularCatch']],
+    ['route_running', ['routeRunning', 'rr', 'RouteRunningRating', 'shortRouteRunning', 'mediumRouteRunning', 'deepRouteRunning', 'srr', 'mrr', 'drr', 'ratingShortRouteRunning', 'ratingMediumRouteRunning', 'ratingDeepRouteRunning']],
+    ['release', ['release', 'rel', 'ReleaseRating', 'ratingRelease']],
+    ['pass_block', ['passBlock', 'pbk', 'PassBlockRating', 'ratingPassBlock']],
+    ['pass_block_power', ['passBlockPower', 'pbp', 'PassBlockPowerRating', 'ratingPassBlockPower']],
+    ['pass_block_finesse', ['passBlockFinesse', 'pbf', 'PassBlockFinesseRating', 'ratingPassBlockFinesse']],
+    ['run_block', ['runBlock', 'rbk', 'RunBlockRating', 'ratingRunBlock']],
+    ['lead_block', ['leadBlock', 'lbk', 'LeadBlockRating', 'ratingLeadBlock']],
+    ['power_moves', ['powerMoves', 'pmv', 'PowerMovesRating', 'ratingPowerMoves']],
+    ['finesse_moves', ['finesseMoves', 'fmv', 'FinesseMovesRating', 'ratingFinesseMoves']],
+    ['block_shed', ['blockShed', 'bsh', 'BlockShedRating', 'ratingBlockShed']],
+    ['pursuit', ['pursuit', 'pur', 'PursuitRating', 'ratingPursuit']],
+    ['tackle', ['tackle', 'tak', 'TackleRating', 'ratingTackle']],
+    ['play_recognition', ['playRecognition', 'prc', 'PlayRecognitionRating', 'ratingPlayRecognition']],
+    ['man_coverage', ['manCoverage', 'mcv', 'ManCoverageRating', 'ratingManCoverage']],
+    ['zone_coverage', ['zoneCoverage', 'zcv', 'ZoneCoverageRating', 'ratingZoneCoverage']],
+    ['press', ['press', 'prs', 'PressRating', 'ratingPress']],
   ];
   const out = {};
   for (const [key, aliases] of specs) {
@@ -25218,19 +25255,31 @@ async function upsertMaddenExpandedPlayerData(guildId, leagueId, player) {
   await ensureMaddenFranchiseDataTables();
   const raw = maddenBydRaw(player.raw_payload || player.raw || {});
   const playerId = String(player.player_id || player.external_player_id || player.id || player.player_name || randomUUID());
-  const playerName = String(player.player_name || player.playerName || maddenBydFirst(raw, ['playerName', 'name', 'fullName'], 'Unknown Player'));
-  const teamName = normalizeMaddenTeamName(player.team_name || maddenBydFirst(raw, ['teamName', 'team_name', 'team'], null));
-  const position = player.position || maddenBydFirst(raw, ['position', 'pos'], null);
-  const overall = maddenBydNumber(player.overall ?? maddenBydFirst(raw, ['overall', 'ovr', 'rating'], null));
-  const age = maddenBydNumber(maddenBydFirst(raw, ['age', 'playerAge'], null));
-  const devTrait = normalizeMaddenDevTrait(maddenBydFirst(raw, ['devTrait', 'dev_trait', 'developmentTrait', 'trait'], null));
-  const archetype = maddenBydFirst(raw, ['archetype', 'playerArchetype', 'schemeArchetype'], null);
-  const yearsLeft = maddenBydNumber(maddenBydFirst(raw, ['yearsLeft', 'years_left', 'contractYearsLeft', 'yearsRemaining'], null));
-  const salary = maddenBydNumber(maddenBydFirst(raw, ['salary', 'contractSalary', 'currentSalary'], null));
-  const capHit = maddenBydNumber(maddenBydFirst(raw, ['capHit', 'cap_hit', 'capNumber', 'currentCapHit'], null));
-  const bonus = maddenBydNumber(maddenBydFirst(raw, ['bonus', 'signingBonus', 'bonusAmount'], null));
-  const penalty = maddenBydNumber(maddenBydFirst(raw, ['penalty', 'releasePenalty', 'capPenalty'], null));
+  const playerName = String(player.player_name || player.playerName || maddenBydFirst(raw, ['playerName', 'player_name', 'name', 'fullName', 'full_name', 'displayName'], 'Unknown Player'));
+
+  const valueResult = await pool.query(
+    `SELECT * FROM madden_player_values
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND (player_id = $3 OR LOWER(player_name) = LOWER($4))
+     ORDER BY updated_at DESC NULLS LAST
+     LIMIT 1`,
+    [String(guildId), String(leagueId), playerId, playerName]
+  ).catch(() => ({ rows: [] }));
+  const valueRow = valueResult.rows?.[0] || {};
+
+  const teamName = normalizeMaddenTeamName(player.team_name || valueRow.team_name || maddenBydFirst(raw, ['teamName', 'team_name', 'team', 'clubName', 'teamAbbr', 'teamAbbreviation'], null));
+  const position = player.position || valueRow.position || maddenBydFirst(raw, ['position', 'pos', 'playerPosition'], null);
+  const overall = maddenBydNumber(player.overall ?? valueRow.overall ?? maddenBydFirst(raw, ['overall', 'ovr', 'rating', 'overallRating'], null));
+  const age = maddenBydNumber(valueRow.age ?? maddenBydFirst(raw, ['age', 'playerAge'], null));
+  const devTrait = normalizeMaddenDevTrait(maddenBydFirst(raw, ['devTrait', 'dev_trait', 'developmentTrait', 'trait', 'dev'], valueRow.dev_trait || null));
+  const archetype = maddenBydFirst(raw, ['archetype', 'playerArchetype', 'schemeArchetype', 'archetypeName'], null);
+  const yearsLeft = maddenBydNumber(valueRow.years_left ?? maddenBydFirst(raw, ['yearsLeft', 'years_left', 'contractYearsLeft', 'contractLength', 'yearsRemaining'], null));
+  const salary = maddenBydNumber(maddenBydFirst(raw, ['salary', 'contractSalary', 'currentSalary', 'totalSalary', 'baseSalary'], null));
+  const capHit = maddenBydNumber(valueRow.cap_hit ?? maddenBydFirst(raw, ['capHit', 'cap_hit', 'capNumber', 'currentCapHit', 'capValue'], null));
+  const bonus = maddenBydNumber(maddenBydFirst(raw, ['bonus', 'signingBonus', 'bonusAmount', 'totalBonus'], null));
+  const penalty = maddenBydNumber(maddenBydFirst(raw, ['penalty', 'releasePenalty', 'capPenalty', 'savingsPenalty'], null));
   const attributes = getMaddenBydAttributeMap(raw);
+  if (!attributes.speed && valueRow.speed) attributes.speed = Number(valueRow.speed);
   const contractStatus = extractMaddenBydContractStatus(raw);
 
   await pool.query(
@@ -25248,8 +25297,8 @@ async function upsertMaddenExpandedPlayerData(guildId, leagueId, player) {
 
 async function backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId) {
   await ensureMaddenFranchiseDataTables();
-  const existing = await pool.query(`SELECT COUNT(*)::int AS count FROM madden_player_attributes WHERE guild_id = $1 AND league_id = $2`, [String(guildId), String(leagueId)]).catch(() => ({ rows: [{ count: 0 }] }));
-  if (Number(existing.rows[0]?.count || 0) > 0) return;
+  // 7J-10BY-DA: always refresh expanded rows from the latest imported roster/player values.
+  // BY-D only created the tables; DA is the bridge that repopulates them after new sync payloads arrive.
   const players = await pool.query(
     `SELECT external_player_id, player_name, team_name, position, overall, raw_payload
      FROM madden_imported_players
@@ -25327,7 +25376,7 @@ async function buildMaddenPlayerAttributesEmbed(guildId, league, playerInput) {
   const embed = new EmbedBuilder()
     .setTitle(`🧬 Player Attributes • ${league.league_name}`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-D Player Attributes' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DA Player Attributes' })
     .setTimestamp();
   if (!row) {
     embed.setDescription(`No expanded attribute record found for **${playerInput}** yet. Run Madden sync, then try again.`);
@@ -25351,7 +25400,7 @@ async function buildMaddenPlayerProgressionEmbed(guildId, league, playerInput) {
   const embed = new EmbedBuilder()
     .setTitle(`📈 ${playerInput} • Progression`)
     .setColor(0x57F287)
-    .setFooter({ text: 'GG Sports • 7J-10BY-D Player Progression' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DA Player Progression' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved progression entries found yet. Progression is created by roster sync comparisons from 7J-10BY-C.');
@@ -25375,7 +25424,7 @@ async function buildMaddenTeamCapEmbed(guildId, league, teamInput) {
   const embed = new EmbedBuilder()
     .setTitle(`💰 Salary Cap • ${maddenTeamDisplayName(team)}`)
     .setColor(row && Number(row.cap_space || 0) < 0 ? 0xED4245 : 0x57F287)
-    .setFooter({ text: 'GG Sports • 7J-10BY-D Salary Cap' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DA Salary Cap' })
     .setTimestamp();
   if (!row) {
     embed.setDescription('No cap snapshot found yet. This will populate when imported player payloads include salary/cap fields.');
@@ -25405,7 +25454,7 @@ async function buildMaddenLeagueCapEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle(`💰 ${league.league_name} • League Cap Snapshot`)
     .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • 7J-10BY-D League Cap' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DA League Cap' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No league cap snapshots found yet. Cap data appears after Madden imports include salary/cap fields.');
@@ -25465,7 +25514,7 @@ async function buildMaddenTeamAttributeRankingsEmbed(guildId, league, category =
   const embed = new EmbedBuilder()
     .setTitle(`📊 ${league.league_name} • ${maddenTeamRankingCategoryLabel(category)}`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-D Team Attribute Rankings' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DA Team Attribute Rankings' })
     .setTimestamp();
   if (!rankings.length) {
     embed.setDescription('No attribute ranking data found yet. This fills in when Madden sync/import payloads include detailed ratings.');
