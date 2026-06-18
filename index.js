@@ -1747,6 +1747,24 @@ function buildCommands() {
             { name: 'Highest OVR Roster', value: 'overall' }
           ))),
 
+
+    new SlashCommandBuilder()
+      .setName('maddendiagnostics')
+      .setDescription('Madden EA Direct attribute, schema, and payload diagnostics')
+      .addSubcommand(sc => sc
+        .setName('attributes')
+        .setDescription('Audit whether the current EA/player payloads contain expanded attribute and cap fields')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('player')
+        .setDescription('Inspect raw imported fields for one Madden player')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('schema')
+        .setDescription('Show raw EA payload/schema coverage from the latest sync payloads')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
+
     new SlashCommandBuilder()
       .setName('maddendebug')
       .setDescription('Staff: Madden diagnostics and EA Direct debug views')
@@ -4082,6 +4100,172 @@ async function ggUpdatePermanentShopPanel(guild) {
 }
 
 
+// 7J-10BY-DB: Attribute Extraction Diagnostics.
+// These helpers inspect the raw imported EA payloads and tell us whether expanded ratings/cap fields exist.
+const MADDEN_DIAGNOSTIC_FIELD_GROUPS_7J10BYDB = {
+  core: ['overall','overallrating','ovr','age','position','team','teamname','devtrait','developmenttrait','yearspro','experience'],
+  athletic: ['speed','spd','acceleration','accel','acc','agility','agi','strength','str','jumping','jmp'],
+  qb: ['throwpower','thp','shortaccuracy','sac','mediumaccuracy','mac','deepaccuracy','dac','throwunderpressure','tup','throwonrun','tor','playaction','pac','awareness','awr'],
+  skill: ['catch','catching','cth','catchintraffic','cit','spectacularcatch','spc','release','rls','shortrouterunning','srr','mediumrouterunning','mrr','deeprouterunning','drr','carrying','car','breaktackle','btk','trucking','trk','juke','juk','spin','spm'],
+  line: ['passblock','pbk','passblockpower','pbp','passblockfinesse','pbf','runblock','rbk','runblockpower','rbp','runblockfinesse','rbf','leadblock','lbk','impactblock','ibl'],
+  defense: ['tackle','tak','pursuit','pur','playrecognition','prc','blockshed','bsh','powermove','pmv','finessemove','fmv','mancoverage','mcv','zonecoverage','zcv','press','prs','hitpower','pow'],
+  contract: ['salary','cap','caphit','cap_hit','bonus','penalty','releasepenalty','deadcap','contract','yearsleft','yearsremaining','contractlength']
+};
+
+function maddenDiagNormalizeKey7J10BYDB(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function maddenDiagFlattenObject7J10BYDB(obj, prefix = '', out = {}, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 5) return out;
+  if (Array.isArray(obj)) {
+    obj.slice(0, 3).forEach((item, index) => maddenDiagFlattenObject7J10BYDB(item, `${prefix}[${index}]`, out, depth + 1));
+    return out;
+  }
+  for (const [key, value] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (value && typeof value === 'object') {
+      maddenDiagFlattenObject7J10BYDB(value, path, out, depth + 1);
+    } else {
+      out[path] = value;
+    }
+  }
+  return out;
+}
+
+function maddenDiagMatchFieldGroups7J10BYDB(flat = {}) {
+  const matches = {};
+  const paths = Object.keys(flat || {});
+  for (const [group, aliases] of Object.entries(MADDEN_DIAGNOSTIC_FIELD_GROUPS_7J10BYDB)) {
+    matches[group] = [];
+    for (const path of paths) {
+      const normalizedPath = maddenDiagNormalizeKey7J10BYDB(path.split('.').pop() || path);
+      const fullNormalizedPath = maddenDiagNormalizeKey7J10BYDB(path);
+      if (aliases.some(alias => normalizedPath === maddenDiagNormalizeKey7J10BYDB(alias) || fullNormalizedPath.endsWith(maddenDiagNormalizeKey7J10BYDB(alias)))) {
+        matches[group].push({ path, value: flat[path] });
+      }
+    }
+  }
+  return matches;
+}
+
+function maddenDiagFormatMatches7J10BYDB(matches = {}, limitPerGroup = 12) {
+  const lines = [];
+  for (const [group, rows] of Object.entries(matches)) {
+    const icon = rows.length ? '✅' : '❌';
+    const examples = rows.slice(0, limitPerGroup).map(r => `\`${r.path}\``).join(', ');
+    lines.push(`**${group}** ${icon} ${rows.length ? examples : 'No matching fields found'}`);
+  }
+  return lines.join('\n').slice(0, 3900) || 'No raw fields found.';
+}
+
+async function maddenDiagGetImportedPlayerSamples7J10BYDB(guildId, leagueId, limit = 75) {
+  const result = await pool.query(
+    `SELECT player_name, team_name, position, overall, raw_payload
+     FROM madden_imported_players
+     WHERE guild_id = $1::text AND league_id::text = $2::text
+     ORDER BY imported_at DESC
+     LIMIT $3`,
+    [guildId, String(leagueId), limit]
+  );
+  return result.rows || [];
+}
+
+async function buildMaddenAttributeDiagnosticsEmbed7J10BYDB(guildId, league) {
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM madden_imported_players WHERE guild_id = $1::text AND league_id::text = $2::text`,
+    [guildId, String(league.league_id)]
+  );
+  const samples = await maddenDiagGetImportedPlayerSamples7J10BYDB(guildId, league.league_id, 150);
+  const combinedMatches = {};
+  for (const group of Object.keys(MADDEN_DIAGNOSTIC_FIELD_GROUPS_7J10BYDB)) combinedMatches[group] = [];
+  for (const row of samples) {
+    const flat = maddenDiagFlattenObject7J10BYDB(row.raw_payload || {});
+    const matches = maddenDiagMatchFieldGroups7J10BYDB(flat);
+    for (const [group, rows] of Object.entries(matches)) {
+      for (const item of rows) {
+        if (!combinedMatches[group].some(existing => existing.path === item.path)) combinedMatches[group].push(item);
+      }
+    }
+  }
+  const attrCount = await pool.query(`SELECT COUNT(*)::int AS count FROM madden_player_attributes WHERE guild_id = $1::text AND league_id = $2::text`, [guildId, String(league.league_id)]).catch(() => ({ rows: [{ count: 0 }] }));
+  const progCount = await pool.query(`SELECT COUNT(*)::int AS count FROM madden_player_progression WHERE guild_id = $1::text AND league_id = $2::text`, [guildId, String(league.league_id)]).catch(() => ({ rows: [{ count: 0 }] }));
+  const capCount = await pool.query(`SELECT COUNT(*)::int AS count FROM madden_team_cap WHERE guild_id = $1::text AND league_id = $2::text`, [guildId, String(league.league_id)]).catch(() => ({ rows: [{ count: 0 }] }));
+  const hasAnyExpanded = ['athletic','qb','skill','line','defense','contract'].some(group => combinedMatches[group]?.length);
+  return new EmbedBuilder()
+    .setTitle(`🧪 Attribute Diagnostics • ${league.league_name}`)
+    .setColor(hasAnyExpanded ? 0x57F287 : 0xFEE75C)
+    .setDescription(hasAnyExpanded ? 'Expanded fields were found in sampled raw payloads. If BY-D views are still empty, the extraction hook needs mapping fixes.' : 'No expanded attribute/cap fields were found in sampled player raw payloads. We may need a different EA endpoint/export source.')
+    .addFields(
+      { name: 'Imported Player Rows', value: String(countResult.rows[0]?.count || 0), inline: true },
+      { name: 'Sampled Raw Payloads', value: String(samples.length), inline: true },
+      { name: 'BY-D Table Counts', value: `Attributes: **${attrCount.rows[0]?.count || 0}**\nProgression: **${progCount.rows[0]?.count || 0}**\nCap: **${capCount.rows[0]?.count || 0}**`, inline: true },
+      { name: 'Detected Field Coverage', value: maddenSafeEmbedText(maddenDiagFormatMatches7J10BYDB(combinedMatches, 10), 3900), inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DB Attribute Diagnostics' })
+    .setTimestamp();
+}
+
+async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, playerInput) {
+  const result = await pool.query(
+    `SELECT * FROM madden_imported_players
+     WHERE guild_id = $1::text AND league_id::text = $2::text
+       AND (LOWER(player_name) = LOWER($3) OR LOWER(player_name) LIKE LOWER($4) OR external_player_id = $3)
+     ORDER BY CASE WHEN LOWER(player_name) = LOWER($3) THEN 0 ELSE 1 END, overall DESC NULLS LAST
+     LIMIT 1`,
+    [guildId, String(league.league_id), String(playerInput || ''), `%${String(playerInput || '')}%`]
+  );
+  const row = result.rows[0];
+  if (!row) {
+    return new EmbedBuilder().setTitle(`🧪 Player Diagnostics • ${league.league_name}`).setColor(0xED4245).setDescription(`No imported player found for **${playerInput}**.`).setFooter({ text: 'GG Sports • 7J-10BY-DB Player Diagnostics' }).setTimestamp();
+  }
+  const flat = maddenDiagFlattenObject7J10BYDB(row.raw_payload || {});
+  const matches = maddenDiagMatchFieldGroups7J10BYDB(flat);
+  const keys = Object.keys(flat).sort();
+  const rawLines = keys.slice(0, 80).map(key => `\`${key}\`: ${String(flat[key]).slice(0, 60)}`);
+  return new EmbedBuilder()
+    .setTitle(`🧪 ${row.player_name} • Raw Player Diagnostics`)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Imported Core Fields', value: [`Team: **${row.team_name || 'Unknown'}**`, `Position: **${row.position || 'N/A'}**`, `OVR: **${row.overall ?? 'N/A'}**`, `External ID: **${row.external_player_id || 'N/A'}**`].join('\n'), inline: false },
+      { name: 'Detected Attribute/Cap Matches', value: maddenSafeEmbedText(maddenDiagFormatMatches7J10BYDB(matches, 8), 2500), inline: false },
+      { name: `Raw Payload Keys (${keys.length})`, value: maddenSafeEmbedText(rawLines.join('\n') || 'No raw payload keys saved for this player.', 1500), inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DB Player Diagnostics' })
+    .setTimestamp();
+}
+
+async function buildMaddenSchemaDiagnosticsEmbed7J10BYDB(guildId, league) {
+  const payloads = await pool.query(
+    `SELECT endpoint, payload_type, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text AND league_id::text = $2::text
+     ORDER BY created_at DESC
+     LIMIT 8`,
+    [guildId, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const playerSamples = await maddenDiagGetImportedPlayerSamples7J10BYDB(guildId, league.league_id, 25);
+  const playerKeys = new Set();
+  for (const row of playerSamples) {
+    Object.keys(maddenDiagFlattenObject7J10BYDB(row.raw_payload || {})).forEach(k => playerKeys.add(k));
+  }
+  const payloadLines = (payloads.rows || []).map(row => {
+    const flat = maddenDiagFlattenObject7J10BYDB(row.raw_payload || {});
+    const keys = Object.keys(flat).slice(0, 12).map(k => `\`${k}\``).join(', ');
+    return `**${row.payload_type || 'payload'}** • ${row.endpoint || 'unknown endpoint'}\n${keys || 'No scalar keys found'}`;
+  });
+  return new EmbedBuilder()
+    .setTitle(`🧬 EA Payload Schema Diagnostics • ${league.league_name}`)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Recent Sync Payloads', value: maddenSafeEmbedText(payloadLines.join('\n\n') || 'No saved sync payload rows found.', 2000), inline: false },
+      { name: `Imported Player Raw Schema (${playerKeys.size} keys)`, value: maddenSafeEmbedText([...playerKeys].sort().slice(0, 90).map(k => `\`${k}\``).join(', ') || 'No player raw payload keys found.', 1900), inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DB Schema Diagnostics' })
+    .setTimestamp();
+}
+
+
 client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isAutocomplete()) {
@@ -4104,7 +4288,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
-        if (['maddencap', 'maddenplayer', 'maddenteam'].includes(commandName)) {
+        if (['maddencap', 'maddenplayer', 'maddenteam', 'maddendiagnostics'].includes(commandName)) {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
@@ -6994,6 +7178,34 @@ if (gameSubcommand === 'report') {
     
     
     
+
+
+    if (interaction.commandName === 'maddendiagnostics') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
+      const sub = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found.' });
+        return;
+      }
+      if (sub === 'attributes') {
+        await interaction.editReply({ embeds: [await buildMaddenAttributeDiagnosticsEmbed7J10BYDB(interaction.guild.id, activeLeague)] });
+        return;
+      }
+      if (sub === 'player') {
+        const playerName = interaction.options.getString('player');
+        await interaction.editReply({ embeds: [await buildMaddenPlayerDiagnosticsEmbed7J10BYDB(interaction.guild.id, activeLeague, playerName)] });
+        return;
+      }
+      if (sub === 'schema') {
+        await interaction.editReply({ embeds: [await buildMaddenSchemaDiagnosticsEmbed7J10BYDB(interaction.guild.id, activeLeague)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown diagnostics view.' });
+      return;
+    }
 
     if (interaction.commandName === 'maddendebug') {
       if (!interaction.guild) return;
