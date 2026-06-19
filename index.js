@@ -1695,13 +1695,26 @@ function buildCommands() {
             { name: 'Ratings', value: 'ratings' },
             { name: 'Injuries', value: 'injury' },
             { name: 'Transactions', value: 'transaction' },
-            { name: 'Position Changes', value: 'position' }
+            { name: 'Position Changes', value: 'position' },
+            { name: 'Offseason', value: 'offseason' },
+            { name: 'Salary Cap', value: 'cap' },
+            { name: 'Contracts', value: 'contracts' },
+            { name: 'League History', value: 'history' }
           )))
       .addSubcommand(sc => sc
         .setName('week')
         .setDescription('Show a Madden weekly news recap')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('week').setDescription('Week label, for example Week 8').setRequired(true))),
+        .addStringOption(o => o.setName('week').setDescription('Week label, for example Week 8').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('offseason')
+        .setDescription('Show the offseason news and year-end summary')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('generate')
+        .setDescription('Staff: generate missing offseason news and post year-end history report')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('confirm').setDescription('Actually post to news/history channels? Leave false for preview.').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('maddenchanges')
@@ -2434,6 +2447,8 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
        DO UPDATE SET status = 'finalized', summary = EXCLUDED.summary, created_by = EXCLUDED.created_by, created_at = NOW()`,
       [randomUUID(), guild.id, String(league.league_id), JSON.stringify({ awards, champion: championName, runner_up: runnerUpName, cap_violations: capViolations }), userId || null]
     ).catch(() => null);
+    await generateMaddenOffseasonNewsEvents(guild, league, userId).catch(error => console.warn('[7J-10BY-DH] offseason news generation failed:', error?.message || error));
+    await postMaddenLeagueHistoryYearEndReport(guild, league, userId).catch(error => console.warn('[7J-10BY-DH] league history year-end post failed:', error?.message || error));
     await recordMaddenNewsEvent(guild, league, {
       event_type: 'year_end_finalized',
       team_name: championName || null,
@@ -8097,6 +8112,29 @@ if (gameSubcommand === 'report') {
       if (subcommand === 'week') {
         const week = interaction.options.getString('week');
         await interaction.editReply({ embeds: [await buildMaddenNewsRecentEmbed(interaction.guild.id, activeLeague, null, week)] });
+        return;
+      }
+      if (subcommand === 'offseason') {
+        await interaction.editReply({ embeds: [await buildMaddenOffseasonNewsSummaryEmbed(interaction.guild, activeLeague)] });
+        return;
+      }
+      if (subcommand === 'generate') {
+        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
+        if (confirm && !(await memberHasStaff(interaction.member, activeLeague))) {
+          await interaction.editReply({ content: 'You do not have permission to generate offseason news/history posts.' });
+          return;
+        }
+        const embed = await buildMaddenOffseasonNewsSummaryEmbed(interaction.guild, activeLeague);
+        if (!confirm) {
+          embed.addFields({ name: 'Preview Only', value: 'Run `/maddennews generate confirm:true` to post missing offseason news and the league history report.', inline: false });
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+        const newsResult = await generateMaddenOffseasonNewsEvents(interaction.guild, activeLeague, interaction.user.id);
+        const historyResult = await postMaddenLeagueHistoryYearEndReport(interaction.guild, activeLeague, interaction.user.id);
+        embed.addFields({ name: 'Generated', value: `News events checked/created: **${newsResult.created}**
+History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}>` : historyResult.reason || 'not posted'}**`, inline: false });
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden news command.' });
@@ -26666,6 +26704,14 @@ function maddenNewsEventTitle(eventType) {
   if (key === 'attribute_change') return '📈 Player Development';
   if (key === 'transaction') return '✂️ Transaction';
   if (key === 'game_threads_created') return '🏈 Game Threads Created';
+  if (key === 'year_end_finalized') return '🏆 Season Year-End Finalized';
+  if (key === 'champion_finalized') return '🏆 Super Bowl Champion';
+  if (key === 'runner_up_finalized') return '🥈 Super Bowl Runner-Up';
+  if (key === 'award_finalized') return '🏅 Season Award Winner';
+  if (key === 'draft_order_locked') return '🧾 Draft Order Locked';
+  if (key === 'cap_violation') return '🚨 Salary Cap Alert';
+  if (key === 'top_expiring_contracts') return '📄 Top Expiring Contracts';
+  if (key === 'league_history_posted') return '📚 League History Updated';
   return '📰 Madden News';
 }
 
@@ -26678,6 +26724,10 @@ function maddenNewsCategoryForEventType(eventType) {
   if (key.includes('transaction')) return 'transaction';
   if (key.includes('position')) return 'position';
   if (key.includes('game_thread')) return 'games';
+  if (key.includes('champion') || key.includes('runner_up') || key.includes('award') || key.includes('year_end') || key.includes('draft_order')) return 'offseason';
+  if (key.includes('cap')) return 'cap';
+  if (key.includes('expiring')) return 'contracts';
+  if (key.includes('history')) return 'history';
   return 'general';
 }
 
@@ -26686,7 +26736,7 @@ function buildMaddenNewsEventEmbed(league, event) {
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-BA Madden News + Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DH Madden News + Offseason History' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
   const playerLine = event.player_name ? `**${event.player_name}**${event.team_name ? ` • ${maddenTeamDisplayName(event.team_name)}` : ''}` : (event.team_name ? `**${maddenTeamDisplayName(event.team_name)}**` : league?.league_name || 'Madden League');
@@ -26777,7 +26827,7 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-BA Madden News + Game Threads' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DH Madden News + Offseason History' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved Madden news events found yet. New trade block activity, committee submissions, approved trades, and future sync changes will appear here.');
@@ -26787,6 +26837,200 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   if (category) embed.addFields({ name: 'Category', value: category, inline: true });
   if (week) embed.addFields({ name: 'Week', value: week, inline: true });
   return embed;
+}
+
+
+async function recordMaddenNewsEventOnce(guild, league, event, dhKey) {
+  if (!guild || !league?.league_id) return null;
+  await ensureMaddenNewsTables();
+  const key = String(dhKey || event?.metadata?.dh_key || `${event.event_type}:${event.player_name || ''}:${event.team_name || ''}:${event.week_label || ''}`).slice(0, 200);
+  const existing = await pool.query(
+    `SELECT * FROM madden_news_events
+     WHERE guild_id = $1 AND league_id = $2 AND event_type = $3 AND metadata->>'dh_key' = $4
+     ORDER BY created_at DESC LIMIT 1`,
+    [guild.id, String(league.league_id), event.event_type, key]
+  ).catch(() => ({ rows: [] }));
+  if (existing.rows?.[0]) return existing.rows[0];
+  return await recordMaddenNewsEvent(guild, league, {
+    ...event,
+    metadata: { ...(event.metadata || {}), dh_key: key },
+  });
+}
+
+async function getMaddenTopCapViolationRows(guildId, leagueId, limit = 8) {
+  const result = await pool.query(
+    `SELECT team_name, cap_space, active_cap, dead_cap, player_count
+     FROM madden_team_cap
+     WHERE guild_id = $1 AND league_id::text = $2::text AND cap_space < 0
+     ORDER BY cap_space ASC
+     LIMIT $3`,
+    [String(guildId), String(leagueId), Math.max(1, Math.min(Number(limit || 8), 20))]
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+async function getMaddenTopCapSpaceRows(guildId, leagueId, limit = 5) {
+  const result = await pool.query(
+    `SELECT team_name, cap_space, active_cap, dead_cap, player_count
+     FROM madden_team_cap
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     ORDER BY cap_space DESC
+     LIMIT $3`,
+    [String(guildId), String(leagueId), Math.max(1, Math.min(Number(limit || 5), 20))]
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+async function getMaddenFinalPowerRankingRows(guildId, leagueId, limit = 10) {
+  const result = await pool.query(
+    `SELECT pr.team_name, pr.rank, pr.power_score, its.wins, its.losses, its.ties, its.points_for, its.points_against
+     FROM madden_power_rankings pr
+     LEFT JOIN madden_imported_team_stats its
+       ON its.league_id::text = pr.league_id::text
+      AND (LOWER(its.team_name) = LOWER(pr.team_name) OR LOWER(its.external_team_id) = LOWER(pr.team_name))
+     WHERE pr.league_id::text = $1::text
+     ORDER BY pr.rank ASC
+     LIMIT $2`,
+    [String(leagueId), Math.max(1, Math.min(Number(limit || 10), 20))]
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
+  await ensureMaddenYearEndTables();
+  await backfillMaddenExpandedPlayerDataForLeague(guild.id, league.league_id).catch(() => null);
+  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(() => null);
+  const [awards, sb, draftRows, expiringRows, violations, capSpace, powerRows] = await Promise.all([
+    getMaddenYearEndAwardWinners(guild.id, league.league_id).catch(() => []),
+    getMaddenSuperBowlResult(guild.id, league.league_id).catch(() => null),
+    getMaddenPlayoffAwareDraftOrderRows(guild.id, league.league_id, 10).catch(() => []),
+    getMaddenExpiringContractRows(guild.id, league.league_id, null, 10).catch(() => []),
+    getMaddenTopCapViolationRows(guild.id, league.league_id, 8).catch(() => []),
+    getMaddenTopCapSpaceRows(guild.id, league.league_id, 5).catch(() => []),
+    getMaddenFinalPowerRankingRows(guild.id, league.league_id, 10).catch(() => []),
+  ]);
+  const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
+  const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
+  const awardLines = awards.length ? awards.map(a => `**${a.award_name}:** ${a.player_name} — ${maddenTeamDisplayName(a.team_name || '')} ${a.position || ''}`).join('\n') : 'No award winners detected yet.';
+  const draftLines = [];
+  for (const [i, row] of draftRows.entries()) draftLines.push(`**${i + 1}.** ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}`);
+  const expiringLines = [];
+  for (const [i, row] of expiringRows.slice(0, 8).entries()) expiringLines.push(`**${i + 1}.** ${row.player_name} — ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
+  const violationLines = [];
+  for (const row of violations) violationLines.push(`🚨 **${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`);
+  const capSpaceLines = [];
+  for (const row of capSpace) capSpaceLines.push(`**${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`);
+  const powerLines = [];
+  for (const row of powerRows.slice(0, 8)) powerLines.push(`**${row.rank}.** ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} — ${Number(row.power_score || 0).toFixed(0)}`);
+  const embed = new EmbedBuilder()
+    .setTitle(`📰 ${league.league_name} • Offseason News Summary`)
+    .setColor(0x3498DB)
+    .addFields(
+      { name: '🏆 Champion / Runner-Up', value: `Champion: **${championName ? maddenTeamDisplayName(championName) : 'Not detected'}**\nRunner-Up: **${runnerUpName ? maddenTeamDisplayName(runnerUpName) : 'Not detected'}**`, inline: false },
+      { name: '🏅 Award Winners', value: maddenSafeEmbedText(awardLines, 1024), inline: false },
+      { name: '🧾 Draft Order Top 10', value: maddenSafeEmbedText(draftLines.join('\n') || 'No draft order detected.', 1024), inline: true },
+      { name: '📄 Top Expiring Contracts', value: maddenSafeEmbedText(expiringLines.join('\n') || 'No expiring contracts detected.', 1024), inline: true },
+      { name: '🚨 Cap Violations', value: maddenSafeEmbedText(violationLines.join('\n') || 'No cap violations detected.', 1024), inline: false },
+      { name: '💰 Most Cap Space', value: maddenSafeEmbedText(capSpaceLines.join('\n') || 'No cap snapshot detected.', 1024), inline: true },
+      { name: '📊 Final Power Top 8', value: maddenSafeEmbedText(powerLines.join('\n') || 'No power rankings found.', 1024), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DH Offseason News Engine' })
+    .setTimestamp();
+  const logo = getMaddenTeamLogoUrl(championName || draftRows[0]?.team_name || expiringRows[0]?.team_name);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
+  const embed = await buildMaddenOffseasonNewsSummaryEmbed(guild, league);
+  embed.setTitle(`📚 ${league.league_name} • Season Year-End Report`);
+  embed.setColor(0xFEE75C);
+  embed.setFooter({ text: 'GG Sports • 7J-10BY-DH League History Year-End Report' });
+  return embed;
+}
+
+async function postMaddenLeagueHistoryYearEndReport(guild, league, userId = null) {
+  if (!guild || !league?.league_id) return { posted: false, reason: 'Missing guild or league.' };
+  const channelId = league.history_channel_id || null;
+  if (!channelId) return { posted: false, reason: 'No league history channel configured.' };
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased?.()) return { posted: false, reason: 'Configured history channel is not available.' };
+  const embed = await buildMaddenLeagueHistoryYearEndEmbed(guild, league);
+  const msg = await channel.send({ embeds: [embed] }).catch(() => null);
+  if (!msg?.id) return { posted: false, reason: 'Failed to send history embed.' };
+  await pool.query(
+    `INSERT INTO madden_year_end_checkpoints (id, guild_id, league_id, season_label, checkpoint_type, status, summary, created_by)
+     VALUES ($1, $2, $3, 'Current', 'league_history_post', 'posted', $4::jsonb, $5)
+     ON CONFLICT (guild_id, league_id, season_label, checkpoint_type)
+     DO UPDATE SET status = 'posted', summary = EXCLUDED.summary, created_by = EXCLUDED.created_by, created_at = NOW()`,
+    [randomUUID(), guild.id, String(league.league_id), JSON.stringify({ channel_id: channel.id, message_id: msg.id }), userId || null]
+  ).catch(() => null);
+  await recordMaddenNewsEventOnce(guild, league, {
+    event_type: 'league_history_posted',
+    team_name: null,
+    metadata: { summary: `Season year-end report posted in <#${channel.id}>.`, history_channel_id: channel.id, history_message_id: msg.id },
+  }, 'league_history_posted_current');
+  return { posted: true, channelId: channel.id, messageId: msg.id };
+}
+
+async function generateMaddenOffseasonNewsEvents(guild, league, userId = null) {
+  await ensureMaddenYearEndTables();
+  await backfillMaddenExpandedPlayerDataForLeague(guild.id, league.league_id).catch(() => null);
+  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(() => null);
+  const [awards, sb, draftRows, expiringRows, violations, capSpace] = await Promise.all([
+    getMaddenYearEndAwardWinners(guild.id, league.league_id).catch(() => []),
+    getMaddenSuperBowlResult(guild.id, league.league_id).catch(() => null),
+    getMaddenPlayoffAwareDraftOrderRows(guild.id, league.league_id, 10).catch(() => []),
+    getMaddenExpiringContractRows(guild.id, league.league_id, null, 10).catch(() => []),
+    getMaddenTopCapViolationRows(guild.id, league.league_id, 8).catch(() => []),
+    getMaddenTopCapSpaceRows(guild.id, league.league_id, 5).catch(() => []),
+  ]);
+  let created = 0;
+  const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
+  const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
+  const baseMeta = { generated_by: userId || null, generated_from: '7J-10BY-DH' };
+  if (championName) {
+    const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'champion_finalized', team_name: championName, metadata: { ...baseMeta, summary: `${maddenTeamDisplayName(championName)} finished the season as Super Bowl champions.` } }, 'champion_finalized_current');
+    if (row) created++;
+  }
+  if (runnerUpName) {
+    const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'runner_up_finalized', team_name: runnerUpName, metadata: { ...baseMeta, summary: `${maddenTeamDisplayName(runnerUpName)} finished as Super Bowl runner-up.` } }, 'runner_up_current');
+    if (row) created++;
+  }
+  for (const award of awards) {
+    const row = await recordMaddenNewsEventOnce(guild, league, {
+      event_type: 'award_finalized',
+      player_id: award.player_key || null,
+      player_name: award.player_name,
+      team_name: award.team_name || null,
+      metadata: { ...baseMeta, award_key: award.award_key, award_name: award.award_name, position: award.position, summary: `${award.award_name}: ${award.player_name}${award.team_name ? ` — ${maddenTeamDisplayName(award.team_name)}` : ''}. ${award.stat_line || ''}`.trim() },
+    }, `award_${award.award_key}_current`);
+    if (row) created++;
+  }
+  if (draftRows.length) {
+    const topFive = [];
+    for (const [i, row] of draftRows.slice(0, 5).entries()) topFive.push(`${i + 1}. ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}`);
+    const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'draft_order_locked', metadata: { ...baseMeta, summary: `Offseason draft order is ready. Top 5:\n${topFive.join('\n')}` } }, 'draft_order_locked_current');
+    if (row) created++;
+  }
+  if (expiringRows.length) {
+    const top = [];
+    for (const [i, row] of expiringRows.slice(0, 5).entries()) top.push(`${i + 1}. ${row.player_name} — ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} ${row.position || ''} ${row.overall || 'N/A'} OVR`);
+    const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'top_expiring_contracts', metadata: { ...baseMeta, summary: `Top expiring contracts entering the offseason:\n${top.join('\n')}` } }, 'top_expiring_contracts_current');
+    if (row) created++;
+  }
+  for (const violation of violations) {
+    const display = await maddenResolvedTeamDisplayName(guild.id, league.league_id, violation.team_name);
+    const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'cap_violation', team_name: violation.team_name, metadata: { ...baseMeta, summary: `${display} is over the cap by ${formatMaddenMoney(Math.abs(Number(violation.cap_space || 0)))}.`, cap_space: Number(violation.cap_space || 0) } }, `cap_violation_${String(violation.team_name).toLowerCase()}_current`);
+    if (row) created++;
+  }
+  if (capSpace.length) {
+    const top = [];
+    for (const [i, row] of capSpace.slice(0, 5).entries()) top.push(`${i + 1}. ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} — ${formatMaddenMoney(row.cap_space)}`);
+    const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'year_end_finalized', team_name: championName || null, metadata: { ...baseMeta, summary: `Year-end offseason data generated. Most cap space:\n${top.join('\n')}` } }, 'year_end_offseason_news_current');
+    if (row) created++;
+  }
+  return { created, awards: awards.length, capViolations: violations.length, expiring: expiringRows.length, champion: championName, runnerUp: runnerUpName };
 }
 
 async function buildMaddenNewsFeedEmbed(guildId, league) {
