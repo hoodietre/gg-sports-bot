@@ -1718,7 +1718,11 @@ function buildCommands() {
         .addStringOption(o => o.setName('week').setDescription('Week label, for example Week 8').setRequired(true)))
       .addSubcommand(sc => sc
         .setName('offseason')
-        .setDescription('Show the offseason news and year-end summary')
+        .setDescription('Show the clean offseason champion and awards summary')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('outlook')
+        .setDescription('Show offseason admin outlook: cap, draft order, expiring contracts, and power rankings')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
       .addSubcommand(sc => sc
         .setName('generate')
@@ -2404,14 +2408,14 @@ async function findMaddenOwnerForTeamName(guildId, leagueId, teamName) {
 
 
 
-// 7J-10BY-DI: league-history polish and offseason news cleanup helpers.
+// 7J-10BY-DJ: league-history polish and offseason news cleanup helpers.
 function isMaddenFreeAgentTeamName(teamName) {
   const clean = String(teamName || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
   return !clean || ['fa', 'freeagent', 'freeagents', 'freeagency', 'none', 'null'].includes(clean);
 }
 
 function maddenOwnerDisplay(ownerUserId) {
-  return ownerUserId ? `<@${ownerUserId}>` : 'CPU / Unassigned';
+  return ownerUserId ? `<@${ownerUserId}>` : 'CPU';
 }
 
 function maddenFormatPositionOverall(position, overall) {
@@ -2557,8 +2561,8 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
        DO UPDATE SET status = 'finalized', summary = EXCLUDED.summary, created_by = EXCLUDED.created_by, created_at = NOW()`,
       [randomUUID(), guild.id, String(league.league_id), JSON.stringify({ awards, champion: championName, runner_up: runnerUpName, cap_violations: capViolations }), userId || null]
     ).catch(() => null);
-    await generateMaddenOffseasonNewsEvents(guild, league, userId).catch(error => console.warn('[7J-10BY-DI] offseason news generation failed:', error?.message || error));
-    await postMaddenLeagueHistoryYearEndReport(guild, league, userId).catch(error => console.warn('[7J-10BY-DI] league history year-end post failed:', error?.message || error));
+    await generateMaddenOffseasonNewsEvents(guild, league, userId).catch(error => console.warn('[7J-10BY-DJ] offseason news generation failed:', error?.message || error));
+    await postMaddenLeagueHistoryYearEndReport(guild, league, userId).catch(error => console.warn('[7J-10BY-DJ] league history year-end post failed:', error?.message || error));
     await recordMaddenNewsEvent(guild, league, {
       event_type: 'year_end_finalized',
       team_name: championName || null,
@@ -8228,6 +8232,10 @@ if (gameSubcommand === 'report') {
         await interaction.editReply({ embeds: [await buildMaddenOffseasonNewsSummaryEmbed(interaction.guild, activeLeague)] });
         return;
       }
+      if (subcommand === 'outlook') {
+        await interaction.editReply({ embeds: [await buildMaddenOffseasonOutlookEmbed(interaction.guild, activeLeague)] });
+        return;
+      }
       if (subcommand === 'generate') {
         const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
         if (confirm && !(await memberHasStaff(interaction.member, activeLeague))) {
@@ -8423,7 +8431,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
           .setColor(0xFEE75C)
           .setDescription(mvp?.player_name && mvp.player_name !== 'Not detected' ? `**${mvp.player_name}** — ${maddenTeamDisplayName(mvp.team_name)}
 ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP candidate detected yet.')
-          .setFooter({ text: 'GG Sports • 7J-10BY-DI Super Bowl MVP' })
+          .setFooter({ text: 'GG Sports • 7J-10BY-DJ Super Bowl MVP' })
           .setTimestamp();
         const logo = getMaddenTeamLogoUrl(mvp?.team_name);
         if (logo) embed.setThumbnail(logo);
@@ -18256,7 +18264,7 @@ function formatMaddenMatchupLeader(row, statLabel = 'Yards', fallback = 'No data
   if (!row) return fallback;
   const team = getMaddenTeamAbbrev(row.resolved_team_name || row.stat_team_name || row.team_name);
   const position = row.position ? String(row.position).toUpperCase() : '';
-  const meta = [team, position].filter(Boolean).join(' ');
+  const meta = [team, position].filter(Boolean).join('\n');
   const value = row.leader_value != null ? formatMaddenLeaderNumber(row.leader_value) + ' ' + statLabel : 'No stat';
   return `**${row.player_name || 'Unknown'}**${meta ? ` (${meta})` : ''}\n${value}`;
 }
@@ -25191,7 +25199,7 @@ function buildMaddenAwardsRaceEmbed(league, awardKey, rows) {
     ? rows.map((player, index) => {
         const medal = getMaddenRankMedal(index);
         const team = getMaddenTeamAbbrev(player.team_name);
-        const label = [team, String(player.position || '').toUpperCase()].filter(Boolean).join(' ');
+        const label = [team, String(player.position || '').toUpperCase()].filter(Boolean).join('\n');
         const rookieText = race.type.endsWith('_rookie') ? ' | Rookie' : '';
         return `${medal} **${player.player_name}**${label ? `
 ${label}` : ''}
@@ -25651,7 +25659,7 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
       }
       const mentionIds = [owners.away?.id, owners.home?.id].filter(Boolean);
       await thread.send({
-        content: mentionIds.length ? `${mentionIds.map(id => `<@${id}>`).join(' ')} your **${game.week_label || weekLabel}** game thread is ready: **${label}**.` : `Game thread created for **${label}**.`,
+        content: mentionIds.length ? `${mentionIds.map(id => `<@${id}>`).join('\n')} your **${game.week_label || weekLabel}** game thread is ready: **${label}**.` : `Game thread created for **${label}**.`,
         embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
         components: [buildMaddenGameThreadButtons(game.id)],
         allowedMentions: { users: mentionIds, roles: [] },
@@ -26253,7 +26261,7 @@ function maddenBydAttributeLabel(key) {
   return String(key || '')
     .split('_')
     .map(part => part ? part[0].toUpperCase() + part.slice(1) : part)
-    .join(' ')
+    .join('\n')
     .replace('Qb', 'QB')
     .replace('Ovr', 'OVR');
 }
@@ -26597,17 +26605,15 @@ async function buildMaddenTeamCapEmbed(guildId, league, teamInput) {
 
 async function buildMaddenLeagueCapEmbed(guildId, league) {
   await ensureMaddenFranchiseDataTables();
-  const result = await pool.query(
-    `SELECT * FROM madden_team_cap
-     WHERE guild_id = $1 AND league_id = $2
-       AND LOWER(COALESCE(team_name, '')) NOT IN ('fa', 'free agent', 'free agents', 'freeagents')
-     ORDER BY cap_space DESC, team_name ASC`,
-    [String(guildId), String(league.league_id)]
-  );
+  const rawRows = typeof getMaddenCleanCapRows === 'function'
+    ? await getMaddenCleanCapRows(guildId, league.league_id)
+    : [];
   const rows = [];
-  for (const row of result.rows || []) {
+  for (const row of rawRows || []) {
     const ctx = await getMaddenBydeTeamContext(guildId, league.league_id, row.team_name);
-    rows.push({ ...row, display_team_name: ctx.displayName || maddenTeamDisplayName(row.team_name), resolved_team_name: ctx.teamName });
+    const display = ctx.displayName || maddenTeamDisplayName(row.team_name);
+    if (isMaddenFreeAgentTeamName(row.team_name) || isMaddenFreeAgentTeamName(display)) continue;
+    rows.push({ ...row, display_team_name: display, resolved_team_name: ctx.teamName });
   }
   const embed = new EmbedBuilder()
     .setTitle(`💰 ${league.league_name} • League Cap Snapshot`)
@@ -26874,7 +26880,7 @@ function buildMaddenNewsEventEmbed(league, event) {
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DI Madden News + Offseason History' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Madden News + Offseason History' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
   const displayTeamForEvent = meta.display_team_name || (event.team_name ? maddenTeamDisplayName(event.team_name) : '');
@@ -26890,7 +26896,7 @@ function buildMaddenNewsEventEmbed(league, event) {
     if (meta.value_score) infoParts.push(`Value ${Number(meta.value_score || 0).toFixed(0)}`);
     if (infoParts.length) fields.push({ name: 'Player Info', value: infoParts.join(' • '), inline: false });
   }
-  if (meta.owner_user_id || meta.owner_label) fields.push({ name: 'Owner', value: meta.owner_user_id ? `<@${meta.owner_user_id}>` : String(meta.owner_label || 'CPU / Unassigned'), inline: true });
+  if (meta.owner_user_id || meta.owner_label) fields.push({ name: 'Owner', value: meta.owner_user_id ? `<@${meta.owner_user_id}>` : String(meta.owner_label || 'CPU'), inline: true });
   if (meta.seeking) fields.push({ name: 'Seeking', value: String(meta.seeking).slice(0, 1024), inline: false });
   if (meta.notes) fields.push({ name: 'Notes', value: String(meta.notes).slice(0, 1024), inline: false });
   if (meta.summary) fields.push({ name: 'Summary', value: String(meta.summary).slice(0, 1024), inline: false });
@@ -26971,7 +26977,7 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DI Madden News + Offseason History' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Madden News + Offseason History' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved Madden news events found yet. New trade block activity, committee submissions, approved trades, and future sync changes will appear here.');
@@ -26995,6 +27001,16 @@ async function recordMaddenNewsEventOnce(guild, league, event, dhKey) {
     [guild.id, String(league.league_id), event.event_type, key]
   ).catch(() => ({ rows: [] }));
   if (existing.rows?.[0]) return existing.rows[0];
+  const strictOnceTypes = new Set(['year_end_finalized', 'champion_finalized', 'runner_up_finalized', 'draft_order_locked', 'top_expiring_contracts', 'league_history_posted']);
+  if (strictOnceTypes.has(String(event.event_type || '').toLowerCase())) {
+    const previous = await pool.query(
+      `SELECT * FROM madden_news_events
+       WHERE guild_id = $1 AND league_id = $2 AND event_type = $3
+       ORDER BY created_at DESC LIMIT 1`,
+      [guild.id, String(league.league_id), event.event_type]
+    ).catch(() => ({ rows: [] }));
+    if (previous.rows?.[0]) return previous.rows[0];
+  }
   return await recordMaddenNewsEvent(guild, league, {
     ...event,
     metadata: { ...(event.metadata || {}), dh_key: key },
@@ -27015,6 +27031,7 @@ async function getMaddenTopCapViolationRows(guildId, leagueId, limit = 8) {
 }
 
 async function getMaddenTopCapSpaceRows(guildId, leagueId, limit = 5) {
+  if (typeof getMaddenCleanTopCapSpaceRows === 'function') return await getMaddenCleanTopCapSpaceRows(guildId, leagueId, limit);
   const result = await pool.query(
     `SELECT team_name, cap_space, active_cap, dead_cap, player_count
      FROM madden_team_cap
@@ -27024,7 +27041,91 @@ async function getMaddenTopCapSpaceRows(guildId, leagueId, limit = 5) {
      LIMIT $3`,
     [String(guildId), String(leagueId), Math.max(1, Math.min(Number(limit || 5), 20))]
   ).catch(() => ({ rows: [] }));
-  return result.rows || [];
+  return (result.rows || []).filter(isMaddenRealTeamCapRow);
+}
+
+
+function isMaddenRealTeamCapRow(row) {
+  const raw = String(row?.team_name || '').trim();
+  if (isMaddenFreeAgentTeamName(raw)) return false;
+  const display = maddenTeamDisplayName(raw);
+  if (isMaddenFreeAgentTeamName(display)) return false;
+  return true;
+}
+
+async function getMaddenCleanTopCapSpaceRows(guildId, leagueId, limit = 5) {
+  const result = await pool.query(
+    `SELECT team_name, cap_space, active_cap, dead_cap, player_count
+     FROM madden_team_cap
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     ORDER BY cap_space DESC
+     LIMIT 40`,
+    [String(guildId), String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  const clean = [];
+  for (const row of result.rows || []) {
+    const resolved = await resolveMaddenTeamNameFromImport(guildId, leagueId, row.team_name).catch(() => row.team_name);
+    const candidate = { ...row, team_name: resolved };
+    if (!isMaddenRealTeamCapRow(candidate)) continue;
+    clean.push(candidate);
+    if (clean.length >= Math.max(1, Math.min(Number(limit || 5), 20))) break;
+  }
+  return clean;
+}
+
+async function getMaddenCleanCapRows(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT * FROM madden_team_cap
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     ORDER BY cap_space DESC, team_name ASC`,
+    [String(guildId), String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  const rows = [];
+  for (const row of result.rows || []) {
+    const resolved = await resolveMaddenTeamNameFromImport(guildId, leagueId, row.team_name).catch(() => row.team_name);
+    const candidate = { ...row, team_name: resolved };
+    if (!isMaddenRealTeamCapRow(candidate)) continue;
+    rows.push(candidate);
+  }
+  return rows;
+}
+
+async function buildMaddenOffseasonOutlookEmbed(guild, league) {
+  await ensureMaddenYearEndTables();
+  await backfillMaddenExpandedPlayerDataForLeague(guild.id, league.league_id).catch(() => null);
+  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(() => null);
+  const [draftRows, expiringRows, violations, capSpace, powerRows] = await Promise.all([
+    getMaddenPlayoffAwareDraftOrderRows(guild.id, league.league_id, 10).catch(() => []),
+    getMaddenExpiringContractRows(guild.id, league.league_id, null, 10).catch(() => []),
+    getMaddenTopCapViolationRows(guild.id, league.league_id, 8).catch(() => []),
+    getMaddenCleanTopCapSpaceRows(guild.id, league.league_id, 5).catch(() => []),
+    getMaddenFinalPowerRankingRows(guild.id, league.league_id, 10).catch(() => []),
+  ]);
+  const draftLines = [];
+  for (const [i, row] of draftRows.entries()) draftLines.push(`**${i + 1}.** ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}`);
+  const expiringLines = [];
+  for (const [i, row] of expiringRows.slice(0, 8).entries()) expiringLines.push(`**${i + 1}.** ${row.player_name} — ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} • ${row.position || 'POS'}${Number(row.overall || 0) > 0 ? ` • ${Math.round(Number(row.overall))} OVR` : ''}`);
+  const violationLines = [];
+  for (const row of violations) violationLines.push(`🚨 **${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`);
+  const capSpaceLines = [];
+  for (const row of capSpace) capSpaceLines.push(`**${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`);
+  const powerLines = [];
+  for (const row of powerRows.slice(0, 8)) powerLines.push(`**${row.rank}.** ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} — ${Number(row.power_score || 0).toFixed(0)}`);
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 ${league.league_name} • Offseason Outlook`)
+    .setColor(0x3498DB)
+    .addFields(
+      { name: '🧾 Draft Order Top 10', value: maddenSafeEmbedText(draftLines.join('\n') || 'No draft order detected.', 1024), inline: true },
+      { name: '📄 Top Expiring Contracts', value: maddenSafeEmbedText(expiringLines.join('\n') || 'No expiring contracts detected.', 1024), inline: true },
+      { name: '🚨 Cap Violations', value: maddenSafeEmbedText(violationLines.join('\n') || 'No cap violations detected.', 1024), inline: false },
+      { name: '💰 Most Cap Space', value: maddenSafeEmbedText(capSpaceLines.join('\n') || 'No cap snapshot detected.', 1024), inline: true },
+      { name: '📊 Final Power Top 8', value: maddenSafeEmbedText(powerLines.join('\n') || 'No power rankings found.', 1024), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Offseason Outlook' })
+    .setTimestamp();
+  const logo = getMaddenTeamLogoUrl(draftRows[0]?.team_name || capSpace[0]?.team_name || powerRows[0]?.team_name);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
 }
 
 async function getMaddenFinalPowerRankingRows(guildId, leagueId, limit = 10) {
@@ -27045,44 +27146,37 @@ async function getMaddenFinalPowerRankingRows(guildId, leagueId, limit = 10) {
 async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
   await ensureMaddenYearEndTables();
   await backfillMaddenExpandedPlayerDataForLeague(guild.id, league.league_id).catch(() => null);
-  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(() => null);
-  const [awards, sb, draftRows, expiringRows, violations, capSpace, powerRows] = await Promise.all([
+  const [awards, sb, bestRecord, sbMvp] = await Promise.all([
     getMaddenYearEndAwardWinners(guild.id, league.league_id).catch(() => []),
     getMaddenSuperBowlResult(guild.id, league.league_id).catch(() => null),
-    getMaddenPlayoffAwareDraftOrderRows(guild.id, league.league_id, 10).catch(() => []),
-    getMaddenExpiringContractRows(guild.id, league.league_id, null, 10).catch(() => []),
-    getMaddenTopCapViolationRows(guild.id, league.league_id, 8).catch(() => []),
-    getMaddenTopCapSpaceRows(guild.id, league.league_id, 5).catch(() => []),
-    getMaddenFinalPowerRankingRows(guild.id, league.league_id, 10).catch(() => []),
+    getMaddenBestRegularSeasonTeam(guild.id, league.league_id).catch(() => null),
+    getMaddenSuperBowlMvpCandidate(guild.id, league.league_id).catch(() => null),
   ]);
   const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
   const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
+  const championOwner = championName ? await findMaddenOwnerForTeamName(guild.id, league.league_id, championName).catch(() => null) : null;
+  const runnerUpOwner = runnerUpName ? await findMaddenOwnerForTeamName(guild.id, league.league_id, runnerUpName).catch(() => null) : null;
   const awardLines = awards.length ? awards.map(formatMaddenCleanAwardLine).join('\n\n') : 'No award winners detected yet.';
-  const draftLines = [];
-  for (const [i, row] of draftRows.entries()) draftLines.push(`**${i + 1}.** ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}`);
-  const expiringLines = [];
-  for (const [i, row] of expiringRows.slice(0, 8).entries()) expiringLines.push(`**${i + 1}.** ${row.player_name} — ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
-  const violationLines = [];
-  for (const row of violations) violationLines.push(`🚨 **${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`);
-  const capSpaceLines = [];
-  for (const row of capSpace) capSpaceLines.push(`**${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}** — ${formatMaddenMoney(row.cap_space)}`);
-  const powerLines = [];
-  for (const row of powerRows.slice(0, 8)) powerLines.push(`**${row.rank}.** ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} — ${Number(row.power_score || 0).toFixed(0)}`);
+  const bestRecordText = bestRecord
+    ? `**${maddenTeamDisplayName(bestRecord.team_name)}** (${Number(bestRecord.wins || 0)}-${Number(bestRecord.losses || 0)}${Number(bestRecord.ties || 0) ? `-${Number(bestRecord.ties || 0)}` : ''})\nOwner: ${maddenOwnerDisplay(bestRecord.owner_user_id)}`
+    : 'Not detected.';
+  const sbMvpText = sbMvp?.player_name && sbMvp.player_name !== 'Not detected'
+    ? `**${sbMvp.player_name}** — ${maddenTeamDisplayName(sbMvp.team_name)}\n${maddenFormatPositionOverall(sbMvp.position, sbMvp.overall)}`
+    : 'Not detected.';
   const embed = new EmbedBuilder()
-    .setTitle(`📰 ${league.league_name} • Offseason News Summary`)
+    .setTitle(`📰 ${league.league_name} • Offseason Season Summary`)
     .setColor(0x3498DB)
     .addFields(
-      { name: '🏆 Champion / Runner-Up', value: `Champion: **${championName ? maddenTeamDisplayName(championName) : 'Not detected'}**\nRunner-Up: **${runnerUpName ? maddenTeamDisplayName(runnerUpName) : 'Not detected'}**`, inline: false },
+      { name: '🏆 Champion', value: championName ? `**${maddenTeamDisplayName(championName)}**\nOwner: ${maddenOwnerDisplay(championOwner)}` : 'Not detected.', inline: true },
+      { name: '🥈 Runner-Up', value: runnerUpName ? `**${maddenTeamDisplayName(runnerUpName)}**\nOwner: ${maddenOwnerDisplay(runnerUpOwner)}` : 'Not detected.', inline: true },
+      { name: '📈 Best Regular Season Record', value: bestRecordText, inline: false },
+      { name: '🏆 Super Bowl MVP', value: sbMvpText, inline: false },
       { name: '🏅 Award Winners', value: maddenSafeEmbedText(awardLines, 1024), inline: false },
-      { name: '🧾 Draft Order Top 10', value: maddenSafeEmbedText(draftLines.join('\n') || 'No draft order detected.', 1024), inline: true },
-      { name: '📄 Top Expiring Contracts', value: maddenSafeEmbedText(expiringLines.join('\n') || 'No expiring contracts detected.', 1024), inline: true },
-      { name: '🚨 Cap Violations', value: maddenSafeEmbedText(violationLines.join('\n') || 'No cap violations detected.', 1024), inline: false },
-      { name: '💰 Most Cap Space', value: maddenSafeEmbedText(capSpaceLines.join('\n') || 'No cap snapshot detected.', 1024), inline: true },
-      { name: '📊 Final Power Top 8', value: maddenSafeEmbedText(powerLines.join('\n') || 'No power rankings found.', 1024), inline: true }
+      { name: 'Need cap/draft/contracts?', value: 'Use `/maddennews outlook` for offseason admin details.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-DI Offseason News Engine' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Offseason Summary' })
     .setTimestamp();
-  const logo = getMaddenTeamLogoUrl(championName || draftRows[0]?.team_name || expiringRows[0]?.team_name);
+  const logo = getMaddenTeamLogoUrl(championName || runnerUpName || bestRecord?.team_name);
   if (logo) embed.setThumbnail(logo);
   return embed;
 }
@@ -27118,7 +27212,7 @@ async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
       { name: 'Award Winners', value: maddenSafeEmbedText(awardText, 1024), inline: false },
       { name: 'Recorded', value: `Season Archive • ${new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}`, inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-DI League History Archive' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DJ League History Archive' })
     .setTimestamp();
   const logo = getMaddenTeamLogoUrl(championName || runnerUpName || bestRecord?.team_name);
   if (logo) embed.setThumbnail(logo);
@@ -27159,12 +27253,12 @@ async function generateMaddenOffseasonNewsEvents(guild, league, userId = null) {
     getMaddenPlayoffAwareDraftOrderRows(guild.id, league.league_id, 10).catch(() => []),
     getMaddenExpiringContractRows(guild.id, league.league_id, null, 10).catch(() => []),
     getMaddenTopCapViolationRows(guild.id, league.league_id, 8).catch(() => []),
-    getMaddenTopCapSpaceRows(guild.id, league.league_id, 5).catch(() => []),
+    getMaddenCleanTopCapSpaceRows(guild.id, league.league_id, 5).catch(() => []),
   ]);
   let created = 0;
   const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
   const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
-  const baseMeta = { generated_by: userId || null, generated_from: '7J-10BY-DI' };
+  const baseMeta = { generated_by: userId || null, generated_from: '7J-10BY-DJ' };
   if (championName) {
     const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'champion_finalized', team_name: championName, metadata: { ...baseMeta, summary: `${maddenTeamDisplayName(championName)} finished the season as Super Bowl champions.` } }, 'champion_finalized_current');
     if (row) created++;
@@ -27186,7 +27280,7 @@ async function generateMaddenOffseasonNewsEvents(guild, league, userId = null) {
         position: award.position,
         overall: award.overall || null,
         owner_user_id: award.owner_user_id || null,
-        owner_label: award.owner_user_id ? null : 'CPU / Unassigned',
+        owner_label: award.owner_user_id ? null : 'CPU',
         display_team_name: award.team_name ? maddenTeamDisplayName(award.team_name) : null,
         summary: `${award.award_name}: ${award.player_name}${award.team_name ? ` — ${maddenTeamDisplayName(award.team_name)}` : ''}. ${award.stat_line || ''}`.trim(),
       },
@@ -28013,7 +28107,7 @@ function maddenLooksLikeChampionshipGame(row) {
     row?.status,
     row?.external_game_id,
     row?.raw_payload ? JSON.stringify(row.raw_payload).slice(0, 2000) : '',
-  ].filter(Boolean).join(' ').toLowerCase();
+  ].filter(Boolean).join('\n').toLowerCase();
   return /super\s*bowl|championship|title\s*game|league\s*final|playoff\s*final|finals/.test(pieces);
 }
 
@@ -28274,7 +28368,7 @@ async function buildMaddenEaEndpointDiscoveryEmbed(guildId, league) {
     const payload = row.raw_payload || {};
     const endpoint = String(row.endpoint || 'unknown endpoint').replace(/^ea_direct:/, '').slice(0, 80);
     const keys = maddenEndpointDiscoveryTopKeys(payload, 14);
-    if (payloadKeyLines.length < 5) payloadKeyLines.push(`**${endpoint}**${NL}${keys.length ? keys.map(k => `\`${String(k).slice(0, 32)}\``).join(' ') : 'No object keys detected.'}`);
+    if (payloadKeyLines.length < 5) payloadKeyLines.push(`**${endpoint}**${NL}${keys.length ? keys.map(k => `\`${String(k).slice(0, 32)}\``).join('\n') : 'No object keys detected.'}`);
 
     for (const signal of maddenEndpointDiscoveryFindGameSignals(payload, 8)) {
       const key = `${endpoint}:${signal}`.toLowerCase();
@@ -28479,8 +28573,8 @@ async function buildMaddenRawPayloadDeepScanEmbed(guildId, league) {
   const signalText = discovered.join(NL + NL) || 'No nested game/score/result fields found in the matching payload samples.';
 
   let diagnosis = 'Raw payload deep scan completed. Review matched endpoints and signals before wiring any new result import logic.';
-  const endpointBlob = (endpointRows.rows || []).map(row => String(row.endpoint || '')).join(' ').toLowerCase();
-  const signalBlob = discovered.join(' ').toLowerCase();
+  const endpointBlob = (endpointRows.rows || []).map(row => String(row.endpoint || '')).join('\n').toLowerCase();
+  const signalBlob = discovered.join('\n').toLowerCase();
   const hasStatsOnly = /weekly.*stats|roster|teamstats/.test(endpointBlob) && !/(schedule|game|box|result)/.test(endpointBlob);
   const hasScoreSignal = /(homescore|awayscore|score|winner|boxscore|result)/.test(signalBlob);
   if (Number(g.scored_games || 0) === 0 && hasStatsOnly && !hasScoreSignal) {
@@ -28572,8 +28666,8 @@ function maddenSchedulePayloadInspectCandidates(payload, limit = 8) {
 }
 
 function maddenSchedulePayloadScoreSignalSummary(candidates) {
-  const signalBlob = (candidates || []).flatMap(c => c.signalKeys || []).join(' ').toLowerCase();
-  const sampleBlob = (candidates || []).map(c => c.sample || '').join(' ').toLowerCase();
+  const signalBlob = (candidates || []).flatMap(c => c.signalKeys || []).join('\n').toLowerCase();
+  const sampleBlob = (candidates || []).map(c => c.sample || '').join('\n').toLowerCase();
   return {
     hasHomeAway: /(hometeam|home_team|home|awayteam|away_team|away)/.test(signalBlob + ' ' + sampleBlob),
     hasScores: /(homescore|home_score|awayscore|away_score|score|points)/.test(signalBlob + ' ' + sampleBlob),
@@ -28649,7 +28743,7 @@ async function buildMaddenSchedulePayloadInspectorEmbed(guildId, league) {
   }
 
   const candidateText = allCandidates.map(candidate => {
-    const keyLine = candidate.keys?.length ? candidate.keys.map(k => `\`${String(k).slice(0, 26)}\``).join(' ') : 'No keys found';
+    const keyLine = candidate.keys?.length ? candidate.keys.map(k => `\`${String(k).slice(0, 26)}\``).join('\n') : 'No keys found';
     return `**${candidate.endpoint}**${NL}\`${String(candidate.path).slice(0, 90)}\` • ${candidate.length} item(s)${NL}${keyLine}`;
   }).join(NL + NL) || 'No schedule/game-like arrays found inside stored schedule payloads.';
 
@@ -29501,7 +29595,7 @@ async function buildMaddenPostseasonCandidateObjectDumpEmbed(guildId, league) {
     const header = [
       `Source: \`${sample.endpoint.slice(0, 90)}\``,
       `Marker: \`${sample.marker ?? 'endpoint-only'}\``,
-      `Keys: ${sample.keys.map(k => `\`${k}\``).join(' ').slice(0, 300)}`
+      `Keys: ${sample.keys.map(k => `\`${k}\``).join('\n').slice(0, 300)}`
     ].join(NL);
     const raw = safeJson(sample.object, 700);
     return { name: `Raw Candidate Object ${i + 1}`, value: `${header}${NL}\`\`\`json${NL}${raw}${NL}\`\`\``.slice(0, 1024), inline: false };
@@ -30887,7 +30981,7 @@ async function buildMaddenPlayoffEndpointEnumeratorEmbed(guildId, league) {
     for (const k of keys.slice(0, 24)) stat.keys.add(k);
 
     const objectText = short(obj, 1400).toLowerCase();
-    const keyText = keys.join(' ').toLowerCase();
+    const keyText = keys.join('\n').toLowerCase();
     let markerHit = null;
     for (const word of markerWords) {
       if (keyText.includes(word) || objectText.includes(word)) {
@@ -31089,7 +31183,7 @@ async function buildMaddenPlayoffPayloadPresenceAuditEmbed(guildId, league) {
     if (typeof obj !== 'object') return;
 
     const keys = Object.keys(obj);
-    const lowerKeys = keys.join(' ').toLowerCase();
+    const lowerKeys = keys.join('\n').toLowerCase();
     const sampleText = short(obj, 900).toLowerCase();
 
     for (const word of playoffWords) {
@@ -31285,7 +31379,7 @@ async function buildMaddenPlayoffScheduleIdOriginAuditEmbed(guildId, league) {
     if (typeof obj !== 'object') return;
 
     const keys = Object.keys(obj);
-    const textKeys = keys.join(' ').toLowerCase();
+    const textKeys = keys.join('\n').toLowerCase();
     if (keywordHits.length < 20 && wantedWords.some(w => textKeys.includes(w))) {
       keywordHits.push(`${String(endpoint).slice(0, 90)} • ${path || '$'} • keys:${keys.slice(0, 12).join(',')}`);
     }
@@ -32103,7 +32197,7 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
   // the imported player weekly stat rows for each player. The previous latest-snapshot attempt was
   // selecting a single week row, which made leaders/awards show 4-8 TDs while /madden player showed 21 TD.
   const fieldSql = fields.map(([alias, jsonKey]) => `SUM(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
-  const groupAliases = fields.map(([alias]) => `, g."${alias}"`).join('');
+  const groupAliases = fields.map(([alias]) => `, g."${alias}"`).join('\n');
 
   const params = [guildId, leagueId, category.statType, limit];
   let weekClause = '';
@@ -32208,7 +32302,7 @@ function buildMaddenLeagueLeadersEmbed(league, category, rows, options = {}) {
 function maddenPlayerDisplayName(row) {
   const first = row?.first_name || row?.firstName;
   const last = row?.last_name || row?.lastName;
-  const full = [first, last].filter(Boolean).join(' ').trim();
+  const full = [first, last].filter(Boolean).join('\n').trim();
   return full || row?.full_name || row?.player_name || 'Unknown Player';
 }
 
@@ -32241,7 +32335,7 @@ function buildSyntheticMaddenPlayerFromStats(statRow) {
     firstName = compactMatch[1];
     lastName = compactMatch[2];
   } else if (parts.length >= 2) {
-    firstName = parts.slice(0, -1).join(' ');
+    firstName = parts.slice(0, -1).join('\n');
     lastName = parts[parts.length - 1];
   }
 
@@ -33206,7 +33300,7 @@ function calculateMaddenPlayerValue(player) {
 }
 
 function maddenValuePlayerName(row) {
-  return row?.player_name || row?.full_name || [row?.first_name, row?.last_name].filter(Boolean).join(' ') || 'Unknown Player';
+  return row?.player_name || row?.full_name || [row?.first_name, row?.last_name].filter(Boolean).join('\n') || 'Unknown Player';
 }
 
 async function getMaddenPlayerValueRankings(guildId, leagueId, filters = {}) {
@@ -33708,7 +33802,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
     const teamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null) ?? getAnyValue(requestPayload, ['teamName', 'displayName', 'canonicalName'], null);
     const firstName = getAnyValue(row, ['firstName', 'first'], null);
     const lastName = getAnyValue(row, ['lastName', 'last'], null);
-    const fullName = getAnyValue(row, ['fullName', 'name', 'playerName'], null) || [firstName, lastName].filter(Boolean).join(' ').trim() || null;
+    const fullName = getAnyValue(row, ['fullName', 'name', 'playerName'], null) || [firstName, lastName].filter(Boolean).join('\n').trim() || null;
     const position = getAnyValue(row, ['position', 'pos'], null);
     const jerseyNumber = getAnyValue(row, ['jerseyNum', 'jerseyNumber', 'number'], null);
     const overall = parseNumberOrNull(getAnyValue(row, ['overallRating', 'playerBestOvr', 'ovr', 'overall'], null));
@@ -37238,7 +37332,7 @@ function deepFindPotentialStatArrays(obj, path = '', out = [], depth = 0, seen =
     if (obj.length && obj.some(item => item && typeof item === 'object')) {
       const firstObj = obj.find(item => item && typeof item === 'object');
       const keys = Object.keys(firstObj || {});
-      const keyText = keys.join(' ').toLowerCase();
+      const keyText = keys.join('\n').toLowerCase();
 
       const interesting =
         /score|point|pts|stat|standing|record|win|loss|tie|rank|team|game|player|schedule|box|summary|offense|defense|passing|rushing|receiving/.test(keyText);
@@ -38485,7 +38579,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
       pa: team.teamTotalPointsAllowed,
       sources: team.sourcePaths,
       topThreats: (team.topThreats || []).slice(0, 2).map(p => ({
-        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
+        name: [p.firstName, p.lastName].filter(Boolean).join('\n'),
         ovr: p.ovr,
         s1: p.stat1Label,
         v1: p.stat1Value,
@@ -38955,7 +39049,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       paRank: team.teamTotalPointsAllowedRank,
       sourcePaths: team.sourcePaths,
       topThreats: (team.topThreats || []).slice(0, 3).map(p => ({
-        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
+        name: [p.firstName, p.lastName].filter(Boolean).join('\n'),
         ovr: p.ovr,
         s1: p.stat1Label,
         v1: p.stat1Value,
@@ -39185,7 +39279,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       pfRank: team.teamTotalPointsScoredRank,
       paRank: team.teamTotalPointsAllowedRank,
       topThreats: (team.topThreats || []).slice(0, 3).map(p => ({
-        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
+        name: [p.firstName, p.lastName].filter(Boolean).join('\n'),
         ovr: p.ovr,
         s1: p.stat1Label,
         v1: p.stat1Value,
