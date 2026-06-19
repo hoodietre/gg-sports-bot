@@ -1664,6 +1664,16 @@ function buildCommands() {
         .setDescription('Preview expiring contracts before offseason')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('yearend')
+        .setDescription('Preview or finalize year-end awards, champion, profile, and legacy updates')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('confirm').setDescription('Finalize and save year-end records? Leave false for preview.').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('offseasonlock')
+        .setDescription('Lock a pre-offseason checkpoint before advancing the franchise')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('confirm').setDescription('Save the lock checkpoint? Leave false for preview.').setRequired(false)))
 
 ,
     new SlashCommandBuilder()
@@ -2166,24 +2176,89 @@ async function getMaddenLatestSyncRun(guildId, leagueId) {
   return result.rows[0] || null;
 }
 
+
+async function resolveMaddenTeamNameFromImport(guildId, leagueId, teamName) {
+  const raw = String(teamName || '').trim();
+  if (!raw) return '';
+  const result = await pool.query(
+    `SELECT team_name
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND (
+         LOWER(team_name) = LOWER($3)
+         OR LOWER(COALESCE(external_team_id, '')) = LOWER($3)
+         OR LOWER(COALESCE(team_role_id, '')) = LOWER($3)
+       )
+     ORDER BY imported_at DESC
+     LIMIT 1`,
+    [guildId, String(leagueId), raw]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0]?.team_name || raw;
+}
+
+async function maddenResolvedTeamDisplayName(guildId, leagueId, teamName, options = {}) {
+  const resolved = await resolveMaddenTeamNameFromImport(guildId, leagueId, teamName);
+  return maddenTeamDisplayName(resolved, options);
+}
+
 async function getMaddenEstimatedDraftOrderRows(guildId, leagueId, limit = 32) {
   const result = await pool.query(
-    `SELECT team_name, wins, losses, ties, points_for, points_against
+    `SELECT team_name, external_team_id, wins, losses, ties, points_for, points_against
      FROM madden_imported_team_stats
      WHERE guild_id = $1 AND league_id::text = $2::text
      ORDER BY wins ASC, losses DESC, ties ASC, (points_for - points_against) ASC, team_name ASC
      LIMIT $3`,
     [guildId, String(leagueId), Number(limit || 32)]
   );
-  return result.rows || [];
+  const rows = result.rows || [];
+  return rows.map(row => ({ ...row, display_team_name: row.team_name }));
+}
+
+async function getMaddenSuperBowlResult(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT *
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND (LOWER(COALESCE(week_label, '')) LIKE '%super%' OR COALESCE(week_label, '') IN ('23', 'Week 23', 'week 23'))
+     ORDER BY imported_at DESC
+     LIMIT 1`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  const game = result.rows[0];
+  if (!game) return null;
+  const homeScore = Number(game.home_score);
+  const awayScore = Number(game.away_score);
+  const hasScore = Number.isFinite(homeScore) && Number.isFinite(awayScore) && (homeScore > 0 || awayScore > 0 || String(game.status || '').toLowerCase().includes('final'));
+  if (!hasScore || homeScore === awayScore) return { game, isFinal: false, winner: null, loser: null };
+  const winner = homeScore > awayScore ? game.home_team : game.away_team;
+  const loser = homeScore > awayScore ? game.away_team : game.home_team;
+  return { game, isFinal: true, winner, loser, homeScore, awayScore };
+}
+
+async function getMaddenPlayoffAwareDraftOrderRows(guildId, leagueId, limit = 32) {
+  const rows = await getMaddenEstimatedDraftOrderRows(guildId, leagueId, 32);
+  const sb = await getMaddenSuperBowlResult(guildId, leagueId);
+  if (!sb?.isFinal) return rows.slice(0, limit);
+  const winnerResolved = await resolveMaddenTeamNameFromImport(guildId, leagueId, sb.winner);
+  const loserResolved = await resolveMaddenTeamNameFromImport(guildId, leagueId, sb.loser);
+  const isTeam = (row, name) => maddenTeamNameMatches(row.team_name, name) || maddenTeamNameMatches(row.external_team_id, name);
+  const normal = rows.filter(row => !isTeam(row, winnerResolved) && !isTeam(row, loserResolved));
+  const loserRow = rows.find(row => isTeam(row, loserResolved));
+  const winnerRow = rows.find(row => isTeam(row, winnerResolved));
+  const ordered = [...normal];
+  if (loserRow) ordered.push({ ...loserRow, playoff_lock_note: 'Super Bowl runner-up' });
+  if (winnerRow) ordered.push({ ...winnerRow, playoff_lock_note: 'Super Bowl champion' });
+  return ordered.slice(0, limit);
 }
 
 async function getMaddenExpiringContractRows(guildId, leagueId, team = null, limit = 15) {
+  const resolvedTeam = team ? await resolveMaddenTeamNameFromImport(guildId, leagueId, team) : null;
   const params = [guildId, String(leagueId)];
   let teamSql = '';
-  if (team) {
+  if (resolvedTeam) {
+    params.push(String(resolvedTeam));
     params.push(String(team));
-    teamSql = ` AND (LOWER(team_name) = LOWER($3) OR LOWER(team_name) = LOWER($3::text) OR LOWER(team_name) LIKE LOWER('%' || $3::text || '%'))`;
+    teamSql = ` AND (LOWER(team_name) = LOWER($3) OR LOWER(team_name) = LOWER($4) OR LOWER(team_name) LIKE LOWER('%' || $3::text || '%') OR LOWER(team_name) LIKE LOWER('%' || $4::text || '%'))`;
   }
   params.push(Number(limit || 15));
   const limitIndex = params.length;
@@ -2201,22 +2276,26 @@ async function getMaddenExpiringContractRows(guildId, leagueId, team = null, lim
 }
 
 async function buildMaddenDraftOrderPreviewEmbed(guildId, league) {
-  const rows = await getMaddenEstimatedDraftOrderRows(guildId, league.league_id, 32);
+  const rows = await getMaddenPlayoffAwareDraftOrderRows(guildId, league.league_id, 32);
+  const sb = await getMaddenSuperBowlResult(guildId, league.league_id);
   const embed = new EmbedBuilder()
-    .setTitle(`🧾 ${league?.league_name || 'Madden'} • Estimated Draft Order`)
+    .setTitle(`🧾 ${league?.league_name || 'Madden'} • Offseason Draft Order`)
     .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DF Draft Order Preview' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DG Draft Order Lock' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No imported standings found yet. Run Madden sync before checking draft order.');
     return embed;
   }
-  const lines = rows.slice(0, 16).map((row, index) => {
+  const displayRows = [];
+  for (const [index, row] of rows.slice(0, 16).entries()) {
     const diff = Number(row.points_for || 0) - Number(row.points_against || 0);
-    return `**${index + 1}. ${maddenTeamDisplayName(row.team_name)}** — ${row.wins || 0}-${row.losses || 0}${Number(row.ties || 0) ? '-' + row.ties : ''} • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
-  });
-  embed.setDescription(lines.join('\n'));
-  embed.addFields({ name: 'Note', value: 'This is an estimated pre-offseason order from imported standings. If Madden locks playoff/Super Bowl draft order differently after advance, sync again after the offseason transition.', inline: false });
+    const display = await maddenResolvedTeamDisplayName(guildId, league.league_id, row.team_name);
+    const note = row.playoff_lock_note ? ` • ${row.playoff_lock_note}` : '';
+    displayRows.push(`**${index + 1}. ${display}** — ${row.wins || 0}-${row.losses || 0}${Number(row.ties || 0) ? '-' + row.ties : ''} • DIFF ${diff >= 0 ? '+' : ''}${diff}${note}`);
+  }
+  embed.setDescription(displayRows.join('\n'));
+  embed.addFields({ name: 'Lock Status', value: sb?.isFinal ? '✅ Super Bowl result detected. Champion and runner-up are locked to the end of the order.' : '⚠️ Estimated order. Super Bowl result has not been detected as final yet.', inline: false });
   const logo = getMaddenTeamLogoUrl(rows[0]?.team_name);
   if (logo) embed.setThumbnail(logo);
   return embed;
@@ -2224,30 +2303,211 @@ async function buildMaddenDraftOrderPreviewEmbed(guildId, league) {
 
 async function buildMaddenExpiringContractsEmbed(guildId, league, team = null) {
   const rows = await getMaddenExpiringContractRows(guildId, league.league_id, team, 20);
-  const titleTeam = team ? ` • ${maddenTeamDisplayName(team)}` : '';
+  const titleTeam = team ? ` • ${await maddenResolvedTeamDisplayName(guildId, league.league_id, team)}` : '';
   const embed = new EmbedBuilder()
     .setTitle(`⏳ ${league?.league_name || 'Madden'}${titleTeam} • Expiring Contracts`)
     .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DF Expiring Contracts' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DG Expiring Contracts' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No expiring 0-1 year contracts found from the current imported player attributes.');
     return embed;
   }
-  embed.setDescription(rows.map((row, index) => {
+  const lines = [];
+  for (const [index, row] of rows.entries()) {
     const cap = Number(row.cap_hit || row.salary || 0) / 1000000;
-    return `**${index + 1}. ${row.player_name}** — ${maddenTeamDisplayName(row.team_name)} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${Number(row.years_left || 0).toFixed(0)} yr • $${cap.toFixed(1)}M`;
-  }).join('\n').slice(0, 4096));
+    const displayTeam = await maddenResolvedTeamDisplayName(guildId, league.league_id, row.team_name);
+    lines.push(`**${index + 1}. ${row.player_name}** — ${displayTeam} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${Number(row.years_left || 0).toFixed(0)} yr • $${cap.toFixed(1)}M`);
+  }
+  embed.setDescription(lines.join('\n').slice(0, 4096));
   const logo = getMaddenTeamLogoUrl(team || rows[0]?.team_name);
   if (logo) embed.setThumbnail(logo);
   return embed;
+}
+
+async function ensureMaddenYearEndTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_year_end_checkpoints (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      season_label TEXT NOT NULL DEFAULT 'Current',
+      checkpoint_type TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'preview',
+      summary JSONB DEFAULT '{}'::jsonb,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (guild_id, league_id, season_label, checkpoint_type)
+    )
+  `);
+}
+
+async function getMaddenYearEndAwardWinners(guildId, leagueId) {
+  const awardKeys = ['mvp', 'opoy', 'dpoy', 'oroy', 'droy'];
+  const winners = [];
+  for (const awardKey of awardKeys) {
+    const rows = await getMaddenAwardsRace(guildId, leagueId, awardKey, 1).catch(() => []);
+    const player = rows[0];
+    if (!player) continue;
+    const race = MADDEN_AWARD_RACES[awardKey] || MADDEN_AWARD_RACES.mvp;
+    winners.push({
+      award_key: awardKey,
+      award_name: race.title.replace(' Race', ''),
+      player_key: maddenAwardPlayerKey(player),
+      player_name: player.player_name,
+      team_name: player.team_name,
+      position: player.position,
+      stat_line: formatMaddenAwardStatLine(player, race.type),
+      award_score: Number(player.award_score || 0),
+    });
+  }
+  return winners;
+}
+
+async function findMaddenOwnerForTeamName(guildId, leagueId, teamName) {
+  const resolved = await resolveMaddenTeamNameFromImport(guildId, leagueId, teamName);
+  const result = await pool.query(
+    `SELECT owner_user_id FROM madden_franchises
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(team_name) = LOWER($3)
+       AND owner_user_id IS NOT NULL
+     LIMIT 1`,
+    [guildId, String(leagueId), resolved]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0]?.owner_user_id || null;
+}
+
+async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userId = null) {
+  await ensureMaddenYearEndTables();
+  await backfillMaddenExpandedPlayerDataForLeague(guild.id, league.league_id).catch(() => null);
+  await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(() => null);
+
+  const [awards, sb, draftRows, expiringRows, capResult] = await Promise.all([
+    getMaddenYearEndAwardWinners(guild.id, league.league_id),
+    getMaddenSuperBowlResult(guild.id, league.league_id),
+    getMaddenPlayoffAwareDraftOrderRows(guild.id, league.league_id, 5),
+    getMaddenExpiringContractRows(guild.id, league.league_id, null, 5),
+    pool.query(`SELECT COUNT(*)::int AS count, SUM(CASE WHEN cap_space < 0 THEN 1 ELSE 0 END)::int AS violations FROM madden_team_cap WHERE guild_id = $1 AND league_id::text = $2::text`, [guild.id, String(league.league_id)]),
+  ]);
+
+  const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
+  const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
+  const championDisplay = championName ? maddenTeamDisplayName(championName) : 'Not detected yet';
+  const runnerUpDisplay = runnerUpName ? maddenTeamDisplayName(runnerUpName) : 'Not detected yet';
+  const capViolations = Number(capResult.rows[0]?.violations || 0);
+  const capTeams = Number(capResult.rows[0]?.count || 0);
+  const championOwnerId = championName ? await findMaddenOwnerForTeamName(guild.id, league.league_id, championName) : null;
+
+  if (confirm) {
+    const seasonLabel = 'Current';
+    for (const award of awards) {
+      await pool.query(
+        `INSERT INTO madden_award_history (guild_id, league_id, season_label, award_key, award_name, player_key, player_name, team_name, position, value_snapshot, status, finalized_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'finalized', NOW(), NOW())
+         ON CONFLICT (guild_id, league_id, season_label, award_key, status)
+         DO UPDATE SET player_key = EXCLUDED.player_key, player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, value_snapshot = EXCLUDED.value_snapshot, finalized_at = NOW(), updated_at = NOW()`,
+        [guild.id, String(league.league_id), seasonLabel, award.award_key, award.award_name, award.player_key || null, award.player_name, award.team_name || null, award.position || null, JSON.stringify(award)]
+      ).catch(() => null);
+    }
+    if (championName) {
+      await pool.query(
+        `INSERT INTO madden_championship_history (guild_id, league_id, season_label, champion_team, runner_up_team, champion_owner_user_id, status, value_snapshot, finalized_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'finalized', $7::jsonb, NOW(), NOW())
+         ON CONFLICT (guild_id, league_id, season_label, status)
+         DO UPDATE SET champion_team = EXCLUDED.champion_team, runner_up_team = EXCLUDED.runner_up_team, champion_owner_user_id = EXCLUDED.champion_owner_user_id, value_snapshot = EXCLUDED.value_snapshot, finalized_at = NOW(), updated_at = NOW()`,
+        [guild.id, String(league.league_id), seasonLabel, championName, runnerUpName || null, championOwnerId || null, JSON.stringify({ super_bowl: sb, champion: championName, runner_up: runnerUpName })]
+      ).catch(() => null);
+      if (championOwnerId) {
+        await pool.query(
+          `INSERT INTO user_recognition (guild_id, user_id, legacy_score, championships, activity_points)
+           VALUES ($1, $2, 1000, 1, 250)
+           ON CONFLICT (guild_id, user_id)
+           DO UPDATE SET legacy_score = user_recognition.legacy_score + 1000, championships = user_recognition.championships + 1, activity_points = user_recognition.activity_points + 250, updated_at = NOW()`,
+          [guild.id, championOwnerId]
+        ).catch(() => null);
+      }
+    }
+    await pool.query(
+      `INSERT INTO madden_year_end_checkpoints (id, guild_id, league_id, season_label, checkpoint_type, status, summary, created_by)
+       VALUES ($1, $2, $3, 'Current', 'year_end', 'finalized', $4::jsonb, $5)
+       ON CONFLICT (guild_id, league_id, season_label, checkpoint_type)
+       DO UPDATE SET status = 'finalized', summary = EXCLUDED.summary, created_by = EXCLUDED.created_by, created_at = NOW()`,
+      [randomUUID(), guild.id, String(league.league_id), JSON.stringify({ awards, champion: championName, runner_up: runnerUpName, cap_violations: capViolations }), userId || null]
+    ).catch(() => null);
+    await recordMaddenNewsEvent(guild, league, {
+      event_type: 'year_end_finalized',
+      team_name: championName || null,
+      metadata: { summary: `Year-end records finalized${championName ? ` — Champion: ${maddenTeamDisplayName(championName)}` : ''}.`, awards },
+    }).catch(() => null);
+  }
+
+  const awardLines = awards.length
+    ? awards.map(a => `**${a.award_name}:** ${a.player_name} — ${maddenTeamDisplayName(a.team_name || '')} ${a.position || ''}`).join('\n')
+    : 'No award winners detected yet.';
+  const draftLines = [];
+  for (const [index, row] of draftRows.entries()) {
+    draftLines.push(`**${index + 1}.** ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)}`);
+  }
+  const expiringLines = [];
+  for (const [index, row] of expiringRows.entries()) {
+    expiringLines.push(`**${index + 1}.** ${row.player_name} — ${await maddenResolvedTeamDisplayName(guild.id, league.league_id, row.team_name)} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
+  }
+  const checks = [
+    `${sb?.isFinal ? '✅' : '⚠️'} Super Bowl final detected: **${sb?.isFinal ? 'Yes' : 'No'}**`,
+    `${awards.length >= 5 ? '✅' : '⚠️'} Award winners detected: **${awards.length}/5**`,
+    `${draftRows.length ? '✅' : '❌'} Draft order preview: **${draftRows.length ? 'available' : 'missing'}**`,
+    `${capTeams >= 20 ? '✅' : '❌'} Salary cap snapshots: **${capTeams} teams**`,
+    `${capViolations === 0 ? '✅' : '⚠️'} Cap violations: **${capViolations}**`,
+    `${expiringRows.length ? '✅' : '⚠️'} Expiring contracts: **${expiringRows.length} shown**`,
+    `${confirm ? '✅' : '📝'} Year-end save: **${confirm ? 'Finalized' : 'Preview only'}**`,
+  ].join('\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${confirm ? '🔒' : '🧾'} ${league?.league_name || 'Madden'} • Year-End Prep ${confirm ? 'Finalized' : 'Preview'}`)
+    .setColor(confirm ? 0x57F287 : 0xFEE75C)
+    .addFields(
+      { name: 'Champion / Runner-Up', value: `Champion: **${championDisplay}**${championOwnerId ? `\nChampion Owner: <@${championOwnerId}>` : ''}\nRunner-Up: **${runnerUpDisplay}**`, inline: false },
+      { name: 'Year-End Checklist', value: checks, inline: false },
+      { name: 'Award Winners', value: awardLines.slice(0, 1024), inline: false },
+      { name: 'Draft Order Top 5', value: (draftLines.join('\n') || 'No draft order found.').slice(0, 1024), inline: true },
+      { name: 'Top Expiring Contracts', value: (expiringLines.join('\n') || 'No expiring contracts found.').slice(0, 1024), inline: true },
+      { name: 'Next Step', value: confirm ? 'Year-end records are saved. You can advance to offseason after one final Madden sync/checkpoint screenshot.' : 'Review this preview. When everything looks correct, rerun with `confirm: true` before advancing to offseason.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-DG Year-End Prep' })
+    .setTimestamp();
+  const logo = getMaddenTeamLogoUrl(championName || draftRows[0]?.team_name || expiringRows[0]?.team_name);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function buildMaddenOffseasonLockEmbed(guild, league, confirm = false, userId = null) {
+  await ensureMaddenYearEndTables();
+  const readiness = await buildMaddenOffseasonReadinessEmbed(guild.id, league);
+  if (confirm) {
+    const [draftRows, sb, expiringRows] = await Promise.all([
+      getMaddenPlayoffAwareDraftOrderRows(guild.id, league.league_id, 32),
+      getMaddenSuperBowlResult(guild.id, league.league_id),
+      getMaddenExpiringContractRows(guild.id, league.league_id, null, 25),
+    ]);
+    await pool.query(
+      `INSERT INTO madden_year_end_checkpoints (id, guild_id, league_id, season_label, checkpoint_type, status, summary, created_by)
+       VALUES ($1, $2, $3, 'Current', 'offseason_lock', 'locked', $4::jsonb, $5)
+       ON CONFLICT (guild_id, league_id, season_label, checkpoint_type)
+       DO UPDATE SET status = 'locked', summary = EXCLUDED.summary, created_by = EXCLUDED.created_by, created_at = NOW()`,
+      [randomUUID(), guild.id, String(league.league_id), JSON.stringify({ draft_order: draftRows, super_bowl: sb, expiring_contracts: expiringRows }), userId || null]
+    ).catch(() => null);
+  }
+  readiness.setTitle(`${confirm ? '🔒' : '🧭'} ${league?.league_name || 'Madden'} • Offseason Lock ${confirm ? 'Saved' : 'Preview'}`);
+  readiness.setFooter({ text: 'GG Sports • 7J-10BY-DG Offseason Lock' });
+  readiness.addFields({ name: 'Lock Action', value: confirm ? '✅ Offseason checkpoint saved. Year-end prep should also be finalized before advancing.' : 'Preview only. Use `confirm: true` to save the lock checkpoint before advancing.', inline: false });
+  return readiness;
 }
 
 async function buildMaddenOffseasonReadinessEmbed(guildId, league) {
   await backfillMaddenExpandedPlayerDataForLeague(guildId, league.league_id).catch(() => null);
   await refreshMaddenTeamCapFromExpandedPlayers(guildId, league.league_id).catch(() => null);
 
-  const [latestSync, teamCountResult, playerCountResult, capResult, changesResult, gameResult, expiringRows, draftRows] = await Promise.all([
+  const [latestSync, teamCountResult, playerCountResult, capResult, changesResult, gameResult, expiringRows, draftRows, sb] = await Promise.all([
     getMaddenLatestSyncRun(guildId, league.league_id),
     pool.query(`SELECT COUNT(*)::int AS count FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`, [guildId, String(league.league_id)]),
     pool.query(`SELECT COUNT(*)::int AS count FROM madden_player_attributes WHERE guild_id = $1 AND league_id::text = $2::text`, [guildId, String(league.league_id)]),
@@ -2255,7 +2515,8 @@ async function buildMaddenOffseasonReadinessEmbed(guildId, league) {
     pool.query(`SELECT COUNT(*)::int AS count FROM madden_change_log WHERE guild_id = $1 AND league_id::text = $2::text`, [guildId, String(league.league_id)]),
     pool.query(`SELECT week_label, status, home_team, away_team, home_score, away_score, played_at FROM madden_imported_games WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY imported_at DESC LIMIT 5`, [guildId, String(league.league_id)]),
     getMaddenExpiringContractRows(guildId, league.league_id, null, 5),
-    getMaddenEstimatedDraftOrderRows(guildId, league.league_id, 5),
+    getMaddenPlayoffAwareDraftOrderRows(guildId, league.league_id, 5),
+    getMaddenSuperBowlResult(guildId, league.league_id),
   ]);
 
   const importedTeams = Number(teamCountResult.rows[0]?.count || 0);
@@ -2264,9 +2525,8 @@ async function buildMaddenOffseasonReadinessEmbed(guildId, league) {
   const capViolations = Number(capResult.rows[0]?.violations || 0);
   const changeCount = Number(changesResult.rows[0]?.count || 0);
   const games = gameResult.rows || [];
-  const latestWeek = latestSync?.week_label || games[0]?.week_label || 'Not specified';
-  const latestGame = games[0];
-  const maybeSuperBowl = String(latestWeek || latestGame?.week_label || '').toLowerCase().includes('super') || String(latestGame?.week_label || '').toLowerCase().includes('23');
+  const latestWeek = sb?.game?.week_label || latestSync?.week_label || games[0]?.week_label || 'Not specified';
+  const stage = sb?.isFinal ? '🏆 Super Bowl Final Synced' : (String(latestWeek || '').toLowerCase().includes('super') || String(latestWeek || '').includes('23') ? '🏆 Super Bowl Week' : `Week/Stage: ${latestWeek}`);
   const hasCoreData = importedTeams >= 32 && importedPlayers >= 1500;
   const hasCapData = capTeams >= 20;
   const capOk = capViolations === 0;
@@ -2280,28 +2540,31 @@ async function buildMaddenOffseasonReadinessEmbed(guildId, league) {
     `${draftRows.length ? '✅' : '❌'} Draft order preview: **${draftRows.length ? 'available' : 'missing'}**`,
     `${expiringRows.length ? '✅' : '⚠️'} Expiring contract preview: **${expiringRows.length} top expiring players found**`,
     `${changeCount ? '✅' : '⏳'} Change logs: **${changeCount} saved changes**`,
+    `${sb?.isFinal ? '✅' : '⚠️'} Super Bowl final: **${sb?.isFinal ? 'detected' : 'not detected yet'}**`,
   ].join('\n');
 
-  const draftPreview = draftRows.length
-    ? draftRows.map((row, index) => `**${index + 1}.** ${maddenTeamDisplayName(row.team_name)} (${row.wins || 0}-${row.losses || 0})`).join('\n')
-    : 'No draft order data found.';
-
-  const expiringPreview = expiringRows.length
-    ? expiringRows.map((row, index) => `**${index + 1}.** ${row.player_name} — ${maddenTeamDisplayName(row.team_name)} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`).join('\n')
-    : 'No expiring contracts found.';
+  const draftPreviewLines = [];
+  for (const [index, row] of draftRows.entries()) {
+    draftPreviewLines.push(`**${index + 1}.** ${await maddenResolvedTeamDisplayName(guildId, league.league_id, row.team_name)} (${row.wins || 0}-${row.losses || 0})`);
+  }
+  const expiringPreviewLines = [];
+  for (const [index, row] of expiringRows.entries()) {
+    expiringPreviewLines.push(`**${index + 1}.** ${row.player_name} — ${await maddenResolvedTeamDisplayName(guildId, league.league_id, row.team_name)} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
+  }
 
   const embed = new EmbedBuilder()
     .setTitle(`🧭 ${league?.league_name || 'Madden'} • Offseason Readiness Check`)
     .setColor(ready ? (capOk ? 0x57F287 : 0xFEE75C) : 0xED4245)
     .addFields(
       { name: 'Status', value: status, inline: false },
+      { name: 'Current Stage', value: stage, inline: false },
       { name: 'Latest Sync', value: `Source: **${latestSync?.source || 'Unknown'}**\nWeek: **${latestWeek}**\nImported: **${latestSync?.imported_teams ?? importedTeams} teams / ${latestSync?.imported_players ?? importedPlayers} players**`, inline: false },
       { name: 'Checklist', value: checklist, inline: false },
-      { name: 'Estimated Draft Order Top 5', value: draftPreview.slice(0, 1024), inline: true },
-      { name: 'Top Expiring Contracts', value: expiringPreview.slice(0, 1024), inline: true },
-      { name: 'Recommendation', value: maybeSuperBowl ? 'You are in or near Super Bowl week. Run this check, save screenshots of awards/power rankings/cap, then advance only after the Super Bowl result is final and synced.' : 'If the Super Bowl/final week is complete and synced, you can advance after saving this checkpoint.', inline: false }
+      { name: 'Estimated Draft Order Top 5', value: (draftPreviewLines.join('\n') || 'No draft order data found.').slice(0, 1024), inline: true },
+      { name: 'Top Expiring Contracts', value: (expiringPreviewLines.join('\n') || 'No expiring contracts found.').slice(0, 1024), inline: true },
+      { name: 'Recommendation', value: sb?.isFinal ? 'Run `/maddenseason yearend confirm:true`, then `/maddenseason offseasonlock confirm:true`, then advance to offseason.' : 'Do not advance until the Super Bowl result is final and synced. You can still preview year-end prep now.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-DF Offseason Readiness' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DG Offseason Readiness' })
     .setTimestamp();
   const logo = getMaddenTeamLogoUrl(draftRows[0]?.team_name || expiringRows[0]?.team_name);
   if (logo) embed.setThumbnail(logo);
@@ -7982,6 +8245,16 @@ if (gameSubcommand === 'report') {
         const team = interaction.options.getString('team') || null;
         await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
         await interaction.editReply({ embeds: [await buildMaddenExpiringContractsEmbed(interaction.guild.id, activeLeague, team)] });
+        return;
+      }
+      if (subcommand === 'yearend') {
+        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
+        await interaction.editReply({ embeds: [await buildMaddenYearEndPrepEmbed(interaction.guild, activeLeague, confirm, interaction.user.id)] });
+        return;
+      }
+      if (subcommand === 'offseasonlock') {
+        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
+        await interaction.editReply({ embeds: [await buildMaddenOffseasonLockEmbed(interaction.guild, activeLeague, confirm, interaction.user.id)] });
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden season command.' });
