@@ -17604,11 +17604,13 @@ function buildBadgeProgressEmbed(user, recognition = {}) {
 
 
 
+// 7J-10BY-DK: Setup dashboard includes League History Channel wiring.
 const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_role', label: 'League Role', description: 'Main league member role', kind: 'role' },
   { value: 'staff_role', label: 'Staff Role', description: 'Role allowed to manage league tools', kind: 'role' },
   { value: 'trade_committee_role', label: 'Trade Committee Role', description: 'Role that votes on trades', kind: 'role' },
   { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
+  { value: 'history_channel', label: 'League History Channel', description: 'Season archives and year-end history posts', kind: 'channel' },
   { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed', kind: 'channel' },
   { value: 'shop_channel', label: 'Shop Channel', description: 'Permanent shop panel channel', kind: 'channel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
@@ -17638,6 +17640,7 @@ function setupDashboardColumn(settingKey) {
     staff_role: 'staff_role_id',
     trade_committee_role: 'trade_committee_role_id',
     standings_channel: 'standings_channel_id',
+    history_channel: 'history_channel_id',
     sportsbook_channel: 'sportsbook_channel_id',
     shop_channel: 'shop_channel_id',
     team_owners_channel: 'team_owners_channel_id',
@@ -17675,6 +17678,7 @@ function setupDashboardFormatValue(league, settingKey) {
 function buildSetupDashboardEmbed(league) {
   const channelLines = [
     'Standings: ' + setupDashboardFormatValue(league, 'standings_channel'),
+    'League History: ' + setupDashboardFormatValue(league, 'history_channel'),
     'Sportsbook: ' + setupDashboardFormatValue(league, 'sportsbook_channel'),
     'Shop: ' + setupDashboardFormatValue(league, 'shop_channel'),
     'Tournament: ' + setupDashboardFormatValue(league, 'tournament_channel'),
