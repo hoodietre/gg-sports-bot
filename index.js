@@ -27212,8 +27212,41 @@ function maddenFreeAgentOverall(row) {
   return null;
 }
 
+function maddenFreeAgentMarketPositionMultiplier(position) {
+  const pos = String(position || '').toUpperCase();
+  if (['QB'].includes(pos)) return 1.75;
+  if (['WR', 'CB', 'EDGE', 'RE', 'LE', 'ROLB', 'LOLB', 'LT'].includes(pos)) return 1.22;
+  if (['HB', 'FS', 'SS', 'TE', 'RT'].includes(pos)) return 1.08;
+  if (['LG', 'RG', 'C', 'DT', 'MLB', 'MIKE', 'WILL', 'SAM'].includes(pos)) return 0.96;
+  if (['FB', 'K', 'P'].includes(pos)) return 0.58;
+  return 1.0;
+}
+
+function maddenFreeAgentFallbackValue(row) {
+  const raw = maddenFreeAgencyRaw(row);
+  const overall = Number(maddenFreeAgentOverall(row) || row?.overall || raw.overallRating || raw.playerBestOvr || 0);
+  if (!Number.isFinite(overall) || overall <= 0) return 1;
+  const age = Number(row?.age || raw.age || 28);
+  const position = maddenFreeAgentRowPosition(row) || row?.position;
+  const posMult = maddenFreeAgentMarketPositionMultiplier(position);
+  let ageMult = 1.0;
+  if (age <= 23) ageMult = 1.28;
+  else if (age <= 26) ageMult = 1.16;
+  else if (age <= 29) ageMult = 1.0;
+  else if (age <= 32) ageMult = 0.76;
+  else if (age <= 35) ageMult = 0.44;
+  else ageMult = 0.24;
+  const dev = String(row?.dev_trait || raw.devTrait || '').toLowerCase();
+  let devMult = 1.0;
+  if (dev.includes('x') || dev === '3') devMult = 1.28;
+  else if (dev.includes('superstar') || dev === '2') devMult = 1.18;
+  else if (dev.includes('star') || dev === '1') devMult = 1.08;
+  const base = Math.max(1, Math.pow(Math.max(1, overall - 58), 2.05));
+  return Math.max(1, Number((base * posMult * ageMult * devMult).toFixed(0)));
+}
+
 function maddenFreeAgentValue(row) {
-  const stored = Number(row?.value_score || 0);
+  const stored = Number(row?.value_score || row?.stored_value_score || 0);
   if (Number.isFinite(stored) && stored > 0) return stored;
   const raw = maddenFreeAgencyRaw(row);
   const calculated = calculateMaddenPlayerValue({
@@ -27225,7 +27258,9 @@ function maddenFreeAgentValue(row) {
     cap_hit: row?.cap_hit || raw.capHit || raw.desiredSalary || raw.contractSalary,
     dev_trait: row?.dev_trait || raw.devTrait,
   });
-  return Number(calculated?.valueScore || 0);
+  const score = Number(calculated?.valueScore || 0);
+  if (Number.isFinite(score) && score > 0) return score;
+  return maddenFreeAgentFallbackValue(row);
 }
 
 function invalidateMaddenFreeAgentRowsCache(guildId = null, leagueId = null) {
@@ -27250,7 +27285,22 @@ function maddenFreeAgentDemand(row) {
   const salary = Number(row?.salary || raw.desiredSalary || raw.contractSalary || 0);
   const bonus = Number(row?.bonus || raw.desiredBonus || raw.contractBonus || 0);
   const cap = Number(row?.cap_hit || raw.capHit || 0);
-  return Math.max(salary, cap, 0) + Math.max(bonus, 0);
+  const existing = Math.max(salary, cap, 0) + Math.max(bonus, 0);
+  if (Number.isFinite(existing) && existing > 0) return existing;
+
+  const overall = Number(maddenFreeAgentOverall(row) || raw.overallRating || raw.playerBestOvr || 65);
+  const age = Number(row?.age || raw.age || 28);
+  const position = maddenFreeAgentRowPosition(row) || row?.position;
+  const posMult = maddenFreeAgentMarketPositionMultiplier(position);
+  let ageMult = 1.0;
+  if (age <= 24) ageMult = 1.18;
+  else if (age <= 28) ageMult = 1.05;
+  else if (age <= 31) ageMult = 0.92;
+  else if (age <= 34) ageMult = 0.72;
+  else ageMult = 0.48;
+  const aboveReplacement = Math.max(0, overall - 64);
+  const estimatedMillions = Math.max(0.75, (0.65 + aboveReplacement * 0.32) * posMult * ageMult);
+  return Math.round(estimatedMillions * 1000000 / 100000) * 100000;
 }
 
 function formatMaddenFreeAgentLine(row, index = 0, showPreviousTeam = true) {
@@ -27417,7 +27467,7 @@ function buildMaddenFreeAgentsEmbedFromRows(league, rows, options = {}) {
   const embed = new EmbedBuilder()
     .setTitle(`🧳 ${league.league_name} • Free Agents${position}${minText}`)
     .setColor(0x3498DB)
-    .setFooter({ text: `GG Sports • 7J-10BY-EA3 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
+    .setFooter({ text: `GG Sports • 7J-10BY-EA4 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run `/madden sync`, then try again.');
@@ -27540,7 +27590,7 @@ async function buildMaddenFreeAgentTeamFitEmbed(guildId, league, teamInput, posi
     .setTitle(`🧩 ${ctx.displayName || maddenTeamDisplayName(teamInput)} • Free Agent Fits`)
     .setColor(capSpace < 0 ? 0xED4245 : 0x57F287)
     .addFields({ name: 'Cap Snapshot', value: capResult.rows?.[0] ? `Cap Space: **${formatMaddenMoney(capSpace)}**\nStatus: ${capSpace < 0 ? '🚨 Over Cap' : '✅ Under Cap'}` : 'No team cap snapshot found.', inline: false })
-    .setFooter({ text: 'GG Sports • 7J-10BY-EA1 Team Fit' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EA4 Team Fit' })
     .setTimestamp();
   if (!fits.length) {
     embed.addFields({ name: 'Recommended Fits', value: 'No matching free agents found yet.', inline: false });
