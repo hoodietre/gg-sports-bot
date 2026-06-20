@@ -2393,22 +2393,104 @@ async function getMaddenYearEndAwardWinners(guildId, leagueId) {
   return winners;
 }
 
+async function getMaddenTeamIdentifierCandidates(guildId, leagueId, teamName) {
+  const raw = String(teamName || '').trim();
+  const resolved = raw ? await resolveMaddenTeamNameFromImport(guildId, leagueId, raw).catch(() => raw) : '';
+  const base = [raw, resolved, getMaddenTeamAbbrev(raw), getMaddenTeamAbbrev(resolved)]
+    .filter(Boolean)
+    .map(value => String(value).trim());
+
+  const lookupValues = [...new Set(base.map(value => value.toLowerCase()))];
+  if (lookupValues.length) {
+    const result = await pool.query(
+      `SELECT team_name, external_team_id, team_role_id, owner_user_id
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND (
+           LOWER(COALESCE(team_name, '')) = ANY($3::text[])
+           OR LOWER(COALESCE(external_team_id, '')) = ANY($3::text[])
+           OR LOWER(COALESCE(team_role_id, '')) = ANY($3::text[])
+         )
+       ORDER BY imported_at DESC
+       LIMIT 5`,
+      [String(guildId), String(leagueId), lookupValues]
+    ).catch(() => ({ rows: [] }));
+    for (const row of result.rows || []) {
+      base.push(row.team_name, row.external_team_id, row.team_role_id, getMaddenTeamAbbrev(row.team_name));
+    }
+  }
+
+  return [...new Set(base.filter(Boolean).map(value => String(value).trim()))];
+}
+
+function maddenNormalizeTeamLookupValue(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 async function findMaddenOwnerForTeamName(guildId, leagueId, teamName) {
-  const resolved = await resolveMaddenTeamNameFromImport(guildId, leagueId, teamName);
-  const result = await pool.query(
-    `SELECT owner_user_id FROM madden_franchises
+  const candidates = await getMaddenTeamIdentifierCandidates(guildId, leagueId, teamName).catch(() => [teamName].filter(Boolean));
+  const normalizedCandidates = [...new Set(candidates.map(maddenNormalizeTeamLookupValue).filter(Boolean))];
+  if (!normalizedCandidates.length) return null;
+
+  const importedResult = await pool.query(
+    `SELECT owner_user_id, team_role_id
+     FROM madden_imported_team_stats
      WHERE guild_id = $1 AND league_id::text = $2::text
-       AND LOWER(team_name) = LOWER($3)
-       AND owner_user_id IS NOT NULL
+       AND (
+         regexp_replace(LOWER(COALESCE(team_name, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+         OR regexp_replace(LOWER(COALESCE(external_team_id, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+         OR regexp_replace(LOWER(COALESCE(team_role_id, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+       )
+       AND (owner_user_id IS NOT NULL OR team_role_id IS NOT NULL)
+     ORDER BY imported_at DESC
      LIMIT 1`,
-    [guildId, String(leagueId), resolved]
+    [String(guildId), String(leagueId), normalizedCandidates]
   ).catch(() => ({ rows: [] }));
-  return result.rows[0]?.owner_user_id || null;
+  const imported = importedResult.rows?.[0];
+  if (imported?.owner_user_id) return imported.owner_user_id;
+
+  const franchiseResult = await pool.query(
+    `SELECT owner_user_id, team_role_id
+     FROM madden_franchises
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND (
+         regexp_replace(LOWER(COALESCE(team_name, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+         OR regexp_replace(LOWER(COALESCE(team_role_id, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+       )
+       AND (owner_user_id IS NOT NULL OR team_role_id IS NOT NULL)
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC
+     LIMIT 1`,
+    [String(guildId), String(leagueId), normalizedCandidates]
+  ).catch(() => ({ rows: [] }));
+  const franchise = franchiseResult.rows?.[0];
+  if (franchise?.owner_user_id) return franchise.owner_user_id;
+
+  const roleIds = [imported?.team_role_id, franchise?.team_role_id].filter(Boolean);
+  const roleResult = await pool.query(
+    `SELECT role_id, role_name
+     FROM league_team_roles
+     WHERE league_id::text = $1::text
+       AND (
+         role_id = ANY($2::text[])
+         OR regexp_replace(LOWER(COALESCE(role_name, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+       )
+     LIMIT 5`,
+    [String(leagueId), roleIds.length ? roleIds : ['__none__'], normalizedCandidates]
+  ).catch(() => ({ rows: [] }));
+
+  const guild = client.guilds.cache.get(String(guildId));
+  if (!guild) return null;
+  for (const row of roleResult.rows || []) {
+    const role = await guild.roles.fetch(row.role_id).catch(() => null);
+    const owner = role?.members?.find(member => !member.user.bot);
+    if (owner?.id) return owner.id;
+  }
+  return null;
 }
 
 
 
-// 7J-10BY-DJ: league-history polish and offseason news cleanup helpers.
+// 7J-10BY-DL: historical archive finalization helpers. No separate history index command is added; the history channel remains the archive.
 function isMaddenFreeAgentTeamName(teamName) {
   const clean = String(teamName || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
   return !clean || ['fa', 'freeagent', 'freeagents', 'freeagency', 'none', 'null'].includes(clean);
@@ -2480,22 +2562,40 @@ async function getMaddenSuperBowlMvpCandidate(guildId, leagueId) {
   const sb = await getMaddenSuperBowlResult(guildId, leagueId).catch(() => null);
   if (!sb?.isFinal || !sb.winner) return null;
   const champion = await resolveMaddenTeamNameFromImport(guildId, leagueId, sb.winner).catch(() => sb.winner);
-  // Fallback priority: champion QB, then champion's highest OVR offensive player, then highest OVR champion player.
+  const candidates = await getMaddenTeamIdentifierCandidates(guildId, leagueId, champion).catch(() => [champion]);
+  const normalizedCandidates = [...new Set(candidates.map(maddenNormalizeTeamLookupValue).filter(Boolean))];
+
+  // Fallback priority: champion QB, then highest-OVR champion offensive player, then highest-OVR champion player.
   const result = await pool.query(
     `SELECT player_name, team_name, position, overall
      FROM madden_player_attributes
      WHERE guild_id = $1 AND league_id::text = $2::text
-       AND LOWER(team_name) = LOWER($3)
+       AND regexp_replace(LOWER(COALESCE(team_name, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+       AND COALESCE(player_name, '') <> ''
      ORDER BY
        CASE WHEN UPPER(position) = 'QB' THEN 0 WHEN UPPER(position) IN ('HB','RB','WR','TE') THEN 1 ELSE 2 END,
        overall DESC NULLS LAST,
        player_name ASC
      LIMIT 1`,
-    [String(guildId), String(leagueId), String(champion)]
+    [String(guildId), String(leagueId), normalizedCandidates.length ? normalizedCandidates : [maddenNormalizeTeamLookupValue(champion)]]
   ).catch(() => ({ rows: [] }));
   const row = result.rows?.[0];
-  if (!row) return { player_name: 'Not detected', team_name: champion, position: null, overall: null };
-  return { ...row, team_name: champion };
+  if (!row) {
+    const fallback = await pool.query(
+      `SELECT player_name, team_name, position, overall
+       FROM madden_imported_players
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND regexp_replace(LOWER(COALESCE(team_name, '')), '[^a-z0-9]', '', 'g') = ANY($3::text[])
+         AND COALESCE(player_name, '') <> ''
+       ORDER BY CASE WHEN UPPER(position) = 'QB' THEN 0 WHEN UPPER(position) IN ('HB','RB','WR','TE') THEN 1 ELSE 2 END, overall DESC NULLS LAST, player_name ASC
+       LIMIT 1`,
+      [String(guildId), String(leagueId), normalizedCandidates.length ? normalizedCandidates : [maddenNormalizeTeamLookupValue(champion)]]
+    ).catch(() => ({ rows: [] }));
+    const fallbackRow = fallback.rows?.[0];
+    if (fallbackRow) return { ...fallbackRow, team_name: champion, source: 'fallback_imported_players' };
+    return { player_name: 'Champion QB fallback unavailable', team_name: champion, position: null, overall: null, source: 'unavailable' };
+  }
+  return { ...row, team_name: champion, source: 'fallback_champion_roster' };
 }
 
 function formatMaddenCleanAwardLine(award) {
@@ -2561,8 +2661,8 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
        DO UPDATE SET status = 'finalized', summary = EXCLUDED.summary, created_by = EXCLUDED.created_by, created_at = NOW()`,
       [randomUUID(), guild.id, String(league.league_id), JSON.stringify({ awards, champion: championName, runner_up: runnerUpName, cap_violations: capViolations }), userId || null]
     ).catch(() => null);
-    await generateMaddenOffseasonNewsEvents(guild, league, userId).catch(error => console.warn('[7J-10BY-DJ] offseason news generation failed:', error?.message || error));
-    await postMaddenLeagueHistoryYearEndReport(guild, league, userId).catch(error => console.warn('[7J-10BY-DJ] league history year-end post failed:', error?.message || error));
+    await generateMaddenOffseasonNewsEvents(guild, league, userId).catch(error => console.warn('[7J-10BY-DL] offseason news generation failed:', error?.message || error));
+    await postMaddenLeagueHistoryYearEndReport(guild, league, userId).catch(error => console.warn('[7J-10BY-DL] league history year-end post failed:', error?.message || error));
     await recordMaddenNewsEvent(guild, league, {
       event_type: 'year_end_finalized',
       team_name: championName || null,
@@ -8431,7 +8531,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
           .setColor(0xFEE75C)
           .setDescription(mvp?.player_name && mvp.player_name !== 'Not detected' ? `**${mvp.player_name}** — ${maddenTeamDisplayName(mvp.team_name)}
 ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP candidate detected yet.')
-          .setFooter({ text: 'GG Sports • 7J-10BY-DJ Super Bowl MVP' })
+          .setFooter({ text: 'GG Sports • 7J-10BY-DL Super Bowl MVP' })
           .setTimestamp();
         const logo = getMaddenTeamLogoUrl(mvp?.team_name);
         if (logo) embed.setThumbnail(logo);
@@ -17604,7 +17704,7 @@ function buildBadgeProgressEmbed(user, recognition = {}) {
 
 
 
-// 7J-10BY-DK: Setup dashboard includes League History Channel wiring.
+// 7J-10BY-DL: Setup dashboard includes League History Channel wiring.
 const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_role', label: 'League Role', description: 'Main league member role', kind: 'role' },
   { value: 'staff_role', label: 'Staff Role', description: 'Role allowed to manage league tools', kind: 'role' },
@@ -26884,7 +26984,7 @@ function buildMaddenNewsEventEmbed(league, event) {
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Madden News + Offseason History' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DL Madden News + Offseason History' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
   const displayTeamForEvent = meta.display_team_name || (event.team_name ? maddenTeamDisplayName(event.team_name) : '');
@@ -26981,7 +27081,7 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Madden News + Offseason History' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DL Madden News + Offseason History' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved Madden news events found yet. New trade block activity, committee submissions, approved trades, and future sync changes will appear here.');
@@ -27125,7 +27225,7 @@ async function buildMaddenOffseasonOutlookEmbed(guild, league) {
       { name: '💰 Most Cap Space', value: maddenSafeEmbedText(capSpaceLines.join('\n') || 'No cap snapshot detected.', 1024), inline: true },
       { name: '📊 Final Power Top 8', value: maddenSafeEmbedText(powerLines.join('\n') || 'No power rankings found.', 1024), inline: true }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Offseason Outlook' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DL Offseason Outlook' })
     .setTimestamp();
   const logo = getMaddenTeamLogoUrl(draftRows[0]?.team_name || capSpace[0]?.team_name || powerRows[0]?.team_name);
   if (logo) embed.setThumbnail(logo);
@@ -27145,6 +27245,11 @@ async function getMaddenFinalPowerRankingRows(guildId, leagueId, limit = 10) {
     [String(leagueId), Math.max(1, Math.min(Number(limit || 10), 20))]
   ).catch(() => ({ rows: [] }));
   return result.rows || [];
+}
+
+function maddenCurrentSeasonArchiveLabel() {
+  const year = new Date().getFullYear();
+  return `Season Archive • ${year}`;
 }
 
 async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
@@ -27178,7 +27283,7 @@ async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
       { name: '🏅 Award Winners', value: maddenSafeEmbedText(awardLines, 1024), inline: false },
       { name: 'Need cap/draft/contracts?', value: 'Use `/maddennews outlook` for offseason admin details.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-DJ Offseason Summary' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DL Offseason Summary' })
     .setTimestamp();
   const logo = getMaddenTeamLogoUrl(championName || runnerUpName || bestRecord?.team_name);
   if (logo) embed.setThumbnail(logo);
@@ -27214,9 +27319,9 @@ async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
       { name: 'Best Regular Season Record', value: bestRecordValue, inline: false },
       { name: 'Super Bowl MVP', value: sbMvpText, inline: false },
       { name: 'Award Winners', value: maddenSafeEmbedText(awardText, 1024), inline: false },
-      { name: 'Recorded', value: `Season Archive • ${new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}`, inline: false }
+      { name: 'Recorded', value: maddenCurrentSeasonArchiveLabel(), inline: false }
     )
-    .setFooter({ text: 'GG Sports • 7J-10BY-DJ League History Archive' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-DL League History Archive' })
     .setTimestamp();
   const logo = getMaddenTeamLogoUrl(championName || runnerUpName || bestRecord?.team_name);
   if (logo) embed.setThumbnail(logo);
@@ -27262,7 +27367,7 @@ async function generateMaddenOffseasonNewsEvents(guild, league, userId = null) {
   let created = 0;
   const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
   const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
-  const baseMeta = { generated_by: userId || null, generated_from: '7J-10BY-DJ' };
+  const baseMeta = { generated_by: userId || null, generated_from: '7J-10BY-DL' };
   if (championName) {
     const row = await recordMaddenNewsEventOnce(guild, league, { event_type: 'champion_finalized', team_name: championName, metadata: { ...baseMeta, summary: `${maddenTeamDisplayName(championName)} finished the season as Super Bowl champions.` } }, 'champion_finalized_current');
     if (row) created++;
