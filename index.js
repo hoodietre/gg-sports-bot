@@ -2973,7 +2973,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -2988,7 +2988,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -3002,13 +3002,13 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
        s.live_channel_id, s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
        s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-       s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id
+       s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id
      )
      LIMIT 1`,
     [guildId, channelId]
@@ -3021,7 +3021,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -6491,6 +6491,10 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       const column = setupDashboardColumn(settingKey);
       const channelId = interaction.values[0];
+
+      if (settingKey === 'madden_free_agents_channel' && typeof ensureMaddenFreeAgencyTables === 'function') {
+        await ensureMaddenFreeAgencyTables().catch(() => null);
+      }
 
       if (!column) {
         await interaction.reply({ content: 'Invalid setup setting.', ephemeral: true });
@@ -17994,6 +17998,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'trade_committee_role', label: 'Trade Committee Role', description: 'Role that votes on trades', kind: 'role' },
   { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
   { value: 'history_channel', label: 'League History Channel', description: 'Season archives and year-end history posts', kind: 'channel' },
+  { value: 'madden_free_agents_channel', label: 'Madden Free Agents Channel', description: 'Live free agent board and offseason free agency panel', kind: 'channel' },
   { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed', kind: 'channel' },
   { value: 'shop_channel', label: 'Shop Channel', description: 'Permanent shop panel channel', kind: 'channel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
@@ -18009,6 +18014,7 @@ const SETUP_DASHBOARD_OPTIONS = [
 
 const SETUP_PANEL_OPTIONS = [
   { value: 'standings_panel', label: 'Create/Refresh Standings Panel' },
+  { value: 'madden_free_agents_panel', label: 'Post/Refresh Madden Free Agents Board' },
   { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
   { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
@@ -18024,6 +18030,7 @@ function setupDashboardColumn(settingKey) {
     trade_committee_role: 'trade_committee_role_id',
     standings_channel: 'standings_channel_id',
     history_channel: 'history_channel_id',
+    madden_free_agents_channel: 'madden_free_agents_channel_id',
     sportsbook_channel: 'sportsbook_channel_id',
     shop_channel: 'shop_channel_id',
     team_owners_channel: 'team_owners_channel_id',
@@ -18062,6 +18069,7 @@ function buildSetupDashboardEmbed(league) {
   const channelLines = [
     'Standings: ' + setupDashboardFormatValue(league, 'standings_channel'),
     'League History: ' + setupDashboardFormatValue(league, 'history_channel'),
+    'Madden Free Agents: ' + setupDashboardFormatValue(league, 'madden_free_agents_channel'),
     'Sportsbook: ' + setupDashboardFormatValue(league, 'sportsbook_channel'),
     'Shop: ' + setupDashboardFormatValue(league, 'shop_channel'),
     'Tournament: ' + setupDashboardFormatValue(league, 'tournament_channel'),
@@ -18087,12 +18095,12 @@ function buildSetupDashboardEmbed(league) {
   return new EmbedBuilder()
     .setTitle('GG Sports Setup Dashboard')
     .setColor(0x5865F2)
-    .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Old slash commands still work as advanced/manual backups. Madden uses the same league role/team role setup bridge.')
+    .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Use the panel menu to post or refresh live boards like the Madden Free Agents Board. Old slash commands still work as advanced/manual backups.')
     .addFields(
       { name: 'Roles', value: roleLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Core Channels', value: channelLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Trade Setup', value: tradeLines.join(String.fromCharCode(10)), inline: false },
-      { name: 'Panels', value: 'Use the panel menu to create or refresh common setup panels.', inline: false }
+      { name: 'Panels', value: 'Use the panel menu to create or refresh common setup panels. Free Agents Board uses the Madden Free Agents Channel and keeps All/QB/HB/WR/TE/OL/DL/LB/DB buttons.', inline: false }
     )
     .setFooter({ text: 'GG Sports • Interactive Setup' })
     .setTimestamp();
@@ -18188,6 +18196,17 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const message = await channel.send({ embeds: [buildStandingsEmbed(league, rows)] });
     await savePanel(league, 'standings', channel.id, message.id);
     return 'Standings panel created/refreshed in ' + channel.toString() + '.';
+  }
+
+  if (panelType === 'madden_free_agents_panel') {
+    if (typeof postOrRefreshMaddenFreeAgentsPanel !== 'function') return 'Madden Free Agents Board is not available in this build.';
+    if (typeof ensureMaddenFreeAgencyTables === 'function') await ensureMaddenFreeAgencyTables().catch(() => null);
+    const configuredChannelId = league.madden_free_agents_channel_id || await getMaddenFreeAgentsChannelId(league.league_id).catch(() => null);
+    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'Madden free agents channel');
+    if (error) return error + ' Set **Madden Free Agents Channel** from this setup dashboard first.';
+    await setMaddenFreeAgentsChannel(league.league_id, channel.id);
+    const result = await postOrRefreshMaddenFreeAgentsPanel(interaction.guild, { ...league, madden_free_agents_channel_id: channel.id }, { page: 0, position: null, minOvr: 0 });
+    return result?.message || ('Madden Free Agents Board posted/refreshed in ' + channel.toString() + '.');
   }
 
   if (panelType === 'shop_panel') {
@@ -27467,7 +27486,7 @@ function buildMaddenFreeAgentsEmbedFromRows(league, rows, options = {}) {
   const embed = new EmbedBuilder()
     .setTitle(`🧳 ${league.league_name} • Free Agents${position}${minText}`)
     .setColor(0x3498DB)
-    .setFooter({ text: `GG Sports • 7J-10BY-EA4 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
+    .setFooter({ text: `GG Sports • 7J-10BY-EA5 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run `/madden sync`, then try again.');
@@ -27590,7 +27609,7 @@ async function buildMaddenFreeAgentTeamFitEmbed(guildId, league, teamInput, posi
     .setTitle(`🧩 ${ctx.displayName || maddenTeamDisplayName(teamInput)} • Free Agent Fits`)
     .setColor(capSpace < 0 ? 0xED4245 : 0x57F287)
     .addFields({ name: 'Cap Snapshot', value: capResult.rows?.[0] ? `Cap Space: **${formatMaddenMoney(capSpace)}**\nStatus: ${capSpace < 0 ? '🚨 Over Cap' : '✅ Under Cap'}` : 'No team cap snapshot found.', inline: false })
-    .setFooter({ text: 'GG Sports • 7J-10BY-EA4 Team Fit' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EA5 Team Fit' })
     .setTimestamp();
   if (!fits.length) {
     embed.addFields({ name: 'Recommended Fits', value: 'No matching free agents found yet.', inline: false });
