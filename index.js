@@ -5404,6 +5404,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
+        if (commandName === 'maddenfreeagents' || commandName === 'maddentransactions') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          const leagueName = interaction.options.getString('league');
+          const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+          if (!activeLeague) { await interaction.respond([]); return; }
+          if (focused?.name === 'team') {
+            const choices = await getMaddenTeamAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          if (focused?.name === 'position') {
+            const all = ['ALL','QB','HB','FB','WR','TE','OL','LT','LG','C','RG','RT','DL','LE','RE','DT','LB','LOLB','MLB','ROLB','DB','CB','FS','SS','K','P'];
+            const needle = String(focused.value || '').toUpperCase();
+            await interaction.respond(all.filter(p => !needle || p.includes(needle)).slice(0, 25).map(p => ({ name: p === 'ALL' ? 'All Positions' : p, value: p })));
+            return;
+          }
+          if (focused?.name === 'player') {
+            const rows = await getMaddenFreeAgentRows(interaction.guild.id, activeLeague.league_id, { limit: 300 });
+            const needle = String(focused.value || '').toLowerCase();
+            await interaction.respond(rows
+              .filter(row => !needle || String(row.player_name || '').toLowerCase().includes(needle))
+              .slice(0, 25)
+              .map(row => ({ name: `${row.player_name} • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`, value: row.player_name })));
+            return;
+          }
+        }
+
         if (commandName === 'maddennews') {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
@@ -6829,6 +6861,32 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('maddenfa:')) {
+      const [, action, leagueId, pageText, positionText, minOvrText] = interaction.customId.split(':');
+      await interaction.deferUpdate().catch(() => null);
+      const league = await getLeagueById(leagueId).catch(() => null);
+      if (!league || !interaction.guild) return;
+      const position = normalizeMaddenFreeAgentFilter(positionText);
+      const minOvr = Number(minOvrText || 0);
+      const page = action === 'filter' ? 0 : Math.max(0, Number(pageText || 0));
+      const panelRow = await pool.query(
+        `SELECT * FROM madden_free_agent_panels WHERE guild_id = $1 AND league_id = $2 AND message_id = $3 LIMIT 1`,
+        [String(interaction.guild.id), String(league.league_id), String(interaction.message?.id || '')]
+      ).catch(() => ({ rows: [] }));
+      if (panelRow.rows?.[0]) {
+        await updateMaddenFreeAgentPanelState(interaction.guild.id, league.league_id, { page, position, minOvr }).catch(() => null);
+      }
+      const payload = await buildMaddenFreeAgentsMessagePayload(interaction.guild.id, league, {
+        position,
+        minOvr,
+        limit: MADDEN_FREE_AGENT_PAGE_SIZE,
+        page,
+        userId: panelRow.rows?.[0] ? 'panel' : interaction.user.id,
+      });
+      await interaction.message.edit(payload).catch(() => null);
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('maddenfreeagents_page:')) {
       const [, token, direction] = interaction.customId.split(':');
       const session = maddenFreeAgentPaginationSessions.get(token);
@@ -6847,7 +6905,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       session.updatedAt = Date.now();
       maddenFreeAgentPaginationSessions.set(token, session);
       if (session.userId === 'panel') {
-        await updateMaddenFreeAgentPanelPage(session.guildId, session.leagueId, session.page).catch(() => null);
+        await updateMaddenFreeAgentPanelState(session.guildId, session.leagueId, { page: session.page, position: session.options?.position || null, minOvr: session.options?.minOvr || 0 }).catch(() => null);
       }
       const league = await getLeagueById(session.leagueId);
       if (!league) return;
@@ -27180,6 +27238,44 @@ function maddenFreeAgentRowPosition(row) {
   return normalizeMaddenFreeAgentPosition(row?.position || raw.position || raw.positionName || raw.playerPosition || raw.pos || raw.positionAbbr);
 }
 
+function normalizeMaddenFreeAgentFilter(value) {
+  const pos = normalizeMaddenFreeAgentPosition(value);
+  if (!pos || ['ALL', 'ANY', 'NONE', 'NULL'].includes(pos)) return null;
+  if (['OL', 'DL', 'LB', 'DB'].includes(pos)) return pos;
+  return pos;
+}
+
+function maddenFreeAgentPositionMatches(row, wantedPosition = null) {
+  const wanted = normalizeMaddenFreeAgentFilter(wantedPosition);
+  if (!wanted) return true;
+  const pos = maddenFreeAgentRowPosition(row);
+  if (!pos) return false;
+  const groups = {
+    OL: new Set(['LT', 'LG', 'C', 'RG', 'RT', 'OL']),
+    DL: new Set(['LE', 'RE', 'DT', 'DL', 'EDGE', 'LEDGE', 'REDGE']),
+    LB: new Set(['LOLB', 'MLB', 'ROLB', 'OLB', 'LB', 'MIKE', 'WILL', 'SAM']),
+    DB: new Set(['CB', 'FS', 'SS', 'DB']),
+  };
+  if (groups[wanted]) return groups[wanted].has(pos);
+  return pos === wanted;
+}
+
+function maddenFreeAgentPanelPositionButtons(leagueId, currentPosition = null, minOvr = 0) {
+  const current = normalizeMaddenFreeAgentFilter(currentPosition) || 'ALL';
+  const mk = (label, value) => new ButtonBuilder()
+    .setCustomId(`maddenfa:filter:${leagueId}:0:${value}:${Number(minOvr || 0)}`)
+    .setLabel(label)
+    .setStyle(current === value ? ButtonStyle.Primary : ButtonStyle.Secondary);
+  return [
+    new ActionRowBuilder().addComponents(
+      mk('All', 'ALL'), mk('QB', 'QB'), mk('HB', 'HB'), mk('WR', 'WR'), mk('TE', 'TE')
+    ),
+    new ActionRowBuilder().addComponents(
+      mk('OL', 'OL'), mk('DL', 'DL'), mk('LB', 'LB'), mk('DB', 'DB')
+    ),
+  ];
+}
+
 async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minOvr = 0, limit = 500 } = {}) {
   await ensureMaddenFreeAgencyTables();
   const wantedPosition = position ? normalizeMaddenFreeAgentPosition(position) : null;
@@ -27202,19 +27298,44 @@ async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minO
     params
   ).catch(() => ({ rows: [] }));
   let rows = result.rows || [];
-  if (wantedPosition) rows = rows.filter(row => maddenFreeAgentRowPosition(row) === wantedPosition);
+  if (wantedPosition) rows = rows.filter(row => maddenFreeAgentPositionMatches(row, wantedPosition));
   return rows.map(row => ({ ...row, position: maddenFreeAgentRowPosition(row) || row.position }));
 }
 
-function buildMaddenFreeAgentPaginationComponents(token, page, totalPages) {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`maddenfreeagents_page:${token}:prev`).setLabel('Previous').setEmoji('⬅️').setStyle(ButtonStyle.Secondary).setDisabled(Number(page || 0) <= 0),
-    new ButtonBuilder().setCustomId(`maddenfreeagents_page:${token}:next`).setLabel(`Next (${Number(page || 0) + 1}/${Math.max(1, totalPages)})`).setEmoji('➡️').setStyle(ButtonStyle.Primary).setDisabled(Number(page || 0) >= Math.max(1, totalPages) - 1)
+function buildMaddenFreeAgentPaginationComponents(token, page, totalPages, options = {}) {
+  const leagueId = options.leagueId;
+  const position = normalizeMaddenFreeAgentFilter(options.position) || 'ALL';
+  const minOvr = Number(options.minOvr || 0);
+  const currentPage = Number(page || 0);
+  const lastPage = Math.max(1, Number(totalPages || 1)) - 1;
+  const prevPage = Math.max(0, currentPage - 1);
+  const nextPage = Math.min(lastPage, currentPage + 1);
+  const prevId = leagueId
+    ? `maddenfa:page:${leagueId}:${prevPage}:${position}:${minOvr}`
+    : `maddenfreeagents_page:${token}:prev`;
+  const nextId = leagueId
+    ? `maddenfa:page:${leagueId}:${nextPage}:${position}:${minOvr}`
+    : `maddenfreeagents_page:${token}:next`;
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(prevId)
+      .setLabel(`Previous (${currentPage + 1}/${Math.max(1, totalPages)})`)
+      .setEmoji('⬅️')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage <= 0),
+    new ButtonBuilder()
+      .setCustomId(nextId)
+      .setLabel(`Next (${currentPage + 1}/${Math.max(1, totalPages)})`)
+      .setEmoji('➡️')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(currentPage >= lastPage)
   )];
+  if (leagueId) rows.push(...maddenFreeAgentPanelPositionButtons(leagueId, position, minOvr));
+  return rows;
 }
 
 function buildMaddenFreeAgentsEmbedFromRows(league, rows, options = {}) {
-  const position = options.position ? ` • ${String(options.position).toUpperCase()}` : '';
+  const position = normalizeMaddenFreeAgentFilter(options.position) ? ` • ${normalizeMaddenFreeAgentFilter(options.position)}` : '';
   const minText = options.minOvr ? ` • ${options.minOvr}+ OVR` : '';
   const page = Math.max(0, Number(options.page || 0));
   const pageSize = Math.min(Math.max(Number(options.pageSize || options.limit || MADDEN_FREE_AGENT_PAGE_SIZE), 5), 25);
@@ -27224,7 +27345,7 @@ function buildMaddenFreeAgentsEmbedFromRows(league, rows, options = {}) {
   const embed = new EmbedBuilder()
     .setTitle(`🧳 ${league.league_name} • Free Agents${position}${minText}`)
     .setColor(0x3498DB)
-    .setFooter({ text: `GG Sports • 7J-10BY-EA1 Free Agency Board • Page ${safePage + 1}/${totalPages}` })
+    .setFooter({ text: `GG Sports • 7J-10BY-EA2 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run `/madden sync`, then try again.');
@@ -27255,7 +27376,7 @@ async function buildMaddenFreeAgentsMessagePayload(guildId, league, options = {}
   });
   return {
     embeds: [buildMaddenFreeAgentsEmbedFromRows(league, rows, { ...options, page, pageSize })],
-    components: rows.length > pageSize ? buildMaddenFreeAgentPaginationComponents(token, page, totalPages) : [],
+    components: buildMaddenFreeAgentPaginationComponents(token, page, totalPages, { leagueId: league.league_id, position: options.position || null, minOvr: options.minOvr || 0 }),
   };
 }
 
@@ -27308,9 +27429,16 @@ async function postOrRefreshMaddenFreeAgentsPanel(guild, league, options = {}) {
   return { ok: true, message: `Live free agents board posted/refreshed in <#${channel.id}>.` };
 }
 
-async function updateMaddenFreeAgentPanelPage(guildId, leagueId, page = 0) {
+async function updateMaddenFreeAgentPanelState(guildId, leagueId, { page = 0, position = null, minOvr = 0 } = {}) {
   await ensureMaddenFreeAgencyTables();
-  await pool.query(`UPDATE madden_free_agent_panels SET page = $3, updated_at = NOW() WHERE guild_id = $1 AND league_id = $2`, [String(guildId), String(leagueId), Number(page || 0)]).catch(() => null);
+  await pool.query(
+    `UPDATE madden_free_agent_panels SET page = $3, position = $4, min_ovr = $5, updated_at = NOW() WHERE guild_id = $1 AND league_id = $2`,
+    [String(guildId), String(leagueId), Number(page || 0), normalizeMaddenFreeAgentFilter(position), Number(minOvr || 0)]
+  ).catch(() => null);
+}
+
+async function updateMaddenFreeAgentPanelPage(guildId, leagueId, page = 0) {
+  return updateMaddenFreeAgentPanelState(guildId, leagueId, { page });
 }
 
 async function refreshMaddenFreeAgentsPanelForLeague(guild, league) {
