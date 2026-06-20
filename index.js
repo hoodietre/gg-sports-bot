@@ -576,6 +576,28 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_team_cap ADD COLUMN IF NOT EXISTS player_count INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_team_cap_league_space ON madden_team_cap (guild_id, league_id, cap_space DESC)`);
 
+  // 7J-10BY-E: Free Agency & Transactions Center foundation.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_transactions (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      player_id TEXT,
+      player_name TEXT,
+      team_name TEXT,
+      old_team_name TEXT,
+      new_team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_transactions ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_recent ON madden_transactions (guild_id, league_id, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_team ON madden_transactions (guild_id, league_id, team_name, created_at DESC)`);
+
 
   // 7J-10BW: User-controlled Madden trade block storage.
   // GMs can list their own roster players, remove them, and browse team/league-wide blocks.
@@ -1729,6 +1751,58 @@ function buildCommands() {
         .setDescription('Staff: generate missing offseason news and post year-end history report')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addBooleanOption(o => o.setName('confirm').setDescription('Actually post to news/history channels? Leave false for preview.').setRequired(false))),
+
+    new SlashCommandBuilder()
+      .setName('maddenfreeagents')
+      .setDescription('Madden offseason free agency board and team fit tools')
+      .addSubcommand(sc => sc
+        .setName('list')
+        .setDescription('Show available Madden free agents')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('position').setDescription('Optional position filter').setRequired(false)
+          .addChoices(
+            { name: 'QB', value: 'QB' }, { name: 'HB', value: 'HB' }, { name: 'FB', value: 'FB' },
+            { name: 'WR', value: 'WR' }, { name: 'TE', value: 'TE' },
+            { name: 'LT', value: 'LT' }, { name: 'LG', value: 'LG' }, { name: 'C', value: 'C' }, { name: 'RG', value: 'RG' }, { name: 'RT', value: 'RT' },
+            { name: 'LE', value: 'LE' }, { name: 'RE', value: 'RE' }, { name: 'DT', value: 'DT' },
+            { name: 'LOLB', value: 'LOLB' }, { name: 'MLB', value: 'MLB' }, { name: 'ROLB', value: 'ROLB' },
+            { name: 'CB', value: 'CB' }, { name: 'FS', value: 'FS' }, { name: 'SS', value: 'SS' },
+            { name: 'K', value: 'K' }, { name: 'P', value: 'P' }
+          ))
+        .addIntegerOption(o => o.setName('min_ovr').setDescription('Minimum overall').setRequired(false).setMinValue(0).setMaxValue(99))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of players to show').setRequired(false).setMinValue(5).setMaxValue(25)))
+      .addSubcommand(sc => sc
+        .setName('top')
+        .setDescription('Show the top Madden free agents overall')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of players to show').setRequired(false).setMinValue(5).setMaxValue(25)))
+      .addSubcommand(sc => sc
+        .setName('teamfit')
+        .setDescription('Show free agents who fit one team needs/cap situation')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('position').setDescription('Optional position filter').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of fits to show').setRequired(false).setMinValue(5).setMaxValue(25))),
+
+    new SlashCommandBuilder()
+      .setName('maddentransactions')
+      .setDescription('Madden offseason transaction tracker')
+      .addSubcommand(sc => sc
+        .setName('recent')
+        .setDescription('Show recent Madden roster/free agency transactions')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of transactions to show').setRequired(false).setMinValue(5).setMaxValue(25)))
+      .addSubcommand(sc => sc
+        .setName('team')
+        .setDescription('Show transactions for one Madden team')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of transactions to show').setRequired(false).setMinValue(5).setMaxValue(25)))
+      .addSubcommand(sc => sc
+        .setName('scan')
+        .setDescription('Staff: scan imported offseason data and generate transaction summary events')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('confirm').setDescription('Save detected events? Leave false for preview.').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('maddenchanges')
@@ -8475,6 +8549,69 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
     }
 
 
+
+
+    if (interaction.commandName === 'maddenfreeagents') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      if (subcommand === 'list' || subcommand === 'top') {
+        const position = subcommand === 'list' ? interaction.options.getString('position') : null;
+        const minOvr = subcommand === 'list' ? interaction.options.getInteger('min_ovr') : null;
+        const limit = interaction.options.getInteger('limit') || 20;
+        await interaction.editReply({ embeds: [await buildMaddenFreeAgentsEmbed(interaction.guild.id, activeLeague, { position, minOvr, limit })] });
+        return;
+      }
+      if (subcommand === 'teamfit') {
+        const team = interaction.options.getString('team');
+        const position = interaction.options.getString('position') || null;
+        const limit = interaction.options.getInteger('limit') || 12;
+        await interaction.editReply({ embeds: [await buildMaddenFreeAgentTeamFitEmbed(interaction.guild.id, activeLeague, team, position, limit)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden free agency command.' });
+      return;
+    }
+
+    if (interaction.commandName === 'maddentransactions') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      if (subcommand === 'recent') {
+        const limit = interaction.options.getInteger('limit') || 15;
+        await interaction.editReply({ embeds: [await buildMaddenTransactionsRecentEmbed(interaction.guild.id, activeLeague, { limit })] });
+        return;
+      }
+      if (subcommand === 'team') {
+        const team = interaction.options.getString('team');
+        const limit = interaction.options.getInteger('limit') || 15;
+        await interaction.editReply({ embeds: [await buildMaddenTransactionsRecentEmbed(interaction.guild.id, activeLeague, { team, limit })] });
+        return;
+      }
+      if (subcommand === 'scan') {
+        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
+        await interaction.editReply({ embeds: [await buildMaddenTransactionsScanEmbed(interaction.guild.id, activeLeague, confirm)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden transactions command.' });
+      return;
+    }
 
     if (interaction.commandName === 'maddenseason') {
       if (!interaction.guild) return;
@@ -26860,6 +26997,214 @@ function estimateMaddenTradeCapImpactForPackage(packageData = {}) {
   const sendCap = [...(packageData.players || []), ...(packageData.picks || [])].reduce((sum, item) => sum + Number(item.cap_hit || item.capHit || 0), 0);
   const receiveCap = [...(packageData.target_players || []), ...(packageData.target_picks || [])].reduce((sum, item) => sum + Number(item.cap_hit || item.capHit || 0), 0);
   return { sendCap, receiveCap, netCap: receiveCap - sendCap };
+}
+
+
+async function ensureMaddenFreeAgencyTables() {
+  await ensureMaddenFranchiseDataTables().catch(() => null);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_transactions (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      player_id TEXT,
+      player_name TEXT,
+      team_name TEXT,
+      old_team_name TEXT,
+      new_team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_recent ON madden_transactions (guild_id, league_id, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_team ON madden_transactions (guild_id, league_id, team_name, created_at DESC)`);
+}
+
+function maddenFreeAgencyRaw(row) {
+  return maddenBydRaw(row?.raw_payload || row?.attributes || {});
+}
+
+function isMaddenFreeAgentRow(row) {
+  const raw = maddenFreeAgencyRaw(row);
+  return Boolean(
+    raw.isFreeAgent === true || raw.isFreeAgent === 'true' || raw.isFreeAgent === 1 ||
+    raw.freeAgent === true || raw.freeAgent === 'true' || raw.isFA === true ||
+    isMaddenFreeAgentTeamName(row?.team_name) || String(row?.contract_status || '').toLowerCase().includes('free')
+  );
+}
+
+function maddenFreeAgentDemand(row) {
+  const raw = maddenFreeAgencyRaw(row);
+  const salary = Number(row?.salary || raw.desiredSalary || raw.contractSalary || 0);
+  const bonus = Number(row?.bonus || raw.desiredBonus || raw.contractBonus || 0);
+  const cap = Number(row?.cap_hit || raw.capHit || 0);
+  return Math.max(salary, cap, 0) + Math.max(bonus, 0);
+}
+
+function formatMaddenFreeAgentLine(row, index = 0, showPreviousTeam = true) {
+  const attrs = maddenBydRaw(row.attributes);
+  const raw = maddenFreeAgencyRaw(row);
+  const priorTeam = raw.lastTeam || raw.previousTeam || raw.prevTeam || row.old_team_name || row.team_name;
+  const demand = maddenFreeAgentDemand(row);
+  const ageText = row.age ? ` • Age ${row.age}` : '';
+  const valueText = row.value_score ? ` • Value ${Number(row.value_score).toFixed(0)}` : '';
+  const moneyText = demand > 0 ? ` • Est. ${formatMaddenMoney(demand)}` : '';
+  const topAttr = attrs.speed ? ` • SPD ${attrs.speed}` : attrs.awareness ? ` • AWR ${attrs.awareness}` : '';
+  const teamText = showPreviousTeam && priorTeam && !isMaddenFreeAgentTeamName(priorTeam) ? ` — ${maddenTeamDisplayName(priorTeam)}` : '';
+  return `**${index + 1}. ${row.player_name}**${teamText}\n${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${ageText}${topAttr}${valueText}${moneyText}`;
+}
+
+async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minOvr = 0, limit = 20 } = {}) {
+  await ensureMaddenFreeAgencyTables();
+  const params = [String(guildId), String(leagueId), Number(minOvr || 0)];
+  let positionSql = '';
+  if (position) {
+    params.push(String(position).toUpperCase());
+    positionSql = `AND UPPER(position) = $${params.length}`;
+  }
+  params.push(Math.min(Math.max(Number(limit || 20), 5), 100));
+  const result = await pool.query(
+    `SELECT a.*, COALESCE(v.value_score, 0) AS value_score
+     FROM madden_player_attributes a
+     LEFT JOIN madden_player_values v
+       ON v.guild_id = a.guild_id AND v.league_id = a.league_id AND v.player_id = a.player_id
+     WHERE a.guild_id = $1 AND a.league_id = $2 AND COALESCE(a.overall, 0) >= $3
+       ${positionSql}
+       AND (
+         LOWER(COALESCE(a.team_name, '')) IN ('fa','free agent','free agents','freeagent')
+         OR COALESCE(a.raw_payload->>'isFreeAgent','false') IN ('true','1','True')
+         OR COALESCE(a.raw_payload->>'isFA','false') IN ('true','1','True')
+         OR LOWER(COALESCE(a.contract_status, '')) LIKE '%free%'
+       )
+     ORDER BY a.overall DESC NULLS LAST, COALESCE(v.value_score, 0) DESC, a.cap_hit DESC NULLS LAST, a.player_name ASC
+     LIMIT $${params.length}`,
+    params
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+async function buildMaddenFreeAgentsEmbed(guildId, league, options = {}) {
+  await backfillMaddenExpandedPlayerDataForLeague(guildId, league.league_id).catch(() => null);
+  const rows = await getMaddenFreeAgentRows(guildId, league.league_id, options);
+  const position = options.position ? ` • ${String(options.position).toUpperCase()}` : '';
+  const minText = options.minOvr ? ` • ${options.minOvr}+ OVR` : '';
+  const embed = new EmbedBuilder()
+    .setTitle(`🧳 ${league.league_name} • Free Agents${position}${minText}`)
+    .setColor(0x3498DB)
+    .setFooter({ text: 'GG Sports • 7J-10BY-E Free Agency Board' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run `/madden sync`, then try again.');
+    return embed;
+  }
+  embed.setDescription(rows.map((row, i) => formatMaddenFreeAgentLine(row, i)).join('\n\n').slice(0, 4096));
+  return embed;
+}
+
+async function buildMaddenFreeAgentTeamFitEmbed(guildId, league, teamInput, position = null, limit = 12) {
+  await backfillMaddenExpandedPlayerDataForLeague(guildId, league.league_id).catch(() => null);
+  await refreshMaddenTeamCapFromExpandedPlayers(guildId, league.league_id).catch(() => null);
+  const ctx = await getMaddenBydeTeamContext(guildId, league.league_id, teamInput);
+  const capResult = await pool.query(
+    `SELECT * FROM madden_team_cap WHERE guild_id = $1 AND league_id = $2 AND (LOWER(team_name) = LOWER($3) OR LOWER(team_name) = LOWER($4)) LIMIT 1`,
+    [String(guildId), String(league.league_id), ctx.rawTeamName || teamInput, ctx.teamName || teamInput]
+  ).catch(() => ({ rows: [] }));
+  const capSpace = Number(capResult.rows?.[0]?.cap_space || 0);
+  const rows = await getMaddenFreeAgentRows(guildId, league.league_id, { position, minOvr: 0, limit: Math.max(limit * 2, 25) });
+  const fits = rows.map(row => {
+    const demand = maddenFreeAgentDemand(row);
+    const fitScore = Number(row.overall || 0) + (Number(row.value_score || 0) / 100) + (capSpace >= demand ? 10 : -15) - Math.max(0, Number(row.age || 0) - 28);
+    return { ...row, demand, fitScore };
+  }).sort((a, b) => b.fitScore - a.fitScore).slice(0, Math.min(Math.max(Number(limit || 12), 5), 25));
+  const embed = new EmbedBuilder()
+    .setTitle(`🧩 ${ctx.displayName || maddenTeamDisplayName(teamInput)} • Free Agent Fits`)
+    .setColor(capSpace < 0 ? 0xED4245 : 0x57F287)
+    .addFields({ name: 'Cap Snapshot', value: capResult.rows?.[0] ? `Cap Space: **${formatMaddenMoney(capSpace)}**\nStatus: ${capSpace < 0 ? '🚨 Over Cap' : '✅ Under Cap'}` : 'No team cap snapshot found.', inline: false })
+    .setFooter({ text: 'GG Sports • 7J-10BY-E Team Fit' })
+    .setTimestamp();
+  if (!fits.length) {
+    embed.addFields({ name: 'Recommended Fits', value: 'No matching free agents found yet.', inline: false });
+  } else {
+    embed.addFields({ name: 'Recommended Fits', value: maddenSafeEmbedText(fits.map((row, i) => `${formatMaddenFreeAgentLine(row, i, false)}\nFit: **${row.fitScore.toFixed(1)}**${row.demand > 0 ? ` • Est. Cost ${formatMaddenMoney(row.demand)}` : ''}`).join('\n\n'), 4096), inline: false });
+  }
+  const logo = getMaddenTeamLogoUrl(ctx.teamName) || getMaddenTeamLogoUrl(teamInput);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function scanMaddenOffseasonTransactions(guildId, league, confirm = false) {
+  await ensureMaddenFreeAgencyTables();
+  await backfillMaddenExpandedPlayerDataForLeague(guildId, league.league_id).catch(() => null);
+  const faRows = await getMaddenFreeAgentRows(guildId, league.league_id, { limit: 25 });
+  const expiring = await getMaddenExpiringContractRows(guildId, league.league_id, null, 15).catch(() => []);
+  const rows = [];
+  for (const row of faRows.slice(0, 15)) {
+    rows.push({ event_type: 'free_agent_available', player_id: row.player_id, player_name: row.player_name, team_name: 'FA', old_team_name: row.team_name, new_team_name: 'FA', position: row.position, overall: row.overall, metadata: { cap_hit: row.cap_hit, age: row.age } });
+  }
+  for (const row of (expiring || []).slice(0, 10)) {
+    rows.push({ event_type: 'expiring_contract', player_id: row.player_id, player_name: row.player_name, team_name: row.team_name, old_team_name: row.team_name, new_team_name: row.team_name, position: row.position, overall: row.overall, metadata: { cap_hit: row.cap_hit, years_left: row.years_left } });
+  }
+  if (confirm && rows.length) {
+    for (const row of rows) {
+      await pool.query(
+        `INSERT INTO madden_transactions (id, guild_id, league_id, event_type, player_id, player_name, team_name, old_team_name, new_team_name, position, overall, metadata)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [randomUUID(), String(guildId), String(league.league_id), row.event_type, row.player_id || null, row.player_name || null, row.team_name || null, row.old_team_name || null, row.new_team_name || null, row.position || null, row.overall || null, row.metadata || {}]
+      ).catch(() => null);
+    }
+  }
+  return rows;
+}
+
+function formatMaddenTransactionLine(row, index = 0) {
+  const eventLabel = row.event_type === 'free_agent_available' ? '🧳 Free Agent' : row.event_type === 'expiring_contract' ? '📄 Expiring' : row.event_type === 'signed' ? '✍️ Signed' : row.event_type === 'released' ? '✂️ Released' : '🔄 Transaction';
+  const team = row.new_team_name || row.team_name || row.old_team_name || '';
+  const teamText = team ? ` • ${maddenTeamDisplayName(team)}` : '';
+  return `**${index + 1}. ${eventLabel}: ${row.player_name || 'Player'}**${teamText}\n${maddenFormatPositionOverall(row.position, row.overall)}`;
+}
+
+async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null, limit = 15 } = {}) {
+  await ensureMaddenFreeAgencyTables();
+  const params = [String(guildId), String(league.league_id)];
+  let teamSql = '';
+  if (team) {
+    const ctx = await getMaddenBydeTeamContext(guildId, league.league_id, team);
+    const candidates = [team, ctx.teamName, ctx.rawTeamName, ctx.externalTeamId, getMaddenTeamAbbrev(ctx.teamName)].filter(Boolean).map(v => String(v).toLowerCase());
+    params.push(candidates);
+    teamSql = `AND (LOWER(COALESCE(team_name,'')) = ANY($${params.length}::text[]) OR LOWER(COALESCE(old_team_name,'')) = ANY($${params.length}::text[]) OR LOWER(COALESCE(new_team_name,'')) = ANY($${params.length}::text[]))`;
+  }
+  params.push(Math.min(Math.max(Number(limit || 15), 5), 25));
+  const result = await pool.query(
+    `SELECT * FROM madden_transactions WHERE guild_id = $1 AND league_id = $2 ${teamSql} ORDER BY created_at DESC LIMIT $${params.length}`,
+    params
+  ).catch(() => ({ rows: [] }));
+  const titleTeam = team ? ` • ${maddenTeamDisplayName(team)}` : '';
+  const embed = new EmbedBuilder()
+    .setTitle(`🔄 ${league.league_name}${titleTeam} • Transactions`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • 7J-10BY-E Transactions' })
+    .setTimestamp();
+  if (!result.rows.length) {
+    embed.setDescription('No saved transaction events yet. Run `/maddentransactions scan confirm:true` after an offseason sync to seed the transaction feed.');
+    return embed;
+  }
+  embed.setDescription(result.rows.map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n').slice(0, 4096));
+  return embed;
+}
+
+async function buildMaddenTransactionsScanEmbed(guildId, league, confirm = false) {
+  const rows = await scanMaddenOffseasonTransactions(guildId, league, confirm);
+  const embed = new EmbedBuilder()
+    .setTitle(`🔎 ${league.league_name} • Offseason Transaction Scan`)
+    .setColor(confirm ? 0x57F287 : 0xFEE75C)
+    .setDescription(confirm ? `Saved **${rows.length}** transaction seed events.` : `Preview found **${rows.length}** transaction seed events. Rerun with \`confirm:true\` to save them.`)
+    .setFooter({ text: 'GG Sports • 7J-10BY-E Transaction Scan' })
+    .setTimestamp();
+  if (rows.length) embed.addFields({ name: 'Detected Events', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n'), 1024), inline: false });
+  return embed;
 }
 
 async function ensureMaddenNewsTables() {
