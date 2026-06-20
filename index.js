@@ -27198,8 +27198,26 @@ async function ensureMaddenFreeAgencyTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE madden_transactions ADD COLUMN IF NOT EXISTS transaction_key TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_madden_transactions_unique_key ON madden_transactions (guild_id, league_id, transaction_key) WHERE transaction_key IS NOT NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_recent ON madden_transactions (guild_id, league_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_team ON madden_transactions (guild_id, league_id, team_name, created_at DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_player_team_snapshots (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      player_id TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      is_free_agent BOOLEAN NOT NULL DEFAULT FALSE,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, player_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_player_team_snapshots_team ON madden_player_team_snapshots (guild_id, league_id, team_name)`);
 }
 
 function maddenFreeAgencyRaw(row) {
@@ -27609,7 +27627,7 @@ async function buildMaddenFreeAgentTeamFitEmbed(guildId, league, teamInput, posi
     .setTitle(`🧩 ${ctx.displayName || maddenTeamDisplayName(teamInput)} • Free Agent Fits`)
     .setColor(capSpace < 0 ? 0xED4245 : 0x57F287)
     .addFields({ name: 'Cap Snapshot', value: capResult.rows?.[0] ? `Cap Space: **${formatMaddenMoney(capSpace)}**\nStatus: ${capSpace < 0 ? '🚨 Over Cap' : '✅ Under Cap'}` : 'No team cap snapshot found.', inline: false })
-    .setFooter({ text: 'GG Sports • 7J-10BY-EA5 Team Fit' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EB Team Fit' })
     .setTimestamp();
   if (!fits.length) {
     embed.addFields({ name: 'Recommended Fits', value: 'No matching free agents found yet.', inline: false });
@@ -27621,35 +27639,164 @@ async function buildMaddenFreeAgentTeamFitEmbed(guildId, league, teamInput, posi
   return embed;
 }
 
+
+function maddenTransactionPlayerKey(row = {}) {
+  return String(row.player_id || row.external_player_id || row.player_key || row.id || row.player_name || '').trim().toLowerCase();
+}
+
+function maddenTransactionTeamKey(team = '') {
+  return normalizeMaddenTeamName(team || '').toLowerCase();
+}
+
+function buildMaddenTransactionKey(row = {}) {
+  const playerKey = String(row.player_id || row.player_name || 'player').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 80);
+  const event = String(row.event_type || 'transaction').toLowerCase();
+  const oldTeam = String(row.old_team_name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40);
+  const newTeam = String(row.new_team_name || row.team_name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40);
+  return `${event}:${playerKey}:${oldTeam}:${newTeam}`.slice(0, 240);
+}
+
+function classifyMaddenRosterMovement(previous = {}, current = {}) {
+  const oldTeam = previous.team_name || null;
+  const newTeam = current.team_name || null;
+  const oldFa = previous.is_free_agent === true || isMaddenFreeAgentTeamName(oldTeam);
+  const newFa = isMaddenFreeAgentRow(current) || isMaddenFreeAgentTeamName(newTeam);
+  const oldKey = maddenTransactionTeamKey(oldTeam);
+  const newKey = maddenTransactionTeamKey(newTeam);
+  if (oldFa && !newFa) return 'signed';
+  if (!oldFa && newFa) return 'released';
+  if (!oldFa && !newFa && oldKey && newKey && oldKey !== newKey) return 'team_change';
+  return null;
+}
+
+async function getMaddenPreviousTransactionSnapshot(guildId, leagueId) {
+  await ensureMaddenFreeAgencyTables();
+  const snapshot = await pool.query(
+    `SELECT * FROM madden_player_team_snapshots WHERE guild_id = $1 AND league_id = $2`,
+    [String(guildId), String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  const map = new Map();
+  for (const row of snapshot.rows || []) {
+    const key = maddenTransactionPlayerKey(row);
+    if (key) map.set(key, row);
+  }
+
+  if (!map.size) {
+    const seeded = await pool.query(
+      `SELECT DISTINCT ON (COALESCE(player_id, player_name)) player_id, player_name, position, overall, old_team_name, new_team_name, team_name, created_at
+       FROM madden_transactions
+       WHERE guild_id = $1 AND league_id = $2 AND event_type IN ('free_agent_available','released')
+       ORDER BY COALESCE(player_id, player_name), created_at DESC`,
+      [String(guildId), String(leagueId)]
+    ).catch(() => ({ rows: [] }));
+    for (const row of seeded.rows || []) {
+      const key = maddenTransactionPlayerKey(row);
+      if (!key) continue;
+      map.set(key, {
+        player_id: row.player_id || row.player_name,
+        player_name: row.player_name,
+        team_name: 'FA',
+        position: row.position,
+        overall: row.overall,
+        is_free_agent: true,
+      });
+    }
+  }
+  return map;
+}
+
+async function saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRows = []) {
+  await ensureMaddenFreeAgencyTables();
+  for (const row of currentRows || []) {
+    const playerId = String(row.player_id || row.external_player_id || row.id || row.player_name || '').trim();
+    if (!playerId || !row.player_name) continue;
+    const teamName = normalizeMaddenTeamName(row.team_name || null) || row.team_name || null;
+    await pool.query(
+      `INSERT INTO madden_player_team_snapshots (guild_id, league_id, player_id, player_name, team_name, position, overall, is_free_agent, raw_payload, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+       ON CONFLICT (guild_id, league_id, player_id)
+       DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, is_free_agent = EXCLUDED.is_free_agent, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
+      [String(guildId), String(leagueId), playerId, row.player_name, teamName, maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row), isMaddenFreeAgentRow(row), row.raw_payload || {}]
+    ).catch(() => null);
+  }
+}
+
+async function getMaddenCurrentTransactionRows(guildId, leagueId) {
+  await backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId).catch(() => null);
+  const result = await pool.query(
+    `SELECT player_id, player_name, team_name, position, overall, age, cap_hit, salary, bonus, contract_status, attributes, raw_payload
+     FROM madden_player_attributes
+     WHERE guild_id = $1 AND league_id = $2
+     ORDER BY player_name ASC`,
+    [String(guildId), String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
 async function scanMaddenOffseasonTransactions(guildId, league, confirm = false) {
   await ensureMaddenFreeAgencyTables();
-  await backfillMaddenExpandedPlayerDataForLeague(guildId, league.league_id).catch(() => null);
-  const faRows = await getMaddenFreeAgentRows(guildId, league.league_id, { limit: 25 });
-  const expiring = await getMaddenExpiringContractRows(guildId, league.league_id, null, 15).catch(() => []);
+  const leagueId = String(league.league_id);
+  const currentRows = await getMaddenCurrentTransactionRows(guildId, leagueId);
+  const previousMap = await getMaddenPreviousTransactionSnapshot(guildId, leagueId);
   const rows = [];
-  for (const row of faRows.slice(0, 15)) {
-    rows.push({ event_type: 'free_agent_available', player_id: row.player_id, player_name: row.player_name, team_name: 'FA', old_team_name: row.team_name, new_team_name: 'FA', position: row.position, overall: row.overall, metadata: { cap_hit: row.cap_hit, age: row.age } });
+
+  for (const current of currentRows) {
+    const key = maddenTransactionPlayerKey(current);
+    if (!key) continue;
+    const previous = previousMap.get(key);
+    if (!previous) continue;
+    const eventType = classifyMaddenRosterMovement(previous, current);
+    if (!eventType) continue;
+    const oldTeam = previous.team_name || null;
+    const newTeam = normalizeMaddenTeamName(current.team_name || null) || current.team_name || null;
+    rows.push({
+      event_type: eventType,
+      player_id: current.player_id || current.external_player_id || current.id || current.player_name,
+      player_name: current.player_name,
+      team_name: eventType === 'released' ? 'FA' : newTeam,
+      old_team_name: oldTeam,
+      new_team_name: eventType === 'released' ? 'FA' : newTeam,
+      position: maddenFreeAgentRowPosition(current) || current.position,
+      overall: maddenFreeAgentOverall(current),
+      metadata: { source: 'sync_detection', age: current.age || null, cap_hit: current.cap_hit || null, previous_team: oldTeam, current_team: newTeam },
+    });
   }
-  for (const row of (expiring || []).slice(0, 10)) {
-    rows.push({ event_type: 'expiring_contract', player_id: row.player_id, player_name: row.player_name, team_name: row.team_name, old_team_name: row.team_name, new_team_name: row.team_name, position: row.position, overall: row.overall, metadata: { cap_hit: row.cap_hit, years_left: row.years_left } });
+
+  if (!rows.length && !previousMap.size) {
+    const faRows = await getMaddenFreeAgentRows(guildId, league.league_id, { limit: 25 });
+    const expiring = await getMaddenExpiringContractRows(guildId, league.league_id, null, 15).catch(() => []);
+    for (const row of faRows.slice(0, 15)) rows.push({ event_type: 'free_agent_available', player_id: row.player_id, player_name: row.player_name, team_name: 'FA', old_team_name: row.team_name, new_team_name: 'FA', position: row.position, overall: maddenFreeAgentOverall(row), metadata: { source: 'bootstrap', cap_hit: row.cap_hit, age: row.age } });
+    for (const row of (expiring || []).slice(0, 10)) rows.push({ event_type: 'expiring_contract', player_id: row.player_id, player_name: row.player_name, team_name: row.team_name, old_team_name: row.team_name, new_team_name: row.team_name, position: row.position, overall: row.overall, metadata: { source: 'bootstrap', cap_hit: row.cap_hit, years_left: row.years_left } });
   }
-  if (confirm && rows.length) {
+
+  if (confirm) {
     for (const row of rows) {
+      const transactionKey = buildMaddenTransactionKey(row);
       await pool.query(
-        `INSERT INTO madden_transactions (id, guild_id, league_id, event_type, player_id, player_name, team_name, old_team_name, new_team_name, position, overall, metadata)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [randomUUID(), String(guildId), String(league.league_id), row.event_type, row.player_id || null, row.player_name || null, row.team_name || null, row.old_team_name || null, row.new_team_name || null, row.position || null, row.overall || null, row.metadata || {}]
+        `INSERT INTO madden_transactions (id, guild_id, league_id, event_type, player_id, player_name, team_name, old_team_name, new_team_name, position, overall, metadata, transaction_key)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (guild_id, league_id, transaction_key) WHERE transaction_key IS NOT NULL DO NOTHING`,
+        [randomUUID(), String(guildId), leagueId, row.event_type, row.player_id || null, row.player_name || null, row.team_name || null, row.old_team_name || null, row.new_team_name || null, row.position || null, row.overall || null, row.metadata || {}, transactionKey]
       ).catch(() => null);
     }
+    await saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRows);
+    invalidateMaddenFreeAgentRowsCache(String(guildId), leagueId);
   }
   return rows;
 }
 
 function formatMaddenTransactionLine(row, index = 0) {
-  const eventLabel = row.event_type === 'free_agent_available' ? '🧳 Free Agent' : row.event_type === 'expiring_contract' ? '📄 Expiring' : row.event_type === 'signed' ? '✍️ Signed' : row.event_type === 'released' ? '✂️ Released' : '🔄 Transaction';
-  const team = row.new_team_name || row.team_name || row.old_team_name || '';
-  const teamText = team ? ` • ${maddenTeamDisplayName(team)}` : '';
-  return `**${index + 1}. ${eventLabel}: ${row.player_name || 'Player'}**${teamText}\n${maddenFormatPositionOverall(row.position, row.overall)}`;
+  const eventLabel = row.event_type === 'free_agent_available' ? '🧳 Free Agent' : row.event_type === 'expiring_contract' ? '📄 Expiring' : row.event_type === 'signed' ? '✍️ Signed' : row.event_type === 'released' ? '✂️ Released' : row.event_type === 'team_change' ? '🔄 Team Change' : '🔄 Transaction';
+  let movement = '';
+  if (row.event_type === 'signed') movement = `FA → ${maddenTeamDisplayName(row.new_team_name || row.team_name || '')}`;
+  else if (row.event_type === 'released') movement = `${maddenTeamDisplayName(row.old_team_name || row.team_name || '')} → FA`;
+  else if (row.event_type === 'team_change') movement = `${maddenTeamDisplayName(row.old_team_name || '')} → ${maddenTeamDisplayName(row.new_team_name || row.team_name || '')}`;
+  else {
+    const team = row.new_team_name || row.team_name || row.old_team_name || '';
+    movement = team ? maddenTeamDisplayName(team) : '';
+  }
+  const moveText = movement ? ` • ${movement}` : '';
+  return `**${index + 1}. ${eventLabel}: ${row.player_name || 'Player'}**${moveText}\n${maddenFormatPositionOverall(row.position, row.overall)}`;
 }
 
 async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null, limit = 15 } = {}) {
@@ -27671,7 +27818,7 @@ async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null
   const embed = new EmbedBuilder()
     .setTitle(`🔄 ${league.league_name}${titleTeam} • Transactions`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-EA1 Transactions' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EB Transactions' })
     .setTimestamp();
   if (!result.rows.length) {
     embed.setDescription('No saved transaction events yet. Run `/maddentransactions scan confirm:true` after an offseason sync to seed the transaction feed.');
@@ -27687,7 +27834,7 @@ async function buildMaddenTransactionsScanEmbed(guildId, league, confirm = false
     .setTitle(`🔎 ${league.league_name} • Offseason Transaction Scan`)
     .setColor(confirm ? 0x57F287 : 0xFEE75C)
     .setDescription(confirm ? `Saved **${rows.length}** transaction seed events.` : `Preview found **${rows.length}** transaction seed events. Rerun with \`confirm:true\` to save them.`)
-    .setFooter({ text: 'GG Sports • 7J-10BY-EA1 Transaction Scan' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EB Sync Detection' })
     .setTimestamp();
   if (rows.length) embed.addFields({ name: 'Detected Events', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n'), 1024), inline: false });
   return embed;
