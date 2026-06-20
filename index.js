@@ -6833,13 +6833,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const [, token, direction] = interaction.customId.split(':');
       const session = maddenFreeAgentPaginationSessions.get(token);
       if (!session) {
-        await interaction.reply({ content: 'This free agents board page has expired. Run `/maddenfreeagents list` again.', ephemeral: true });
+        await interaction.reply({ content: 'This free agents board page has expired. Run `/maddenfreeagents list` again.', ephemeral: true }).catch(() => null);
         return;
       }
       if (session.userId && session.userId !== 'panel' && session.userId !== interaction.user.id) {
-        await interaction.reply({ content: 'Only the user who opened this free agents list can change pages.', ephemeral: true });
+        await interaction.reply({ content: 'Only the user who opened this free agents list can change pages.', ephemeral: true }).catch(() => null);
         return;
       }
+      await interaction.deferUpdate().catch(() => null);
       const totalPages = Math.max(1, Math.ceil(Number(session.totalRows || 0) / Number(session.pageSize || MADDEN_FREE_AGENT_PAGE_SIZE)));
       if (direction === 'next') session.page = Math.min(totalPages - 1, Number(session.page || 0) + 1);
       if (direction === 'prev') session.page = Math.max(0, Number(session.page || 0) - 1);
@@ -6849,12 +6850,9 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await updateMaddenFreeAgentPanelPage(session.guildId, session.leagueId, session.page).catch(() => null);
       }
       const league = await getLeagueById(session.leagueId);
-      if (!league) {
-        await interaction.reply({ content: 'League not found for this free agents page.', ephemeral: true });
-        return;
-      }
+      if (!league) return;
       const payload = await buildMaddenFreeAgentsMessagePayload(interaction.guild.id, league, { ...session.options, page: session.page, userId: session.userId, token });
-      await interaction.update(payload);
+      await interaction.message.edit(payload).catch(() => null);
       return;
     }
 
@@ -27159,14 +27157,33 @@ function formatMaddenFreeAgentLine(row, index = 0, showPreviousTeam = true) {
   return `**${index + 1}. ${row.player_name}**${teamText}\n${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${ageText}${topAttr}${valueText}${moneyText}`;
 }
 
+function normalizeMaddenFreeAgentPosition(value) {
+  const raw = String(value || '').trim().toUpperCase();
+  const compact = raw.replace(/[^A-Z0-9]/g, '');
+  const aliases = {
+    HALF_BACK: 'HB', RUNNINGBACK: 'HB', RUNNING_BACK: 'HB', RB: 'HB', HB: 'HB',
+    WIDERECEIVER: 'WR', WIDE_RECEIVER: 'WR', RECEIVER: 'WR', WR: 'WR',
+    TIGHTEND: 'TE', TIGHT_END: 'TE', TE: 'TE',
+    CENTER: 'C', C: 'C',
+    LEFTTACKLE: 'LT', RIGHTTACKLE: 'RT', LEFTGUARD: 'LG', RIGHTGUARD: 'RG',
+    LEFTEND: 'LE', RIGHTEND: 'RE', DEFENSIVETACKLE: 'DT',
+    MIDDLELINEBACKER: 'MLB', LEFTOUTSIDELINEBACKER: 'LOLB', RIGHTOUTSIDELINEBACKER: 'ROLB',
+    OUTSIDELINEBACKER: 'OLB', LINEBACKER: 'LB',
+    CORNERBACK: 'CB', FREESAFETY: 'FS', STRONGSAFETY: 'SS',
+    QUARTERBACK: 'QB', FULLBACK: 'FB', KICKER: 'K', PUNTER: 'P',
+  };
+  return aliases[compact] || raw;
+}
+
+function maddenFreeAgentRowPosition(row) {
+  const raw = maddenFreeAgencyRaw(row);
+  return normalizeMaddenFreeAgentPosition(row?.position || raw.position || raw.positionName || raw.playerPosition || raw.pos || raw.positionAbbr);
+}
+
 async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minOvr = 0, limit = 500 } = {}) {
   await ensureMaddenFreeAgencyTables();
+  const wantedPosition = position ? normalizeMaddenFreeAgentPosition(position) : null;
   const params = [String(guildId), String(leagueId), Number(minOvr || 0)];
-  let positionSql = '';
-  if (position) {
-    params.push(String(position).toUpperCase());
-    positionSql = `AND UPPER(position) = $${params.length}`;
-  }
   params.push(Math.min(Math.max(Number(limit || 500), 5), 1000));
   const result = await pool.query(
     `SELECT a.*, COALESCE(v.value_score, 0) AS value_score
@@ -27174,7 +27191,6 @@ async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minO
      LEFT JOIN madden_player_values v
        ON v.guild_id = a.guild_id AND v.league_id = a.league_id AND v.player_id = a.player_id
      WHERE a.guild_id = $1 AND a.league_id = $2 AND COALESCE(a.overall, 0) >= $3
-       ${positionSql}
        AND (
          LOWER(COALESCE(a.team_name, '')) IN ('fa','free agent','free agents','freeagent')
          OR COALESCE(a.raw_payload->>'isFreeAgent','false') IN ('true','1','True')
@@ -27182,10 +27198,12 @@ async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minO
          OR LOWER(COALESCE(a.contract_status, '')) LIKE '%free%'
        )
      ORDER BY a.overall DESC NULLS LAST, COALESCE(v.value_score, 0) DESC, a.cap_hit DESC NULLS LAST, a.player_name ASC
-     LIMIT $${params.length}`,
+     LIMIT $4`,
     params
   ).catch(() => ({ rows: [] }));
-  return result.rows || [];
+  let rows = result.rows || [];
+  if (wantedPosition) rows = rows.filter(row => maddenFreeAgentRowPosition(row) === wantedPosition);
+  return rows.map(row => ({ ...row, position: maddenFreeAgentRowPosition(row) || row.position }));
 }
 
 function buildMaddenFreeAgentPaginationComponents(token, page, totalPages) {
@@ -27206,7 +27224,7 @@ function buildMaddenFreeAgentsEmbedFromRows(league, rows, options = {}) {
   const embed = new EmbedBuilder()
     .setTitle(`🧳 ${league.league_name} • Free Agents${position}${minText}`)
     .setColor(0x3498DB)
-    .setFooter({ text: `GG Sports • 7J-10BY-EA Free Agency Board • Page ${safePage + 1}/${totalPages}` })
+    .setFooter({ text: `GG Sports • 7J-10BY-EA1 Free Agency Board • Page ${safePage + 1}/${totalPages}` })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run `/madden sync`, then try again.');
@@ -27322,7 +27340,7 @@ async function buildMaddenFreeAgentTeamFitEmbed(guildId, league, teamInput, posi
     .setTitle(`🧩 ${ctx.displayName || maddenTeamDisplayName(teamInput)} • Free Agent Fits`)
     .setColor(capSpace < 0 ? 0xED4245 : 0x57F287)
     .addFields({ name: 'Cap Snapshot', value: capResult.rows?.[0] ? `Cap Space: **${formatMaddenMoney(capSpace)}**\nStatus: ${capSpace < 0 ? '🚨 Over Cap' : '✅ Under Cap'}` : 'No team cap snapshot found.', inline: false })
-    .setFooter({ text: 'GG Sports • 7J-10BY-E Team Fit' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EA1 Team Fit' })
     .setTimestamp();
   if (!fits.length) {
     embed.addFields({ name: 'Recommended Fits', value: 'No matching free agents found yet.', inline: false });
@@ -27384,7 +27402,7 @@ async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null
   const embed = new EmbedBuilder()
     .setTitle(`🔄 ${league.league_name}${titleTeam} • Transactions`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-E Transactions' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EA1 Transactions' })
     .setTimestamp();
   if (!result.rows.length) {
     embed.setDescription('No saved transaction events yet. Run `/maddentransactions scan confirm:true` after an offseason sync to seed the transaction feed.');
@@ -27400,7 +27418,7 @@ async function buildMaddenTransactionsScanEmbed(guildId, league, confirm = false
     .setTitle(`🔎 ${league.league_name} • Offseason Transaction Scan`)
     .setColor(confirm ? 0x57F287 : 0xFEE75C)
     .setDescription(confirm ? `Saved **${rows.length}** transaction seed events.` : `Preview found **${rows.length}** transaction seed events. Rerun with \`confirm:true\` to save them.`)
-    .setFooter({ text: 'GG Sports • 7J-10BY-E Transaction Scan' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-EA1 Transaction Scan' })
     .setTimestamp();
   if (rows.length) embed.addFields({ name: 'Detected Events', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n'), 1024), inline: false });
   return embed;
