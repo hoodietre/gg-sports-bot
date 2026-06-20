@@ -616,6 +616,31 @@ async function initDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_recent ON madden_transactions (guild_id, league_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_team ON madden_transactions (guild_id, league_id, team_name, created_at DESC)`);
 
+  // 7J-10BY-EC: Retirement Tracking & Legacy System.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_retirements (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      season_label TEXT,
+      player_id TEXT,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      age INTEGER,
+      years_pro INTEGER,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_retirements ADD COLUMN IF NOT EXISTS season_label TEXT`);
+  await pool.query(`ALTER TABLE madden_retirements ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE madden_retirements ADD COLUMN IF NOT EXISTS retirement_key TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_madden_retirements_unique_key ON madden_retirements (guild_id, league_id, retirement_key) WHERE retirement_key IS NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_retirements_recent ON madden_retirements (guild_id, league_id, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_retirements_team ON madden_retirements (guild_id, league_id, team_name, created_at DESC)`);
+
 
   // 7J-10BW: User-controlled Madden trade block storage.
   // GMs can list their own roster players, remove them, and browse team/league-wide blocks.
@@ -1841,6 +1866,30 @@ function buildCommands() {
         .setDescription('Staff: scan imported offseason data and generate transaction summary events')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addBooleanOption(o => o.setName('confirm').setDescription('Save detected events? Leave false for preview.').setRequired(false))),
+
+    new SlashCommandBuilder()
+      .setName('maddenretirements')
+      .setDescription('Madden retirement tracking and legacy views')
+      .addSubcommand(sc => sc
+        .setName('scan')
+        .setDescription('Staff: scan the current retirement stage and save detected retirements')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('confirm').setDescription('Save detected retirements and post news?').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('recent')
+        .setDescription('Show recent Madden retirements')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of retirements to show').setRequired(false).setMinValue(5).setMaxValue(25)))
+      .addSubcommand(sc => sc
+        .setName('season')
+        .setDescription('Show all retirements saved for this offseason/season')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('team')
+        .setDescription('Show retirements for one Madden team')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('limit').setDescription('Number of retirements to show').setRequired(false).setMinValue(5).setMaxValue(25))),
 
     new SlashCommandBuilder()
       .setName('maddenchanges')
@@ -5406,7 +5455,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
-        if (commandName === 'maddenfreeagents' || commandName === 'maddentransactions') {
+        if (commandName === 'maddenfreeagents' || commandName === 'maddentransactions' || commandName === 'maddenretirements') {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
@@ -8759,6 +8808,42 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden transactions command.' });
+      return;
+    }
+
+    if (interaction.commandName === 'maddenretirements') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      if (subcommand === 'scan') {
+        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
+        await interaction.editReply({ embeds: [await buildMaddenRetirementsScanEmbed(interaction.guild, activeLeague, confirm)] });
+        return;
+      }
+      if (subcommand === 'recent') {
+        const limit = interaction.options.getInteger('limit') || 15;
+        await interaction.editReply({ embeds: [await buildMaddenRetirementsEmbed(interaction.guild.id, activeLeague, { limit })] });
+        return;
+      }
+      if (subcommand === 'season') {
+        await interaction.editReply({ embeds: [await buildMaddenRetirementsEmbed(interaction.guild.id, activeLeague, { limit: 25, season: true })] });
+        return;
+      }
+      if (subcommand === 'team') {
+        const team = interaction.options.getString('team');
+        const limit = interaction.options.getInteger('limit') || 15;
+        await interaction.editReply({ embeds: [await buildMaddenRetirementsEmbed(interaction.guild.id, activeLeague, { team, limit })] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden retirements command.' });
       return;
     }
 
@@ -27203,6 +27288,30 @@ async function ensureMaddenFreeAgencyTables() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_recent ON madden_transactions (guild_id, league_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_team ON madden_transactions (guild_id, league_id, team_name, created_at DESC)`);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_retirements (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      season_label TEXT,
+      player_id TEXT,
+      player_name TEXT NOT NULL,
+      team_name TEXT,
+      position TEXT,
+      overall INTEGER,
+      age INTEGER,
+      years_pro INTEGER,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      retirement_key TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`ALTER TABLE madden_retirements ADD COLUMN IF NOT EXISTS season_label TEXT`);
+  await pool.query(`ALTER TABLE madden_retirements ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE madden_retirements ADD COLUMN IF NOT EXISTS retirement_key TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_madden_retirements_unique_key ON madden_retirements (guild_id, league_id, retirement_key) WHERE retirement_key IS NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_retirements_recent ON madden_retirements (guild_id, league_id, created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_retirements_team ON madden_retirements (guild_id, league_id, team_name, created_at DESC)`);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_player_team_snapshots (
       guild_id TEXT NOT NULL,
       league_id TEXT NOT NULL,
@@ -27840,6 +27949,163 @@ async function buildMaddenTransactionsScanEmbed(guildId, league, confirm = false
   return embed;
 }
 
+
+function maddenRetirementKey(row = {}) {
+  const playerKey = String(row.player_id || row.player_name || 'player').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 90);
+  const season = String(row.season_label || 'current').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40);
+  return `retired:${season}:${playerKey}`.slice(0, 240);
+}
+
+function maddenRetirementAge(row = {}) {
+  const raw = maddenBydRaw(row.raw_payload || row.attributes || {});
+  const value = Number(row.age || raw.age || raw.playerAge || 0);
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : null;
+}
+
+function maddenRetirementYearsPro(row = {}) {
+  const raw = maddenBydRaw(row.raw_payload || row.attributes || {});
+  const candidates = [row.years_pro, row.yearsPro, raw.yearsPro, raw.yearsExperience, raw.yearsExperienceRating, raw.experience, raw.proYears];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n >= 0) return Math.round(n);
+  }
+  return null;
+}
+
+function isLikelyMaddenRetirementCandidate(row = {}) {
+  if (!row?.player_name) return false;
+  const teamName = row.team_name || '';
+  const age = maddenRetirementAge(row) || 0;
+  const years = maddenRetirementYearsPro(row);
+  const overall = Number(row.overall || 0);
+  const raw = maddenBydRaw(row.raw_payload || row.attributes || {});
+  const explicitRetired = raw.isRetired === true || raw.retired === true || String(raw.status || '').toLowerCase().includes('retir');
+  if (explicitRetired) return true;
+  if (age >= 33) return true;
+  if (Number.isFinite(years) && years >= 10) return true;
+  if (overall >= 75 && age >= 30) return true;
+  if (isMaddenFreeAgentTeamName(teamName) && age >= 34) return true;
+  return false;
+}
+
+async function scanMaddenRetirements(guild, league, confirm = false) {
+  const guildId = String(guild?.id || guild);
+  const leagueId = String(league.league_id);
+  await ensureMaddenFreeAgencyTables();
+  const currentRows = await getMaddenCurrentTransactionRows(guildId, leagueId);
+  const currentKeys = new Set(currentRows.map(row => maddenTransactionPlayerKey(row)).filter(Boolean));
+  const previousMap = await getMaddenPreviousTransactionSnapshot(guildId, leagueId);
+  const rows = [];
+  const latestSync = await pool.query(
+    `SELECT week_label, completed_at, started_at FROM madden_sync_runs WHERE guild_id = $1 AND league_id = $2 ORDER BY started_at DESC LIMIT 1`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  const seasonLabel = latestSync.rows?.[0]?.week_label || 'Offseason';
+
+  for (const previous of previousMap.values()) {
+    const key = maddenTransactionPlayerKey(previous);
+    if (!key || currentKeys.has(key)) continue;
+    if (!isLikelyMaddenRetirementCandidate(previous)) continue;
+    rows.push({
+      player_id: previous.player_id || previous.external_player_id || previous.id || previous.player_name,
+      player_name: previous.player_name,
+      team_name: normalizeMaddenTeamName(previous.team_name || null) || previous.team_name || null,
+      position: maddenFreeAgentRowPosition(previous) || previous.position || null,
+      overall: maddenFreeAgentOverall(previous) || previous.overall || null,
+      age: maddenRetirementAge(previous),
+      years_pro: maddenRetirementYearsPro(previous),
+      season_label: seasonLabel,
+      metadata: { source: 'retirement_stage_missing_from_roster', previous_team: previous.team_name || null, was_free_agent: Boolean(previous.is_free_agent) },
+    });
+  }
+
+  rows.sort((a, b) => Number(b.overall || 0) - Number(a.overall || 0) || Number(b.age || 0) - Number(a.age || 0) || String(a.player_name).localeCompare(String(b.player_name)));
+
+  if (confirm) {
+    for (const row of rows) {
+      const retirementKey = maddenRetirementKey(row);
+      await pool.query(
+        `INSERT INTO madden_retirements (id, guild_id, league_id, season_label, player_id, player_name, team_name, position, overall, age, years_pro, metadata, retirement_key)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (guild_id, league_id, retirement_key) WHERE retirement_key IS NOT NULL DO NOTHING`,
+        [randomUUID(), guildId, leagueId, row.season_label || null, row.player_id || null, row.player_name, row.team_name || null, row.position || null, row.overall || null, row.age || null, row.years_pro || null, row.metadata || {}, retirementKey]
+      ).catch(() => null);
+      if (guild?.channels) {
+        await recordMaddenNewsEvent(guild, league, {
+          event_type: 'retirement',
+          player_id: row.player_id || null,
+          player_name: row.player_name,
+          team_name: row.team_name || null,
+          metadata: {
+            position: row.position || null,
+            overall: row.overall || null,
+            summary: `${row.player_name} has retired${row.team_name ? ` after finishing with ${maddenTeamDisplayName(row.team_name)}` : ''}.`,
+            age: row.age || null,
+            years_pro: row.years_pro || null,
+          },
+        }).catch(() => null);
+      }
+    }
+  }
+  return rows;
+}
+
+function formatMaddenRetirementLine(row, index = 0) {
+  const team = row.team_name ? ` — ${maddenTeamDisplayName(row.team_name)}` : '';
+  const info = [row.position || 'POS'];
+  if (Number(row.overall || 0) > 0) info.push(`${Math.round(Number(row.overall))} OVR`);
+  if (Number(row.age || 0) > 0) info.push(`Age ${row.age}`);
+  if (Number(row.years_pro || 0) > 0) info.push(`${row.years_pro} yrs`);
+  return `**${index + 1}. ${row.player_name || 'Player'}**${team}\n${info.join(' • ')}`;
+}
+
+async function getMaddenRetirementRows(guildId, leagueId, { team = null, limit = 25 } = {}) {
+  await ensureMaddenFreeAgencyTables();
+  const params = [String(guildId), String(leagueId)];
+  let teamSql = '';
+  if (team) {
+    const ctx = await getMaddenBydeTeamContext(guildId, leagueId, team);
+    const candidates = [team, ctx.teamName, ctx.rawTeamName, ctx.externalTeamId, getMaddenTeamAbbrev(ctx.teamName)].filter(Boolean).map(v => String(v).toLowerCase());
+    params.push(candidates);
+    teamSql = `AND LOWER(COALESCE(team_name,'')) = ANY($${params.length}::text[])`;
+  }
+  params.push(Math.min(Math.max(Number(limit || 25), 5), 100));
+  const result = await pool.query(
+    `SELECT * FROM madden_retirements WHERE guild_id = $1 AND league_id = $2 ${teamSql} ORDER BY overall DESC NULLS LAST, age DESC NULLS LAST, created_at DESC LIMIT $${params.length}`,
+    params
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+async function buildMaddenRetirementsEmbed(guildId, league, { team = null, limit = 15, season = false } = {}) {
+  const rows = await getMaddenRetirementRows(guildId, league.league_id, { team, limit: season ? 100 : limit });
+  const titleTeam = team ? ` • ${maddenTeamDisplayName(team)}` : '';
+  const embed = new EmbedBuilder()
+    .setTitle(`👋 ${league.league_name}${titleTeam} • Retirements`)
+    .setColor(0x95A5A6)
+    .setFooter({ text: 'GG Sports • 7J-10BY-EC Retirement Tracking' })
+    .setTimestamp();
+  if (!rows.length) {
+    embed.setDescription('No saved retirements found yet. Run `/maddenretirements scan confirm:true` during the Madden retirement stage after syncing.');
+    return embed;
+  }
+  embed.setDescription(rows.slice(0, season ? 25 : limit).map((row, i) => formatMaddenRetirementLine(row, i)).join('\n\n').slice(0, 4096));
+  return embed;
+}
+
+async function buildMaddenRetirementsScanEmbed(guild, league, confirm = false) {
+  const rows = await scanMaddenRetirements(guild, league, confirm);
+  const embed = new EmbedBuilder()
+    .setTitle(`👋 ${league.league_name} • Retirement Scan`)
+    .setColor(confirm ? 0x57F287 : 0xFEE75C)
+    .setDescription(confirm ? `Saved **${rows.length}** detected retirements and posted retirement news.` : `Preview found **${rows.length}** likely retirements. Rerun with \`confirm:true\` to save them and post news.`)
+    .setFooter({ text: 'GG Sports • 7J-10BY-EC Retirement Tracking' })
+    .setTimestamp();
+  if (rows.length) embed.addFields({ name: 'Detected Retirements', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenRetirementLine(row, i)).join('\n\n'), 1024), inline: false });
+  if (!rows.length) embed.addFields({ name: 'Note', value: 'Retirement detection compares the previous saved roster snapshot against the current synced roster. If this is the first snapshot after advancing, run one more scan only after a pre-retirement snapshot exists.', inline: false });
+  return embed;
+}
+
 async function ensureMaddenNewsTables() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_news_channel_id TEXT`);
   await pool.query(`
@@ -27929,6 +28195,7 @@ function maddenNewsEventTitle(eventType) {
   if (key === 'overall_change') return '📊 Ratings Update';
   if (key === 'attribute_change') return '📈 Player Development';
   if (key === 'transaction') return '✂️ Transaction';
+  if (key === 'retirement') return '👋 Retirement';
   if (key === 'game_threads_created') return '🏈 Game Threads Created';
   if (key === 'year_end_finalized') return '🏆 Season Year-End Finalized';
   if (key === 'champion_finalized') return '🏆 Super Bowl Champion';
@@ -27947,6 +28214,7 @@ function maddenNewsCategoryForEventType(eventType) {
   if (key.includes('trade_')) return 'trade';
   if (key.includes('overall') || key.includes('attribute') || key.includes('dev_trait')) return 'ratings';
   if (key.includes('injury')) return 'injury';
+  if (key.includes('retir')) return 'retirement';
   if (key.includes('transaction')) return 'transaction';
   if (key.includes('position')) return 'position';
   if (key.includes('game_thread')) return 'games';
