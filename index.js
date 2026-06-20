@@ -69,7 +69,9 @@ const MADDEN_VALUES_PAGE_SIZE = 25;
 const maddenTradeFinderPaginationSessions = new Map();
 const MADDEN_TRADE_FINDER_PAGE_SIZE = 8;
 const maddenFreeAgentPaginationSessions = new Map();
+const maddenFreeAgentRowsCache = new Map();
 const MADDEN_FREE_AGENT_PAGE_SIZE = 10;
+const MADDEN_FREE_AGENT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -27185,6 +27187,55 @@ function maddenFreeAgencyRaw(row) {
   return maddenBydRaw(row?.raw_payload || row?.attributes || {});
 }
 
+function maddenFreeAgentOverall(row) {
+  const raw = maddenFreeAgencyRaw(row);
+  const attrs = maddenBydRaw(row?.attributes || row?.raw_payload || {});
+  const candidates = [
+    row?.overall,
+    row?.overall_rating,
+    row?.player_best_ovr,
+    row?.playerBestOvr,
+    raw.overallRating,
+    raw.overall,
+    raw.ovr,
+    raw.playerBestOvr,
+    raw.playerBestOverall,
+    raw.playerBestOVR,
+    attrs.overall,
+    attrs.overallRating,
+    attrs.playerBestOvr,
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return Math.round(n);
+  }
+  return null;
+}
+
+function maddenFreeAgentValue(row) {
+  const stored = Number(row?.value_score || 0);
+  if (Number.isFinite(stored) && stored > 0) return stored;
+  const raw = maddenFreeAgencyRaw(row);
+  const calculated = calculateMaddenPlayerValue({
+    ...row,
+    overall: maddenFreeAgentOverall(row) || row?.overall || raw.overallRating || raw.playerBestOvr || 0,
+    position: maddenFreeAgentRowPosition(row) || row?.position,
+    age: row?.age || raw.age,
+    years_left: row?.years_left || row?.contract_years_left || raw.contractYearsLeft || raw.contractLength,
+    cap_hit: row?.cap_hit || raw.capHit || raw.desiredSalary || raw.contractSalary,
+    dev_trait: row?.dev_trait || raw.devTrait,
+  });
+  return Number(calculated?.valueScore || 0);
+}
+
+function invalidateMaddenFreeAgentRowsCache(guildId = null, leagueId = null) {
+  const g = guildId ? String(guildId) : null;
+  const l = leagueId ? String(leagueId) : null;
+  for (const key of Array.from(maddenFreeAgentRowsCache.keys())) {
+    if ((!g || key.startsWith(`${g}:`)) && (!l || key.includes(`:${l}:`))) maddenFreeAgentRowsCache.delete(key);
+  }
+}
+
 function isMaddenFreeAgentRow(row) {
   const raw = maddenFreeAgencyRaw(row);
   return Boolean(
@@ -27203,16 +27254,20 @@ function maddenFreeAgentDemand(row) {
 }
 
 function formatMaddenFreeAgentLine(row, index = 0, showPreviousTeam = true) {
-  const attrs = maddenBydRaw(row.attributes);
+  const attrs = maddenBydRaw(row.attributes || row.raw_payload || {});
   const raw = maddenFreeAgencyRaw(row);
   const priorTeam = raw.lastTeam || raw.previousTeam || raw.prevTeam || row.old_team_name || row.team_name;
   const demand = maddenFreeAgentDemand(row);
-  const ageText = row.age ? ` • Age ${row.age}` : '';
-  const valueText = row.value_score ? ` • Value ${Number(row.value_score).toFixed(0)}` : '';
+  const overall = maddenFreeAgentOverall(row);
+  const valueScore = maddenFreeAgentValue(row);
+  const ageText = row.age ? ` • Age ${row.age}` : raw.age ? ` • Age ${raw.age}` : '';
+  const valueText = valueScore > 0 ? ` • Value ${Number(valueScore).toFixed(0)}` : '';
   const moneyText = demand > 0 ? ` • Est. ${formatMaddenMoney(demand)}` : '';
-  const topAttr = attrs.speed ? ` • SPD ${attrs.speed}` : attrs.awareness ? ` • AWR ${attrs.awareness}` : '';
+  const speed = attrs.speed || attrs.speedRating || raw.speedRating || raw.speed;
+  const awareness = attrs.awareness || attrs.awarenessRating || raw.awareRating || raw.awarenessRating;
+  const topAttr = speed ? ` • SPD ${speed}` : awareness ? ` • AWR ${awareness}` : '';
   const teamText = showPreviousTeam && priorTeam && !isMaddenFreeAgentTeamName(priorTeam) ? ` — ${maddenTeamDisplayName(priorTeam)}` : '';
-  return `**${index + 1}. ${row.player_name}**${teamText}\n${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${ageText}${topAttr}${valueText}${moneyText}`;
+  return `**${index + 1}. ${row.player_name}**${teamText} — ${row.position || maddenFreeAgentRowPosition(row) || 'POS'} • ${overall || 'N/A'} OVR${ageText}${topAttr}${valueText}${moneyText}`;
 }
 
 function normalizeMaddenFreeAgentPosition(value) {
@@ -27276,30 +27331,47 @@ function maddenFreeAgentPanelPositionButtons(leagueId, currentPosition = null, m
   ];
 }
 
-async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minOvr = 0, limit = 500 } = {}) {
+async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minOvr = 0, limit = 500, useCache = true } = {}) {
   await ensureMaddenFreeAgencyTables();
-  const wantedPosition = position ? normalizeMaddenFreeAgentPosition(position) : null;
-  const params = [String(guildId), String(leagueId), Number(minOvr || 0)];
-  params.push(Math.min(Math.max(Number(limit || 500), 5), 1000));
+  const wantedPosition = normalizeMaddenFreeAgentFilter(position);
+  const safeLimit = Math.min(Math.max(Number(limit || 1000), 5), 2500);
+  const cacheKey = `${String(guildId)}:${String(leagueId)}:${wantedPosition || 'ALL'}:${Number(minOvr || 0)}:${safeLimit}`;
+  const cached = maddenFreeAgentRowsCache.get(cacheKey);
+  if (useCache && cached && Date.now() - cached.createdAt < MADDEN_FREE_AGENT_CACHE_TTL_MS) return cached.rows;
+
+  const params = [String(guildId), String(leagueId)];
   const result = await pool.query(
-    `SELECT a.*, COALESCE(v.value_score, 0) AS value_score
+    `SELECT a.*, COALESCE(v.value_score, 0) AS stored_value_score
      FROM madden_player_attributes a
      LEFT JOIN madden_player_values v
        ON v.guild_id = a.guild_id AND v.league_id = a.league_id AND v.player_id = a.player_id
-     WHERE a.guild_id = $1 AND a.league_id = $2 AND COALESCE(a.overall, 0) >= $3
+     WHERE a.guild_id = $1 AND a.league_id = $2
        AND (
          LOWER(COALESCE(a.team_name, '')) IN ('fa','free agent','free agents','freeagent')
          OR COALESCE(a.raw_payload->>'isFreeAgent','false') IN ('true','1','True')
          OR COALESCE(a.raw_payload->>'isFA','false') IN ('true','1','True')
          OR LOWER(COALESCE(a.contract_status, '')) LIKE '%free%'
-       )
-     ORDER BY a.overall DESC NULLS LAST, COALESCE(v.value_score, 0) DESC, a.cap_hit DESC NULLS LAST, a.player_name ASC
-     LIMIT $4`,
+       )`,
     params
   ).catch(() => ({ rows: [] }));
-  let rows = result.rows || [];
+  let rows = (result.rows || []).map(row => {
+    const normalized = { ...row };
+    normalized.position = maddenFreeAgentRowPosition(normalized) || normalized.position;
+    normalized.overall = maddenFreeAgentOverall(normalized);
+    normalized.value_score = Number(normalized.stored_value_score || 0) > 0 ? Number(normalized.stored_value_score || 0) : maddenFreeAgentValue(normalized);
+    return normalized;
+  });
+  rows = rows.filter(row => Number(row.overall || 0) >= Number(minOvr || 0));
   if (wantedPosition) rows = rows.filter(row => maddenFreeAgentPositionMatches(row, wantedPosition));
-  return rows.map(row => ({ ...row, position: maddenFreeAgentRowPosition(row) || row.position }));
+  rows.sort((a, b) =>
+    Number(b.overall || 0) - Number(a.overall || 0) ||
+    Number(b.value_score || 0) - Number(a.value_score || 0) ||
+    Number(b.cap_hit || 0) - Number(a.cap_hit || 0) ||
+    String(a.player_name || '').localeCompare(String(b.player_name || ''))
+  );
+  rows = rows.slice(0, safeLimit);
+  maddenFreeAgentRowsCache.set(cacheKey, { rows, createdAt: Date.now() });
+  return rows;
 }
 
 function buildMaddenFreeAgentPaginationComponents(token, page, totalPages, options = {}) {
@@ -27345,20 +27417,20 @@ function buildMaddenFreeAgentsEmbedFromRows(league, rows, options = {}) {
   const embed = new EmbedBuilder()
     .setTitle(`🧳 ${league.league_name} • Free Agents${position}${minText}`)
     .setColor(0x3498DB)
-    .setFooter({ text: `GG Sports • 7J-10BY-EA2 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
+    .setFooter({ text: `GG Sports • 7J-10BY-EA3 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run `/madden sync`, then try again.');
     return embed;
   }
   const lines = pageRows.map((row, i) => formatMaddenFreeAgentLine(row, safePage * pageSize + i));
-  embed.setDescription(maddenSafeEmbedText(lines.join('\n\n'), 4096));
+  embed.setDescription(maddenSafeEmbedText(lines.join('\n'), 4096));
   embed.addFields({ name: 'Sorted By', value: 'Overall rating, then value, then estimated cost.', inline: false });
   return embed;
 }
 
 async function buildMaddenFreeAgentsMessagePayload(guildId, league, options = {}) {
-  await backfillMaddenExpandedPlayerDataForLeague(guildId, league.league_id).catch(() => null);
+  // 7J-10BY-EA3: do not rescan/import 2,500+ players on every FA page click.
   const pageSize = Math.min(Math.max(Number(options.limit || MADDEN_FREE_AGENT_PAGE_SIZE), 5), 25);
   const rows = await getMaddenFreeAgentRows(guildId, league.league_id, { position: options.position, minOvr: options.minOvr, limit: 1000 });
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
