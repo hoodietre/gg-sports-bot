@@ -1865,7 +1865,13 @@ function buildCommands() {
         .setName('scan')
         .setDescription('Staff: scan synced offseason data for re-signings, FA moves, releases')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
-        .addBooleanOption(o => o.setName('confirm').setDescription('Save detected events? Leave false for preview.').setRequired(false))),
+        .addBooleanOption(o => o.setName('confirm').setDescription('Save detected events? Leave false for preview.').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('backfillnews')
+        .setDescription('Staff: post missing news for saved Madden transaction events')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('confirm').setDescription('Post missing news now? Leave false for preview.').setRequired(false))
+        .addIntegerOption(o => o.setName('limit').setDescription('Maximum news posts to backfill').setRequired(false).setMinValue(1).setMaxValue(50))),
 
     new SlashCommandBuilder()
       .setName('maddenretirements')
@@ -8826,6 +8832,12 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       if (subcommand === 'scan') {
         const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
         await interaction.editReply({ embeds: [await buildMaddenTransactionsScanEmbed(interaction.guild, activeLeague, confirm)] });
+        return;
+      }
+      if (subcommand === 'backfillnews') {
+        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
+        const limit = interaction.options.getInteger('limit') || 25;
+        await interaction.editReply({ embeds: [await buildMaddenTransactionsBackfillNewsEmbed(interaction.guild, activeLeague, confirm, limit)] });
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden transactions command.' });
@@ -27328,6 +27340,8 @@ async function ensureMaddenFreeAgencyTables() {
     )
   `);
   await pool.query(`ALTER TABLE madden_transactions ADD COLUMN IF NOT EXISTS transaction_key TEXT`);
+  await pool.query(`ALTER TABLE madden_transactions ADD COLUMN IF NOT EXISTS news_posted_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_transactions ADD COLUMN IF NOT EXISTS news_posted_at TIMESTAMPTZ`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_madden_transactions_unique_key ON madden_transactions (guild_id, league_id, transaction_key) WHERE transaction_key IS NOT NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_recent ON madden_transactions (guild_id, league_id, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_transactions_team ON madden_transactions (guild_id, league_id, team_name, created_at DESC)`);
@@ -28027,7 +28041,7 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
       ).catch(() => ({ rows: [] }));
       const savedRow = inserted.rows?.[0];
       if (guild && savedRow && ['entered_free_agency','signed','free_agency_signing','re_signed','released','team_change'].includes(String(row.event_type))) {
-        await recordMaddenNewsEvent(guild, league, {
+        const newsRow = await recordMaddenNewsEvent(guild, league, {
           event_type: 'transaction',
           player_id: row.player_id || null,
           player_name: row.player_name || null,
@@ -28041,6 +28055,9 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
             new_team: row.new_team_name || row.team_name || null,
           },
         }).catch(() => null);
+        if (newsRow?.id) {
+          await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = $1`, [savedRow.id]).catch(() => null);
+        }
       }
     }
     await saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRows);
@@ -28094,7 +28111,7 @@ async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null
   const embed = new EmbedBuilder()
     .setTitle(`🔄 ${league.league_name}${titleTeam} • Transactions`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-ED1 Transactions' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED2 Transactions' })
     .setTimestamp();
   if (!result.rows.length) {
     embed.setDescription('No saved transaction events yet. Run `/maddentransactions scan confirm:true` after an offseason sync to seed the transaction feed.');
@@ -28104,13 +28121,70 @@ async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null
   return embed;
 }
 
+
+async function backfillMaddenTransactionNews(guild, league, confirm = false, limit = 25) {
+  await ensureMaddenFreeAgencyTables();
+  if (!guild || !league?.league_id) return [];
+  const cappedLimit = Math.min(Math.max(Number(limit || 25), 1), 50);
+  const result = await pool.query(
+    `SELECT * FROM madden_transactions
+     WHERE guild_id = $1 AND league_id = $2
+       AND news_posted_at IS NULL
+       AND event_type IN ('expiring_contract','free_agent_available','entered_free_agency','signed','free_agency_signing','re_signed','released','team_change')
+     ORDER BY created_at ASC
+     LIMIT $3`,
+    [String(guild.id), String(league.league_id), cappedLimit]
+  ).catch(() => ({ rows: [] }));
+  const rows = result.rows || [];
+  if (!confirm) return rows;
+  const posted = [];
+  for (const row of rows) {
+    const newsRow = await recordMaddenNewsEvent(guild, league, {
+      event_type: 'transaction',
+      player_id: row.player_id || null,
+      player_name: row.player_name || null,
+      team_name: row.new_team_name || row.team_name || row.old_team_name || null,
+      metadata: {
+        transaction_type: row.event_type,
+        position: row.position || null,
+        overall: row.overall || null,
+        summary: formatMaddenTransactionLine(row, 0).replace(/^\*\*1\.\s*/, '').replace(/\*\*/g, ''),
+        old_team: row.old_team_name || null,
+        new_team: row.new_team_name || row.team_name || null,
+        backfilled: true,
+      },
+    }).catch(() => null);
+    if (newsRow?.id) {
+      await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = $1`, [row.id]).catch(() => null);
+      posted.push(row);
+    }
+  }
+  return posted;
+}
+
+async function buildMaddenTransactionsBackfillNewsEmbed(guild, league, confirm = false, limit = 25) {
+  const rows = await backfillMaddenTransactionNews(guild, league, confirm, limit);
+  const embed = new EmbedBuilder()
+    .setTitle(`📰 ${league.league_name} • Transaction News Backfill`)
+    .setColor(confirm ? 0x57F287 : 0xFEE75C)
+    .setDescription(confirm ? `Posted **${rows.length}** missing transaction news event(s).` : `Preview found **${rows.length}** saved transaction event(s) without news posts. Rerun with \`confirm:true\` to post them.`)
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED2 Transaction News Backfill' })
+    .setTimestamp();
+  if (rows.length) {
+    embed.addFields({ name: 'Transactions', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('
+
+'), 1024), inline: false });
+  }
+  return embed;
+}
+
 async function buildMaddenTransactionsScanEmbed(guildOrId, league, confirm = false) {
   const rows = await scanMaddenOffseasonTransactions(guildOrId, league, confirm);
   const embed = new EmbedBuilder()
     .setTitle(`🔎 ${league.league_name} • Offseason Transaction Scan`)
     .setColor(confirm ? 0x57F287 : 0xFEE75C)
     .setDescription(confirm ? `Saved **${rows.length}** detected offseason transaction events.` : `Preview found **${rows.length}** transaction seed events. Rerun with \`confirm:true\` to save them.`)
-    .setFooter({ text: 'GG Sports • 7J-10BY-ED1 Transaction Detection Repair' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED2 Transaction News Backfill' })
     .setTimestamp();
   if (rows.length) embed.addFields({ name: 'Detected Events', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n'), 1024), inline: false });
   return embed;
