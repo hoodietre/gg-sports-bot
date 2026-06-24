@@ -28042,7 +28042,7 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
       const savedRow = inserted.rows?.[0];
       if (guild && savedRow && ['entered_free_agency','signed','free_agency_signing','re_signed','released','team_change'].includes(String(row.event_type))) {
         const newsRow = await recordMaddenNewsEvent(guild, league, {
-          event_type: 'transaction',
+          event_type: maddenTransactionNewsEventType(row.event_type),
           player_id: row.player_id || null,
           player_name: row.player_name || null,
           team_name: row.new_team_name || row.team_name || row.old_team_name || null,
@@ -28050,9 +28050,10 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
             transaction_type: row.event_type,
             position: row.position || null,
             overall: row.overall || null,
-            summary: formatMaddenTransactionLine(row, 0).replace(/^\*\*1\.\s*/, '').replace(/\*\*/g, ''),
+            summary: buildMaddenTransactionSummary(row),
             old_team: row.old_team_name || null,
             new_team: row.new_team_name || row.team_name || null,
+            display_team_name: maddenTransactionDisplayTeam(row.new_team_name || row.team_name || row.old_team_name || ''),
           },
         }).catch(() => null);
         if (newsRow?.id) {
@@ -28066,30 +28067,87 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
   return rows;
 }
 
+
+function maddenTransactionNewsEventType(eventType) {
+  const key = String(eventType || '').toLowerCase();
+  if (key === 'expiring_contract' || key === 'entered_free_agency') return 'contract_expired';
+  if (key === 'free_agent_available') return 'free_agent_available';
+  if (key === 'signed' || key === 'free_agency_signing') return 'free_agent_signing';
+  if (key === 're_signed') return 'player_re_signed';
+  if (key === 'released') return 'player_released';
+  if (key === 'team_change') return 'player_team_change';
+  return 'transaction';
+}
+
+function maddenTransactionPrettyLabel(eventType) {
+  const key = String(eventType || '').toLowerCase();
+  if (key === 'expiring_contract' || key === 'entered_free_agency' || key === 'contract_expired') return '📄 Contract Expired';
+  if (key === 'free_agent_available') return '🧳 Free Agent';
+  if (key === 'signed' || key === 'free_agency_signing' || key === 'free_agent_signing') return '🤝 Free Agent Signing';
+  if (key === 're_signed' || key === 'player_re_signed') return '✍️ Re-Signed';
+  if (key === 'released' || key === 'player_released') return '✂️ Released';
+  if (key === 'team_change' || key === 'player_team_change') return '🔄 Team Change';
+  return '🔄 Transaction';
+}
+
+function maddenCleanTransactionTeamName(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (isMaddenFreeAgentTeamName(raw)) return 'FA';
+  // Known EA Direct team IDs discovered from franchise payloads. DB resolution is used when available;
+  // this fallback prevents raw IDs from leaking in older transaction/news rows.
+  const known = {
+    '775553039':'Dolphins','775553040':'Eagles','775553041':'Falcons','775553043':'Giants','775553047':'Lions','775553049':'Packers','775553050':'Panthers','775553053':'Rams','775553054':'Ravens','775553057':'Steelers','775553060':'Vikings'
+  };
+  return known[raw] || raw;
+}
+
+function maddenTransactionDisplayTeam(value) {
+  const clean = maddenCleanTransactionTeamName(value);
+  if (!clean) return '';
+  return maddenTeamDisplayName(clean);
+}
+
+function buildMaddenTransactionSummary(row = {}) {
+  const type = String(row.event_type || row.transaction_type || '').toLowerCase();
+  const player = row.player_name || 'Player';
+  const oldTeam = maddenTransactionDisplayTeam(row.old_team_name || row.metadata?.old_team || '');
+  const newTeam = maddenTransactionDisplayTeam(row.new_team_name || row.team_name || row.metadata?.new_team || '');
+  const team = newTeam || oldTeam;
+  if (type === 'expiring_contract' || type === 'entered_free_agency' || type === 'contract_expired') {
+    return `${player}${oldTeam ? ` (${oldTeam})` : ''} had his contract expire and entered free agency.`;
+  }
+  if (type === 'signed' || type === 'free_agency_signing' || type === 'free_agent_signing') {
+    return `${player} signed with ${team || 'a new team'} from free agency.`;
+  }
+  if (type === 're_signed' || type === 'player_re_signed') {
+    return `${player} re-signed with ${team || 'his team'}.`;
+  }
+  if (type === 'released' || type === 'player_released') {
+    return `${player}${oldTeam ? ` was released by ${oldTeam}` : ' was released'} and entered free agency.`;
+  }
+  if (type === 'team_change' || type === 'player_team_change') {
+    return `${player} moved from ${oldTeam || 'one team'} to ${newTeam || 'a new team'}.`;
+  }
+  if (type === 'free_agent_available') return `${player} is available in free agency.`;
+  return `${player}${team ? ` • ${team}` : ''}`;
+}
+
 function formatMaddenTransactionLine(row, index = 0) {
-  const eventLabel = row.event_type === 'free_agent_available' ? '🧳 Free Agent'
-    : row.event_type === 'expiring_contract' ? '📄 Expiring'
-    : row.event_type === 'signed' ? '✍️ FA Signing'
-    : row.event_type === 'free_agency_signing' ? '✍️ FA Signing'
-    : row.event_type === 're_signed' ? '📝 Re-Signed'
-    : row.event_type === 'entered_free_agency' ? '🧳 Entered Free Agency'
-    : row.event_type === 'released' ? '✂️ Released'
-    : row.event_type === 'team_change' ? '🔄 Team Change'
-    : '🔄 Transaction';
+  const eventLabel = maddenTransactionPrettyLabel(row.event_type);
   let movement = '';
-  if (row.event_type === 'signed' || row.event_type === 'free_agency_signing') movement = `${maddenTeamDisplayName(row.old_team_name || 'FA')} → ${maddenTeamDisplayName(row.new_team_name || row.team_name || '')}`;
-  else if (row.event_type === 're_signed') movement = `${maddenTeamDisplayName(row.new_team_name || row.team_name || row.old_team_name || '')}`;
-  else if (row.event_type === 'entered_free_agency' || row.event_type === 'released') movement = `${maddenTeamDisplayName(row.old_team_name || row.team_name || '')} → FA`;
-  else if (row.event_type === 'team_change') movement = `${maddenTeamDisplayName(row.old_team_name || '')} → ${maddenTeamDisplayName(row.new_team_name || row.team_name || '')}`;
+  if (row.event_type === 'signed' || row.event_type === 'free_agency_signing') movement = `${maddenTransactionDisplayTeam(row.old_team_name || 'FA')} → ${maddenTransactionDisplayTeam(row.new_team_name || row.team_name || '')}`;
+  else if (row.event_type === 're_signed') movement = `${maddenTransactionDisplayTeam(row.new_team_name || row.team_name || row.old_team_name || '')}`;
+  else if (row.event_type === 'entered_free_agency' || row.event_type === 'expiring_contract' || row.event_type === 'released') movement = `${maddenTransactionDisplayTeam(row.old_team_name || row.team_name || '')} → FA`;
+  else if (row.event_type === 'team_change') movement = `${maddenTransactionDisplayTeam(row.old_team_name || '')} → ${maddenTransactionDisplayTeam(row.new_team_name || row.team_name || '')}`;
   else {
     const team = row.new_team_name || row.team_name || row.old_team_name || '';
-    movement = team ? maddenTeamDisplayName(team) : '';
+    movement = team ? maddenTransactionDisplayTeam(team) : '';
   }
   const moveText = movement ? ` • ${movement}` : '';
   const years = row?.metadata?.current_years_left || row?.metadata?.years_left;
   const yearsText = Number.isFinite(Number(years)) && Number(years) > 0 ? ` • ${Number(years)} yrs` : '';
-  return `**${index + 1}. ${eventLabel}: ${row.player_name || 'Player'}**${moveText}
-${maddenFormatPositionOverall(row.position, row.overall)}${yearsText}`;
+  return `**${index + 1}. ${eventLabel}: ${row.player_name || 'Player'}**${moveText}\n${maddenFormatPositionOverall(row.position, row.overall)}${yearsText}`;
 }
 
 async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null, limit = 15 } = {}) {
@@ -28111,7 +28169,7 @@ async function buildMaddenTransactionsRecentEmbed(guildId, league, { team = null
   const embed = new EmbedBuilder()
     .setTitle(`🔄 ${league.league_name}${titleTeam} • Transactions`)
     .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-ED2 Transactions' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED3 Transactions' })
     .setTimestamp();
   if (!result.rows.length) {
     embed.setDescription('No saved transaction events yet. Run `/maddentransactions scan confirm:true` after an offseason sync to seed the transaction feed.');
@@ -28131,7 +28189,16 @@ async function backfillMaddenTransactionNews(guild, league, confirm = false, lim
      WHERE guild_id = $1 AND league_id = $2
        AND news_posted_at IS NULL
        AND event_type IN ('expiring_contract','free_agent_available','entered_free_agency','signed','free_agency_signing','re_signed','released','team_change')
-     ORDER BY created_at ASC
+     ORDER BY CASE event_type
+       WHEN 're_signed' THEN 1
+       WHEN 'signed' THEN 2
+       WHEN 'free_agency_signing' THEN 3
+       WHEN 'entered_free_agency' THEN 4
+       WHEN 'expiring_contract' THEN 5
+       WHEN 'released' THEN 6
+       WHEN 'team_change' THEN 7
+       WHEN 'free_agent_available' THEN 8
+       ELSE 9 END, created_at DESC
      LIMIT $3`,
     [String(guild.id), String(league.league_id), cappedLimit]
   ).catch(() => ({ rows: [] }));
@@ -28148,7 +28215,7 @@ async function backfillMaddenTransactionNews(guild, league, confirm = false, lim
         transaction_type: row.event_type,
         position: row.position || null,
         overall: row.overall || null,
-        summary: formatMaddenTransactionLine(row, 0).replace(/^\*\*1\.\s*/, '').replace(/\*\*/g, ''),
+        summary: buildMaddenTransactionSummary(row),
         old_team: row.old_team_name || null,
         new_team: row.new_team_name || row.team_name || null,
         backfilled: true,
@@ -28168,7 +28235,7 @@ async function buildMaddenTransactionsBackfillNewsEmbed(guild, league, confirm =
     .setTitle(`📰 ${league.league_name} • Transaction News Backfill`)
     .setColor(confirm ? 0x57F287 : 0xFEE75C)
     .setDescription(confirm ? `Posted **${rows.length}** missing transaction news event(s).` : `Preview found **${rows.length}** saved transaction event(s) without news posts. Rerun with \`confirm:true\` to post them.`)
-    .setFooter({ text: 'GG Sports • 7J-10BY-ED2 Transaction News Backfill' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED3 Transaction News Cleanup' })
     .setTimestamp();
   if (rows.length) {
     embed.addFields({ name: 'Transactions', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n'), 1024), inline: false });
@@ -28182,7 +28249,7 @@ async function buildMaddenTransactionsScanEmbed(guildOrId, league, confirm = fal
     .setTitle(`🔎 ${league.league_name} • Offseason Transaction Scan`)
     .setColor(confirm ? 0x57F287 : 0xFEE75C)
     .setDescription(confirm ? `Saved **${rows.length}** detected offseason transaction events.` : `Preview found **${rows.length}** transaction seed events. Rerun with \`confirm:true\` to save them.`)
-    .setFooter({ text: 'GG Sports • 7J-10BY-ED2 Transaction News Backfill' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED3 Transaction News Cleanup' })
     .setTimestamp();
   if (rows.length) embed.addFields({ name: 'Detected Events', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n'), 1024), inline: false });
   return embed;
@@ -28605,7 +28672,13 @@ function maddenNewsEventTitle(eventType) {
   if (key === 'position_change') return '🔄 Position Change';
   if (key === 'overall_change') return '📊 Ratings Update';
   if (key === 'attribute_change') return '📈 Player Development';
-  if (key === 'transaction') return '✂️ Transaction';
+  if (key === 'transaction') return '🔄 Transaction';
+  if (key === 'contract_expired') return '📄 Contract Expired';
+  if (key === 'free_agent_available') return '🧳 Free Agent';
+  if (key === 'free_agent_signing') return '🤝 Free Agent Signing';
+  if (key === 'player_re_signed') return '✍️ Re-Signed';
+  if (key === 'player_released') return '✂️ Released';
+  if (key === 'player_team_change') return '🔄 Team Change';
   if (key === 'retirement') return '👋 Retirement';
   if (key === 'game_threads_created') return '🏈 Game Threads Created';
   if (key === 'year_end_finalized') return '🏆 Season Year-End Finalized';
@@ -28626,7 +28699,7 @@ function maddenNewsCategoryForEventType(eventType) {
   if (key.includes('overall') || key.includes('attribute') || key.includes('dev_trait')) return 'ratings';
   if (key.includes('injury')) return 'injury';
   if (key.includes('retir')) return 'retirement';
-  if (key.includes('transaction')) return 'transaction';
+  if (key.includes('transaction') || key === 'contract_expired' || key === 'free_agent_available' || key === 'free_agent_signing' || key === 'player_re_signed' || key === 'player_released' || key === 'player_team_change') return 'transaction';
   if (key.includes('position')) return 'position';
   if (key.includes('game_thread')) return 'games';
   if (key.includes('champion') || key.includes('runner_up') || key.includes('award') || key.includes('year_end') || key.includes('draft_order')) return 'offseason';
@@ -28641,10 +28714,10 @@ function buildMaddenNewsEventEmbed(league, event) {
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DL Madden News + Offseason History' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED3 Madden News + Transactions' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
-  const displayTeamForEvent = meta.display_team_name || (event.team_name ? maddenTeamDisplayName(event.team_name) : '');
+  const displayTeamForEvent = meta.display_team_name || (event.team_name ? maddenTransactionDisplayTeam(event.team_name) : '');
   const playerLine = event.player_name ? `**${event.player_name}**${displayTeamForEvent ? ` • ${displayTeamForEvent}` : ''}` : (displayTeamForEvent ? `**${displayTeamForEvent}**` : league?.league_name || 'Madden League');
   embed.setDescription(playerLine);
 
@@ -28726,8 +28799,10 @@ async function getMaddenNewsEvents(guildId, leagueId, { category = null, week = 
 
 function maddenNewsEventLine(row, index = 0) {
   const date = row.created_at ? new Date(row.created_at).toLocaleDateString('en-US') : 'Unknown date';
+  const meta = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
   const player = row.player_name ? ` — **${row.player_name}**` : '';
-  const team = row.team_name ? ` (${getMaddenTeamAbbrev(row.team_name) || row.team_name})` : '';
+  const rawTeam = meta.display_team_name || row.team_name || meta.new_team || meta.old_team || '';
+  const team = rawTeam ? ` (${maddenTransactionDisplayTeam(rawTeam)})` : '';
   const change = row.old_value || row.new_value ? ` • ${row.old_value || 'N/A'} → ${row.new_value || 'N/A'}` : '';
   return `**${index + 1}. ${maddenNewsEventTitle(row.event_type)}**${player}${team}${change} • ${date}`;
 }
@@ -28738,7 +28813,7 @@ async function buildMaddenNewsRecentEmbed(guildId, league, category = null, week
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setColor(0x3498DB)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DL Madden News + Offseason History' })
+    .setFooter({ text: 'GG Sports • 7J-10BY-ED3 Madden News + Transactions' })
     .setTimestamp();
   if (!rows.length) {
     embed.setDescription('No saved Madden news events found yet. New trade block activity, committee submissions, approved trades, and future sync changes will appear here.');
