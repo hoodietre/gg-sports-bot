@@ -28171,9 +28171,7 @@ async function buildMaddenTransactionsBackfillNewsEmbed(guild, league, confirm =
     .setFooter({ text: 'GG Sports • 7J-10BY-ED2 Transaction News Backfill' })
     .setTimestamp();
   if (rows.length) {
-    embed.addFields({ name: 'Transactions', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('
-
-'), 1024), inline: false });
+    embed.addFields({ name: 'Transactions', value: maddenSafeEmbedText(rows.slice(0, 12).map((row, i) => formatMaddenTransactionLine(row, i)).join('\n\n'), 1024), inline: false });
   }
   return embed;
 }
