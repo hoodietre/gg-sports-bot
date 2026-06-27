@@ -4802,6 +4802,8 @@ client.once(Events.ClientReady, async () => {
     await initDatabase();
     await registerCommands();
     startGGSportsInternalApiServer();
+    startMaddenAutosyncLoop(client);
+    console.log('Madden autosync loop started.');
   } catch (error) {
     console.error('Startup failed:', error);
   }
@@ -31043,6 +31045,8 @@ async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
 
   const signalText = signalLines.slice(0, 25).join(NL) || 'No stage/phase/week/season-named fields found at the top level of the hub payload.';
   const inferredLabel = getEaHubSeasonModeLabel(hubPayload, leagueId);
+  const realStage = getMaddenSeasonStage(hubPayload, leagueId);
+  const realStageLabel = getMaddenSeasonStageLabel(hubPayload, leagueId);
 
   const embed = new EmbedBuilder()
     .setTitle('🧭 Madden Season Stage Probe • ' + (league.league_name || 'Madden League'))
@@ -31050,7 +31054,8 @@ async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
     .setDescription('Read-only inspection of the latest captured league hub payload. Does not change sync data.')
     .addFields(
       { name: 'Payload Captured', value: capturedAt ? new Date(capturedAt).toUTCString() : 'Unknown', inline: false },
-      { name: "Bot's Current Best Guess", value: '`' + inferredLabel + '`', inline: false },
+      { name: "Old Guess (preseason/regular season only)", value: '`' + inferredLabel + '`', inline: true },
+      { name: 'Corrected Stage (with offseason detection)', value: '`' + realStageLabel + '` (' + realStage + ')', inline: true },
       { name: 'Parsed Context Fields', value: ctxText.slice(0, 1024), inline: false },
       { name: 'Raw Stage/Week/Season Signals', value: signalText.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/maddendebug view:Season Stage Probe`', inline: false }
@@ -37603,6 +37608,20 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
     isLeagueAdvancing: Boolean(getAnyValue(careerInfo, ['isLeagueAdvancing'], false)),
     isLeagueAutoSimming: Boolean(getAnyValue(careerInfo, ['isLeagueAutoSimming'], false)),
     currentWeekInfoKeys: Object.keys(currentWeekInfo || {}),
+
+    // 7J-OFFSEASON-1: true only if EA actually sent SOME real week/schedule signal
+    // (before any of our own fallback defaults kicked in). When this is false, the hub
+    // payload genuinely has no current-week data to report, which is the offseason
+    // fingerprint: rosters/teams still sync fine, but there is no week to play.
+    hasRealWeekSignal: Boolean(
+      hubDisplayWeek !== null ||
+      hubWeekIndex !== null ||
+      stageIndex !== null ||
+      nextSeasonWeek !== null ||
+      nextSeasonWeekType !== null ||
+      (currentWeekInfo && Object.keys(currentWeekInfo).length > 0) ||
+      (availableWeeks && availableWeeks.length > 0)
+    ),
   };
 
   return ctx;
@@ -37634,6 +37653,27 @@ function getEaHubSeasonModeLabel(hubPayload, leagueId = null) {
   }
 
   return ctx.displayedWeek || 'Season Active';
+}
+
+// 7J-OFFSEASON-1: real three-state stage detector. Existing isEaHubInPreseason /
+// getEaHubSeasonModeLabel only ever distinguish preseason vs "regular season," and the
+// "regular season" bucket silently swallows offseason too (because weekType defaults to 1
+// when EA sends nothing). This function adds the missing third state using
+// ctx.hasRealWeekSignal: if EA gave us no real week/schedule data at all, we are between
+// seasons (free agency / resigning / draft), not in an actual regular season week.
+function getMaddenSeasonStage(hubPayload, leagueId = null) {
+  const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId || 0);
+  if (isEaHubInPreseason(hubPayload, leagueId)) return 'preseason';
+  if (!ctx.hasRealWeekSignal) return 'offseason';
+  if (ctx.isRegularSeason || ctx.weekType === 1) return 'regular_season';
+  return 'unknown';
+}
+
+function getMaddenSeasonStageLabel(hubPayload, leagueId = null) {
+  const stage = getMaddenSeasonStage(hubPayload, leagueId);
+  if (stage === 'offseason') return 'Offseason';
+  if (stage === 'unknown') return 'Unknown';
+  return getEaHubSeasonModeLabel(hubPayload, leagueId);
 }
 
 function buildEaStandingsPayloadVariantsFromHub(hubPayload, leagueId) {
@@ -42421,9 +42461,12 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
     const preseasonMode = isEaHubInPreseason(hub, context.externalLeagueId);
     const seasonModeLabel = getEaHubSeasonModeLabel(hub, context.externalLeagueId);
+    const seasonStage = getMaddenSeasonStage(hub, context.externalLeagueId); // 'preseason' | 'regular_season' | 'offseason' | 'unknown'
+    const offseasonMode = seasonStage === 'offseason';
     console.log('[EA SEASON MODE 7J-5AX] ' + JSON.stringify({
       preseasonMode,
       seasonModeLabel,
+      seasonStage,
       context: extractEaStandingsRequestContextFromHub(hub, context.externalLeagueId),
     }).slice(0, 2000));
 
@@ -42560,6 +42603,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ', players: ' + Number(maddenPlayerImportCounts?.players || 0) + '. ' +
       (preseasonMode
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
+        : offseasonMode
+        ? 'Offseason mode active: no current week/schedule data from EA (rosters/teams still synced normally); imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
         : 'Regular season mode: CareerMode_GetStandingsExport + madden compare system enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
