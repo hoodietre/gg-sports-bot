@@ -34302,7 +34302,7 @@ function buildMaddenLeagueLeadersEmbed(league, category, rows, options = {}) {
 function maddenPlayerDisplayName(row) {
   const first = row?.first_name || row?.firstName;
   const last = row?.last_name || row?.lastName;
-  const full = [first, last].filter(Boolean).join('\n').trim();
+  const full = [first, last].filter(Boolean).join(' ').trim();
   return full || row?.full_name || row?.player_name || 'Unknown Player';
 }
 
@@ -35300,7 +35300,7 @@ function calculateMaddenPlayerValue(player) {
 }
 
 function maddenValuePlayerName(row) {
-  return row?.player_name || row?.full_name || [row?.first_name, row?.last_name].filter(Boolean).join('\n') || 'Unknown Player';
+  return row?.player_name || row?.full_name || [row?.first_name, row?.last_name].filter(Boolean).join(' ') || 'Unknown Player';
 }
 
 async function getMaddenPlayerValueRankings(guildId, leagueId, filters = {}) {
