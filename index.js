@@ -5201,7 +5201,10 @@ async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, player
      ORDER BY CASE WHEN LOWER(COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name)) = LOWER($3) THEN 0 ELSE 1 END, overall DESC NULLS LAST
      LIMIT 1`,
     [guildId, String(league.league_id), q, `%${q}%`]
-  ).catch(() => ({ rows: [] }));
+  ).catch(error => {
+    console.error('[PLAYER DIAGNOSTICS 7J-OFFSEASON-3] madden_players lookup failed:', error?.message || error);
+    return { rows: [] };
+  });
   row = live.rows?.[0] || null;
 
   if (!row) {
