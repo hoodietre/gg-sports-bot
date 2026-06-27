@@ -26881,26 +26881,58 @@ async function upsertMaddenExpandedPlayerData(guildId, leagueId, player) {
 
 async function backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId) {
   await ensureMaddenFranchiseDataTables();
+
+  // 7J-OFFSEASON-2: madden_players is fed by the live EA Direct roster sync and is
+  // confirmed correct (this is the same table /madden roster reads from). The previous
+  // primary source here, madden_imported_players, is fed by a different/legacy import
+  // path that EA Direct connections never populate -- it is permanently empty for those
+  // leagues, which was silently forcing every transaction/free-agency/cap refresh onto a
+  // weaker fallback that scans old raw sync payloads instead of live data.
   const players = await pool.query(
-    `SELECT external_player_id, player_name, team_name, position, overall, raw_payload
-     FROM madden_imported_players
+    `SELECT id AS external_player_id,
+            COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name) AS player_name,
+            team_name, position, overall, raw_payload, is_free_agent
+     FROM madden_players
      WHERE guild_id = $1 AND league_id::text = $2::text
      LIMIT 3000`,
     [String(guildId), String(leagueId)]
   ).catch(() => ({ rows: [] }));
+
   let processed = 0;
   for (const row of players.rows || []) {
     await upsertMaddenExpandedPlayerData(guildId, leagueId, {
       player_id: row.external_player_id || row.player_name,
       player_name: row.player_name,
-      team_name: row.team_name,
+      team_name: row.is_free_agent ? 'FA' : row.team_name,
       position: row.position,
       overall: row.overall,
       raw_payload: row.raw_payload,
     }).then(() => { processed += 1; }).catch(() => null);
   }
 
-  // 7J-10BY-DC: if madden_imported_players is empty, backfill directly from saved EA roster payloads.
+  // Legacy fallback preserved as-is for leagues still on the older manual_api/neon
+  // import path (the one that actually populates madden_imported_players).
+  if (processed === 0) {
+    const legacyPlayers = await pool.query(
+      `SELECT external_player_id, player_name, team_name, position, overall, raw_payload
+       FROM madden_imported_players
+       WHERE guild_id = $1 AND league_id::text = $2::text
+       LIMIT 3000`,
+      [String(guildId), String(leagueId)]
+    ).catch(() => ({ rows: [] }));
+    for (const row of legacyPlayers.rows || []) {
+      await upsertMaddenExpandedPlayerData(guildId, leagueId, {
+        player_id: row.external_player_id || row.player_name,
+        player_name: row.player_name,
+        team_name: row.team_name,
+        position: row.position,
+        overall: row.overall,
+        raw_payload: row.raw_payload,
+      }).then(() => { processed += 1; }).catch(() => null);
+    }
+  }
+
+  // 7J-10BY-DC: last-resort fallback only if neither modern nor legacy player tables have rows.
   if (processed === 0) {
     const rawRows = await maddenDcGetRosterRowsFromSyncPayloads(guildId, leagueId, 20).catch(() => []);
     let index = 0;
