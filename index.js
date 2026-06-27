@@ -5247,12 +5247,22 @@ async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, player
   const matches = maddenDiagMatchFieldGroups7J10BYDB(flat);
   const keys = Object.keys(flat).sort();
   const rawLines = keys.slice(0, 45).map(key => `\`${key}\`: ${String(flat[key]).slice(0, 60)}`);
+
+  // 7J-OFFSEASON-4: surface roster-status-style fields directly, regardless of where they
+  // fall alphabetically, since the 45-key raw dump above can cut them off before they're
+  // ever shown (e.g. isActive/isRetired/isOnIR start with "i" and were getting truncated).
+  const statusPattern = /active|retir|status|injur|^isOnIR$|practicesquad/i;
+  const statusLines = keys
+    .filter(key => statusPattern.test(key))
+    .map(key => `\`${key}\`: ${String(flat[key]).slice(0, 60)}`);
+
   return new EmbedBuilder()
     .setTitle(`🧪 ${row.player_name} • Raw Player Diagnostics`)
     .setColor(0x5865F2)
     .addFields(
       { name: 'Lookup Source', value: source, inline: false },
       { name: 'Imported Core Fields', value: [`Team: **${row.team_name || 'Unknown'}**`, `Position: **${row.position || 'N/A'}**`, `OVR: **${row.overall ?? 'N/A'}**`, `External ID: **${row.external_player_id || 'N/A'}**`].join('\n'), inline: false },
+      { name: 'Roster Status Flags', value: maddenDcSafeFieldText(statusLines.join('\n') || 'No active/retired/status-style fields found in raw payload.', 1010), inline: false },
       { name: 'Detected Attribute/Cap Matches', value: maddenDcSafeFieldText(maddenDiagFormatMatches7J10BYDB(matches, 6), 1010), inline: false },
       { name: `Raw Payload Keys (${keys.length})`, value: maddenDcSafeFieldText(rawLines.join('\n') || 'No raw payload keys saved for this player.', 1010), inline: false }
     )
