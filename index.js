@@ -5181,8 +5181,31 @@ async function buildMaddenAttributeDiagnosticsEmbed7J10BYDB(guildId, league) {
 
 async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, playerInput) {
   const q = String(playerInput || '').trim();
-  let source = 'madden_imported_players';
+  let source = 'madden_players';
   let row = null;
+
+  // 7J-OFFSEASON-3: check the live, correctly-synced roster table first (same one
+  // /madden roster reads from), before falling back to the legacy/diagnostic-only tables
+  // below, which can be empty or stale for EA Direct leagues.
+  const live = await pool.query(
+    `SELECT id AS external_player_id,
+            COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name) AS player_name,
+            team_name, position, overall, raw_payload
+     FROM madden_players
+     WHERE guild_id = $1::text AND league_id::text = $2::text
+       AND (
+         LOWER(COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name)) = LOWER($3)
+         OR LOWER(COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name)) LIKE LOWER($4)
+         OR id = $3
+       )
+     ORDER BY CASE WHEN LOWER(COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name)) = LOWER($3) THEN 0 ELSE 1 END, overall DESC NULLS LAST
+     LIMIT 1`,
+    [guildId, String(league.league_id), q, `%${q}%`]
+  ).catch(() => ({ rows: [] }));
+  row = live.rows?.[0] || null;
+
+  if (!row) {
+  source = 'madden_imported_players';
   const imported = await pool.query(
     `SELECT * FROM madden_imported_players
      WHERE guild_id = $1::text AND league_id::text = $2::text
@@ -5192,6 +5215,7 @@ async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, player
     [guildId, String(league.league_id), q, `%${q}%`]
   ).catch(() => ({ rows: [] }));
   row = imported.rows?.[0] || null;
+  }
   if (!row) {
     const expanded = await pool.query(
       `SELECT player_id AS external_player_id, player_name, team_name, position, overall, raw_payload
