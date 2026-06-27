@@ -35748,23 +35748,6 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
   let inserted = 0;
   let updated = 0;
 
-  // 7J-9B-A: Player stats refresh fix. EA weekly stat exports can be re-run after an advance.
-  // Clear the specific league/stat/week/stage bucket before importing fresh rows so old rows do not remain
-  // when EA changes stat IDs/player keys between syncs. This keeps awards, leaders, records, and HOF current.
-  if (Array.isArray(rows) && rows.length) {
-    await pool.query(
-      `DELETE FROM madden_player_weekly_stats
-       WHERE guild_id = $1::text
-         AND league_id::text = $2::text
-         AND stat_type = $3::text
-         AND week_index = $4::int
-         AND stage_index = $5::int`,
-      [guild.id, league.league_id, statType, weekIndex, stageIndex]
-    ).catch(error => {
-      console.error('[MADDEN WEEKLY STAT REFRESH 7J-9B-A] Bucket cleanup failed:', error?.message || error);
-    });
-  }
-
   for (const row of rows || []) {
     if (!row || typeof row !== 'object') continue;
 
