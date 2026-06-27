@@ -2040,7 +2040,8 @@ function buildCommands() {
         { name: 'Postseason Result Matcher', value: 'postseason_result_matcher' },
         { name: 'Playoff Score Verification Audit', value: 'playoff_score_verification_audit' },
         { name: 'Postseason Candidate Object Dump', value: 'postseason_candidate_object_dump' },
-        { name: 'Postseason Result Promotion Audit', value: 'postseason_result_promotion_audit' }
+        { name: 'Postseason Result Promotion Audit', value: 'postseason_result_promotion_audit' },
+        { name: 'Season Stage Probe (offseason/FA detector)', value: 'season_stage_probe' }
       ))
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
 
@@ -8336,6 +8337,7 @@ if (gameSubcommand === 'report') {
         playoff_score_verification_audit: buildMaddenPlayoffScoreVerificationAuditEmbed,
         postseason_candidate_object_dump: buildMaddenPostseasonCandidateObjectDumpEmbed,
         postseason_result_promotion_audit: buildMaddenPostseasonResultPromotionAuditEmbed,
+        season_stage_probe: buildMaddenSeasonStageProbeEmbed,
       };
 
       const builder = debugBuilders[view];
@@ -9942,6 +9944,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
           playoff_score_verification_audit: buildMaddenPlayoffScoreVerificationAuditEmbed,
           postseason_candidate_object_dump: buildMaddenPostseasonCandidateObjectDumpEmbed,
           postseason_result_promotion_audit: buildMaddenPostseasonResultPromotionAuditEmbed,
+          season_stage_probe: buildMaddenSeasonStageProbeEmbed,
         };
 
         const builder = debugBuilders[view];
@@ -30963,6 +30966,98 @@ async function buildMaddenScheduleStatusDecoderEmbed(guildId, league) {
 
   const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
   if (thumb) embed.setThumbnail(thumb);
+  return embed;
+}
+
+// New: Season Stage Probe. Read-only inspector for the live league hub payload so we can
+// see exactly what EA sends for stageIndex/weekType/etc during free agency, draft, and
+// rollover, instead of guessing. Does not write to any table or change sync behavior.
+async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  const NL = String.fromCharCode(10);
+
+  const hubRow = await pool.query(
+    `SELECT endpoint, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text
+       AND league_id::text = $2::text
+       AND endpoint ILIKE '%LeagueHub%'
+     ORDER BY created_at DESC NULLS LAST
+     LIMIT 1`,
+    [guildId, String(leagueId)]
+  ).catch(error => {
+    console.warn('Madden season stage probe hub query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const hubPayload = hubRow.rows?.[0]?.raw_payload || null;
+  const capturedAt = hubRow.rows?.[0]?.created_at || null;
+
+  if (!hubPayload) {
+    return new EmbedBuilder()
+      .setTitle('🧭 Madden Season Stage Probe • ' + (league.league_name || 'Madden League'))
+      .setColor(0x95A5A6)
+      .setDescription('No stored league hub payload found yet. Run `/madden sync` (or wait for autosync), then try this view again.')
+      .setFooter({ text: 'GG Sports • Season Stage Probe' })
+      .setTimestamp();
+  }
+
+  const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId);
+  const seasonInfo = hubPayload?.seasonInfo || {};
+
+  const ctxText = [
+    `displayedWeek: **${ctx.displayedWeek ?? 'null'}**`,
+    `stageIndex: **${ctx.stageIndex ?? 'null'}**`,
+    `weekType / seasonWeekType: **${ctx.weekType ?? 'null'}**`,
+    `nextSeasonWeek: **${ctx.nextSeasonWeek ?? 'null'}** / nextSeasonWeekType: **${ctx.nextSeasonWeekType ?? 'null'}**`,
+    `isPreseason: **${ctx.isPreseason}** / isRegularSeason: **${ctx.isRegularSeason}**`,
+    `isLeagueAdvancing: **${ctx.isLeagueAdvancing}** / isLeagueAutoSimming: **${ctx.isLeagueAutoSimming}**`,
+    `seasonYear: **${ctx.seasonYear ?? 'null'}** / calendarYear: **${ctx.calendarYear ?? 'null'}**`,
+    `gamesPlayedCount: **${ctx.gamesPlayedCount ?? 'null'}** / gameTotalCount: **${ctx.gameTotalCount ?? 'null'}**`,
+  ].join(NL);
+
+  // Generic scan: any top-level field whose NAME suggests a stage/phase/offseason/week
+  // signal, anywhere in the hub payload or its nested info blocks. This is the part most
+  // likely to reveal a literal free-agency/offseason marker if EA sends one that the rest
+  // of the code doesn't know about yet.
+  const signalPattern = /stage|phase|offseason|off_season|week|season/i;
+  const signalLines = [];
+  const seen = new Set();
+
+  function scanObjectShallow(obj, label) {
+    if (!obj || typeof obj !== 'object') return;
+    for (const [key, value] of Object.entries(obj)) {
+      if (!signalPattern.test(key)) continue;
+      if (value !== null && typeof value === 'object') continue; // skip nested blobs, too noisy here
+      const line = `${label}.${key}: ${JSON.stringify(value)}`;
+      if (seen.has(line)) continue;
+      seen.add(line);
+      signalLines.push(line);
+    }
+  }
+
+  scanObjectShallow(hubPayload, 'hub');
+  scanObjectShallow(seasonInfo, 'seasonInfo');
+  scanObjectShallow(hubPayload?.careerHubInfo || {}, 'careerHubInfo');
+  scanObjectShallow(hubPayload?.gameScheduleHubInfo || {}, 'scheduleHubInfo');
+
+  const signalText = signalLines.slice(0, 25).join(NL) || 'No stage/phase/week/season-named fields found at the top level of the hub payload.';
+  const inferredLabel = getEaHubSeasonModeLabel(hubPayload, leagueId);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧭 Madden Season Stage Probe • ' + (league.league_name || 'Madden League'))
+    .setColor(0x9B59B6)
+    .setDescription('Read-only inspection of the latest captured league hub payload. Does not change sync data.')
+    .addFields(
+      { name: 'Payload Captured', value: capturedAt ? new Date(capturedAt).toUTCString() : 'Unknown', inline: false },
+      { name: "Bot's Current Best Guess", value: '`' + inferredLabel + '`', inline: false },
+      { name: 'Parsed Context Fields', value: ctxText.slice(0, 1024), inline: false },
+      { name: 'Raw Stage/Week/Season Signals', value: signalText.slice(0, 1024), inline: false },
+      { name: 'Command', value: '`/maddendebug view:Season Stage Probe`', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Season Stage Probe' })
+    .setTimestamp();
+
   return embed;
 }
 
