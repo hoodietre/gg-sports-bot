@@ -5256,12 +5256,39 @@ async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, player
     .filter(key => statusPattern.test(key))
     .map(key => `\`${key}\`: ${String(flat[key]).slice(0, 60)}`);
 
+  // 7J-OFFSEASON-5: live transaction-matching probe. Shows the exact keys this player's
+  // CURRENT row generates, and whether any of them match a SAVED PREVIOUS snapshot row --
+  // which is exactly the mechanism /maddentransactions scan depends on to detect a move.
+  // If no key matches here, the scan cannot detect this player moving, regardless of
+  // whether the move actually happened.
+  let matchProbeText = 'Could not run match probe.';
+  try {
+    const currentForKeys = { player_id: row.external_player_id, player_name: row.player_name, position: row.position };
+    const currentKeys = maddenTransactionLookupKeys(currentForKeys);
+    const previousMap = await getMaddenPreviousTransactionSnapshot(guildId, league.league_id);
+    let matchedKey = null;
+    let matchedPrevious = null;
+    for (const key of currentKeys) {
+      if (previousMap.has(key)) { matchedKey = key; matchedPrevious = previousMap.get(key); break; }
+    }
+    matchProbeText = [
+      `Current keys generated: ${currentKeys.map(k => '`' + k + '`').join(', ') || 'none'}`,
+      `Saved previous snapshot rows in league: ${previousMap.size}`,
+      matchedKey
+        ? `✅ Matched on \`${matchedKey}\` — previous team: **${matchedPrevious?.team_name || 'unknown'}**, current team: **${row.team_name || 'unknown'}**`
+        : '❌ No match found in previous snapshot — this player would be invisible to the transaction scan right now.',
+    ].join('\n');
+  } catch (error) {
+    matchProbeText = 'Match probe error: ' + (error?.message || String(error));
+  }
+
   return new EmbedBuilder()
     .setTitle(`🧪 ${row.player_name} • Raw Player Diagnostics`)
     .setColor(0x5865F2)
     .addFields(
       { name: 'Lookup Source', value: source, inline: false },
       { name: 'Imported Core Fields', value: [`Team: **${row.team_name || 'Unknown'}**`, `Position: **${row.position || 'N/A'}**`, `OVR: **${row.overall ?? 'N/A'}**`, `External ID: **${row.external_player_id || 'N/A'}**`].join('\n'), inline: false },
+      { name: 'Transaction Match Probe', value: maddenDcSafeFieldText(matchProbeText, 1010), inline: false },
       { name: 'Roster Status Flags', value: maddenDcSafeFieldText(statusLines.join('\n') || 'No active/retired/status-style fields found in raw payload.', 1010), inline: false },
       { name: 'Detected Attribute/Cap Matches', value: maddenDcSafeFieldText(maddenDiagFormatMatches7J10BYDB(matches, 6), 1010), inline: false },
       { name: `Raw Payload Keys (${keys.length})`, value: maddenDcSafeFieldText(rawLines.join('\n') || 'No raw payload keys saved for this player.', 1010), inline: false }
