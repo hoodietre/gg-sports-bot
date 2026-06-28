@@ -28013,18 +28013,33 @@ async function getMaddenPreviousTransactionSnapshot(guildId, leagueId) {
 
 async function saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRows = []) {
   await ensureMaddenFreeAgencyTables();
+  let successCount = 0;
+  let failCount = 0;
+  let skippedCount = 0;
+  const seenErrors = new Set();
   for (const row of currentRows || []) {
     const playerId = String(row.player_id || row.external_player_id || row.id || row.player_name || '').trim();
-    if (!playerId || !row.player_name) continue;
+    if (!playerId || !row.player_name) { skippedCount += 1; continue; }
     const teamName = normalizeMaddenTeamName(row.team_name || null) || row.team_name || null;
-    await pool.query(
-      `INSERT INTO madden_player_team_snapshots (guild_id, league_id, player_id, player_name, team_name, position, overall, is_free_agent, raw_payload, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-       ON CONFLICT (guild_id, league_id, player_id)
-       DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, is_free_agent = EXCLUDED.is_free_agent, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
-      [String(guildId), String(leagueId), playerId, row.player_name, teamName, maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row), isMaddenFreeAgentRow(row), row.raw_payload || {}]
-    ).catch(() => null);
+    try {
+      await pool.query(
+        `INSERT INTO madden_player_team_snapshots (guild_id, league_id, player_id, player_name, team_name, position, overall, is_free_agent, raw_payload, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+         ON CONFLICT (guild_id, league_id, player_id)
+         DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, is_free_agent = EXCLUDED.is_free_agent, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
+        [String(guildId), String(leagueId), playerId, row.player_name, teamName, maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row), isMaddenFreeAgentRow(row), row.raw_payload || {}]
+      );
+      successCount += 1;
+    } catch (error) {
+      failCount += 1;
+      const msg = error?.message || String(error);
+      if (!seenErrors.has(msg) && seenErrors.size < 5) {
+        seenErrors.add(msg);
+        console.error('[SNAPSHOT SAVE 7J-OFFSEASON-7] Insert failed for', row.player_name, '| error:', msg);
+      }
+    }
   }
+  console.log('[SNAPSHOT SAVE 7J-OFFSEASON-7] Summary: success=' + successCount + ' failed=' + failCount + ' skipped=' + skippedCount + ' totalRows=' + (currentRows || []).length);
 }
 
 async function getMaddenCurrentTransactionRows(guildId, leagueId) {
