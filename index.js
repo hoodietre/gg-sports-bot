@@ -26930,16 +26930,21 @@ async function upsertMaddenExpandedPlayerData(guildId, leagueId, player) {
   if (weight !== null) attributes.weight = weight;
   const contractStatus = extractMaddenBydContractStatus(raw);
 
-  await pool.query(
-    `INSERT INTO madden_player_attributes (guild_id, league_id, player_id, player_name, team_name, position, overall, dev_trait, archetype, age, years_left, salary, cap_hit, bonus, penalty, contract_status, attributes, raw_payload, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, NOW())
-     ON CONFLICT (guild_id, league_id, player_id)
-     DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall,
-       dev_trait = EXCLUDED.dev_trait, archetype = EXCLUDED.archetype, age = EXCLUDED.age, years_left = EXCLUDED.years_left,
-       salary = EXCLUDED.salary, cap_hit = EXCLUDED.cap_hit, bonus = EXCLUDED.bonus, penalty = EXCLUDED.penalty,
-       contract_status = EXCLUDED.contract_status, attributes = EXCLUDED.attributes, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
-    [String(guildId), String(leagueId), playerId, playerName, teamName, position, overall, devTrait, archetype, age, yearsLeft, salary, capHit, bonus, penalty, contractStatus, JSON.stringify(attributes), JSON.stringify(raw)]
-  );
+  try {
+    await pool.query(
+      `INSERT INTO madden_player_attributes (guild_id, league_id, player_id, player_name, team_name, position, overall, dev_trait, archetype, age, years_left, salary, cap_hit, bonus, penalty, contract_status, attributes, raw_payload, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, NOW())
+       ON CONFLICT (guild_id, league_id, player_id)
+       DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall,
+         dev_trait = EXCLUDED.dev_trait, archetype = EXCLUDED.archetype, age = EXCLUDED.age, years_left = EXCLUDED.years_left,
+         salary = EXCLUDED.salary, cap_hit = EXCLUDED.cap_hit, bonus = EXCLUDED.bonus, penalty = EXCLUDED.penalty,
+         contract_status = EXCLUDED.contract_status, attributes = EXCLUDED.attributes, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
+      [String(guildId), String(leagueId), playerId, playerName, teamName, position, overall, devTrait, archetype, age, yearsLeft, salary, capHit, bonus, penalty, contractStatus, JSON.stringify(attributes), JSON.stringify(raw)]
+    );
+  } catch (error) {
+    console.error('[EXPANDED PLAYER UPSERT 7J-OFFSEASON-6] Failed for player:', playerName, '| error:', error?.message || error);
+    throw error;
+  }
   return { playerId, teamName, capHit };
 }
 
