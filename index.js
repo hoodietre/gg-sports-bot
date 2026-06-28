@@ -26965,7 +26965,11 @@ async function backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId) {
      WHERE guild_id = $1 AND league_id::text = $2::text
      LIMIT 3000`,
     [String(guildId), String(leagueId)]
-  ).catch(() => ({ rows: [] }));
+  ).catch(error => {
+    console.error('[BACKFILL 7J-OFFSEASON-8] madden_players query failed:', error?.message || error);
+    return { rows: [] };
+  });
+  console.log('[BACKFILL 7J-OFFSEASON-8] madden_players rows found:', (players.rows || []).length, '| guildId:', guildId, '| leagueId:', leagueId);
 
   let processed = 0;
   for (const row of players.rows || []) {
@@ -26978,6 +26982,7 @@ async function backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId) {
       raw_payload: row.raw_payload,
     }).then(() => { processed += 1; }).catch(() => null);
   }
+  console.log('[BACKFILL 7J-OFFSEASON-8] Tier 1 (madden_players) processed:', processed);
 
   // Legacy fallback preserved as-is for leagues still on the older manual_api/neon
   // import path (the one that actually populates madden_imported_players).
