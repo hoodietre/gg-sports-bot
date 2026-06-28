@@ -28050,12 +28050,15 @@ async function saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRo
 async function getMaddenCurrentTransactionRows(guildId, leagueId) {
   await backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId).catch(() => null);
   const result = await pool.query(
-    `SELECT player_id, player_name, team_name, position, overall, age, cap_hit, salary, bonus, years_left, contract_years_left, contract_status, attributes, raw_payload
+    `SELECT player_id, player_name, team_name, position, overall, age, cap_hit, salary, bonus, years_left, contract_status, attributes, raw_payload
      FROM madden_player_attributes
      WHERE guild_id = $1 AND league_id = $2
      ORDER BY player_name ASC`,
     [String(guildId), String(leagueId)]
-  ).catch(() => ({ rows: [] }));
+  ).catch(error => {
+    console.error('[CURRENT TXN ROWS 7J-OFFSEASON-9] Query failed:', error?.message || error);
+    return { rows: [] };
+  });
   return result.rows || [];
 }
 
