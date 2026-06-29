@@ -28125,6 +28125,24 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
   const guild = guildOrId && typeof guildOrId === 'object' && guildOrId.id ? guildOrId : null;
   const guildId = String(guild?.id || guildOrId);
   const leagueId = String(league.league_id);
+
+  // 7J-OFFSEASON-13: one-time cleanup of stale "team change" records saved BEFORE the
+  // team-name normalization fix -- these were false positives where the old and new team
+  // were actually the same real team, just formatted slightly differently at the time. New
+  // detections already use the fixed comparison; this just removes the old bad rows so
+  // they stop showing up in /maddennews recent.
+  await pool.query(
+    `DELETE FROM madden_transactions
+     WHERE guild_id = $1 AND league_id = $2
+       AND event_type IN ('team_change', 'player_team_change')
+       AND old_team_name IS NOT NULL AND new_team_name IS NOT NULL
+       AND lower(regexp_replace(regexp_replace(old_team_name, '\\([^)]*\\)\\s*$', ''), '[^a-zA-Z0-9]', '', 'g'))
+         = lower(regexp_replace(regexp_replace(new_team_name, '\\([^)]*\\)\\s*$', ''), '[^a-zA-Z0-9]', '', 'g'))`,
+    [guildId, leagueId]
+  ).catch(error => {
+    console.error('[STALE TXN CLEANUP 7J-OFFSEASON-13] Failed:', error?.message || error);
+  });
+
   const currentRows = await getMaddenCurrentTransactionRows(guildId, leagueId);
   const previousMap = await getMaddenPreviousTransactionSnapshot(guildId, leagueId);
   const rows = [];
