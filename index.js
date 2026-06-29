@@ -27976,7 +27976,16 @@ function maddenTransactionLookupKeys(row = {}) {
 }
 
 function maddenTransactionTeamKey(team = '') {
-  return normalizeMaddenTeamName(team || '').toLowerCase();
+  // 7J-OFFSEASON-11: strip anything that's just formatting, not an actual team identity --
+  // a trailing "(NYG)"-style abbreviation, case, punctuation/whitespace differences. Without
+  // this, the exact same real team stored slightly differently between two syncs (e.g.
+  // "Giants" vs "Giants (NYG)") was being treated as two different teams, producing false
+  // "team change" events for players who never actually moved.
+  return String(normalizeMaddenTeamName(team || ''))
+    .replace(/\([^)]*\)\s*$/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+    .trim();
 }
 
 function buildMaddenTransactionKey(row = {}) {
@@ -28274,8 +28283,17 @@ function maddenCleanTransactionTeamName(value) {
   if (isMaddenFreeAgentTeamName(raw)) return 'FA';
   // Known EA Direct team IDs discovered from franchise payloads. DB resolution is used when available;
   // this fallback prevents raw IDs from leaking in older transaction/news rows.
+  // 7J-OFFSEASON-12: was only 11 of 32 teams, so most unresolved IDs fell straight through
+  // to displaying the raw number. Filled in the rest using this league's own confirmed
+  // team-id mapping (captured from sync logs earlier this session).
   const known = {
-    '775553039':'Dolphins','775553040':'Eagles','775553041':'Falcons','775553043':'Giants','775553047':'Lions','775553049':'Packers','775553050':'Panthers','775553053':'Rams','775553054':'Ravens','775553057':'Steelers','775553060':'Vikings'
+    '775553024':'49ers','775553025':'Bears','775553026':'Bengals','775553027':'Bills','775553028':'Broncos',
+    '775553029':'Browns','775553030':'Buccaneers','775553031':'Cardinals','775553034':'Chargers','775553035':'Chiefs',
+    '775553036':'Colts','775553037':'Commanders','775553038':'Cowboys','775553039':'Dolphins','775553040':'Eagles',
+    '775553041':'Falcons','775553043':'Giants','775553045':'Jaguars','775553046':'Jets','775553047':'Lions',
+    '775553049':'Packers','775553050':'Panthers','775553051':'Patriots','775553052':'Raiders','775553053':'Rams',
+    '775553054':'Ravens','775553055':'Saints','775553056':'Seahawks','775553057':'Steelers','775553058':'Texans',
+    '775553059':'Titans','775553060':'Vikings'
   };
   return known[raw] || raw;
 }
