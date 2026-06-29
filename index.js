@@ -28143,6 +28143,48 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     console.error('[STALE TXN CLEANUP 7J-OFFSEASON-13] Failed:', error?.message || error);
   });
 
+  // 7J-OFFSEASON-14: the cleanup above compared raw stored text, but some old rows have
+  // old_team_name stored as a raw numeric team ID (e.g. "775553053") while new_team_name is
+  // already a resolved name (e.g. "Rams") -- these display identically once both get
+  // resolved through the team-id lookup, but raw-text comparison missed them entirely.
+  // Resolve both sides to real team identity before comparing, then delete true duplicates.
+  const staleCandidates = await pool.query(
+    `SELECT id, old_team_name, new_team_name FROM madden_transactions
+     WHERE guild_id = $1 AND league_id = $2
+       AND event_type IN ('team_change', 'player_team_change')
+       AND old_team_name IS NOT NULL AND new_team_name IS NOT NULL`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  const staleIds = (staleCandidates.rows || [])
+    .filter(r => maddenTransactionTeamKey(maddenCleanTransactionTeamName(r.old_team_name)) === maddenTransactionTeamKey(maddenCleanTransactionTeamName(r.new_team_name)))
+    .map(r => r.id);
+  if (staleIds.length) {
+    await pool.query(`DELETE FROM madden_transactions WHERE id = ANY($1::uuid[])`, [staleIds]).catch(error => {
+      console.error('[STALE TXN CLEANUP 7J-OFFSEASON-14] Failed:', error?.message || error);
+    });
+  }
+
+  // 7J-OFFSEASON-14b: fix the underlying old data, not just the symptom -- some very early
+  // bootstrap-seeded rows still have a raw numeric team ID stored instead of a resolved
+  // name (from before the team-id map was complete). The "repair" loop below reuses these
+  // old rows as comparison baselines indefinitely, so leaving them unresolved would keep
+  // producing the same false signal on every future scan, not just this one.
+  const rawIdRows = await pool.query(
+    `SELECT id, team_name, old_team_name, new_team_name FROM madden_transactions
+     WHERE guild_id = $1 AND league_id = $2
+       AND (team_name ~ '^[0-9]+$' OR old_team_name ~ '^[0-9]+$' OR new_team_name ~ '^[0-9]+$')`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  for (const r of rawIdRows.rows || []) {
+    const resolve = v => (v == null ? null : maddenCleanTransactionTeamName(v));
+    await pool.query(
+      `UPDATE madden_transactions SET team_name = $2, old_team_name = $3, new_team_name = $4 WHERE id = $1`,
+      [r.id, resolve(r.team_name), resolve(r.old_team_name), resolve(r.new_team_name)]
+    ).catch(error => {
+      console.error('[RESOLVE STALE TEAM IDS 7J-OFFSEASON-14b] Failed for row', r.id, ':', error?.message || error);
+    });
+  }
+
   const currentRows = await getMaddenCurrentTransactionRows(guildId, leagueId);
   const previousMap = await getMaddenPreviousTransactionSnapshot(guildId, leagueId);
   const rows = [];
