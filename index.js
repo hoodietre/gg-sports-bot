@@ -26951,6 +26951,41 @@ async function upsertMaddenExpandedPlayerData(guildId, leagueId, player) {
 async function backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId) {
   await ensureMaddenFranchiseDataTables();
 
+  // 7J-OFFSEASON-10 cleanup: remove duplicate madden_players rows left over from the old
+  // team-dependent identity key (same real player, multiple rows because they signed with
+  // a new team). Keeps the most recently synced row per name+position, deletes the rest.
+  await pool.query(
+    `WITH ranked AS (
+       SELECT id, ROW_NUMBER() OVER (
+         PARTITION BY guild_id, league_id,
+           LOWER(COALESCE(NULLIF(CONCAT_WS(' ', first_name, last_name), ''), full_name)),
+           LOWER(COALESCE(position, ''))
+         ORDER BY imported_at DESC NULLS LAST
+       ) AS rn
+       FROM madden_players
+       WHERE guild_id = $1 AND league_id::text = $2::text
+     )
+     DELETE FROM madden_players WHERE id IN (SELECT id FROM ranked WHERE rn > 1)`,
+    [String(guildId), String(leagueId)]
+  ).catch(error => {
+    console.error('[DEDUP MADDEN_PLAYERS 7J-OFFSEASON-10] Cleanup failed:', error?.message || error);
+  });
+
+  await pool.query(
+    `WITH ranked AS (
+       SELECT player_id, ROW_NUMBER() OVER (
+         PARTITION BY guild_id, league_id, LOWER(player_name), LOWER(COALESCE(position, ''))
+         ORDER BY updated_at DESC NULLS LAST
+       ) AS rn
+       FROM madden_player_attributes
+       WHERE guild_id = $1 AND league_id::text = $2::text
+     )
+     DELETE FROM madden_player_attributes WHERE player_id IN (SELECT player_id FROM ranked WHERE rn > 1)`,
+    [String(guildId), String(leagueId)]
+  ).catch(error => {
+    console.error('[DEDUP MADDEN_PLAYER_ATTRIBUTES 7J-OFFSEASON-10] Cleanup failed:', error?.message || error);
+  });
+
   // 7J-OFFSEASON-2: madden_players is fed by the live EA Direct roster sync and is
   // confirmed correct (this is the same table /madden roster reads from). The previous
   // primary source here, madden_imported_players, is fed by a different/legacy import
@@ -27984,6 +28019,20 @@ function classifyMaddenRosterMovement(previous = {}, current = {}) {
 
 async function getMaddenPreviousTransactionSnapshot(guildId, leagueId) {
   await ensureMaddenFreeAgencyTables();
+  await pool.query(
+    `WITH ranked AS (
+       SELECT player_id, ROW_NUMBER() OVER (
+         PARTITION BY guild_id, league_id, LOWER(player_name), LOWER(COALESCE(position, ''))
+         ORDER BY updated_at DESC NULLS LAST
+       ) AS rn
+       FROM madden_player_team_snapshots
+       WHERE guild_id = $1 AND league_id = $2
+     )
+     DELETE FROM madden_player_team_snapshots WHERE player_id IN (SELECT player_id FROM ranked WHERE rn > 1)`,
+    [String(guildId), String(leagueId)]
+  ).catch(error => {
+    console.error('[DEDUP SNAPSHOTS 7J-OFFSEASON-10] Cleanup failed:', error?.message || error);
+  });
   const snapshot = await pool.query(
     `SELECT * FROM madden_player_team_snapshots WHERE guild_id = $1 AND league_id = $2`,
     [String(guildId), String(leagueId)]
@@ -35800,13 +35849,19 @@ function makeMaddenPlayerKey(guild, league, row) {
   const birthDay = getAnyValue(row, ['birthDay'], null);
   const rosterId = getAnyValue(row, ['rosterId', 'rosterID', 'playerId', 'playerID'], null);
   const fullName = getAnyValue(row, ['fullName', 'playerName', 'name'], null);
-  const teamId = getAnyValue(row, ['teamId', 'teamID'], null);
+  const position = getAnyValue(row, ['position'], null);
 
   if (presentationId != null && birthYear != null && birthMonth != null && birthDay != null) {
     return `${guild.id}:${league.league_id}:pid:${presentationId}:${birthYear}:${birthMonth}:${birthDay}`;
   }
   if (rosterId != null) return `${guild.id}:${league.league_id}:rid:${rosterId}`;
-  if (fullName != null && teamId != null) return `${guild.id}:${league.league_id}:name:${String(fullName).toLowerCase()}:team:${teamId}`;
+  // 7J-OFFSEASON-10: this branch used to include teamId, which meant a player's identity
+  // changed every time they signed with a new team -- creating a brand-new "ghost" row
+  // for the same real person instead of updating their existing one (the duplicate
+  // transaction/news entries we saw during free agency). Name + position is far less
+  // precise (two real players can share a name), but it stays stable across a signing,
+  // which matters far more for tracking the same player over time.
+  if (fullName != null) return `${guild.id}:${league.league_id}:name:${String(fullName).toLowerCase()}:pos:${String(position || '').toLowerCase()}`;
   return `${guild.id}:${league.league_id}:raw:${safeHashJson(row)}`;
 }
 
