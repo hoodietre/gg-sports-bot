@@ -26930,22 +26930,34 @@ function extractMaddenBydContractStatus(rawPayload) {
   return 'Unknown';
 }
 
-async function upsertMaddenExpandedPlayerData(guildId, leagueId, player) {
-  await ensureMaddenFranchiseDataTables();
+async function upsertMaddenExpandedPlayerData(guildId, leagueId, player, valueRowOverride = null) {
+  // 7J-10BY-EC3: this used to call ensureMaddenFranchiseDataTables() here, which runs
+  // ~12 CREATE TABLE/ALTER TABLE/CREATE INDEX statements. Calling that once per player
+  // (up to 3,000 times per backfill) was the dominant cost behind the 10-minute hang on
+  // baseline/scan/diagnostics -- worse than the sequential-insert issue fixed earlier.
+  // The caller (backfillMaddenExpandedPlayerDataForLeague) now ensures tables exist once,
+  // before the loop, instead of on every iteration.
   const raw = maddenBydRaw(player.raw_payload || player.raw || {});
   const fallbackName = player.player_name || player.playerName || null;
   const playerName = String(maddenDcPlayerNameFromRaw(raw, fallbackName) || fallbackName || 'Unknown Player').trim();
   const playerId = String(player.player_id || player.external_player_id || player.id || maddenDcFirstDeep(raw, ['playerId','rosterId','id','externalPlayerId','assetId'], playerName));
 
-  const valueResult = await pool.query(
-    `SELECT * FROM madden_player_values
-     WHERE guild_id = $1 AND league_id::text = $2::text
-       AND (player_id = $3 OR LOWER(player_name) = LOWER($4))
-     ORDER BY updated_at DESC NULLS LAST
-     LIMIT 1`,
-    [String(guildId), String(leagueId), playerId, playerName]
-  ).catch(() => ({ rows: [] }));
-  const valueRow = valueResult.rows?.[0] || {};
+  // 7J-10BY-EC3: bulk callers (the league-wide backfill loop) pre-fetch all value rows
+  // once and pass them in via valueRowOverride to avoid one SELECT per player. Single-
+  // player callers (real-time transaction/news processing) still get the original
+  // per-call lookup so their enrichment behavior is unchanged.
+  let valueRow = valueRowOverride;
+  if (valueRow === null) {
+    const valueResult = await pool.query(
+      `SELECT * FROM madden_player_values
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND (player_id = $3 OR LOWER(player_name) = LOWER($4))
+       ORDER BY updated_at DESC NULLS LAST
+       LIMIT 1`,
+      [String(guildId), String(leagueId), playerId, playerName]
+    ).catch(() => ({ rows: [] }));
+    valueRow = valueResult.rows?.[0] || {};
+  }
 
   const teamName = normalizeMaddenTeamName(player.team_name || valueRow.team_name || maddenDcFirstDeep(raw, ['teamName', 'team_name', 'team', 'clubName', 'teamAbbr', 'teamAbbreviation', 'teamId'], null));
   const position = player.position || valueRow.position || maddenDcFirstDeep(raw, ['position', 'pos', 'playerPosition', 'positionName'], null);
@@ -27043,16 +27055,46 @@ async function backfillMaddenExpandedPlayerDataForLeague(guildId, leagueId) {
   });
   console.log('[BACKFILL 7J-OFFSEASON-8] madden_players rows found:', (players.rows || []).length, '| guildId:', guildId, '| leagueId:', leagueId);
 
+  // 7J-10BY-EC3: pre-fetch every madden_player_values row for this league ONCE and build
+  // lookup maps, instead of running one SELECT per player (up to 3,000 extra round-trips).
+  const valueRowsResult = await pool.query(
+    `SELECT DISTINCT ON (player_id) * FROM madden_player_values
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     ORDER BY player_id, updated_at DESC NULLS LAST`,
+    [String(guildId), String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  const valueRowsByName = new Map();
+  const valueRowsById = new Map();
+  for (const vr of valueRowsResult.rows || []) {
+    if (vr.player_id) valueRowsById.set(String(vr.player_id), vr);
+    if (vr.player_name) valueRowsByName.set(String(vr.player_name).toLowerCase(), vr);
+  }
+  function lookupValueRow(playerId, playerName) {
+    return valueRowsById.get(String(playerId)) || valueRowsByName.get(String(playerName || '').toLowerCase()) || {};
+  }
+
+  // 7J-10BY-EC3: run upserts in parallel batches instead of one sequential await per
+  // player. Combined with the table-creation and value-lookup fixes above, this turns a
+  // ~10 minute call (tens of thousands of sequential round-trips) into a handful of
+  // seconds for a full 2,500+ player league.
   let processed = 0;
-  for (const row of players.rows || []) {
-    await upsertMaddenExpandedPlayerData(guildId, leagueId, {
-      player_id: row.external_player_id || row.player_name,
-      player_name: row.player_name,
-      team_name: row.is_free_agent ? 'FA' : row.team_name,
-      position: row.position,
-      overall: row.overall,
-      raw_payload: row.raw_payload,
-    }).then(() => { processed += 1; }).catch(() => null);
+  const BATCH_SIZE = 50;
+  const allPlayers = players.rows || [];
+  for (let i = 0; i < allPlayers.length; i += BATCH_SIZE) {
+    const batch = allPlayers.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(batch.map(row => {
+      const playerId = row.external_player_id || row.player_name;
+      const valueRow = lookupValueRow(playerId, row.player_name);
+      return upsertMaddenExpandedPlayerData(guildId, leagueId, {
+        player_id: playerId,
+        player_name: row.player_name,
+        team_name: row.is_free_agent ? 'FA' : row.team_name,
+        position: row.position,
+        overall: row.overall,
+        raw_payload: row.raw_payload,
+      }, valueRow).then(() => true).catch(() => false);
+    }));
+    processed += results.filter(Boolean).length;
   }
   console.log('[BACKFILL 7J-OFFSEASON-8] Tier 1 (madden_players) processed:', processed);
 
