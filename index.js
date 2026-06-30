@@ -28395,7 +28395,7 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     });
   }
 
-
+  if (!rows.length && !previousMap.size) {
     const faRows = await getMaddenFreeAgentRows(guildId, league.league_id, { limit: 25 });
     const expiring = await getMaddenExpiringContractRows(guildId, league.league_id, null, 15).catch(() => []);
     for (const row of faRows.slice(0, 15)) addDetectedTransaction({ event_type: 'free_agent_available', player_id: row.player_id, player_name: row.player_name, team_name: 'FA', old_team_name: row.team_name, new_team_name: 'FA', position: row.position, overall: maddenFreeAgentOverall(row), metadata: { source: 'bootstrap', cap_hit: row.cap_hit, age: row.age } });
@@ -28532,7 +28532,7 @@ function formatMaddenTransactionLine(row, index = 0) {
     const meta = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
     const slotStr = meta.draft_round ? `Rd ${meta.draft_round}${meta.draft_pick ? `, Pk ${meta.draft_pick}` : ''}` : '';
     movement = `${maddenTransactionDisplayTeam(row.new_team_name || row.team_name || '')}${slotStr ? ` • ${slotStr}` : ''}`;
-  } movement = `${maddenTransactionDisplayTeam(row.new_team_name || row.team_name || row.old_team_name || '')}`;
+  } else if (row.event_type === 're_signed') movement = `${maddenTransactionDisplayTeam(row.new_team_name || row.team_name || row.old_team_name || '')}`;
   else if (row.event_type === 'entered_free_agency' || row.event_type === 'expiring_contract' || row.event_type === 'released') movement = `${maddenTransactionDisplayTeam(row.old_team_name || row.team_name || '')} → FA`;
   else if (row.event_type === 'team_change') movement = `${maddenTransactionDisplayTeam(row.old_team_name || '')} → ${maddenTransactionDisplayTeam(row.new_team_name || row.team_name || '')}`;
   else {
