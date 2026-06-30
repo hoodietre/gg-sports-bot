@@ -28602,19 +28602,52 @@ async function saveMaddenRetirementBaseline(guildId, leagueId) {
   await ensureMaddenRetirementBaselineTables();
   const rows = await getMaddenCurrentTransactionRows(guildId, leagueId);
   await pool.query(`DELETE FROM madden_retirement_baselines WHERE guild_id = $1 AND league_id = $2`, [String(guildId), String(leagueId)]).catch(() => null);
-  let saved = 0;
+
+  const validRows = [];
   for (const row of rows || []) {
     const playerId = String(row.player_id || row.external_player_id || row.id || row.player_name || '').trim();
     if (!playerId || !row.player_name) continue;
+    validRows.push([
+      String(guildId),
+      String(leagueId),
+      playerId,
+      row.player_name,
+      normalizeMaddenTeamName(row.team_name || null) || row.team_name || null,
+      maddenFreeAgentRowPosition(row) || row.position || null,
+      maddenFreeAgentOverall(row) || row.overall || null,
+      maddenRetirementAge(row),
+      maddenRetirementYearsPro(row),
+      row.raw_payload || row.attributes || {},
+    ]);
+  }
+
+  // 7J-10BY-EC2: the previous version did one sequential awaited INSERT per player
+  // (2,500+ individual round-trips to Postgres), which made this command take 10+
+  // minutes and risked hitting Discord's interaction timeout. Batched into chunked
+  // multi-row inserts instead so this completes in roughly a second.
+  let saved = 0;
+  const COLS_PER_ROW = 10;
+  const CHUNK_SIZE = 500;
+  for (let i = 0; i < validRows.length; i += CHUNK_SIZE) {
+    const chunk = validRows.slice(i, i + CHUNK_SIZE);
+    const valuesSql = chunk.map((_, idx) => {
+      const base = idx * COLS_PER_ROW;
+      const placeholders = Array.from({ length: COLS_PER_ROW }, (_, c) => `$${base + c + 1}`);
+      return `(${placeholders[0]},${placeholders[1]},${placeholders[2]},${placeholders[3]},${placeholders[4]},${placeholders[5]},${placeholders[6]},${placeholders[7]},${placeholders[8]},${placeholders[9]},NOW(),NOW())`;
+    }).join(',');
+    const params = chunk.flat();
     await pool.query(
       `INSERT INTO madden_retirement_baselines (guild_id, league_id, player_id, player_name, team_name, position, overall, age, years_pro, raw_payload, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
+       VALUES ${valuesSql}
        ON CONFLICT (guild_id, league_id, player_id)
        DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, age = EXCLUDED.age, years_pro = EXCLUDED.years_pro, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
-      [String(guildId), String(leagueId), playerId, row.player_name, normalizeMaddenTeamName(row.team_name || null) || row.team_name || null, maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row) || row.overall || null, maddenRetirementAge(row), maddenRetirementYearsPro(row), row.raw_payload || row.attributes || {}]
-    ).catch(() => null);
-    saved++;
+      params
+    ).catch(error => {
+      console.error('[RETIREMENT BASELINE BATCH 7J-10BY-EC2] Chunk insert failed:', error?.message || error);
+    });
+    saved += chunk.length;
   }
+
   return { saved, rows };
 }
 
