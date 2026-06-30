@@ -5282,6 +5282,42 @@ async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, player
     matchProbeText = 'Match probe error: ' + (error?.message || String(error));
   }
 
+  // 7J-OFFSEASON-15: full raw dump across every table that could be feeding a duplicate or
+  // a false transaction for this player. Three rounds of targeted fixes haven't fully
+  // resolved one specific case, so instead of theorizing further, show every literal row.
+  let rawDumpText = 'Could not run raw dump.';
+  try {
+    const nameLike = `%${String(row.player_name || '').toLowerCase()}%`;
+    const attrRows = await pool.query(
+      `SELECT player_id, team_name, position, overall, updated_at FROM madden_player_attributes
+       WHERE guild_id = $1::text AND league_id::text = $2::text AND LOWER(player_name) LIKE $3
+       ORDER BY updated_at DESC LIMIT 5`,
+      [guildId, String(league.league_id), nameLike]
+    ).catch(() => ({ rows: [] }));
+    const snapRows = await pool.query(
+      `SELECT player_id, team_name, position, overall, updated_at FROM madden_player_team_snapshots
+       WHERE guild_id = $1::text AND league_id::text = $2::text AND LOWER(player_name) LIKE $3
+       ORDER BY updated_at DESC LIMIT 5`,
+      [guildId, String(league.league_id), nameLike]
+    ).catch(() => ({ rows: [] }));
+    const txnRows = await pool.query(
+      `SELECT event_type, team_name, old_team_name, new_team_name, created_at FROM madden_transactions
+       WHERE guild_id = $1::text AND league_id::text = $2::text AND LOWER(player_name) LIKE $3
+       ORDER BY created_at DESC LIMIT 5`,
+      [guildId, String(league.league_id), nameLike]
+    ).catch(() => ({ rows: [] }));
+    rawDumpText = [
+      `**madden_player_attributes** (${attrRows.rows.length} row(s)):`,
+      ...attrRows.rows.map(r => `\`${r.player_id?.slice?.(0, 40) || r.player_id}\` team="${r.team_name}" pos=${r.position} ovr=${r.overall} updated=${new Date(r.updated_at).toISOString()}`),
+      `**madden_player_team_snapshots** (${snapRows.rows.length} row(s)):`,
+      ...snapRows.rows.map(r => `\`${r.player_id?.slice?.(0, 40) || r.player_id}\` team="${r.team_name}" pos=${r.position} ovr=${r.overall} updated=${new Date(r.updated_at).toISOString()}`),
+      `**madden_transactions** (${txnRows.rows.length} row(s)):`,
+      ...txnRows.rows.map(r => `${r.event_type}: old="${r.old_team_name}" new="${r.new_team_name}" team="${r.team_name}" at=${new Date(r.created_at).toISOString()}`),
+    ].join('\n');
+  } catch (error) {
+    rawDumpText = 'Raw dump error: ' + (error?.message || String(error));
+  }
+
   return new EmbedBuilder()
     .setTitle(`🧪 ${row.player_name} • Raw Player Diagnostics`)
     .setColor(0x5865F2)
@@ -5289,6 +5325,7 @@ async function buildMaddenPlayerDiagnosticsEmbed7J10BYDB(guildId, league, player
       { name: 'Lookup Source', value: source, inline: false },
       { name: 'Imported Core Fields', value: [`Team: **${row.team_name || 'Unknown'}**`, `Position: **${row.position || 'N/A'}**`, `OVR: **${row.overall ?? 'N/A'}**`, `External ID: **${row.external_player_id || 'N/A'}**`].join('\n'), inline: false },
       { name: 'Transaction Match Probe', value: maddenDcSafeFieldText(matchProbeText, 1010), inline: false },
+      { name: 'Raw Rows Across All Tables', value: maddenDcSafeFieldText(rawDumpText, 1010), inline: false },
       { name: 'Roster Status Flags', value: maddenDcSafeFieldText(statusLines.join('\n') || 'No active/retired/status-style fields found in raw payload.', 1010), inline: false },
       { name: 'Detected Attribute/Cap Matches', value: maddenDcSafeFieldText(maddenDiagFormatMatches7J10BYDB(matches, 6), 1010), inline: false },
       { name: `Raw Payload Keys (${keys.length})`, value: maddenDcSafeFieldText(rawLines.join('\n') || 'No raw payload keys saved for this player.', 1010), inline: false }
