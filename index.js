@@ -24990,12 +24990,18 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
 
     // 7J-10I: postseason schedule exports use stageIndex/seasonWeekType instead of regular week labels.
     // Regular season remains zero-based weekIndex + 1. Playoff stages are kept as human-readable labels.
+    // 7J-10BY-EE: preseason (stageIndex/weekType === 0) also needs its own label to distinguish
+    // from regular season weeks — "Preseason Week 1" not "Week 1".
     const rawWeekNumber = Number(rawWeek);
     const numericStageForLabel = parseNumberOrNull(rawStage);
     const postseasonStageLabel = getMaddenEaPostseasonStageLabel(numericStageForLabel);
     const inferredWeekNumber = weekNumber || (Number.isFinite(rawWeekNumber) ? rawWeekNumber + 1 : rawWeek);
     const playoffWeekLabel = getMaddenPlayoffWeekLabelFromDisplayWeek(inferredWeekNumber);
-    const weekLabel = postseasonStageLabel || playoffWeekLabel || ('Week ' + String(inferredWeekNumber || 'TBD'));
+    const isPreseasonStage = numericStageForLabel === 0 || String(stage || '').toLowerCase() === 'pre';
+    const weekLabel = postseasonStageLabel || playoffWeekLabel ||
+      (isPreseasonStage
+        ? 'Preseason Week ' + String(inferredWeekNumber || 'TBD')
+        : 'Week ' + String(inferredWeekNumber || 'TBD'));
 
     const awayScore = parseNumberOrNull(
       getAnyValue(game, ['awayScore', 'away_score', 'awayTeamScore', 'awayPoints', 'awayPts', 'away_score_total'], null) ??
