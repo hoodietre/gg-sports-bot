@@ -368,6 +368,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_team_stats (
@@ -3085,7 +3086,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -6694,6 +6695,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       if (settingKey === 'madden_free_agents_channel' && typeof ensureMaddenFreeAgencyTables === 'function') {
         await ensureMaddenFreeAgencyTables().catch(() => null);
+      }
+
+      if (settingKey === 'game_thread_channel') {
+        // Also sync to madden_league_settings so /maddengames setup and auto-thread creation see the same value
+        await pool.query(
+          `UPDATE madden_league_settings SET game_threads_channel_id = $2, updated_at = NOW() WHERE league_id = $1`,
+          [leagueId, channelId]
+        ).catch(() => null);
       }
 
       if (!column) {
@@ -18331,6 +18340,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
   { value: 'history_channel', label: 'League History Channel', description: 'Season archives and year-end history posts', kind: 'channel' },
   { value: 'madden_free_agents_channel', label: 'Madden Free Agents Channel', description: 'Live free agent board and offseason free agency panel', kind: 'channel' },
+  { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed', kind: 'channel' },
   { value: 'shop_channel', label: 'Shop Channel', description: 'Permanent shop panel channel', kind: 'channel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
@@ -18363,6 +18373,7 @@ function setupDashboardColumn(settingKey) {
     standings_channel: 'standings_channel_id',
     history_channel: 'history_channel_id',
     madden_free_agents_channel: 'madden_free_agents_channel_id',
+    game_thread_channel: 'game_threads_channel_id',
     sportsbook_channel: 'sportsbook_channel_id',
     shop_channel: 'shop_channel_id',
     team_owners_channel: 'team_owners_channel_id',
@@ -18402,6 +18413,7 @@ function buildSetupDashboardEmbed(league) {
     'Standings: ' + setupDashboardFormatValue(league, 'standings_channel'),
     'League History: ' + setupDashboardFormatValue(league, 'history_channel'),
     'Madden Free Agents: ' + setupDashboardFormatValue(league, 'madden_free_agents_channel'),
+    'Game Threads: ' + setupDashboardFormatValue(league, 'game_thread_channel'),
     'Sportsbook: ' + setupDashboardFormatValue(league, 'sportsbook_channel'),
     'Shop: ' + setupDashboardFormatValue(league, 'shop_channel'),
     'Tournament: ' + setupDashboardFormatValue(league, 'tournament_channel'),
@@ -26335,11 +26347,15 @@ function buildMaddenGameThreadsSummaryEmbed(league, week, result = {}) {
 
 // 7J-10BY-GT: Game thread channel / settings helpers
 async function getMaddenGameThreadsChannelId(leagueId) {
+  // Check league_settings first (set via /setup panel), then madden_league_settings (set via /maddengames setup)
   const result = await pool.query(
-    `SELECT game_threads_channel_id FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    `SELECT ls.game_threads_channel_id AS ls_channel, mls.game_threads_channel_id AS mls_channel
+     FROM league_settings ls
+     LEFT JOIN madden_league_settings mls ON mls.league_id = ls.league_id
+     WHERE ls.league_id = $1 LIMIT 1`,
     [leagueId]
   ).catch(() => ({ rows: [] }));
-  return result.rows[0]?.game_threads_channel_id || null;
+  return result.rows[0]?.ls_channel || result.rows[0]?.mls_channel || null;
 }
 
 async function setMaddenGameThreadsSettings(league, { channelId, auto, visibility } = {}) {
