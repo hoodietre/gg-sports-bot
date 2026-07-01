@@ -72,6 +72,7 @@ const maddenFreeAgentPaginationSessions = new Map();
 const maddenFreeAgentRowsCache = new Map();
 const MADDEN_FREE_AGENT_PAGE_SIZE = 10;
 const MADDEN_FREE_AGENT_CACHE_TTL_MS = 5 * 60 * 1000;
+const maddenPlayerSearchSessions = new Map();
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -7121,6 +7122,31 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('madden_players_view:')) {
+      const [, token, mode] = interaction.customId.split(':');
+      const session = maddenPlayerSearchSessions.get(token);
+      if (!session) {
+        await interaction.reply({ content: 'This player search has expired. Run `/madden players` again.', ephemeral: true }).catch(() => null);
+        return;
+      }
+      if (session.userId !== interaction.user.id) {
+        await interaction.reply({ content: 'Only the user who ran this search can switch views.', ephemeral: true }).catch(() => null);
+        return;
+      }
+      await interaction.deferUpdate().catch(() => null);
+      session.mode = mode;
+      session.updatedAt = Date.now();
+      maddenPlayerSearchSessions.set(token, session);
+      const embed = mode === 'attributes'
+        ? buildMaddenPlayersAttributesEmbed(session.league, session.rows, session.filters)
+        : buildMaddenImportedPlayersEmbed(session.league, session.rows, session.filters);
+      await interaction.message.edit({
+        embeds: [embed],
+        components: buildMaddenPlayerSearchComponents(token, mode),
+      }).catch(() => null);
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('maddenfreeagents_page:')) {
       const [, token, direction] = interaction.customId.split(':');
       const session = maddenFreeAgentPaginationSessions.get(token);
@@ -9615,7 +9641,10 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
           `SELECT p.*,
                   COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
                   COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name,
-                  pa.years_left, pa.cap_hit, pa.salary, pa.archetype
+                  COALESCE(pa.years_left, pv.years_left)   AS years_left,
+                  COALESCE(pa.cap_hit,    pv.cap_hit)      AS cap_hit,
+                  COALESCE(pa.salary,     pv.cap_hit)      AS salary,
+                  pa.archetype
            FROM madden_players p
            LEFT JOIN madden_imported_team_stats t
              ON t.guild_id = p.guild_id::text
@@ -9626,6 +9655,10 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
              ON pa.guild_id = p.guild_id
             AND pa.league_id::text = p.league_id::text
             AND pa.player_id = p.id
+           LEFT JOIN madden_player_values pv
+             ON pv.guild_id = p.guild_id
+            AND pv.league_id::text = p.league_id::text
+            AND pv.player_id = p.id
            WHERE p.guild_id = $1 AND p.league_id = $2
              AND ($3::text IS NULL OR LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER('%' || $3 || '%'))
              AND ($4::text IS NULL OR LOWER(p.position) = LOWER($4))
@@ -9651,7 +9684,20 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
           [interaction.guild.id, activeLeague.league_id, team || null, position || null, limit, dev || null]
         );
 
-        await interaction.reply({ embeds: [buildMaddenImportedPlayersEmbed(activeLeague, result.rows, { team, position, dev })], ephemeral: true });
+        const token = randomBytes(6).toString('hex');
+        maddenPlayerSearchSessions.set(token, {
+          rows: result.rows,
+          league: activeLeague,
+          filters: { team, position, dev },
+          mode: 'info',
+          userId: interaction.user.id,
+          createdAt: Date.now(),
+        });
+        await interaction.reply({
+          embeds: [buildMaddenImportedPlayersEmbed(activeLeague, result.rows, { team, position, dev })],
+          components: buildMaddenPlayerSearchComponents(token, 'info'),
+          ephemeral: true,
+        });
         return;
       }
 
@@ -19821,18 +19867,20 @@ function formatMaddenImportedPlayerLine(player, index = null, compact = false) {
   const age = !compact && player.age ? `Age ${player.age}` : null;
   const prefix = index !== null ? `**${index + 1}. ${name}**` : `**${name}**`;
 
-  // Contract info — show if available from madden_player_attributes join
+  // Contract info — show if cap_hit > 0 (real data) or years_left > 0. Skip when both are 0/null
+  // (EA's preseason roster export doesn't include salary yet — will populate when integrated)
   let contractText = null;
   if (!compact) {
-    const yrs = Number(player.years_left ?? player.contract_years_left ?? -1);
+    const yrs = Number(player.years_left ?? -1);
     const cap = Number(player.cap_hit || player.salary || 0);
-    if (yrs >= 0 && cap > 0) {
+    if (yrs > 0 && cap > 0) {
       contractText = `${yrs.toFixed(0)}yr • $${(cap / 1000000).toFixed(1)}M`;
-    } else if (yrs >= 0) {
-      contractText = `${yrs.toFixed(0)}yr`;
     } else if (cap > 0) {
       contractText = `$${(cap / 1000000).toFixed(1)}M`;
+    } else if (yrs > 0) {
+      contractText = `${yrs.toFixed(0)}yr`;
     }
+    // yrs === 0 or cap === 0 means no data from EA yet — omit rather than show misleading "0yr"
   }
 
   const details = [abbr, pos, ovr, dev, age, contractText].filter(Boolean).join(' • ');
@@ -19865,6 +19913,172 @@ function buildMaddenRosterGroupedText(rows) {
   }
 
   return lines.join('\n');
+}
+
+// 7J-10BY-GT2: Player search two-mode view (Info / Attributes)
+// Reads attributes directly from raw_payload already stored on each madden_players row.
+function extractMaddenPlayerAttributesForDisplay(player) {
+  const raw = player.raw_payload && typeof player.raw_payload === 'object' ? player.raw_payload : {};
+  const flat = maddenDiagFlattenObject7J10BYDB(raw);
+
+  // Build a normalized lookup: last path segment → numeric value
+  const lookup = {};
+  for (const [path, value] of Object.entries(flat)) {
+    const key = path.split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const num = Number(value);
+    if (!isNaN(num) && num > 0) lookup[key] = num;
+  }
+
+  const get = (...keys) => {
+    for (const k of keys) {
+      const norm = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (lookup[norm] !== undefined) return lookup[norm];
+    }
+    return null;
+  };
+
+  const pos = String(player.position || '').toUpperCase();
+  const results = [];
+
+  // Athletic (universal — show for everyone)
+  const spd = get('speed', 'spd');
+  const acc = get('acceleration', 'accel', 'acc');
+  const agi = get('agility', 'agi');
+  const str = get('strength', 'str');
+  const awr = get('awareness', 'awr');
+  if (spd) results.push(`SPD ${spd}`);
+  if (acc) results.push(`ACC ${acc}`);
+  if (agi) results.push(`AGI ${agi}`);
+  if (str) results.push(`STR ${str}`);
+
+  // Position-specific
+  if (pos === 'QB') {
+    const thp = get('throwPower', 'thp');
+    const sac = get('shortAccuracy', 'sac');
+    const mac = get('mediumAccuracy', 'mac');
+    const dac = get('deepAccuracy', 'dac');
+    const tup = get('throwUnderPressure', 'tup');
+    if (thp) results.push(`THP ${thp}`);
+    if (sac) results.push(`SAC ${sac}`);
+    if (mac) results.push(`MAC ${mac}`);
+    if (dac) results.push(`DAC ${dac}`);
+    if (tup) results.push(`TUP ${tup}`);
+  } else if (['HB', 'FB'].includes(pos)) {
+    const car = get('carrying', 'car');
+    const btk = get('breakTackle', 'btk');
+    const trk = get('trucking', 'trk');
+    const juk = get('juke', 'juk', 'jukeMoves');
+    const cth = get('catching', 'cth');
+    if (car) results.push(`CAR ${car}`);
+    if (btk) results.push(`BTK ${btk}`);
+    if (trk) results.push(`TRK ${trk}`);
+    if (juk) results.push(`JUK ${juk}`);
+    if (cth) results.push(`CTH ${cth}`);
+  } else if (['WR', 'TE'].includes(pos)) {
+    const cth = get('catching', 'cth');
+    const cit = get('catchInTraffic', 'cit');
+    const rls = get('release', 'rls');
+    const srr = get('shortRouteRunning', 'srr');
+    const mrr = get('mediumRouteRunning', 'mrr');
+    if (cth) results.push(`CTH ${cth}`);
+    if (cit) results.push(`CIT ${cit}`);
+    if (rls) results.push(`RLS ${rls}`);
+    if (srr) results.push(`SRR ${srr}`);
+    if (mrr) results.push(`MRR ${mrr}`);
+  } else if (['LT', 'LG', 'C', 'RG', 'RT'].includes(pos)) {
+    const pbk = get('passBlock', 'pbk');
+    const rbk = get('runBlock', 'rbk');
+    const ibl = get('impactBlock', 'ibl');
+    if (pbk) results.push(`PBK ${pbk}`);
+    if (rbk) results.push(`RBK ${rbk}`);
+    if (ibl) results.push(`IBL ${ibl}`);
+  } else if (['LE', 'RE', 'DT'].includes(pos)) {
+    const tak = get('tackle', 'tak');
+    const pur = get('pursuit', 'pur');
+    const pmv = get('powerMove', 'pmv');
+    const fmv = get('finessMove', 'fmv');
+    const bsh = get('blockShed', 'bsh');
+    if (tak) results.push(`TAK ${tak}`);
+    if (pur) results.push(`PUR ${pur}`);
+    if (pmv) results.push(`PMV ${pmv}`);
+    if (fmv) results.push(`FMV ${fmv}`);
+    if (bsh) results.push(`BSH ${bsh}`);
+  } else if (['LOLB', 'MLB', 'ROLB'].includes(pos)) {
+    const tak = get('tackle', 'tak');
+    const pur = get('pursuit', 'pur');
+    const prc = get('playRecognition', 'prc');
+    const bsh = get('blockShed', 'bsh');
+    const mcv = get('manCoverage', 'mcv');
+    if (tak) results.push(`TAK ${tak}`);
+    if (pur) results.push(`PUR ${pur}`);
+    if (prc) results.push(`PRC ${prc}`);
+    if (bsh) results.push(`BSH ${bsh}`);
+    if (mcv) results.push(`MCV ${mcv}`);
+  } else if (['CB', 'FS', 'SS'].includes(pos)) {
+    const mcv = get('manCoverage', 'mcv');
+    const zcv = get('zoneCoverage', 'zcv');
+    const prs = get('press', 'prs');
+    const tak = get('tackle', 'tak');
+    if (mcv) results.push(`MCV ${mcv}`);
+    if (zcv) results.push(`ZCV ${zcv}`);
+    if (prs) results.push(`PRS ${prs}`);
+    if (tak) results.push(`TAK ${tak}`);
+  }
+
+  if (awr) results.push(`AWR ${awr}`);
+  return results.slice(0, 7); // cap for line length
+}
+
+function buildMaddenPlayersAttributesEmbed(league, rows, filters = {}) {
+  const NL = String.fromCharCode(10);
+  const filterText = [
+    filters.team ? 'Team: ' + filters.team : null,
+    filters.position ? 'Position: ' + filters.position : null,
+    filters.dev ? 'Dev: ' + filters.dev : null,
+  ].filter(Boolean).join(' • ');
+
+  let hasAnyAttributes = false;
+  const lines = rows.map((player, index) => {
+    const name = player.player_name || maddenPlayerDisplayName(player);
+    const pos = player.position || 'POS';
+    const ovr = player.overall != null ? player.overall : 'N/A';
+    const dev = maddenPlayerDevEmojiOnly(player.dev_trait);
+    const attrs = extractMaddenPlayerAttributesForDisplay(player);
+    if (attrs.length) hasAnyAttributes = true;
+    const attrLine = attrs.length ? attrs.join(' • ') : '— no attribute data in payload';
+    return `**${index + 1}. ${name}** — ${pos} ${ovr} OVR ${dev}\n${attrLine}`;
+  });
+
+  const body = lines.join(NL).slice(0, 3900);
+  const noDataNote = !hasAnyAttributes
+    ? NL + NL + '_No attribute ratings found in raw payload. EA may not include these in the current sync endpoint — check `/maddendiagnostics` for details._'
+    : '';
+
+  return new EmbedBuilder()
+    .setTitle('⚡ Player Attributes • ' + league.league_name)
+    .setColor(0x5865F2)
+    .setDescription((filterText ? '_' + filterText + '_' + NL + NL : '') + (body || 'No players found.') + noDataNote)
+    .setFooter({ text: `GG Sports • Player Attributes • Showing ${Math.min(rows.length, 50)}` })
+    .setTimestamp();
+}
+
+function buildMaddenPlayerSearchComponents(token, mode) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`madden_players_view:${token}:info`)
+        .setLabel('Player Info')
+        .setEmoji('📋')
+        .setStyle(mode === 'info' ? ButtonStyle.Primary : ButtonStyle.Secondary)
+        .setDisabled(mode === 'info'),
+      new ButtonBuilder()
+        .setCustomId(`madden_players_view:${token}:attributes`)
+        .setLabel('Player Attributes')
+        .setEmoji('⚡')
+        .setStyle(mode === 'attributes' ? ButtonStyle.Primary : ButtonStyle.Secondary)
+        .setDisabled(mode === 'attributes'),
+    ),
+  ];
 }
 
 function buildMaddenImportedPlayersEmbed(league, rows, filters = {}) {
