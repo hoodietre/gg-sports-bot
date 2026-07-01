@@ -38075,7 +38075,7 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
 
     stageIndex,
     isPreseason: weekType === 0 || String(displayedWeek || '').toLowerCase().includes('preseason'),
-    isRegularSeason: weekType === 1 || String(displayedWeek || '').toLowerCase().match(/^week\s+\d+/),
+    isRegularSeason: weekType === 1 || Boolean(String(displayedWeek || '').toLowerCase().match(/^week\s+\d+/)),
     gamesPlayedCount,
     gameTotalCount,
     regularSeasonWeekCount: parseNumberOrNull(getAnyValue(hubPayload, ['regularSeasonWeekCount'], null)),
@@ -38107,15 +38107,18 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
 function isEaHubInPreseason(hubPayload, leagueId = null) {
   const ctx = extractEaStandingsRequestContextFromHub(hubPayload, leagueId || 0);
 
-  // Strong regular-season signals override stale availableWeekInfoList preseason entries.
+  // 7J-10BY-EF: EA sends weekType:0 and isPreseason:true even when displayedWeek
+  // is "Week 1" (which previously made isRegularSeason truthy and overrode these).
+  // Explicit weekType:0 or isPreseason:true are stronger signals than the
+  // displayedWeek string, so check them first before deferring to isRegularSeason.
+  if (ctx.weekType === 0 || ctx.seasonWeekType === 0) return true;
+  if (ctx.isPreseason === true) return true;
+  if (String(ctx.displayedWeek || '').toLowerCase().includes('preseason')) return true;
+
+  // Strong regular-season signals that are NOT overridden by preseason fields above.
   if (ctx.isRegularSeason || ctx.seasonWeekType === 1 || ctx.weekType === 1) return false;
 
-  return Boolean(
-    ctx.isPreseason ||
-    ctx.seasonWeekType === 0 ||
-    ctx.weekType === 0 ||
-    String(ctx.displayedWeek || '').toLowerCase().includes('preseason')
-  );
+  return false;
 }
 
 function getEaHubSeasonModeLabel(hubPayload, leagueId = null) {
@@ -38886,7 +38889,7 @@ function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = n
 
   if (currentCtx && currentCtx.isPreseason && !currentCtx.isRegularSeason) {
     // 7J-10BY-EF: hub context has been overridden to preseason — build a preseason
-    // label from whatever week signal is available in the game row.
+    // label from whatever week signal is available in the game row first, then context.
     for (const source of sources) {
       const rawWeek = parseNumberOrNull(getAnyValue(source, [
         'week', 'weekIndex', 'seasonWeek', 'displayWeek', 'displayedWeekIndex',
@@ -38894,11 +38897,10 @@ function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = n
       ], null));
       if (rawWeek !== null) return 'Preseason Week ' + String(rawWeek + 1);
     }
-    // fallback: use current season week from context
-    if (currentCtx.seasonWeek !== null && currentCtx.seasonWeek !== undefined) {
-      return 'Preseason Week ' + String(Math.max(1, Number(currentCtx.seasonWeek) + 1));
-    }
-    return 'Preseason Week TBD';
+    // No week field in game row — fall back to context's seasonWeek
+    const ctxWeek = parseNumberOrNull(currentCtx.seasonWeek ?? currentCtx.weekIndex ?? null);
+    if (ctxWeek !== null) return 'Preseason Week ' + String(ctxWeek + 1);
+    return 'Preseason Week 1';
   }
 
   if (currentCtx && currentCtx.isRegularSeason) {
@@ -38972,32 +38974,16 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
   const maps = buildEaTeamNameMaps(hubPayload);
   const currentCtx = extractEaStandingsRequestContextFromHub(hubPayload, 0);
 
-  // 7J-10BY-EF: EA reports isRegularSeason:true and weekType:1 at the hub level even
-  // during preseason, which makes repairEaFutureWeekLabelFromGame fall through to
-  // "Week N" for every preseason game. Detect preseason independently by looking at
-  // whether any game rows carry weekType:0 or have weekIndex in the preseason range
-  // (0-3) with no scores — that's a more reliable signal than the hub context alone.
-  const candidates = collectEaScheduleCandidateRows(hubPayload)
-    .filter(row => looksLikeEaScheduleGame(row.item));
-
-  const preseasonOverride = candidates.some(wrapper => {
-    const item = wrapper.item;
-    const game = item?.seasonGameInfo || item?.gameInfo || item || {};
-    const weekType = parseNumberOrNull(getAnyValue(game, ['weekType', 'seasonWeekType', 'stageIndex'], null) ??
-      getAnyValue(item, ['weekType', 'seasonWeekType', 'stageIndex'], null));
-    const weekIndex = parseNumberOrNull(getAnyValue(game, ['weekIndex', 'week', 'seasonWeek'], null) ??
-      getAnyValue(item, ['weekIndex', 'week', 'seasonWeek'], null));
-    const homeScore = parseNumberOrNull(getAnyValue(game, ['homeScore', 'home_score'], null));
-    const awayScore = parseNumberOrNull(getAnyValue(game, ['awayScore', 'away_score'], null));
-    const hasScore = (homeScore ?? 0) > 0 || (awayScore ?? 0) > 0;
-    if (weekType === 0) return true;
-    if (weekIndex !== null && weekIndex >= 0 && weekIndex <= 3 && !hasScore) return true;
-    return false;
-  });
-
-  const effectiveCtx = preseasonOverride
+  // 7J-10BY-EF: isEaHubInPreseason now correctly returns true when weekType:0 or
+  // isPreseason:true, even if displayedWeek is "Week 1". Build effectiveCtx from
+  // that signal so repairEaFutureWeekLabelFromGame gets a correct preseason context.
+  const hubIsPreseason = isEaHubInPreseason(hubPayload, 0);
+  const effectiveCtx = hubIsPreseason
     ? { ...currentCtx, isRegularSeason: false, isPreseason: true, weekType: 0 }
     : currentCtx;
+
+  const candidates = collectEaScheduleCandidateRows(hubPayload)
+    .filter(row => looksLikeEaScheduleGame(row.item));
 
   const byGameKey = new Map();
 
