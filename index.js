@@ -2195,6 +2195,25 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('panel').setDescription('Open the interactive setup dashboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
+      .setName('leagueannounce')
+      .setDescription('Staff: post a professional league announcement embed')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o => o.setName('title').setDescription('Announcement title').setRequired(true))
+      .addStringOption(o => o.setName('message').setDescription('Announcement body text').setRequired(true))
+      .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false))
+      .addStringOption(o => o.setName('color').setDescription('Embed color').setRequired(false)
+        .addChoices(
+          { name: '🟢 Green',  value: 'green'  },
+          { name: '🔵 Blue',   value: 'blue'   },
+          { name: '🟡 Gold',   value: 'gold'   },
+          { name: '🔴 Red',    value: 'red'    },
+          { name: '🟣 Purple', value: 'purple' },
+          { name: '⚪ White',  value: 'white'  }
+        ))
+      .addStringOption(o => o.setName('image').setDescription('Optional image URL to attach to the announcement').setRequired(false))
+      .addBooleanOption(o => o.setName('ping').setDescription('Ping the league role with the announcement? (default: false)').setRequired(false)),
+
+    new SlashCommandBuilder()
       .setName('avatar')
       .setDescription('Visual avatar and cosmetic commands')
       .addSubcommand(sc => sc.setName('view').setDescription('View your full-body avatar').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
@@ -3086,7 +3105,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -9595,13 +9614,18 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const result = await pool.query(
           `SELECT p.*,
                   COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
-                  COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name
+                  COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name,
+                  pa.years_left, pa.cap_hit, pa.salary, pa.archetype
            FROM madden_players p
            LEFT JOIN madden_imported_team_stats t
              ON t.guild_id = p.guild_id::text
             AND t.league_id::text = p.league_id::text
             AND p.team_id IS NOT NULL
             AND t.external_team_id::text = p.team_id
+           LEFT JOIN madden_player_attributes pa
+             ON pa.guild_id = p.guild_id
+            AND pa.league_id::text = p.league_id::text
+            AND pa.player_id = p.id
            WHERE p.guild_id = $1 AND p.league_id = $2
              AND ($3::text IS NULL OR LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER('%' || $3 || '%'))
              AND ($4::text IS NULL OR LOWER(p.position) = LOWER($4))
@@ -15164,6 +15188,60 @@ if (shopSubcommand === 'view') {
       return;
     }
 
+    if (interaction.commandName === 'leagueannounce') {
+      if (!interaction.guild) return;
+      await interaction.deferReply({ ephemeral: true });
+
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
+      if (!activeLeague) {
+        await interaction.editReply({ content: `Could not find league **${leagueName}**.` });
+        return;
+      }
+      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+        await interaction.editReply({ content: 'You do not have permission to post league announcements.' });
+        return;
+      }
+
+      const title   = interaction.options.getString('title');
+      const message = interaction.options.getString('message');
+      const colorChoice = interaction.options.getString('color') || 'blue';
+      const imageUrl = interaction.options.getString('image') || null;
+      const pingLeague = interaction.options.getBoolean('ping') || false;
+      const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+
+      const colorMap = {
+        green:  0x57F287,
+        blue:   0x5865F2,
+        gold:   0xFEE75C,
+        red:    0xED4245,
+        purple: 0x9B59B6,
+        white:  0xFFFFFF,
+      };
+
+      const embed = new EmbedBuilder()
+        .setTitle(title)
+        .setDescription(message)
+        .setColor(colorMap[colorChoice] || 0x5865F2)
+        .setFooter({ text: activeLeague.league_name + ' • GG Sports' })
+        .setTimestamp();
+      if (imageUrl) embed.setImage(imageUrl);
+
+      const leagueRoleId = activeLeague.league_role_id;
+      const content = pingLeague && leagueRoleId ? `<@&${leagueRoleId}>` : null;
+      const allowedMentions = pingLeague && leagueRoleId
+        ? { roles: [leagueRoleId] }
+        : { roles: [], users: [] };
+
+      try {
+        const posted = await targetChannel.send({ content, embeds: [embed], allowedMentions });
+        await interaction.editReply({ content: `✅ Announcement posted in <#${posted.channelId}>.` });
+      } catch (err) {
+        await interaction.editReply({ content: `Failed to post announcement: ${err?.message || 'Unknown error'}. Make sure the bot has Send Messages and Embed Links permissions in that channel.` });
+      }
+      return;
+    }
+
     if (interaction.commandName === 'whogotnext') {
       const requestedLeagueName = interaction.options.getString('league');
       const activeLeague = requestedLeagueName && interaction.guild ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
@@ -18341,6 +18419,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'history_channel', label: 'League History Channel', description: 'Season archives and year-end history posts', kind: 'channel' },
   { value: 'madden_free_agents_channel', label: 'Madden Free Agents Channel', description: 'Live free agent board and offseason free agency panel', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
+  { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed', kind: 'channel' },
   { value: 'shop_channel', label: 'Shop Channel', description: 'Permanent shop panel channel', kind: 'channel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
@@ -18374,6 +18453,7 @@ function setupDashboardColumn(settingKey) {
     history_channel: 'history_channel_id',
     madden_free_agents_channel: 'madden_free_agents_channel_id',
     game_thread_channel: 'game_threads_channel_id',
+    madden_news_channel: 'madden_news_channel_id',
     sportsbook_channel: 'sportsbook_channel_id',
     shop_channel: 'shop_channel_id',
     team_owners_channel: 'team_owners_channel_id',
@@ -18414,6 +18494,7 @@ function buildSetupDashboardEmbed(league) {
     'League History: ' + setupDashboardFormatValue(league, 'history_channel'),
     'Madden Free Agents: ' + setupDashboardFormatValue(league, 'madden_free_agents_channel'),
     'Game Threads: ' + setupDashboardFormatValue(league, 'game_thread_channel'),
+    'Madden News: ' + setupDashboardFormatValue(league, 'madden_news_channel'),
     'Sportsbook: ' + setupDashboardFormatValue(league, 'sportsbook_channel'),
     'Shop: ' + setupDashboardFormatValue(league, 'shop_channel'),
     'Tournament: ' + setupDashboardFormatValue(league, 'tournament_channel'),
@@ -19739,7 +19820,22 @@ function formatMaddenImportedPlayerLine(player, index = null, compact = false) {
   const dev = maddenPlayerDevEmojiOnly(player.dev_trait);
   const age = !compact && player.age ? `Age ${player.age}` : null;
   const prefix = index !== null ? `**${index + 1}. ${name}**` : `**${name}**`;
-  const details = [abbr, pos, ovr, dev, age].filter(Boolean).join(' • ');
+
+  // Contract info — show if available from madden_player_attributes join
+  let contractText = null;
+  if (!compact) {
+    const yrs = Number(player.years_left ?? player.contract_years_left ?? -1);
+    const cap = Number(player.cap_hit || player.salary || 0);
+    if (yrs >= 0 && cap > 0) {
+      contractText = `${yrs.toFixed(0)}yr • $${(cap / 1000000).toFixed(1)}M`;
+    } else if (yrs >= 0) {
+      contractText = `${yrs.toFixed(0)}yr`;
+    } else if (cap > 0) {
+      contractText = `$${(cap / 1000000).toFixed(1)}M`;
+    }
+  }
+
+  const details = [abbr, pos, ovr, dev, age, contractText].filter(Boolean).join(' • ');
   return `${prefix}\n— ${details}`;
 }
 
@@ -19759,7 +19855,12 @@ function buildMaddenRosterGroupedText(rows) {
       const pos = player.position || 'POS';
       const ovr = player.overall !== null && player.overall !== undefined ? player.overall : 'N/A';
       const ageText = Number(player.age || 0) > 0 && Number(player.age || 0) <= 24 ? ` • Age ${player.age}` : '';
-      lines.push(`${name} — ${pos} • ${ovr} OVR • ${maddenPlayerDevEmojiOnly(player.dev_trait)}${ageText}`);
+      const yrs = Number(player.years_left ?? player.contract_years_left ?? -1);
+      const cap = Number(player.cap_hit || player.salary || 0);
+      const contractText = yrs >= 0 && cap > 0
+        ? ` • ${yrs.toFixed(0)}yr $${(cap / 1000000).toFixed(1)}M`
+        : yrs >= 0 ? ` • ${yrs.toFixed(0)}yr` : '';
+      lines.push(`${name} — ${pos} • ${ovr} OVR • ${maddenPlayerDevEmojiOnly(player.dev_trait)}${ageText}${contractText}`);
     }
   }
 
