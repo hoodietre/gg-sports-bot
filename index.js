@@ -21277,6 +21277,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
   const needsLogo = getMaddenTeamLogoUrl(teamNeed.teamName);
   if (needsLogo) tradeNeedsEmbed.setThumbnail(needsLogo);
   return tradeNeedsEmbed;
+}
 
 
 
