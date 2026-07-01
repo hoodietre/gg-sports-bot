@@ -18970,7 +18970,8 @@ function formatMaddenStandingLine(team, index) {
   const diff = pf - pa;
   const seed = team.seed ? `${team.seed}. ` : `${index + 1}. `;
   const rank = team.rank ? ` • Rank #${team.rank}` : '';
-  return `**${seed}${team.team_name}** — ${formatMaddenStandingsRecord(team)} • PF ${pf} • PA ${pa} • DIFF ${diff >= 0 ? '+' : ''}${diff}${rank}`;
+  const teamDisplay = maddenTeamDisplayNameWithLogo(team.team_name);
+  return `**${seed}${teamDisplay}** — ${formatMaddenStandingsRecord(team)} • PF ${pf} • PA ${pa} • DIFF ${diff >= 0 ? '+' : ''}${diff}${rank}`;
 }
 
 
@@ -19076,7 +19077,8 @@ function buildMaddenPowerRankingsEmbed(league, rankings) {
     const record = ties ? `${wins}-${losses}-${ties}` : `${wins}-${losses}`;
     const diff = Number(row.point_diff || 0);
     const diffText = diff >= 0 ? '+' + diff : String(diff);
-    return `**${row.rank}. ${row.team_name}** (${record}) — ${formatMaddenPowerMovement(row)}\nScore ${formatMaddenPowerScore(row.power_score)} • DIFF ${diffText} • OFF #${row.offense_rank || 'N/A'} • DEF #${row.defense_rank || 'N/A'}`;
+    const teamDisplay = maddenTeamDisplayNameWithLogo(row.team_name);
+    return `**${row.rank}. ${teamDisplay}** (${record}) — ${formatMaddenPowerMovement(row)}\nScore ${formatMaddenPowerScore(row.power_score)} • DIFF ${diffText} • OFF #${row.offense_rank || 'N/A'} • DEF #${row.defense_rank || 'N/A'}`;
   });
 
   return new EmbedBuilder()
@@ -19737,6 +19739,9 @@ function buildMaddenGameCenterEmbed(league, game, awayPerformers, homePerformers
     )
     .setFooter({ text: 'GG Sports • Madden Game Center' })
     .setTimestamp();
+
+  const gameLogo = getMaddenTeamLogoUrl(homeTeam) || getMaddenTeamLogoUrl(awayTeam);
+  if (gameLogo) embed.setThumbnail(gameLogo);
 
   if (mvp) {
     embed.addFields({
@@ -21257,7 +21262,7 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
 
   const surplus = (teamNeed.strengths || []).slice(0, 3).map(row => row.position).join(', ') || 'None detected';
   const abbr = getMaddenTeamAbbrev(teamNeed.teamName) || teamNeed.teamName;
-  return new EmbedBuilder()
+  const tradeNeedsEmbed = new EmbedBuilder()
     .setTitle(`Madden Team Needs • ${maddenTeamDisplayName(teamNeed.teamName)}`)
     .setColor(0x5865F2)
     .setDescription(`${league?.league_name || 'Madden League'}\nRoster Avg OVR: **${Number(teamNeed.teamAvgOverall || 0).toFixed(1)}** • Team: **${abbr}**`)
@@ -21269,7 +21274,9 @@ async function buildMaddenTradeNeedsEmbed(guildId, league, teamName) {
     )
     .setFooter({ text: 'GG Sports • 7J-10BW-A Trade Block Integrations' })
     .setTimestamp();
-}
+  const needsLogo = getMaddenTeamLogoUrl(teamNeed.teamName);
+  if (needsLogo) tradeNeedsEmbed.setThumbnail(needsLogo);
+  return tradeNeedsEmbed;
 
 
 
@@ -25986,12 +25993,34 @@ function maddenJsonNumberSql(key) {
 
 
 const NFL_TEAM_ABBREVIATIONS = {
+  // Mascot-only (EA's primary format)
   '49ers': 'SF', bears: 'CHI', bengals: 'CIN', bills: 'BUF', broncos: 'DEN', browns: 'CLE',
   buccaneers: 'TB', cardinals: 'ARI', chargers: 'LAC', chiefs: 'KC', colts: 'IND', commanders: 'WAS',
   cowboys: 'DAL', dolphins: 'MIA', eagles: 'PHI', falcons: 'ATL', giants: 'NYG', jaguars: 'JAX',
   jets: 'NYJ', lions: 'DET', packers: 'GB', panthers: 'CAR', patriots: 'NE', raiders: 'LV',
   rams: 'LAR', ravens: 'BAL', saints: 'NO', seahawks: 'SEA', steelers: 'PIT', texans: 'HOU',
   titans: 'TEN', vikings: 'MIN',
+  // City + mascot (full names from exports or user input)
+  'san francisco 49ers': 'SF', 'chicago bears': 'CHI', 'cincinnati bengals': 'CIN',
+  'buffalo bills': 'BUF', 'denver broncos': 'DEN', 'cleveland browns': 'CLE',
+  'tampa bay buccaneers': 'TB', 'arizona cardinals': 'ARI', 'los angeles chargers': 'LAC',
+  'kansas city chiefs': 'KC', 'indianapolis colts': 'IND', 'washington commanders': 'WAS',
+  'dallas cowboys': 'DAL', 'miami dolphins': 'MIA', 'philadelphia eagles': 'PHI',
+  'atlanta falcons': 'ATL', 'new york giants': 'NYG', 'jacksonville jaguars': 'JAX',
+  'new york jets': 'NYJ', 'detroit lions': 'DET', 'green bay packers': 'GB',
+  'carolina panthers': 'CAR', 'new england patriots': 'NE', 'las vegas raiders': 'LV',
+  'los angeles rams': 'LAR', 'baltimore ravens': 'BAL', 'new orleans saints': 'NO',
+  'seattle seahawks': 'SEA', 'pittsburgh steelers': 'PIT', 'houston texans': 'HOU',
+  'tennessee titans': 'TEN', 'minnesota vikings': 'MIN',
+  // City-only shortcuts
+  'san francisco': 'SF', 'chicago': 'CHI', 'cincinnati': 'CIN', 'buffalo': 'BUF',
+  'denver': 'DEN', 'cleveland': 'CLE', 'tampa bay': 'TB', 'arizona': 'ARI',
+  'los angeles': 'LAR', 'kansas city': 'KC', 'indianapolis': 'IND', 'washington': 'WAS',
+  'dallas': 'DAL', 'miami': 'MIA', 'philadelphia': 'PHI', 'atlanta': 'ATL',
+  'new york': 'NYG', 'jacksonville': 'JAX', 'detroit': 'DET', 'green bay': 'GB',
+  'carolina': 'CAR', 'new england': 'NE', 'las vegas': 'LV', 'baltimore': 'BAL',
+  'new orleans': 'NO', 'seattle': 'SEA', 'pittsburgh': 'PIT', 'houston': 'HOU',
+  'tennessee': 'TEN', 'minnesota': 'MIN',
 };
 
 function getMaddenTeamAbbrev(teamName) {
@@ -29825,9 +29854,31 @@ function maddenNewsCategoryForEventType(eventType) {
 
 function buildMaddenNewsEventEmbed(league, event) {
   const meta = event.metadata && typeof event.metadata === 'object' ? event.metadata : {};
+
+  // Color by event type so the news channel feels like a real ticker
+  const colorMap = {
+    transaction:        0x57F287, // green  — roster moves
+    trade:              0xFEE75C, // gold   — trades
+    trade_accepted:     0xFEE75C,
+    trade_proposed:     0xFEE75C,
+    trade_block_added:  0x3498DB, // blue   — trade block
+    trade_block_removed:0x95A5A6, // grey
+    retirement:         0xED4245, // red    — retirements
+    retired:            0xED4245,
+    draft_pick:         0x9B59B6, // purple — draft
+    rookie_signed:      0x9B59B6,
+    re_signed:          0x2ECC71, // teal   — re-signings
+    contract_extended:  0x2ECC71,
+    released:           0xE67E22, // orange — releases / cuts
+    cut:                0xE67E22,
+    game_threads_created: 0x5865F2, // indigo — game threads
+    week_advance:       0x1ABC9C,  // cyan   — advances
+  };
+  const eventColor = colorMap[String(event.event_type || '').toLowerCase()] ?? 0x3498DB;
+
   const embed = new EmbedBuilder()
     .setTitle(maddenNewsEventTitle(event.event_type))
-    .setColor(0x3498DB)
+    .setColor(eventColor)
     .setFooter({ text: 'GG Sports • 7J-10BY-ED3 Madden News + Transactions' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
