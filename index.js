@@ -38826,6 +38826,23 @@ function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = n
     }
   }
 
+  if (currentCtx && currentCtx.isPreseason && !currentCtx.isRegularSeason) {
+    // 7J-10BY-EF: hub context has been overridden to preseason — build a preseason
+    // label from whatever week signal is available in the game row.
+    for (const source of sources) {
+      const rawWeek = parseNumberOrNull(getAnyValue(source, [
+        'week', 'weekIndex', 'seasonWeek', 'displayWeek', 'displayedWeekIndex',
+        'scheduleWeek', 'gameWeek'
+      ], null));
+      if (rawWeek !== null) return 'Preseason Week ' + String(rawWeek + 1);
+    }
+    // fallback: use current season week from context
+    if (currentCtx.seasonWeek !== null && currentCtx.seasonWeek !== undefined) {
+      return 'Preseason Week ' + String(Math.max(1, Number(currentCtx.seasonWeek) + 1));
+    }
+    return 'Preseason Week TBD';
+  }
+
   if (currentCtx && currentCtx.isRegularSeason) {
     const currentWeekNumber = Number(String(currentCtx.displayedWeek || '').match(/\d+/)?.[0] || 0) ||
       (Number.isFinite(Number(currentCtx.seasonWeek)) ? Math.max(1, Number(currentCtx.seasonWeek) - 3) : null);
@@ -38897,8 +38914,32 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
   const maps = buildEaTeamNameMaps(hubPayload);
   const currentCtx = extractEaStandingsRequestContextFromHub(hubPayload, 0);
 
+  // 7J-10BY-EF: EA reports isRegularSeason:true and weekType:1 at the hub level even
+  // during preseason, which makes repairEaFutureWeekLabelFromGame fall through to
+  // "Week N" for every preseason game. Detect preseason independently by looking at
+  // whether any game rows carry weekType:0 or have weekIndex in the preseason range
+  // (0-3) with no scores — that's a more reliable signal than the hub context alone.
   const candidates = collectEaScheduleCandidateRows(hubPayload)
     .filter(row => looksLikeEaScheduleGame(row.item));
+
+  const preseasonOverride = candidates.some(wrapper => {
+    const item = wrapper.item;
+    const game = item?.seasonGameInfo || item?.gameInfo || item || {};
+    const weekType = parseNumberOrNull(getAnyValue(game, ['weekType', 'seasonWeekType', 'stageIndex'], null) ??
+      getAnyValue(item, ['weekType', 'seasonWeekType', 'stageIndex'], null));
+    const weekIndex = parseNumberOrNull(getAnyValue(game, ['weekIndex', 'week', 'seasonWeek'], null) ??
+      getAnyValue(item, ['weekIndex', 'week', 'seasonWeek'], null));
+    const homeScore = parseNumberOrNull(getAnyValue(game, ['homeScore', 'home_score'], null));
+    const awayScore = parseNumberOrNull(getAnyValue(game, ['awayScore', 'away_score'], null));
+    const hasScore = (homeScore ?? 0) > 0 || (awayScore ?? 0) > 0;
+    if (weekType === 0) return true;
+    if (weekIndex !== null && weekIndex >= 0 && weekIndex <= 3 && !hasScore) return true;
+    return false;
+  });
+
+  const effectiveCtx = preseasonOverride
+    ? { ...currentCtx, isRegularSeason: false, isPreseason: true, weekType: 0 }
+    : currentCtx;
 
   const byGameKey = new Map();
 
@@ -38913,7 +38954,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const seasonGameKey = getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) ||
       getAnyValue(game, ['seasonGameKey', 'id', 'gameId'], null);
 
-    const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, currentCtx, item);
+    const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, effectiveCtx, item);
     const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
 
@@ -38971,16 +39012,22 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
 
   const knownWeek = games
     .map(g => String(g.week_label || ''))
-    .find(label => label && label !== 'Week TBD' && /^Week\s+\d+/i.test(label));
+    .find(label => label && label !== 'Week TBD' && label !== 'Preseason Week TBD' && /^Week\s+\d+/i.test(label) && !/preseason/i.test(label));
 
-  if (knownWeek) {
+  const knownPreseasonWeek = games
+    .map(g => String(g.week_label || ''))
+    .find(label => label && label !== 'Preseason Week TBD' && /^Preseason Week\s+\d+/i.test(label));
+
+  if (knownPreseasonWeek || knownWeek) {
     games = games.map(game => {
-      if (String(game.week_label || '') !== 'Week TBD') return game;
+      const label = String(game.week_label || '');
+      if (label !== 'Week TBD' && label !== 'Preseason Week TBD') return game;
+      const fillLabel = /preseason/i.test(label) ? (knownPreseasonWeek || label) : (knownWeek || label);
       return {
         ...game,
-        week: knownWeek,
-        weekLabel: knownWeek,
-        week_label: knownWeek,
+        week: fillLabel,
+        weekLabel: fillLabel,
+        week_label: fillLabel,
       };
     });
   }
