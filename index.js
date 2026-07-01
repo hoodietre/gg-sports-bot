@@ -19867,20 +19867,20 @@ function formatMaddenImportedPlayerLine(player, index = null, compact = false) {
   const age = !compact && player.age ? `Age ${player.age}` : null;
   const prefix = index !== null ? `**${index + 1}. ${name}**` : `**${name}**`;
 
-  // Contract info — show if cap_hit > 0 (real data) or years_left > 0. Skip when both are 0/null
-  // (EA's preseason roster export doesn't include salary yet — will populate when integrated)
+  // Contract info — pull from raw_payload first (EA: contractYearsLeft, capHit, contractSalary)
+  // then fall back to joined table columns (pa/pv)
   let contractText = null;
   if (!compact) {
-    const yrs = Number(player.years_left ?? -1);
-    const cap = Number(player.cap_hit || player.salary || 0);
-    if (yrs > 0 && cap > 0) {
-      contractText = `${yrs.toFixed(0)}yr • $${(cap / 1000000).toFixed(1)}M`;
-    } else if (cap > 0) {
+    const raw = extractMaddenPlayerContractFromRaw(player);
+    const yrs = raw.yrs ?? (Number(player.years_left ?? -1) > 0 ? Number(player.years_left) : null);
+    const cap = raw.cap ?? (Number(player.cap_hit || player.salary || 0) > 0 ? Number(player.cap_hit || player.salary) : null);
+    if (yrs && cap) {
+      contractText = `${yrs}yr • $${(cap / 1000000).toFixed(1)}M`;
+    } else if (cap) {
       contractText = `$${(cap / 1000000).toFixed(1)}M`;
-    } else if (yrs > 0) {
-      contractText = `${yrs.toFixed(0)}yr`;
+    } else if (yrs) {
+      contractText = `${yrs}yr`;
     }
-    // yrs === 0 or cap === 0 means no data from EA yet — omit rather than show misleading "0yr"
   }
 
   const details = [abbr, pos, ovr, dev, age, contractText].filter(Boolean).join(' • ');
@@ -19903,11 +19903,12 @@ function buildMaddenRosterGroupedText(rows) {
       const pos = player.position || 'POS';
       const ovr = player.overall !== null && player.overall !== undefined ? player.overall : 'N/A';
       const ageText = Number(player.age || 0) > 0 && Number(player.age || 0) <= 24 ? ` • Age ${player.age}` : '';
-      const yrs = Number(player.years_left ?? player.contract_years_left ?? -1);
-      const cap = Number(player.cap_hit || player.salary || 0);
-      const contractText = yrs >= 0 && cap > 0
-        ? ` • ${yrs.toFixed(0)}yr $${(cap / 1000000).toFixed(1)}M`
-        : yrs >= 0 ? ` • ${yrs.toFixed(0)}yr` : '';
+      const rawContract = extractMaddenPlayerContractFromRaw(player);
+      const yrs = rawContract.yrs ?? (Number(player.years_left ?? -1) > 0 ? Number(player.years_left) : null);
+      const cap = rawContract.cap ?? (Number(player.cap_hit || 0) > 0 ? Number(player.cap_hit) : null);
+      const contractText = yrs && cap
+        ? ` • ${yrs}yr $${(cap / 1000000).toFixed(1)}M`
+        : yrs ? ` • ${yrs}yr` : '';
       lines.push(`${name} — ${pos} • ${ovr} OVR • ${maddenPlayerDevEmojiOnly(player.dev_trait)}${ageText}${contractText}`);
     }
   }
@@ -19916,12 +19917,12 @@ function buildMaddenRosterGroupedText(rows) {
 }
 
 // 7J-10BY-GT2: Player search two-mode view (Info / Attributes)
-// Reads attributes directly from raw_payload already stored on each madden_players row.
+// EA stores ratings as camelCase with Rating suffix: accelRating, agilityRating, etc.
 function extractMaddenPlayerAttributesForDisplay(player) {
   const raw = player.raw_payload && typeof player.raw_payload === 'object' ? player.raw_payload : {};
   const flat = maddenDiagFlattenObject7J10BYDB(raw);
 
-  // Build a normalized lookup: last path segment → numeric value
+  // Normalized lookup: last path segment (stripped) → numeric value
   const lookup = {};
   for (const [path, value] of Object.entries(flat)) {
     const key = path.split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -19940,93 +19941,137 @@ function extractMaddenPlayerAttributesForDisplay(player) {
   const pos = String(player.position || '').toUpperCase();
   const results = [];
 
-  // Athletic (universal — show for everyone)
-  const spd = get('speed', 'spd');
-  const acc = get('acceleration', 'accel', 'acc');
-  const agi = get('agility', 'agi');
-  const str = get('strength', 'str');
-  const awr = get('awareness', 'awr');
+  // Athletic — EA sends XxxRating; keep fallback aliases for other sync sources
+  const spd = get('speedRating', 'speed', 'spd');
+  const acc = get('accelRating', 'accelerationRating', 'acceleration', 'accel');
+  const agi = get('agilityRating', 'changeOfDirectionRating', 'agility', 'agi');
+  const str = get('strengthRating', 'strength', 'str');
+  const awr = get('awareRating', 'awarenessRating', 'awareness', 'awr');
+
   if (spd) results.push(`SPD ${spd}`);
   if (acc) results.push(`ACC ${acc}`);
   if (agi) results.push(`AGI ${agi}`);
   if (str) results.push(`STR ${str}`);
 
-  // Position-specific
   if (pos === 'QB') {
-    const thp = get('throwPower', 'thp');
-    const sac = get('shortAccuracy', 'sac');
-    const mac = get('mediumAccuracy', 'mac');
-    const dac = get('deepAccuracy', 'dac');
-    const tup = get('throwUnderPressure', 'tup');
+    const thp = get('throwPowerRating', 'throwPower', 'thp');
+    const sac = get('shortAccuracyRating', 'shortAccuracy', 'sac');
+    const mac = get('medAccuracyRating', 'mediumAccuracyRating', 'mediumAccuracy', 'mac');
+    const dac = get('deepAccuracyRating', 'deepAccuracy', 'dac');
+    const tup = get('throwUnderPressureRating', 'throwUnderPressure', 'tup');
+    const tor = get('throwOnRunRating', 'throwOnRun', 'tor');
     if (thp) results.push(`THP ${thp}`);
     if (sac) results.push(`SAC ${sac}`);
     if (mac) results.push(`MAC ${mac}`);
     if (dac) results.push(`DAC ${dac}`);
     if (tup) results.push(`TUP ${tup}`);
+    if (tor) results.push(`TOR ${tor}`);
   } else if (['HB', 'FB'].includes(pos)) {
-    const car = get('carrying', 'car');
-    const btk = get('breakTackle', 'btk');
-    const trk = get('trucking', 'trk');
-    const juk = get('juke', 'juk', 'jukeMoves');
-    const cth = get('catching', 'cth');
+    const car = get('carryRating', 'carryingRating', 'carrying', 'car');
+    const btk = get('breakTackleRating', 'breakTackle', 'btk');
+    const trk = get('truckingRating', 'trucking', 'trk');
+    const juk = get('jukeMoveRating', 'jukeMovesRating', 'juke', 'juk');
+    const cth = get('catchRating', 'catchingRating', 'catching', 'cth');
     if (car) results.push(`CAR ${car}`);
     if (btk) results.push(`BTK ${btk}`);
     if (trk) results.push(`TRK ${trk}`);
     if (juk) results.push(`JUK ${juk}`);
     if (cth) results.push(`CTH ${cth}`);
   } else if (['WR', 'TE'].includes(pos)) {
-    const cth = get('catching', 'cth');
-    const cit = get('catchInTraffic', 'cit');
-    const rls = get('release', 'rls');
-    const srr = get('shortRouteRunning', 'srr');
-    const mrr = get('mediumRouteRunning', 'mrr');
+    const cth = get('catchRating', 'catchingRating', 'catching', 'cth');
+    const cit = get('cITRating', 'catchInTrafficRating', 'catchInTraffic', 'cit');
+    const spc = get('specCatchRating', 'spectacularCatchRating', 'spectacularCatch', 'spc');
+    const rls = get('releaseRating', 'release', 'rls');
+    const srr = get('shortRouteRunRating', 'shortRouteRunningRating', 'shortRouteRunning', 'srr');
+    const mrr = get('medRouteRunRating', 'mediumRouteRunningRating', 'mediumRouteRunning', 'mrr');
     if (cth) results.push(`CTH ${cth}`);
     if (cit) results.push(`CIT ${cit}`);
+    if (spc) results.push(`SPC ${spc}`);
     if (rls) results.push(`RLS ${rls}`);
     if (srr) results.push(`SRR ${srr}`);
     if (mrr) results.push(`MRR ${mrr}`);
   } else if (['LT', 'LG', 'C', 'RG', 'RT'].includes(pos)) {
-    const pbk = get('passBlock', 'pbk');
-    const rbk = get('runBlock', 'rbk');
-    const ibl = get('impactBlock', 'ibl');
+    const pbk = get('passBlockRating', 'passBlock', 'pbk');
+    const rbk = get('runBlockRating', 'runBlock', 'rbk');
+    const ibl = get('impactBlockRating', 'impactBlock', 'ibl');
+    const pbp = get('passBlockPowerRating', 'passBlockPower', 'pbp');
+    const pbf = get('passBlockFinesseRating', 'passBlockFinesse', 'pbf');
     if (pbk) results.push(`PBK ${pbk}`);
     if (rbk) results.push(`RBK ${rbk}`);
     if (ibl) results.push(`IBL ${ibl}`);
+    if (pbp) results.push(`PBP ${pbp}`);
+    if (pbf) results.push(`PBF ${pbf}`);
   } else if (['LE', 'RE', 'DT'].includes(pos)) {
-    const tak = get('tackle', 'tak');
-    const pur = get('pursuit', 'pur');
-    const pmv = get('powerMove', 'pmv');
-    const fmv = get('finessMove', 'fmv');
-    const bsh = get('blockShed', 'bsh');
+    const tak = get('tackleRating', 'tackle', 'tak');
+    const pur = get('pursuitRating', 'pursuit', 'pur');
+    const pmv = get('powerMovesRating', 'powerMoveRating', 'powerMove', 'pmv');
+    const fmv = get('finessMovesRating', 'finesseMovesRating', 'finessMove', 'fmv');
+    const bsh = get('blockShedRating', 'blockShed', 'bsh');
     if (tak) results.push(`TAK ${tak}`);
     if (pur) results.push(`PUR ${pur}`);
     if (pmv) results.push(`PMV ${pmv}`);
     if (fmv) results.push(`FMV ${fmv}`);
     if (bsh) results.push(`BSH ${bsh}`);
   } else if (['LOLB', 'MLB', 'ROLB'].includes(pos)) {
-    const tak = get('tackle', 'tak');
-    const pur = get('pursuit', 'pur');
-    const prc = get('playRecognition', 'prc');
-    const bsh = get('blockShed', 'bsh');
-    const mcv = get('manCoverage', 'mcv');
+    const tak = get('tackleRating', 'tackle', 'tak');
+    const pur = get('pursuitRating', 'pursuit', 'pur');
+    const prc = get('playRecognitionRating', 'playRecognition', 'prc');
+    const bsh = get('blockShedRating', 'blockShed', 'bsh');
+    const mcv = get('manCoverageRating', 'manCoverage', 'mcv');
+    const zcv = get('zoneCoverageRating', 'zoneCoverage', 'zcv');
     if (tak) results.push(`TAK ${tak}`);
     if (pur) results.push(`PUR ${pur}`);
     if (prc) results.push(`PRC ${prc}`);
     if (bsh) results.push(`BSH ${bsh}`);
     if (mcv) results.push(`MCV ${mcv}`);
+    if (zcv) results.push(`ZCV ${zcv}`);
   } else if (['CB', 'FS', 'SS'].includes(pos)) {
-    const mcv = get('manCoverage', 'mcv');
-    const zcv = get('zoneCoverage', 'zcv');
-    const prs = get('press', 'prs');
-    const tak = get('tackle', 'tak');
+    const mcv = get('manCoverageRating', 'manCoverage', 'mcv');
+    const zcv = get('zoneCoverageRating', 'zoneCoverage', 'zcv');
+    const prs = get('pressRating', 'press', 'prs');
+    const tak = get('tackleRating', 'tackle', 'tak');
+    const pur = get('pursuitRating', 'pursuit', 'pur');
+    const prc = get('playRecognitionRating', 'playRecognition', 'prc');
     if (mcv) results.push(`MCV ${mcv}`);
     if (zcv) results.push(`ZCV ${zcv}`);
     if (prs) results.push(`PRS ${prs}`);
     if (tak) results.push(`TAK ${tak}`);
+    if (pur) results.push(`PUR ${pur}`);
+    if (prc) results.push(`PRC ${prc}`);
+  } else if (['K', 'P'].includes(pos)) {
+    const kpw = get('kickPowerRating', 'kickPower', 'kpw');
+    const kac = get('kickAccuracyRating', 'kickAccuracy', 'kac');
+    if (kpw) results.push(`KPW ${kpw}`);
+    if (kac) results.push(`KAC ${kac}`);
   }
 
   if (awr) results.push(`AWR ${awr}`);
-  return results.slice(0, 7); // cap for line length
+  return results.slice(0, 7);
+}
+
+// Extract contract data from raw_payload using EA's actual field names
+function extractMaddenPlayerContractFromRaw(player) {
+  const raw = player.raw_payload && typeof player.raw_payload === 'object' ? player.raw_payload : {};
+  const flat = maddenDiagFlattenObject7J10BYDB(raw);
+  const lookup = {};
+  for (const [path, value] of Object.entries(flat)) {
+    const key = path.split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+    lookup[key] = value;
+  }
+  const get = (...keys) => {
+    for (const k of keys) {
+      const norm = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (lookup[norm] !== undefined) return lookup[norm];
+    }
+    return null;
+  };
+  const yrs = Number(get('contractYearsLeft', 'yearsLeft', 'years_left', 'contractlength') ?? -1);
+  const cap = Number(get('capHit', 'cap_hit', 'contractSalary', 'salary') || 0);
+  return {
+    yrs: yrs > 0 ? yrs : null,
+    cap: cap > 0 ? cap : null,
+    capText: cap > 0 ? `$${(cap / 1000000).toFixed(1)}M` : null,
+  };
 }
 
 function buildMaddenPlayersAttributesEmbed(league, rows, filters = {}) {
@@ -36576,8 +36621,19 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
     fields.push({ name: 'Bio', value: physical, inline: false });
   }
 
-
-  const valueInfo = calculateMaddenPlayerValue(player);
+  // Attributes from raw_payload
+  const attrs = extractMaddenPlayerAttributesForDisplay(player);
+  const rawContract = extractMaddenPlayerContractFromRaw(player);
+  if (attrs.length || rawContract.yrs || rawContract.cap) {
+    const attrLine = attrs.length ? attrs.join(' • ') : null;
+    const contractLine = rawContract.yrs && rawContract.cap
+      ? `Contract: ${rawContract.yrs}yr • ${rawContract.capText}`
+      : rawContract.cap ? `Cap Hit: ${rawContract.capText}`
+      : rawContract.yrs ? `Years Left: ${rawContract.yrs}`
+      : null;
+    const attrValue = [contractLine, attrLine].filter(Boolean).join('\n');
+    if (attrValue) fields.push({ name: 'Attributes', value: attrValue, inline: false });
+  }
   if (valueInfo.valueScore > 0) {
     fields.push({
       name: 'Player Value',
