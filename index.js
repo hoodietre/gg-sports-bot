@@ -7133,14 +7133,13 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await interaction.reply({ content: 'Only the user who ran this search can switch views.', ephemeral: true }).catch(() => null);
         return;
       }
-      await interaction.deferUpdate().catch(() => null);
       session.mode = mode;
       session.updatedAt = Date.now();
       maddenPlayerSearchSessions.set(token, session);
       const embed = mode === 'attributes'
         ? buildMaddenPlayersAttributesEmbed(session.league, session.rows, session.filters)
         : buildMaddenImportedPlayersEmbed(session.league, session.rows, session.filters);
-      await interaction.message.edit({
+      await interaction.update({
         embeds: [embed],
         components: buildMaddenPlayerSearchComponents(token, mode),
       }).catch(() => null);
@@ -36634,6 +36633,9 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
     const attrValue = [contractLine, attrLine].filter(Boolean).join('\n');
     if (attrValue) fields.push({ name: 'Attributes', value: attrValue, inline: false });
   }
+
+  const valueInfo = calculateMaddenPlayerValue(player);
+
   if (valueInfo.valueScore > 0) {
     fields.push({
       name: 'Player Value',
