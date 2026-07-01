@@ -19161,16 +19161,52 @@ function getMaddenTeamLogoUrl(teamName) {
 }
 
 
+const NFL_TEAM_EMOJIS = {
+  NFL: '<:nfl:1522018278111707257>',
+  NFC: '<:nfc:1522018487763992577>',
+  AFC: '<:afc:1522018401411665980>',
+  SF:  '<:49ers:1522007318940749906>',
+  CHI: '<:bears:1522007060915425450>',
+  CIN: '<:bengals:1522007560524267690>',
+  BUF: '<:bills:1522007859640930364>',
+  DEN: '<:broncos:1522008093364588545>',
+  CLE: '<:browns:1522008229008117881>',
+  TB:  '<:buccaneers:1522008449062408253>',
+  ARI: '<:cardinals:1522008696584929310>',
+  LAC: '<:chargers:1522008893050454066>',
+  KC:  '<:chiefs:1522009012663746610>',
+  IND: '<:colts:1522011991558852849>',
+  WAS: '<:commanders:1522013219470704710>',
+  DAL: '<:cowboys:1522013373451993098>',
+  MIA: '<:dolphins:1522013806455291914>',
+  PHI: '<:eagles:1522013929830744197>',
+  ATL: '<:falcons:1522014081043661042>',
+  JAX: '<:jaguars:1522014256206315721>',
+  NYJ: '<:jets:1522014341493293146>',
+  DET: '<:lions:1522015304077676585>',
+  NYG: '<:giants:1522015448361861152>',
+  GB:  '<:packers:1522016232876802088>',
+  CAR: '<:panthers:1522016511273861120>',
+  NE:  '<:patriots:1522016598892875976>',
+  LV:  '<:raiders:1522016707122561054>',
+  LAR: '<:rams:1522017178839416963>',
+  BAL: '<:ravens:1522017327657386014>',
+  NO:  '<:saints:1522017533551448345>',
+  SEA: '<:seahawks:1522017628338520114>',
+  PIT: '<:steelers:1522017686173909022>',
+  HOU: '<:texans:1522017799114063983>',
+  TEN: '<:titans:1522017903598243961>',
+  MIN: '<:vikings:1522018005750382793>',
+};
+
+function getMaddenTeamEmoji(teamName) {
+  const abbr = String(getMaddenTeamAbbrev(teamName) || '').toUpperCase();
+  return NFL_TEAM_EMOJIS[abbr] || '';
+}
+
 function maddenTeamDisplayNameWithLogo(teamName) {
   const name = String(teamName || '').trim() || 'Unknown Team';
-  const abbr = getMaddenTeamAbbrev(name);
-  const emojiMap = {
-    SF: '🔴', CHI: '🐻', CIN: '🐅', BUF: '🦬', DEN: '🐴', CLE: '🟤', TB: '🏴‍☠️', ARI: '🐦',
-    LAC: '⚡', KC: '🏹', IND: '🐴', WAS: '🟡', DAL: '⭐', MIA: '🐬', PHI: '🦅', ATL: '🐦‍⬛',
-    NYG: '🔵', JAX: '🐆', NYJ: '✈️', DET: '🦁', GB: '🧀', CAR: '🐾', NE: '🇺🇸', LV: '☠️',
-    LAR: '🐏', BAL: '🐦‍⬛', NO: '⚜️', SEA: '🟢', PIT: '⚫', HOU: '🐂', TEN: '⚔️', MIN: '🟣',
-  };
-  const emoji = emojiMap[String(abbr || '').toUpperCase()] || '';
+  const emoji = getMaddenTeamEmoji(name);
   return `${emoji ? emoji + ' ' : ''}${name}`;
 }
 
@@ -19277,7 +19313,7 @@ function buildMaddenMatchupPreviewEmbed(league, matchup) {
   const embed = new EmbedBuilder()
     .setTitle('🏈 Madden Matchup Preview • ' + (league.league_name || 'Madden League'))
     .setColor(0x5865F2)
-    .setDescription(`**${awayName} vs ${homeName}**\n${storyline}`)
+    .setDescription(`**${getMaddenTeamEmoji(awayName) || ''} ${awayName} vs ${getMaddenTeamEmoji(homeName) || ''} ${homeName}**\n${storyline}`)
     .addFields(
       { name: 'Record', value: `${formatMaddenStandingsRecord(away)} vs ${formatMaddenStandingsRecord(home)}`, inline: true },
       { name: 'PPG', value: `${formatMaddenOneDecimal(awayPf / awayGames)} vs ${formatMaddenOneDecimal(homePf / homeGames)}`, inline: true },
@@ -19288,7 +19324,7 @@ function buildMaddenMatchupPreviewEmbed(league, matchup) {
       { name: 'Top QB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayQB, 'Pass Yards')}\nvs\n${formatMaddenMatchupLeader(matchup.leaders.homeQB, 'Pass Yards')}`, inline: true },
       { name: 'Top RB', value: `${formatMaddenMatchupLeader(matchup.leaders.awayRB, 'Rush Yards')}\nvs\n${formatMaddenMatchupLeader(matchup.leaders.homeRB, 'Rush Yards')}`, inline: true },
       { name: 'Top WR', value: `${formatMaddenMatchupLeader(matchup.leaders.awayWR, 'Rec Yards')}\nvs\n${formatMaddenMatchupLeader(matchup.leaders.homeWR, 'Rec Yards')}`, inline: true },
-      { name: '🤖 GG Sports Prediction', value: `**${awayName} ${matchup.prediction.projectedAway}**\n**${homeName} ${matchup.prediction.projectedHome}**\n\nFavorite: **${favorite}**\n\nWin Probability\n${awayName}: **${matchup.prediction.awayProb}%**\n${homeName}: **${matchup.prediction.homeProb}%**`, inline: false }
+      { name: '🤖 GG Sports Prediction', value: `**${getMaddenTeamEmoji(awayName) || ''} ${awayName} ${matchup.prediction.projectedAway}**\n**${getMaddenTeamEmoji(homeName) || ''} ${homeName} ${matchup.prediction.projectedHome}**\n\nFavorite: **${favorite}**\n\nWin Probability\n${awayName}: **${matchup.prediction.awayProb}%**\n${homeName}: **${matchup.prediction.homeProb}%**`, inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-7ZS-D Matchup Preview' })
     .setTimestamp();
@@ -19781,10 +19817,15 @@ function buildMaddenImportedScheduleEmbed(league, rows, week = null) {
   );
 
   const lines = sorted.map(game => {
+    const awayEmoji = getMaddenTeamEmoji(game.away_team);
+    const homeEmoji = getMaddenTeamEmoji(game.home_team);
+    const awayDisplay = `${awayEmoji ? awayEmoji + ' ' : ''}${game.away_team || 'Away'}`;
+    const homeDisplay = `${homeEmoji ? homeEmoji + ' ' : ''}${game.home_team || 'Home'}`;
+    const statusLabel = String(game.status || 'scheduled') === 'completed_with_real_score' ? 'Final' : (game.status || 'Scheduled');
     return '**' + (game.week_label || 'Week TBD') + '** — ' +
-      game.away_team + ' @ ' + game.home_team +
+      awayDisplay + ' @ ' + homeDisplay +
       formatMaddenGameScore(game) +
-      ' • ' + (String(game.status || 'scheduled') === 'completed_with_real_score' ? 'completed' : (game.status || 'scheduled'));
+      ' • ' + statusLabel;
   });
 
   return new EmbedBuilder()
@@ -29884,7 +29925,10 @@ function buildMaddenNewsEventEmbed(league, event) {
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
 
   const displayTeamForEvent = meta.display_team_name || (event.team_name ? maddenTransactionDisplayTeam(event.team_name) : '');
-  const playerLine = event.player_name ? `**${event.player_name}**${displayTeamForEvent ? ` • ${displayTeamForEvent}` : ''}` : (displayTeamForEvent ? `**${displayTeamForEvent}**` : league?.league_name || 'Madden League');
+  const teamEmoji = event.team_name ? getMaddenTeamEmoji(event.team_name) : '';
+  const playerLine = event.player_name
+    ? `**${event.player_name}**${displayTeamForEvent ? ` • ${teamEmoji ? teamEmoji + ' ' : ''}${displayTeamForEvent}` : ''}`
+    : (displayTeamForEvent ? `${teamEmoji ? teamEmoji + ' ' : ''}**${displayTeamForEvent}**` : league?.league_name || 'Madden League');
   embed.setDescription(playerLine);
 
   const fields = [];
