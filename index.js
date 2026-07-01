@@ -38860,8 +38860,14 @@ function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = n
 
     if (explicit && String(explicit).trim() && String(explicit).trim() !== 'Week TBD') {
       const value = String(explicit).trim();
-      if (value.match(/^\d+$/)) return 'Week ' + value;
-      return value;
+      const normalized = value.match(/^\d+$/) ? 'Week ' + value : value;
+      // 7J-10BY-EF: if context says preseason but the explicit field says "Week N",
+      // the field is carrying a stale/incorrect hub-level displayedWeek. Convert it.
+      if (currentCtx?.isPreseason && !currentCtx?.isRegularSeason && /^Week\s+\d+$/i.test(normalized) && !/preseason/i.test(normalized)) {
+        const weekNum = parseNumberOrNull(normalized.match(/\d+/)?.[0]);
+        if (weekNum !== null) return 'Preseason Week ' + String(weekNum);
+      }
+      return normalized;
     }
   }
 
