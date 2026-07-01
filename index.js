@@ -39327,6 +39327,49 @@ async function getEaBlazeLeagueHubWithRefreshRetryDetailed(context) {
 
 
 
+async function cleanupMaddenMislabeledPreseasonRows(guild, league) {
+  // 7J-10BY-EF: when preseason games were first imported, EA's hub reported
+  // isRegularSeason:true so all games got labeled "Week 1" instead of
+  // "Preseason Week 1". After the fix, new correctly-labeled rows are inserted
+  // with different external_game_ids (since the label is part of the fallback ID).
+  // The old mislabeled zero-score "Week 1" rows need to be removed so the correct
+  // "Preseason Week 1" rows win autocomplete and game thread queries.
+  // Only removes zero-score "Week 1" rows when "Preseason Week 1" rows also exist
+  // for the same league — safe to run on every sync.
+  const preseasonExists = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+       AND LOWER(week_label) LIKE 'preseason week%'
+       AND status = 'scheduled'`,
+    [guild.id, league.league_id]
+  ).catch(() => ({ rows: [{ count: 0 }] }));
+
+  if (Number(preseasonExists.rows[0]?.count || 0) === 0) return 0;
+
+  const deleted = await pool.query(
+    `DELETE FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+       AND LOWER(week_label) = 'week 1'
+       AND status = 'scheduled'
+       AND COALESCE(home_score, 0) = 0
+       AND COALESCE(away_score, 0) = 0
+       AND external_game_id LIKE 'ea-schedule-export%'
+       AND imported_at < (
+         SELECT MIN(imported_at) FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id = $2
+           AND LOWER(week_label) LIKE 'preseason week%'
+       )`,
+    [guild.id, league.league_id]
+  ).catch(() => ({ rowCount: 0 }));
+
+  if (Number(deleted.rowCount || 0) > 0) {
+    console.log('[Madden Schedule Cleanup 7J-10BY-EF] Removed mislabeled preseason rows that were stored as "Week 1":', deleted.rowCount);
+  }
+
+  return Number(deleted.rowCount || 0);
+}
+
+
 async function cleanupMaddenWeekTbdRows(guild, league) {
   const normalized = await pool.query(
     `SELECT COUNT(*)::int AS count
@@ -42970,6 +43013,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null) : 0;
     await cleanupMaddenWeekTbdRows(guild, league).catch(error => {
       console.error('[Madden Sync] Week TBD cleanup failed:', error?.message || error);
+    });
+    await cleanupMaddenMislabeledPreseasonRows(guild, league).catch(error => {
+      console.error('[Madden Sync] Preseason mislabel cleanup failed:', error?.message || error);
     });
     await backfillMaddenGameScoresFromRawPayload(guild, league).catch(error => {
       console.error('[Madden Sync] Score backfill failed:', error?.message || error);
