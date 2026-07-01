@@ -8680,45 +8680,45 @@ if (gameSubcommand === 'report') {
           [guild.id, String(activeLeague.league_id), String(week || '')]
         ).catch(() => ({ rows: [] }));
         const games = gamesResult.rows || [];
-        const deleted = [];
-        const skipped = [];
-        const failed = [];
-        for (const game of games) {
-          const label = `${game.away_team || '?'} @ ${game.home_team || '?'}`;
-          if (game.thread_id) {
-            if (confirm) {
-              const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
-              if (thread) {
-                await thread.delete('GG Sports game thread cleanup').catch(() => null);
-              }
-              await pool.query(
-                `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL WHERE id = $1`,
-                [game.id]
-              ).catch(() => null);
-              deleted.push(label);
-            } else {
-              skipped.push(`${label} — would delete thread <#${game.thread_id}>`);
-            }
-          } else {
-            skipped.push(`${label} — no thread`);
-          }
-        }
-        if (!confirm) {
-          await pool.query(
-            `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
-             WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(COALESCE(week_label,'')) = LOWER($3)`,
-            [guild.id, String(activeLeague.league_id), String(week || '')]
-          ).catch(() => null);
-        }
+        const withThreads = games.filter(g => g.thread_id);
+        const withoutThreads = games.filter(g => !g.thread_id);
         const embed = new EmbedBuilder()
           .setTitle(`🗑️ ${confirm ? 'Deleted' : 'Preview'} • ${week || 'Unknown Week'} Game Threads`)
           .setColor(confirm ? 0xED4245 : 0xFEE75C)
           .setFooter({ text: 'GG Sports • Madden Game Thread Cleanup' })
           .setTimestamp();
-        if (confirm && deleted.length) embed.addFields({ name: `Deleted (${deleted.length})`, value: deleted.map(l => `• ${l}`).join('\n').slice(0, 1024) || 'None', inline: false });
-        if (!confirm && skipped.length) embed.addFields({ name: `Would affect (${skipped.length}) — rerun with confirm:true`, value: skipped.map(l => `• ${l}`).join('\n').slice(0, 1024) || 'None', inline: false });
-        if (!confirm) embed.addFields({ name: 'Note', value: 'Thread IDs cleared from DB in preview so `/maddengames threads` can recreate them. Discord threads not deleted until `confirm:true`.', inline: false });
-        if (confirm && !deleted.length) embed.addFields({ name: 'Result', value: 'No threads found to delete for this week.', inline: false });
+        if (!confirm) {
+          const lines = [
+            ...withThreads.map(g => `• ${g.away_team} @ ${g.home_team} — <#${g.thread_id}>`),
+            ...withoutThreads.map(g => `• ${g.away_team} @ ${g.home_team} — no thread`),
+          ];
+          embed.addFields({ name: `Found ${games.length} game(s), ${withThreads.length} with threads`, value: lines.join('\n').slice(0, 1024) || 'No games found for this week.', inline: false });
+          embed.addFields({ name: 'Next step', value: 'Run with `confirm:true` to delete the Discord threads and clear them from the DB.', inline: false });
+          await interaction.editReply({ embeds: [embed] });
+          return;
+        }
+        // confirm:true — delete threads from Discord and clear from DB
+        const deleted = [];
+        const failed = [];
+        for (const game of withThreads) {
+          const label = `${game.away_team || '?'} @ ${game.home_team || '?'}`;
+          const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+          if (thread) {
+            const ok = await thread.delete('GG Sports game thread cleanup').catch(() => false);
+            if (ok !== false) deleted.push(label);
+            else failed.push(label);
+          } else {
+            deleted.push(`${label} (already gone)`);
+          }
+        }
+        await pool.query(
+          `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
+           WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(COALESCE(week_label,'')) = LOWER($3)`,
+          [guild.id, String(activeLeague.league_id), String(week || '')]
+        ).catch(() => null);
+        if (deleted.length) embed.addFields({ name: `Deleted (${deleted.length})`, value: deleted.map(l => `• ${l}`).join('\n').slice(0, 1024), inline: false });
+        if (failed.length) embed.addFields({ name: `Failed (${failed.length})`, value: failed.map(l => `• ${l}`).join('\n').slice(0, 1024), inline: false });
+        if (!deleted.length && !failed.length) embed.addFields({ name: 'Result', value: 'No threads found to delete for this week.', inline: false });
         await interaction.editReply({ embeds: [embed] });
         return;
       }
