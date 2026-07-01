@@ -38075,7 +38075,7 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
 
     stageIndex,
     isPreseason: weekType === 0 || String(displayedWeek || '').toLowerCase().includes('preseason'),
-    isRegularSeason: weekType === 1 || Boolean(String(displayedWeek || '').toLowerCase().match(/^week\s+\d+/)),
+    isRegularSeason: weekType === 1 || (weekType !== 0 && Boolean(String(displayedWeek || '').toLowerCase().match(/^week\s+\d+/))),
     gamesPlayedCount,
     gameTotalCount,
     regularSeasonWeekCount: parseNumberOrNull(getAnyValue(hubPayload, ['regularSeasonWeekCount'], null)),
