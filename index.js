@@ -18563,7 +18563,7 @@ function buildSetupDashboardEmbed(league) {
   ];
 
   return new EmbedBuilder()
-    .setTitle('GG Sports Setup Dashboard')
+    .setTitle(`${GG_EMOJI} GG Sports Setup Dashboard`)
     .setColor(0x5865F2)
     .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Use the panel menu to post or refresh live boards like the Madden Free Agents Board. Old slash commands still work as advanced/manual backups.')
     .addFields(
@@ -19082,7 +19082,7 @@ function buildMaddenPowerRankingsEmbed(league, rankings) {
   });
 
   return new EmbedBuilder()
-    .setTitle('🏆 Madden Power Rankings • ' + league.league_name)
+    .setTitle(`${GG_EMOJI} Madden Power Rankings • ${league.league_name}`)
     .setColor(0xFEE75C)
     .setDescription(lines.join(NL + NL).slice(0, 4096))
     .setFooter({ text: 'GG Sports • 7J-7ZQ-R Power Rankings' })
@@ -19165,6 +19165,7 @@ const NFL_TEAM_EMOJIS = {
   NFL: '<:nfl:1522018278111707257>',
   NFC: '<:nfc:1522018487763992577>',
   AFC: '<:afc:1522018401411665980>',
+  GGSPORTS: '<:ggsports:1522025498425692230>',
   SF:  '<:49ers:1522007318940749906>',
   CHI: '<:bears:1522007060915425450>',
   CIN: '<:bengals:1522007560524267690>',
@@ -19203,6 +19204,8 @@ function getMaddenTeamEmoji(teamName) {
   const abbr = String(getMaddenTeamAbbrev(teamName) || '').toUpperCase();
   return NFL_TEAM_EMOJIS[abbr] || '';
 }
+
+const GG_EMOJI = '<:ggsports:1522025498425692230>';
 
 function maddenTeamDisplayNameWithLogo(teamName) {
   const name = String(teamName || '').trim() || 'Unknown Team';
@@ -19311,7 +19314,7 @@ function buildMaddenMatchupPreviewEmbed(league, matchup) {
   const storyline = buildMaddenMatchupStoryline(homeName, awayName, home, away, matchup.homePower, matchup.awayPower);
 
   const embed = new EmbedBuilder()
-    .setTitle('🏈 Madden Matchup Preview • ' + (league.league_name || 'Madden League'))
+    .setTitle(`${GG_EMOJI} Madden Matchup Preview • ${league.league_name || 'Madden League'}`)
     .setColor(0x5865F2)
     .setDescription(`**${getMaddenTeamEmoji(awayName) || ''} ${awayName} vs ${getMaddenTeamEmoji(homeName) || ''} ${homeName}**\n${storyline}`)
     .addFields(
@@ -19340,7 +19343,7 @@ function buildMaddenImportedStandingsEmbed(league, rows, scope = 'division') {
 
   if (!cleanRows.length) {
     return new EmbedBuilder()
-      .setTitle('Madden Standings • ' + league.league_name)
+      .setTitle(`${GG_EMOJI} Madden Standings • ${league.league_name}`)
       .setColor(0x57F287)
       .setDescription('No imported Madden standings found yet. Use `/madden sync` first.')
       .setFooter({ text: 'GG Sports • Madden Standings' })
@@ -19349,7 +19352,7 @@ function buildMaddenImportedStandingsEmbed(league, rows, scope = 'division') {
 
   const normalizedScope = String(scope || 'division').toLowerCase();
   const embed = new EmbedBuilder()
-    .setTitle('Madden Standings • ' + league.league_name)
+    .setTitle(`${GG_EMOJI} Madden Standings • ${league.league_name}`)
     .setColor(0x57F287)
     .setFooter({ text: 'GG Sports • Madden Standings' })
     .setTimestamp();
@@ -19765,7 +19768,7 @@ function buildMaddenGameCenterEmbed(league, game, awayPerformers, homePerformers
   const mvp = getMaddenGameMvp(awayTeam, awayPerformers, homeTeam, homePerformers);
 
   const embed = new EmbedBuilder()
-    .setTitle(`Madden Game Center • ${week}`)
+    .setTitle(`${GG_EMOJI} Madden Game Center • ${week}`)
     .setDescription(`**${formatMaddenTeamWithRecord(awayTeam, awayRecord)}**\n@ **${formatMaddenTeamWithRecord(homeTeam, homeRecord)}**`)
     .setColor(status === 'Final' ? 0x57F287 : 0xFEE75C)
     .addFields(
@@ -26672,7 +26675,7 @@ function buildMaddenGameThreadEmbed(league, game, owners = {}) {
     ? `${maddenTeamDisplayNameWithLogo(game.away_team)} **${game.away_score}** @ ${maddenTeamDisplayNameWithLogo(game.home_team)} **${game.home_score}**`
     : `Status: **${formatMaddenGameStatus(game)}**`;
   const embed = new EmbedBuilder()
-    .setTitle(`🏈 ${game.week_label || 'Madden'} Game Thread`)
+    .setTitle(`${GG_EMOJI} ${game.week_label || 'Madden'} Game Thread`)
     .setColor(hasScore ? 0x5865F2 : 0x57F287)
     .setDescription(`**${maddenTeamDisplayNameWithLogo(game.away_team || 'Away')} @ ${maddenTeamDisplayNameWithLogo(game.home_team || 'Home')}**`)
     .addFields(
@@ -29919,7 +29922,7 @@ function buildMaddenNewsEventEmbed(league, event) {
   const eventColor = colorMap[String(event.event_type || '').toLowerCase()] ?? 0x3498DB;
 
   const embed = new EmbedBuilder()
-    .setTitle(maddenNewsEventTitle(event.event_type))
+    .setTitle(`${GG_EMOJI} ${maddenNewsEventTitle(event.event_type)}`)
     .setColor(eventColor)
     .setFooter({ text: 'GG Sports • 7J-10BY-ED3 Madden News + Transactions' })
     .setTimestamp(event.created_at ? new Date(event.created_at) : new Date());
