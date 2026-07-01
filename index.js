@@ -44586,7 +44586,10 @@ function buildMaddenSyncSettingsEmbed(league, settings, status = null) {
       { name: 'Last Message', value: settings.last_sync_message || 'No sync has run yet.', inline: false },
       { name: 'Autosync', value: settings.autosync_enabled ? 'Enabled every ' + String(settings.autosync_interval_minutes || 60) + ' minutes' : 'Disabled', inline: true },
       { name: 'Next Sync', value: settings.next_sync_at ? String(settings.next_sync_at) : 'Not scheduled', inline: true },
-      { name: 'Sync Feed', value: settings.sync_feed_channel_id ? '<#' + settings.sync_feed_channel_id + '>' : 'Not set', inline: true }
+      { name: 'Sync Feed', value: settings.sync_feed_channel_id ? '<#' + settings.sync_feed_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Game Thread Channel', value: settings.game_threads_channel_id ? '<#' + settings.game_threads_channel_id + '>' : 'Not set — use /maddengames setup', inline: true },
+      { name: 'Auto Game Threads', value: settings.game_threads_auto !== false ? '✅ On' : '❌ Off', inline: true },
+      { name: 'Thread Visibility', value: settings.game_threads_visibility === 'public' ? '🔓 Public' : '🔒 Private', inline: true }
     )
     .setFooter({ text: 'GG Sports • Madden External Sync' })
     .setTimestamp();
@@ -44691,6 +44694,7 @@ function buildMaddenLeagueEmbed(league, summary) {
       { name: 'Teams Synced', value: String(summary.teams.length || 0), inline: true },
       { name: 'Sync Source', value: summary.settings.sync_source || 'Not linked', inline: true },
       { name: 'External Franchise ID', value: summary.settings.external_franchise_id || 'Not set', inline: true },
+      { name: 'Game Thread Channel', value: summary.settings.game_threads_channel_id ? '<#' + summary.settings.game_threads_channel_id + '>' : 'Not set — use /maddengames setup', inline: true },
       { name: 'League Bridge', value: 'Uses existing GG Sports league roles, standings, sportsbook, activity, legacy, shop, avatar, and badge systems.', inline: false },
       { name: 'Next Commands', value: '/madden teams\\n/madden franchise\\n/game add\\n/game report', inline: false }
     )
