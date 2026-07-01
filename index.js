@@ -8673,6 +8673,7 @@ if (gameSubcommand === 'report') {
       if (subcommand === 'deletethreads') {
         const week = interaction.options.getString('week');
         const confirm = Boolean(interaction.options.getBoolean('confirm'));
+        const guild = interaction.guild;
         const gamesResult = await pool.query(
           `SELECT * FROM madden_imported_games
            WHERE guild_id = $1 AND league_id::text = $2::text
