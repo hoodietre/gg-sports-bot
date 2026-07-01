@@ -365,6 +365,9 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_id TEXT`);
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_created_at TIMESTAMPTZ`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_imported_games_thread_lookup ON madden_imported_games (guild_id, league_id, week_label, thread_id)`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_team_stats (
@@ -1714,6 +1717,17 @@ function buildCommands() {
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('week').setDescription('Week label to clear, for example Week 1').setRequired(true).setAutocomplete(true))
         .addBooleanOption(o => o.setName('confirm').setDescription('Actually delete? Leave false to preview only.').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('setup')
+        .setDescription('Staff: configure game thread channel and auto-creation settings')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addChannelOption(o => o.setName('channel').setDescription('Channel where game threads will be created').setRequired(false))
+        .addBooleanOption(o => o.setName('auto').setDescription('Auto-create threads after each sync? (default: true)').setRequired(false))
+        .addStringOption(o => o.setName('visibility').setDescription('Thread visibility (default: private)').setRequired(false)
+          .addChoices(
+            { name: 'Private', value: 'private' },
+            { name: 'Public',  value: 'public'  }
+          )))
 
 ,
 
@@ -8661,6 +8675,19 @@ if (gameSubcommand === 'report') {
       }
       if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
         await interaction.editReply({ content: 'You do not have permission to create Madden game threads.' });
+        return;
+      }
+      if (subcommand === 'setup') {
+        const channel    = interaction.options.getChannel('channel') || null;
+        const auto       = interaction.options.getBoolean('auto');
+        const visibility = interaction.options.getString('visibility') || null;
+        const updates = {};
+        if (channel    !== null) updates.channelId  = channel.id;
+        if (auto       !== null) updates.auto       = auto;
+        if (visibility !== null) updates.visibility = visibility;
+        if (Object.keys(updates).length) await setMaddenGameThreadsSettings(activeLeague, updates);
+        const settings = await ensureMaddenLeagueSettings(activeLeague);
+        await interaction.editReply({ embeds: [buildMaddenGameThreadsSetupEmbed(activeLeague, settings)] });
         return;
       }
       if (subcommand === 'threads') {
@@ -26306,9 +26333,122 @@ function buildMaddenGameThreadsSummaryEmbed(league, week, result = {}) {
     .setTimestamp();
 }
 
-async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, visibility = 'private') {
+// 7J-10BY-GT: Game thread channel / settings helpers
+async function getMaddenGameThreadsChannelId(leagueId) {
+  const result = await pool.query(
+    `SELECT game_threads_channel_id FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    [leagueId]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0]?.game_threads_channel_id || null;
+}
+
+async function setMaddenGameThreadsSettings(league, { channelId, auto, visibility } = {}) {
+  const updates = [];
+  const values = [league.league_id];
+  if (channelId  !== undefined) { values.push(channelId);  updates.push(`game_threads_channel_id = $${values.length}`); }
+  if (auto       !== undefined) { values.push(auto);       updates.push(`game_threads_auto = $${values.length}`); }
+  if (visibility !== undefined) { values.push(visibility); updates.push(`game_threads_visibility = $${values.length}`); }
+  if (!updates.length) return;
+  updates.push(`updated_at = NOW()`);
+  await pool.query(
+    `UPDATE madden_league_settings SET ${updates.join(', ')} WHERE league_id = $1`,
+    values
+  );
+}
+
+function buildMaddenGameThreadsSetupEmbed(league, settings) {
+  const channelId = settings.game_threads_channel_id;
+  const auto = settings.game_threads_auto !== false;
+  const vis = settings.game_threads_visibility || 'private';
+  return new EmbedBuilder()
+    .setTitle('🏈 Game Thread Settings • ' + league.league_name)
+    .setColor(channelId ? 0x57F287 : 0xFEE75C)
+    .addFields(
+      { name: 'Thread Channel', value: channelId ? `<#${channelId}>` : '⚠️ Not set — threads fall back to the news channel', inline: false },
+      { name: 'Auto Create on Sync', value: auto ? '✅ Enabled' : '❌ Disabled', inline: true },
+      { name: 'Visibility', value: vis === 'public' ? '🔓 Public' : '🔒 Private', inline: true },
+      { name: 'Auto Delete Prior Week', value: 'Always on when auto-create is enabled', inline: false },
+      { name: 'How it works', value: 'After every sync, if new games appear for a week with no threads yet, threads are created automatically in the configured channel and the prior week\'s threads are removed.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-GT Auto Game Threads' })
+    .setTimestamp();
+}
+
+// 7J-10BY-GT: Canonical week ordering
+function maddenWeekLabelSortKey(label) {
+  const s = String(label || '').toLowerCase().trim();
+  const preMatch = s.match(/^preseason week (\d+)$/);
+  if (preMatch) return [0, Number(preMatch[1])];
+  const regMatch = s.match(/^week (\d+)$/);
+  if (regMatch) return [1, Number(regMatch[1])];
+  if (s.includes('wild card'))  return [2, 0];
+  if (s.includes('divisional')) return [2, 1];
+  if (s.includes('conference')) return [2, 2];
+  if (s.includes('super bowl') || s.includes('championship')) return [2, 3];
+  return [1, 999];
+}
+function compareMaddenWeekLabels(a, b) {
+  const [aG, aN] = maddenWeekLabelSortKey(a);
+  const [bG, bN] = maddenWeekLabelSortKey(b);
+  return aG !== bG ? aG - bG : aN - bN;
+}
+
+// 7J-10BY-GT: Find the most recent week with threads that precedes currentWeekLabel
+async function getPreviousWeekWithThreads(guildId, leagueId, currentWeekLabel) {
+  const result = await pool.query(
+    `SELECT DISTINCT week_label
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND thread_id IS NOT NULL
+       AND week_label IS NOT NULL`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  const weeks = (result.rows || []).map(r => r.week_label).filter(Boolean);
+  if (!weeks.length) return null;
+  const [cG, cN] = maddenWeekLabelSortKey(currentWeekLabel);
+  const before = weeks.filter(w => {
+    const [g, n] = maddenWeekLabelSortKey(w);
+    return g < cG || (g === cG && n < cN);
+  });
+  if (!before.length) return null;
+  before.sort(compareMaddenWeekLabels);
+  return before[before.length - 1];
+}
+
+// 7J-10BY-GT: Silent (non-interactive) thread deletion for auto-rotation
+async function deleteMaddenWeekThreadsSilent(guild, league, weekLabel) {
+  if (!weekLabel) return { deleted: 0, failed: 0 };
+  const result = await pool.query(
+    `SELECT * FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(COALESCE(week_label, '')) = LOWER($3)
+       AND thread_id IS NOT NULL`,
+    [guild.id, String(league.league_id), weekLabel]
+  ).catch(() => ({ rows: [] }));
+  let deleted = 0, failed = 0;
+  for (const game of result.rows || []) {
+    const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+    if (thread) {
+      const ok = await thread.delete('GG Sports auto game thread rotation').catch(() => false);
+      if (ok !== false) deleted++;
+      else failed++;
+    } else {
+      deleted++; // already gone from Discord — still counts as cleared
+    }
+  }
+  await pool.query(
+    `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(COALESCE(week_label, '')) = LOWER($3)`,
+    [guild.id, String(league.league_id), weekLabel]
+  ).catch(() => null);
+  return { deleted, failed };
+}
+
+// 7J-10BY-GT: Core thread creation — accepts a resolved channel object so it
+// can be called with or without an interaction (manual command or auto-sync).
+async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visibility = 'private', baseChannel) {
   await ensureMaddenGameThreadColumns();
-  const guild = interaction.guild;
   const result = await pool.query(
     `SELECT *
      FROM madden_imported_games
@@ -26320,18 +26460,21 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
   );
   const games = result.rows || [];
   const out = { created: [], skipped: [], failed: [] };
-  let baseChannel = interaction.channel;
-  if (!baseChannel?.isTextBased?.() || baseChannel?.isThread?.()) {
-    const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
-    baseChannel = newsChannelId ? await guild.channels.fetch(newsChannelId).catch(() => null) : null;
-  }
+
   if (!baseChannel?.isTextBased?.()) {
-    out.failed.push({ label: 'All games', reason: 'No valid text channel found. Run this command in the channel where threads should be created, or configure /maddennews setup.' });
+    out.failed.push({ label: 'All games', reason: 'No valid text channel found. Configure one with /maddengames setup or run this command from inside the target channel.' });
     return out;
   }
 
+  // Matchup-level dedup guard: skip duplicate DB rows for the same matchup
+  const processedMatchups = new Set();
+
   for (const game of games) {
+    const matchupKey = `${String(game.away_team || '').toLowerCase()}@${String(game.home_team || '').toLowerCase()}`;
     const label = `${maddenTeamDisplayName(game.away_team)} @ ${maddenTeamDisplayName(game.home_team)}`;
+    if (processedMatchups.has(matchupKey)) continue;
+    processedMatchups.add(matchupKey);
+
     if (game.thread_id) {
       const existing = await guild.channels.fetch(game.thread_id).catch(() => null);
       if (existing) {
@@ -26365,10 +26508,14 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
           components: [buildMaddenGameThreadButtons(game.id)],
           allowedMentions: { users: [], roles: [] },
         });
-        thread = await starter.startThread({ name: threadName, autoArchiveDuration: 10080, reason: 'GG Sports Madden weekly game thread' }).catch(() => null);
+        thread = await starter.startThread({
+          name: threadName,
+          autoArchiveDuration: 10080,
+          reason: 'GG Sports Madden weekly game thread',
+        }).catch(() => null);
       }
       if (!thread) {
-        out.failed.push({ label, reason: 'Could not create thread. Check bot Create Threads permissions.' });
+        out.failed.push({ label, reason: 'Could not create thread. Check bot Create Threads permissions in the configured channel.' });
         continue;
       }
       for (const owner of [owners.away, owners.home].filter(Boolean)) {
@@ -26376,7 +26523,9 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
       }
       const mentionIds = [owners.away?.id, owners.home?.id].filter(Boolean);
       await thread.send({
-        content: mentionIds.length ? `${mentionIds.map(id => `<@${id}>`).join('\n')} your **${game.week_label || weekLabel}** game thread is ready: **${label}**.` : `Game thread created for **${label}**.`,
+        content: mentionIds.length
+          ? `${mentionIds.map(id => `<@${id}>`).join('\n')} your **${game.week_label || weekLabel}** game thread is ready: **${label}**.`
+          : `Game thread created for **${label}**.`,
         embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
         components: [buildMaddenGameThreadButtons(game.id)],
         allowedMentions: { users: mentionIds, roles: [] },
@@ -26387,7 +26536,7 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
       );
       out.created.push({ label, threadId: thread.id });
     } catch (error) {
-      console.error('[7J-10BY-BA1 GAME THREAD] create failed:', error?.stack || error?.message || error);
+      console.error('[7J-10BY-GT GAME THREAD] create failed:', error?.stack || error?.message || error);
       out.failed.push({ label, reason: String(error?.message || error).slice(0, 140) });
     }
   }
@@ -26399,6 +26548,103 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
     }).catch(() => null);
   }
   return out;
+}
+
+// 7J-10BY-GT: Interaction-facing wrapper — resolves channel then delegates to core
+async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, visibility = 'private') {
+  const guild = interaction.guild;
+  // Channel priority: configured game-thread channel → command channel → news channel
+  const configuredChannelId = await getMaddenGameThreadsChannelId(league.league_id).catch(() => null);
+  let baseChannel = null;
+  if (configuredChannelId) {
+    baseChannel = await guild.channels.fetch(configuredChannelId).catch(() => null);
+  }
+  if (!baseChannel?.isTextBased?.() || baseChannel?.isThread?.()) {
+    if (interaction.channel?.isTextBased?.() && !interaction.channel?.isThread?.()) {
+      baseChannel = interaction.channel;
+    }
+  }
+  if (!baseChannel?.isTextBased?.() || baseChannel?.isThread?.()) {
+    const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+    baseChannel = newsChannelId ? await guild.channels.fetch(newsChannelId).catch(() => null) : null;
+  }
+  return createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visibility, baseChannel);
+}
+
+// 7J-10BY-GT: Auto-trigger — called at end of every sync
+async function autoCreateGameThreadsAfterSync(guild, league) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  if (settings.game_threads_auto === false) {
+    console.log('[AUTO GAME THREADS] Disabled for league ' + league.league_id + ' — skipping.');
+    return;
+  }
+
+  // Find weeks where ALL games are threadless AND at least one is still scheduled
+  const result = await pool.query(
+    `SELECT
+       week_label,
+       COUNT(*) AS total,
+       SUM(CASE WHEN thread_id IS NULL THEN 1 ELSE 0 END) AS no_thread,
+       SUM(CASE WHEN LOWER(status) = 'scheduled' THEN 1 ELSE 0 END) AS scheduled_count
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND week_label IS NOT NULL
+       AND TRIM(week_label) <> ''
+       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'
+     GROUP BY week_label
+     HAVING
+       COUNT(*) > 0
+       AND SUM(CASE WHEN thread_id IS NULL THEN 1 ELSE 0 END) = COUNT(*)
+       AND SUM(CASE WHEN LOWER(status) = 'scheduled' THEN 1 ELSE 0 END) > 0`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+
+  const threadlessWeeks = (result.rows || [])
+    .map(r => r.week_label)
+    .filter(Boolean)
+    .sort(compareMaddenWeekLabels);
+
+  if (!threadlessWeeks.length) {
+    console.log('[AUTO GAME THREADS] No new threadless weeks for league ' + league.league_id);
+    return;
+  }
+
+  const weekLabel = threadlessWeeks[0];
+  console.log('[AUTO GAME THREADS] New week detected: ' + weekLabel + ' for league ' + league.league_id);
+
+  // Resolve the target channel
+  const configuredChannelId = settings.game_threads_channel_id
+    || await getMaddenGameThreadsChannelId(league.league_id).catch(() => null)
+    || await getMaddenNewsChannelId(league.league_id).catch(() => null);
+
+  if (!configuredChannelId) {
+    console.warn('[AUTO GAME THREADS] No thread channel configured for league ' + league.league_id
+      + ' — set one with /maddengames setup channel:#channel');
+    return;
+  }
+  const baseChannel = await guild.channels.fetch(configuredChannelId).catch(() => null);
+  if (!baseChannel?.isTextBased?.()) {
+    console.warn('[AUTO GAME THREADS] Configured channel not found or not text-based for league ' + league.league_id);
+    return;
+  }
+
+  // Delete prior week's threads first
+  const prevWeek = await getPreviousWeekWithThreads(guild.id, league.league_id, weekLabel).catch(() => null);
+  if (prevWeek) {
+    const del = await deleteMaddenWeekThreadsSilent(guild, league, prevWeek)
+      .catch(err => { console.error('[AUTO GAME THREADS] Prior week deletion failed:', err?.message || err); return { deleted: 0, failed: 0 }; });
+    console.log('[AUTO GAME THREADS] Deleted prior week (' + prevWeek + '): ' + del.deleted + ' removed, ' + del.failed + ' failed.');
+  }
+
+  // Create threads for the new week
+  const visibility = settings.game_threads_visibility || 'private';
+  const threadResult = await createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visibility, baseChannel)
+    .catch(err => { console.error('[AUTO GAME THREADS] Thread creation failed:', err?.message || err); return { created: [], skipped: [], failed: [] }; });
+
+  console.log('[AUTO GAME THREADS] ' + weekLabel
+    + ' — created: ' + (threadResult.created?.length || 0)
+    + ', skipped: ' + (threadResult.skipped?.length || 0)
+    + ', failed: ' + (threadResult.failed?.length || 0));
 }
 
 async function getMaddenImportedGameById(gameId) {
@@ -43148,6 +43394,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
     await syncMaddenFranchises(guild, league).catch(() => null);
     await cleanupMaddenTradeBlockAfterRosterSync(guild.id, league.league_id).catch(() => null);
+    await autoCreateGameThreadsAfterSync(guild, league).catch(error => {
+      console.error('[Madden Sync] Auto game thread creation failed:', error?.message || error);
+    });
 
     const message =
       'EA Direct sync completed for ' + context.externalLeagueName +
@@ -44116,6 +44365,9 @@ async function runDueMaddenAutosyncs(client) {
         run = { status: 'failed', source: row.sync_source || 'unknown', message: error.message || 'Autosync failed.', imported_teams: 0, imported_games: 0, imported_players: 0 };
       }
       await postMaddenSyncFeed(guild, league, run).catch(() => null);
+      await autoCreateGameThreadsAfterSync(guild, league).catch(error => {
+        console.error('[Madden Autosync] Auto game thread creation failed:', error?.message || error);
+      });
 
       const interval = Math.max(Number(row.autosync_interval_minutes || 60), 15);
       await pool.query(
