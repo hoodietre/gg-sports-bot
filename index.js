@@ -374,12 +374,8 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_power_rankings_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS current_season_stage TEXT NOT NULL DEFAULT 'preseason'`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
-  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_threshold INTEGER NOT NULL DEFAULT 30`);
-  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_review_channel_id TEXT`);
-  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS espn_news_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
-  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_channel_id TEXT`);
-  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_message_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_message_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS free_agents_message_id TEXT`);
@@ -45628,17 +45624,33 @@ async function updatePersistentMaddenEmbed(guild, league, channelIdKey, messageI
 }
 
 async function refreshPersistentMaddenEmbeds(guild, league) {
+  const standingsRows = await pool.query(
+    `SELECT * FROM madden_imported_standings
+     WHERE guild_id = $1 AND league_id::text = $2::text
+     ORDER BY wins DESC, losses ASC, points_for DESC`,
+    [guild.id, String(league.league_id)]
+  ).then(r => r.rows).catch(() => []);
+
   await Promise.allSettled([
     updatePersistentMaddenEmbed(guild, league, 'standings_channel_id', 'standings_message_id',
-      () => buildMaddenImportedStandingsEmbed(league, [], 'conference')),
+      () => buildMaddenImportedStandingsEmbed(league, standingsRows, 'conference')),
     updatePersistentMaddenEmbed(guild, league, 'power_rankings_channel_id', 'power_rankings_message_id',
       async () => {
-        const rows = await getMaddenPowerRankingsRows(guild.id, league.league_id);
+        const rows = await pool.query(
+          `SELECT * FROM madden_power_rankings WHERE league_id::text = $1::text ORDER BY rank ASC`,
+          [String(league.league_id)]
+        ).then(r => r.rows).catch(() => []);
         return buildMaddenPowerRankingsEmbed(league, rows);
       }),
     updatePersistentMaddenEmbed(guild, league, 'madden_free_agents_channel_id', 'free_agents_message_id',
       async () => {
-        const fas = await getMaddenFreeAgentRows(guild.id, league.league_id);
+        const fas = await pool.query(
+          `SELECT * FROM madden_players
+           WHERE guild_id = $1 AND league_id::text = $2::text
+             AND (team_name IS NULL OR LOWER(team_name) IN ('fa','free agent','free agents',''))
+           ORDER BY overall DESC NULLS LAST LIMIT 50`,
+          [guild.id, String(league.league_id)]
+        ).then(r => r.rows).catch(() => []);
         return buildMaddenFreeAgentsEmbed(league, fas);
       }),
   ]);
@@ -46300,6 +46312,75 @@ Rules:
 
 
 // ---------------------------------------------------------------------------
+// Season transition handler — fires when preseason → regular season detected
+// ---------------------------------------------------------------------------
+function maddenIsPreseasonWeek(weekLabel) {
+  return maddenWeekLabelSortKey(weekLabel)[0] === 0;
+}
+function maddenIsRegularSeasonWeek(weekLabel) {
+  return maddenWeekLabelSortKey(weekLabel)[0] === 1;
+}
+
+async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel) {
+  if (!previousWeekLabel || !newWeekLabel) return;
+  const wasPreseason = maddenIsPreseasonWeek(previousWeekLabel);
+  const isRegular = maddenIsRegularSeasonWeek(newWeekLabel);
+  if (!wasPreseason || !isRegular) return; // Not a preseason → regular transition
+
+  console.log('[SEASON TRANSITION] Preseason → Regular Season for league', league.league_id);
+
+  // 1. Wipe preseason weekly stats (don't carry into regular season)
+  const wiped = await pool.query(
+    `DELETE FROM madden_player_weekly_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(err => {
+    console.error('[SEASON TRANSITION] Stats wipe failed:', err?.message);
+    return null;
+  });
+  console.log('[SEASON TRANSITION] Wiped preseason stats:', wiped?.rowCount || 0, 'rows');
+
+  // 2. Reset persistent embed message IDs so they repost fresh for regular season
+  await pool.query(
+    `UPDATE madden_league_settings
+     SET standings_message_id = NULL,
+         power_rankings_message_id = NULL,
+         free_agents_message_id = NULL,
+         current_season_stage = 'regular',
+         updated_at = NOW()
+     WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => null);
+
+  // 3. Post season kickoff announcement to news channel
+  const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+  if (newsChannelId) {
+    const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
+    if (newsChannel?.isTextBased?.()) {
+      await newsChannel.send({
+        embeds: [new EmbedBuilder()
+          .setTitle(`${GG_EMOJI} 🏈 ${league.league_name} Regular Season Starts NOW`)
+          .setColor(0x57F287)
+          .setDescription([
+            '**The wait is over.** Preseason is done, rosters are set, and every game counts.',
+            '',
+            `Preseason records and stats have been cleared. Every team enters ${newWeekLabel} at **0-0**.`,
+            '',
+            'Game threads, standings, sportsbook lines, and news will auto-update after every advance.',
+            '',
+            '**May the best GM win.** 🏆',
+          ].join('\n'))
+          .setFooter({ text: `GG Sports • ${league.league_name} • Season Kickoff` })
+          .setTimestamp()],
+      }).catch(() => null);
+    }
+  }
+
+  console.log('[SEASON TRANSITION] Complete — regular season is live.');
+}
+
+
+// ---------------------------------------------------------------------------
 // Master orchestrator — called at the end of every sync
 // Replaces the existing autoCreateGameThreadsAfterSync pattern by
 // wrapping it and adding all the new detection on top.
@@ -46316,7 +46397,12 @@ async function autoDetectAfterSync(guild, league) {
 
   console.log(`[AUTO DETECT] New week detected: ${newWeekLabel} for league ${league.league_id}`);
   const settings = await ensureMaddenLeagueSettings(league);
+  const previousWeekLabel = settings.last_auto_detect_week_label || null;
   const allEvents = [];
+
+  // Check for preseason → regular season transition before anything else
+  await handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel).catch(err =>
+    console.error('[AUTO DETECT] Season transition handler failed:', err?.message));
 
   // 1. Transaction auto-detect
   await autoDetectMaddenTransactions(guild, league).catch(err =>
