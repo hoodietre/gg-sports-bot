@@ -1708,18 +1708,6 @@ function buildCommands() {
 
       .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
       .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
-      .addSubcommand(sc => sc
-        .setName('autodetect')
-        .setDescription('Staff: configure auto-detection after each advance')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
-        .addBooleanOption(o => o.setName('enabled').setDescription('Enable auto-detection after sync?'))
-        .addIntegerOption(o => o.setName('threshold').setDescription('Max transactions before flagging for review (default: 30)'))
-        .addChannelOption(o => o.setName('review_channel').setDescription('Channel for anomaly alerts'))
-        .addBooleanOption(o => o.setName('espn_news').setDescription('Post ESPN-style headlines after each advance?'))
-        .addBooleanOption(o => o.setName('sportsbook_lines').setDescription('Auto-create betting lines for user vs user games?'))
-        .addChannelOption(o => o.setName('sportsbook_channel').setDescription('Channel for Madden sportsbook lines'))
-        .addChannelOption(o => o.setName('standings_channel').setDescription('Channel for persistent standings board'))
-        .addChannelOption(o => o.setName('power_rankings_channel').setDescription('Channel for persistent power rankings board')))
 
       .addSubcommand(sc => sc.setName('connect').setDescription('Start Discord-native EA Direct connection wizard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
       .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
@@ -1757,6 +1745,18 @@ function buildCommands() {
             { name: 'Private', value: 'private' },
             { name: 'Public',  value: 'public'  }
           )))
+      .addSubcommand(sc => sc
+        .setName('autodetect')
+        .setDescription('Staff: configure auto-detection and auto-posting after each advance')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('enabled').setDescription('Enable auto-detection after sync?'))
+        .addIntegerOption(o => o.setName('threshold').setDescription('Max transactions before flagging for review (default: 30)'))
+        .addChannelOption(o => o.setName('review_channel').setDescription('Channel for anomaly alerts'))
+        .addBooleanOption(o => o.setName('espn_news').setDescription('Post ESPN-style headlines after each advance?'))
+        .addBooleanOption(o => o.setName('sportsbook_lines').setDescription('Auto-create betting lines for user vs user games?'))
+        .addChannelOption(o => o.setName('sportsbook_channel').setDescription('Channel for Madden sportsbook lines'))
+        .addChannelOption(o => o.setName('standings_channel').setDescription('Channel for persistent standings board'))
+        .addChannelOption(o => o.setName('power_rankings_channel').setDescription('Channel for persistent power rankings board')))
 
 ,
 
@@ -8757,6 +8757,36 @@ if (gameSubcommand === 'report') {
         await interaction.editReply({ content: 'You do not have permission to create Madden game threads.' });
         return;
       }
+      if (subcommand === 'autodetect') {
+        await ensureMaddenAutoDetectColumns();
+        const updates = [];
+        const vals = [activeLeague.league_id];
+        const setCol = (col, val) => {
+          if (val !== null && val !== undefined) { vals.push(val); updates.push(`${col} = $${vals.length}`); }
+        };
+        setCol('auto_detect_enabled',          interaction.options.getBoolean('enabled'));
+        setCol('auto_detect_threshold',         interaction.options.getInteger('threshold'));
+        setCol('auto_detect_review_channel_id', interaction.options.getChannel('review_channel')?.id);
+        setCol('espn_news_enabled',             interaction.options.getBoolean('espn_news'));
+        setCol('sportsbook_auto_lines_enabled', interaction.options.getBoolean('sportsbook_lines'));
+        setCol('madden_sportsbook_channel_id',  interaction.options.getChannel('sportsbook_channel')?.id);
+        const standCh = interaction.options.getChannel('standings_channel');
+        const rankCh  = interaction.options.getChannel('power_rankings_channel');
+        setCol('standings_channel_id', standCh?.id);
+        if (standCh) setCol('standings_message_id', null);
+        setCol('power_rankings_channel_id', rankCh?.id);
+        if (rankCh) setCol('power_rankings_message_id', null);
+        if (updates.length) {
+          updates.push('updated_at = NOW()');
+          await pool.query(
+            `UPDATE madden_league_settings SET ${updates.join(', ')} WHERE league_id = $1`,
+            vals
+          );
+        }
+        const s = await ensureMaddenLeagueSettings(activeLeague);
+        await interaction.editReply({ embeds: [buildMaddenAutoDetectSettingsEmbed(activeLeague, s)] });
+        return;
+      }
       if (subcommand === 'setup') {
         const channel    = interaction.options.getChannel('channel') || null;
         const auto       = interaction.options.getBoolean('auto');
@@ -8770,9 +8800,6 @@ if (gameSubcommand === 'report') {
         await interaction.editReply({ embeds: [buildMaddenGameThreadsSetupEmbed(activeLeague, settings)] });
         return;
       }
-      if (subcommand === 'threads') {
-        const week = interaction.options.getString('week');
-        const visibility = interaction.options.getString('visibility') || 'private';
         const result = await createMaddenWeeklyGameThreads(interaction, activeLeague, week, visibility);
         await interaction.editReply({ embeds: [buildMaddenGameThreadsSummaryEmbed(activeLeague, week, result)] });
         return;
@@ -9397,37 +9424,6 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
       }
 
 
-
-      if (maddenSubcommand === 'autodetect') {
-        await ensureMaddenAutoDetectColumns();
-        const updates = [];
-        const vals = [activeLeague.league_id];
-        const setCol = (col, val) => {
-          if (val !== null && val !== undefined) { vals.push(val); updates.push(`${col} = $${vals.length}`); }
-        };
-        setCol('auto_detect_enabled',          interaction.options.getBoolean('enabled'));
-        setCol('auto_detect_threshold',         interaction.options.getInteger('threshold'));
-        setCol('auto_detect_review_channel_id', interaction.options.getChannel('review_channel')?.id);
-        setCol('espn_news_enabled',             interaction.options.getBoolean('espn_news'));
-        setCol('sportsbook_auto_lines_enabled', interaction.options.getBoolean('sportsbook_lines'));
-        setCol('madden_sportsbook_channel_id',  interaction.options.getChannel('sportsbook_channel')?.id);
-        const standCh = interaction.options.getChannel('standings_channel');
-        const rankCh  = interaction.options.getChannel('power_rankings_channel');
-        setCol('standings_channel_id',          standCh?.id);
-        if (standCh) setCol('standings_message_id', null);
-        setCol('power_rankings_channel_id',     rankCh?.id);
-        if (rankCh) setCol('power_rankings_message_id', null);
-        if (updates.length) {
-          updates.push('updated_at = NOW()');
-          await pool.query(
-            `UPDATE madden_league_settings SET ${updates.join(', ')} WHERE league_id = $1`,
-            vals
-          );
-        }
-        const s = await ensureMaddenLeagueSettings(activeLeague);
-        await interaction.editReply({ embeds: [buildMaddenAutoDetectSettingsEmbed(activeLeague, s)] });
-        return;
-      }
 
       if (maddenSubcommand === 'autosync') {
         const leagueName = interaction.options.getString('league');
