@@ -46323,24 +46323,11 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
   if (!previousWeekLabel || !newWeekLabel) return;
   const wasPreseason = maddenIsPreseasonWeek(previousWeekLabel);
   const isRegular = maddenIsRegularSeasonWeek(newWeekLabel);
-  if (!wasPreseason || !isRegular) return; // Not a preseason → regular transition
+  if (!wasPreseason || !isRegular) return;
 
-  // Guard: EA exports the full season schedule upfront, so regular season weeks
-  // exist in the DB while preseason is still active. Only fire when preseason
-  // games are no longer scheduled (meaning we've truly finished preseason).
-  const preseasonCheck = await pool.query(
-    `SELECT COUNT(*) AS cnt FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id::text = $2::text
-       AND LOWER(week_label) LIKE 'preseason%'
-       AND LOWER(COALESCE(status, 'scheduled')) = 'scheduled'`,
-    [guild.id, String(league.league_id)]
-  ).catch(() => ({ rows: [{ cnt: 1 }] }));
-  const preseasonCount = Number(preseasonCheck.rows[0]?.cnt || 0);
-  if (preseasonCount > 0) {
-    console.log(`[SEASON TRANSITION] Skipping — ${preseasonCount} preseason game(s) still scheduled. Not in regular season yet.`);
-    return;
-  }
-
+  // EA keeps preseason games as 'scheduled' forever after advancing past them —
+  // they never update statuses. Since EA only exports current-week games, the
+  // mere appearance of regular season Week 1 in the DB confirms we've advanced.
   console.log('[SEASON TRANSITION] Preseason → Regular Season confirmed for league', league.league_id);
 
   // 1. Wipe preseason weekly stats (don't carry into regular season)
