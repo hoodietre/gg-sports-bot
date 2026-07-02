@@ -8800,6 +8800,9 @@ if (gameSubcommand === 'report') {
         await interaction.editReply({ embeds: [buildMaddenGameThreadsSetupEmbed(activeLeague, settings)] });
         return;
       }
+      if (subcommand === 'threads') {
+        const week = interaction.options.getString('week');
+        const visibility = interaction.options.getString('visibility') || 'private';
         const result = await createMaddenWeeklyGameThreads(interaction, activeLeague, week, visibility);
         await interaction.editReply({ embeds: [buildMaddenGameThreadsSummaryEmbed(activeLeague, week, result)] });
         return;
