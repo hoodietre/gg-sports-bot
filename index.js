@@ -370,6 +370,21 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_threshold INTEGER NOT NULL DEFAULT 30`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_review_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS espn_news_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS free_agents_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sportsbook_auto_lines_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS sportsbook_game_id UUID REFERENCES sportsbook_games(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS is_user_vs_user BOOLEAN`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_imported_games_sb ON madden_imported_games(guild_id, league_id, sportsbook_game_id)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_team_stats (
@@ -1693,6 +1708,18 @@ function buildCommands() {
 
       .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
       .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
+      .addSubcommand(sc => sc
+        .setName('autodetect')
+        .setDescription('Staff: configure auto-detection after each advance')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addBooleanOption(o => o.setName('enabled').setDescription('Enable auto-detection after sync?'))
+        .addIntegerOption(o => o.setName('threshold').setDescription('Max transactions before flagging for review (default: 30)'))
+        .addChannelOption(o => o.setName('review_channel').setDescription('Channel for anomaly alerts'))
+        .addBooleanOption(o => o.setName('espn_news').setDescription('Post ESPN-style headlines after each advance?'))
+        .addBooleanOption(o => o.setName('sportsbook_lines').setDescription('Auto-create betting lines for user vs user games?'))
+        .addChannelOption(o => o.setName('sportsbook_channel').setDescription('Channel for Madden sportsbook lines'))
+        .addChannelOption(o => o.setName('standings_channel').setDescription('Channel for persistent standings board'))
+        .addChannelOption(o => o.setName('power_rankings_channel').setDescription('Channel for persistent power rankings board')))
 
       .addSubcommand(sc => sc.setName('connect').setDescription('Start Discord-native EA Direct connection wizard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
       .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
@@ -9370,6 +9397,37 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
       }
 
 
+
+      if (maddenSubcommand === 'autodetect') {
+        await ensureMaddenAutoDetectColumns();
+        const updates = [];
+        const vals = [activeLeague.league_id];
+        const setCol = (col, val) => {
+          if (val !== null && val !== undefined) { vals.push(val); updates.push(`${col} = $${vals.length}`); }
+        };
+        setCol('auto_detect_enabled',          interaction.options.getBoolean('enabled'));
+        setCol('auto_detect_threshold',         interaction.options.getInteger('threshold'));
+        setCol('auto_detect_review_channel_id', interaction.options.getChannel('review_channel')?.id);
+        setCol('espn_news_enabled',             interaction.options.getBoolean('espn_news'));
+        setCol('sportsbook_auto_lines_enabled', interaction.options.getBoolean('sportsbook_lines'));
+        setCol('madden_sportsbook_channel_id',  interaction.options.getChannel('sportsbook_channel')?.id);
+        const standCh = interaction.options.getChannel('standings_channel');
+        const rankCh  = interaction.options.getChannel('power_rankings_channel');
+        setCol('standings_channel_id',          standCh?.id);
+        if (standCh) setCol('standings_message_id', null);
+        setCol('power_rankings_channel_id',     rankCh?.id);
+        if (rankCh) setCol('power_rankings_message_id', null);
+        if (updates.length) {
+          updates.push('updated_at = NOW()');
+          await pool.query(
+            `UPDATE madden_league_settings SET ${updates.join(', ')} WHERE league_id = $1`,
+            vals
+          );
+        }
+        const s = await ensureMaddenLeagueSettings(activeLeague);
+        await interaction.editReply({ embeds: [buildMaddenAutoDetectSettingsEmbed(activeLeague, s)] });
+        return;
+      }
 
       if (maddenSubcommand === 'autosync') {
         const leagueName = interaction.options.getString('league');
@@ -43901,6 +43959,10 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       console.error('[Madden Sync] Auto game thread creation failed:', error?.message || error);
     });
 
+    await autoDetectAfterSync(guild, league).catch(error => {
+      console.error('[Madden Sync] Auto detect failed:', error?.message || error);
+    });
+
     // Auto-prune sync payloads — keep only the 10 most recent per league to prevent DB bloat
     pool.query(
       `DELETE FROM madden_sync_payloads
@@ -44885,6 +44947,10 @@ async function runDueMaddenAutosyncs(client) {
         console.error('[Madden Autosync] Auto game thread creation failed:', error?.message || error);
       });
 
+      await autoDetectAfterSync(guild, league).catch(error => {
+        console.error('[Madden Autosync] Auto detect failed:', error?.message || error);
+      });
+
       const interval = Math.max(Number(row.autosync_interval_minutes || 60), 15);
       await pool.query(
         `UPDATE madden_league_settings
@@ -45356,4 +45422,909 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
 
 
 
+// 7J-10BY-GT3 — Auto Detection System
+//
+// Fires after every sync. Uses a week-label dedup guard so nothing runs twice
+// even if the commissioner syncs multiple times before advancing.
+//
+// What it does on each NEW week advance:
+//   1.  Transaction scan (with anomaly threshold + commissioner review path)
+//   2.  Retirement detection (baseline diff)
+//   3.  Game results: scores, big performances, streak alerts, award race
+//   4.  Sportsbook: auto-lines for user vs user games in new week
+//   5.  Persistent embed refresh: standings, free agents, power rankings
+//   6.  ESPN-style news via Claude API (falls back to templates)
+//
+//   // 7J-10AX Madden Compare Value + Trade Foundation
+//
+
+
+// ---------------------------------------------------------------------------
+// DB migrations — add to initDatabase()
+// ---------------------------------------------------------------------------
+async function ensureMaddenAutoDetectColumns() {
+  // Week-advance dedup guard + detection settings
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_threshold INTEGER NOT NULL DEFAULT 30`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_review_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS espn_news_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  // Persistent embed message IDs
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS free_agents_message_id TEXT`);
+  // Sportsbook auto-lines
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sportsbook_auto_lines_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
+  // Link madden games to sportsbook games for auto-settlement
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS sportsbook_game_id UUID REFERENCES sportsbook_games(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS is_user_vs_user BOOLEAN`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_imported_games_sb ON madden_imported_games(guild_id, league_id, sportsbook_game_id)`);
+}
+
+
+// ---------------------------------------------------------------------------
+// Week advance dedup guard
+// Returns the new week label if this is a fresh advance, null if already seen.
+// ---------------------------------------------------------------------------
+async function getMaddenNewAdvanceWeek(guildId, leagueId) {
+  const settings = await pool.query(
+    `SELECT last_auto_detect_week_label FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    [leagueId]
+  ).catch(() => ({ rows: [] }));
+  const lastLabel = settings.rows[0]?.last_auto_detect_week_label || null;
+
+  // Find the current week: most recent week that has scheduled games
+  const current = await pool.query(
+    `SELECT week_label FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(status) = 'scheduled'
+       AND week_label IS NOT NULL
+     GROUP BY week_label
+     ORDER BY MIN(created_at) DESC
+     LIMIT 1`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+
+  const currentLabel = current.rows[0]?.week_label || null;
+  if (!currentLabel) return null;
+  if (currentLabel === lastLabel) return null; // Already processed this advance
+  return currentLabel;
+}
+
+async function markMaddenAdvanceProcessed(guildId, leagueId, weekLabel) {
+  await pool.query(
+    `UPDATE madden_league_settings SET last_auto_detect_week_label = $2, updated_at = NOW()
+     WHERE league_id = $1`,
+    [leagueId, weekLabel]
+  ).catch(() => null);
+}
+
+
+// ---------------------------------------------------------------------------
+// Persistent embed updater
+// Edits the stored message in place, or posts a new one and saves the new ID.
+// ---------------------------------------------------------------------------
+async function updatePersistentMaddenEmbed(guild, league, channelIdKey, messageIdKey, buildEmbedFn) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  const channelId = settings[channelIdKey];
+  if (!channelId) return null; // Not configured, skip
+
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased?.()) return null;
+
+  const embed = await buildEmbedFn().catch(() => null);
+  if (!embed) return null;
+
+  const existingMessageId = settings[messageIdKey];
+  if (existingMessageId) {
+    const existing = await channel.messages.fetch(existingMessageId).catch(() => null);
+    if (existing) {
+      await existing.edit({ embeds: [embed] }).catch(() => null);
+      return existing;
+    }
+  }
+
+  // Message gone or not yet set — post new one and store the ID
+  const posted = await channel.send({ embeds: [embed] }).catch(() => null);
+  if (posted) {
+    await pool.query(
+      `UPDATE madden_league_settings SET ${messageIdKey} = $2, updated_at = NOW() WHERE league_id = $1`,
+      [league.league_id, posted.id]
+    ).catch(() => null);
+  }
+  return posted;
+}
+
+async function refreshPersistentMaddenEmbeds(guild, league) {
+  await Promise.allSettled([
+    updatePersistentMaddenEmbed(guild, league, 'standings_channel_id', 'standings_message_id',
+      () => buildMaddenImportedStandingsEmbed(league, [], 'conference')),
+    updatePersistentMaddenEmbed(guild, league, 'power_rankings_channel_id', 'power_rankings_message_id',
+      async () => {
+        const rows = await getMaddenPowerRankingsRows(guild.id, league.league_id);
+        return buildMaddenPowerRankingsEmbed(league, rows);
+      }),
+    updatePersistentMaddenEmbed(guild, league, 'madden_free_agents_channel_id', 'free_agents_message_id',
+      async () => {
+        const fas = await getMaddenFreeAgentRows(guild.id, league.league_id);
+        return buildMaddenFreeAgentsEmbed(league, fas);
+      }),
+  ]);
+}
+
+
+// ---------------------------------------------------------------------------
+// Transaction auto-detect with anomaly threshold guard
+// ---------------------------------------------------------------------------
+async function autoDetectMaddenTransactions(guild, league) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  if (settings.auto_detect_enabled !== true) return [];
+
+  const threshold = Number(settings.auto_detect_threshold || 30);
+  const reviewChannelId = settings.auto_detect_review_channel_id
+    || await getMaddenNewsChannelId(league.league_id).catch(() => null);
+
+  // Preview scan first — don't commit until we know the count is sane
+  const preview = await runMaddenTransactionScan(guild.id, league, { confirm: false }).catch(() => null);
+  if (!preview) return [];
+
+  const count = preview.transactions?.length || 0;
+  if (count === 0) return [];
+
+  if (count > threshold) {
+    // Anomalous — hold for commissioner review
+    if (reviewChannelId) {
+      const reviewChannel = await guild.channels.fetch(reviewChannelId).catch(() => null);
+      if (reviewChannel?.isTextBased?.()) {
+        await reviewChannel.send({
+          embeds: [new EmbedBuilder()
+            .setTitle(`${GG_EMOJI} ⚠️ Auto-Detection Held — Review Required`)
+            .setColor(0xFEE75C)
+            .setDescription([
+              `**League:** ${league.league_name}`,
+              `**Transactions detected:** ${count} (threshold: ${threshold})`,
+              '',
+              'This advance generated more transactions than expected. This has been **held** rather than auto-posted to avoid flooding the news channel.',
+              '',
+              'Review with `/maddentransactions scan confirm:false` and post manually with `confirm:true` when ready.',
+              '',
+              `To raise the threshold: \`/maddensettings autodetect threshold:${count + 10}\``,
+            ].join('\n'))
+            .setFooter({ text: 'GG Sports • 7J-10BY-GT3 Auto Detection' })
+            .setTimestamp()],
+        }).catch(() => null);
+      }
+    }
+    return [];
+  }
+
+  // Count is within threshold — run with confirm:true and post
+  await runMaddenTransactionScan(guild.id, league, { confirm: true }).catch(() => null);
+  return [{ type: 'transactions', count }];
+}
+
+
+// ---------------------------------------------------------------------------
+// Retirement auto-detect (baseline diff)
+// ---------------------------------------------------------------------------
+async function autoDetectMaddenRetirements(guild, league) {
+  const result = await runMaddenRetirementScan(guild.id, league, { confirm: true }).catch(() => null);
+  if (!result?.retired?.length) return [];
+  return result.retired.map(p => ({ type: 'retirement', player: p }));
+}
+
+
+// ---------------------------------------------------------------------------
+// Madden-specific sportsbook odds generator
+// Uses Madden tables instead of league game role IDs.
+// ---------------------------------------------------------------------------
+async function getMaddenTeamStandingsForOdds(guildId, leagueId, teamName) {
+  const result = await pool.query(
+    `SELECT wins, losses, ties, points_for, points_against
+     FROM madden_imported_standings
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(team_name) = LOWER($3)
+     LIMIT 1`,
+    [guildId, String(leagueId), teamName]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
+async function getMaddenTeamAvgOvr(guildId, leagueId, teamName) {
+  const result = await pool.query(
+    `SELECT AVG(overall) AS avg_ovr
+     FROM madden_players
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(team_name) = LOWER($3)
+       AND overall IS NOT NULL AND overall > 0`,
+    [guildId, String(leagueId), teamName]
+  ).catch(() => ({ rows: [] }));
+  return Number(result.rows[0]?.avg_ovr || 0) || null;
+}
+
+async function getMaddenH2HHistory(guildId, leagueId, homeTeamName, awayTeamName) {
+  const result = await pool.query(
+    `SELECT
+       SUM(CASE WHEN LOWER(home_team) = LOWER($3) AND home_score > away_score THEN 1 ELSE 0 END) AS home_wins,
+       SUM(CASE WHEN LOWER(away_team) = LOWER($4) AND away_score > home_score THEN 1 ELSE 0 END) AS away_wins
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(status) IN ('final', 'completed', 'completed_with_real_score')
+       AND (
+         (LOWER(home_team) = LOWER($3) AND LOWER(away_team) = LOWER($4))
+         OR (LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($3))
+       )`,
+    [guildId, String(leagueId), homeTeamName, awayTeamName]
+  ).catch(() => ({ rows: [] }));
+  return {
+    homeWins: Number(result.rows[0]?.home_wins || 0),
+    awayWins: Number(result.rows[0]?.away_wins || 0),
+  };
+}
+
+async function getMaddenTeamPowerRank(leagueId, teamName) {
+  const result = await pool.query(
+    `SELECT rank, power_score FROM madden_power_rankings
+     WHERE league_id::text = $1::text AND LOWER(team_name) = LOWER($2)
+     LIMIT 1`,
+    [String(leagueId), teamName]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
+async function generateMaddenMatchupOdds(guildId, league, homeTeamName, awayTeamName) {
+  const [homeStandings, awayStandings, homeOvr, awayOvr, homePower, awayPower, h2h] =
+    await Promise.all([
+      getMaddenTeamStandingsForOdds(guildId, league.league_id, homeTeamName),
+      getMaddenTeamStandingsForOdds(guildId, league.league_id, awayTeamName),
+      getMaddenTeamAvgOvr(guildId, league.league_id, homeTeamName),
+      getMaddenTeamAvgOvr(guildId, league.league_id, awayTeamName),
+      getMaddenTeamPowerRank(league.league_id, homeTeamName),
+      getMaddenTeamPowerRank(league.league_id, awayTeamName),
+      getMaddenH2HHistory(guildId, league.league_id, homeTeamName, awayTeamName),
+    ]);
+
+  const winPct = (row) => row
+    ? row.wins / Math.max(row.wins + row.losses + row.ties, 1)
+    : 0.5;
+  const homeWinPct = winPct(homeStandings);
+  const awayWinPct = winPct(awayStandings);
+
+  const pointDiff = (row) => row ? (row.points_for - row.points_against) : 0;
+
+  let homeScore = 50;
+
+  // Win % differential (weight 35)
+  homeScore += (homeWinPct - awayWinPct) * 35;
+
+  // Point differential per game (weight 0.06)
+  const homeGames = homeStandings ? Math.max(homeStandings.wins + homeStandings.losses + homeStandings.ties, 1) : 1;
+  const awayGames = awayStandings ? Math.max(awayStandings.wins + awayStandings.losses + awayStandings.ties, 1) : 1;
+  homeScore += (pointDiff(homeStandings) / homeGames - pointDiff(awayStandings) / awayGames) * 0.6;
+
+  // Power rank (weight 1.5 — lower rank = better, so invert)
+  if (homePower?.rank && awayPower?.rank) {
+    homeScore += (awayPower.rank - homePower.rank) * 1.5;
+  }
+
+  // Roster OVR differential (weight 0.5)
+  if (homeOvr && awayOvr) {
+    homeScore += (homeOvr - awayOvr) * 0.5;
+  }
+
+  // Head-to-head Madden history (weight 2.5 per game advantage)
+  homeScore += (h2h.homeWins - h2h.awayWins) * 2.5;
+
+  // Home field advantage
+  homeScore += 3;
+
+  const homeProbability = Math.max(0.2, Math.min(0.8, homeScore / 100));
+  const awayProbability = 1 - homeProbability;
+
+  return {
+    homeOdds: probabilityToAmericanOdds(homeProbability),
+    awayOdds: probabilityToAmericanOdds(awayProbability),
+    homeProbability: Math.round(homeProbability * 100),
+    awayProbability: Math.round(awayProbability * 100),
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// User vs user detection for Madden games
+// Returns true if both teams have a confirmed human owner in madden_imported_team_stats.
+// ---------------------------------------------------------------------------
+async function isMaddenUserVsUserGame(guildId, leagueId, homeTeam, awayTeam) {
+  const result = await pool.query(
+    `SELECT team_name, owner_user_id
+     FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(team_name) = ANY(ARRAY[LOWER($3), LOWER($4)])`,
+    [guildId, String(leagueId), homeTeam, awayTeam]
+  ).catch(() => ({ rows: [] }));
+
+  const rows = result.rows || [];
+  const homeRow = rows.find(r => r.team_name?.toLowerCase() === homeTeam?.toLowerCase());
+  const awayRow = rows.find(r => r.team_name?.toLowerCase() === awayTeam?.toLowerCase());
+  return !!(homeRow?.owner_user_id && awayRow?.owner_user_id);
+}
+
+
+// ---------------------------------------------------------------------------
+// Sportsbook auto-lines for Madden user vs user games
+// Creates betting lines for new scheduled games in the upcoming week.
+// ---------------------------------------------------------------------------
+async function autoCreateMaddenSportsbookLines(guild, league, weekLabel) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  if (!settings.sportsbook_auto_lines_enabled) return;
+
+  // Get all scheduled games for the upcoming week that don't have a sportsbook line yet
+  const games = await pool.query(
+    `SELECT * FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(week_label) = LOWER($3)
+       AND LOWER(status) = 'scheduled'
+       AND sportsbook_game_id IS NULL`,
+    [guild.id, String(league.league_id), weekLabel]
+  ).catch(() => ({ rows: [] }));
+
+  const feedChannelId = settings.madden_sportsbook_channel_id
+    || settings.madden_news_channel_id
+    || await getMaddenNewsChannelId(league.league_id).catch(() => null);
+
+  for (const game of games.rows || []) {
+    // Only create lines for user vs user matchups
+    const isUvU = await isMaddenUserVsUserGame(
+      guild.id, league.league_id, game.home_team, game.away_team
+    );
+
+    await pool.query(
+      `UPDATE madden_imported_games SET is_user_vs_user = $3 WHERE id = $1 AND guild_id = $2`,
+      [game.id, guild.id, isUvU]
+    ).catch(() => null);
+
+    if (!isUvU) continue;
+
+    // Check for existing sportsbook line to avoid duplicates
+    const existing = await pool.query(
+      `SELECT id FROM sportsbook_games
+       WHERE guild_id = $1 AND league_id = $2::uuid AND source = 'madden_auto'
+         AND game_label = $3
+         AND status = 'open'`,
+      [guild.id, league.league_id, `${game.away_team} @ ${game.home_team}`]
+    ).catch(() => ({ rows: [] }));
+    if (existing.rows.length) continue;
+
+    const odds = await generateMaddenMatchupOdds(
+      guild.id, league, game.home_team, game.away_team
+    ).catch(() => ({ homeOdds: -110, awayOdds: -110, homeProbability: 50, awayProbability: 50 }));
+
+    const homeEmoji = getMaddenTeamEmoji(game.home_team);
+    const awayEmoji = getMaddenTeamEmoji(game.away_team);
+    const gameLabel = `${game.away_team} @ ${game.home_team}`;
+    const homeLabel = `${homeEmoji} ${game.home_team}`.trim();
+    const awayLabel = `${awayEmoji} ${game.away_team}`.trim();
+
+    const sbGameId = randomUUID();
+    await pool.query(
+      `INSERT INTO sportsbook_games
+        (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds,
+         source, auto_generated, created_by_user_id)
+       VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, 'madden_auto', TRUE, 'system')`,
+      [sbGameId, guild.id, league.league_id, gameLabel, homeLabel, awayLabel,
+       odds.homeOdds, odds.awayOdds]
+    ).catch(err => {
+      console.error('[MADDEN SPORTSBOOK AUTO] Failed to create line:', err?.message || err);
+      return null;
+    });
+
+    // Link the madden game to the sportsbook game for auto-settlement
+    await pool.query(
+      `UPDATE madden_imported_games SET sportsbook_game_id = $3 WHERE id = $1 AND guild_id = $2`,
+      [game.id, guild.id, sbGameId]
+    ).catch(() => null);
+
+    // Post to sportsbook feed channel
+    if (feedChannelId) {
+      const feedChannel = await guild.channels.fetch(feedChannelId).catch(() => null);
+      if (feedChannel?.isTextBased?.()) {
+        await feedChannel.send({
+          embeds: [new EmbedBuilder()
+            .setTitle(`${GG_EMOJI} Madden Betting Line Opened`)
+            .setColor(0x57F287)
+            .setDescription(`**${weekLabel}** — ${awayLabel} @ ${homeLabel}`)
+            .addFields(
+              { name: awayLabel, value: `ML **${odds.awayOdds > 0 ? '+' : ''}${odds.awayOdds}** (${odds.awayProbability}%)`, inline: true },
+              { name: homeLabel, value: `ML **${odds.homeOdds > 0 ? '+' : ''}${odds.homeOdds}** (${odds.homeProbability}%)`, inline: true },
+              { name: 'How to bet', value: `Use \`/placebet\` to place your wager.`, inline: false }
+            )
+            .setFooter({ text: 'GG Sports • Madden Sportsbook • Auto-Generated' })
+            .setTimestamp()],
+        }).catch(() => null);
+      }
+    }
+  }
+
+  // Refresh the sportsbook panel
+  await updateSportsbookPanel(guild).catch(() => null);
+}
+
+
+// ---------------------------------------------------------------------------
+// Auto-settle Madden sportsbook bets when game results come in
+// Called when a game's status changes to final/completed.
+// ---------------------------------------------------------------------------
+async function autoSettleMaddenSportsbookBet(guild, league, maddenGame) {
+  if (!maddenGame.sportsbook_game_id) return;
+  const homeScore = Number(maddenGame.home_score || 0);
+  const awayScore = Number(maddenGame.away_score || 0);
+  if (homeScore === 0 && awayScore === 0) return; // No real score yet
+
+  const winnerSide = homeScore > awayScore ? 'home' : awayScore > homeScore ? 'away' : null;
+  if (!winnerSide) return; // Tie — refund (rare in Madden)
+
+  await settleParlaysForSportsbookGame(
+    guild.id, maddenGame.sportsbook_game_id, winnerSide, 'system'
+  ).catch(err => console.error('[MADDEN SPORTSBOOK SETTLE]', err?.message));
+
+  await pool.query(
+    `UPDATE sportsbook_games SET status = 'settled', winner_side = $2, settled_at = NOW()
+     WHERE id = $1 AND guild_id = $3`,
+    [maddenGame.sportsbook_game_id, winnerSide, guild.id]
+  ).catch(() => null);
+
+  await updateSportsbookPanel(guild).catch(() => null);
+}
+
+
+// ---------------------------------------------------------------------------
+// Game results processor
+// Detects newly completed games and generates event objects for the news system.
+// ---------------------------------------------------------------------------
+async function autoProcessMaddenGameResults(guild, league, weekLabel) {
+  const events = [];
+
+  // Find games that just completed (have scores, status = final)
+  const completedGames = await pool.query(
+    `SELECT * FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND week_label IS NOT NULL
+       AND LOWER(status) IN ('final', 'completed', 'completed_with_real_score')
+       AND home_score IS NOT NULL AND away_score IS NOT NULL
+       AND (home_score > 0 OR away_score > 0)
+     ORDER BY updated_at DESC
+     LIMIT 32`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+
+  const games = completedGames.rows || [];
+
+  for (const game of games) {
+    const homeScore = Number(game.home_score || 0);
+    const awayScore = Number(game.away_score || 0);
+    const winner = homeScore > awayScore ? game.home_team : game.away_team;
+    const loser = homeScore > awayScore ? game.away_team : game.home_team;
+    const margin = Math.abs(homeScore - awayScore);
+
+    events.push({
+      type: 'game_result',
+      winner,
+      loser,
+      homeTeam: game.home_team,
+      awayTeam: game.away_team,
+      homeScore,
+      awayScore,
+      margin,
+      weekLabel: game.week_label || weekLabel,
+      winnerEmoji: getMaddenTeamEmoji(winner),
+      loserEmoji: getMaddenTeamEmoji(loser),
+    });
+
+    // Auto-settle sportsbook if linked
+    if (game.sportsbook_game_id) {
+      await autoSettleMaddenSportsbookBet(guild, league, game).catch(() => null);
+    }
+  }
+
+  // Big performance detection from weekly stats
+  const bigPerfs = await pool.query(
+    `SELECT ws.*, p.first_name, p.last_name, p.position, p.team_name
+     FROM madden_player_weekly_stats ws
+     LEFT JOIN madden_players p ON p.id = ws.player_key
+       AND p.guild_id = ws.guild_id
+     WHERE ws.guild_id = $1 AND ws.league_id = $2
+       AND (
+         (ws.stat_type = 'passing' AND (ws.raw_payload->>'passYds')::numeric > 300) OR
+         (ws.stat_type = 'rushing' AND (ws.raw_payload->>'rushYds')::numeric > 125) OR
+         (ws.stat_type = 'receiving' AND (ws.raw_payload->>'recYds')::numeric > 100) OR
+         (ws.stat_type = 'passing' AND (ws.raw_payload->>'passTDs')::numeric >= 3) OR
+         (ws.stat_type = 'rushing' AND (ws.raw_payload->>'rushTDs')::numeric >= 2) OR
+         (ws.stat_type = 'receiving' AND (ws.raw_payload->>'recTDs')::numeric >= 2)
+       )
+     LIMIT 10`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+
+  for (const perf of bigPerfs.rows || []) {
+    const raw = perf.raw_payload || {};
+    const name = [perf.first_name, perf.last_name].filter(Boolean).join(' ') || 'Unknown';
+    events.push({
+      type: 'big_performance',
+      playerName: name,
+      team: perf.team_name,
+      position: perf.position,
+      statType: perf.stat_type,
+      stats: raw,
+      teamEmoji: getMaddenTeamEmoji(perf.team_name),
+    });
+  }
+
+  // Streak detection
+  const streakTeams = await pool.query(
+    `WITH recent AS (
+       SELECT
+         CASE WHEN home_score > away_score THEN home_team ELSE away_team END AS winner,
+         CASE WHEN home_score > away_score THEN away_team ELSE home_team END AS loser,
+         week_label, updated_at
+       FROM madden_imported_games
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND LOWER(status) IN ('final', 'completed', 'completed_with_real_score')
+         AND home_score IS NOT NULL AND away_score IS NOT NULL
+       ORDER BY updated_at DESC
+     ),
+     team_recent AS (
+       SELECT winner AS team, 'W' AS result FROM recent
+       UNION ALL
+       SELECT loser AS team, 'L' AS result FROM recent
+     ),
+     streaks AS (
+       SELECT team,
+         SUM(CASE WHEN result = 'W' THEN 1 ELSE 0 END) AS total_wins,
+         SUM(CASE WHEN result = 'L' THEN 1 ELSE 0 END) AS total_losses
+       FROM (SELECT DISTINCT ON (team) * FROM team_recent ORDER BY team) grouped
+       GROUP BY team
+     )
+     SELECT * FROM streaks WHERE total_wins >= 3 OR total_losses >= 3`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+
+  for (const row of streakTeams.rows || []) {
+    const streakType = row.total_wins >= 3 ? 'win' : 'loss';
+    const streakLen = streakType === 'win' ? row.total_wins : row.total_losses;
+    events.push({
+      type: 'streak',
+      team: row.team,
+      streakType,
+      streakLen,
+      teamEmoji: getMaddenTeamEmoji(row.team),
+    });
+  }
+
+  // Award race leaders
+  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id).catch(() => null);
+  if (awardLeaders) {
+    events.push({ type: 'award_race', leaders: awardLeaders });
+  }
+
+  // Power ranking movers (biggest jumps/drops)
+  const powerMovers = await pool.query(
+    `SELECT team_name, rank, previous_rank,
+       (previous_rank - rank) AS movement
+     FROM madden_power_rankings
+     WHERE league_id::text = $1::text
+       AND previous_rank IS NOT NULL
+       AND ABS(previous_rank - rank) >= 3
+     ORDER BY ABS(previous_rank - rank) DESC
+     LIMIT 4`,
+    [String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+
+  if (powerMovers.rows?.length) {
+    events.push({
+      type: 'power_ranking_movers',
+      movers: powerMovers.rows.map(r => ({
+        team: r.team_name,
+        rank: r.rank,
+        previousRank: r.previous_rank,
+        movement: r.movement,
+        emoji: getMaddenTeamEmoji(r.team_name),
+      })),
+    });
+  }
+
+  return events;
+}
+
+async function getMaddenAwardRaceLeaders(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT
+       full_name, position, team_name,
+       stat_type,
+       SUM((raw_payload->>'passYds')::numeric)  FILTER (WHERE stat_type = 'passing')   AS pass_yds,
+       SUM((raw_payload->>'passTDs')::numeric)  FILTER (WHERE stat_type = 'passing')   AS pass_tds,
+       SUM((raw_payload->>'rushYds')::numeric)  FILTER (WHERE stat_type = 'rushing')   AS rush_yds,
+       SUM((raw_payload->>'rushTDs')::numeric)  FILTER (WHERE stat_type = 'rushing')   AS rush_tds,
+       SUM((raw_payload->>'recYds')::numeric)   FILTER (WHERE stat_type = 'receiving') AS rec_yds,
+       SUM((raw_payload->>'recTDs')::numeric)   FILTER (WHERE stat_type = 'receiving') AS rec_tds
+     FROM madden_player_weekly_stats
+     WHERE guild_id = $1 AND league_id = $2
+     GROUP BY full_name, position, team_name, stat_type
+     ORDER BY pass_yds DESC NULLS LAST, rush_yds DESC NULLS LAST, rec_yds DESC NULLS LAST
+     LIMIT 20`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  return result.rows || [];
+}
+
+
+// ---------------------------------------------------------------------------
+// ESPN-style news via Claude API
+// Generates headlines + blurbs for the week's notable events.
+// Falls back to templates if the API fails.
+// ---------------------------------------------------------------------------
+async function generateMaddenESPNNews(guild, league, events, weekLabel) {
+  const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+  if (!newsChannelId) return;
+  const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
+  if (!newsChannel?.isTextBased?.()) return;
+
+  const settings = await ensureMaddenLeagueSettings(league);
+  const useClaudeApi = settings.espn_news_enabled !== false;
+
+  // Build structured event summary for Claude
+  const gameResults = events.filter(e => e.type === 'game_result');
+  const bigPerfs   = events.filter(e => e.type === 'big_performance');
+  const streaks    = events.filter(e => e.type === 'streak');
+  const movers     = events.find(e => e.type === 'power_ranking_movers');
+  const awards     = events.find(e => e.type === 'award_race');
+
+  if (!gameResults.length && !bigPerfs.length && !streaks.length && !movers && !awards) return;
+
+  let newsItems = [];
+
+  if (useClaudeApi && (gameResults.length || bigPerfs.length || streaks.length)) {
+    try {
+      const context = {
+        leagueName: league.league_name,
+        weekLabel,
+        gameResults: gameResults.slice(0, 8).map(g => ({
+          matchup: `${g.awayTeam} @ ${g.homeTeam}`,
+          score: `${g.awayTeam} ${g.awayScore} - ${g.homeTeam} ${g.homeScore}`,
+          winner: g.winner,
+          margin: g.margin,
+        })),
+        bigPerformances: bigPerfs.slice(0, 5).map(p => ({
+          player: p.playerName,
+          team: p.team,
+          position: p.position,
+          statType: p.statType,
+          stats: p.stats,
+        })),
+        streaks: streaks.slice(0, 4).map(s => ({
+          team: s.team,
+          type: s.streakType,
+          length: s.streakLen,
+        })),
+      };
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 1000,
+          system: `You are an ESPN sports journalist covering a Madden NFL franchise league called "${league.league_name}". 
+Write punchy, authentic sports news headlines and one-line blurbs for this week's results. 
+Rules:
+- Each item: a headline (under 80 chars) and a blurb (1-2 sentences, under 150 chars).
+- Vary your angles: underdog stories, dominant performances, individual highlights, team narratives, streaks.
+- Never use the same sentence structure twice. Mix tones: hype, surprise, concern, admiration.
+- Sound like a real ESPN writer, not a bot. Use sports vernacular naturally.
+- Return ONLY valid JSON: array of objects with "headline" and "blurb" keys. No markdown, no preamble.
+- Max 5 items. Pick the most compelling stories.`,
+          messages: [{ role: 'user', content: JSON.stringify(context) }],
+        }),
+      }).then(r => r.json()).catch(() => null);
+
+      const text = response?.content?.map(c => c.text || '').join('') || '';
+      const clean = text.replace(/```json|```/g, '').trim();
+      const parsed = JSON.parse(clean);
+      if (Array.isArray(parsed)) newsItems = parsed.slice(0, 5);
+    } catch (err) {
+      console.warn('[MADDEN ESPN NEWS] Claude API failed, falling back to templates:', err?.message);
+    }
+  }
+
+  // Template fallback — always runs if Claude API returned nothing
+  if (!newsItems.length) {
+    for (const g of gameResults.slice(0, 3)) {
+      newsItems.push({
+        headline: `${g.winner} defeat ${g.loser === g.homeTeam ? g.loser : g.loser}`,
+        blurb: `Final score: ${g.awayTeam} ${g.awayScore} – ${g.homeTeam} ${g.homeScore}. ${g.margin >= 21 ? 'A dominant performance.' : g.margin <= 3 ? 'A nail-biter to the end.' : ''}`,
+      });
+    }
+    for (const s of streaks.slice(0, 2)) {
+      newsItems.push({
+        headline: `${s.team} ${s.streakType === 'win' ? 'on fire' : 'struggling'} at ${s.streakLen} straight`,
+        blurb: s.streakType === 'win'
+          ? `${s.team} have won ${s.streakLen} in a row and are building serious momentum.`
+          : `${s.team} have dropped ${s.streakLen} straight and need answers fast.`,
+      });
+    }
+    if (movers?.movers?.length) {
+      const bigMover = movers.movers[0];
+      const dir = bigMover.movement > 0 ? '▲' : '▼';
+      newsItems.push({
+        headline: `${bigMover.team} ${dir} ${Math.abs(bigMover.movement)} in power rankings`,
+        blurb: `${bigMover.team} moved from #${bigMover.previousRank} to #${bigMover.rank} in this week's power rankings.`,
+      });
+    }
+  }
+
+  // Post each news item as a separate embed to the news channel
+  for (const item of newsItems) {
+    if (!item.headline) continue;
+
+    // Pick event color based on content
+    let color = 0x3498DB;
+    const h = String(item.headline || '').toLowerCase();
+    if (h.includes('fire') || h.includes('win') || h.includes('dominant')) color = 0x57F287;
+    if (h.includes('strug') || h.includes('drop') || h.includes('skid')) color = 0xED4245;
+    if (h.includes('power') || h.includes('rank')) color = 0xFEE75C;
+
+    await newsChannel.send({
+      embeds: [new EmbedBuilder()
+        .setTitle(`${GG_EMOJI} ${item.headline}`)
+        .setDescription(item.blurb || '')
+        .setColor(color)
+        .setFooter({ text: `GG Sports • ${league.league_name} • ${weekLabel}` })
+        .setTimestamp()],
+    }).catch(() => null);
+
+    await new Promise(r => setTimeout(r, 300)); // small delay to avoid rate limits
+  }
+
+  // Post award race summary if we have stats
+  if (awards?.leaders?.length) {
+    const qbs = awards.leaders.filter(r => r.position === 'QB' && r.pass_yds > 0).slice(0, 3);
+    const rbs = awards.leaders.filter(r => ['HB', 'FB'].includes(r.position) && r.rush_yds > 0).slice(0, 3);
+    if (qbs.length || rbs.length) {
+      const qbLines = qbs.map(r => `**${r.full_name}** (${r.team_name}) — ${r.pass_yds} YDS ${r.pass_tds} TD`).join('\n') || 'No data';
+      const rbLines = rbs.map(r => `**${r.full_name}** (${r.team_name}) — ${r.rush_yds} YDS ${r.rush_tds} TD`).join('\n') || 'No data';
+      await newsChannel.send({
+        embeds: [new EmbedBuilder()
+          .setTitle(`${GG_EMOJI} ${weekLabel} Award Race Leaders`)
+          .setColor(0x9B59B6)
+          .addFields(
+            { name: '🏈 Passing', value: qbLines, inline: true },
+            { name: '🏃 Rushing', value: rbLines, inline: true },
+          )
+          .setFooter({ text: `GG Sports • ${league.league_name} Award Race` })
+          .setTimestamp()],
+      }).catch(() => null);
+    }
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Master orchestrator — called at the end of every sync
+// Replaces the existing autoCreateGameThreadsAfterSync pattern by
+// wrapping it and adding all the new detection on top.
+// ---------------------------------------------------------------------------
+async function autoDetectAfterSync(guild, league) {
+  await ensureMaddenAutoDetectColumns();
+
+  // Week-advance dedup guard — exit immediately if same week
+  const newWeekLabel = await getMaddenNewAdvanceWeek(guild.id, league.league_id);
+  if (!newWeekLabel) {
+    console.log(`[AUTO DETECT] No new advance detected for league ${league.league_id} — skipping.`);
+    return;
+  }
+
+  console.log(`[AUTO DETECT] New week detected: ${newWeekLabel} for league ${league.league_id}`);
+  const settings = await ensureMaddenLeagueSettings(league);
+  const allEvents = [];
+
+  // 1. Transaction auto-detect
+  await autoDetectMaddenTransactions(guild, league).catch(err =>
+    console.error('[AUTO DETECT] Transactions:', err?.message));
+
+  // 2. Retirement auto-detect
+  const retirements = await autoDetectMaddenRetirements(guild, league).catch(() => []);
+  allEvents.push(...retirements);
+
+  // 3. Game results, performances, streaks, awards, power movers
+  const gameEvents = await autoProcessMaddenGameResults(guild, league, newWeekLabel).catch(() => []);
+  allEvents.push(...gameEvents);
+
+  // 4. Sportsbook auto-lines for the new week
+  await autoCreateMaddenSportsbookLines(guild, league, newWeekLabel).catch(err =>
+    console.error('[AUTO DETECT] Sportsbook lines:', err?.message));
+
+  // 5. ESPN-style news
+  if (allEvents.length > 0) {
+    await generateMaddenESPNNews(guild, league, allEvents, newWeekLabel).catch(err =>
+      console.error('[AUTO DETECT] ESPN news:', err?.message));
+  }
+
+  // 6. Persistent embed refresh (standings, free agents, power rankings)
+  await refreshPersistentMaddenEmbeds(guild, league).catch(err =>
+    console.error('[AUTO DETECT] Persistent embeds:', err?.message));
+
+  // Mark this week as processed — must be last so a crash mid-run retries next sync
+  await markMaddenAdvanceProcessed(guild.id, league.league_id, newWeekLabel);
+  console.log(`[AUTO DETECT] Completed for ${newWeekLabel}, league ${league.league_id}`);
+}
+
+
+//   await ensureMaddenAutoDetectColumns();
+//
+//   await autoDetectAfterSync(guild, league).catch(err => {
+//     console.error('[Madden Sync] Auto detect failed:', err?.message || err);
+//   });
+//
+//   await autoDetectAfterSync(guild, league).catch(err => {
+//     console.error('[Madden Autosync] Auto detect failed:', err?.message || err);
+//   });
+//
+
+
+// /maddensettings autodetect — configure all auto-detect options
+//
+//
+//
+//
+//    await ensureMaddenAutoDetectColumns();
+//    const updates = [];
+//    const vals = [activeLeague.league_id];
+//    const setCol = (col, val) => { if (val !== null && val !== undefined) { vals.push(val); updates.push(`${col} = $${vals.length}`); } };
+//    const enabled    = interaction.options.getBoolean('enabled');
+//    const threshold  = interaction.options.getInteger('threshold');
+//    const reviewCh   = interaction.options.getChannel('review_channel');
+//    const espnNews   = interaction.options.getBoolean('espn_news');
+//    const sbLines    = interaction.options.getBoolean('sportsbook_lines');
+//    const sbCh       = interaction.options.getChannel('sportsbook_channel');
+//    const standCh    = interaction.options.getChannel('standings_channel');
+//    const rankCh     = interaction.options.getChannel('power_rankings_channel');
+//    setCol('auto_detect_enabled', enabled);
+//    setCol('auto_detect_threshold', threshold);
+//    setCol('auto_detect_review_channel_id', reviewCh?.id);
+//    setCol('espn_news_enabled', espnNews);
+//    setCol('sportsbook_auto_lines_enabled', sbLines);
+//    setCol('madden_sportsbook_channel_id', sbCh?.id);
+//    setCol('standings_channel_id', standCh?.id);
+//    if (standCh) setCol('standings_message_id', null); // Reset stored message when channel changes
+//    setCol('power_rankings_channel_id', rankCh?.id);
+//    if (rankCh) setCol('power_rankings_message_id', null);
+//    if (updates.length) {
+//      updates.push('updated_at = NOW()');
+//      await pool.query(`UPDATE madden_league_settings SET ${updates.join(', ')} WHERE league_id = $1`, vals);
+//    }
+//    const s = await ensureMaddenLeagueSettings(activeLeague);
+//    await interaction.editReply({ embeds: [buildMaddenAutoDetectSettingsEmbed(activeLeague, s)] });
+//    return;
+
+function buildMaddenAutoDetectSettingsEmbed(league, settings) {
+  return new EmbedBuilder()
+    .setTitle(`${GG_EMOJI} Auto-Detection Settings • ${league.league_name}`)
+    .setColor(settings.auto_detect_enabled ? 0x57F287 : 0xFEE75C)
+    .addFields(
+      { name: 'Auto-Detect Enabled', value: settings.auto_detect_enabled ? '✅ On' : '❌ Off', inline: true },
+      { name: 'Transaction Threshold', value: String(settings.auto_detect_threshold || 30), inline: true },
+      { name: 'Review Channel', value: settings.auto_detect_review_channel_id ? `<#${settings.auto_detect_review_channel_id}>` : 'News channel (default)', inline: true },
+      { name: 'ESPN News', value: settings.espn_news_enabled !== false ? '✅ On' : '❌ Off', inline: true },
+      { name: 'Sportsbook Auto-Lines', value: settings.sportsbook_auto_lines_enabled ? '✅ On' : '❌ Off', inline: true },
+      { name: 'Sportsbook Channel', value: settings.madden_sportsbook_channel_id ? `<#${settings.madden_sportsbook_channel_id}>` : 'Not set', inline: true },
+      { name: 'Standings Board', value: settings.standings_channel_id ? `<#${settings.standings_channel_id}>` : 'Not set', inline: true },
+      { name: 'Power Rankings Board', value: settings.power_rankings_channel_id ? `<#${settings.power_rankings_channel_id}>` : 'Not set', inline: true },
+      { name: 'Last Processed Week', value: settings.last_auto_detect_week_label || 'None yet', inline: true },
+      { name: 'How to enable', value: 'Run `/maddensettings autodetect enabled:True` to turn on. Set a transaction threshold that matches your typical advance size (default: 30). The system will hold anomalous advances for commissioner review instead of auto-posting.', inline: false },
+    )
+    .setFooter({ text: 'GG Sports • 7J-10BY-GT3 Auto Detection' })
+    .setTimestamp();
+}
 // 7J-10AX Madden Compare Value + Trade Foundation
