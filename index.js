@@ -1759,7 +1759,8 @@ function buildCommands() {
         .addBooleanOption(o => o.setName('sportsbook_lines').setDescription('Auto-create betting lines for user vs user games?'))
         .addChannelOption(o => o.setName('sportsbook_channel').setDescription('Channel for Madden sportsbook lines'))
         .addChannelOption(o => o.setName('standings_channel').setDescription('Channel for persistent standings board'))
-        .addChannelOption(o => o.setName('power_rankings_channel').setDescription('Channel for persistent power rankings board')))
+        .addChannelOption(o => o.setName('power_rankings_channel').setDescription('Channel for persistent power rankings board'))
+        .addStringOption(o => o.setName('reset_week').setDescription('Manually set the last processed week label (e.g. Preseason Week 2)').setRequired(false)))
 
 ,
 
@@ -8800,6 +8801,8 @@ if (gameSubcommand === 'report') {
         if (standCh) setCol('standings_message_id', null);
         setCol('power_rankings_channel_id', rankCh?.id);
         if (rankCh) setCol('power_rankings_message_id', null);
+        const resetWeek = interaction.options.getString('reset_week');
+        if (resetWeek) setCol('last_auto_detect_week_label', resetWeek.trim());
         if (updates.length) {
           updates.push('updated_at = NOW()');
           await pool.query(
@@ -27148,7 +27151,33 @@ async function autoCreateGameThreadsAfterSync(guild, league) {
     return;
   }
 
-  const weekLabel = threadlessWeeks[0];
+  // Find the most recent week that already has threads — use it as an anchor.
+  // Only create threads for weeks that come AFTER it in canonical order.
+  // This prevents re-creating threads for old weeks that had their threads deleted.
+  const existingThreadsResult = await pool.query(
+    `SELECT DISTINCT week_label FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text AND thread_id IS NOT NULL`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const existingThreadedWeeks = (existingThreadsResult.rows || []).map(r => r.week_label).filter(Boolean);
+  existingThreadedWeeks.sort(compareMaddenWeekLabels);
+  const lastThreadedWeek = existingThreadedWeeks[existingThreadedWeeks.length - 1] || null;
+
+  // Filter to only weeks after the last threaded week
+  const candidateWeeks = lastThreadedWeek
+    ? threadlessWeeks.filter(w => {
+        const [wG, wN] = maddenWeekLabelSortKey(w);
+        const [lG, lN] = maddenWeekLabelSortKey(lastThreadedWeek);
+        return wG > lG || (wG === lG && wN > lN);
+      })
+    : threadlessWeeks;
+
+  if (!candidateWeeks.length) {
+    console.log('[AUTO GAME THREADS] No new weeks after last threaded week (' + (lastThreadedWeek || 'none') + ') for league ' + league.league_id);
+    return;
+  }
+
+  const weekLabel = candidateWeeks[0]; // earliest new week after last threaded
   console.log('[AUTO GAME THREADS] New week detected: ' + weekLabel + ' for league ' + league.league_id);
 
   // Resolve the target channel
@@ -45502,28 +45531,56 @@ async function ensureMaddenAutoDetectColumns() {
 // Returns the new week label if this is a fresh advance, null if already seen.
 // ---------------------------------------------------------------------------
 async function getMaddenNewAdvanceWeek(guildId, leagueId) {
-  const settings = await pool.query(
+  const settingsResult = await pool.query(
     `SELECT last_auto_detect_week_label FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
     [leagueId]
   ).catch(() => ({ rows: [] }));
-  const lastLabel = settings.rows[0]?.last_auto_detect_week_label || null;
+  const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
 
-  // Find the current week: most recent week that has scheduled games
-  const current = await pool.query(
-    `SELECT week_label FROM madden_imported_games
+  // Get all distinct weeks that exist in the schedule
+  const result = await pool.query(
+    `SELECT DISTINCT week_label FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
-       AND LOWER(status) = 'scheduled'
        AND week_label IS NOT NULL
-     GROUP BY week_label
-     ORDER BY MIN(created_at) DESC
-     LIMIT 1`,
+       AND TRIM(week_label) <> ''
+       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'`,
     [guildId, String(leagueId)]
   ).catch(() => ({ rows: [] }));
 
-  const currentLabel = current.rows[0]?.week_label || null;
-  if (!currentLabel) return null;
-  if (currentLabel === lastLabel) return null; // Already processed this advance
-  return currentLabel;
+  const allWeeks = (result.rows || []).map(r => r.week_label).filter(Boolean);
+  allWeeks.sort(compareMaddenWeekLabels);
+  if (!allWeeks.length) return null;
+
+  if (!lastLabel) {
+    // First run — anchor off the most recent week that has threads so we don't
+    // reprocess old weeks. Mark it as processed and return null for this run;
+    // the NEXT advance will be detected cleanly.
+    const threadedResult = await pool.query(
+      `SELECT DISTINCT week_label FROM madden_imported_games
+       WHERE guild_id = $1 AND league_id::text = $2::text AND thread_id IS NOT NULL`,
+      [guildId, String(leagueId)]
+    ).catch(() => ({ rows: [] }));
+    const threadedWeeks = (threadedResult.rows || []).map(r => r.week_label).filter(Boolean);
+    threadedWeeks.sort(compareMaddenWeekLabels);
+    const latestThreaded = threadedWeeks[threadedWeeks.length - 1];
+    if (latestThreaded) {
+      // Silently mark the current week as processed so the next advance is detected
+      await markMaddenAdvanceProcessed(guildId, leagueId, latestThreaded);
+      console.log(`[AUTO DETECT] First run — anchored to current week: ${latestThreaded}. Will detect NEXT advance.`);
+      return null;
+    }
+    // No threads yet — return the earliest week as the starting point
+    return allWeeks[0];
+  }
+
+  // Normal run — find the first week in canonical order that comes AFTER lastLabel
+  const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
+  const weeksAfterLast = allWeeks.filter(w => {
+    const [g, n] = maddenWeekLabelSortKey(w);
+    return g > lastG || (g === lastG && n > lastN);
+  });
+
+  return weeksAfterLast.length ? weeksAfterLast[0] : null;
 }
 
 async function markMaddenAdvanceProcessed(guildId, leagueId, weekLabel) {
