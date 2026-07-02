@@ -45668,15 +45668,13 @@ async function autoDetectMaddenTransactions(guild, league) {
   const reviewChannelId = settings.auto_detect_review_channel_id
     || await getMaddenNewsChannelId(league.league_id).catch(() => null);
 
-  // Preview scan first — don't commit until we know the count is sane
-  const preview = await runMaddenTransactionScan(guild.id, league, { confirm: false }).catch(() => null);
-  if (!preview) return [];
-
-  const count = preview.transactions?.length || 0;
+  // Preview scan first — count results before committing
+  const previewRows = await scanMaddenOffseasonTransactions(guild, league, false).catch(() => null);
+  const count = Array.isArray(previewRows) ? previewRows.length : 0;
   if (count === 0) return [];
 
   if (count > threshold) {
-    // Anomalous — hold for commissioner review
+    // Anomalous count — hold for commissioner review
     if (reviewChannelId) {
       const reviewChannel = await guild.channels.fetch(reviewChannelId).catch(() => null);
       if (reviewChannel?.isTextBased?.()) {
@@ -45686,13 +45684,12 @@ async function autoDetectMaddenTransactions(guild, league) {
             .setColor(0xFEE75C)
             .setDescription([
               `**League:** ${league.league_name}`,
-              `**Transactions detected:** ${count} (threshold: ${threshold})`,
+              `**Transactions detected:** ${count} (threshold: ${settings.auto_detect_threshold || 30})`,
               '',
-              'This advance generated more transactions than expected. This has been **held** rather than auto-posted to avoid flooding the news channel.',
+              'This advance generated more transactions than expected and has been **held** to avoid flooding the news channel.',
               '',
-              'Review with `/maddentransactions scan confirm:false` and post manually with `confirm:true` when ready.',
-              '',
-              `To raise the threshold: \`/maddensettings autodetect threshold:${count + 10}\``,
+              'Review with `/maddentransactions scan confirm:false` then post manually with `confirm:true`.',
+              `To raise the threshold: \`/maddengames autodetect threshold:${count + 10}\``,
             ].join('\n'))
             .setFooter({ text: 'GG Sports • 7J-10BY-GT3 Auto Detection' })
             .setTimestamp()],
@@ -45702,8 +45699,9 @@ async function autoDetectMaddenTransactions(guild, league) {
     return [];
   }
 
-  // Count is within threshold — run with confirm:true and post
-  await runMaddenTransactionScan(guild.id, league, { confirm: true }).catch(() => null);
+  // Count is within threshold — run with confirm:true to save and post news
+  await scanMaddenOffseasonTransactions(guild, league, true).catch(err =>
+    console.error('[AUTO DETECT TRANSACTIONS] Scan failed:', err?.message));
   return [{ type: 'transactions', count }];
 }
 
@@ -46327,7 +46325,23 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
   const isRegular = maddenIsRegularSeasonWeek(newWeekLabel);
   if (!wasPreseason || !isRegular) return; // Not a preseason → regular transition
 
-  console.log('[SEASON TRANSITION] Preseason → Regular Season for league', league.league_id);
+  // Guard: EA exports the full season schedule upfront, so regular season weeks
+  // exist in the DB while preseason is still active. Only fire when preseason
+  // games are no longer scheduled (meaning we've truly finished preseason).
+  const preseasonCheck = await pool.query(
+    `SELECT COUNT(*) AS cnt FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(week_label) LIKE 'preseason%'
+       AND LOWER(COALESCE(status, 'scheduled')) = 'scheduled'`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [{ cnt: 1 }] }));
+  const preseasonCount = Number(preseasonCheck.rows[0]?.cnt || 0);
+  if (preseasonCount > 0) {
+    console.log(`[SEASON TRANSITION] Skipping — ${preseasonCount} preseason game(s) still scheduled. Not in regular season yet.`);
+    return;
+  }
+
+  console.log('[SEASON TRANSITION] Preseason → Regular Season confirmed for league', league.league_id);
 
   // 1. Wipe preseason weekly stats (don't carry into regular season)
   const wiped = await pool.query(
