@@ -370,6 +370,9 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_standings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_power_rankings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_threshold INTEGER NOT NULL DEFAULT 30`);
@@ -3133,7 +3136,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -6748,6 +6751,27 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         // Also sync to madden_league_settings so /maddengames setup and auto-thread creation see the same value
         await pool.query(
           `UPDATE madden_league_settings SET game_threads_channel_id = $2, updated_at = NOW() WHERE league_id = $1`,
+          [leagueId, channelId]
+        ).catch(() => null);
+      }
+
+      if (settingKey === 'madden_standings_channel') {
+        await pool.query(
+          `UPDATE madden_league_settings SET standings_channel_id = $2, standings_message_id = NULL, updated_at = NOW() WHERE league_id = $1`,
+          [leagueId, channelId]
+        ).catch(() => null);
+      }
+
+      if (settingKey === 'madden_power_rankings_channel') {
+        await pool.query(
+          `UPDATE madden_league_settings SET power_rankings_channel_id = $2, power_rankings_message_id = NULL, updated_at = NOW() WHERE league_id = $1`,
+          [leagueId, channelId]
+        ).catch(() => null);
+      }
+
+      if (settingKey === 'madden_sportsbook_channel') {
+        await pool.query(
+          `UPDATE madden_league_settings SET madden_sportsbook_channel_id = $2, updated_at = NOW() WHERE league_id = $1`,
           [leagueId, channelId]
         ).catch(() => null);
       }
@@ -18522,6 +18546,9 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'madden_free_agents_channel', label: 'Madden Free Agents Channel', description: 'Live free agent board and offseason free agency panel', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
+  { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
+  { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
+  { value: 'madden_sportsbook_channel', label: 'Madden Sportsbook Channel', description: 'Channel for Madden betting lines (user vs user games)', kind: 'channel' },
   { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed', kind: 'channel' },
   { value: 'shop_channel', label: 'Shop Channel', description: 'Permanent shop panel channel', kind: 'channel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
@@ -18556,6 +18583,9 @@ function setupDashboardColumn(settingKey) {
     madden_free_agents_channel: 'madden_free_agents_channel_id',
     game_thread_channel: 'game_threads_channel_id',
     madden_news_channel: 'madden_news_channel_id',
+    madden_standings_channel: 'madden_standings_channel_id',
+    madden_power_rankings_channel: 'madden_power_rankings_channel_id',
+    madden_sportsbook_channel: 'madden_sportsbook_channel_id',
     sportsbook_channel: 'sportsbook_channel_id',
     shop_channel: 'shop_channel_id',
     team_owners_channel: 'team_owners_channel_id',
@@ -18597,6 +18627,9 @@ function buildSetupDashboardEmbed(league) {
     'Madden Free Agents: ' + setupDashboardFormatValue(league, 'madden_free_agents_channel'),
     'Game Threads: ' + setupDashboardFormatValue(league, 'game_thread_channel'),
     'Madden News: ' + setupDashboardFormatValue(league, 'madden_news_channel'),
+    'Madden Standings Board: ' + setupDashboardFormatValue(league, 'madden_standings_channel'),
+    'Madden Power Rankings Board: ' + setupDashboardFormatValue(league, 'madden_power_rankings_channel'),
+    'Madden Sportsbook: ' + setupDashboardFormatValue(league, 'madden_sportsbook_channel'),
     'Sportsbook: ' + setupDashboardFormatValue(league, 'sportsbook_channel'),
     'Shop: ' + setupDashboardFormatValue(league, 'shop_channel'),
     'Tournament: ' + setupDashboardFormatValue(league, 'tournament_channel'),
