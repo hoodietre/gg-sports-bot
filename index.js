@@ -27103,13 +27103,28 @@ async function getMaddenImportedGameById(gameId) {
 
 async function handleMaddenGameThreadButton(interaction) {
   if (!interaction.guild) return;
+
+  // Guard against expired interactions (Discord error 10062 — token > 15min old or post-restart)
+  const safeReply = async (options) => {
+    try {
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(options).catch(() => null);
+      } else {
+        await interaction.reply(options);
+      }
+    } catch (err) {
+      if (err?.code === 10062) return; // Unknown interaction — token expired, nothing we can do
+      throw err;
+    }
+  };
+
   const parts = String(interaction.customId || '').split(':');
   const action = parts[0].replace('maddengame_thread_', '');
   const gameId = parts[1];
   const game = await getMaddenImportedGameById(gameId);
   const league = game?.league_id ? await getLeagueById(game.league_id) : null;
   if (!game || !league) {
-    await interaction.reply({ content: 'That Madden game could not be found.', ephemeral: true });
+    await safeReply({ content: 'That Madden game could not be found.', ephemeral: true });
     return;
   }
   const owners = {
@@ -27118,29 +27133,29 @@ async function handleMaddenGameThreadButton(interaction) {
   };
   const matchup = await getMaddenMatchupPreviewData(interaction.guild.id, league.league_id, game.home_team, game.away_team).catch(() => null);
   if (action === 'game') {
-    await interaction.reply({ embeds: [buildMaddenGameThreadCenterEmbed(league, game, matchup, owners)], ephemeral: true });
+    await safeReply({ embeds: [buildMaddenGameThreadCenterEmbed(league, game, matchup, owners)], ephemeral: true });
     return;
   }
   if (action === 'preview') {
     if (matchup?.home && matchup?.away) {
-      await interaction.reply({ embeds: [buildMaddenMatchupPreviewEmbed(league, matchup)], ephemeral: true });
+      await safeReply({ embeds: [buildMaddenMatchupPreviewEmbed(league, matchup)], ephemeral: true });
     } else {
-      await interaction.reply({ content: 'No matchup preview data found yet. Run Madden sync or check imported team stats.', ephemeral: true });
+      await safeReply({ content: 'No matchup preview data found yet. Run Madden sync or check imported team stats.', ephemeral: true });
     }
     return;
   }
   if (action === 'compare') {
-    await interaction.reply({ embeds: [buildMaddenTeamComparisonEmbed(league, game, matchup)], ephemeral: true });
+    await safeReply({ embeds: [buildMaddenTeamComparisonEmbed(league, game, matchup)], ephemeral: true });
     return;
   }
   if (action === 'stream') {
     const result = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
     const url = result.rows[0]?.stream_url;
     if (!url) {
-      await interaction.reply({ content: 'No saved stream link found. Save one with `/linkstream url:<your stream link>`, then press **Stream Hub** again.', ephemeral: true });
+      await safeReply({ content: 'No saved stream link found. Save one with `/linkstream url:<your stream link>`, then press **Stream Hub** again.', ephemeral: true });
       return;
     }
-    await interaction.reply({ content: `📺 <@${interaction.user.id}> is streaming this matchup: ${url}`, allowedMentions: { users: [interaction.user.id], roles: [] } });
+    await safeReply({ content: `📺 <@${interaction.user.id}> is streaming this matchup: ${url}`, allowedMentions: { users: [interaction.user.id], roles: [] } });
     return;
   }
   if (action === 'issue') {
@@ -43885,6 +43900,19 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await autoCreateGameThreadsAfterSync(guild, league).catch(error => {
       console.error('[Madden Sync] Auto game thread creation failed:', error?.message || error);
     });
+
+    // Auto-prune sync payloads — keep only the 10 most recent per league to prevent DB bloat
+    pool.query(
+      `DELETE FROM madden_sync_payloads
+       WHERE guild_id = $1 AND league_id = $2
+         AND id NOT IN (
+           SELECT id FROM madden_sync_payloads
+           WHERE guild_id = $1 AND league_id = $2
+           ORDER BY created_at DESC NULLS LAST
+           LIMIT 10
+         )`,
+      [guild.id, league.league_id]
+    ).catch(() => null); // fire-and-forget
 
     const message =
       'EA Direct sync completed for ' + context.externalLeagueName +
