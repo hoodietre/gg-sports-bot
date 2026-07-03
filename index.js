@@ -3133,7 +3133,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -3148,7 +3148,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -3162,7 +3162,7 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
@@ -3181,7 +3181,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -6890,6 +6890,26 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
+      if (action === 'connect') {
+        await ensureMaddenLeagueSettings(league).catch(() => null);
+        await upsertMaddenEaConnection(interaction.guild.id, league.league_id, interaction.user.id, {
+          connection_status: 'pending',
+          accepted_disclaimer: false,
+        }).catch(() => null);
+        await logMaddenEaConnectionEvent(interaction.guild.id, league.league_id, interaction.user.id, 'connect_started', 'EA Direct connection wizard started from commissioner panel.').catch(() => null);
+        try {
+          const dm = await interaction.user.createDM();
+          await dm.send({
+            embeds: [buildMaddenEaDisclaimerEmbed(league)],
+            components: buildMaddenEaStartComponents(league.league_id),
+          });
+          await interaction.reply({ content: 'Sent you a DM to continue EA Direct setup for **' + league.league_name + '**. Run this before Sync if your token has expired.', ephemeral: true });
+        } catch {
+          await interaction.reply({ content: 'Could not DM you. Enable DMs from this server and try again.', ephemeral: true });
+        }
+        return;
+      }
+
       if (action === 'sync') {
         await interaction.deferUpdate();
         const run = await runMaddenExternalFetchSync(interaction.guild, league, {}).catch(err => ({ status: 'error', message: err?.message || String(err) }));
@@ -7002,6 +7022,26 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('madstand:scope:')) {
+      const [, , leagueId, scope] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      await interaction.deferUpdate();
+      await pool.query(
+        `UPDATE madden_league_settings SET standings_scope = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, scope]
+      ).catch(() => null);
+      const standingsRows = await pool.query(
+        `SELECT * FROM madden_imported_standings WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY wins DESC, losses ASC, points_for DESC`,
+        [interaction.guild.id, String(league.league_id)]
+      ).then(r => r.rows).catch(() => []);
+      await interaction.editReply({
+        embeds: [buildMaddenImportedStandingsEmbed(league, standingsRows, scope)],
+        components: buildMaddenStandingsScopeComponents(leagueId, scope),
+      });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('madtb:page:')) {
       const [, , leagueId, pageStr, sort, positionRaw] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
@@ -7061,6 +7101,19 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         `UPDATE madden_trade_block_panels SET position = $3, page = 0, updated_at = NOW() WHERE guild_id = $1 AND league_id = $2`,
         [String(interaction.guild.id), String(leagueId), position]
       ).catch(() => null);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madneg_from_profile:')) {
+      const [, leagueId, encodedName] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      await ensureMaddenPlayerPersistenceTables().catch(() => null);
+      const playerName = decodeURIComponent(encodedName || '');
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const result = await createMaddenTradeNegotiationHub(interaction.guild.id, league, member, interaction.user.id, playerName);
+      await interaction.editReply({ embeds: [result.embed], components: result.components || [] });
       return;
     }
 
@@ -7138,7 +7191,10 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const statRows = await getMaddenPlayerSeasonStatSummary(interaction.guild.id, league.league_id, player);
       const ranks = await getMaddenPlayerLeagueRanks(interaction.guild.id, league.league_id, player);
       const valueRankContext = await getMaddenPlayerValueRankContext(interaction.guild.id, league.league_id, player);
-      await interaction.editReply({ embeds: [buildMaddenPlayerProfileEmbed(league, player, statRows, ranks, valueRankContext)] });
+      await interaction.editReply({
+        embeds: [buildMaddenPlayerProfileEmbed(league, player, statRows, ranks, valueRankContext)],
+        components: buildMaddenPlayerProfileActionRow(league.league_id, player.player_name || playerName),
+      });
       return;
     }
 
@@ -10069,7 +10125,11 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const statRows = await getMaddenPlayerSeasonStatSummary(interaction.guild.id, activeLeague.league_id, player);
         const ranks = await getMaddenPlayerLeagueRanks(interaction.guild.id, activeLeague.league_id, player);
         const valueRankContext = await getMaddenPlayerValueRankContext(interaction.guild.id, activeLeague.league_id, player);
-        await interaction.reply({ embeds: [buildMaddenPlayerProfileEmbed(activeLeague, player, statRows, ranks, valueRankContext)], ephemeral: true });
+        await interaction.reply({
+          embeds: [buildMaddenPlayerProfileEmbed(activeLeague, player, statRows, ranks, valueRankContext)],
+          components: buildMaddenPlayerProfileActionRow(activeLeague.league_id, player.player_name || playerName),
+          ephemeral: true,
+        });
         return;
       }
 
@@ -22063,6 +22123,16 @@ function buildMaddenTradeNegotiationStarterComponents(leagueId) {
   )];
 }
 
+function buildMaddenPlayerProfileActionRow(leagueId, playerName) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('madneg_from_profile:' + leagueId + ':' + encodeURIComponent(String(playerName || '').slice(0, 80)))
+      .setLabel('Start Negotiation')
+      .setEmoji('🤝')
+      .setStyle(ButtonStyle.Primary)
+  )];
+}
+
 async function createMaddenTradeNegotiationHub(guildId, league, member, userId, playerName) {
   await ensureMaddenTradeNegotiationTables();
   const listing = await findMaddenTradeBlockListing(guildId, league.league_id, playerName);
@@ -23325,13 +23395,13 @@ function buildMaddenTradeBlockBoardComponents(leagueId, page, totalPages, sort =
   const posValue = position || 'ALL';
   const navRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`madtb:page:${leagueId}:${prevPage}:${sort}:${posValue}`)
+      .setCustomId(`madtb:page:${leagueId}:${prevPage}:${sort}:${posValue}:prev`)
       .setLabel(`Previous (${currentPage + 1}/${Math.max(1, totalPages)})`)
       .setEmoji('⬅️')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(currentPage <= 0),
     new ButtonBuilder()
-      .setCustomId(`madtb:page:${leagueId}:${nextPage}:${sort}:${posValue}`)
+      .setCustomId(`madtb:page:${leagueId}:${nextPage}:${sort}:${posValue}:next`)
       .setLabel(`Next (${currentPage + 1}/${Math.max(1, totalPages)})`)
       .setEmoji('➡️')
       .setStyle(ButtonStyle.Primary)
@@ -29405,10 +29475,10 @@ function buildMaddenFreeAgentPaginationComponents(token, page, totalPages, optio
   const prevPage = Math.max(0, currentPage - 1);
   const nextPage = Math.min(lastPage, currentPage + 1);
   const prevId = leagueId
-    ? `maddenfa:page:${leagueId}:${prevPage}:${position}:${minOvr}`
+    ? `maddenfa:page:${leagueId}:${prevPage}:${position}:${minOvr}:prev`
     : `maddenfreeagents_page:${token}:prev`;
   const nextId = leagueId
-    ? `maddenfa:page:${leagueId}:${nextPage}:${position}:${minOvr}`
+    ? `maddenfa:page:${leagueId}:${nextPage}:${position}:${minOvr}:next`
     : `maddenfreeagents_page:${token}:next`;
   const rows = [new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -46163,6 +46233,7 @@ async function ensureMaddenAutoDetectColumns() {
   // Persistent embed message IDs
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS standings_scope TEXT NOT NULL DEFAULT 'conference'`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_message_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS free_agents_message_id TEXT`);
@@ -46249,7 +46320,7 @@ async function markMaddenAdvanceProcessed(guildId, leagueId, weekLabel) {
 // Persistent embed updater
 // Edits the stored message in place, or posts a new one and saves the new ID.
 // ---------------------------------------------------------------------------
-async function updatePersistentMaddenEmbed(guild, league, channelIdKey, messageIdKey, buildEmbedFn) {
+async function updatePersistentMaddenEmbed(guild, league, channelIdKey, messageIdKey, buildEmbedFn, buildComponentsFn = null) {
   const settings = await ensureMaddenLeagueSettings(league);
   const channelId = settings[channelIdKey];
   if (!channelId) return null; // Not configured, skip
@@ -46257,20 +46328,22 @@ async function updatePersistentMaddenEmbed(guild, league, channelIdKey, messageI
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased?.()) return null;
 
-  const embed = await buildEmbedFn().catch(() => null);
+  const embed = await buildEmbedFn(settings).catch(() => null);
   if (!embed) return null;
+  const components = buildComponentsFn ? await buildComponentsFn(settings).catch(() => undefined) : undefined;
+  const payload = components ? { embeds: [embed], components } : { embeds: [embed] };
 
   const existingMessageId = settings[messageIdKey];
   if (existingMessageId) {
     const existing = await channel.messages.fetch(existingMessageId).catch(() => null);
     if (existing) {
-      await existing.edit({ embeds: [embed] }).catch(() => null);
+      await existing.edit(payload).catch(() => null);
       return existing;
     }
   }
 
   // Message gone or not yet set — post new one and store the ID
-  const posted = await channel.send({ embeds: [embed] }).catch(() => null);
+  const posted = await channel.send(payload).catch(() => null);
   if (posted) {
     await pool.query(
       `UPDATE madden_league_settings SET ${messageIdKey} = $2, updated_at = NOW() WHERE league_id = $1`,
@@ -46278,6 +46351,14 @@ async function updatePersistentMaddenEmbed(guild, league, channelIdKey, messageI
     ).catch(() => null);
   }
   return posted;
+}
+
+function buildMaddenStandingsScopeComponents(leagueId, currentScope = 'conference') {
+  const mk = (label, value) => new ButtonBuilder()
+    .setCustomId(`madstand:scope:${leagueId}:${value}`)
+    .setLabel(label)
+    .setStyle(currentScope === value ? ButtonStyle.Primary : ButtonStyle.Secondary);
+  return [new ActionRowBuilder().addComponents(mk('League', 'league'), mk('Conference', 'conference'), mk('Division', 'division'))];
 }
 
 async function refreshPersistentMaddenEmbeds(guild, league) {
@@ -46290,7 +46371,8 @@ async function refreshPersistentMaddenEmbeds(guild, league) {
 
   await Promise.allSettled([
     updatePersistentMaddenEmbed(guild, league, 'standings_channel_id', 'standings_message_id',
-      () => buildMaddenImportedStandingsEmbed(league, standingsRows, 'conference')),
+      (settings) => buildMaddenImportedStandingsEmbed(league, standingsRows, (settings && settings.standings_scope) || 'conference'),
+      (settings) => buildMaddenStandingsScopeComponents(league.league_id, (settings && settings.standings_scope) || 'conference')),
     updatePersistentMaddenEmbed(guild, league, 'power_rankings_channel_id', 'power_rankings_message_id',
       async () => {
         const rows = await pool.query(
@@ -47227,6 +47309,7 @@ async function showCommissionerHome(interaction, leagueId, note = null) {
 
 function buildCommissionerOperationsComponents(leagueId) {
   const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_op:connect:' + leagueId).setLabel('Connect to EA').setEmoji('🔗').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('commissioner_op:sync:' + leagueId).setLabel('Run Sync').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('commissioner_op:refresh:' + leagueId).setLabel('Refresh Boards').setStyle(ButtonStyle.Secondary),
   );
