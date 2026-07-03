@@ -26708,6 +26708,7 @@ async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId =
       const owner = await findTeamOwnerByRoleId(guild, roleId).catch(() => null);
       if (owner) return owner;
     }
+  }
 
   // 3. Use explicit madden_franchises ownership mappings.
   if (league?.league_id) {
