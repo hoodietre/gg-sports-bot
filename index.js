@@ -15424,7 +15424,27 @@ if (shopSubcommand === 'view') {
       if (interaction.commandName === 'assignrole') await targetMember.roles.add(role);
       else await targetMember.roles.remove(role);
       const configuredTeamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
-      if (configuredTeamRoles.some(team => team.role_id === role.id) || isLegacyTeamRole(role.name)) await updateTeamOwnersPanel(interaction.guild, league);
+      const isMaddenTeamRole = configuredTeamRoles.some(team => team.role_id === role.id) || isLegacyTeamRole(role.name);
+      if (isMaddenTeamRole) await updateTeamOwnersPanel(interaction.guild, league);
+
+      // Sync Madden team ownership tables when a team role is assigned/unassigned
+      if (isMaddenTeamRole && league?.league_id) {
+        const newOwnerId = interaction.commandName === 'assignrole' ? targetUser.id : null;
+        await pool.query(
+          `UPDATE madden_imported_team_stats
+           SET owner_user_id = $3, imported_at = NOW()
+           WHERE guild_id = $1 AND league_id::text = $2::text
+             AND team_role_id = $4`,
+          [interaction.guild.id, String(league.league_id), newOwnerId, role.id]
+        ).catch(() => null);
+        await pool.query(
+          `UPDATE madden_franchises
+           SET owner_user_id = $3, updated_at = NOW()
+           WHERE guild_id = $1 AND league_id::text = $2::text
+             AND team_role_id = $4`,
+          [interaction.guild.id, String(league.league_id), newOwnerId, role.id]
+        ).catch(() => null);
+      }
       await interaction.reply({ content: `${interaction.commandName === 'assignrole' ? 'Assigned' : 'Removed'} ${role} ${interaction.commandName === 'assignrole' ? 'to' : 'from'} ${targetMember}.`, ephemeral: true });
       return;
     }
