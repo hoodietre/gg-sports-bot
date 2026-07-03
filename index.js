@@ -27137,23 +27137,25 @@ async function autoCreateGameThreadsAfterSync(guild, league) {
     return;
   }
 
-  // Find weeks where ALL games are threadless AND at least one is still scheduled
+  // Find weeks where ALL *scheduled* games are threadless.
+  // Only look at scheduled rows — completed games from previous seasons
+  // share the same week labels and must not trigger thread creation.
   const result = await pool.query(
     `SELECT
        week_label,
-       COUNT(*) AS total,
-       SUM(CASE WHEN thread_id IS NULL THEN 1 ELSE 0 END) AS no_thread,
-       SUM(CASE WHEN LOWER(status) = 'scheduled' THEN 1 ELSE 0 END) AS scheduled_count
+       COUNT(*) FILTER (WHERE LOWER(status) = 'scheduled')                        AS scheduled_total,
+       COUNT(*) FILTER (WHERE LOWER(status) = 'scheduled' AND thread_id IS NULL) AS scheduled_no_thread
      FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND week_label IS NOT NULL
        AND TRIM(week_label) <> ''
        AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'
+       AND LOWER(status) = 'scheduled'
      GROUP BY week_label
      HAVING
-       COUNT(*) > 0
-       AND SUM(CASE WHEN thread_id IS NULL THEN 1 ELSE 0 END) = COUNT(*)
-       AND SUM(CASE WHEN LOWER(status) = 'scheduled' THEN 1 ELSE 0 END) > 0`,
+       COUNT(*) FILTER (WHERE LOWER(status) = 'scheduled') > 0
+       AND COUNT(*) FILTER (WHERE LOWER(status) = 'scheduled' AND thread_id IS NULL)
+             = COUNT(*) FILTER (WHERE LOWER(status) = 'scheduled')`,
     [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [] }));
 
@@ -45566,13 +45568,16 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   ).catch(() => ({ rows: [] }));
   const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
 
-  // Get all distinct weeks that exist in the schedule
+  // Get all distinct weeks that have at least one SCHEDULED game.
+  // Completed games from previous seasons are excluded to prevent them
+  // from appearing as "new" advance candidates.
   const result = await pool.query(
     `SELECT DISTINCT week_label FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND week_label IS NOT NULL
        AND TRIM(week_label) <> ''
-       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'`,
+       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'
+       AND LOWER(status) = 'scheduled'`,
     [guildId, String(leagueId)]
   ).catch(() => ({ rows: [] }));
 
