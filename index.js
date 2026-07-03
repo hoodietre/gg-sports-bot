@@ -27177,7 +27177,20 @@ async function autoCreateGameThreadsAfterSync(guild, league) {
   ).catch(() => ({ rows: [] }));
   const existingThreadedWeeks = (existingThreadsResult.rows || []).map(r => r.week_label).filter(Boolean);
   existingThreadedWeeks.sort(compareMaddenWeekLabels);
-  const lastThreadedWeek = existingThreadedWeeks[existingThreadedWeeks.length - 1] || null;
+  let lastThreadedWeek = existingThreadedWeeks[existingThreadedWeeks.length - 1] || null;
+
+  // If no threads exist in the DB (e.g. all were deleted via deletethreads),
+  // fall back to the auto-detect anchor so we don't recreate old weeks.
+  if (!lastThreadedWeek) {
+    const anchorResult = await pool.query(
+      `SELECT last_auto_detect_week_label FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+      [league.league_id]
+    ).catch(() => ({ rows: [] }));
+    lastThreadedWeek = anchorResult.rows[0]?.last_auto_detect_week_label || null;
+    if (lastThreadedWeek) {
+      console.log('[AUTO GAME THREADS] No threaded weeks found — using auto-detect anchor as fallback: ' + lastThreadedWeek);
+    }
+  }
 
   // Filter to only weeks after the last threaded week
   const candidateWeeks = lastThreadedWeek
