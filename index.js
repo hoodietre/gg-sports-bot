@@ -26697,12 +26697,17 @@ async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId =
         const member = await guild.members.fetch(row.owner_user_id).catch(() => null);
         if (member && !member.user.bot) return member;
       }
-      if (row.team_role_id) {
-        const owner = await findTeamOwnerByRoleId(guild, row.team_role_id).catch(() => null);
-        if (owner) return owner;
-      }
+      // If a DB record exists for this team but owner_user_id is NULL,
+      // treat it as explicitly unassigned — do NOT fall back to role lookup.
+      // Role lookup fallback only fires if no DB record exists at all.
+      return null;
     }
-  }
+
+    // No DB record found for this team at all — try role lookup as last resort
+    if (roleId) {
+      const owner = await findTeamOwnerByRoleId(guild, roleId).catch(() => null);
+      if (owner) return owner;
+    }
 
   // 3. Use explicit madden_franchises ownership mappings.
   if (league?.league_id) {
