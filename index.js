@@ -2218,9 +2218,9 @@ function buildCommands() {
 ,
 
     new SlashCommandBuilder()
-      .setName('setup')
-      .setDescription('Interactive GG Sports setup dashboard')
-      .addSubcommand(sc => sc.setName('panel').setDescription('Open the interactive setup dashboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+      .setName('commissioner')
+      .setDescription('Commissioner/admin control panel')
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open the commissioner control panel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('leagueannounce')
@@ -6810,6 +6810,183 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('commissioner_category:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const category = interaction.values[0];
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+
+      if (category === 'setup') {
+        await interaction.update({
+          embeds: [buildSetupDashboardEmbed(league)],
+          components: buildSetupDashboardComponents(leagueId),
+        });
+        return;
+      }
+      if (category === 'operations') {
+        await showCommissionerOperations(interaction, leagueId);
+        return;
+      }
+      if (category === 'league') {
+        await showCommissionerLeagueSettings(interaction, leagueId);
+        return;
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_back:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+
+      await showCommissionerHome(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_op:')) {
+      const [, action, leagueId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to run commissioner operations.', ephemeral: true });
+        return;
+      }
+
+      if (action === 'sync') {
+        await interaction.deferUpdate();
+        const run = await runMaddenExternalFetchSync(interaction.guild, league, {}).catch(err => ({ status: 'error', message: err?.message || String(err) }));
+        await postMaddenSyncFeed(interaction.guild, league, run).catch(() => null);
+        await refreshMaddenFreeAgentsPanelForLeague(interaction.guild, league).catch(() => null);
+        await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(league, run)], components: [buildCommissionerBackRow(leagueId)] });
+        return;
+      }
+
+      if (action === 'refresh') {
+        await interaction.deferUpdate();
+        await refreshPersistentMaddenEmbeds(interaction.guild, league).catch(() => null);
+        await showCommissionerOperations(interaction, leagueId);
+        return;
+      }
+
+      if (action === 'txn_preview') {
+        await interaction.deferUpdate();
+        const embed = await buildMaddenTransactionsScanEmbed(interaction.guild.id, league, false);
+        await interaction.editReply({ embeds: [embed], components: [buildCommissionerBackRow(leagueId)] });
+        return;
+      }
+
+      if (action === 'txn_confirm') {
+        await interaction.deferUpdate();
+        const embed = await buildMaddenTransactionsScanEmbed(interaction.guild.id, league, true);
+        await interaction.editReply({ embeds: [embed], components: [buildCommissionerBackRow(leagueId)] });
+        return;
+      }
+
+      if (action === 'retire_scan') {
+        await interaction.deferUpdate();
+        const embed = await buildMaddenRetirementsScanEmbed(interaction.guild, league, true);
+        await interaction.editReply({ embeds: [embed], components: [buildCommissionerBackRow(leagueId)] });
+        return;
+      }
+
+      if (action === 'toggle_autodetect') {
+        await ensureMaddenAutoDetectColumns();
+        const settings = await ensureMaddenLeagueSettings(league);
+        const next = !settings.auto_detect_enabled;
+        await pool.query(
+          `UPDATE madden_league_settings SET auto_detect_enabled = $2, updated_at = NOW() WHERE league_id = $1`,
+          [leagueId, next]
+        );
+        await showCommissionerOperations(interaction, leagueId);
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_league_edit_season:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to edit league settings.', ephemeral: true });
+        return;
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId('commissioner_season_modal:' + leagueId)
+        .setTitle('Edit Season Length')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('commissioner_season_length')
+              .setLabel('Season length (games)')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('e.g. 17')
+              .setValue(league.season_length ? String(league.season_length) : '')
+              .setRequired(true)
+          )
+        );
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_season_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+
+      if (!league) {
+        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        return;
+      }
+
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to edit league settings.', ephemeral: true });
+        return;
+      }
+
+      const raw = interaction.fields.getTextInputValue('commissioner_season_length');
+      const value = Number.parseInt(raw, 10);
+
+      if (!Number.isInteger(value) || value <= 0 || value > 30) {
+        await interaction.reply({ content: 'Season length must be a whole number between 1 and 30.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(`UPDATE leagues SET season_length = $2 WHERE league_id = $1`, [leagueId, value]);
+      await interaction.reply({ content: `Season length updated to **${value} games**.`, ephemeral: true });
+      return;
+    }
+
 
 
     if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_find:')) {
@@ -10509,11 +10686,11 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
       }
     }
 
-if (interaction.commandName === 'setup') {
+if (interaction.commandName === 'commissioner') {
       if (!interaction.guild) return;
-      const setupSubcommand = interaction.options.getSubcommand();
+      const commissionerSubcommand = interaction.options.getSubcommand();
 
-      if (setupSubcommand === 'panel') {
+      if (commissionerSubcommand === 'panel') {
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
@@ -10523,13 +10700,14 @@ if (interaction.commandName === 'setup') {
         }
 
         if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
-          await interaction.reply({ content: 'You do not have permission to open the setup dashboard.', ephemeral: true });
+          await interaction.reply({ content: 'You do not have permission to open the commissioner panel.', ephemeral: true });
           return;
         }
 
+        const settings = await ensureMaddenLeagueSettings(activeLeague).catch(() => ({}));
         await interaction.reply({
-          embeds: [buildSetupDashboardEmbed(activeLeague)],
-          components: buildSetupDashboardComponents(activeLeague.league_id),
+          embeds: [buildCommissionerHomeEmbed(activeLeague, settings)],
+          components: buildCommissionerHomeComponents(activeLeague.league_id),
           ephemeral: true,
         });
         return;
@@ -17544,7 +17722,7 @@ function buildCommandsGuideEmbed() {
   return new EmbedBuilder()
     .setTitle('GG Sports Commands')
     .setColor(0x5865F2)
-    .setDescription('Commands are organized by hub. Use /setup panel for interactive setup or /setupguide for full setup instructions.')
+    .setDescription('Commands are organized by hub. Use /commissioner panel for the interactive commissioner control panel or /setupguide for full setup instructions.')
     .addFields(
       {
         name: 'League Setup',
@@ -17623,7 +17801,7 @@ function buildHelpEmbed() {
       {
         name: 'New Server Owners',
         value:
-          '**/setup panel** — interactive setup dashboard.\n**/setupguide** — full step-by-step setup guide.\\n' +
+          '**/commissioner panel** — interactive commissioner control panel.\n**/setupguide** — full step-by-step setup guide.\\n' +
           '**/quicksetup** — short setup checklist.\\n' +
           '**/commands** — categorized command directory.',
         inline: false,
@@ -18731,6 +18909,7 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
   }
 
   rows.push(new ActionRowBuilder().addComponents(panelMenu));
+  rows.push(buildCommissionerBackRow(leagueId));
   return rows;
 }
 
@@ -26895,7 +27074,7 @@ function buildMaddenGameThreadsSummaryEmbed(league, week, result = {}) {
 
 // 7J-10BY-GT: Game thread channel / settings helpers
 async function getMaddenGameThreadsChannelId(leagueId) {
-  // Check league_settings first (set via /setup panel), then madden_league_settings (set via /maddengames setup)
+  // Check league_settings first (set via /commissioner panel), then madden_league_settings (set via /maddengames setup)
   const result = await pool.query(
     `SELECT ls.game_threads_channel_id AS ls_channel, mls.game_threads_channel_id AS mls_channel
      FROM league_settings ls
@@ -45754,9 +45933,9 @@ async function autoDetectMaddenTransactions(guild, league) {
 // Retirement auto-detect (baseline diff)
 // ---------------------------------------------------------------------------
 async function autoDetectMaddenRetirements(guild, league) {
-  const result = await runMaddenRetirementScan(guild.id, league, { confirm: true }).catch(() => null);
-  if (!result?.retired?.length) return [];
-  return result.retired.map(p => ({ type: 'retirement', player: p }));
+  const rows = await scanMaddenRetirements(guild, league, true).catch(() => null);
+  if (!Array.isArray(rows) || !rows.length) return [];
+  return rows.map(p => ({ type: 'retirement', player: p }));
 }
 
 
@@ -46542,9 +46721,138 @@ function buildMaddenAutoDetectSettingsEmbed(league, settings) {
       { name: 'Standings Board', value: settings.standings_channel_id ? `<#${settings.standings_channel_id}>` : 'Not set', inline: true },
       { name: 'Power Rankings Board', value: settings.power_rankings_channel_id ? `<#${settings.power_rankings_channel_id}>` : 'Not set', inline: true },
       { name: 'Last Processed Week', value: settings.last_auto_detect_week_label || 'None yet', inline: true },
-      { name: 'How to enable', value: 'Run `/maddensettings autodetect enabled:True` to turn on. Set a transaction threshold that matches your typical advance size (default: 30). The system will hold anomalous advances for commissioner review instead of auto-posting.', inline: false },
+      { name: 'How to enable', value: 'Use the **Toggle Auto-Detection** button in /commissioner panel → Operations, or run `/maddengames autodetect enabled:True`. Set a transaction threshold that matches your typical advance size (default: 30) with `/maddengames autodetect threshold:`. The system will hold anomalous advances for commissioner review instead of auto-posting.', inline: false },
     )
     .setFooter({ text: 'GG Sports • 7J-10BY-GT3 Auto Detection' })
     .setTimestamp();
 }
+
+// ---------------------------------------------------------------------------
+// Commissioner/Admin Panel (replaces /setup panel as the single admin surface)
+// ---------------------------------------------------------------------------
+const COMMISSIONER_CATEGORIES = [
+  { value: 'setup', label: 'Channels, Roles & Panels', description: 'Configure channels, roles, and create/refresh boards', emoji: '🛠️' },
+  { value: 'operations', label: 'Operations', description: 'Run sync, run scans, toggle auto-detection, refresh boards', emoji: '⚙️' },
+  { value: 'league', label: 'League Settings', description: 'Season length and other league-level settings', emoji: '📋' },
+];
+
+function buildCommissionerHomeEmbed(league, settings = {}) {
+  return new EmbedBuilder()
+    .setTitle(`${GG_EMOJI} GG Sports Commissioner Panel`)
+    .setColor(0x5865F2)
+    .setDescription('League: **' + league.league_name + '**\nPick a category below to manage this league. Old slash commands still work as advanced/manual backups.')
+    .addFields(
+      { name: 'Auto-Detection', value: settings.auto_detect_enabled ? '✅ On' : '❌ Off', inline: true },
+      { name: 'Transaction Threshold', value: String(settings.auto_detect_threshold || 30), inline: true },
+      { name: 'Last Processed Week', value: settings.last_auto_detect_week_label || 'None yet', inline: true },
+      { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Commissioner Panel' })
+    .setTimestamp();
+}
+
+function buildCommissionerHomeComponents(leagueId) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('commissioner_category:' + leagueId)
+    .setPlaceholder('Choose a category')
+    .addOptions(COMMISSIONER_CATEGORIES.map(c => ({
+      label: c.label,
+      value: c.value,
+      description: c.description,
+      emoji: c.emoji,
+    })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+function buildCommissionerBackRow(leagueId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('commissioner_back:' + leagueId)
+      .setLabel('⬅ Back to Overview')
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function showCommissionerHome(interaction, leagueId, note = null) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+    return;
+  }
+  const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+  const embed = buildCommissionerHomeEmbed(league, settings);
+  if (note) embed.setDescription(embed.data.description + '\n\n' + note);
+  const payload = { embeds: [embed], components: buildCommissionerHomeComponents(leagueId) };
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload);
+  } else {
+    await interaction.update(payload);
+  }
+}
+
+function buildCommissionerOperationsComponents(leagueId) {
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_op:sync:' + leagueId).setLabel('Run Sync').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('commissioner_op:refresh:' + leagueId).setLabel('Refresh Boards').setStyle(ButtonStyle.Secondary),
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_op:txn_preview:' + leagueId).setLabel('Preview Transactions').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('commissioner_op:txn_confirm:' + leagueId).setLabel('Confirm Transactions').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('commissioner_op:retire_scan:' + leagueId).setLabel('Scan Retirements').setStyle(ButtonStyle.Secondary),
+  );
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_op:toggle_autodetect:' + leagueId).setLabel('Toggle Auto-Detection').setStyle(ButtonStyle.Danger),
+  );
+  return [row1, row2, row3, buildCommissionerBackRow(leagueId)];
+}
+
+async function showCommissionerOperations(interaction, leagueId) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+    return;
+  }
+  const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+  const embed = buildMaddenAutoDetectSettingsEmbed(league, settings);
+  const payload = { embeds: [embed], components: buildCommissionerOperationsComponents(leagueId) };
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload);
+  } else {
+    await interaction.update(payload);
+  }
+}
+
+function buildCommissionerLeagueEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle(`📋 League Settings • ${league.league_name}`)
+    .setColor(0x5865F2)
+    .setDescription('Season length is editable below. Standings system options and the schedule generator are on the backlog but not built yet, so they are not shown here as live controls.')
+    .addFields(
+      { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Commissioner Panel' })
+    .setTimestamp();
+}
+
+function buildCommissionerLeagueComponents(leagueId) {
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_league_edit_season:' + leagueId).setLabel('Edit Season Length').setStyle(ButtonStyle.Primary),
+  );
+  return [row1, buildCommissionerBackRow(leagueId)];
+}
+
+async function showCommissionerLeagueSettings(interaction, leagueId) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+    return;
+  }
+  const payload = { embeds: [buildCommissionerLeagueEmbed(league)], components: buildCommissionerLeagueComponents(leagueId) };
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload);
+  } else {
+    await interaction.update(payload);
+  }
+}
+
 // 7J-10AX Madden Compare Value + Trade Foundation
