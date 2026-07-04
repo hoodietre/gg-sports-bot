@@ -6691,7 +6691,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
     
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('setup_select_setting:')) {
+    if (interaction.isStringSelectMenu() && (interaction.customId.startsWith('setup_select_setting:') || interaction.customId.startsWith('setup_select_setting2:'))) {
       const leagueId = interaction.customId.split(':')[1];
       const selectedSetting = interaction.values[0];
       const league = await getLeagueById(leagueId);
@@ -19445,7 +19445,7 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
 
   if (groupB.length) {
     const settingMenuB = new StringSelectMenuBuilder()
-      .setCustomId('setup_select_setting:' + leagueId)
+      .setCustomId('setup_select_setting2:' + leagueId)
       .setPlaceholder('Choose a setting to update (2/2)')
       .addOptions(groupB.map(option => ({
         label: option.label,
