@@ -24188,6 +24188,37 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
 // plus one new piece: suggested free agent signings.
 // ---------------------------------------------------------------------------
 async function getMaddenTeamOwnedByUser(guildId, leagueId, userId) {
+  // Primary path: team ownership in this bot is tracked via a Discord role
+  // (league_team_roles), not a stored owner_user_id column — that column is only
+  // populated when EA sync data happens to include a Discord ID mapping, which is
+  // the exception rather than the rule. Check roles first.
+  const guild = client.guilds.cache.get(String(guildId));
+  if (guild) {
+    const member = await guild.members.fetch(String(userId)).catch(() => null);
+    if (member) {
+      const roleIds = [...member.roles.cache.keys()];
+      if (roleIds.length) {
+        const roleMatch = await pool.query(
+          `SELECT role_id, role_name FROM league_team_roles WHERE league_id::text = $1::text AND role_id = ANY($2::text[]) LIMIT 1`,
+          [String(leagueId), roleIds]
+        ).catch(() => ({ rows: [] }));
+        const roleRow = roleMatch.rows?.[0];
+        if (roleRow) {
+          const teamResult = await pool.query(
+            `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3 LIMIT 1`,
+            [String(guildId), String(leagueId), roleRow.role_id]
+          ).catch(() => ({ rows: [] }));
+          if (teamResult.rows?.[0]) return teamResult.rows[0];
+          // Role exists and is assigned, but no imported team-stats row matched yet
+          // (e.g. sync hasn't run since role assignment) — return a minimal team
+          // object built from the role so the panel still resolves a team.
+          return { team_name: roleRow.role_name, team_role_id: roleRow.role_id };
+        }
+      }
+    }
+  }
+
+  // Fallback: direct owner_user_id column, for leagues where that's populated.
   const result = await pool.query(
     `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND owner_user_id = $3 LIMIT 1`,
     [String(guildId), String(leagueId), String(userId)]
