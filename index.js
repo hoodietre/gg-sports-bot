@@ -22236,7 +22236,7 @@ function maddenGmSuggestedPackageText(targetItem, tradeChips = [], slotMap = nul
   const pkg = maddenBuildSuggestedPackageForTarget(targetItem, tradeChips, slotMap, fromTeamName);
   if (!pkg) return '';
   const gapText = `${pkg.gap >= 0 ? '+' : ''}${Number(pkg.gap || 0).toFixed(0)}`;
-  return `\n   📦 Suggested offer: **${pkg.label}**\n   Package: **${Number(pkg.total || 0).toFixed(0)}** • Gap: **${gapText}** • Likelihood: **${pkg.likelihood}**`;
+  return `\n> 📦 Offer: **${pkg.label}**\n> Value **${Number(pkg.total || 0).toFixed(0)}** • Gap **${gapText}** • Likelihood **${pkg.likelihood}**`;
 }
 
 function maddenGmTieredTargetText(scoredTargets, maxTotal = 9) {
@@ -22278,7 +22278,7 @@ function maddenGmPositionAwareTargetText(scoredTargets, needRows = [], maxGroups
       .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || Number(b.value?.valueScore || 0) - Number(a.value?.valueScore || 0))
       .slice(0, perGroup);
     if (!items.length) continue;
-    sections.push(`**${maddenGmTargetSectionTitle(group, items)}**\n${items.map((item, index) => maddenGmTargetLine(item, index) + maddenGmSuggestedPackageText(item, tradeChips, slotMap, fromTeamName)).join('\n')}`);
+    sections.push(`**${maddenGmTargetSectionTitle(group, items)}**\n${items.map((item, index) => maddenGmTargetLine(item, index) + maddenGmSuggestedPackageText(item, tradeChips, slotMap, fromTeamName)).join('\n\n')}`);
   }
   if (!sections.length) return maddenGmTieredTargetText(scoredTargets || [], maxGroups * perGroup);
   return sections.join('\n\n');
@@ -22471,8 +22471,7 @@ function maddenTradeChipDebugText(items = []) {
 }
 
 function maddenTradeChipSectionText(items = []) {
-  const debugText = maddenTradeChipDebugText(items);
-  if (!items.length) return `**🔍 Trade Chip Debug**\n${debugText}\n\nNo movable assets found after fallback.`;
+  if (!items.length) return 'No movable assets found after fallback.';
   const premium = items.filter(item => item.category === 'premium').slice(0, 4);
   const veterans = items.filter(item => item.category === 'veteran').slice(0, 4);
   const depth = items.filter(item => item.category === 'depth').slice(0, 4);
@@ -22483,7 +22482,6 @@ function maddenTradeChipSectionText(items = []) {
   if (depth.length) sections.push(`**📦 Depth Assets**\n${depth.map((item, index) => maddenTradeChipLine(item, index)).join('\n')}`);
   if (!sections.length && fallback.length) sections.push(`**📦 Most Movable Assets**\n${fallback.map((item, index) => maddenTradeChipLine(item, index)).join('\n')}`);
   if (!sections.length) sections.push(items.slice(0, 8).map((item, index) => maddenTradeChipLine(item, index)).join('\n'));
-  sections.push(`**🔍 Trade Chip Debug**\n${debugText}`);
   return sections.join('\n\n');
 }
 
@@ -24320,7 +24318,7 @@ async function buildMaddenGmPanelHomeEmbed(guildId, league, teamName) {
     .addFields(
       { name: 'Record', value: teamRow ? `${teamRow.wins || 0}-${teamRow.losses || 0}${teamRow.ties ? '-' + teamRow.ties : ''} • PF ${teamRow.points_for || 0} • PA ${teamRow.points_against || 0}` : 'No record yet', inline: true },
       { name: 'Avg Overall', value: teamNeed ? Number(teamNeed.teamAvgOverall || 0).toFixed(1) : 'N/A', inline: true },
-      { name: 'Top Need', value: topNeed ? `${topNeed.position} — Need ${Math.round(Number(topNeed.needScore || 0))}` : 'None detected', inline: true },
+      { name: 'Top Need', value: topNeed ? `${topNeed.position} — ${maddenTeamNeedSeverity(topNeed.needScore).label}` : 'None detected', inline: true },
     )
     .setFooter({ text: 'GG Sports • GM Panel • Pick a section below' })
     .setTimestamp();
@@ -29934,6 +29932,10 @@ async function buildMaddenTeamProfileEmbed(guildId, league, teamInput) {
      LIMIT 12`,
     [String(guildId), String(league.league_id), candidates]
   ).catch(() => ({ rows: [] }));
+  const rosterCountResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM madden_player_attributes WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = ANY($3::text[])`,
+    [String(guildId), String(league.league_id), candidates]
+  ).catch(() => ({ rows: [{ count: 0 }] }));
   const cap = await pool.query(
     `SELECT * FROM madden_team_cap
      WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = ANY($3::text[])
@@ -29948,6 +29950,7 @@ async function buildMaddenTeamProfileEmbed(guildId, league, teamInput) {
     [String(league.league_id), ctx.teamName, ctx.rawTeamName]
   ).catch(() => ({ rows: [] }));
   const rows = players.rows || [];
+  const rosterCount = rosterCountResult.rows?.[0]?.count ?? rows.length;
   const capRow = cap.rows?.[0] || null;
   const avgOverall = rows.length ? rows.reduce((sum, p) => sum + Number(p.overall || 0), 0) / rows.length : 0;
   const topPlayers = rows.slice(0, 6).map((p, i) => `**${i + 1}. ${p.player_name}** — ${p.position || 'POS'} • ${p.overall || 'N/A'} OVR • ${formatMaddenMoney(p.cap_hit || 0)}`).join('\n') || 'No expanded player rows found yet.';
@@ -29958,10 +29961,10 @@ async function buildMaddenTeamProfileEmbed(guildId, league, teamInput) {
     .setTitle(`🏈 ${ctx.displayName || maddenTeamDisplayName(teamInput)} • Team Profile`)
     .setColor(0x57F287)
     .addFields(
-      { name: 'Roster Snapshot', value: [`Players: **${rows.length}**`, `Avg Top OVR: **${avgOverall.toFixed(1)}**`, `Avg Speed: **${speedAvg.toFixed(1)}**`].join('\n'), inline: true },
+      { name: 'Roster Snapshot', value: [`Roster Size: **${rosterCount}**`, `Avg OVR (Top 12): **${avgOverall.toFixed(1)}**`, `Avg Speed (Top 12): **${speedAvg.toFixed(1)}**`].join('\n'), inline: true },
       { name: 'Power Ranking', value: powerText, inline: true },
       { name: 'Salary Cap', value: capText, inline: true },
-      { name: 'Top Players', value: maddenSafeEmbedText(topPlayers, 1024), inline: false }
+      { name: 'Top 6 Players', value: maddenSafeEmbedText(topPlayers, 1024), inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-10BY-DE Team Profile' })
     .setTimestamp();
