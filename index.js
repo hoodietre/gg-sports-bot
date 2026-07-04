@@ -7130,46 +7130,48 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madpick:team:')) {
-      const [, , flow, leagueId] = interaction.customId.split(':');
-      const league = await getLeagueById(leagueId);
-      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const [, , flow, idOrToken] = interaction.customId.split(':');
+      const league = await resolveMaddenPickerLeague(flow, idOrToken);
+      if (!league) { await interaction.update({ content: 'League not found or session expired.', embeds: [], components: [] }); return; }
       const teamName = interaction.values[0];
       const excludeFreeAgents = flow === 'neg';
       const { rows, total } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset: 0, excludeFreeAgents });
+      const label = flow === 'compareA' ? 'Compare Players — Player A' : flow === 'compareB' ? 'Compare Players — Player B' : (flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player');
       await interaction.update({
-        content: `**${flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player'}** — team: **${teamName}**`,
+        content: `**${label}** — team: **${teamName}**`,
         embeds: [],
-        components: buildMaddenRosterPickerComponents(flow, leagueId, teamName, rows, 0, total),
+        components: buildMaddenRosterPickerComponents(flow, idOrToken, teamName, rows, 0, total),
       });
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('madpick:rosterpage:')) {
-      const [, , flow, leagueId, encTeam, offsetStr] = interaction.customId.split(':');
-      const league = await getLeagueById(leagueId);
-      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const [, , flow, idOrToken, encTeam, offsetStr] = interaction.customId.split(':');
+      const league = await resolveMaddenPickerLeague(flow, idOrToken);
+      if (!league) { await interaction.update({ content: 'League not found or session expired.', embeds: [], components: [] }); return; }
       const teamName = decodeURIComponent(encTeam || '');
       const offset = Math.max(0, Number(offsetStr || 0));
       const excludeFreeAgents = flow === 'neg';
       const { rows, total } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset, excludeFreeAgents });
+      const label = flow === 'compareA' ? 'Compare Players — Player A' : flow === 'compareB' ? 'Compare Players — Player B' : (flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player');
       await interaction.update({
-        content: `**${flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player'}** — team: **${teamName}**`,
+        content: `**${label}** — team: **${teamName}**`,
         embeds: [],
-        components: buildMaddenRosterPickerComponents(flow, leagueId, teamName, rows, offset, total),
+        components: buildMaddenRosterPickerComponents(flow, idOrToken, teamName, rows, offset, total),
       });
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('madpick:backteam:')) {
-      const [, , flow, leagueId] = interaction.customId.split(':');
-      await showMaddenTeamPicker(interaction, flow, leagueId, { update: true });
+      const [, , flow, idOrToken] = interaction.customId.split(':');
+      await showMaddenTeamPicker(interaction, flow, idOrToken, { update: true });
       return;
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madpick:player:')) {
-      const [, , flow, leagueId] = interaction.customId.split(':');
-      const league = await getLeagueById(leagueId);
-      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const [, , flow, idOrToken] = interaction.customId.split(':');
+      const league = await resolveMaddenPickerLeague(flow, idOrToken);
+      if (!league) { await interaction.update({ content: 'League not found or session expired.', embeds: [], components: [] }); return; }
       const playerName = interaction.values[0];
 
       if (flow === 'neg') {
@@ -7178,6 +7180,38 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
         const result = await createMaddenTradeNegotiationHub(interaction.guild.id, league, member, interaction.user.id, playerName);
         await interaction.editReply({ content: null, embeds: [result.embed], components: result.components || [] });
+        return;
+      }
+
+      if (flow === 'compareA') {
+        const session = maddenCompareSessions.get(idOrToken) || {};
+        session.leagueId = league.league_id;
+        session.playerA = playerName;
+        maddenCompareSessions.set(idOrToken, session);
+        await showMaddenTeamPicker(interaction, 'compareB', idOrToken, { update: true });
+        return;
+      }
+
+      if (flow === 'compareB') {
+        const session = maddenCompareSessions.get(idOrToken);
+        const playerAName = session?.playerA;
+        maddenCompareSessions.delete(idOrToken);
+        await interaction.update({ content: 'Comparing…', embeds: [], components: [] });
+        const [playerA, playerB] = await Promise.all([
+          findMaddenImportedPlayer(interaction.guild.id, league.league_id, playerAName, null),
+          findMaddenImportedPlayer(interaction.guild.id, league.league_id, playerName, null),
+        ]);
+        if (!playerA || !playerB) {
+          await interaction.editReply({ content: 'Could not load one of the players for comparison.', embeds: [], components: [] });
+          return;
+        }
+        const [statsA, statsB, ranksA, ranksB] = await Promise.all([
+          getMaddenPlayerSeasonStatSummary(interaction.guild.id, league.league_id, playerA),
+          getMaddenPlayerSeasonStatSummary(interaction.guild.id, league.league_id, playerB),
+          getMaddenPlayerLeagueRanks(interaction.guild.id, league.league_id, playerA),
+          getMaddenPlayerLeagueRanks(interaction.guild.id, league.league_id, playerB),
+        ]);
+        await interaction.editReply({ content: null, embeds: [buildMaddenPlayerCompareEmbed(league, playerA, playerB, statsA, statsB, ranksA, ranksB)], components: [] });
         return;
       }
 
@@ -7200,39 +7234,91 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('madcompare_start:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const token = randomBytes(6).toString('hex');
+      maddenCompareSessions.set(token, { leagueId, playerA: null });
+      await showMaddenTeamPicker(interaction, 'compareA', token, { update: false });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('madsearch_browse:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
       await interaction.deferReply({ ephemeral: true });
-      const result = await pool.query(
-        `SELECT p.*,
-                COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
-                COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name
-         FROM madden_players p
-         LEFT JOIN madden_imported_team_stats t
-           ON t.guild_id = p.guild_id::text
-          AND t.league_id::text = p.league_id::text
-          AND p.team_id IS NOT NULL
-          AND t.external_team_id::text = p.team_id
-         WHERE p.guild_id = $1 AND p.league_id = $2
-         ORDER BY p.overall DESC NULLS LAST, player_name ASC
-         LIMIT 50`,
-        [interaction.guild.id, league.league_id]
-      );
       const token = randomBytes(6).toString('hex');
-      maddenPlayerSearchSessions.set(token, {
-        rows: result.rows,
-        league,
-        filters: {},
-        mode: 'info',
+      maddenPlayerBrowseSessions.set(token, {
+        guildId: interaction.guild.id,
+        leagueId: league.league_id,
+        sort: 'overall',
+        position: null,
+        page: 0,
         userId: interaction.user.id,
         createdAt: Date.now(),
       });
+      await renderMaddenBrowsePage(interaction, token, { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madbrowse:page:')) {
+      const [, , token, pageStr] = interaction.customId.split(':');
+      const session = maddenPlayerBrowseSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This browse session expired. Click **Browse Players** again.', embeds: [], components: [] }); return; }
+      session.page = Math.max(0, Number(pageStr || 0));
+      await renderMaddenBrowsePage(interaction, token, { update: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madbrowse:sort:')) {
+      const token = interaction.customId.split(':')[2];
+      const session = maddenPlayerBrowseSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This browse session expired. Click **Browse Players** again.', embeds: [], components: [] }); return; }
+      session.sort = interaction.values[0];
+      session.page = 0;
+      await renderMaddenBrowsePage(interaction, token, { update: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madbrowse:pos:')) {
+      const token = interaction.customId.split(':')[2];
+      const session = maddenPlayerBrowseSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This browse session expired. Click **Browse Players** again.', embeds: [], components: [] }); return; }
+      const value = interaction.values[0];
+      session.position = value === 'ALL' ? null : value;
+      session.page = 0;
+      await renderMaddenBrowsePage(interaction, token, { update: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madbrowse:view:')) {
+      const token = interaction.customId.split(':')[2];
+      const session = maddenPlayerBrowseSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This browse session expired. Click **Browse Players** again.', embeds: [], components: [] }); return; }
+      const league = await getLeagueById(session.leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const playerName = interaction.values[0];
+      await interaction.update({ content: 'Looking up player…', embeds: [], components: [] });
+      let player = await findMaddenImportedPlayer(interaction.guild.id, league.league_id, playerName, null)
+        || await findMaddenPlayerFromWeeklyStats(interaction.guild.id, league.league_id, playerName, null);
+      if (!player) {
+        await interaction.editReply({ content: `No player found for "${String(playerName || '').slice(0, 80)}".`, embeds: [], components: [] });
+        return;
+      }
+      const statRows = await getMaddenPlayerSeasonStatSummary(interaction.guild.id, league.league_id, player);
+      const ranks = await getMaddenPlayerLeagueRanks(interaction.guild.id, league.league_id, player);
+      const valueRankContext = await getMaddenPlayerValueRankContext(interaction.guild.id, league.league_id, player);
       await interaction.editReply({
-        embeds: [buildMaddenImportedPlayersEmbed(league, result.rows, {})],
-        components: buildMaddenPlayerSearchComponents(token, 'info'),
+        content: null,
+        embeds: [buildMaddenPlayerProfileEmbed(league, player, statRows, ranks, valueRankContext)],
+        components: buildMaddenBrowseProfileActionRow(token, league.league_id, player.player_name || playerName),
       });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madbrowse:backlist:')) {
+      const token = interaction.customId.split(':')[2];
+      await renderMaddenBrowsePage(interaction, token, { update: true });
       return;
     }
 
@@ -20807,6 +20893,7 @@ function buildMaddenPlayerSearchPanelComponents(leagueId) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('madsearch_player:' + leagueId).setLabel('Search Player').setEmoji('🔍').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('madsearch_browse:' + leagueId).setLabel('Browse Players').setEmoji('📋').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('madcompare_start:' + leagueId).setLabel('Compare Players').setEmoji('⚖️').setStyle(ButtonStyle.Secondary),
   )];
 }
 
@@ -20900,19 +20987,185 @@ function buildMaddenRosterPickerComponents(flow, leagueId, teamName, rows, offse
   return components;
 }
 
-async function showMaddenTeamPicker(interaction, flow, leagueId, { update = false } = {}) {
-  const league = await getLeagueById(leagueId);
+async function showMaddenTeamPicker(interaction, flow, idOrToken, { update = false } = {}) {
+  const league = await resolveMaddenPickerLeague(flow, idOrToken);
   if (!league) {
     const payload = { content: 'League not found.', embeds: [], components: [] };
     return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
   }
   const excludeFreeAgents = flow === 'neg';
   const teams = await getMaddenLeagueTeamNames(interaction.guild.id, league.league_id, { excludeFreeAgents });
+  const label = flow === 'compareA' ? 'Compare Players — Player A'
+    : flow === 'compareB' ? 'Compare Players — Player B'
+    : flow === 'neg' ? 'Start a Trade Negotiation'
+    : 'Search for a Player';
   const content = teams.length
-    ? `**${flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player'}** — pick a team, then pick a player. No typing needed.`
+    ? `**${label}** — pick a team, then pick a player. No typing needed.`
     : 'No team rosters found yet. Run `/madden sync` first.';
-  const payload = { content, embeds: [], components: teams.length ? buildMaddenTeamPickerComponents(flow, leagueId, teams) : [] };
+  const payload = { content, embeds: [], components: teams.length ? buildMaddenTeamPickerComponents(flow, idOrToken, teams) : [] };
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+// ---------------------------------------------------------------------------
+// Compare Players — reuses the Team -> Player picker twice, no new UI pattern
+// ---------------------------------------------------------------------------
+const maddenCompareSessions = new Map();
+
+async function resolveMaddenPickerLeague(flow, idOrToken) {
+  if (flow === 'compareA' || flow === 'compareB') {
+    const session = maddenCompareSessions.get(idOrToken);
+    if (!session) return null;
+    return getLeagueById(session.leagueId);
+  }
+  return getLeagueById(idOrToken);
+}
+
+// ---------------------------------------------------------------------------
+// Browse Players — full pagination/sort/position filter/click-to-view, same
+// mechanics as the Trade Block Board rather than a second bespoke pattern.
+// ---------------------------------------------------------------------------
+const maddenPlayerBrowseSessions = new Map();
+const MADDEN_BROWSE_PAGE_SIZE = 10;
+const MADDEN_BROWSE_SORTS = [
+  { value: 'overall', label: 'Sort: Overall', column: 'p.overall DESC NULLS LAST, player_name ASC' },
+  { value: 'name', label: 'Sort: Name (A-Z)', column: 'player_name ASC' },
+  { value: 'position', label: 'Sort: Position', column: 'p.position ASC NULLS LAST, p.overall DESC NULLS LAST' },
+  { value: 'age', label: 'Sort: Age', column: 'p.age ASC NULLS LAST, p.overall DESC NULLS LAST' },
+  { value: 'team', label: 'Sort: Team', column: 'resolved_team_name ASC NULLS LAST, p.overall DESC NULLS LAST' },
+];
+
+async function getMaddenBrowsePlayers(guildId, leagueId, { position = null, sort = 'overall' } = {}) {
+  const sortCol = (MADDEN_BROWSE_SORTS.find(s => s.value === sort) || MADDEN_BROWSE_SORTS[0]).column;
+  const result = await pool.query(
+    `SELECT p.*,
+            COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
+            COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name
+     FROM madden_players p
+     LEFT JOIN madden_imported_team_stats t
+       ON t.guild_id = p.guild_id::text AND t.league_id::text = p.league_id::text AND p.team_id IS NOT NULL AND t.external_team_id::text = p.team_id
+     WHERE p.guild_id = $1 AND p.league_id = $2
+     ORDER BY ${sortCol}`,
+    [String(guildId), String(leagueId)]
+  );
+  const rows = result.rows || [];
+  const wantedPosition = normalizeMaddenFreeAgentFilter(position);
+  if (!wantedPosition) return rows;
+  return rows.filter(row => maddenFreeAgentPositionMatches(row, wantedPosition));
+}
+
+function buildMaddenBrowseEmbed(league, allRows, { page = 0, sort = 'overall', position = null } = {}) {
+  const pageSize = MADDEN_BROWSE_PAGE_SIZE;
+  const totalPages = Math.max(1, Math.ceil(allRows.length / pageSize));
+  const safePage = Math.min(Math.max(page, 0), totalPages - 1);
+  const pageRows = allRows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  const sortLabel = (MADDEN_BROWSE_SORTS.find(s => s.value === sort) || MADDEN_BROWSE_SORTS[0]).label.replace('Sort: ', '');
+  const positionText = position ? ` • ${normalizeMaddenFreeAgentFilter(position)}` : '';
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 ${league.league_name} • Browse Players${positionText}`)
+    .setColor(0x5865F2)
+    .setFooter({ text: `GG Sports • Page ${safePage + 1}/${totalPages} • Sorted by ${sortLabel} • ${allRows.length} total` })
+    .setTimestamp();
+
+  if (!allRows.length) {
+    embed.setDescription('No players found. Run `/madden sync` first.');
+    return embed;
+  }
+
+  embed.setDescription(maddenSafeEmbedText(pageRows.map((r, i) => {
+    const idx = safePage * pageSize + i + 1;
+    const team = maddenTeamDisplayName(r.resolved_team_name || r.team_name || 'Free Agent');
+    return `**${idx}. ${r.player_name}** — ${team} • ${r.position || 'POS'} • ${r.overall || 'N/A'} OVR${r.age ? ' • Age ' + r.age : ''}`;
+  }).join('\n'), 4096));
+
+  return embed;
+}
+
+function buildMaddenBrowseComponents(token, page, totalPages, sort, position, pageRows) {
+  const posValue = position || 'ALL';
+
+  const navRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`madbrowse:page:${token}:${Math.max(0, page - 1)}:prev`)
+      .setLabel(`Previous (${page + 1}/${Math.max(1, totalPages)})`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`madbrowse:page:${token}:${Math.min(totalPages - 1, page + 1)}:next`)
+      .setLabel(`Next (${page + 1}/${Math.max(1, totalPages)})`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(page >= totalPages - 1),
+  );
+
+  const sortMenu = new StringSelectMenuBuilder()
+    .setCustomId(`madbrowse:sort:${token}`)
+    .setPlaceholder('Sort by...')
+    .addOptions(MADDEN_BROWSE_SORTS.map(s => ({ label: s.label, value: s.value, default: s.value === sort })));
+
+  const posOptions = ['ALL', 'QB', 'HB', 'WR', 'TE', 'OL', 'DL', 'LB', 'DB'].map(p => ({
+    label: p === 'ALL' ? 'All Positions' : p,
+    value: p,
+    default: posValue === p,
+  }));
+  const posMenu = new StringSelectMenuBuilder()
+    .setCustomId(`madbrowse:pos:${token}`)
+    .setPlaceholder('Filter position...')
+    .addOptions(posOptions);
+
+  const rows = [
+    navRow,
+    new ActionRowBuilder().addComponents(sortMenu),
+    new ActionRowBuilder().addComponents(posMenu),
+  ];
+
+  if (pageRows.length) {
+    const playerMenu = new StringSelectMenuBuilder()
+      .setCustomId(`madbrowse:view:${token}`)
+      .setPlaceholder("View a player's full profile...")
+      .addOptions(pageRows.slice(0, 25).map(r => ({
+        label: String(r.player_name || 'Unknown').slice(0, 100),
+        value: String(r.player_name || 'unknown').slice(0, 100),
+        description: `${r.position || 'POS'} • ${r.overall || 'N/A'} OVR`.slice(0, 100),
+      })));
+    rows.push(new ActionRowBuilder().addComponents(playerMenu));
+  }
+
+  return rows;
+}
+
+function buildMaddenBrowseProfileActionRow(token, leagueId, playerName) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`madbrowse:backlist:${token}`).setLabel('⬅ Back to List').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('madneg_from_profile:' + leagueId + ':' + encodeURIComponent(String(playerName || '').slice(0, 80)))
+      .setLabel('Start Negotiation')
+      .setEmoji('🤝')
+      .setStyle(ButtonStyle.Primary),
+  )];
+}
+
+async function renderMaddenBrowsePage(interaction, token, { update = true } = {}) {
+  const session = maddenPlayerBrowseSessions.get(token);
+  if (!session) {
+    const payload = { content: 'This browse session expired. Click **Browse Players** again.', embeds: [], components: [] };
+    return update ? interaction.update(payload) : interaction.editReply(payload);
+  }
+  const league = await getLeagueById(session.leagueId);
+  if (!league) {
+    const payload = { content: 'League not found.', embeds: [], components: [] };
+    return update ? interaction.update(payload) : interaction.editReply(payload);
+  }
+  const allRows = await getMaddenBrowsePlayers(session.guildId, session.leagueId, { position: session.position, sort: session.sort });
+  const pageSize = MADDEN_BROWSE_PAGE_SIZE;
+  const totalPages = Math.max(1, Math.ceil(allRows.length / pageSize));
+  session.page = Math.min(Math.max(session.page, 0), totalPages - 1);
+  const pageRows = allRows.slice(session.page * pageSize, session.page * pageSize + pageSize);
+  const payload = {
+    content: null,
+    embeds: [buildMaddenBrowseEmbed(league, allRows, { page: session.page, sort: session.sort, position: session.position })],
+    components: buildMaddenBrowseComponents(token, session.page, totalPages, session.sort, session.position, pageRows),
+  };
+  return update ? interaction.update(payload) : interaction.editReply(payload);
 }
 
 function buildMaddenImportedPlayersEmbed(league, rows, filters = {}) {
