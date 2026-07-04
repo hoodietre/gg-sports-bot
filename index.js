@@ -24328,6 +24328,7 @@ async function showMaddenGmPanelCategory(interaction, leagueId, teamName, catego
 }
 
 
+function maddenTradeFinderPlayerKey(player) {
   return String(player?.roster_id || player?.external_player_id || player?.id || maddenPlayerDisplayName(player)).toLowerCase();
 }
 
