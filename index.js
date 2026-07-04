@@ -601,6 +601,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_free_agents_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_negotiation_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS player_search_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS gm_panel_channel_id TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_free_agent_panels (
       guild_id TEXT NOT NULL,
@@ -2238,6 +2239,11 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('panel').setDescription('Open the commissioner control panel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
+      .setName('gm')
+      .setDescription('Team GM dashboard')
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open your GM panel').addStringOption(o => o.setName('team').setDescription('Team name (defaults to your owned team)').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+
+    new SlashCommandBuilder()
       .setName('leagueannounce')
       .setDescription('Staff: post a professional league announcement embed')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
@@ -3133,7 +3139,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -3148,7 +3154,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -3162,7 +3168,7 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
@@ -3181,7 +3187,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -7242,6 +7248,144 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('gmpanel_open:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      const team = await getMaddenTeamOwnedByUser(interaction.guild.id, league.league_id, interaction.user.id);
+      if (!team) {
+        await interaction.reply({ content: "You don't own a team in this league yet. Ask your commissioner to assign you one, or use `/gm panel team:` to view a specific team.", ephemeral: true });
+        return;
+      }
+      await showMaddenGmPanelHome(interaction, leagueId, team.team_name, { update: false });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gmpanel_category:')) {
+      const [, leagueId, encTeam] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      const category = interaction.values[0];
+      await showMaddenGmPanelCategory(interaction, leagueId, teamName, category, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gmpanel_back:')) {
+      const [, leagueId, encTeam] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      await showMaddenGmPanelHome(interaction, leagueId, teamName, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gmpanel_addblock:')) {
+      const [, leagueId, encTeam] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const teamRow = await pool.query(
+        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) LIMIT 1`,
+        [String(interaction.guild.id), String(league.league_id), teamName]
+      ).then(r => r.rows?.[0]).catch(() => null);
+      const isOwner = teamRow?.owner_user_id === interaction.user.id;
+      if (!isOwner && !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only the team owner or league staff can manage this trade block.', ephemeral: true });
+        return;
+      }
+      const { rows } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset: 0, limit: 25, excludeFreeAgents: true });
+      if (!rows.length) {
+        await interaction.update({ content: 'No roster data found for this team yet.', embeds: [], components: [buildMaddenGmPanelBackRow(leagueId, teamName)] });
+        return;
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`gmpanel_addblock_select:${leagueId}:${encTeam}`)
+        .setPlaceholder('Choose a player to add to the block')
+        .addOptions(rows.map(r => ({
+          label: String(r.player_name || 'Unknown').slice(0, 100),
+          value: String(r.player_name || 'unknown').slice(0, 100),
+          description: `${r.position || 'POS'} • ${r.overall || 'N/A'} OVR`.slice(0, 100),
+        })));
+      await interaction.update({
+        content: `**Add to Trade Block** — ${teamName}`,
+        embeds: [],
+        components: [new ActionRowBuilder().addComponents(menu), buildMaddenGmPanelBackRow(leagueId, teamName)],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gmpanel_addblock_select:')) {
+      const [, leagueId, encTeam] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const playerName = interaction.values[0];
+      await interaction.update({ content: 'Adding to trade block…', embeds: [], components: [] });
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      await addMaddenTradeBlockEntry(interaction.guild.id, league, member, interaction.user.id, playerName, '', '').catch(() => null);
+      await refreshMaddenTradeBlockBoardForLeague(interaction.guild, league).catch(() => null);
+      const blockPayload = await buildMaddenGmBlockCategoryPayload(interaction, league, teamName);
+      await interaction.editReply({ content: `Added **${playerName}** to the trade block.`, ...blockPayload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gmpanel_removeblock:')) {
+      const [, leagueId, encTeam] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const teamRow = await pool.query(
+        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) LIMIT 1`,
+        [String(interaction.guild.id), String(league.league_id), teamName]
+      ).then(r => r.rows?.[0]).catch(() => null);
+      const isOwner = teamRow?.owner_user_id === interaction.user.id;
+      if (!isOwner && !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only the team owner or league staff can manage this trade block.', ephemeral: true });
+        return;
+      }
+      const listings = await pool.query(
+        `SELECT * FROM madden_trade_block_entries WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) AND is_active = TRUE ORDER BY player_name ASC LIMIT 25`,
+        [String(interaction.guild.id), String(league.league_id), teamName]
+      ).then(r => r.rows).catch(() => []);
+      if (!listings.length) {
+        await interaction.update({ content: 'This team has nothing on the trade block right now.', embeds: [], components: [buildMaddenGmPanelBackRow(leagueId, teamName)] });
+        return;
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`gmpanel_removeblock_select:${leagueId}:${encTeam}`)
+        .setPlaceholder('Choose a player to remove from the block')
+        .addOptions(listings.map(r => ({
+          label: String(r.player_name || 'Unknown').slice(0, 100),
+          value: String(r.player_name || 'unknown').slice(0, 100),
+          description: `${r.position || 'POS'} • ${r.overall || 'N/A'} OVR`.slice(0, 100),
+        })));
+      await interaction.update({
+        content: `**Remove from Trade Block** — ${teamName}`,
+        embeds: [],
+        components: [new ActionRowBuilder().addComponents(menu), buildMaddenGmPanelBackRow(leagueId, teamName)],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gmpanel_removeblock_select:')) {
+      const [, leagueId, encTeam] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const playerName = interaction.values[0];
+      await interaction.update({ content: 'Removing from trade block…', embeds: [], components: [] });
+      const removed = await removeMaddenTradeBlockEntry(interaction.guild.id, league, interaction.user.id, playerName).catch(() => null);
+      if (!removed && (await userCanUseLeagueSetup(interaction, league))) {
+        // Staff override: original submitter may differ from the staff member acting on the team's behalf.
+        await pool.query(
+          `UPDATE madden_trade_block_entries SET is_active = FALSE, updated_at = NOW()
+           WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) AND LOWER(player_name) = LOWER($4) AND is_active = TRUE`,
+          [String(interaction.guild.id), String(league.league_id), teamName, playerName]
+        ).catch(() => null);
+      }
+      await refreshMaddenTradeBlockBoardForLeague(interaction.guild, league).catch(() => null);
+      const blockPayload = await buildMaddenGmBlockCategoryPayload(interaction, league, teamName);
+      await interaction.editReply({ content: `Removed **${playerName}** from the trade block.`, ...blockPayload });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('madsearch_browse:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -11051,6 +11195,35 @@ if (interaction.commandName === 'commissioner') {
           components: buildCommissionerHomeComponents(activeLeague.league_id),
           ephemeral: true,
         });
+        return;
+      }
+    }
+
+    if (interaction.commandName === 'gm') {
+      if (!interaction.guild) return;
+      const gmSubcommand = interaction.options.getSubcommand();
+
+      if (gmSubcommand === 'panel') {
+        const leagueName = interaction.options.getString('league');
+        const teamOption = interaction.options.getString('team');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+
+        if (!activeLeague) {
+          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          return;
+        }
+
+        let teamName = teamOption;
+        if (!teamName) {
+          const owned = await getMaddenTeamOwnedByUser(interaction.guild.id, activeLeague.league_id, interaction.user.id);
+          if (!owned) {
+            await interaction.reply({ content: "You don't own a team in this league yet. Specify one with `/gm panel team:`, or ask your commissioner to assign you a team.", ephemeral: true });
+            return;
+          }
+          teamName = owned.team_name;
+        }
+
+        await showMaddenGmPanelHome(interaction, activeLeague.league_id, teamName, { update: false });
         return;
       }
     }
@@ -19085,6 +19258,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'trade_block_channel', label: 'Trade Block Channel', description: 'Live, sortable trade block board', kind: 'channel' },
   { value: 'trade_negotiation_channel', label: 'Trade Negotiation Channel', description: 'Panel to start a trade negotiation for a player', kind: 'channel' },
   { value: 'player_search_channel', label: 'Player Search Channel', description: 'Panel to search/browse all players', kind: 'channel' },
+  { value: 'gm_panel_channel', label: 'GM Panel Channel', description: 'Panel for team owners to open their GM dashboard', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
@@ -19111,6 +19285,7 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'trade_block_board_panel', label: 'Post/Refresh Trade Block Board' },
   { value: 'trade_negotiation_starter_panel', label: 'Post/Refresh Trade Negotiation Starter' },
   { value: 'player_search_panel', label: 'Post/Refresh Player Search Panel' },
+  { value: 'gm_panel_starter_panel', label: 'Post/Refresh GM Panel Starter' },
   { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
   { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
@@ -19130,6 +19305,7 @@ function setupDashboardColumn(settingKey) {
     trade_block_channel: 'trade_block_channel_id',
     trade_negotiation_channel: 'trade_negotiation_channel_id',
     player_search_channel: 'player_search_channel_id',
+    gm_panel_channel: 'gm_panel_channel_id',
     game_thread_channel: 'game_threads_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
@@ -19177,6 +19353,7 @@ function buildSetupDashboardEmbed(league) {
     'Trade Block Board: ' + setupDashboardFormatValue(league, 'trade_block_channel'),
     'Trade Negotiation Starter: ' + setupDashboardFormatValue(league, 'trade_negotiation_channel'),
     'Player Search: ' + setupDashboardFormatValue(league, 'player_search_channel'),
+    'GM Panel: ' + setupDashboardFormatValue(league, 'gm_panel_channel'),
     'Game Threads: ' + setupDashboardFormatValue(league, 'game_thread_channel'),
     'Madden News: ' + setupDashboardFormatValue(league, 'madden_news_channel'),
     'Madden Standings Board: ' + setupDashboardFormatValue(league, 'madden_standings_channel'),
@@ -19383,6 +19560,18 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     });
     await savePanel(league, 'player_search', channel.id, message.id);
     return 'Player search panel posted/refreshed in ' + channel.toString() + '.';
+  }
+
+  if (panelType === 'gm_panel_starter_panel') {
+    const configuredChannelId = league.gm_panel_channel_id;
+    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'GM panel channel');
+    if (error) return error + ' Set **GM Panel Channel** from this setup dashboard first.';
+    const message = await channel.send({
+      embeds: [buildMaddenGmPanelStarterEmbed(league)],
+      components: buildMaddenGmPanelStarterComponents(league.league_id),
+    });
+    await savePanel(league, 'gm_panel_starter', channel.id, message.id);
+    return 'GM Panel starter posted/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'shop_panel') {
@@ -23956,7 +24145,189 @@ async function buildMaddenTradeGmAssistantEmbed(guildId, league, teamName) {
     .setTimestamp();
 }
 
-function maddenTradeFinderPlayerKey(player) {
+// ---------------------------------------------------------------------------
+// GM Panel — single per-team dashboard consolidating existing team-management
+// features (roster, stats, needs, trade suggestions, trade block, transactions)
+// plus one new piece: suggested free agent signings.
+// ---------------------------------------------------------------------------
+async function getMaddenTeamOwnedByUser(guildId, leagueId, userId) {
+  const result = await pool.query(
+    `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND owner_user_id = $3 LIMIT 1`,
+    [String(guildId), String(leagueId), String(userId)]
+  ).catch(() => ({ rows: [] }));
+  return result.rows?.[0] || null;
+}
+
+async function buildMaddenSuggestedSigningsEmbed(guildId, league, teamName) {
+  const model = await buildMaddenTeamNeedsModel(guildId, league.league_id, teamName);
+  const wanted = maddenTradeNormalizeTeamKey(teamName);
+  const teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🆓 Suggested Free Agent Signings • ${maddenTeamDisplayName(teamName)}`)
+    .setColor(0x57F287)
+    .setFooter({ text: 'GG Sports • GM Panel' })
+    .setTimestamp();
+
+  if (!teamNeed) {
+    embed.setDescription(`Could not find **${String(teamName || '').slice(0, 80)}** in ${league?.league_name || 'this league'}.`);
+    return embed;
+  }
+
+  const topNeeds = (teamNeed.weaknesses || []).filter(row => row.position !== 'K/P').slice(0, 3);
+  if (!topNeeds.length) {
+    embed.setDescription('No pressing needs detected — roster looks solid enough that free agency is optional right now.');
+    return embed;
+  }
+
+  embed.setDescription(`Based on your top needs, here's who's available in free agency right now.`);
+  for (const need of topNeeds) {
+    const rank = (teamNeed.weaknesses || []).indexOf(need) + 1;
+    const fas = await getMaddenFreeAgentRows(guildId, league.league_id, { position: need.position, limit: 5 }).catch(() => []);
+    const lines = fas.slice(0, 5).map((p, i) => `${i + 1}. **${maddenPlayerDisplayName(p)}** — ${p.overall || 'N/A'} OVR${p.age ? ' • Age ' + p.age : ''}`);
+    embed.addFields({
+      name: `${need.position} (Need #${rank})`,
+      value: lines.length ? lines.join('\n') : 'No free agents currently available at this position.',
+      inline: false,
+    });
+  }
+  return embed;
+}
+
+const GM_PANEL_CATEGORIES = [
+  { value: 'roster', label: 'Roster', description: 'Full team roster', emoji: '📋' },
+  { value: 'stats', label: 'Team Stats & Rankings', description: 'Record, power ranking, cap, top players', emoji: '📊' },
+  { value: 'needs', label: 'Needs & Strengths', description: 'Positional needs and roster strengths', emoji: '🎯' },
+  { value: 'assistant', label: 'GM Assistant', description: 'Suggested trade targets and packages', emoji: '🧠' },
+  { value: 'block', label: 'Trade Block', description: 'Add or remove players from your block', emoji: '🔀' },
+  { value: 'transactions', label: 'Transactions', description: "Your team's recent moves", emoji: '🔄' },
+  { value: 'signings', label: 'Suggested Signings', description: 'Free agents that fill your needs', emoji: '🆓' },
+];
+
+function buildMaddenGmPanelStarterEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle(`🏈 ${league.league_name} • GM Panel`)
+    .setColor(0x5865F2)
+    .setDescription("Click below to open your team's GM Panel — roster, stats, needs, trade suggestions, trade block, transactions, and free agent targets all in one place.")
+    .setFooter({ text: 'GG Sports • GM Panel' })
+    .setTimestamp();
+}
+
+function buildMaddenGmPanelStarterComponents(leagueId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gmpanel_open:' + leagueId).setLabel('Open My GM Panel').setEmoji('🏈').setStyle(ButtonStyle.Primary)
+  )];
+}
+
+function buildMaddenGmPanelHomeComponents(leagueId, teamName) {
+  const encTeam = encodeURIComponent(teamName).slice(0, 80);
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`gmpanel_category:${leagueId}:${encTeam}`)
+    .setPlaceholder('Choose a section')
+    .addOptions(GM_PANEL_CATEGORIES.map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+function buildMaddenGmPanelBackRow(leagueId, teamName) {
+  const encTeam = encodeURIComponent(teamName).slice(0, 80);
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gmpanel_back:${leagueId}:${encTeam}`).setLabel('⬅ Back to Overview').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function buildMaddenGmPanelHomeEmbed(guildId, league, teamName) {
+  const teamRow = await pool.query(
+    `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) LIMIT 1`,
+    [String(guildId), String(league.league_id), teamName]
+  ).then(r => r.rows?.[0]).catch(() => null);
+  const model = await buildMaddenTeamNeedsModel(guildId, league.league_id, teamName).catch(() => new Map());
+  const wanted = maddenTradeNormalizeTeamKey(teamName);
+  const teamNeed = model.get(wanted) || Array.from(model.values()).find(item => String(item.teamName || '').toLowerCase().includes(String(teamName || '').toLowerCase()));
+  const topNeed = teamNeed?.weaknesses?.[0];
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏈 ${maddenTeamDisplayName(teamName)} • GM Panel`)
+    .setColor(0x5865F2)
+    .setDescription(league.league_name)
+    .addFields(
+      { name: 'Record', value: teamRow ? `${teamRow.wins || 0}-${teamRow.losses || 0}${teamRow.ties ? '-' + teamRow.ties : ''} • PF ${teamRow.points_for || 0} • PA ${teamRow.points_against || 0}` : 'No record yet', inline: true },
+      { name: 'Avg Overall', value: teamNeed ? Number(teamNeed.teamAvgOverall || 0).toFixed(1) : 'N/A', inline: true },
+      { name: 'Top Need', value: topNeed ? `${topNeed.position} — Need ${Math.round(Number(topNeed.needScore || 0))}` : 'None detected', inline: true },
+    )
+    .setFooter({ text: 'GG Sports • GM Panel • Pick a section below' })
+    .setTimestamp();
+  const logo = getMaddenTeamLogoUrl(teamName);
+  if (logo) embed.setThumbnail(logo);
+  return embed;
+}
+
+async function showMaddenGmPanelHome(interaction, leagueId, teamName, { update = true } = {}) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    const payload = { content: 'League not found.', embeds: [], components: [] };
+    return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+  }
+  const embed = await buildMaddenGmPanelHomeEmbed(interaction.guild.id, league, teamName);
+  const payload = { content: null, embeds: [embed], components: buildMaddenGmPanelHomeComponents(leagueId, teamName) };
+  return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+async function buildMaddenGmBlockCategoryPayload(interaction, league, teamName) {
+  const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  const embed = await buildMaddenTradeBlockTeamEmbed(interaction.guild.id, league, member, teamName);
+  const encTeam = encodeURIComponent(teamName).slice(0, 80);
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gmpanel_addblock:${league.league_id}:${encTeam}`).setLabel('Add to Block').setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`gmpanel_removeblock:${league.league_id}:${encTeam}`).setLabel('Remove from Block').setEmoji('➖').setStyle(ButtonStyle.Danger),
+  );
+  return { embeds: [embed], components: [actionRow, buildMaddenGmPanelBackRow(league.league_id, teamName)] };
+}
+
+async function showMaddenGmPanelCategory(interaction, leagueId, teamName, category, { update = true } = {}) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    const payload = { content: 'League not found.', embeds: [], components: [] };
+    return update ? interaction.update(payload) : interaction.editReply(payload);
+  }
+  const backRow = [buildMaddenGmPanelBackRow(leagueId, teamName)];
+  let payload;
+
+  if (category === 'roster') {
+    const rosterResult = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset: 0, limit: 100 });
+    payload = { content: null, embeds: [buildMaddenRosterEmbed(league, teamName, rosterResult.rows, {})], components: backRow };
+  } else if (category === 'stats') {
+    const embed = await buildMaddenTeamProfileEmbed(interaction.guild.id, league, teamName);
+    const teamRow = await pool.query(
+      `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) LIMIT 1`,
+      [String(interaction.guild.id), String(league.league_id), teamName]
+    ).then(r => r.rows?.[0]).catch(() => null);
+    if (teamRow) {
+      embed.addFields({ name: 'Record', value: `${teamRow.wins || 0}-${teamRow.losses || 0}${teamRow.ties ? '-' + teamRow.ties : ''} • PF ${teamRow.points_for || 0} • PA ${teamRow.points_against || 0}`, inline: true });
+    }
+    payload = { content: null, embeds: [embed], components: backRow };
+  } else if (category === 'needs') {
+    const embed = await buildMaddenTradeNeedsEmbed(interaction.guild.id, league, teamName);
+    payload = { content: null, embeds: [embed], components: backRow };
+  } else if (category === 'assistant') {
+    const embed = await buildMaddenTradeGmAssistantEmbed(interaction.guild.id, league, teamName);
+    payload = { content: null, embeds: [embed], components: backRow };
+  } else if (category === 'block') {
+    const blockPayload = await buildMaddenGmBlockCategoryPayload(interaction, league, teamName);
+    payload = { content: null, ...blockPayload };
+  } else if (category === 'transactions') {
+    const embed = await buildMaddenTransactionsRecentEmbed(interaction.guild.id, league, { team: teamName, limit: 15 });
+    payload = { content: null, embeds: [embed], components: backRow };
+  } else if (category === 'signings') {
+    const embed = await buildMaddenSuggestedSigningsEmbed(interaction.guild.id, league, teamName);
+    payload = { content: null, embeds: [embed], components: backRow };
+  } else {
+    payload = { content: 'Unknown section.', embeds: [], components: backRow };
+  }
+
+  return update ? interaction.update(payload) : interaction.editReply(payload);
+}
+
+
   return String(player?.roster_id || player?.external_player_id || player?.id || maddenPlayerDisplayName(player)).toLowerCase();
 }
 
