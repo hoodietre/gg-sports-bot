@@ -7119,79 +7119,81 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.isButton() && interaction.customId.startsWith('madneg_start:')) {
       const leagueId = interaction.customId.split(':')[1];
-      const modal = new ModalBuilder()
-        .setCustomId('madneg_start_modal:' + leagueId)
-        .setTitle('Start a Trade Negotiation')
-        .addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('madneg_player_name')
-              .setLabel('Player name')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. Justin Jefferson')
-              .setRequired(true)
-          )
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('madneg_start_modal:')) {
-      const leagueId = interaction.customId.split(':')[1];
-      const league = await getLeagueById(leagueId);
-      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
-      await interaction.deferReply({ ephemeral: true });
-      await ensureMaddenPlayerPersistenceTables().catch(() => null);
-      const playerName = interaction.fields.getTextInputValue('madneg_player_name');
-      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      const result = await createMaddenTradeNegotiationHub(interaction.guild.id, league, member, interaction.user.id, playerName);
-      await interaction.editReply({ embeds: [result.embed], components: result.components || [] });
+      await showMaddenTeamPicker(interaction, 'neg', leagueId, { update: false });
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('madsearch_player:')) {
       const leagueId = interaction.customId.split(':')[1];
-      const modal = new ModalBuilder()
-        .setCustomId('madsearch_player_modal:' + leagueId)
-        .setTitle('Search for a Player')
-        .addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('madsearch_name')
-              .setLabel('Player name')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. Patrick Mahomes')
-              .setRequired(true)
-          ),
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('madsearch_team')
-              .setLabel('Team (optional, helps disambiguate)')
-              .setStyle(TextInputStyle.Short)
-              .setRequired(false)
-          )
-        );
-      await interaction.showModal(modal);
+      await showMaddenTeamPicker(interaction, 'search', leagueId, { update: false });
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('madsearch_player_modal:')) {
-      const leagueId = interaction.customId.split(':')[1];
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madpick:team:')) {
+      const [, , flow, leagueId] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
-      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
-      await interaction.deferReply({ ephemeral: true });
-      const playerName = interaction.fields.getTextInputValue('madsearch_name');
-      const teamFilter = interaction.fields.getTextInputValue('madsearch_team') || null;
-      let player = await findMaddenImportedPlayer(interaction.guild.id, league.league_id, playerName, teamFilter)
-        || await findMaddenPlayerFromWeeklyStats(interaction.guild.id, league.league_id, playerName, teamFilter);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const teamName = interaction.values[0];
+      const excludeFreeAgents = flow === 'neg';
+      const { rows, total } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset: 0, excludeFreeAgents });
+      await interaction.update({
+        content: `**${flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player'}** — team: **${teamName}**`,
+        embeds: [],
+        components: buildMaddenRosterPickerComponents(flow, leagueId, teamName, rows, 0, total),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madpick:rosterpage:')) {
+      const [, , flow, leagueId, encTeam, offsetStr] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const teamName = decodeURIComponent(encTeam || '');
+      const offset = Math.max(0, Number(offsetStr || 0));
+      const excludeFreeAgents = flow === 'neg';
+      const { rows, total } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset, excludeFreeAgents });
+      await interaction.update({
+        content: `**${flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player'}** — team: **${teamName}**`,
+        embeds: [],
+        components: buildMaddenRosterPickerComponents(flow, leagueId, teamName, rows, offset, total),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madpick:backteam:')) {
+      const [, , flow, leagueId] = interaction.customId.split(':');
+      await showMaddenTeamPicker(interaction, flow, leagueId, { update: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madpick:player:')) {
+      const [, , flow, leagueId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const playerName = interaction.values[0];
+
+      if (flow === 'neg') {
+        await interaction.update({ content: 'Starting negotiation…', embeds: [], components: [] });
+        await ensureMaddenPlayerPersistenceTables().catch(() => null);
+        const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const result = await createMaddenTradeNegotiationHub(interaction.guild.id, league, member, interaction.user.id, playerName);
+        await interaction.editReply({ content: null, embeds: [result.embed], components: result.components || [] });
+        return;
+      }
+
+      // flow === 'search'
+      await interaction.update({ content: 'Looking up player…', embeds: [], components: [] });
+      let player = await findMaddenImportedPlayer(interaction.guild.id, league.league_id, playerName, null)
+        || await findMaddenPlayerFromWeeklyStats(interaction.guild.id, league.league_id, playerName, null);
       if (!player) {
-        await interaction.editReply({ content: `No player found for "${String(playerName || '').slice(0, 80)}". Try a last name, or check spelling.` });
+        await interaction.editReply({ content: `No player found for "${String(playerName || '').slice(0, 80)}".`, embeds: [], components: [] });
         return;
       }
       const statRows = await getMaddenPlayerSeasonStatSummary(interaction.guild.id, league.league_id, player);
       const ranks = await getMaddenPlayerLeagueRanks(interaction.guild.id, league.league_id, player);
       const valueRankContext = await getMaddenPlayerValueRankContext(interaction.guild.id, league.league_id, player);
       await interaction.editReply({
+        content: null,
         embeds: [buildMaddenPlayerProfileEmbed(league, player, statRows, ranks, valueRankContext)],
         components: buildMaddenPlayerProfileActionRow(league.league_id, player.player_name || playerName),
       });
@@ -19016,7 +19018,9 @@ const SETUP_DASHBOARD_OPTIONS = [
 ];
 
 const SETUP_PANEL_OPTIONS = [
-  { value: 'standings_panel', label: 'Create/Refresh Standings Panel' },
+  { value: 'standings_panel', label: 'Create/Refresh Standings Panel (generic, non-Madden)' },
+  { value: 'madden_standings_panel', label: 'Post/Refresh Madden Standings Board' },
+  { value: 'madden_power_rankings_panel', label: 'Post/Refresh Madden Power Rankings Board' },
   { value: 'madden_free_agents_panel', label: 'Post/Refresh Madden Free Agents Board' },
   { value: 'trade_block_board_panel', label: 'Post/Refresh Trade Block Board' },
   { value: 'trade_negotiation_starter_panel', label: 'Post/Refresh Trade Negotiation Starter' },
@@ -19122,7 +19126,7 @@ function buildSetupDashboardEmbed(league) {
       { name: 'Roles', value: roleLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Core Channels', value: channelLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Trade Setup', value: tradeLines.join(String.fromCharCode(10)), inline: false },
-      { name: 'Panels', value: 'Use the panel menu to create or refresh common setup panels. Free Agents Board uses the Madden Free Agents Channel and keeps All/QB/HB/WR/TE/OL/DL/LB/DB buttons.', inline: false }
+      { name: 'Panels', value: 'Use the panel menu to create or refresh common setup panels. Free Agents Board uses the Madden Free Agents Channel and keeps All/QB/HB/WR/TE/OL/DL/LB/DB buttons. Note: "Standings Panel" is a generic manual standings board (separate from "Madden Standings Board", which auto-updates from EA sync) — for a Madden league, you want the Madden one.', inline: false }
     )
     .setFooter({ text: 'GG Sports • Interactive Setup' })
     .setTimestamp();
@@ -19219,6 +19223,37 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const message = await channel.send({ embeds: [buildStandingsEmbed(league, rows)] });
     await savePanel(league, 'standings', channel.id, message.id);
     return 'Standings panel created/refreshed in ' + channel.toString() + '.';
+  }
+
+  if (panelType === 'madden_standings_panel') {
+    const { channel, error } = await requireTextChannel(league.madden_standings_channel_id, interaction.channel, 'Madden standings channel');
+    if (error) return error + ' Set **Madden Standings Board** from this setup dashboard first. (This is separate from the generic "Standings Channel" — this one pulls from EA sync data.)';
+
+    const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+    const scope = settings.standings_scope || 'conference';
+    const standingsRows = await pool.query(
+      `SELECT * FROM madden_imported_standings WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY wins DESC, losses ASC, points_for DESC`,
+      [interaction.guild.id, String(league.league_id)]
+    ).then(r => r.rows).catch(() => []);
+    const message = await channel.send({
+      embeds: [buildMaddenImportedStandingsEmbed(league, standingsRows, scope)],
+      components: buildMaddenStandingsScopeComponents(league.league_id, scope),
+    });
+    await pool.query(`UPDATE madden_league_settings SET standings_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
+    return 'Madden Standings Board posted/refreshed in ' + channel.toString() + '.' + (standingsRows.length ? '' : ' (No imported standings yet — run /madden sync first.)');
+  }
+
+  if (panelType === 'madden_power_rankings_panel') {
+    const { channel, error } = await requireTextChannel(league.madden_power_rankings_channel_id, interaction.channel, 'Madden power rankings channel');
+    if (error) return error + ' Set **Madden Power Rankings Board** from this setup dashboard first.';
+
+    const rankRows = await pool.query(
+      `SELECT * FROM madden_power_rankings WHERE league_id::text = $1::text ORDER BY rank ASC`,
+      [String(league.league_id)]
+    ).then(r => r.rows).catch(() => []);
+    const message = await channel.send({ embeds: [buildMaddenPowerRankingsEmbed(league, rankRows)] });
+    await pool.query(`UPDATE madden_league_settings SET power_rankings_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
+    return 'Madden Power Rankings Board posted/refreshed in ' + channel.toString() + '.' + (rankRows.length ? '' : ' (No power rankings computed yet — run /madden sync first.)');
   }
 
   if (panelType === 'madden_free_agents_panel') {
@@ -20773,6 +20808,111 @@ function buildMaddenPlayerSearchPanelComponents(leagueId) {
     new ButtonBuilder().setCustomId('madsearch_player:' + leagueId).setLabel('Search Player').setEmoji('🔍').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('madsearch_browse:' + leagueId).setLabel('Browse Players').setEmoji('📋').setStyle(ButtonStyle.Secondary),
   )];
+}
+
+// ---------------------------------------------------------------------------
+// Click-only player picker (Team -> Player) — replaces free-text name entry for
+// negotiation start and player search, since Discord modals cannot autocomplete
+// and player names are easy to misspell.
+// ---------------------------------------------------------------------------
+async function getMaddenLeagueTeamNames(guildId, leagueId, { excludeFreeAgents = false } = {}) {
+  const result = await pool.query(
+    `SELECT DISTINCT COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS team_name
+     FROM madden_players p
+     LEFT JOIN madden_imported_team_stats t
+       ON t.guild_id = p.guild_id::text AND t.league_id::text = p.league_id::text AND p.team_id IS NOT NULL AND t.external_team_id::text = p.team_id
+     WHERE p.guild_id = $1 AND p.league_id = $2
+       AND COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) IS NOT NULL
+       ${excludeFreeAgents ? 'AND COALESCE(p.is_free_agent, false) = false' : ''}
+     ORDER BY team_name ASC`,
+    [String(guildId), String(leagueId)]
+  );
+  return (result.rows || []).map(r => r.team_name).filter(Boolean);
+}
+
+function buildMaddenTeamPickerComponents(flow, leagueId, teams) {
+  const groups = [];
+  let bucket = [];
+  for (const team of teams) {
+    bucket.push(team);
+    if (bucket.length === 25) { groups.push(bucket); bucket = []; }
+  }
+  if (bucket.length) groups.push(bucket);
+  const rows = groups.slice(0, 4).map((group, idx) => new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`madpick:team:${flow}:${leagueId}:${idx}`)
+      .setPlaceholder(groups.length > 1 ? `Choose a team (${idx + 1}/${groups.length})` : 'Choose a team')
+      .addOptions(group.map(name => ({ label: String(name).slice(0, 100), value: String(name).slice(0, 100) })))
+  ));
+  return rows;
+}
+
+async function getMaddenTeamRosterPage(guildId, leagueId, teamName, { offset = 0, limit = 25, excludeFreeAgents = false } = {}) {
+  const result = await pool.query(
+    `SELECT p.*, COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name
+     FROM madden_players p
+     LEFT JOIN madden_imported_team_stats t
+       ON t.guild_id = p.guild_id::text AND t.league_id::text = p.league_id::text AND p.team_id IS NOT NULL AND t.external_team_id::text = p.team_id
+     WHERE p.guild_id = $1 AND p.league_id = $2
+       AND COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) = $3
+       ${excludeFreeAgents ? 'AND COALESCE(p.is_free_agent, false) = false' : ''}
+     ORDER BY p.overall DESC NULLS LAST, player_name ASC
+     OFFSET $4 LIMIT $5`,
+    [String(guildId), String(leagueId), teamName, offset, limit]
+  );
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM madden_players p
+     WHERE p.guild_id = $1 AND p.league_id = $2
+       AND COALESCE(NULLIF(p.team_name, ''), '') = $3
+       ${excludeFreeAgents ? 'AND COALESCE(p.is_free_agent, false) = false' : ''}`,
+    [String(guildId), String(leagueId), teamName]
+  ).catch(() => ({ rows: [{ count: (result.rows || []).length }] }));
+  return { rows: result.rows || [], total: countResult.rows?.[0]?.count || (result.rows || []).length };
+}
+
+function buildMaddenRosterPickerComponents(flow, leagueId, teamName, rows, offset, total) {
+  const encTeam = encodeURIComponent(teamName).slice(0, 80);
+  const components = [new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`madpick:player:${flow}:${leagueId}:${encTeam}:${offset}`)
+      .setPlaceholder(`Choose a player from ${String(teamName).slice(0, 60)}`)
+      .addOptions((rows.length ? rows : [{ player_name: 'No players found', position: '', overall: '' }]).map(r => ({
+        label: String(r.player_name || 'Unknown').slice(0, 100),
+        value: String(r.player_name || 'unknown').slice(0, 100),
+        description: (r.position ? `${r.position} • ${r.overall || 'N/A'} OVR` : 'No roster data').slice(0, 100),
+      })))
+      .setDisabled(!rows.length)
+  )];
+
+  const navButtons = [
+    new ButtonBuilder().setCustomId(`madpick:backteam:${flow}:${leagueId}`).setLabel('⬅ Change Team').setStyle(ButtonStyle.Secondary),
+  ];
+  if (total > 25) {
+    const prevOffset = Math.max(0, offset - 25);
+    const nextOffset = offset + 25;
+    navButtons.push(
+      new ButtonBuilder().setCustomId(`madpick:rosterpage:${flow}:${leagueId}:${encTeam}:${prevOffset}`).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(offset <= 0),
+      new ButtonBuilder().setCustomId(`madpick:rosterpage:${flow}:${leagueId}:${encTeam}:${nextOffset}`).setLabel('Next').setStyle(ButtonStyle.Primary).setDisabled(nextOffset >= total),
+    );
+  }
+  components.push(new ActionRowBuilder().addComponents(...navButtons));
+  return components;
+}
+
+async function showMaddenTeamPicker(interaction, flow, leagueId, { update = false } = {}) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    const payload = { content: 'League not found.', embeds: [], components: [] };
+    return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+  }
+  const excludeFreeAgents = flow === 'neg';
+  const teams = await getMaddenLeagueTeamNames(interaction.guild.id, league.league_id, { excludeFreeAgents });
+  const content = teams.length
+    ? `**${flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player'}** — pick a team, then pick a player. No typing needed.`
+    : 'No team rosters found yet. Run `/madden sync` first.';
+  const payload = { content, embeds: [], components: teams.length ? buildMaddenTeamPickerComponents(flow, leagueId, teams) : [] };
+  return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
 }
 
 function buildMaddenImportedPlayersEmbed(league, rows, filters = {}) {
