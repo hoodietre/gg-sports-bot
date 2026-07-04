@@ -6827,7 +6827,12 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       }
 
       const message = await createConfiguredPanelFromSetup(interaction, league, panelType);
-      await refreshSetupDashboardInteraction(interaction, leagueId, null, message);
+      const embed = buildSetupPanelMenuEmbed(league);
+      embed.setDescription(embed.data.description + '\n\n' + message);
+      await interaction.update({
+        embeds: [embed],
+        components: buildSetupPanelMenuComponents(leagueId),
+      });
       return;
     }
 
@@ -6850,6 +6855,13 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await interaction.update({
           embeds: [buildSetupDashboardEmbed(league)],
           components: buildSetupDashboardComponents(leagueId),
+        });
+        return;
+      }
+      if (category === 'panels') {
+        await interaction.update({
+          embeds: [buildSetupPanelMenuEmbed(league)],
+          components: buildSetupPanelMenuComponents(leagueId),
         });
         return;
       }
@@ -19384,28 +19396,26 @@ function buildSetupDashboardEmbed(league) {
   return new EmbedBuilder()
     .setTitle(`${GG_EMOJI} GG Sports Setup Dashboard`)
     .setColor(0x5865F2)
-    .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Use the panel menu to post or refresh live boards like the Madden Free Agents Board. Old slash commands still work as advanced/manual backups.')
+    .setDescription('League: **' + league.league_name + '**\nUse the menus below to pick a setting, then select the channel or role. Panel creation moved to its own "Panels" category. Old slash commands still work as advanced/manual backups.')
     .addFields(
       { name: 'Roles', value: roleLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Core Channels', value: channelLines.join(String.fromCharCode(10)), inline: false },
-      { name: 'Trade Setup', value: tradeLines.join(String.fromCharCode(10)), inline: false },
-      { name: 'Panels', value: 'Use the panel menu to create or refresh common setup panels. Free Agents Board uses the Madden Free Agents Channel and keeps All/QB/HB/WR/TE/OL/DL/LB/DB buttons. Note: "Standings Panel" is a generic manual standings board (separate from "Madden Standings Board", which auto-updates from EA sync) — for a Madden league, you want the Madden one.', inline: false }
+      { name: 'Trade Setup', value: tradeLines.join(String.fromCharCode(10)), inline: false }
     )
     .setFooter({ text: 'GG Sports • Interactive Setup' })
     .setTimestamp();
 }
 
-function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
-  const settingMenu = new StringSelectMenuBuilder()
-    .setCustomId('setup_select_setting:' + leagueId)
-    .setPlaceholder('Choose a setting to update')
-    .addOptions(SETUP_DASHBOARD_OPTIONS.map(option => ({
-      label: option.label,
-      value: option.value,
-      description: option.description,
-      default: selectedSetting === option.value,
-    })));
+function buildSetupPanelMenuEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle(`🖼️ ${league.league_name} • Panels`)
+    .setColor(0x5865F2)
+    .setDescription('Use the menu below to create or refresh live boards. Free Agents Board uses the Madden Free Agents Channel and keeps All/QB/HB/WR/TE/OL/DL/LB/DB buttons. Note: "Standings Panel" is a generic manual standings board (separate from "Madden Standings Board", which auto-updates from EA sync) — for a Madden league, you want the Madden one.')
+    .setFooter({ text: 'GG Sports • Interactive Setup' })
+    .setTimestamp();
+}
 
+function buildSetupPanelMenuComponents(leagueId) {
   const panelMenu = new StringSelectMenuBuilder()
     .setCustomId('setup_create_panel:' + leagueId)
     .setPlaceholder('Create/refresh a setup panel')
@@ -19413,10 +19423,38 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
       label: option.label,
       value: option.value,
     })));
+  return [new ActionRowBuilder().addComponents(panelMenu), buildCommissionerBackRow(leagueId)];
+}
 
-  const rows = [
-    new ActionRowBuilder().addComponents(settingMenu),
-  ];
+function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
+  const half = Math.ceil(SETUP_DASHBOARD_OPTIONS.length / 2);
+  const groupA = SETUP_DASHBOARD_OPTIONS.slice(0, half);
+  const groupB = SETUP_DASHBOARD_OPTIONS.slice(half);
+
+  const settingMenuA = new StringSelectMenuBuilder()
+    .setCustomId('setup_select_setting:' + leagueId)
+    .setPlaceholder('Choose a setting to update (1/2)')
+    .addOptions(groupA.map(option => ({
+      label: option.label,
+      value: option.value,
+      description: option.description,
+      default: selectedSetting === option.value,
+    })));
+
+  const rows = [new ActionRowBuilder().addComponents(settingMenuA)];
+
+  if (groupB.length) {
+    const settingMenuB = new StringSelectMenuBuilder()
+      .setCustomId('setup_select_setting:' + leagueId)
+      .setPlaceholder('Choose a setting to update (2/2)')
+      .addOptions(groupB.map(option => ({
+        label: option.label,
+        value: option.value,
+        description: option.description,
+        default: selectedSetting === option.value,
+      })));
+    rows.push(new ActionRowBuilder().addComponents(settingMenuB));
+  }
 
   if (selectedSetting) {
     const kind = setupDashboardKind(selectedSetting);
@@ -19440,7 +19478,6 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
     }
   }
 
-  rows.push(new ActionRowBuilder().addComponents(panelMenu));
   rows.push(buildCommissionerBackRow(leagueId));
   return rows;
 }
@@ -48013,7 +48050,8 @@ function buildMaddenAutoDetectSettingsEmbed(league, settings) {
 // Commissioner/Admin Panel (replaces /setup panel as the single admin surface)
 // ---------------------------------------------------------------------------
 const COMMISSIONER_CATEGORIES = [
-  { value: 'setup', label: 'Channels, Roles & Panels', description: 'Configure channels, roles, and create/refresh boards', emoji: '🛠️' },
+  { value: 'setup', label: 'Channels & Roles', description: 'Configure channels and roles', emoji: '🛠️' },
+  { value: 'panels', label: 'Panels', description: 'Create/refresh live boards', emoji: '🖼️' },
   { value: 'operations', label: 'Operations', description: 'Run sync, run scans, toggle auto-detection, refresh boards', emoji: '⚙️' },
   { value: 'league', label: 'League Settings', description: 'Season length and other league-level settings', emoji: '📋' },
 ];
