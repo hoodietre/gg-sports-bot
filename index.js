@@ -7032,7 +7032,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         [leagueId, scope]
       ).catch(() => null);
       const standingsRows = await pool.query(
-        `SELECT * FROM madden_imported_standings WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY wins DESC, losses ASC, points_for DESC`,
+        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY wins DESC, losses ASC, points_for DESC`,
         [interaction.guild.id, String(league.league_id)]
       ).then(r => r.rows).catch(() => []);
       await interaction.editReply({
@@ -19232,7 +19232,7 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
     const scope = settings.standings_scope || 'conference';
     const standingsRows = await pool.query(
-      `SELECT * FROM madden_imported_standings WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY wins DESC, losses ASC, points_for DESC`,
+      `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY wins DESC, losses ASC, points_for DESC`,
       [interaction.guild.id, String(league.league_id)]
     ).then(r => r.rows).catch(() => []);
     const message = await channel.send({
@@ -46503,7 +46503,7 @@ function buildMaddenStandingsScopeComponents(leagueId, currentScope = 'conferenc
 
 async function refreshPersistentMaddenEmbeds(guild, league) {
   const standingsRows = await pool.query(
-    `SELECT * FROM madden_imported_standings
+    `SELECT * FROM madden_imported_team_stats
      WHERE guild_id = $1 AND league_id::text = $2::text
      ORDER BY wins DESC, losses ASC, points_for DESC`,
     [guild.id, String(league.league_id)]
@@ -46603,7 +46603,7 @@ async function autoDetectMaddenRetirements(guild, league) {
 async function getMaddenTeamStandingsForOdds(guildId, leagueId, teamName) {
   const result = await pool.query(
     `SELECT wins, losses, ties, points_for, points_against
-     FROM madden_imported_standings
+     FROM madden_imported_team_stats
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND LOWER(team_name) = LOWER($3)
      LIMIT 1`,
