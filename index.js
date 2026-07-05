@@ -4839,15 +4839,28 @@ async function finalizeTournamentCreation(guild, session) {
   );
   const tournament = await findTournament(guild.id, tournamentId);
   const channel = await guild.channels.fetch(session.channelId).catch(() => null);
-  if (channel?.isTextBased?.()) {
+
+  if (!channel?.isTextBased?.()) {
+    return { tournament, panelPosted: false, panelError: 'That channel could not be found or is not a text channel.' };
+  }
+
+  const botMember = await guild.members.fetchMe();
+  const permissions = channel.permissionsFor(botMember);
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions.has(PermissionFlagsBits.SendMessages) || !permissions.has(PermissionFlagsBits.EmbedLinks)) {
+    return { tournament, panelPosted: false, panelError: `I don't have View Channel, Send Messages, and Embed Links permission in <#${channel.id}>. The tournament was still created — grant those permissions and use Post Public Bracket Panel from the tournament view.` };
+  }
+
+  try {
     const entries = await getTournamentEntries(tournamentId);
     const message = await channel.send({
       embeds: [buildTournamentRegistrationEmbed(tournament, entries)],
       components: buildTournamentRegistrationComponents(tournament),
     });
     await saveTournamentPanel(tournamentId, guild.id, channel.id, message.id);
+    return { tournament, panelPosted: true, panelError: null };
+  } catch (err) {
+    return { tournament, panelPosted: false, panelError: `Could not post the registration panel (${err?.message || 'unknown error'}). The tournament was still created — use Post Public Bracket Panel from the tournament view once the issue is fixed.` };
   }
-  return tournament;
 }
 
 function buildTournamentRegistrationEmbed(tournament, entries) {
@@ -7977,10 +7990,13 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       session.time = interaction.fields.getTextInputValue('time') || null;
       session.rules = interaction.fields.getTextInputValue('rules') || null;
       await interaction.deferReply({ ephemeral: true });
-      const tournament = await finalizeTournamentCreation(interaction.guild, session);
+      const { tournament, panelPosted, panelError } = await finalizeTournamentCreation(interaction.guild, session);
       tournamentCreateSessions.delete(token);
       const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
-      await interaction.editReply({ content: `Tournament **${tournament.tournament_name}** created and posted in <#${session.channelId}>.`, ...payload });
+      const statusMessage = panelPosted
+        ? `Tournament **${tournament.tournament_name}** created and posted in <#${session.channelId}>.`
+        : `Tournament **${tournament.tournament_name}** created, but the registration panel could not be posted: ${panelError}`;
+      await interaction.editReply({ content: statusMessage, ...payload });
       return;
     }
 
