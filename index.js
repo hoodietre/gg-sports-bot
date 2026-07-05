@@ -7770,7 +7770,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         .addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Tournament name').setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game').setLabel('Game').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('format').setLabel('Format (single_elim, double_elim, round_robin)').setStyle(TextInputStyle.Short).setRequired(false).setValue('single_elim')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('format').setLabel('Format (single/double_elim, round_robin)').setStyle(TextInputStyle.Short).setRequired(false).setValue('single_elim')),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_entries').setLabel('Max entries (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('buy_in').setLabel('Buy-in (optional, 0 = free)').setStyle(TextInputStyle.Short).setRequired(false).setValue('0')),
         );
