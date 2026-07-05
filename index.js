@@ -934,6 +934,8 @@ async function initDatabase() {
       PRIMARY KEY (league_id, role_id)
     )
   `);
+  await pool.query(`ALTER TABLE league_team_roles ADD COLUMN IF NOT EXISTS conference TEXT`);
+  await pool.query(`ALTER TABLE league_team_roles ADD COLUMN IF NOT EXISTS division TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_panels (
@@ -1052,8 +1054,30 @@ async function initDatabase() {
   `);
 
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS standings_points INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS ties INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS conference TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS playoff_team_count INTEGER NOT NULL DEFAULT 8`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_custom_settings (
+      league_id UUID PRIMARY KEY REFERENCES leagues(league_id) ON DELETE CASCADE,
+      season_length INTEGER,
+      schedule_style TEXT NOT NULL DEFAULT 'open',
+      matchup_frequency INTEGER NOT NULL DEFAULT 1,
+      playoff_seeding_method TEXT NOT NULL DEFAULT 'overall_record',
+      use_conferences BOOLEAN NOT NULL DEFAULT FALSE,
+      use_divisions BOOLEAN NOT NULL DEFAULT FALSE,
+      playoff_series_lengths JSONB NOT NULL DEFAULT '[]',
+      cpu_trades_allowed BOOLEAN NOT NULL DEFAULT TRUE,
+      standings_system TEXT NOT NULL DEFAULT 'wl',
+      win_points INTEGER NOT NULL DEFAULT 2,
+      loss_points INTEGER NOT NULL DEFAULT 0,
+      tie_points INTEGER NOT NULL DEFAULT 1,
+      ties_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+      trade_limit_per_season INTEGER,
+      awards JSONB NOT NULL DEFAULT '[]',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS playoff_brackets (
@@ -2499,7 +2523,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('reset').setDescription('Staff: reset a reported game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
       .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true))),
+      .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false))),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -3697,6 +3721,79 @@ function isNbaLeague(league) {
   return key.includes('nba') || key.includes('2k') || key.includes('basketball');
 }
 
+function isNhlLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return key.includes('nhl') || key.includes('hockey') || key.includes('chel');
+}
+
+function isCfbLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return key.includes('cfb') || key.includes('ncaa') || key.includes('college football');
+}
+
+function isFcLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return key.includes('fc ') || key.startsWith('fc') || key.includes('soccer') || key.includes('fifa') || key.includes('efootball');
+}
+
+function getLeagueSportKey(league) {
+  if (isMlbLeague(league)) return 'mlb';
+  if (isNbaLeague(league)) return 'nba';
+  if (isNhlLeague(league)) return 'nhl';
+  if (isCfbLeague(league)) return 'cfb';
+  if (isFcLeague(league)) return 'fc';
+  return 'other';
+}
+
+const LEAGUE_DEFAULT_AWARDS = {
+  nba: ['MVP', 'Defensive Player of the Year', '6th Man of the Year', 'Most Improved Player', 'Rookie of the Year', 'Coach of the Year'],
+  mlb: ['MVP', 'Cy Young', 'Rookie of the Year', 'Manager of the Year'],
+  nhl: ['Hart Trophy (MVP)', 'Vezina Trophy (Goalie)', 'Norris Trophy (Defenseman)', 'Calder Trophy (Rookie)', 'Conn Smythe (Playoffs MVP)'],
+  cfb: ['Heisman Trophy', 'Coach of the Year'],
+  fc: ['Golden Boot', 'Golden Glove', 'Player of the Season', "Young Player of the Season"],
+  other: ['MVP'],
+};
+
+const LEAGUE_SPORT_DEFAULT_SETTINGS = {
+  nba: { use_conferences: true, use_divisions: true, playoff_seeding_method: 'conference', ties_allowed: false },
+  mlb: { use_conferences: false, use_divisions: true, playoff_seeding_method: 'division', ties_allowed: false },
+  nhl: { use_conferences: true, use_divisions: true, playoff_seeding_method: 'conference', ties_allowed: false, standings_system: 'points', win_points: 2, loss_points: 0, tie_points: 1 },
+  cfb: { use_conferences: true, use_divisions: false, playoff_seeding_method: 'overall_record', ties_allowed: false },
+  fc: { use_conferences: false, use_divisions: false, playoff_seeding_method: 'overall_record', standings_system: 'points', win_points: 3, loss_points: 0, tie_points: 1, ties_allowed: true },
+  other: {},
+};
+
+async function ensureLeagueCustomSettings(league) {
+  const existing = await pool.query(`SELECT * FROM league_custom_settings WHERE league_id = $1`, [league.league_id]);
+  if (existing.rows[0]) return existing.rows[0];
+
+  const sportKey = getLeagueSportKey(league);
+  const defaults = LEAGUE_SPORT_DEFAULT_SETTINGS[sportKey] || {};
+  const awards = (LEAGUE_DEFAULT_AWARDS[sportKey] || LEAGUE_DEFAULT_AWARDS.other).map(label => ({ key: label.toLowerCase().replace(/[^a-z0-9]+/g, '_'), label }));
+
+  const result = await pool.query(
+    `INSERT INTO league_custom_settings (league_id, use_conferences, use_divisions, playoff_seeding_method, ties_allowed, standings_system, win_points, loss_points, tie_points, awards)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (league_id) DO NOTHING
+     RETURNING *`,
+    [
+      league.league_id,
+      defaults.use_conferences ?? false,
+      defaults.use_divisions ?? false,
+      defaults.playoff_seeding_method ?? 'overall_record',
+      defaults.ties_allowed ?? false,
+      defaults.standings_system ?? 'wl',
+      defaults.win_points ?? 2,
+      defaults.loss_points ?? 0,
+      defaults.tie_points ?? 1,
+      JSON.stringify(awards),
+    ]
+  );
+  if (result.rows[0]) return result.rows[0];
+  const refetch = await pool.query(`SELECT * FROM league_custom_settings WHERE league_id = $1`, [league.league_id]);
+  return refetch.rows[0];
+}
+
 const NBA_EAST_TEAMS = new Set(['76ers', 'Bucks', 'Bulls', 'Cavs', 'Celtics', 'Hawks', 'Heat', 'Hornets', 'Knicks', 'Magic', 'Nets', 'Pacers', 'Pistons', 'Raptors', 'Wizards']);
 const NBA_WEST_TEAMS = new Set(['Clippers', 'Grizzlies', 'Jazz', 'Kings', 'Lakers', 'Mavs', 'Nuggets', 'Rockets', 'Spurs', 'Suns', 'Sonics', 'Wolves', 'Blazers', 'Warriors']);
 
@@ -3709,7 +3806,22 @@ function getTeamConference(teamName = '') {
   return 'Unassigned Conference';
 }
 
-function calculateStandingsPointsForLeague(league, wins, losses) {
+async function getTeamConferenceDivisionForLeague(guildId, leagueId, teamName) {
+  const result = await pool.query(
+    `SELECT conference, division FROM league_team_roles WHERE league_id::text = $1::text AND LOWER(role_name) = LOWER($2) LIMIT 1`,
+    [String(leagueId), teamName]
+  ).catch(() => ({ rows: [] }));
+  const row = result.rows?.[0];
+  if (row && (row.conference || row.division)) return { conference: row.conference || null, division: row.division || null };
+  // Fall back to the old hardcoded NBA lookup for leagues that haven't assigned
+  // conferences/divisions through the new settings panel yet.
+  return { conference: getTeamConference(teamName), division: null };
+}
+
+function calculateStandingsPointsForLeague(league, wins, losses, ties = 0, customSettings = null) {
+  if (customSettings?.standings_system === 'points') {
+    return (Number(wins || 0) * Number(customSettings.win_points ?? 2)) + (Number(losses || 0) * Number(customSettings.loss_points ?? 0)) + (Number(ties || 0) * Number(customSettings.tie_points ?? 1));
+  }
   return isMlbLeague(league) ? (Number(wins || 0) * 3) + Number(losses || 0) : 0;
 }
 
@@ -3974,7 +4086,9 @@ async function updateTradeCountPanel(guild, league = null) {
 
 async function getStandingsRows(guildId, leagueId) {
   const league = await getLeagueById(leagueId);
-  const orderBy = isMlbLeague(league)
+  const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => null) : null;
+  const usesPoints = customSettings?.standings_system === 'points' || isMlbLeague(league);
+  const orderBy = usesPoints
     ? 'standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC'
     : 'wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC';
 
@@ -3989,26 +4103,48 @@ async function getStandingsRows(guildId, leagueId) {
 
 async function selectPlayoffTeamsForLeague(guildId, league) {
   const standingsRows = await getStandingsRows(guildId, league.league_id);
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => null);
+  const seedingMethod = customSettings?.playoff_seeding_method || (isNbaLeague(league) ? 'conference' : 'overall_record');
+  const teamCount = isMlbLeague(league) ? 8 : Number(league.playoff_team_count || 8);
 
-  if (isNbaLeague(league)) {
-    const eastern = standingsRows
-      .filter(team => getTeamConference(team.team_name) === 'Eastern Conference')
-      .slice(0, 8)
-      .map((team, index) => ({ ...team, seed: index + 1, conference: 'Eastern Conference' }));
-
-    const western = standingsRows
-      .filter(team => getTeamConference(team.team_name) === 'Western Conference')
-      .slice(0, 8)
-      .map((team, index) => ({ ...team, seed: index + 1, conference: 'Western Conference' }));
-
-    const unassigned = standingsRows
-      .filter(team => !['Eastern Conference', 'Western Conference'].includes(getTeamConference(team.team_name)))
-      .map((team, index) => ({ ...team, seed: eastern.length + western.length + index + 1, conference: 'Unassigned Conference' }));
-
-    return [...eastern, ...western, ...unassigned].slice(0, 16);
+  if (seedingMethod === 'conference') {
+    const withConference = await Promise.all(standingsRows.map(async team => {
+      const { conference } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name);
+      return { ...team, resolvedConference: conference || 'Unassigned Conference' };
+    }));
+    const conferences = [...new Set(withConference.map(t => t.resolvedConference).filter(c => c && c !== 'Unassigned Conference'))];
+    const perConference = Math.max(1, Math.floor(teamCount / Math.max(1, conferences.length || 2)));
+    const seeded = [];
+    for (const conference of conferences.length ? conferences : ['Eastern Conference', 'Western Conference']) {
+      const teamsInConference = withConference.filter(t => t.resolvedConference === conference).slice(0, perConference);
+      teamsInConference.forEach((team, index) => seeded.push({ ...team, seed: index + 1, conference }));
+    }
+    const unassigned = withConference
+      .filter(t => t.resolvedConference === 'Unassigned Conference')
+      .slice(0, Math.max(0, teamCount - seeded.length))
+      .map((team, index) => ({ ...team, seed: seeded.length + index + 1, conference: 'Unassigned Conference' }));
+    return [...seeded, ...unassigned].slice(0, teamCount);
   }
 
-  const teamCount = isMlbLeague(league) ? 8 : Number(league.playoff_team_count || 8);
+  if (seedingMethod === 'division') {
+    const withDivision = await Promise.all(standingsRows.map(async team => {
+      const { division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name);
+      return { ...team, resolvedDivision: division || 'Unassigned Division' };
+    }));
+    const divisions = [...new Set(withDivision.map(t => t.resolvedDivision).filter(d => d && d !== 'Unassigned Division'))];
+    if (!divisions.length) {
+      return standingsRows.slice(0, teamCount).map((team, index) => ({ ...team, seed: index + 1 }));
+    }
+    const divisionLeaders = divisions
+      .map(division => withDivision.filter(t => t.resolvedDivision === division)[0])
+      .filter(Boolean);
+    const remaining = withDivision
+      .filter(t => !divisionLeaders.some(leader => leader.team_name === t.team_name))
+      .slice(0, Math.max(0, teamCount - divisionLeaders.length));
+    return [...divisionLeaders, ...remaining].slice(0, teamCount).map((team, index) => ({ ...team, seed: index + 1, division: team.resolvedDivision }));
+  }
+
+  // overall_record (default)
   return standingsRows.slice(0, teamCount).map((team, index) => ({
     ...team,
     seed: index + 1,
@@ -7343,6 +7479,308 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       await pool.query(`UPDATE leagues SET season_length = $2 WHERE league_id = $1`, [leagueId, value]);
       await interaction.reply({ content: `Season length updated to **${value} games**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('commissioner_league_section:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const section = interaction.values[0];
+      await showLeagueCustomizationSection(interaction, leagueId, section, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_back:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      await showCommissionerLeagueSettings(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguecustom_schedulestyle:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const value = interaction.values[0];
+      await pool.query(`UPDATE league_custom_settings SET schedule_style = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, value]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'season', { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_season_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_season_submit:' + leagueId)
+        .setTitle('Season & Schedule')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('season_length').setLabel('Season length (games)').setStyle(TextInputStyle.Short).setRequired(false).setValue(league.season_length ? String(league.season_length) : '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('matchup_frequency').setLabel('Times each team plays each opponent').setStyle(TextInputStyle.Short).setRequired(false).setValue(String(customSettings.matchup_frequency || 1))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_season_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const seasonLengthRaw = interaction.fields.getTextInputValue('season_length');
+      const matchupRaw = interaction.fields.getTextInputValue('matchup_frequency');
+      const seasonLength = seasonLengthRaw ? Number.parseInt(seasonLengthRaw, 10) : null;
+      const matchupFrequency = matchupRaw ? Number.parseInt(matchupRaw, 10) : 1;
+      if ((seasonLength !== null && (!Number.isInteger(seasonLength) || seasonLength <= 0)) || !Number.isInteger(matchupFrequency) || matchupFrequency <= 0) {
+        await interaction.reply({ content: 'Season length and matchup frequency must be whole numbers greater than 0.', ephemeral: true });
+        return;
+      }
+      if (seasonLength !== null) await pool.query(`UPDATE leagues SET season_length = $2 WHERE league_id = $1`, [leagueId, seasonLength]);
+      await pool.query(`UPDATE league_custom_settings SET matchup_frequency = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, matchupFrequency]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'season', { update: false });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguecustom_standingssys:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      await pool.query(`UPDATE league_custom_settings SET standings_system = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, interaction.values[0]]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_points_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_points_submit:' + leagueId)
+        .setTitle('Win/Loss/Tie Point Values')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('win_points').setLabel('Points for a win').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(customSettings.win_points ?? 2))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('loss_points').setLabel('Points for a loss').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(customSettings.loss_points ?? 0))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tie_points').setLabel('Points for a tie').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(customSettings.tie_points ?? 1))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_points_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const winPoints = Number.parseInt(interaction.fields.getTextInputValue('win_points'), 10);
+      const lossPoints = Number.parseInt(interaction.fields.getTextInputValue('loss_points'), 10);
+      const tiePoints = Number.parseInt(interaction.fields.getTextInputValue('tie_points'), 10);
+      if (![winPoints, lossPoints, tiePoints].every(Number.isInteger)) {
+        await interaction.reply({ content: 'All point values must be whole numbers.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE league_custom_settings SET win_points = $2, loss_points = $3, tie_points = $4, updated_at = NOW() WHERE league_id = $1`, [leagueId, winPoints, lossPoints, tiePoints]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_ties:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      await pool.query(`UPDATE league_custom_settings SET ties_allowed = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, !customSettings.ties_allowed]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguecustom_seeding:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      await pool.query(`UPDATE league_custom_settings SET playoff_seeding_method = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, interaction.values[0]]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'playoffs', { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_playoffteams_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_playoffteams_submit:' + leagueId)
+        .setTitle('Playoff Team Count')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('playoff_team_count').setLabel('Number of playoff teams').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(league.playoff_team_count || 8))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_playoffteams_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const value = Number.parseInt(interaction.fields.getTextInputValue('playoff_team_count'), 10);
+      if (!Number.isInteger(value) || value < 2) {
+        await interaction.reply({ content: 'Playoff team count must be a whole number 2 or greater.', ephemeral: true });
+        return;
+      }
+      await pool.query(
+        `INSERT INTO league_settings (league_id, playoff_team_count, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (league_id) DO UPDATE SET playoff_team_count = $2, updated_at = NOW()`,
+        [leagueId, value]
+      );
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'playoffs', { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_series_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const current = Array.isArray(customSettings.playoff_series_lengths) ? customSettings.playoff_series_lengths.join(',') : '';
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_series_submit:' + leagueId)
+        .setTitle('Playoff Series Lengths')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('series_lengths').setLabel('Best-of-X per round, comma-separated').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('e.g. 7,7,7,7').setValue(current)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_series_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const raw = interaction.fields.getTextInputValue('series_lengths');
+      const lengths = raw ? raw.split(',').map(s => Number.parseInt(s.trim(), 10)) : [];
+      if (lengths.some(n => !Number.isInteger(n) || n <= 0 || n % 2 === 0)) {
+        await interaction.reply({ content: 'Each round must be an odd, positive whole number (best-of-X), separated by commas.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE league_custom_settings SET playoff_series_lengths = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, JSON.stringify(lengths)]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'playoffs', { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_cpu:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const next = customSettings.cpu_trades_allowed === false ? true : false;
+      await pool.query(`UPDATE league_custom_settings SET cpu_trades_allowed = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, next]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'trades', { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_tradelimit_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_tradelimit_submit:' + leagueId)
+        .setTitle('Trade Limit Per Season')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('trade_limit').setLabel('Max trades/team/season (blank=unlimited)').setStyle(TextInputStyle.Short).setRequired(false).setValue(customSettings.trade_limit_per_season ? String(customSettings.trade_limit_per_season) : '')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_tradelimit_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const raw = interaction.fields.getTextInputValue('trade_limit');
+      const value = raw ? Number.parseInt(raw, 10) : null;
+      if (value !== null && (!Number.isInteger(value) || value <= 0)) {
+        await interaction.reply({ content: 'Trade limit must be a whole number greater than 0, or blank for unlimited.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE league_custom_settings SET trade_limit_per_season = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, value]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'trades', { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_award_add:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_award_submit:' + leagueId)
+        .setTitle('Add Award')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_label').setLabel('Award name').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_award_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const label = interaction.fields.getTextInputValue('award_label');
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const awards = Array.isArray(customSettings.awards) ? customSettings.awards : [];
+      const key = label.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      if (awards.some(a => a.key === key)) {
+        await interaction.reply({ content: 'That award already exists.', ephemeral: true });
+        return;
+      }
+      awards.push({ key, label });
+      await pool.query(`UPDATE league_custom_settings SET awards = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, JSON.stringify(awards)]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'awards', { update: false });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguecustom_award_remove:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const awards = (Array.isArray(customSettings.awards) ? customSettings.awards : []).filter(a => a.key !== interaction.values[0]);
+      await pool.query(`UPDATE league_custom_settings SET awards = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, JSON.stringify(awards)]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'awards', { update: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguecustom_team_select:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const roleId = interaction.values[0];
+      const teamResult = await pool.query(`SELECT * FROM league_team_roles WHERE league_id = $1 AND role_id = $2 LIMIT 1`, [leagueId, roleId]);
+      const team = teamResult.rows[0];
+      if (!team) { await interaction.reply({ content: 'Team not found.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId(`leaguecustom_teamcd_submit:${leagueId}:${roleId}`)
+        .setTitle(`${team.role_name.slice(0, 33)} — Conf/Div`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('conference').setLabel('Conference').setStyle(TextInputStyle.Short).setRequired(false).setValue(team.conference || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('division').setLabel('Division').setStyle(TextInputStyle.Short).setRequired(false).setValue(team.division || '')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_teamcd_submit:')) {
+      const [, leagueId, roleId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const conference = interaction.fields.getTextInputValue('conference') || null;
+      const division = interaction.fields.getTextInputValue('division') || null;
+      await pool.query(`UPDATE league_team_roles SET conference = $3, division = $4 WHERE league_id = $1 AND role_id = $2`, [leagueId, roleId, conference, division]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'conferences', { update: false });
       return;
     }
 
@@ -16093,17 +16531,19 @@ if (shopSubcommand === 'view') {
       const team = interaction.options.getRole('team');
       const wins = interaction.options.getInteger('wins');
       const losses = interaction.options.getInteger('losses');
-      const standingsPoints = calculateStandingsPointsForLeague(activeLeague, wins, losses);
-      const conference = isNbaLeague(activeLeague) ? getTeamConference(team.name) : null;
+      const ties = interaction.options.getInteger('ties') || 0;
+      const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => null);
+      const standingsPoints = calculateStandingsPointsForLeague(activeLeague, wins, losses, ties, customSettings);
+      const { conference } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, team.name);
       await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, standings_points, conference)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, standings_points, conference)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (guild_id, league_id, team_role_id)
-         DO UPDATE SET wins = $5, losses = $6, standings_points = $7, conference = $8, team_name = $4, updated_at = NOW()`,
-        [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses, standingsPoints, conference]
+         DO UPDATE SET wins = $5, losses = $6, ties = $7, standings_points = $8, conference = $9, team_name = $4, updated_at = NOW()`,
+        [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses, ties, standingsPoints, conference]
       );
       await updateStandingsPanel(interaction.guild, activeLeague);
-      await interaction.reply({ content: `Standings adjusted: **${team.name}** is now **${wins}-${losses}**.`, ephemeral: true });
+      await interaction.reply({ content: `Standings adjusted: **${team.name}** is now **${wins}-${losses}${ties ? '-' + ties : ''}**.`, ephemeral: true });
       return;
     }
 
@@ -50559,23 +50999,40 @@ async function showCommissionerOperations(interaction, leagueId) {
   }
 }
 
-function buildCommissionerLeagueEmbed(league) {
+const LEAGUE_CUSTOMIZATION_SECTIONS = [
+  { value: 'season', label: 'Season & Schedule', description: 'Season length, schedule style, matchup frequency', emoji: '📅' },
+  { value: 'standings', label: 'Standings', description: 'W/L, points system, ties', emoji: '📊' },
+  { value: 'playoffs', label: 'Playoffs', description: 'Team count, seeding, series length per round', emoji: '🏆' },
+  { value: 'trades', label: 'Trades', description: 'CPU trades, trade limit per season', emoji: '🔀' },
+  { value: 'awards', label: 'Awards', description: 'Which awards this league tracks', emoji: '🎖️' },
+  { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Assign each team a conference/division', emoji: '🗺️' },
+];
+
+async function buildCommissionerLeagueEmbed(league) {
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  const sportKey = getLeagueSportKey(league);
   return new EmbedBuilder()
-    .setTitle(`📋 League Settings • ${league.league_name}`)
+    .setTitle(`📋 League Customization • ${league.league_name}`)
     .setColor(0x5865F2)
-    .setDescription('Season length is editable below. Standings system options and the schedule generator are on the backlog but not built yet, so they are not shown here as live controls.')
+    .setDescription(`Sport: **${sportKey.toUpperCase()}**\nPick a section below to configure. These settings apply to standings, playoffs, and future schedule/trade features as they're built.`)
     .addFields(
       { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
+      { name: 'Schedule Style', value: customSettings.schedule_style === 'structured' ? 'Structured' : 'Open', inline: true },
+      { name: 'Standings System', value: customSettings.standings_system === 'points' ? 'Points-based' : 'W/L Record', inline: true },
+      { name: 'Playoff Teams', value: String(league.playoff_team_count || 8), inline: true },
+      { name: 'Seeding Method', value: customSettings.playoff_seeding_method || 'overall_record', inline: true },
+      { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
     )
     .setFooter({ text: 'GG Sports • Commissioner Panel' })
     .setTimestamp();
 }
 
 function buildCommissionerLeagueComponents(leagueId) {
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('commissioner_league_edit_season:' + leagueId).setLabel('Edit Season Length').setStyle(ButtonStyle.Primary),
-  );
-  return [row1, buildCommissionerBackRow(leagueId)];
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('commissioner_league_section:' + leagueId)
+    .setPlaceholder('Choose a section to configure')
+    .addOptions(LEAGUE_CUSTOMIZATION_SECTIONS.map(s => ({ label: s.label, value: s.value, description: s.description, emoji: s.emoji })));
+  return [new ActionRowBuilder().addComponents(menu), buildCommissionerBackRow(leagueId)];
 }
 
 async function showCommissionerLeagueSettings(interaction, leagueId) {
@@ -50584,12 +51041,168 @@ async function showCommissionerLeagueSettings(interaction, leagueId) {
     await interaction.update({ content: 'League not found.', embeds: [], components: [] });
     return;
   }
-  const payload = { embeds: [buildCommissionerLeagueEmbed(league)], components: buildCommissionerLeagueComponents(leagueId) };
+  const payload = { content: null, embeds: [await buildCommissionerLeagueEmbed(league)], components: buildCommissionerLeagueComponents(leagueId) };
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply(payload);
   } else {
     await interaction.update(payload);
   }
+}
+
+function buildLeagueCustomizationBackRow(leagueId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('leaguecustom_back:' + leagueId).setLabel('⬅ Back to Sections').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function showLeagueCustomizationSection(interaction, leagueId, section, { update = true } = {}) {
+  const league = await getLeagueById(leagueId);
+  if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  let embed;
+  let components;
+
+  if (section === 'season') {
+    embed = new EmbedBuilder()
+      .setTitle(`📅 Season & Schedule • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .addFields(
+        { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
+        { name: 'Schedule Style', value: customSettings.schedule_style === 'structured' ? 'Structured (advance-to-next-opponent + auto threads)' : 'Open (no fixed schedule)', inline: true },
+        { name: 'Matchup Frequency', value: `${customSettings.matchup_frequency || 1}x per opponent (structured mode only)`, inline: true },
+      )
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    const styleMenu = new StringSelectMenuBuilder()
+      .setCustomId('leaguecustom_schedulestyle:' + leagueId)
+      .setPlaceholder('Choose a schedule style')
+      .addOptions([
+        { label: 'Open Schedule', value: 'open', description: 'No fixed schedule, teams arrange games freely', default: customSettings.schedule_style !== 'structured' },
+        { label: 'Structured Schedule', value: 'structured', description: 'Advance-to-next-opponent, auto thread creation', default: customSettings.schedule_style === 'structured' },
+      ]);
+    components = [
+      new ActionRowBuilder().addComponents(styleMenu),
+      new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('leaguecustom_season_modal:' + leagueId).setLabel('Edit Season Length & Matchup Frequency').setStyle(ButtonStyle.Primary)),
+      buildLeagueCustomizationBackRow(leagueId),
+    ];
+  } else if (section === 'standings') {
+    embed = new EmbedBuilder()
+      .setTitle(`📊 Standings • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .addFields(
+        { name: 'System', value: customSettings.standings_system === 'points' ? 'Points-based' : customSettings.standings_system === 'point_differential' ? 'Point Differential' : 'W/L Record', inline: true },
+        { name: 'Win / Loss / Tie Points', value: `${customSettings.win_points ?? 2} / ${customSettings.loss_points ?? 0} / ${customSettings.tie_points ?? 1}`, inline: true },
+        { name: 'Ties Allowed', value: customSettings.ties_allowed ? 'Yes' : 'No', inline: true },
+      )
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    const sysMenu = new StringSelectMenuBuilder()
+      .setCustomId('leaguecustom_standingssys:' + leagueId)
+      .setPlaceholder('Choose a standings system')
+      .addOptions([
+        { label: 'W/L Record', value: 'wl', default: customSettings.standings_system === 'wl' || !customSettings.standings_system },
+        { label: 'Points-based (win/loss/tie values)', value: 'points', default: customSettings.standings_system === 'points' },
+        { label: 'Point Differential', value: 'point_differential', default: customSettings.standings_system === 'point_differential' },
+      ]);
+    components = [
+      new ActionRowBuilder().addComponents(sysMenu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_points_modal:' + leagueId).setLabel('Edit Win/Loss/Tie Points').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_ties:' + leagueId).setLabel(customSettings.ties_allowed ? 'Disable Ties' : 'Enable Ties').setStyle(ButtonStyle.Secondary),
+      ),
+      buildLeagueCustomizationBackRow(leagueId),
+    ];
+  } else if (section === 'playoffs') {
+    const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) ? customSettings.playoff_series_lengths : [];
+    embed = new EmbedBuilder()
+      .setTitle(`🏆 Playoffs • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .addFields(
+        { name: 'Playoff Teams', value: String(league.playoff_team_count || 8), inline: true },
+        { name: 'Seeding Method', value: customSettings.playoff_seeding_method || 'overall_record', inline: true },
+        { name: 'Series Length Per Round', value: seriesLengths.length ? seriesLengths.map((n, i) => `Round ${i + 1}: Bo${n}`).join(', ') : 'Not set (defaults to single game)', inline: false },
+      )
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    const seedMenu = new StringSelectMenuBuilder()
+      .setCustomId('leaguecustom_seeding:' + leagueId)
+      .setPlaceholder('Choose a seeding method')
+      .addOptions([
+        { label: 'Overall Record', value: 'overall_record', default: customSettings.playoff_seeding_method === 'overall_record' || !customSettings.playoff_seeding_method },
+        { label: 'By Conference', value: 'conference', default: customSettings.playoff_seeding_method === 'conference' },
+        { label: 'By Division', value: 'division', default: customSettings.playoff_seeding_method === 'division' },
+      ]);
+    components = [
+      new ActionRowBuilder().addComponents(seedMenu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_playoffteams_modal:' + leagueId).setLabel('Edit Playoff Team Count').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('leaguecustom_series_modal:' + leagueId).setLabel('Edit Series Lengths').setStyle(ButtonStyle.Primary),
+      ),
+      buildLeagueCustomizationBackRow(leagueId),
+    ];
+  } else if (section === 'trades') {
+    embed = new EmbedBuilder()
+      .setTitle(`🔀 Trades • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .addFields(
+        { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
+        { name: 'Trade Limit Per Season', value: customSettings.trade_limit_per_season ? `${customSettings.trade_limit_per_season} trades` : 'Unlimited', inline: true },
+      )
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_cpu:' + leagueId).setLabel(customSettings.cpu_trades_allowed === false ? 'Allow CPU Trades' : 'Disallow CPU Trades').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('leaguecustom_tradelimit_modal:' + leagueId).setLabel('Edit Trade Limit').setStyle(ButtonStyle.Primary),
+      ),
+      buildLeagueCustomizationBackRow(leagueId),
+    ];
+  } else if (section === 'awards') {
+    const awards = Array.isArray(customSettings.awards) ? customSettings.awards : [];
+    embed = new EmbedBuilder()
+      .setTitle(`🎖️ Awards • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .setDescription(awards.length ? awards.map((a, i) => `${i + 1}. ${a.label}`).join('\n') : 'No awards configured yet.')
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    const rows = [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('leaguecustom_award_add:' + leagueId).setLabel('Add Award').setEmoji('➕').setStyle(ButtonStyle.Success),
+    )];
+    if (awards.length) {
+      const removeMenu = new StringSelectMenuBuilder()
+        .setCustomId('leaguecustom_award_remove:' + leagueId)
+        .setPlaceholder('Remove an award')
+        .addOptions(awards.slice(0, 25).map(a => ({ label: a.label.slice(0, 100), value: a.key.slice(0, 100) })));
+      rows.push(new ActionRowBuilder().addComponents(removeMenu));
+    }
+    rows.push(buildLeagueCustomizationBackRow(leagueId));
+    components = rows;
+  } else if (section === 'conferences') {
+    const teamsResult = await pool.query(`SELECT * FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC LIMIT 25`, [leagueId]);
+    embed = new EmbedBuilder()
+      .setTitle(`🗺️ Team Conferences/Divisions • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .setDescription(teamsResult.rows.length
+        ? teamsResult.rows.map(t => `**${t.role_name}** — ${t.conference || 'No conference'}${t.division ? ' / ' + t.division : ''}`).join('\n')
+        : 'No team roles found for this league yet.')
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    components = [];
+    if (teamsResult.rows.length) {
+      const teamMenu = new StringSelectMenuBuilder()
+        .setCustomId('leaguecustom_team_select:' + leagueId)
+        .setPlaceholder('Choose a team to assign conference/division')
+        .addOptions(teamsResult.rows.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id.slice(0, 100) })));
+      components.push(new ActionRowBuilder().addComponents(teamMenu));
+    }
+    components.push(buildLeagueCustomizationBackRow(leagueId));
+  } else {
+    embed = new EmbedBuilder().setTitle('Unknown section').setColor(0xED4245);
+    components = [buildLeagueCustomizationBackRow(leagueId)];
+  }
+
+  const payload = { content: null, embeds: [embed], components };
+  return update ? interaction.update(payload) : interaction.editReply(payload);
 }
 
 // 7J-10AX Madden Compare Value + Trade Foundation
