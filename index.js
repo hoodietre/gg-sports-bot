@@ -603,6 +603,18 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS player_search_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS gm_panel_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_announcement_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_leaders_channel_id TEXT`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_league_leaders_panels (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'passing',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id)
+    )
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_free_agent_panels (
       guild_id TEXT NOT NULL,
@@ -3140,7 +3152,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -3155,7 +3167,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -3169,7 +3181,7 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
@@ -3188,7 +3200,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -7134,6 +7146,24 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         embeds: [buildMaddenImportedStandingsEmbed(league, standingsRows, scope)],
         components: buildMaddenStandingsScopeComponents(leagueId, scope),
       });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madleaders:cat:')) {
+      const leagueId = interaction.customId.split(':')[2];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      const category = interaction.values[0];
+      await interaction.deferUpdate();
+      const { category: categoryData, rows } = await getMaddenLeagueLeaders(interaction.guild.id, league.league_id, category, null, 10);
+      await interaction.editReply({
+        embeds: [buildMaddenLeagueLeadersEmbed(league, categoryData, rows, { limit: 10 })],
+        components: buildMaddenLeagueLeadersPanelComponents(leagueId, category),
+      });
+      await pool.query(
+        `UPDATE madden_league_leaders_panels SET category = $3, updated_at = NOW() WHERE guild_id = $1 AND league_id = $2`,
+        [String(interaction.guild.id), String(leagueId), category]
+      ).catch(() => null);
       return;
     }
 
@@ -19687,6 +19717,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'player_search_channel', label: 'Player Search Channel', description: 'Panel to search/browse all players', kind: 'channel' },
   { value: 'gm_panel_channel', label: 'GM Panel Channel', description: 'Panel for team owners to open their GM dashboard', kind: 'channel' },
   { value: 'league_announcement_channel', label: 'League Announcement Channel', description: 'Where announcements posted from the commissioner panel go', kind: 'channel' },
+  { value: 'league_leaders_channel', label: 'League Leaders Channel', description: 'Live, switchable stat leaders board', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
@@ -19714,6 +19745,7 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'trade_negotiation_starter_panel', label: 'Post/Refresh Trade Negotiation Starter' },
   { value: 'player_search_panel', label: 'Post/Refresh Player Search Panel' },
   { value: 'gm_panel_starter_panel', label: 'Post/Refresh GM Panel Starter' },
+  { value: 'league_leaders_panel', label: 'Post/Refresh League Leaders Board' },
   { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
   { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
@@ -19735,6 +19767,7 @@ function setupDashboardColumn(settingKey) {
     player_search_channel: 'player_search_channel_id',
     gm_panel_channel: 'gm_panel_channel_id',
     league_announcement_channel: 'league_announcement_channel_id',
+    league_leaders_channel: 'league_leaders_channel_id',
     game_thread_channel: 'game_threads_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
@@ -19784,6 +19817,7 @@ function buildSetupDashboardEmbed(league) {
     'Player Search: ' + setupDashboardFormatValue(league, 'player_search_channel'),
     'GM Panel: ' + setupDashboardFormatValue(league, 'gm_panel_channel'),
     'League Announcement: ' + setupDashboardFormatValue(league, 'league_announcement_channel'),
+    'League Leaders: ' + setupDashboardFormatValue(league, 'league_leaders_channel'),
     'Game Threads: ' + setupDashboardFormatValue(league, 'game_thread_channel'),
     'Madden News: ' + setupDashboardFormatValue(league, 'madden_news_channel'),
     'Madden Standings Board: ' + setupDashboardFormatValue(league, 'madden_standings_channel'),
@@ -20027,6 +20061,14 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     });
     await savePanel(league, 'gm_panel_starter', channel.id, message.id);
     return 'GM Panel starter posted/refreshed in ' + channel.toString() + '.';
+  }
+
+  if (panelType === 'league_leaders_panel') {
+    const configuredChannelId = league.league_leaders_channel_id;
+    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'league leaders channel');
+    if (error) return error + ' Set **League Leaders Channel** from this setup dashboard first.';
+    const result = await postOrRefreshMaddenLeagueLeadersPanel(interaction.guild, { ...league, league_leaders_channel_id: channel.id }, 'passing');
+    return result?.message || ('League Leaders board posted/refreshed in ' + channel.toString() + '.');
   }
 
   if (panelType === 'shop_panel') {
@@ -37850,6 +37892,79 @@ function buildMaddenLeagueLeadersEmbed(league, category, rows, options = {}) {
   return embed;
 }
 
+// ---------------------------------------------------------------------------
+// League Leaders Board — persistent panel, category-switchable, powered
+// entirely by the existing getMaddenLeagueLeaders / buildMaddenLeagueLeadersEmbed
+// engine that already backs /madden leaders.
+// ---------------------------------------------------------------------------
+const MADDEN_LEAGUE_LEADERS_CATEGORIES = [
+  { value: 'passing', label: 'Passing Yards' },
+  { value: 'passing_tds', label: 'Passing TDs' },
+  { value: 'rushing', label: 'Rushing Yards' },
+  { value: 'rushing_tds', label: 'Rushing TDs' },
+  { value: 'receiving', label: 'Receiving Yards' },
+  { value: 'receiving_tds', label: 'Receiving TDs' },
+  { value: 'sacks', label: 'Sacks' },
+  { value: 'interceptions', label: 'Interceptions' },
+  { value: 'tackles', label: 'Tackles' },
+  { value: 'forced_fumbles', label: 'Forced Fumbles' },
+  { value: 'pass_deflections', label: 'Pass Deflections' },
+  { value: 'kicking', label: 'Kicking Points' },
+  { value: 'fg_made', label: 'FG Made' },
+  { value: 'punting', label: 'Punting Yards' },
+  { value: 'punting_avg', label: 'Punting Average' },
+];
+
+function buildMaddenLeagueLeadersPanelComponents(leagueId, category) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`madleaders:cat:${leagueId}`)
+    .setPlaceholder('Choose a stat category...')
+    .addOptions(MADDEN_LEAGUE_LEADERS_CATEGORIES.map(c => ({
+      label: c.label,
+      value: c.value,
+      default: c.value === category,
+    })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+async function postOrRefreshMaddenLeagueLeadersPanel(guild, league, category = 'passing') {
+  const channelId = league.league_leaders_channel_id;
+  if (!channelId) return { ok: false, message: 'No League Leaders channel configured. Set it in /commissioner panel → Channels & Roles.' };
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased?.()) return { ok: false, message: 'Configured League Leaders channel was not found or is not text-based.' };
+
+  const { category: categoryData, rows } = await getMaddenLeagueLeaders(guild.id, league.league_id, category, null, 10);
+  const payload = {
+    embeds: [buildMaddenLeagueLeadersEmbed(league, categoryData, rows, { limit: 10 })],
+    components: buildMaddenLeagueLeadersPanelComponents(league.league_id, category),
+  };
+
+  const existing = await pool.query(`SELECT * FROM madden_league_leaders_panels WHERE guild_id = $1 AND league_id = $2 LIMIT 1`, [String(guild.id), String(league.league_id)]).catch(() => ({ rows: [] }));
+  let message = null;
+  if (existing.rows?.[0]?.message_id) {
+    message = await channel.messages.fetch(existing.rows[0].message_id).catch(() => null);
+  }
+  if (message) {
+    await message.edit(payload);
+  } else {
+    message = await channel.send(payload);
+  }
+  await pool.query(
+    `INSERT INTO madden_league_leaders_panels (guild_id, league_id, channel_id, message_id, category, updated_at)
+     VALUES ($1,$2,$3,$4,$5,NOW())
+     ON CONFLICT (guild_id, league_id)
+     DO UPDATE SET channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id, category = EXCLUDED.category, updated_at = NOW()`,
+    [String(guild.id), String(league.league_id), channel.id, message.id, category]
+  );
+  return { ok: true, message: `League Leaders board posted/refreshed in <#${channel.id}>.` };
+}
+
+async function refreshMaddenLeagueLeadersPanelForLeague(guild, league) {
+  const result = await pool.query(`SELECT * FROM madden_league_leaders_panels WHERE guild_id = $1 AND league_id = $2 LIMIT 1`, [String(guild.id), String(league.league_id)]).catch(() => ({ rows: [] }));
+  const panel = result.rows?.[0];
+  if (!panel) return null;
+  return postOrRefreshMaddenLeagueLeadersPanel(guild, league, panel.category || 'passing');
+}
 
 
 function maddenPlayerDisplayName(row) {
@@ -47943,6 +48058,7 @@ async function refreshPersistentMaddenEmbeds(guild, league) {
         return buildMaddenFreeAgentsEmbed(league, fas);
       }),
     refreshMaddenTradeBlockBoardForLeague(guild, league),
+    refreshMaddenLeagueLeadersPanelForLeague(guild, league),
   ]);
 }
 
