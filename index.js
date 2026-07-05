@@ -607,6 +607,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_leaders_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS award_race_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS member_profile_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS bank_channel_id TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_award_race_panels (
       guild_id TEXT NOT NULL,
@@ -3172,7 +3173,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -3187,7 +3188,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -3201,7 +3202,7 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
@@ -3220,7 +3221,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -7669,6 +7670,75 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
       await showMaddenGmPanelHome(interaction, leagueId, team.team_name, { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'bankpanel_open') {
+      await showBankHome(interaction, interaction.user, { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'bankpanel_back') {
+      await showBankHome(interaction, interaction.user, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'bankpanel_transfer') {
+      const userMenu = new UserSelectMenuBuilder().setCustomId('bankpanel_transfer_user').setPlaceholder('Choose who to send currency to');
+      await interaction.reply({ content: '**Transfer Currency** — choose a recipient', components: [new ActionRowBuilder().addComponents(userMenu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isUserSelectMenu() && interaction.customId === 'bankpanel_transfer_user') {
+      const targetUserId = interaction.values[0];
+      if (targetUserId === interaction.user.id) {
+        await interaction.update({ content: 'You cannot transfer currency to yourself.', components: [] });
+        return;
+      }
+      const targetMember = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+      if (targetMember?.user?.bot) {
+        await interaction.update({ content: 'Choose a non-bot user to transfer to.', components: [] });
+        return;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`bankpanel_transfer_modal:${targetUserId}`)
+        .setTitle('Transfer Currency')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Amount').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('bankpanel_transfer_modal:')) {
+      const targetUserId = interaction.customId.split(':')[1];
+      const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
+      const reason = interaction.fields.getTextInputValue('reason') || 'User transfer';
+      const settings = await getCurrencySettings(interaction.guild.id);
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.reply({ content: 'Transfer amount must be a whole number greater than 0.', ephemeral: true });
+        return;
+      }
+      const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'transfer_out', reason, interaction.user.id);
+      if (!removed) {
+        await interaction.reply({ content: `You do not have enough ${settings.currency_name} for that transfer.`, ephemeral: true });
+        return;
+      }
+      await addCurrency(interaction.guild.id, targetUserId, amount, 'transfer_in', reason, interaction.user.id);
+      await interaction.reply({ content: `Transferred **${settings.currency_icon} ${amount}** to <@${targetUserId}>.`, ephemeral: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'bankpanel_purchases') {
+      const embed = await buildBankPurchasesEmbed(interaction.guild, interaction.user);
+      await interaction.update({ content: null, embeds: [embed], components: [buildBankBackRow()] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'bankpanel_transactions') {
+      const embed = await buildBankTransactionsEmbed(interaction.guild, interaction.user);
+      await interaction.update({ content: null, embeds: [embed], components: [buildBankBackRow()] });
       return;
     }
 
@@ -20174,6 +20244,95 @@ async function showMemberProfileCategory(interaction, targetUser, category, { up
   return update ? interaction.update(payload) : interaction.editReply(payload);
 }
 
+// ---------------------------------------------------------------------------
+// Bank Panel — personal economy panel: balance/stats, transfer currency,
+// recent purchases. Wraps existing getBalance/addCurrency/removeCurrency/
+// user_inventory, no new economy logic.
+// ---------------------------------------------------------------------------
+function buildBankStarterEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🏦 Bank')
+    .setColor(0xFEE75C)
+    .setDescription('Click below to check your balance, transfer currency to another member, or view your recent purchases.')
+    .setFooter({ text: 'GG Sports • Bank' })
+    .setTimestamp();
+}
+
+function buildBankStarterComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('bankpanel_open').setLabel('Open My Bank').setEmoji('🏦').setStyle(ButtonStyle.Primary)
+  )];
+}
+
+function buildBankBackRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('bankpanel_back').setLabel('⬅ Back to Overview').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function buildBankHomeEmbed(guild, targetUser) {
+  const settings = await getCurrencySettings(guild.id);
+  const balance = await getBalance(guild.id, targetUser.id);
+  return new EmbedBuilder()
+    .setTitle(`🏦 ${targetUser.username} • Bank`)
+    .setColor(0xFEE75C)
+    .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'Balance', value: `${settings.currency_icon} ${balance.balance}`, inline: true },
+      { name: 'All-Time Earned', value: `${settings.currency_icon} ${balance.lifetime_earned}`, inline: true },
+      { name: 'All-Time Spent', value: `${settings.currency_icon} ${balance.lifetime_spent}`, inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Bank' })
+    .setTimestamp();
+}
+
+function buildBankHomeComponents() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('bankpanel_transfer').setLabel('Transfer Currency').setEmoji('💸').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('bankpanel_purchases').setLabel('Recent Purchases').setEmoji('🛍️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('bankpanel_transactions').setLabel('Transaction History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+  );
+  return [row];
+}
+
+async function showBankHome(interaction, targetUser, { update = false } = {}) {
+  const embed = await buildBankHomeEmbed(interaction.guild, targetUser);
+  const payload = { content: null, embeds: [embed], components: buildBankHomeComponents() };
+  return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+async function buildBankPurchasesEmbed(guild, targetUser) {
+  const settings = await getCurrencySettings(guild.id);
+  const result = await pool.query(
+    `SELECT * FROM user_inventory WHERE guild_id = $1 AND user_id = $2 ORDER BY purchased_at DESC LIMIT 15`,
+    [guild.id, targetUser.id]
+  );
+  return new EmbedBuilder()
+    .setTitle(`${targetUser.username} • Recent Purchases`)
+    .setColor(0xFEE75C)
+    .setDescription(result.rows.length
+      ? result.rows.map(row => `**${row.item_name}** — ${settings.currency_icon} ${row.price_paid} • ${row.status}`).join('\n')
+      : 'No purchases found yet.')
+    .setFooter({ text: 'GG Sports • Bank' })
+    .setTimestamp();
+}
+
+async function buildBankTransactionsEmbed(guild, targetUser) {
+  const settings = await getCurrencySettings(guild.id);
+  const result = await pool.query(
+    `SELECT * FROM currency_transactions WHERE guild_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 15`,
+    [guild.id, targetUser.id]
+  );
+  return new EmbedBuilder()
+    .setTitle(`${targetUser.username} • Transaction History`)
+    .setColor(0xFEE75C)
+    .setDescription(result.rows.length
+      ? result.rows.map(row => `${row.amount >= 0 ? '+' : ''}${row.amount} ${settings.currency_icon} • ${row.type}${row.reason ? ' • ' + row.reason : ''}`).join('\n')
+      : 'No transactions found yet.')
+    .setFooter({ text: 'GG Sports • Bank' })
+    .setTimestamp();
+}
+
 async function getExpandedUserBadges(guildId, userId, recognition = null) {
   await syncExpandedProfileBadges(guildId, userId, recognition).catch(() => null);
   const result = await pool.query(
@@ -20241,6 +20400,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_leaders_channel', label: 'League Leaders Channel', description: 'Live, switchable stat leaders board', kind: 'channel' },
   { value: 'award_race_channel', label: 'Award Race Channel', description: 'Live, switchable MVP/OPOY/DPOY/OROY/DROY race board', kind: 'channel' },
   { value: 'member_profile_channel', label: 'Member Profile Channel', description: 'Panel for members to open their profile', kind: 'channel' },
+  { value: 'bank_channel', label: 'Bank Channel', description: 'Panel for members to check balance, transfer currency, view purchases', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
@@ -20271,6 +20431,7 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'league_leaders_panel', label: 'Post/Refresh League Leaders Board' },
   { value: 'award_race_panel', label: 'Post/Refresh Award Race Board' },
   { value: 'member_profile_starter_panel', label: 'Post/Refresh Member Profile Starter' },
+  { value: 'bank_starter_panel', label: 'Post/Refresh Bank Starter' },
   { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
   { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
@@ -20295,6 +20456,7 @@ function setupDashboardColumn(settingKey) {
     league_leaders_channel: 'league_leaders_channel_id',
     award_race_channel: 'award_race_channel_id',
     member_profile_channel: 'member_profile_channel_id',
+    bank_channel: 'bank_channel_id',
     game_thread_channel: 'game_threads_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
@@ -20347,6 +20509,7 @@ function buildSetupDashboardEmbed(league) {
     'League Leaders: ' + setupDashboardFormatValue(league, 'league_leaders_channel'),
     'Award Race: ' + setupDashboardFormatValue(league, 'award_race_channel'),
     'Member Profile: ' + setupDashboardFormatValue(league, 'member_profile_channel'),
+    'Bank: ' + setupDashboardFormatValue(league, 'bank_channel'),
     'Game Threads: ' + setupDashboardFormatValue(league, 'game_thread_channel'),
     'Madden News: ' + setupDashboardFormatValue(league, 'madden_news_channel'),
     'Madden Standings Board: ' + setupDashboardFormatValue(league, 'madden_standings_channel'),
@@ -20618,6 +20781,18 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     });
     await savePanel(league, 'member_profile_starter', channel.id, message.id);
     return 'Member profile starter posted/refreshed in ' + channel.toString() + '.';
+  }
+
+  if (panelType === 'bank_starter_panel') {
+    const configuredChannelId = league.bank_channel_id;
+    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'bank channel');
+    if (error) return error + ' Set **Bank Channel** from this setup dashboard first.';
+    const message = await channel.send({
+      embeds: [buildBankStarterEmbed()],
+      components: buildBankStarterComponents(),
+    });
+    await savePanel(league, 'bank_starter', channel.id, message.id);
+    return 'Bank starter posted/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'shop_panel') {
