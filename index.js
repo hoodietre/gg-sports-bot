@@ -2420,7 +2420,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('close').setDescription('Staff: close registration').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('start').setDescription('Staff: start tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('matches').setDescription('Show tournament matches').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc.setName('panel').setDescription('Create tournament panel').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open the tournament manager, or a specific tournament panel').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(false)))
       .addSubcommand(sc => sc.setName('report').setDescription('Staff: report match winner').addStringOption(o => o.setName('match_id').setDescription('Match short ID').setRequired(true)).addUserOption(o => o.setName('winner').setDescription('Winner').setRequired(true)))
       .addSubcommand(sc => sc.setName('shuffle').setDescription('Staff: randomly seed tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('seed').setDescription('Staff: set seed').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true)).addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)))
@@ -4688,6 +4688,80 @@ async function saveTournamentPanel(tournamentId, guildId, channelId, messageId) 
      DO UPDATE SET channel_id = $3, message_id = $4, updated_at = NOW()`,
     [tournamentId, guildId, channelId, messageId]
   );
+}
+
+// ---------------------------------------------------------------------------
+// Tournament Panel — the slash commands for create/join/start/report/shuffle
+// were registered but never actually implemented (they'd silently fail). The
+// underlying engine (createTournamentRound, finalizeTournamentMatch,
+// createMatchThreads, updateTournamentPanel) is real and solid, so this panel
+// is the actual entry point for that engine rather than a wrapper around
+// working commands.
+// ---------------------------------------------------------------------------
+async function buildTournamentManagerHomePayload(guild) {
+  const result = await pool.query(
+    `SELECT * FROM tournaments WHERE guild_id = $1 AND status IN ('open','closed','active') ORDER BY created_at DESC LIMIT 25`,
+    [guild.id]
+  );
+  const embed = new EmbedBuilder()
+    .setTitle('🏆 Tournament Manager')
+    .setColor(0xED4245)
+    .setDescription(result.rows.length ? 'Pick a tournament to manage, or create a new one.' : 'No open tournaments. Create one to get started.')
+    .setFooter({ text: 'GG Sports • Tournament Manager' })
+    .setTimestamp();
+
+  const components = [];
+  if (result.rows.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('tourneypanel_select')
+      .setPlaceholder('Choose a tournament to manage')
+      .addOptions(result.rows.map(t => ({
+        label: (t.tournament_name || 'Unnamed').slice(0, 100),
+        value: t.id.slice(0, 100),
+        description: `${t.game || 'Game TBD'} • ${t.status}`.slice(0, 100),
+      })));
+    components.push(new ActionRowBuilder().addComponents(menu));
+  }
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('tourneypanel_create').setLabel('Create Tournament').setEmoji('➕').setStyle(ButtonStyle.Success)
+  ));
+  return { embeds: [embed], components };
+}
+
+function buildTournamentManagerBackRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('tourneypanel_home').setLabel('⬅ Back to Tournaments').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function buildTournamentManagerViewPayload(guild, tournament) {
+  const settings = await getCurrencySettings(guild.id);
+  const entries = await getTournamentEntries(tournament.id);
+  const embed = buildTournamentInfoEmbed(settings, tournament, entries);
+  const rows = [];
+
+  const row1 = new ActionRowBuilder();
+  if (tournament.status === 'open') {
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_join:${tournament.id}`).setLabel('Join Tournament').setEmoji('🎟️').setStyle(ButtonStyle.Success));
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_close:${tournament.id}`).setLabel('Close Registration').setEmoji('🔒').setStyle(ButtonStyle.Secondary));
+  }
+  if (tournament.status === 'closed') {
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_shuffle:${tournament.id}`).setLabel('Shuffle Seeds').setEmoji('🔀').setStyle(ButtonStyle.Secondary));
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_start:${tournament.id}`).setLabel('Start Tournament').setEmoji('🚀').setStyle(ButtonStyle.Success));
+  }
+  if (tournament.status === 'active') {
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_report:${tournament.id}`).setLabel('Report Match').setEmoji('📋').setStyle(ButtonStyle.Primary));
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_bracket:${tournament.id}`).setLabel('View Bracket').setEmoji('🗂️').setStyle(ButtonStyle.Secondary));
+  }
+  if (row1.components.length) rows.push(row1);
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`tourneypanel_postpanel:${tournament.id}`).setLabel('Post Public Bracket Panel').setEmoji('📣').setStyle(ButtonStyle.Secondary)
+  );
+  rows.push(row2);
+  rows.push(buildTournamentManagerBackRow());
+
+  return { embeds: [embed], components: rows };
 }
 
 async function updateTournamentPanel(guild, tournament) {
@@ -7670,6 +7744,197 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
       await showMaddenGmPanelHome(interaction, leagueId, team.team_name, { update: false });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'tourneypanel_home') {
+      const payload = await buildTournamentManagerHomePayload(interaction.guild);
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'tourneypanel_select') {
+      const tournamentId = interaction.values[0];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.update({ content: 'Could not find that tournament.', embeds: [], components: [] }); return; }
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'tourneypanel_create') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create tournaments.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('tourneypanel_create_modal')
+        .setTitle('Create Tournament')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Tournament name').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game').setLabel('Game').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('format').setLabel('Format (single_elim, double_elim, round_robin)').setStyle(TextInputStyle.Short).setRequired(false).setValue('single_elim')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_entries').setLabel('Max entries (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('buy_in').setLabel('Buy-in (optional, 0 = free)').setStyle(TextInputStyle.Short).setRequired(false).setValue('0')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'tourneypanel_create_modal') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create tournaments.', ephemeral: true }); return; }
+      const name = interaction.fields.getTextInputValue('name');
+      const game = interaction.fields.getTextInputValue('game');
+      const format = interaction.fields.getTextInputValue('format') || 'single_elim';
+      const maxEntriesRaw = interaction.fields.getTextInputValue('max_entries');
+      const buyInRaw = interaction.fields.getTextInputValue('buy_in');
+      const maxEntries = maxEntriesRaw ? Number.parseInt(maxEntriesRaw, 10) : null;
+      const buyIn = buyInRaw ? Number.parseInt(buyInRaw, 10) : 0;
+      if ((maxEntries !== null && (!Number.isInteger(maxEntries) || maxEntries < 2)) || !Number.isInteger(buyIn) || buyIn < 0) {
+        await interaction.reply({ content: 'Max entries must be a whole number 2 or greater (or blank), and buy-in must be 0 or greater.', ephemeral: true });
+        return;
+      }
+      const tournamentId = randomUUID();
+      await pool.query(
+        `INSERT INTO tournaments (id, guild_id, tournament_name, game, format, max_entries, buy_in, created_by_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [tournamentId, interaction.guild.id, name, game, format, maxEntries, buyIn, interaction.user.id]
+      );
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.reply({ content: `Tournament **${name}** created.`, ...payload, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_join:')) {
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament || tournament.status !== 'open') { await interaction.reply({ content: 'That tournament is not open for registration.', ephemeral: true }); return; }
+      const existing = await pool.query(`SELECT 1 FROM tournament_entries WHERE tournament_id = $1 AND user_id = $2`, [tournamentId, interaction.user.id]);
+      if (existing.rows.length) { await interaction.reply({ content: 'You are already entered in this tournament.', ephemeral: true }); return; }
+      if (tournament.max_entries) {
+        const countResult = await pool.query(`SELECT COUNT(*)::int AS count FROM tournament_entries WHERE tournament_id = $1`, [tournamentId]);
+        if (countResult.rows[0].count >= tournament.max_entries) { await interaction.reply({ content: 'This tournament is full.', ephemeral: true }); return; }
+      }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      if (Number(tournament.buy_in) > 0) {
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, Number(tournament.buy_in), 'tournament_buy_in', `Entered ${tournament.tournament_name}`, interaction.user.id);
+        if (!removed) { await interaction.reply({ content: `You need ${settings.currency_icon} ${tournament.buy_in} to enter this tournament.`, ephemeral: true }); return; }
+        await pool.query(`UPDATE tournaments SET prize_pool = prize_pool + $2, updated_at = NOW() WHERE id = $1`, [tournamentId, Number(tournament.buy_in)]);
+      }
+      await pool.query(`INSERT INTO tournament_entries (tournament_id, guild_id, user_id, paid_buy_in) VALUES ($1, $2, $3, $4)`, [tournamentId, interaction.guild.id, interaction.user.id, Number(tournament.buy_in) || 0]);
+      const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
+      await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament);
+      await interaction.reply({ content: `You're entered in **${tournament.tournament_name}**.`, ...payload, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_close:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      await pool.query(`UPDATE tournaments SET status = 'closed', updated_at = NOW() WHERE id = $1`, [tournamentId]);
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.update({ content: 'Registration closed.', ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_shuffle:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const entries = await getTournamentEntries(tournamentId);
+      const shuffled = [...entries].sort(() => Math.random() - 0.5);
+      for (let i = 0; i < shuffled.length; i++) {
+        await pool.query(`UPDATE tournament_entries SET seed = $3 WHERE tournament_id = $1 AND user_id = $2`, [tournamentId, shuffled[i].user_id, i + 1]);
+      }
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.update({ content: 'Seeds shuffled.', ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_start:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.update({ content: 'Tournament not found.', embeds: [], components: [] }); return; }
+      const entries = await getTournamentEntries(tournamentId);
+      if (entries.length < 2) { await interaction.reply({ content: 'Need at least 2 entries to start.', ephemeral: true }); return; }
+      await interaction.deferUpdate();
+      await createTournamentRound(tournament, entries, 1);
+      await pool.query(`UPDATE tournaments SET status = 'active', updated_at = NOW() WHERE id = $1`, [tournamentId]);
+      const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
+      const matches = await getTournamentMatches(tournamentId);
+      await createMatchThreads(interaction.guild, refreshedTournament, matches).catch(() => null);
+      await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament);
+      await interaction.editReply({ content: 'Tournament started. Round 1 bracket generated.', ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_bracket:')) {
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      const matches = await getTournamentMatches(tournamentId);
+      await interaction.reply({ embeds: [buildTournamentPanelEmbed(tournament, matches)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_postpanel:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      const configuredChannelId = await getGuildTournamentChannelId(interaction.guild.id);
+      const channel = configuredChannelId ? await interaction.guild.channels.fetch(configuredChannelId).catch(() => null) : interaction.channel;
+      const targetChannel = channel?.isTextBased?.() ? channel : interaction.channel;
+      const matches = await getTournamentMatches(tournamentId);
+      const message = await targetChannel.send({ embeds: [buildTournamentPanelEmbed(tournament, matches)] });
+      await saveTournamentPanel(tournamentId, interaction.guild.id, targetChannel.id, message.id);
+      await interaction.reply({ content: `Public bracket panel posted in ${targetChannel.toString()}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_report:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to report matches.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const matches = await getTournamentMatches(tournamentId);
+      const reportable = matches.filter(m => m.status === 'scheduled' && m.player1_user_id && m.player2_user_id);
+      if (!reportable.length) { await interaction.reply({ content: 'No reportable matches right now.', ephemeral: true }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`tourneypanel_report_match:${tournamentId}`)
+        .setPlaceholder('Choose a match to report')
+        .addOptions(reportable.slice(0, 25).map(m => ({
+          label: `Round ${m.round_number} • Match ${m.match_number}`.slice(0, 100),
+          value: m.id.slice(0, 100),
+          description: `${m.player1_entry_name || 'Player 1'} vs ${m.player2_entry_name || 'Player 2'}`.slice(0, 100),
+        })));
+      await interaction.reply({ content: '**Report Match** — choose a match', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypanel_report_match:')) {
+      const matchId = interaction.values[0];
+      const match = await findTournamentMatch(interaction.guild.id, matchId);
+      if (!match) { await interaction.update({ content: 'Match not found.', components: [] }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`tourneypanel_report_winner:${matchId}`)
+        .setPlaceholder('Who won?')
+        .addOptions([
+          { label: (match.player1_entry_name || 'Player 1').slice(0, 100), value: 'p1' },
+          { label: (match.player2_entry_name || 'Player 2').slice(0, 100), value: 'p2' },
+        ]);
+      await interaction.update({ content: `**Report Match** — Round ${match.round_number}, Match ${match.match_number}`, components: [new ActionRowBuilder().addComponents(menu)] });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypanel_report_winner:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to report matches.', ephemeral: true }); return; }
+      const matchId = interaction.customId.split(':')[1];
+      const match = await findTournamentMatch(interaction.guild.id, matchId);
+      if (!match) { await interaction.update({ content: 'Match not found.', components: [] }); return; }
+      const winnerUserId = interaction.values[0] === 'p1' ? match.player1_user_id : match.player2_user_id;
+      await interaction.update({ content: 'Reporting match…', components: [] });
+      const result = await finalizeTournamentMatch(interaction.guild, match, winnerUserId, interaction.user.id);
+      await interaction.editReply({ content: result.message, components: [] });
       return;
     }
 
@@ -12764,6 +13029,23 @@ if (shopSubcommand === 'view') {
     if (interaction.commandName === 'tournament') {
       if (!interaction.guild) return;
       const tournamentSubcommand = interaction.options.getSubcommand();
+
+      if (tournamentSubcommand === 'panel') {
+        const tournamentInput = interaction.options.getString('tournament');
+        if (!tournamentInput) {
+          const payload = await buildTournamentManagerHomePayload(interaction.guild);
+          await interaction.reply({ ...payload, ephemeral: true });
+          return;
+        }
+        const tournament = await findTournament(interaction.guild.id, tournamentInput);
+        if (!tournament) {
+          await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
+          return;
+        }
+        const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+        await interaction.reply({ ...payload, ephemeral: true });
+        return;
+      }
 
       if (tournamentSubcommand === 'list') {
         const result = await pool.query(
