@@ -11,6 +11,7 @@ import {
   ChannelType,
   RoleSelectMenuBuilder,
   ChannelSelectMenuBuilder,
+  UserSelectMenuBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -2267,6 +2268,11 @@ function buildCommands() {
       .setName('gm')
       .setDescription('Team GM dashboard')
       .addSubcommand(sc => sc.setName('panel').setDescription('Open your GM panel').addStringOption(o => o.setName('team').setDescription('Team name (defaults to your owned team)').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+
+    new SlashCommandBuilder()
+      .setName('admin')
+      .setDescription('Server-wide admin control panel (economy, shop, sportsbook)')
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open the admin control panel')),
 
     new SlashCommandBuilder()
       .setName('leagueannounce')
@@ -7649,6 +7655,251 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_category') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      await showAdminPanelCategory(interaction, interaction.values[0], { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_back') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      await showAdminPanelHome(interaction, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_econ:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const action = interaction.customId.split(':')[1];
+
+      if (action === 'give' || action === 'take') {
+        const userMenu = new UserSelectMenuBuilder().setCustomId(`adminpanel_econ_user:${action}`).setPlaceholder(`Choose a user to ${action} currency`);
+        await interaction.reply({ content: `**${action === 'give' ? 'Give' : 'Take'} Currency** — choose a user`, components: [new ActionRowBuilder().addComponents(userMenu)], ephemeral: true });
+        return;
+      }
+
+      if (action === 'transactions') {
+        const settings = await getCurrencySettings(interaction.guild.id);
+        const result = await pool.query(
+          `SELECT * FROM currency_transactions WHERE guild_id = $1 ORDER BY created_at DESC LIMIT 15`,
+          [interaction.guild.id]
+        );
+        const embed = new EmbedBuilder()
+          .setTitle('Recent Transactions')
+          .setColor(0xFEE75C)
+          .setDescription(result.rows.length
+            ? result.rows.map(row => `<@${row.user_id}> — ${row.amount >= 0 ? '+' : ''}${row.amount} ${settings.currency_icon} • ${row.type}${row.reason ? ' • ' + row.reason : ''}`).join('\n')
+            : 'No transactions found yet.')
+          .setFooter({ text: 'GG Sports • Admin Panel' })
+          .setTimestamp();
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+      return;
+    }
+
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('adminpanel_econ_user:')) {
+      const action = interaction.customId.split(':')[1];
+      const targetUserId = interaction.values[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`adminpanel_econ_modal:${action}:${targetUserId}`)
+        .setTitle(action === 'give' ? 'Give Currency' : 'Take Currency')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('amount').setLabel('Amount').setStyle(TextInputStyle.Short).setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Short).setRequired(false)
+          ),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('adminpanel_econ_modal:')) {
+      const [, action, targetUserId] = interaction.customId.split(':');
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
+      const reason = interaction.fields.getTextInputValue('reason') || (action === 'give' ? 'Staff currency adjustment' : 'Staff currency adjustment');
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.reply({ content: 'Amount must be a whole number greater than 0.', ephemeral: true });
+        return;
+      }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      if (action === 'give') {
+        await addCurrency(interaction.guild.id, targetUserId, amount, 'staff_give', reason, interaction.user.id);
+        await interaction.reply({ content: `Gave **${settings.currency_icon} ${amount}** to <@${targetUserId}>.`, ephemeral: true });
+      } else {
+        const removed = await removeCurrency(interaction.guild.id, targetUserId, amount, 'staff_take', reason, interaction.user.id);
+        if (!removed) {
+          await interaction.reply({ content: `<@${targetUserId}> does not have enough ${settings.currency_name} to remove that amount.`, ephemeral: true });
+          return;
+        }
+        await interaction.reply({ content: `Removed **${settings.currency_icon} ${amount}** from <@${targetUserId}>.`, ephemeral: true });
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_shop:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const action = interaction.customId.split(':')[1];
+
+      if (action === 'create') {
+        const modal = new ModalBuilder()
+          .setCustomId('adminpanel_shop_create_modal')
+          .setTitle('Create Shop Item')
+          .addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Item name').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stock').setLabel('Stock (optional, blank = unlimited)').setStyle(TextInputStyle.Short).setRequired(false)),
+          );
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === 'remove') {
+        const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`, [interaction.guild.id]);
+        if (!items.rows.length) { await interaction.reply({ content: 'No active shop items to remove.', ephemeral: true }); return; }
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId('adminpanel_shop_remove_select')
+          .setPlaceholder('Choose an item to remove')
+          .addOptions(items.rows.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: `Price: ${item.price}`.slice(0, 100) })));
+        await interaction.reply({ content: '**Remove Shop Item**', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+        return;
+      }
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_shop_create_modal') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const name = interaction.fields.getTextInputValue('name');
+      const price = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
+      const description = interaction.fields.getTextInputValue('description') || null;
+      const stockRaw = interaction.fields.getTextInputValue('stock');
+      const stock = stockRaw ? Number.parseInt(stockRaw, 10) : null;
+      if (!Number.isInteger(price) || price <= 0) { await interaction.reply({ content: 'Price must be a whole number greater than 0.', ephemeral: true }); return; }
+      if (stock !== null && (!Number.isInteger(stock) || stock < 0)) { await interaction.reply({ content: 'Stock must be a whole number 0 or greater.', ephemeral: true }); return; }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const itemId = randomUUID();
+      await pool.query(
+        `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, created_by_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [itemId, interaction.guild.id, name, description, price, stock, interaction.user.id]
+      );
+      await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+      await interaction.reply({ content: `Shop item created: **${shortShopItemId(itemId)} • ${name}** for **${settings.currency_icon} ${price}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_shop_remove_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const itemId = interaction.values[0];
+      await interaction.update({ content: 'Removing item…', components: [] });
+      const item = await findShopItem(interaction.guild.id, itemId);
+      if (!item) { await interaction.editReply({ content: 'Could not find that shop item.', components: [] }); return; }
+      await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
+      await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+      await interaction.editReply({ content: `Removed/deactivated shop item **${item.item_name}**.`, components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_sb:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const action = interaction.customId.split(':')[1];
+
+      if (action === 'create') {
+        const modal = new ModalBuilder()
+          .setCustomId('adminpanel_sb_create_modal')
+          .setTitle('Create Sportsbook Game')
+          .addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('label').setLabel('Game label').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('home').setLabel('Home/Team A label').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('away').setLabel('Away/Team B label').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('home_odds').setLabel('Home odds (American, e.g. -110)').setStyle(TextInputStyle.Short).setRequired(false)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('away_odds').setLabel('Away odds (American, e.g. -110)').setStyle(TextInputStyle.Short).setRequired(false)),
+          );
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === 'settle') {
+        const components = await buildAdminSportsbookGamePickerComponents(interaction.guild, 'adminpanel_sb_settle_game');
+        if (!components) { await interaction.reply({ content: 'No open sportsbook games to settle.', ephemeral: true }); return; }
+        await interaction.reply({ content: '**Settle Sportsbook Game** — choose a game', components, ephemeral: true });
+        return;
+      }
+
+      if (action === 'refund') {
+        const components = await buildAdminSportsbookGamePickerComponents(interaction.guild, 'adminpanel_sb_refund_game');
+        if (!components) { await interaction.reply({ content: 'No open sportsbook games to refund.', ephemeral: true }); return; }
+        await interaction.reply({ content: '**Refund Sportsbook Game** — choose a game', components, ephemeral: true });
+        return;
+      }
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_sb_create_modal') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const label = interaction.fields.getTextInputValue('label');
+      const home = interaction.fields.getTextInputValue('home');
+      const away = interaction.fields.getTextInputValue('away');
+      const homeOddsRaw = interaction.fields.getTextInputValue('home_odds');
+      const awayOddsRaw = interaction.fields.getTextInputValue('away_odds');
+      const homeOdds = homeOddsRaw ? Number.parseInt(homeOddsRaw, 10) : -110;
+      const awayOdds = awayOddsRaw ? Number.parseInt(awayOddsRaw, 10) : -110;
+      if (!Number.isInteger(homeOdds) || !Number.isInteger(awayOdds) || homeOdds === 0 || awayOdds === 0) {
+        await interaction.reply({ content: 'Odds cannot be 0 and must be whole numbers, like -110, -150, +120, or 120.', ephemeral: true });
+        return;
+      }
+      const sportsbookGameId = randomUUID();
+      await pool.query(
+        `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [sportsbookGameId, interaction.guild.id, null, label, home, away, homeOdds, awayOdds, interaction.user.id]
+      );
+      await updateSportsbookPanel(interaction.guild).catch(() => null);
+      await interaction.reply({ content: `Sportsbook game created: **${shortSportsbookId(sportsbookGameId)} • ${label}**.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_sb_settle_game') {
+      const gameId = interaction.values[0];
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`adminpanel_sb_settle_winner:${gameId}`)
+        .setPlaceholder('Which side won?')
+        .addOptions([{ label: 'Home', value: 'home' }, { label: 'Away', value: 'away' }]);
+      await interaction.update({ content: '**Settle Sportsbook Game** — pick the winning side', components: [new ActionRowBuilder().addComponents(menu)] });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('adminpanel_sb_settle_winner:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const gameId = interaction.customId.split(':')[1];
+      const winner = interaction.values[0];
+      await interaction.update({ content: 'Settling game…', components: [] });
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+      if (!sportsbookGame || sportsbookGame.status !== 'open') {
+        await interaction.editReply({ content: 'Could not find an open sportsbook game with that ID.', components: [] });
+        return;
+      }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { winners, losers, totalPaid, parlayResult, winnerLabel } = await performSportsbookSettlement(interaction.guild, sportsbookGame, winner, interaction.user.id, settings);
+      await interaction.editReply({ content: `Settled. Winner: **${winnerLabel}**. Winning bets: **${winners}**. Losing bets: **${losers}**. Total paid: **${totalPaid}**. Parlays settled: **${parlayResult.settledCount}**.`, components: [] });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_sb_refund_game') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const gameId = interaction.values[0];
+      await interaction.update({ content: 'Refunding game…', components: [] });
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+      if (!sportsbookGame || sportsbookGame.status !== 'open') {
+        await interaction.editReply({ content: 'Could not find an open sportsbook game with that ID.', components: [] });
+        return;
+      }
+      const refunded = await refundSportsbookGameBets(interaction.guild, sportsbookGame, interaction.user.id, 'Admin panel refund');
+      await interaction.editReply({ content: `Refunded **${refunded.refundedCount}** bets for **${sportsbookGame.game_label}**.`, components: [] });
+      return;
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gmpanel_category:')) {
       const [, leagueId, encTeam] = interaction.customId.split(':');
       const teamName = decodeURIComponent(encTeam || '');
@@ -11715,6 +11966,24 @@ if (interaction.commandName === 'commissioner') {
       }
     }
 
+    if (interaction.commandName === 'admin') {
+      if (!interaction.guild) return;
+      const adminSubcommand = interaction.options.getSubcommand();
+
+      if (adminSubcommand === 'panel') {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
+          await interaction.reply({ content: 'You do not have permission to open the admin panel.', ephemeral: true });
+          return;
+        }
+        await interaction.reply({
+          embeds: [buildAdminPanelHomeEmbed(interaction.guild)],
+          components: buildAdminPanelHomeComponents(),
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
 if (interaction.commandName === 'badges') {
       if (!interaction.guild) return;
       const badgeSubcommand = interaction.options.getSubcommand();
@@ -12016,7 +12285,7 @@ if (interaction.commandName === 'trade') {
       }
 
       if (economySubcommand === 'give' || economySubcommand === 'take') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to manage currency.', ephemeral: true });
           return;
         }
@@ -12071,7 +12340,7 @@ if (interaction.commandName === 'trade') {
       }
 
       if (economySubcommand === 'transactions' || economySubcommand === 'banklog') {
-        if (economySubcommand === 'banklog' && !(await userCanUseLeagueSetup(interaction, league))) {
+        if (economySubcommand === 'banklog' && !(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to view the bank log.', ephemeral: true });
           return;
         }
@@ -12307,7 +12576,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (shopSubcommand === 'createitem') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to create shop items.', ephemeral: true });
           return;
         }
@@ -12404,7 +12673,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (shopSubcommand === 'removeitem') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to remove shop items.', ephemeral: true });
           return;
         }
@@ -14384,7 +14653,7 @@ if (shopSubcommand === 'view') {
       const subcommand = interaction.options.getSubcommand();
 
       if (subcommand === 'refund') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to refund sportsbook bets.', ephemeral: true });
           return;
         }
@@ -14409,7 +14678,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (subcommand === 'limits') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to update sportsbook limits.', ephemeral: true });
           return;
         }
@@ -14523,7 +14792,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (subcommand === 'create') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to create sportsbook games.', ephemeral: true });
           return;
         }
@@ -14623,7 +14892,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (subcommand === 'settle') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to settle sportsbook games.', ephemeral: true });
           return;
         }
@@ -14641,63 +14910,7 @@ if (shopSubcommand === 'view') {
           return;
         }
 
-        const bets = await pool.query(
-          `SELECT * FROM sportsbook_bets WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
-          [interaction.guild.id, sportsbookGame.id]
-        );
-
-        let winners = 0;
-        let losers = 0;
-        let totalPaid = 0;
-        const winningUserIds = new Set();
-        const lostBets = [];
-        for (const bet of bets.rows) {
-          if (bet.side === winner) {
-            await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, interaction.user.id);
-            await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_wins', 1).catch(() => null);
-            await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', Number(bet.potential_payout) - Number(bet.amount)).catch(() => null);
-            await addRecognitionPoints(interaction.guild.id, bet.user_id, 10, 2).catch(() => null);
-            winningUserIds.add(bet.user_id);
-            await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
-            winners += 1;
-            totalPaid += Number(bet.potential_payout);
-            const winSideLabel = bet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-            await postSportsbookFeed(interaction.guild, buildSportsbookWinAlertEmbed(settings, bet, sportsbookGame, winSideLabel));
-          } else {
-            await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', -Number(bet.amount)).catch(() => null);
-            lostBets.push(bet);
-            await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
-            losers += 1;
-          }
-        }
-
-        await pool.query(
-          `UPDATE sportsbook_games SET status = 'settled', winner_side = $1, settled_at = NOW() WHERE id = $2`,
-          [winner, sportsbookGame.id]
-        );
-
-        const parlayResult = typeof settleParlaysForSportsbookGame === 'function'
-          ? await settleParlaysForSportsbookGame(interaction.guild.id, sportsbookGame.id, winner, interaction.user.id)
-          : { settledCount: 0, parlayPaid: 0 };
-
-        const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-        await updateSportsbookPanel(interaction.guild).catch(() => null);
-        await postSportsbookFeed(interaction.guild, buildSportsbookSettlementAlertEmbed(sportsbookGame, winnerLabel, winners, losers, totalPaid, parlayResult));
-
-        for (const wonParlay of parlayResult.wonParlays || []) {
-          await postSportsbookFeed(interaction.guild, buildParlayHitAlertEmbed(settings, wonParlay));
-        }
-
-        const badBeatBet = getBadBeatBet(lostBets);
-        if (badBeatBet) {
-          const badBeatSideLabel = badBeatBet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-          await postSportsbookFeed(interaction.guild, buildBadBeatAlertEmbed(settings, badBeatBet, sportsbookGame, badBeatSideLabel));
-        }
-
-        const leaderboardSpotlight = await getSportsbookLeaderboardSpotlight(interaction.guild.id, [...winningUserIds]);
-        if (leaderboardSpotlight) {
-          await postSportsbookFeed(interaction.guild, buildSportsbookLeaderboardAlertEmbed(settings, leaderboardSpotlight));
-        }
+        const { winners, losers, totalPaid, parlayResult, winnerLabel } = await performSportsbookSettlement(interaction.guild, sportsbookGame, winner, interaction.user.id, settings);
 
         await interaction.reply({ content: 'Sportsbook settled. Winner: **' + winnerLabel + '**. Winning bets: **' + winners + '**. Losing bets: **' + losers + '**. Total paid: **' + totalPaid + '**. Parlays settled: **' + parlayResult.settledCount + '**. Parlay paid: **' + parlayResult.parlayPaid + '**.', ephemeral: true });
         return;
@@ -18286,6 +18499,68 @@ async function refundSportsbookGameBets(guild, sportsbookGame, issuedByUserId, r
 
   await postSportsbookFeed(guild, embed);
   return { refundedCount, refundedAmount };
+}
+
+async function performSportsbookSettlement(guild, sportsbookGame, winner, actorUserId, settings) {
+  const bets = await pool.query(
+    `SELECT * FROM sportsbook_bets WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+    [guild.id, sportsbookGame.id]
+  );
+
+  let winners = 0;
+  let losers = 0;
+  let totalPaid = 0;
+  const winningUserIds = new Set();
+  const lostBets = [];
+  for (const bet of bets.rows) {
+    if (bet.side === winner) {
+      await addCurrency(guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, actorUserId);
+      await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_wins', 1).catch(() => null);
+      await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', Number(bet.potential_payout) - Number(bet.amount)).catch(() => null);
+      await addRecognitionPoints(guild.id, bet.user_id, 10, 2).catch(() => null);
+      winningUserIds.add(bet.user_id);
+      await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
+      winners += 1;
+      totalPaid += Number(bet.potential_payout);
+      const winSideLabel = bet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+      await postSportsbookFeed(guild, buildSportsbookWinAlertEmbed(settings, bet, sportsbookGame, winSideLabel));
+    } else {
+      await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', -Number(bet.amount)).catch(() => null);
+      lostBets.push(bet);
+      await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
+      losers += 1;
+    }
+  }
+
+  await pool.query(
+    `UPDATE sportsbook_games SET status = 'settled', winner_side = $1, settled_at = NOW() WHERE id = $2`,
+    [winner, sportsbookGame.id]
+  );
+
+  const parlayResult = typeof settleParlaysForSportsbookGame === 'function'
+    ? await settleParlaysForSportsbookGame(guild.id, sportsbookGame.id, winner, actorUserId)
+    : { settledCount: 0, parlayPaid: 0 };
+
+  const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+  await updateSportsbookPanel(guild).catch(() => null);
+  await postSportsbookFeed(guild, buildSportsbookSettlementAlertEmbed(sportsbookGame, winnerLabel, winners, losers, totalPaid, parlayResult));
+
+  for (const wonParlay of parlayResult.wonParlays || []) {
+    await postSportsbookFeed(guild, buildParlayHitAlertEmbed(settings, wonParlay));
+  }
+
+  const badBeatBet = getBadBeatBet(lostBets);
+  if (badBeatBet) {
+    const badBeatSideLabel = badBeatBet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+    await postSportsbookFeed(guild, buildBadBeatAlertEmbed(settings, badBeatBet, sportsbookGame, badBeatSideLabel));
+  }
+
+  const leaderboardSpotlight = await getSportsbookLeaderboardSpotlight(guild.id, [...winningUserIds]);
+  if (leaderboardSpotlight) {
+    await postSportsbookFeed(guild, buildSportsbookLeaderboardAlertEmbed(settings, leaderboardSpotlight));
+  }
+
+  return { winners, losers, totalPaid, parlayResult, winnerLabel };
 }
 
 async function findSportsbookGame(guildId, input) {
@@ -25191,6 +25466,141 @@ async function showMaddenGmPanelCategory(interaction, leagueId, teamName, catego
   return update ? interaction.update(payload) : interaction.editReply(payload);
 }
 
+// ---------------------------------------------------------------------------
+// Admin Panel — server-wide (not per-league) controls for economy, shop, and
+// sportsbook. Consolidates existing staff-only slash commands into one panel,
+// same pattern as the Commissioner and GM panels.
+// ---------------------------------------------------------------------------
+const ADMIN_PANEL_CATEGORIES = [
+  { value: 'economy', label: 'Economy', description: 'Give/take currency, richest, transactions', emoji: '💰' },
+  { value: 'shop', label: 'Shop', description: 'Create/remove items, view active listings', emoji: '🛍️' },
+  { value: 'sportsbook', label: 'Sportsbook', description: 'Create/settle/refund games', emoji: '📊' },
+];
+
+function buildAdminPanelHomeEmbed(guild) {
+  return new EmbedBuilder()
+    .setTitle(`🛠️ ${guild.name} • Admin Panel`)
+    .setColor(0x5865F2)
+    .setDescription('Server-wide controls — not tied to any one league. Pick a category below. Old slash commands still work as advanced/manual backups.')
+    .setFooter({ text: 'GG Sports • Admin Panel' })
+    .setTimestamp();
+}
+
+function buildAdminPanelHomeComponents() {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('adminpanel_category')
+    .setPlaceholder('Choose a category')
+    .addOptions(ADMIN_PANEL_CATEGORIES.map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+function buildAdminPanelBackRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Overview').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function showAdminPanelHome(interaction, { update = true } = {}) {
+  const payload = { content: null, embeds: [buildAdminPanelHomeEmbed(interaction.guild)], components: buildAdminPanelHomeComponents() };
+  return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+async function buildAdminEconomyPayload(guild) {
+  const settings = await getCurrencySettings(guild.id);
+  const totalResult = await pool.query(
+    `SELECT COALESCE(SUM(balance), 0)::int AS total_balance, COUNT(*)::int AS users_with_balance
+     FROM guild_currency_balances WHERE guild_id = $1 AND balance > 0`,
+    [guild.id]
+  );
+  const richest = await pool.query(
+    `SELECT * FROM guild_currency_balances WHERE guild_id = $1 ORDER BY balance DESC, lifetime_earned DESC LIMIT 5`,
+    [guild.id]
+  );
+  const totals = totalResult.rows?.[0] || { total_balance: 0, users_with_balance: 0 };
+  const embed = new EmbedBuilder()
+    .setTitle(`💰 Economy • ${settings.currency_name}`)
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Total In Circulation', value: `${settings.currency_icon} ${totals.total_balance}`, inline: true },
+      { name: 'Users With Balance', value: String(totals.users_with_balance), inline: true },
+    )
+    .setDescription(richest.rows.length
+      ? '**Top 5 Richest**\n' + richest.rows.map((row, i) => `${i + 1}. <@${row.user_id}> — ${settings.currency_icon} ${row.balance}`).join('\n')
+      : 'No balances found yet.')
+    .setFooter({ text: 'GG Sports • Admin Panel' })
+    .setTimestamp();
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_econ:give').setLabel('Give Currency').setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('adminpanel_econ:take').setLabel('Take Currency').setEmoji('➖').setStyle(ButtonStyle.Danger),
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_econ:transactions').setLabel('Recent Transactions').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row1, row2, buildAdminPanelBackRow()] };
+}
+
+async function buildAdminShopPayload(guild) {
+  const settings = await getCurrencySettings(guild.id);
+  const items = await pool.query(
+    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY price ASC, item_name ASC LIMIT 25`,
+    [guild.id]
+  );
+  const embed = new EmbedBuilder()
+    .setTitle('🛍️ Server Shop')
+    .setColor(0xFEE75C)
+    .setDescription(items.rows.length
+      ? items.rows.map(item => `**${shortShopItemId(item.id)} • ${item.item_name}** — ${settings.currency_icon} ${item.price}${item.stock === null ? '' : ' • Stock: ' + item.stock}`).join('\n')
+      : 'No active shop items yet.')
+    .setFooter({ text: 'GG Sports • Admin Panel' })
+    .setTimestamp();
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_shop:create').setLabel('Create Item').setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('adminpanel_shop:remove').setLabel('Remove Item').setEmoji('➖').setStyle(ButtonStyle.Danger),
+  );
+  return { embeds: [embed], components: [row1, buildAdminPanelBackRow()] };
+}
+
+async function buildAdminSportsbookPayload(guild) {
+  const settings = await getCurrencySettings(guild.id);
+  const games = await pool.query(
+    `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 20`,
+    [guild.id]
+  );
+  const embed = buildSportsbookEmbed(settings, games.rows);
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_sb:create').setLabel('Create Game').setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('adminpanel_sb:settle').setLabel('Settle Game').setEmoji('🏁').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('adminpanel_sb:refund').setLabel('Refund Game').setEmoji('↩️').setStyle(ButtonStyle.Danger),
+  );
+  return { embeds: [embed], components: [row1, buildAdminPanelBackRow()] };
+}
+
+async function showAdminPanelCategory(interaction, category, { update = true } = {}) {
+  let payload;
+  if (category === 'economy') payload = await buildAdminEconomyPayload(interaction.guild);
+  else if (category === 'shop') payload = await buildAdminShopPayload(interaction.guild);
+  else if (category === 'sportsbook') payload = await buildAdminSportsbookPayload(interaction.guild);
+  else payload = { content: 'Unknown section.', embeds: [], components: [buildAdminPanelBackRow()] };
+  const finalPayload = { content: null, ...payload };
+  return update ? interaction.update(finalPayload) : interaction.editReply(finalPayload);
+}
+
+async function buildAdminSportsbookGamePickerComponents(guild, customIdPrefix) {
+  const games = await pool.query(
+    `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 25`,
+    [guild.id]
+  );
+  if (!games.rows.length) return null;
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(customIdPrefix)
+    .setPlaceholder('Choose an open sportsbook game...')
+    .addOptions(games.rows.map(g => ({
+      label: g.game_label.slice(0, 100),
+      value: g.id.slice(0, 100),
+      description: `${g.home_label} vs ${g.away_label}`.slice(0, 100),
+    })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
 
 function maddenTradeFinderPlayerKey(player) {
   return String(player?.roster_id || player?.external_player_id || player?.id || maddenPlayerDisplayName(player)).toLowerCase();
