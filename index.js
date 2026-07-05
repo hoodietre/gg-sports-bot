@@ -4033,6 +4033,21 @@ async function getCurrencySettings(guildId) {
   return result.rows[0] || { currency_name: 'GG Coins', currency_icon: '🪙', win_payout: 100, game_played_payout: 25, award_payout: 50 };
 }
 
+function buildCurrencySettingsEmbed(settings) {
+  return new EmbedBuilder()
+    .setTitle('Currency Settings')
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Currency Name', value: settings.currency_name || 'GG Coins', inline: true },
+      { name: 'Currency Icon', value: settings.currency_icon || '🪙', inline: true },
+      { name: 'Win Payout', value: String(settings.win_payout ?? 100), inline: true },
+      { name: 'Game Played Payout', value: String(settings.game_played_payout ?? 25), inline: true },
+      { name: 'Award Payout', value: String(settings.award_payout ?? 50), inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Economy' })
+    .setTimestamp();
+}
+
 async function getBalance(guildId, userId) {
   await pool.query(
     `INSERT INTO guild_currency_balances (guild_id, user_id)
@@ -7694,6 +7709,55 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await interaction.reply({ embeds: [embed], ephemeral: true });
         return;
       }
+
+      if (action === 'settings') {
+        const currentSettings = await getCurrencySettings(interaction.guild.id);
+        const editRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('adminpanel_econ_settings_edit').setLabel('Edit Settings').setEmoji('✏️').setStyle(ButtonStyle.Primary)
+        );
+        await interaction.reply({ embeds: [buildCurrencySettingsEmbed(currentSettings)], components: [editRow], ephemeral: true });
+        return;
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_econ_settings_edit') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const currentSettings = await getCurrencySettings(interaction.guild.id);
+      const modal = new ModalBuilder()
+        .setCustomId('adminpanel_econ_settings_modal')
+        .setTitle('Edit Currency Settings')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Currency name').setStyle(TextInputStyle.Short).setRequired(true).setValue(currentSettings.currency_name || 'GG Coins')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('icon').setLabel('Currency icon (emoji)').setStyle(TextInputStyle.Short).setRequired(true).setValue(currentSettings.currency_icon || '🪙')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('win_payout').setLabel('Win payout').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currentSettings.win_payout ?? 100))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game_played_payout').setLabel('Game played payout').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currentSettings.game_played_payout ?? 25))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_payout').setLabel('Award payout').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currentSettings.award_payout ?? 50))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_econ_settings_modal') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const name = interaction.fields.getTextInputValue('name');
+      const icon = interaction.fields.getTextInputValue('icon');
+      const winPayout = Number.parseInt(interaction.fields.getTextInputValue('win_payout'), 10);
+      const gamePlayedPayout = Number.parseInt(interaction.fields.getTextInputValue('game_played_payout'), 10);
+      const awardPayout = Number.parseInt(interaction.fields.getTextInputValue('award_payout'), 10);
+      if ([winPayout, gamePlayedPayout, awardPayout].some(n => !Number.isInteger(n) || n < 0)) {
+        await interaction.reply({ content: 'Payout amounts must be whole numbers 0 or greater.', ephemeral: true });
+        return;
+      }
+      await pool.query(
+        `INSERT INTO guild_currency_settings (guild_id, currency_name, currency_icon, win_payout, game_played_payout, award_payout, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (guild_id)
+         DO UPDATE SET currency_name = $2, currency_icon = $3, win_payout = $4, game_played_payout = $5, award_payout = $6, updated_at = NOW()`,
+        [interaction.guild.id, name, icon, winPayout, gamePlayedPayout, awardPayout]
+      );
+      const updatedSettings = await getCurrencySettings(interaction.guild.id);
+      await interaction.reply({ content: 'Currency settings updated.', embeds: [buildCurrencySettingsEmbed(updatedSettings)], ephemeral: true });
       return;
     }
 
@@ -12372,7 +12436,9 @@ if (interaction.commandName === 'trade') {
       }
 
       if (economySubcommand === 'settings') {
-        interaction.commandName = 'economy';
+        const currentSettings = await getCurrencySettings(interaction.guild.id);
+        await interaction.reply({ embeds: [buildCurrencySettingsEmbed(currentSettings)], ephemeral: true });
+        return;
       }
     }
 
@@ -13642,7 +13708,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (leagueSubcommand === 'currency') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to configure server currency.', ephemeral: true });
           return;
         }
@@ -25535,6 +25601,7 @@ async function buildAdminEconomyPayload(guild) {
   );
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('adminpanel_econ:transactions').setLabel('Recent Transactions').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('adminpanel_econ:settings').setLabel('Currency Settings').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row1, row2, buildAdminPanelBackRow()] };
 }
