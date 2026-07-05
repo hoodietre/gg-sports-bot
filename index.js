@@ -4727,6 +4727,9 @@ async function buildTournamentManagerHomePayload(guild) {
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('tourneypanel_create').setLabel('Create Tournament').setEmoji('➕').setStyle(ButtonStyle.Success)
   ));
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Admin Panel').setStyle(ButtonStyle.Secondary)
+  ));
   return { embeds: [embed], components };
 }
 
@@ -4773,6 +4776,9 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
   rows.push(row3);
 
   rows.push(buildTournamentManagerBackRow());
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Admin Panel').setStyle(ButtonStyle.Secondary)
+  ));
 
   return { embeds: [embed], components: rows };
 }
