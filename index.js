@@ -4760,7 +4760,18 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`tourneypanel_postpanel:${tournament.id}`).setLabel('Post Public Bracket Panel').setEmoji('📣').setStyle(ButtonStyle.Secondary)
   );
+  if (['open', 'closed', 'active'].includes(tournament.status)) {
+    row2.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_postpone:${tournament.id}`).setLabel('Postpone').setEmoji('🕒').setStyle(ButtonStyle.Secondary));
+  }
   rows.push(row2);
+
+  const row3 = new ActionRowBuilder();
+  if (['open', 'closed', 'active'].includes(tournament.status)) {
+    row3.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_cancel:${tournament.id}`).setLabel('Cancel Tournament').setEmoji('🛑').setStyle(ButtonStyle.Danger));
+  }
+  row3.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_delete:${tournament.id}`).setLabel('Delete Tournament').setEmoji('🗑️').setStyle(ButtonStyle.Danger));
+  rows.push(row3);
+
   rows.push(buildTournamentManagerBackRow());
 
   return { embeds: [embed], components: rows };
@@ -4872,6 +4883,15 @@ function buildTournamentRegistrationComponents(tournament) {
   )];
 }
 
+function buildTournamentCancelledEmbed(tournament) {
+  return new EmbedBuilder()
+    .setTitle(`🛑 ${tournament.tournament_name} — Cancelled`)
+    .setColor(0x99AAB5)
+    .setDescription('This tournament has been cancelled by staff. Any paid buy-ins have been refunded.')
+    .setFooter({ text: 'GG Sports • Tournament Cancelled' })
+    .setTimestamp();
+}
+
 async function updateTournamentPanel(guild, tournament) {
   const panelResult = await pool.query(
     `SELECT channel_id, message_id FROM tournament_panels WHERE tournament_id = $1`,
@@ -4885,6 +4905,11 @@ async function updateTournamentPanel(guild, tournament) {
 
   const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
   if (!message) return;
+
+  if (tournament.status === 'cancelled') {
+    await message.edit({ embeds: [buildTournamentCancelledEmbed(tournament)], components: [] });
+    return;
+  }
 
   if (tournament.status === 'open') {
     const entries = await getTournamentEntries(tournament.id);
@@ -8088,6 +8113,103 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const message = await targetChannel.send({ embeds: [buildTournamentPanelEmbed(tournament, matches)] });
       await saveTournamentPanel(tournamentId, interaction.guild.id, targetChannel.id, message.id);
       await interaction.reply({ content: `Public bracket panel posted in ${targetChannel.toString()}.`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_postpone:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId(`tourneypanel_postpone_modal:${tournamentId}`)
+        .setTitle('Postpone Tournament')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('New date').setStyle(TextInputStyle.Short).setRequired(false).setValue(tournament.starts_at || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('New time').setStyle(TextInputStyle.Short).setRequired(false).setValue(tournament.start_time || '')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('tourneypanel_postpone_modal:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const date = interaction.fields.getTextInputValue('date') || null;
+      const time = interaction.fields.getTextInputValue('time') || null;
+      await pool.query(`UPDATE tournaments SET starts_at = $2, start_time = $3, updated_at = NOW() WHERE id = $1`, [tournamentId, date, time]);
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      await updateTournamentPanel(interaction.guild, tournament).catch(() => null);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.reply({ content: `**${tournament.tournament_name}** rescheduled to ${date || 'TBD'} at ${time || 'TBD'}.`, ...payload, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_cancel:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      await interaction.deferUpdate();
+      const entries = await getTournamentEntries(tournamentId);
+      for (const entry of entries) {
+        if (Number(entry.paid_buy_in) > 0) {
+          await addCurrency(interaction.guild.id, entry.user_id, Number(entry.paid_buy_in), 'tournament_refund', `Cancelled: ${tournament.tournament_name}`, interaction.user.id).catch(() => null);
+        }
+      }
+      await pool.query(`UPDATE tournaments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`, [tournamentId]);
+      const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
+      await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament);
+      await interaction.editReply({ content: `**${tournament.tournament_name}** cancelled. ${entries.length ? 'Buy-ins refunded.' : ''}`, ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_delete:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`tourneypanel_delete_confirm:${tournamentId}`).setLabel('Yes, Delete Permanently').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`tourneypanel_delete_abort:${tournamentId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.reply({ content: `Delete **${tournament.tournament_name}** permanently? This removes all entries and match data and cannot be undone. Unrefunded buy-ins will be returned first.`, components: [confirmRow], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_delete_abort:')) {
+      await interaction.update({ content: 'Delete cancelled.', components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_delete_confirm:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.update({ content: 'Tournament already deleted.', components: [] }); return; }
+      await interaction.update({ content: 'Deleting…', components: [] });
+
+      if (tournament.status !== 'cancelled' && tournament.status !== 'completed') {
+        const entries = await getTournamentEntries(tournamentId);
+        for (const entry of entries) {
+          if (Number(entry.paid_buy_in) > 0) {
+            await addCurrency(interaction.guild.id, entry.user_id, Number(entry.paid_buy_in), 'tournament_refund', `Deleted: ${tournament.tournament_name}`, interaction.user.id).catch(() => null);
+          }
+        }
+      }
+
+      const panelResult = await pool.query(`SELECT channel_id, message_id FROM tournament_panels WHERE tournament_id = $1`, [tournamentId]);
+      if (panelResult.rows.length) {
+        const panelChannel = await interaction.guild.channels.fetch(panelResult.rows[0].channel_id).catch(() => null);
+        if (panelChannel?.isTextBased?.()) {
+          const panelMessage = await panelChannel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
+          if (panelMessage) await panelMessage.delete().catch(() => null);
+        }
+      }
+
+      await pool.query(`DELETE FROM tournaments WHERE id = $1`, [tournamentId]);
+      await interaction.editReply({ content: `**${tournament.tournament_name}** has been permanently deleted.`, components: [] });
       return;
     }
 
