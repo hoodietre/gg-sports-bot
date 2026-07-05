@@ -2290,7 +2290,7 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('commissioner')
       .setDescription('Commissioner/admin control panel')
-      .addSubcommand(sc => sc.setName('panel').setDescription('Open the commissioner control panel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open the commissioner control panel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('gm')
@@ -5881,6 +5881,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isAutocomplete()) {
       try {
         const commandName = interaction.commandName;
+        if (commandName === 'commissioner') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
         if (commandName === 'maddengames') {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
@@ -7248,7 +7257,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       embed.setDescription(embed.data.description + '\n\n' + message);
       await interaction.update({
         embeds: [embed],
-        components: buildSetupPanelMenuComponents(leagueId),
+        components: buildSetupPanelMenuComponents(leagueId, getLeagueSportKey(league) === 'madden'),
       });
       return;
     }
@@ -7271,14 +7280,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       if (category === 'setup') {
         await interaction.update({
           embeds: [buildSetupDashboardEmbed(league)],
-          components: buildSetupDashboardComponents(leagueId),
+          components: buildSetupDashboardComponents(leagueId, null, getLeagueSportKey(league) === 'madden'),
         });
         return;
       }
       if (category === 'panels') {
         await interaction.update({
           embeds: [buildSetupPanelMenuEmbed(league)],
-          components: buildSetupPanelMenuComponents(leagueId),
+          components: buildSetupPanelMenuComponents(leagueId, getLeagueSportKey(league) === 'madden'),
         });
         return;
       }
@@ -8799,6 +8808,105 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.isButton() && interaction.customId === 'memberprofile_back') {
       await showMemberProfileHome(interaction, interaction.user, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_league_create') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('adminpanel_league_create_modal')
+        .setTitle('Create League')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('League name').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game').setLabel('Game (nba/mlb/nhl/cfb/fc/madden/general)').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_league_create_modal') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true }); return; }
+      const leagueName = interaction.fields.getTextInputValue('name');
+      const gameKey = (interaction.fields.getTextInputValue('game') || 'general').toLowerCase().trim();
+      const leagueId = randomUUID();
+      await pool.query(
+        `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`,
+        [interaction.guild.id, interaction.guild.name]
+      );
+      await pool.query(
+        `INSERT INTO leagues (league_id, guild_id, league_name, game_key) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (guild_id, league_name) DO UPDATE SET is_active = TRUE`,
+        [leagueId, interaction.guild.id, leagueName, gameKey]
+      );
+      const savedLeague = await getLeagueByName(interaction.guild.id, leagueName);
+      await pool.query(`INSERT INTO league_settings (league_id) VALUES ($1) ON CONFLICT (league_id) DO NOTHING`, [savedLeague.league_id]);
+      await interaction.deferReply({ ephemeral: true });
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      await interaction.editReply({ content: `League created: **${leagueName}** (${gameKey.toUpperCase()}).`, ...payload });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_league_delete_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to delete leagues.', ephemeral: true }); return; }
+      const leagueId = interaction.values[0];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`adminpanel_league_delete_confirm:${leagueId}`).setLabel('Yes, Delete').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('adminpanel_league_delete_abort').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.update({ content: `Delete **${league.league_name}**? This deactivates the league (soft delete) — its data is kept but it will no longer appear as active.`, embeds: [], components: [confirmRow] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_league_delete_abort') {
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      await interaction.update({ content: 'Delete cancelled.', ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_league_delete_confirm:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to delete leagues.', ephemeral: true }); return; }
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      await pool.query(`UPDATE leagues SET is_active = FALSE WHERE league_id = $1`, [leagueId]);
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      await interaction.update({ content: `League deactivated: **${league.league_name}**.`, ...payload });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_league_teamrole_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage team roles.', ephemeral: true }); return; }
+      const leagueId = interaction.values[0];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const roleMenu = new RoleSelectMenuBuilder()
+        .setCustomId(`adminpanel_league_teamrole_pick:${leagueId}`)
+        .setPlaceholder(`Choose a role to add as a team in ${league.league_name}`);
+      await interaction.update({ content: `**Add Team Role** — ${league.league_name}`, embeds: [], components: [new ActionRowBuilder().addComponents(roleMenu)] });
+      return;
+    }
+
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('adminpanel_league_teamrole_pick:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage team roles.', ephemeral: true }); return; }
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const role = interaction.roles.first();
+      await pool.query(
+        `INSERT INTO league_team_roles (league_id, role_id, role_name) VALUES ($1, $2, $3)
+         ON CONFLICT (league_id, role_id) DO UPDATE SET role_name = EXCLUDED.role_name`,
+        [leagueId, role.id, role.name]
+      );
+      await pool.query(
+        `INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count) VALUES ($1, $2, $3, 0)
+         ON CONFLICT (league_id, role_id) DO NOTHING`,
+        [leagueId, role.id, role.name]
+      );
+      await interaction.deferReply({ ephemeral: true });
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      await interaction.editReply({ content: `Added **${role.name}** as a team in **${league.league_name}**.`, ...payload });
       return;
     }
 
@@ -14631,7 +14739,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (leagueSubcommand === 'playoffs') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to generate playoff brackets.', ephemeral: true });
           return;
         }
@@ -14680,7 +14788,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (leagueSubcommand === 'delete') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to delete leagues.', ephemeral: true });
           return;
         }
@@ -14736,7 +14844,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (leagueSubcommand === 'create') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true });
           return;
         }
@@ -14846,7 +14954,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (leagueSubcommand === 'teamrole') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to update league team roles.', ephemeral: true });
           return;
         }
@@ -21449,6 +21557,32 @@ function buildBadgeProgressEmbed(user, recognition = {}) {
 
 
 // 7J-10BY-DL: Setup dashboard includes League History Channel wiring.
+const MADDEN_ONLY_SETUP_KEYS = new Set([
+  'madden_free_agents_channel',
+  'trade_block_channel',
+  'trade_negotiation_channel',
+  'player_search_channel',
+  'gm_panel_channel',
+  'league_leaders_channel',
+  'award_race_channel',
+  'madden_news_channel',
+  'madden_standings_channel',
+  'madden_power_rankings_channel',
+  'madden_sportsbook_channel',
+]);
+
+const MADDEN_ONLY_PANEL_KEYS = new Set([
+  'madden_standings_panel',
+  'madden_power_rankings_panel',
+  'madden_free_agents_panel',
+  'trade_block_board_panel',
+  'trade_negotiation_starter_panel',
+  'player_search_panel',
+  'gm_panel_starter_panel',
+  'league_leaders_panel',
+  'award_race_panel',
+]);
+
 const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_role', label: 'League Role', description: 'Main league member role', kind: 'role' },
   { value: 'staff_role', label: 'Staff Role', description: 'Role allowed to manage league tools', kind: 'role' },
@@ -21623,21 +21757,23 @@ function buildSetupPanelMenuEmbed(league) {
     .setTimestamp();
 }
 
-function buildSetupPanelMenuComponents(leagueId) {
+function buildSetupPanelMenuComponents(leagueId, isMaddenLeague = true) {
+  const filteredOptions = isMaddenLeague ? SETUP_PANEL_OPTIONS : SETUP_PANEL_OPTIONS.filter(o => !MADDEN_ONLY_PANEL_KEYS.has(o.value));
   const panelMenu = new StringSelectMenuBuilder()
     .setCustomId('setup_create_panel:' + leagueId)
     .setPlaceholder('Create/refresh a setup panel')
-    .addOptions(SETUP_PANEL_OPTIONS.map(option => ({
+    .addOptions(filteredOptions.map(option => ({
       label: option.label,
       value: option.value,
     })));
   return [new ActionRowBuilder().addComponents(panelMenu), buildCommissionerBackRow(leagueId)];
 }
 
-function buildSetupDashboardComponents(leagueId, selectedSetting = null) {
-  const half = Math.ceil(SETUP_DASHBOARD_OPTIONS.length / 2);
-  const groupA = SETUP_DASHBOARD_OPTIONS.slice(0, half);
-  const groupB = SETUP_DASHBOARD_OPTIONS.slice(half);
+function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMaddenLeague = true) {
+  const filteredOptions = isMaddenLeague ? SETUP_DASHBOARD_OPTIONS : SETUP_DASHBOARD_OPTIONS.filter(o => !MADDEN_ONLY_SETUP_KEYS.has(o.value));
+  const half = Math.ceil(filteredOptions.length / 2);
+  const groupA = filteredOptions.slice(0, half);
+  const groupB = filteredOptions.slice(half);
 
   const settingMenuA = new StringSelectMenuBuilder()
     .setCustomId('setup_select_setting:' + leagueId)
@@ -21702,7 +21838,7 @@ async function refreshSetupDashboardInteraction(interaction, leagueId, selectedS
 
   await interaction.update({
     embeds: [embed],
-    components: buildSetupDashboardComponents(league.league_id, selectedSetting),
+    components: buildSetupDashboardComponents(league.league_id, selectedSetting, getLeagueSportKey(league) === 'madden'),
   });
 }
 
@@ -26943,6 +27079,7 @@ async function showMaddenGmPanelCategory(interaction, leagueId, teamName, catego
 // same pattern as the Commissioner and GM panels.
 // ---------------------------------------------------------------------------
 const ADMIN_PANEL_CATEGORIES = [
+  { value: 'leagues', label: 'League Setup', description: 'Create/delete leagues, add team roles', emoji: '🏟️' },
   { value: 'economy', label: 'Economy', description: 'Give/take currency, richest, transactions', emoji: '💰' },
   { value: 'shop', label: 'Shop', description: 'Create/remove items, view active listings', emoji: '🛍️' },
   { value: 'sportsbook', label: 'Sportsbook', description: 'Create/settle/refund games', emoji: '📊' },
@@ -26975,6 +27112,41 @@ function buildAdminPanelBackRow() {
 async function showAdminPanelHome(interaction, { update = true } = {}) {
   const payload = { content: null, embeds: [buildAdminPanelHomeEmbed(interaction.guild)], components: buildAdminPanelHomeComponents() };
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+async function buildAdminLeagueSetupPayload(guild) {
+  const result = await pool.query(
+    `SELECT * FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY league_name ASC LIMIT 25`,
+    [guild.id]
+  );
+  const embed = new EmbedBuilder()
+    .setTitle('🏟️ League Setup')
+    .setColor(0x5865F2)
+    .setDescription(result.rows.length
+      ? result.rows.map(l => `**${l.league_name}** — ${(l.game_key || 'general').toUpperCase()}${l.season_length ? ' • ' + l.season_length + ' games' : ''}`).join('\n')
+      : 'No leagues created yet.')
+    .setFooter({ text: 'GG Sports • Admin Panel' })
+    .setTimestamp();
+
+  const components = [];
+  if (result.rows.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('adminpanel_league_teamrole_select')
+      .setPlaceholder('Choose a league to add a team role to')
+      .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
+    components.push(new ActionRowBuilder().addComponents(menu));
+
+    const deleteMenu = new StringSelectMenuBuilder()
+      .setCustomId('adminpanel_league_delete_select')
+      .setPlaceholder('Choose a league to delete')
+      .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
+    components.push(new ActionRowBuilder().addComponents(deleteMenu));
+  }
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_league_create').setLabel('Create League').setEmoji('➕').setStyle(ButtonStyle.Success)
+  ));
+  components.push(buildAdminPanelBackRow());
+  return { embeds: [embed], components };
 }
 
 async function buildAdminEconomyPayload(guild) {
@@ -27050,7 +27222,8 @@ async function buildAdminSportsbookPayload(guild) {
 
 async function showAdminPanelCategory(interaction, category, { update = true } = {}) {
   let payload;
-  if (category === 'economy') payload = await buildAdminEconomyPayload(interaction.guild);
+  if (category === 'leagues') payload = await buildAdminLeagueSetupPayload(interaction.guild);
+  else if (category === 'economy') payload = await buildAdminEconomyPayload(interaction.guild);
   else if (category === 'shop') payload = await buildAdminShopPayload(interaction.guild);
   else if (category === 'sportsbook') payload = await buildAdminSportsbookPayload(interaction.guild);
   else if (category === 'tournament') payload = await buildTournamentManagerHomePayload(interaction.guild);
@@ -50912,18 +51085,25 @@ const COMMISSIONER_CATEGORIES = [
 ];
 
 function buildCommissionerHomeEmbed(league, settings = {}) {
-  return new EmbedBuilder()
+  const isMadden = getLeagueSportKey(league) === 'madden';
+  const embed = new EmbedBuilder()
     .setTitle(`${GG_EMOJI} GG Sports Commissioner Panel`)
     .setColor(0x5865F2)
     .setDescription('League: **' + league.league_name + '**\nPick a category below to manage this league. Old slash commands still work as advanced/manual backups.')
-    .addFields(
+    .setFooter({ text: 'GG Sports • Commissioner Panel' })
+    .setTimestamp();
+
+  if (isMadden) {
+    embed.addFields(
       { name: 'Auto-Detection', value: settings.auto_detect_enabled ? '✅ On' : '❌ Off', inline: true },
       { name: 'Transaction Threshold', value: String(settings.auto_detect_threshold || 30), inline: true },
       { name: 'Last Processed Week', value: settings.last_auto_detect_week_label || 'None yet', inline: true },
-      { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
-    )
-    .setFooter({ text: 'GG Sports • Commissioner Panel' })
-    .setTimestamp();
+    );
+  }
+  embed.addFields(
+    { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
+  );
+  return embed;
 }
 
 function buildCommissionerHomeComponents(leagueId) {
@@ -50965,7 +51145,15 @@ async function showCommissionerHome(interaction, leagueId, note = null) {
   }
 }
 
-function buildCommissionerOperationsComponents(leagueId) {
+function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true) {
+  if (!isMaddenLeague) {
+    return [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('commissioner_op:announce:' + leagueId).setLabel('League Announcement').setEmoji('📣').setStyle(ButtonStyle.Primary),
+      ),
+      buildCommissionerBackRow(leagueId),
+    ];
+  }
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('commissioner_op:connect:' + leagueId).setLabel('Connect to EA').setEmoji('🔗').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('commissioner_op:sync:' + leagueId).setLabel('Run Sync').setStyle(ButtonStyle.Primary),
@@ -50983,15 +51171,26 @@ function buildCommissionerOperationsComponents(leagueId) {
   return [row1, row2, row3, buildCommissionerBackRow(leagueId)];
 }
 
+function buildCommissionerGenericOperationsEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle(`⚙️ Operations • ${league.league_name}`)
+    .setColor(0x5865F2)
+    .setDescription('This league is not a Madden league, so EA sync, auto-detection, and transaction/retirement scanning don\'t apply here. League Announcement is available below.')
+    .setFooter({ text: 'GG Sports • Commissioner Panel' })
+    .setTimestamp();
+}
+
 async function showCommissionerOperations(interaction, leagueId) {
   const league = await getLeagueById(leagueId);
   if (!league) {
     await interaction.update({ content: 'League not found.', embeds: [], components: [] });
     return;
   }
-  const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
-  const embed = buildMaddenAutoDetectSettingsEmbed(league, settings);
-  const payload = { embeds: [embed], components: buildCommissionerOperationsComponents(leagueId) };
+  const isMadden = getLeagueSportKey(league) === 'madden';
+  const embed = isMadden
+    ? buildMaddenAutoDetectSettingsEmbed(league, await ensureMaddenLeagueSettings(league).catch(() => ({})))
+    : buildCommissionerGenericOperationsEmbed(league);
+  const payload = { embeds: [embed], components: buildCommissionerOperationsComponents(leagueId, isMadden) };
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply(payload);
   } else {
