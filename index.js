@@ -7231,20 +7231,22 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await interaction.reply({ content: "You don't own a team in this league, so there's nothing for you to add to the trade block. Ask your commissioner to assign you one.", ephemeral: true });
         return;
       }
-      const { rows } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, ownedTeam.team_name, { offset: 0, limit: 25, excludeFreeAgents: true });
-      if (!rows.length) {
-        await interaction.reply({ content: 'No roster data found for your team yet.', ephemeral: true });
-        return;
-      }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`madtb:add_select:${leagueId}`)
-        .setPlaceholder(`Choose a player from ${ownedTeam.team_name} to add`)
-        .addOptions(rows.map(r => ({
-          label: String(r.player_name || 'Unknown').slice(0, 100),
-          value: String(r.player_name || 'unknown').slice(0, 100),
-          description: `${r.position || 'POS'} • ${r.overall || 'N/A'} OVR`.slice(0, 100),
-        })));
-      await interaction.reply({ content: `**Add to Trade Block** — ${ownedTeam.team_name}`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      const payload = await buildMaddenAddToBlockPickerPayload(interaction.guild.id, league.league_id, ownedTeam.team_name, 0, `madtb:add_select:${leagueId}`, `madtb:add_page:${leagueId}`);
+      await interaction.reply({ ...payload, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('madtb:add_page:')) {
+      const parts = interaction.customId.split(':');
+      const leagueId = parts[2];
+      const page = Math.max(0, Number(parts[3] || 0));
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      const ownedTeam = await getMaddenTeamOwnedByUser(interaction.guild.id, league.league_id, interaction.user.id);
+      if (!ownedTeam) { await interaction.update({ content: "You don't own a team in this league.", components: [] }); return; }
+      await interaction.deferUpdate();
+      const payload = await buildMaddenAddToBlockPickerPayload(interaction.guild.id, league.league_id, ownedTeam.team_name, page, `madtb:add_select:${leagueId}`, `madtb:add_page:${leagueId}`);
+      await interaction.editReply(payload);
       return;
     }
 
@@ -7619,6 +7621,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const ranks = await getMaddenPlayerLeagueRanks(interaction.guild.id, league.league_id, player);
       const valueRankContext = await getMaddenPlayerValueRankContext(interaction.guild.id, league.league_id, player);
       const encTeamBack = encodeURIComponent(teamName).slice(0, 80);
+      const encPlayerName = encodeURIComponent(String(player.player_name || playerName).slice(0, 80));
       const backToRosterRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`gmpanel_roster_page:${leagueId}:${encTeamBack}:${pageStr || 0}`).setLabel('⬅ Back to Roster').setStyle(ButtonStyle.Secondary)
       );
@@ -7627,12 +7630,37 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         embeds: [buildMaddenPlayerProfileEmbed(league, player, statRows, ranks, valueRankContext)],
         components: [backToRosterRow, new ActionRowBuilder().addComponents(
           new ButtonBuilder()
-            .setCustomId('madneg_from_profile:' + leagueId + ':' + encodeURIComponent(String(player.player_name || playerName).slice(0, 80)))
+            .setCustomId('madneg_from_profile:' + leagueId + ':' + encPlayerName)
             .setLabel('Start Negotiation')
             .setEmoji('🤝')
-            .setStyle(ButtonStyle.Primary)
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder()
+            .setCustomId(`gmpanel_roster_addblock:${leagueId}:${encTeamBack}:${encPlayerName}`)
+            .setLabel('Add to Block')
+            .setEmoji('➕')
+            .setStyle(ButtonStyle.Success),
         )],
       });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gmpanel_roster_addblock:')) {
+      const [, leagueId, encTeam, encPlayerName] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      const playerName = decodeURIComponent(encPlayerName || '');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      const ownedTeam = await getMaddenTeamOwnedByUser(interaction.guild.id, league.league_id, interaction.user.id);
+      const isOwner = ownedTeam && ownedTeam.team_name?.toLowerCase() === teamName.toLowerCase();
+      if (!isOwner && !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only the team owner or league staff can manage this trade block.', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      await addMaddenTradeBlockEntry(interaction.guild.id, league, member, interaction.user.id, playerName, '', '').catch(() => null);
+      await refreshMaddenTradeBlockBoardForLeague(interaction.guild, league).catch(() => null);
+      await interaction.editReply({ content: `Added **${playerName}** to the trade block. The board has been refreshed.` });
       return;
     }
 
@@ -7648,33 +7676,26 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const teamName = decodeURIComponent(encTeam || '');
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
-      const teamRow = await pool.query(
-        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) LIMIT 1`,
-        [String(interaction.guild.id), String(league.league_id), teamName]
-      ).then(r => r.rows?.[0]).catch(() => null);
-      const isOwner = teamRow?.owner_user_id === interaction.user.id;
+      const ownedTeam = await getMaddenTeamOwnedByUser(interaction.guild.id, league.league_id, interaction.user.id);
+      const isOwner = ownedTeam && ownedTeam.team_name?.toLowerCase() === teamName.toLowerCase();
       if (!isOwner && !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'Only the team owner or league staff can manage this trade block.', ephemeral: true });
         return;
       }
-      const { rows } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset: 0, limit: 25, excludeFreeAgents: true });
-      if (!rows.length) {
-        await interaction.update({ content: 'No roster data found for this team yet.', embeds: [], components: [buildMaddenGmPanelBackRow(leagueId, teamName)] });
-        return;
-      }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`gmpanel_addblock_select:${leagueId}:${encTeam}`)
-        .setPlaceholder('Choose a player to add to the block')
-        .addOptions(rows.map(r => ({
-          label: String(r.player_name || 'Unknown').slice(0, 100),
-          value: String(r.player_name || 'unknown').slice(0, 100),
-          description: `${r.position || 'POS'} • ${r.overall || 'N/A'} OVR`.slice(0, 100),
-        })));
-      await interaction.update({
-        content: `**Add to Trade Block** — ${teamName}`,
-        embeds: [],
-        components: [new ActionRowBuilder().addComponents(menu), buildMaddenGmPanelBackRow(leagueId, teamName)],
-      });
+      const payload = await buildMaddenAddToBlockPickerPayload(interaction.guild.id, league.league_id, teamName, 0, `gmpanel_addblock_select:${leagueId}:${encTeam}`, `gmpanel_addblock_page:${leagueId}:${encTeam}`);
+      await interaction.update({ content: payload.content, embeds: [], components: [...payload.components, buildMaddenGmPanelBackRow(leagueId, teamName)] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gmpanel_addblock_page:')) {
+      const [, leagueId, encTeam, pageStr] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam || '');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const page = Math.max(0, Number(pageStr || 0));
+      await interaction.deferUpdate();
+      const payload = await buildMaddenAddToBlockPickerPayload(interaction.guild.id, league.league_id, teamName, page, `gmpanel_addblock_select:${leagueId}:${encTeam}`, `gmpanel_addblock_page:${leagueId}:${encTeam}`);
+      await interaction.editReply({ content: payload.content, embeds: [], components: [...payload.components, buildMaddenGmPanelBackRow(leagueId, teamName)] });
       return;
     }
 
@@ -7698,11 +7719,8 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const teamName = decodeURIComponent(encTeam || '');
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
-      const teamRow = await pool.query(
-        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) LIMIT 1`,
-        [String(interaction.guild.id), String(league.league_id), teamName]
-      ).then(r => r.rows?.[0]).catch(() => null);
-      const isOwner = teamRow?.owner_user_id === interaction.user.id;
+      const ownedTeam = await getMaddenTeamOwnedByUser(interaction.guild.id, league.league_id, interaction.user.id);
+      const isOwner = ownedTeam && ownedTeam.team_name?.toLowerCase() === teamName.toLowerCase();
       if (!isOwner && !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'Only the team owner or league staff can manage this trade block.', ephemeral: true });
         return;
@@ -24950,6 +24968,30 @@ async function showMaddenGmPanelHome(interaction, leagueId, teamName, { update =
   const embed = await buildMaddenGmPanelHomeEmbed(interaction.guild.id, league, teamName);
   const payload = { content: null, embeds: [embed], components: buildMaddenGmPanelHomeComponents(leagueId, teamName) };
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+async function buildMaddenAddToBlockPickerPayload(guildId, leagueId, teamName, page, selectCustomId, navCustomIdPrefix) {
+  const { rows, total } = await getMaddenTeamRosterPage(guildId, leagueId, teamName, { offset: page * 25, limit: 25, excludeFreeAgents: true });
+  if (!rows.length) {
+    return { content: page > 0 ? 'No more players on this page.' : 'No roster data found for this team yet.', components: [] };
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(selectCustomId)
+    .setPlaceholder(`Choose a player from ${teamName} to add`)
+    .addOptions(rows.map(r => ({
+      label: String(r.player_name || 'Unknown').slice(0, 100),
+      value: String(r.player_name || 'unknown').slice(0, 100),
+      description: `${r.position || 'POS'} • ${r.overall || 'N/A'} OVR`.slice(0, 100),
+    })));
+  const rowsOut = [new ActionRowBuilder().addComponents(menu)];
+  if (total > 25) {
+    const totalPages = Math.ceil(total / 25);
+    rowsOut.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`${navCustomIdPrefix}:${Math.max(0, page - 1)}`).setLabel(`Previous (${page + 1}/${totalPages})`).setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+      new ButtonBuilder().setCustomId(`${navCustomIdPrefix}:${Math.min(totalPages - 1, page + 1)}`).setLabel(`Next (${page + 1}/${totalPages})`).setStyle(ButtonStyle.Primary).setDisabled(page >= totalPages - 1),
+    ));
+  }
+  return { content: `**Add to Trade Block** — ${teamName}`, components: rowsOut };
 }
 
 async function buildMaddenGmBlockCategoryPayload(interaction, league, teamName) {
