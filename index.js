@@ -606,6 +606,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_announcement_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_leaders_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS award_race_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS member_profile_channel_id TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_award_race_panels (
       guild_id TEXT NOT NULL,
@@ -2353,7 +2354,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('activity').setDescription('Show profile activity snapshot').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('earnings').setDescription('Show all-time economy and sportsbook earnings').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('milestones').setDescription('Show activity and legacy milestones').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
-      .addSubcommand(sc => sc.setName('badges').setDescription('Show earned profile badges and cosmetic progress').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false))),
+      .addSubcommand(sc => sc.setName('badges').setDescription('Show earned profile badges and cosmetic progress').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open your interactive member profile panel')),
 
     new SlashCommandBuilder()
       .setName('activity')
@@ -3170,7 +3172,7 @@ async function getLeagueByName(guildId, leagueName) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -3185,7 +3187,7 @@ async function getLeagueById(leagueId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -3199,7 +3201,7 @@ async function getLeagueByChannel(guildId, channelId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
@@ -3218,7 +3220,7 @@ async function getDefaultLeague(guildId) {
     `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
             s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -7670,6 +7672,21 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId === 'memberprofile_open') {
+      await showMemberProfileHome(interaction, interaction.user, { update: false });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'memberprofile_category') {
+      await showMemberProfileCategory(interaction, interaction.user, interaction.values[0], { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'memberprofile_back') {
+      await showMemberProfileHome(interaction, interaction.user, { update: true });
+      return;
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_category') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
       await showAdminPanelCategory(interaction, interaction.values[0], { update: true });
@@ -9686,108 +9703,8 @@ if (gameSubcommand === 'report') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
-
-        const recognitionResult = await pool.query(
-          `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
-          [interaction.guild.id, targetUser.id]
-        );
-        const recognition = recognitionResult.rows[0] || {};
-
-        const balanceResult = await pool.query(
-          `SELECT balance, lifetime_earned, lifetime_spent
-           FROM guild_currency_balances
-           WHERE guild_id = $1 AND user_id = $2
-           LIMIT 1`,
-          [interaction.guild.id, targetUser.id]
-        );
-        const balance = balanceResult.rows[0] || { balance: 0, lifetime_earned: 0, lifetime_spent: 0 };
-
-        const betResult = await pool.query(
-          `SELECT
-             COUNT(*) FILTER (WHERE status IN ('won','lost')) AS settled_bets,
-             COUNT(*) FILTER (WHERE status = 'won') AS won_bets,
-             COUNT(*) FILTER (WHERE status = 'lost') AS lost_bets,
-             COALESCE(SUM(amount), 0) AS total_wagered,
-             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS net_profit
-           FROM sportsbook_bets
-           WHERE guild_id = $1 AND user_id = $2`,
-          [interaction.guild.id, targetUser.id]
-        );
-        const bets = betResult.rows[0] || {};
-
-        const parlayResult = await pool.query(
-          `SELECT
-             COUNT(*) FILTER (WHERE status IN ('won','lost')) AS settled_parlays,
-             COUNT(*) FILTER (WHERE status = 'won') AS won_parlays,
-             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS parlay_profit
-           FROM sportsbook_parlays
-           WHERE guild_id = $1 AND user_id = $2`,
-          [interaction.guild.id, targetUser.id]
-        );
-        const parlays = parlayResult.rows[0] || {};
-
-        const tournamentResult = activeLeague
-          ? await pool.query(
-              `SELECT
-                 COUNT(*) FILTER (WHERE champion_user_id = $3) AS tournament_titles,
-                 COUNT(*) FILTER (WHERE mvp_user_id = $3) AS tournament_mvps,
-                 COALESCE(SUM(CASE WHEN champion_user_id = $3 THEN prize_paid ELSE 0 END), 0) AS tournament_prizes,
-                 COALESCE(SUM(CASE WHEN mvp_user_id = $3 THEN mvp_payout ELSE 0 END), 0) AS mvp_prizes
-               FROM tournament_history
-               WHERE guild_id = $1 AND league_id = $2`,
-              [interaction.guild.id, activeLeague.league_id, targetUser.id]
-            )
-          : await pool.query(
-              `SELECT
-                 COUNT(*) FILTER (WHERE champion_user_id = $2) AS tournament_titles,
-                 COUNT(*) FILTER (WHERE mvp_user_id = $2) AS tournament_mvps,
-                 COALESCE(SUM(CASE WHEN champion_user_id = $2 THEN prize_paid ELSE 0 END), 0) AS tournament_prizes,
-                 COALESCE(SUM(CASE WHEN mvp_user_id = $2 THEN mvp_payout ELSE 0 END), 0) AS mvp_prizes
-               FROM tournament_history
-               WHERE guild_id = $1`,
-              [interaction.guild.id, targetUser.id]
-            );
-        const tournaments = tournamentResult.rows[0] || {};
-
-        const activityTier = getActivityTier(Number(recognition.activity_points || 0));
-        const legacyTier = getLegacyTier(Number(recognition.legacy_score || 0));
-        const settings = await getCurrencySettings(interaction.guild.id);
-        const badges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, recognition);
-        const streamUrl = await getUserStreamUrl(interaction.guild.id, targetUser.id);
-        const avatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
-        const profileAvatarAttachment = buildAvatarAttachment(targetUser, avatar);
-        const legacyIcon = getLegacyTierIcon(legacyTier);
-        const activityIcon = getActivityTierIcon(activityTier);
-        const normalizedActivityTier = normalizeActivityTierName(activityTier);
-        const badgesDisplay = badges.length ? badges.map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(String.fromCharCode(10)) : 'No badges unlocked yet.';
-
-
-        const embed = new EmbedBuilder()
-          .setTitle('Franchise Hub • ' + targetUser.username)
-          .setColor(0xFEE75C)
-          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-          .setImage('attachment://avatar.png')
-          .addFields(
-            { name: 'League Scope', value: activeLeague ? activeLeague.league_name : 'All Leagues', inline: true },
-            { name: '⚡ Activity', value: activityIcon + ' ' + normalizedActivityTier + ' • ' + String(recognition.activity_points || 0) + ' pts', inline: true },
-            { name: '🏆 Legacy', value: legacyIcon + ' ' + legacyTier.name + ' • ' + String(recognition.legacy_score || 0) + ' pts', inline: true },
-            { name: 'Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
-            { name: 'All-Time Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
-            { name: 'All-Time Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
-            { name: 'Sportsbook Record', value: String(bets.won_bets || 0) + '-' + String(bets.lost_bets || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(bets.net_profit || 0), inline: false },
-            { name: 'Parlays', value: 'Won: ' + String(parlays.won_parlays || 0) + ' • Settled: ' + String(parlays.settled_parlays || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(parlays.parlay_profit || 0), inline: false },
-            { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • MVPs: ' + String(tournaments.tournament_mvps || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
-            { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false },
-            { name: 'Badges', value: badgesDisplay.slice(0, 1024), inline: false },
-            { name: 'Stream', value: streamUrl || 'No stream linked. Use /linkstream to add one.', inline: false },
-            { name: 'Visual Avatar', value: 'Rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.', inline: false }
-          )
-          .setFooter({ text: 'GG Sports • Franchise Hub Foundation' })
-          .setTimestamp();
-
-        await interaction.reply({ embeds: [embed], files: [profileAvatarAttachment], ephemeral: true });
+        const { embed, attachment } = await buildFranchiseHubPayload(interaction.guild, targetUser, activeLeague);
+        await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
         return;
       }
 
@@ -9866,74 +9783,20 @@ if (gameSubcommand === 'report') {
 
       if (profileSubcommand === 'milestones') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
-        await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
-
-        const profileResult = await pool.query(
-          `SELECT activity_points, legacy_score, championships, tournament_titles, sportsbook_wins, sportsbook_profit, tickets_resolved, games_played
-           FROM user_recognition
-           WHERE guild_id = $1 AND user_id = $2
-           LIMIT 1`,
-          [interaction.guild.id, targetUser.id]
-        );
-
-        const claimedResult = await pool.query(
-          `SELECT milestone_key FROM activity_milestones_claimed WHERE guild_id = $1 AND user_id = $2`,
-          [interaction.guild.id, targetUser.id]
-        );
-
-        const profile = profileResult.rows[0] || {};
-        const activityPoints = Number(profile.activity_points || 0);
-        const legacyScore = Number(profile.legacy_score || 0);
-        const claimedKeys = claimedResult.rows.map(row => row.milestone_key);
-        const claimed = new Set(claimedKeys);
-        const NL = String.fromCharCode(10);
-
-        const legacyMilestones = [
-          { key: 'legacy_100', label: 'Rising Star', needed: 100, current: legacyScore },
-          { key: 'legacy_500', label: 'Veteran Legacy', needed: 500, current: legacyScore },
-          { key: 'legacy_1000', label: 'Elite Legacy', needed: 1000, current: legacyScore },
-          { key: 'legacy_2500', label: 'Legend Status', needed: 2500, current: legacyScore },
-          { key: 'legacy_5000', label: 'GOAT Status', needed: 5000, current: legacyScore },
-        ];
-
-        const activityLines = ACTIVITY_MILESTONES.map(milestone => {
-          const unlocked = activityPoints >= milestone.points;
-          const state = claimed.has(milestone.key) ? '✅ Claimed' : unlocked ? '🎁 Unlocked' : '🔒 Locked';
-          return '**' + milestone.title + '** — ' + activityPoints + '/' + milestone.points + ' Activity • ' + state;
-        });
-
-        const legacyLines = legacyMilestones.map(milestone => {
-          const unlocked = milestone.current >= milestone.needed;
-          return '**' + milestone.label + '** — ' + milestone.current + '/' + milestone.needed + ' Legacy • ' + (unlocked ? '✅ Unlocked' : '🔒 Locked');
-        });
-
-        const embed = new EmbedBuilder()
-          .setTitle(targetUser.username + ' • Milestones')
-          .setColor(0x57F287)
-          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-          .addFields(
-            { name: '⚡ Activity Milestones', value: activityLines.join(NL).slice(0, 1024) || 'No activity milestones found.', inline: false },
-            { name: '🏆 Legacy Milestones', value: legacyLines.join(NL).slice(0, 1024) || 'No legacy milestones found.', inline: false }
-          )
-          .setFooter({ text: 'GG Sports • Milestones' })
-          .setTimestamp();
-
+        const embed = await buildMemberMilestonesEmbed(interaction.guild, targetUser);
         await interaction.reply({ embeds: [embed], ephemeral: true });
         return;
       }
 
       if (profileSubcommand === 'badges') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
-        await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
+        const embed = await buildMemberBadgesEmbed(interaction.guild, targetUser);
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        return;
+      }
 
-        const recognitionResult = await pool.query(
-          `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
-          [interaction.guild.id, targetUser.id]
-        );
-        const recognition = recognitionResult.rows[0] || {};
-        const badges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, recognition);
-
-        await interaction.reply({ embeds: [buildBadgesEmbed(targetUser, badges)], ephemeral: true });
+      if (profileSubcommand === 'panel') {
+        await showMemberProfileHome(interaction, interaction.user, { update: false });
         return;
       }
 
@@ -20024,6 +19887,293 @@ async function syncExpandedProfileBadges(guildId, userId, recognition = null) {
   }
 }
 
+async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) {
+  await ensureRecognitionProfile(guild.id, targetUser.id);
+
+  const recognitionResult = await pool.query(
+    `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guild.id, targetUser.id]
+  );
+  const recognition = recognitionResult.rows[0] || {};
+
+  const balanceResult = await pool.query(
+    `SELECT balance, lifetime_earned, lifetime_spent
+     FROM guild_currency_balances
+     WHERE guild_id = $1 AND user_id = $2
+     LIMIT 1`,
+    [guild.id, targetUser.id]
+  );
+  const balance = balanceResult.rows[0] || { balance: 0, lifetime_earned: 0, lifetime_spent: 0 };
+
+  const betResult = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status IN ('won','lost')) AS settled_bets,
+       COUNT(*) FILTER (WHERE status = 'won') AS won_bets,
+       COUNT(*) FILTER (WHERE status = 'lost') AS lost_bets,
+       COALESCE(SUM(amount), 0) AS total_wagered,
+       COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS net_profit
+     FROM sportsbook_bets
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guild.id, targetUser.id]
+  );
+  const bets = betResult.rows[0] || {};
+
+  const parlayResult = await pool.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status IN ('won','lost')) AS settled_parlays,
+       COUNT(*) FILTER (WHERE status = 'won') AS won_parlays,
+       COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS parlay_profit
+     FROM sportsbook_parlays
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guild.id, targetUser.id]
+  );
+  const parlays = parlayResult.rows[0] || {};
+
+  const tournamentResult = activeLeague
+    ? await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE champion_user_id = $3) AS tournament_titles,
+           COUNT(*) FILTER (WHERE mvp_user_id = $3) AS tournament_mvps,
+           COALESCE(SUM(CASE WHEN champion_user_id = $3 THEN prize_paid ELSE 0 END), 0) AS tournament_prizes,
+           COALESCE(SUM(CASE WHEN mvp_user_id = $3 THEN mvp_payout ELSE 0 END), 0) AS mvp_prizes
+         FROM tournament_history
+         WHERE guild_id = $1 AND league_id = $2`,
+        [guild.id, activeLeague.league_id, targetUser.id]
+      )
+    : await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE champion_user_id = $2) AS tournament_titles,
+           COUNT(*) FILTER (WHERE mvp_user_id = $2) AS tournament_mvps,
+           COALESCE(SUM(CASE WHEN champion_user_id = $2 THEN prize_paid ELSE 0 END), 0) AS tournament_prizes,
+           COALESCE(SUM(CASE WHEN mvp_user_id = $2 THEN mvp_payout ELSE 0 END), 0) AS mvp_prizes
+         FROM tournament_history
+         WHERE guild_id = $1`,
+        [guild.id, targetUser.id]
+      );
+  const tournaments = tournamentResult.rows[0] || {};
+
+  const activityTier = getActivityTier(Number(recognition.activity_points || 0));
+  const legacyTier = getLegacyTier(Number(recognition.legacy_score || 0));
+  const settings = await getCurrencySettings(guild.id);
+  const badges = await getExpandedUserBadges(guild.id, targetUser.id, recognition);
+  const streamUrl = await getUserStreamUrl(guild.id, targetUser.id);
+  const avatar = await ensureUserAvatar(guild.id, targetUser.id);
+  const profileAvatarAttachment = buildAvatarAttachment(targetUser, avatar);
+  const legacyIcon = getLegacyTierIcon(legacyTier);
+  const activityIcon = getActivityTierIcon(activityTier);
+  const normalizedActivityTier = normalizeActivityTierName(activityTier);
+  const badgesDisplay = badges.length ? badges.map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(String.fromCharCode(10)) : 'No badges unlocked yet.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('Franchise Hub • ' + targetUser.username)
+    .setColor(0xFEE75C)
+    .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+    .setImage('attachment://avatar.png')
+    .addFields(
+      { name: 'League Scope', value: activeLeague ? activeLeague.league_name : 'All Leagues', inline: true },
+      { name: '⚡ Activity', value: activityIcon + ' ' + normalizedActivityTier + ' • ' + String(recognition.activity_points || 0) + ' pts', inline: true },
+      { name: '🏆 Legacy', value: legacyIcon + ' ' + legacyTier.name + ' • ' + String(recognition.legacy_score || 0) + ' pts', inline: true },
+      { name: 'Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
+      { name: 'All-Time Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
+      { name: 'All-Time Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
+      { name: 'Sportsbook Record', value: String(bets.won_bets || 0) + '-' + String(bets.lost_bets || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(bets.net_profit || 0), inline: false },
+      { name: 'Parlays', value: 'Won: ' + String(parlays.won_parlays || 0) + ' • Settled: ' + String(parlays.settled_parlays || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(parlays.parlay_profit || 0), inline: false },
+      { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • MVPs: ' + String(tournaments.tournament_mvps || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
+      { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false },
+      { name: 'Badges', value: badgesDisplay.slice(0, 1024), inline: false },
+      { name: 'Stream', value: streamUrl || 'No stream linked. Use /linkstream to add one.', inline: false },
+      { name: 'Visual Avatar', value: 'Rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Franchise Hub Foundation' })
+    .setTimestamp();
+
+  return { embed, attachment: profileAvatarAttachment };
+}
+
+async function buildMemberMilestonesEmbed(guild, targetUser) {
+  await ensureRecognitionProfile(guild.id, targetUser.id);
+
+  const profileResult = await pool.query(
+    `SELECT activity_points, legacy_score, championships, tournament_titles, sportsbook_wins, sportsbook_profit, tickets_resolved, games_played
+     FROM user_recognition
+     WHERE guild_id = $1 AND user_id = $2
+     LIMIT 1`,
+    [guild.id, targetUser.id]
+  );
+
+  const claimedResult = await pool.query(
+    `SELECT milestone_key FROM activity_milestones_claimed WHERE guild_id = $1 AND user_id = $2`,
+    [guild.id, targetUser.id]
+  );
+
+  const profile = profileResult.rows[0] || {};
+  const activityPoints = Number(profile.activity_points || 0);
+  const legacyScore = Number(profile.legacy_score || 0);
+  const claimedKeys = claimedResult.rows.map(row => row.milestone_key);
+  const claimed = new Set(claimedKeys);
+  const NL = String.fromCharCode(10);
+
+  const legacyMilestones = [
+    { key: 'legacy_100', label: 'Rising Star', needed: 100, current: legacyScore },
+    { key: 'legacy_500', label: 'Veteran Legacy', needed: 500, current: legacyScore },
+    { key: 'legacy_1000', label: 'Elite Legacy', needed: 1000, current: legacyScore },
+    { key: 'legacy_2500', label: 'Legend Status', needed: 2500, current: legacyScore },
+    { key: 'legacy_5000', label: 'GOAT Status', needed: 5000, current: legacyScore },
+  ];
+
+  const activityLines = ACTIVITY_MILESTONES.map(milestone => {
+    const unlocked = activityPoints >= milestone.points;
+    const state = claimed.has(milestone.key) ? '✅ Claimed' : unlocked ? '🎁 Unlocked' : '🔒 Locked';
+    return '**' + milestone.title + '** — ' + activityPoints + '/' + milestone.points + ' Activity • ' + state;
+  });
+
+  const legacyLines = legacyMilestones.map(milestone => {
+    const unlocked = milestone.current >= milestone.needed;
+    return '**' + milestone.label + '** — ' + milestone.current + '/' + milestone.needed + ' Legacy • ' + (unlocked ? '✅ Unlocked' : '🔒 Locked');
+  });
+
+  return new EmbedBuilder()
+    .setTitle(targetUser.username + ' • Milestones')
+    .setColor(0x57F287)
+    .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: '⚡ Activity Milestones', value: activityLines.join(NL).slice(0, 1024) || 'No activity milestones found.', inline: false },
+      { name: '🏆 Legacy Milestones', value: legacyLines.join(NL).slice(0, 1024) || 'No legacy milestones found.', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Milestones' })
+    .setTimestamp();
+}
+
+async function buildMemberBadgesEmbed(guild, targetUser) {
+  await ensureRecognitionProfile(guild.id, targetUser.id);
+  const recognitionResult = await pool.query(
+    `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guild.id, targetUser.id]
+  );
+  const recognition = recognitionResult.rows[0] || {};
+  const badges = await getExpandedUserBadges(guild.id, targetUser.id, recognition);
+  return buildBadgesEmbed(targetUser, badges);
+}
+
+async function getMemberLeagueMemberships(guildId, userId) {
+  const guild = client.guilds.cache.get(String(guildId));
+  if (!guild) return [];
+  const member = await guild.members.fetch(String(userId)).catch(() => null);
+  if (!member) return [];
+  const roleIds = [...member.roles.cache.keys()];
+  if (!roleIds.length) return [];
+
+  const result = await pool.query(
+    `SELECT DISTINCT l.league_id, l.league_name, l.game, r.role_id, r.role_name
+     FROM league_team_roles r
+     JOIN leagues l ON l.league_id = r.league_id
+     WHERE l.guild_id = $1 AND l.is_active = TRUE AND r.role_id = ANY($2::text[])
+     ORDER BY l.league_name ASC`,
+    [String(guildId), roleIds]
+  ).catch(() => ({ rows: [] }));
+  return result.rows;
+}
+
+async function buildMemberTeamsLeaguesEmbed(guild, targetUser) {
+  const memberships = await getMemberLeagueMemberships(guild.id, targetUser.id);
+  let combinedWins = 0;
+  let combinedLosses = 0;
+  let combinedTies = 0;
+  let hasMaddenRecord = false;
+  const lines = [];
+
+  for (const m of memberships) {
+    let recordText = '';
+    if (m.game === 'madden') {
+      const teamRow = await pool.query(
+        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3 LIMIT 1`,
+        [String(guild.id), String(m.league_id), m.role_id]
+      ).then(r => r.rows?.[0]).catch(() => null);
+      if (teamRow) {
+        const w = Number(teamRow.wins || 0);
+        const l = Number(teamRow.losses || 0);
+        const t = Number(teamRow.ties || 0);
+        combinedWins += w;
+        combinedLosses += l;
+        combinedTies += t;
+        hasMaddenRecord = true;
+        recordText = ` — ${w}-${l}${t ? '-' + t : ''}`;
+      }
+    }
+    lines.push(`**${m.role_name}** (${m.league_name})${recordText}`);
+  }
+
+  const combinedRecordText = hasMaddenRecord ? `${combinedWins}-${combinedLosses}${combinedTies ? '-' + combinedTies : ''}` : 'No Madden teams owned yet';
+
+  return new EmbedBuilder()
+    .setTitle(`${targetUser.username} • Teams & Leagues`)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Leagues Joined', value: String(memberships.length), inline: true },
+      { name: 'Combined W-L Record', value: combinedRecordText, inline: true },
+    )
+    .setDescription(lines.length ? lines.join('\n') : 'Not currently assigned a team in any league. Ask a commissioner to assign you one.')
+    .setFooter({ text: 'GG Sports • Member Profile' })
+    .setTimestamp();
+}
+
+// ---------------------------------------------------------------------------
+// Member Profile Panel — guild-wide, aggregates across every league. Wraps the
+// existing Franchise Hub (activity/legacy/currency/sportsbook/tournaments/
+// badges) as the home view, plus Teams & Leagues (new cross-league aggregation),
+// Milestones, and Badges as categories.
+// ---------------------------------------------------------------------------
+const MEMBER_PROFILE_CATEGORIES = [
+  { value: 'teams', label: 'Teams & Leagues', description: 'Teams owned, leagues joined, combined record', emoji: '🏈' },
+  { value: 'milestones', label: 'Milestones', description: 'Activity and legacy milestones', emoji: '🏁' },
+  { value: 'badges', label: 'Badges', description: 'Earned profile badges', emoji: '🎖️' },
+];
+
+function buildMemberProfileStarterEmbed() {
+  return new EmbedBuilder()
+    .setTitle('👤 Member Profile')
+    .setColor(0x5865F2)
+    .setDescription('Click below to open your profile — activity, legacy, currency, sportsbook record, tournaments, teams owned across every league, milestones, and badges all in one place.')
+    .setFooter({ text: 'GG Sports • Member Profile' })
+    .setTimestamp();
+}
+
+function buildMemberProfileStarterComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('memberprofile_open').setLabel('Open My Profile').setEmoji('👤').setStyle(ButtonStyle.Primary)
+  )];
+}
+
+function buildMemberProfileHomeComponents() {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('memberprofile_category')
+    .setPlaceholder('Choose a section')
+    .addOptions(MEMBER_PROFILE_CATEGORIES.map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
+function buildMemberProfileBackRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('memberprofile_back').setLabel('⬅ Back to Overview').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function showMemberProfileHome(interaction, targetUser, { update = false } = {}) {
+  const { embed, attachment } = await buildFranchiseHubPayload(interaction.guild, targetUser, null);
+  const payload = { content: null, embeds: [embed], files: [attachment], components: buildMemberProfileHomeComponents() };
+  return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+async function showMemberProfileCategory(interaction, targetUser, category, { update = true } = {}) {
+  let embed;
+  if (category === 'teams') embed = await buildMemberTeamsLeaguesEmbed(interaction.guild, targetUser);
+  else if (category === 'milestones') embed = await buildMemberMilestonesEmbed(interaction.guild, targetUser);
+  else if (category === 'badges') embed = await buildMemberBadgesEmbed(interaction.guild, targetUser);
+  else embed = new EmbedBuilder().setTitle('Unknown section').setColor(0xED4245);
+  const payload = { content: null, embeds: [embed], files: [], components: [buildMemberProfileBackRow()] };
+  return update ? interaction.update(payload) : interaction.editReply(payload);
+}
+
 async function getExpandedUserBadges(guildId, userId, recognition = null) {
   await syncExpandedProfileBadges(guildId, userId, recognition).catch(() => null);
   const result = await pool.query(
@@ -20090,6 +20240,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_announcement_channel', label: 'League Announcement Channel', description: 'Where announcements posted from the commissioner panel go', kind: 'channel' },
   { value: 'league_leaders_channel', label: 'League Leaders Channel', description: 'Live, switchable stat leaders board', kind: 'channel' },
   { value: 'award_race_channel', label: 'Award Race Channel', description: 'Live, switchable MVP/OPOY/DPOY/OROY/DROY race board', kind: 'channel' },
+  { value: 'member_profile_channel', label: 'Member Profile Channel', description: 'Panel for members to open their profile', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
@@ -20119,6 +20270,7 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'gm_panel_starter_panel', label: 'Post/Refresh GM Panel Starter' },
   { value: 'league_leaders_panel', label: 'Post/Refresh League Leaders Board' },
   { value: 'award_race_panel', label: 'Post/Refresh Award Race Board' },
+  { value: 'member_profile_starter_panel', label: 'Post/Refresh Member Profile Starter' },
   { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
   { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
@@ -20142,6 +20294,7 @@ function setupDashboardColumn(settingKey) {
     league_announcement_channel: 'league_announcement_channel_id',
     league_leaders_channel: 'league_leaders_channel_id',
     award_race_channel: 'award_race_channel_id',
+    member_profile_channel: 'member_profile_channel_id',
     game_thread_channel: 'game_threads_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
@@ -20193,6 +20346,7 @@ function buildSetupDashboardEmbed(league) {
     'League Announcement: ' + setupDashboardFormatValue(league, 'league_announcement_channel'),
     'League Leaders: ' + setupDashboardFormatValue(league, 'league_leaders_channel'),
     'Award Race: ' + setupDashboardFormatValue(league, 'award_race_channel'),
+    'Member Profile: ' + setupDashboardFormatValue(league, 'member_profile_channel'),
     'Game Threads: ' + setupDashboardFormatValue(league, 'game_thread_channel'),
     'Madden News: ' + setupDashboardFormatValue(league, 'madden_news_channel'),
     'Madden Standings Board: ' + setupDashboardFormatValue(league, 'madden_standings_channel'),
@@ -20452,6 +20606,18 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     if (error) return error + ' Set **Award Race Channel** from this setup dashboard first.';
     const result = await postOrRefreshMaddenAwardRacePanel(interaction.guild, { ...league, award_race_channel_id: channel.id }, 'mvp');
     return result?.message || ('Award Race board posted/refreshed in ' + channel.toString() + '.');
+  }
+
+  if (panelType === 'member_profile_starter_panel') {
+    const configuredChannelId = league.member_profile_channel_id;
+    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'member profile channel');
+    if (error) return error + ' Set **Member Profile Channel** from this setup dashboard first.';
+    const message = await channel.send({
+      embeds: [buildMemberProfileStarterEmbed()],
+      components: buildMemberProfileStarterComponents(),
+    });
+    await savePanel(league, 'member_profile_starter', channel.id, message.id);
+    return 'Member profile starter posted/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'shop_panel') {
