@@ -2464,16 +2464,9 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('tournament')
       .setDescription('Tournament commands')
-      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create tournament').addStringOption(o => o.setName('name').setDescription('Tournament name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game').setRequired(true)).addStringOption(o => o.setName('format').setDescription('single_elim, double_elim, round_robin').setRequired(false)).addIntegerOption(o => o.setName('max_entries').setDescription('Max entries').setRequired(false)).addIntegerOption(o => o.setName('buy_in').setDescription('Buy-in amount').setRequired(false)).addStringOption(o => o.setName('prize').setDescription('Prize').setRequired(false)).addStringOption(o => o.setName('date').setDescription('Start date/time').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('join').setDescription('Join tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addStringOption(o => o.setName('entry_name').setDescription('Entry name').setRequired(false)))
       .addSubcommand(sc => sc.setName('list').setDescription('List active tournaments'))
       .addSubcommand(sc => sc.setName('info').setDescription('Show tournament info').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc.setName('close').setDescription('Staff: close registration').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc.setName('start').setDescription('Staff: start tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc.setName('matches').setDescription('Show tournament matches').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('panel').setDescription('Open the tournament manager, or a specific tournament panel').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(false)))
-      .addSubcommand(sc => sc.setName('report').setDescription('Staff: report match winner').addStringOption(o => o.setName('match_id').setDescription('Match short ID').setRequired(true)).addUserOption(o => o.setName('winner').setDescription('Winner').setRequired(true)))
-      .addSubcommand(sc => sc.setName('shuffle').setDescription('Staff: randomly seed tournament').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('seed').setDescription('Staff: set seed').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true)).addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)))
       .addSubcommand(sc => sc.setName('seeds').setDescription('Show seeds').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('announce').setDescription('Post tournament announcement').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(false)))
@@ -2518,7 +2511,6 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('delete').setDescription('Delete/deactivate a league').addStringOption(o => o.setName('name').setDescription('League name to delete').setRequired(true)))
       .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('nba, mlb, madden, general').setRequired(true)))
       .addSubcommand(sc => sc.setName('playoffsettings').setDescription('Set playoff team count for a league').addIntegerOption(o => o.setName('teams').setDescription('Number of teams that make playoffs').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('playoffs').setDescription('Generate/show playoff bracket from current standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(false)))
       .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
       .addSubcommand(sc => sc.setName('list').setDescription('List leagues'))
@@ -4071,41 +4063,6 @@ async function resolveAwardWinnerUserId(guild, winnerText) {
   });
 
   return partial?.id || null;
-}
-
-function buildPlayoffBracketEmbed(league, bracket, teams) {
-  const NL = String.fromCharCode(10);
-  const embed = new EmbedBuilder()
-    .setTitle((league?.league_name || 'League') + ' • Playoff Bracket')
-    .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • Playoffs' })
-    .setTimestamp();
-
-  if (!teams.length) {
-    embed.setDescription('No playoff teams found yet.');
-    return embed;
-  }
-
-  const lines = teams.map(team => {
-    const pts = isMlbLeague(league) ? ' • ' + team.standings_points + ' PTS' : '';
-    const conference = isNbaLeague(league) && team.conference ? ' • ' + team.conference.replace(' Conference', '') : '';
-    return '**#' + team.seed + ' ' + team.team_name + '** — ' + team.wins + '-' + team.losses + pts + conference;
-  });
-
-  embed.setDescription(lines.join(NL));
-  const formatText = isNbaLeague(league)
-    ? 'NBA: Top 8 from East + Top 8 from West'
-    : isMlbLeague(league)
-      ? 'MLB: Top 8 overall'
-      : 'Custom: Top ' + String(bracket?.team_count || teams.length) + ' overall';
-
-  embed.addFields(
-    { name: 'Teams', value: String(bracket?.team_count || teams.length), inline: true },
-    { name: 'Status', value: bracket?.status || 'generated', inline: true },
-    { name: 'Season', value: bracket?.season_label || 'Current Season', inline: true },
-    { name: 'Format', value: formatText, inline: false }
-  );
-  return embed;
 }
 
 function buildScheduleEmbed(league, rows) {
@@ -7745,66 +7702,6 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('commissioner_league_edit_season:')) {
-      const leagueId = interaction.customId.split(':')[1];
-      const league = await getLeagueById(leagueId);
-
-      if (!league) {
-        await interaction.reply({ content: 'League not found.', ephemeral: true });
-        return;
-      }
-
-      if (!(await userCanUseLeagueSetup(interaction, league))) {
-        await interaction.reply({ content: 'You do not have permission to edit league settings.', ephemeral: true });
-        return;
-      }
-
-      const modal = new ModalBuilder()
-        .setCustomId('commissioner_season_modal:' + leagueId)
-        .setTitle('Edit Season Length')
-        .addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('commissioner_season_length')
-              .setLabel('Season length (games)')
-              .setStyle(TextInputStyle.Short)
-              .setPlaceholder('e.g. 17')
-              .setValue(league.season_length ? String(league.season_length) : '')
-              .setRequired(true)
-          )
-        );
-
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_season_modal:')) {
-      const leagueId = interaction.customId.split(':')[1];
-      const league = await getLeagueById(leagueId);
-
-      if (!league) {
-        await interaction.reply({ content: 'League not found.', ephemeral: true });
-        return;
-      }
-
-      if (!(await userCanUseLeagueSetup(interaction, league))) {
-        await interaction.reply({ content: 'You do not have permission to edit league settings.', ephemeral: true });
-        return;
-      }
-
-      const raw = interaction.fields.getTextInputValue('commissioner_season_length');
-      const value = Number.parseInt(raw, 10);
-
-      if (!Number.isInteger(value) || value <= 0 || value > 30) {
-        await interaction.reply({ content: 'Season length must be a whole number between 1 and 30.', ephemeral: true });
-        return;
-      }
-
-      await pool.query(`UPDATE leagues SET season_length = $2 WHERE league_id = $1`, [leagueId, value]);
-      await interaction.reply({ content: `Season length updated to **${value} games**.`, ephemeral: true });
       return;
     }
 
@@ -15228,55 +15125,6 @@ if (shopSubcommand === 'view') {
             ? ' MLB leagues use **top 8 overall** regardless of this custom value.'
             : '';
         await interaction.reply({ content: 'Playoff team count for **' + activeLeague.league_name + '** set to **' + teamCount + '**.' + playoffNote, ephemeral: true });
-        return;
-      }
-
-      if (leagueSubcommand === 'playoffs') {
-        if (!(await userCanUseLeagueSetup(interaction, null))) {
-          await interaction.reply({ content: 'You do not have permission to generate playoff brackets.', ephemeral: true });
-          return;
-        }
-
-        const leagueName = interaction.options.getString('league');
-        const seasonLabel = interaction.options.getString('season') || 'Current Season';
-        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found.', ephemeral: true });
-          return;
-        }
-
-        const playoffTeams = await selectPlayoffTeamsForLeague(interaction.guild.id, activeLeague);
-        const requiredTeams = isNbaLeague(activeLeague) ? 16 : isMlbLeague(activeLeague) ? 8 : Number(activeLeague.playoff_team_count || 8);
-
-        if (playoffTeams.length < 2) {
-          await interaction.reply({ content: 'Not enough teams in the standings to generate a playoff bracket.', ephemeral: true });
-          return;
-        }
-
-        if ((isNbaLeague(activeLeague) || isMlbLeague(activeLeague)) && playoffTeams.length < requiredTeams) {
-          await interaction.reply({ content: 'Only found **' + playoffTeams.length + '** eligible playoff teams. Expected **' + requiredTeams + '** for this league type. Add/adjust standings first.', ephemeral: true });
-          return;
-        }
-
-        const bracketId = randomUUID();
-        await pool.query(
-          `INSERT INTO playoff_brackets (id, guild_id, league_id, season_label, team_count, created_by_user_id)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [bracketId, interaction.guild.id, activeLeague.league_id, seasonLabel, playoffTeams.length, interaction.user.id]
-        );
-
-        for (let i = 0; i < playoffTeams.length; i += 1) {
-          const team = playoffTeams[i];
-          await pool.query(
-            `INSERT INTO playoff_bracket_teams (bracket_id, guild_id, league_id, seed, team_role_id, team_name, wins, losses, standings_points, conference)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-            [bracketId, interaction.guild.id, activeLeague.league_id, team.seed || (i + 1), team.team_role_id, team.team_name, team.wins, team.losses, Number(team.standings_points || 0), team.conference || (isNbaLeague(activeLeague) ? getTeamConference(team.team_name) : null)]
-          );
-        }
-
-        const bracket = { id: bracketId, team_count: playoffTeams.length, status: 'generated', season_label: seasonLabel };
-        await interaction.reply({ embeds: [buildPlayoffBracketEmbed(activeLeague, bracket, playoffTeams)], ephemeral: false });
         return;
       }
 
@@ -51896,7 +51744,8 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
     embed = new EmbedBuilder()
       .setTitle(`🎖️ Awards • ${league.league_name}`)
       .setColor(0x5865F2)
-      .setDescription(awards.length ? awards.map((a, i) => `${i + 1}. ${a.label}`).join('\n') : 'No awards configured yet.')
+      .setDescription((awards.length ? awards.map((a, i) => `${i + 1}. ${a.label}`).join('\n') : 'No awards configured yet.')
+        + '\n\nThis is the list of awards this league recognizes. There\'s no live stat-driven race for non-Madden leagues — record each season\'s winners with `/addseasonhistory` at season end, which posts them in the League History channel and updates franchise legacy.')
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
     const rows = [new ActionRowBuilder().addComponents(
