@@ -2467,11 +2467,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('list').setDescription('List active tournaments'))
       .addSubcommand(sc => sc.setName('info').setDescription('Show tournament info').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('panel').setDescription('Open the tournament manager, or a specific tournament panel').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(false)))
-      .addSubcommand(sc => sc.setName('seed').setDescription('Staff: set seed').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addUserOption(o => o.setName('user').setDescription('User to seed').setRequired(true)).addIntegerOption(o => o.setName('seed').setDescription('Seed number').setRequired(true)))
-      .addSubcommand(sc => sc.setName('seeds').setDescription('Show seeds').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
-      .addSubcommand(sc => sc.setName('announce').setDescription('Post tournament announcement').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(false)))
       .addSubcommand(sc => sc.setName('history').setDescription('Show tournament history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('mvp').setDescription('Staff: set tournament MVP').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)).addUserOption(o => o.setName('user').setDescription('MVP').setRequired(true)).addIntegerOption(o => o.setName('payout').setDescription('Optional payout').setRequired(false)))
       .addSubcommand(sc => sc.setName('rewards').setDescription('Show tournament rewards').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
 
     new SlashCommandBuilder()
@@ -4090,15 +4086,19 @@ function buildScheduleEmbed(league, rows) {
   return embed;
 }
 
-function buildStandingsEmbed(league, rows) {
+async function buildStandingsEmbed(league, rows) {
   const NL = String.fromCharCode(10);
-  const showPoints = isMlbLeague(league);
-  const splitConferences = isNbaLeague(league);
+  const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
+  const standingsSystem = customSettings.standings_system === 'points' || isMlbLeague(league) ? 'points' : customSettings.standings_system === 'point_differential' ? 'point_differential' : 'wl';
+  const useConferences = customSettings.use_conferences ?? isNbaLeague(league);
+  const useDivisions = customSettings.use_divisions ?? false;
+  const showTies = customSettings.ties_allowed ?? false;
 
+  const systemLabel = standingsSystem === 'points' ? 'Points Standings' : standingsSystem === 'point_differential' ? 'Point Differential Standings' : 'W/L Standings';
   const embed = new EmbedBuilder()
     .setTitle(`${league?.league_name || 'League'} • Standings`)
     .setColor(0x57F287)
-    .setFooter({ text: showPoints ? 'GG Sports • MLB Points Standings' : splitConferences ? 'GG Sports • NBA Conference Standings' : 'GG Sports • Standings' })
+    .setFooter({ text: `GG Sports • ${systemLabel}` })
     .setTimestamp();
 
   if (!rows.length) {
@@ -4107,22 +4107,28 @@ function buildStandingsEmbed(league, rows) {
   }
 
   const formatLine = (row, index) => {
-    const games = Number(row.wins) + Number(row.losses);
-    const winPct = games > 0 ? (Number(row.wins) / games).toFixed(3).replace(/^0/, '') : '.000';
+    const games = Number(row.wins) + Number(row.losses) + Number(row.ties || 0);
+    const winPct = games > 0 ? ((Number(row.wins) + Number(row.ties || 0) * 0.5) / games).toFixed(3).replace(/^0/, '') : '.000';
     const diff = Number(row.points_for || 0) - Number(row.points_against || 0);
-    const standingsPoints = Number(row.standings_points ?? calculateStandingsPointsForLeague(league, row.wins, row.losses));
-    const pointsText = showPoints ? ' • ' + standingsPoints + ' PTS' : '';
-    return `**${index + 1}. ${row.team_name}** — ${row.wins}-${row.losses} (${winPct})${pointsText} • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
+    const standingsPoints = Number(row.standings_points ?? calculateStandingsPointsForLeague(league, row.wins, row.losses, row.ties, customSettings));
+    const record = showTies ? `${row.wins}-${row.losses}-${row.ties || 0}` : `${row.wins}-${row.losses}`;
+    const pointsText = standingsSystem === 'points' ? ' • ' + standingsPoints + ' PTS' : '';
+    return `**${index + 1}. ${row.team_name}** — ${record} (${winPct})${pointsText} • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
   };
 
-  if (splitConferences) {
-    const eastern = rows.filter(row => getTeamConference(row.team_name) === 'Eastern Conference');
-    const western = rows.filter(row => getTeamConference(row.team_name) === 'Western Conference');
-    const other = rows.filter(row => !['Eastern Conference', 'Western Conference'].includes(getTeamConference(row.team_name)));
-
-    if (eastern.length) embed.addFields({ name: 'Eastern Conference', value: eastern.map(formatLine).join(NL).slice(0, 1024), inline: false });
-    if (western.length) embed.addFields({ name: 'Western Conference', value: western.map(formatLine).join(NL).slice(0, 1024), inline: false });
-    if (other.length) embed.addFields({ name: 'Unassigned', value: other.map(formatLine).join(NL).slice(0, 1024), inline: false });
+  if (useConferences || useDivisions) {
+    const guildId = rows[0]?.guild_id;
+    const groupKey = useConferences ? 'conference' : 'division';
+    const grouped = new Map();
+    for (const row of rows) {
+      const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, row.team_name).catch(() => ({ conference: null, division: null }));
+      const key = (useConferences ? conference : division) || `Unassigned ${useConferences ? 'Conference' : 'Division'}`;
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(row);
+    }
+    for (const [groupName, groupRows] of grouped) {
+      embed.addFields({ name: groupName, value: groupRows.map(formatLine).join(NL).slice(0, 1024), inline: false });
+    }
     return embed;
   }
 
@@ -4258,9 +4264,12 @@ async function getStandingsRows(guildId, leagueId) {
   const league = await getLeagueById(leagueId);
   const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => null) : null;
   const usesPoints = customSettings?.standings_system === 'points' || isMlbLeague(league);
+  const usesDiff = customSettings?.standings_system === 'point_differential';
   const orderBy = usesPoints
     ? 'standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC'
-    : 'wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC';
+    : usesDiff
+      ? '(points_for - points_against) DESC, wins DESC, losses ASC, team_name ASC'
+      : 'wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC';
 
   const result = await pool.query(
     `SELECT * FROM league_standings
@@ -4325,7 +4334,7 @@ async function selectPlayoffTeamsForLeague(guildId, league) {
 async function updateStandingsPanel(guild, league) {
   if (!guild || !league?.league_id) return;
   const rows = await getStandingsRows(guild.id, league.league_id);
-  await updatePanel(guild, league, 'standings', buildStandingsEmbed(league, rows));
+  await updatePanel(guild, league, 'standings', await buildStandingsEmbed(league, rows));
 }
 
 async function getCurrencySettings(guildId) {
@@ -4648,37 +4657,6 @@ function buildTournamentInfoEmbed(settings, tournament, entries) {
       { name: 'Entries', value: entryLines, inline: false }
     )
     .setFooter({ text: 'GG Sports • Tournament Info' })
-    .setTimestamp();
-}
-
-function buildTournamentJoinButton(tournamentId, disabled = false) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`tournament_join:${tournamentId}`)
-      .setLabel('Join Tournament')
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(disabled)
-  );
-}
-
-function buildTournamentAnnouncementEmbed(settings, tournament, entries) {
-  const buyIn = Number(tournament.buy_in) > 0 ? `${settings.currency_icon} ${tournament.buy_in} ${settings.currency_name}` : 'Free Entry';
-  const maxEntries = tournament.max_entries ? `${entries.length}/${tournament.max_entries}` : `${entries.length}`;
-
-  return new EmbedBuilder()
-    .setTitle(`🏆 ${tournament.tournament_name}`)
-    .setDescription('Registration is now open. Press the button below to join.')
-    .setColor(0xED4245)
-    .addFields(
-      { name: 'Game', value: tournament.game || 'TBD', inline: true },
-      { name: 'Format', value: tournament.format || 'single_elim', inline: true },
-      { name: 'Entries', value: maxEntries, inline: true },
-      { name: 'Buy-in', value: buyIn, inline: true },
-      { name: 'Prize', value: tournament.prize || 'Not listed', inline: true },
-      { name: 'Start Date', value: tournament.starts_at || 'TBD', inline: true },
-      { name: 'Tournament ID', value: shortTournamentId(tournament.id), inline: true }
-    )
-    .setFooter({ text: 'GG Sports • Tournament Registration' })
     .setTimestamp();
 }
 
@@ -5056,6 +5034,9 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
     row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_join:${tournament.id}`).setLabel('Join Tournament').setEmoji('🎟️').setStyle(ButtonStyle.Success));
     row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_close:${tournament.id}`).setLabel('Close Registration').setEmoji('🔒').setStyle(ButtonStyle.Secondary));
   }
+  if (['open', 'closed'].includes(tournament.status) && !(await getTournamentMatches(tournament.id)).length) {
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_setseed:${tournament.id}`).setLabel('Set Seed').setEmoji('🔢').setStyle(ButtonStyle.Secondary));
+  }
   if (tournament.status === 'closed') {
     row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_shuffle:${tournament.id}`).setLabel('Shuffle Seeds').setEmoji('🔀').setStyle(ButtonStyle.Secondary));
     row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_start:${tournament.id}`).setLabel('Start Tournament').setEmoji('🚀').setStyle(ButtonStyle.Success));
@@ -5064,10 +5045,13 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
     row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_report:${tournament.id}`).setLabel('Report Match').setEmoji('📋').setStyle(ButtonStyle.Primary));
     row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_bracket:${tournament.id}`).setLabel('View Bracket').setEmoji('🗂️').setStyle(ButtonStyle.Secondary));
   }
+  if (tournament.status === 'completed') {
+    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_setmvp:${tournament.id}`).setLabel('Set MVP').setEmoji('⭐').setStyle(ButtonStyle.Primary));
+  }
   if (row1.components.length) rows.push(row1);
 
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`tourneypanel_postpanel:${tournament.id}`).setLabel('Post Public Bracket Panel').setEmoji('📣').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`tourneypanel_postpanel:${tournament.id}`).setLabel('Post/Refresh Panel').setEmoji('📣').setStyle(ButtonStyle.Secondary)
   );
   if (['open', 'closed', 'active'].includes(tournament.status)) {
     row2.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_postpone:${tournament.id}`).setLabel('Postpone').setEmoji('🕒').setStyle(ButtonStyle.Secondary));
@@ -5096,6 +5080,7 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
 // multi-step flow: selects first, then two bridged modals.
 // ---------------------------------------------------------------------------
 const tournamentCreateSessions = new Map();
+const commissionerSeasonHistorySessions = new Map();
 const TOURNAMENT_FORMAT_OPTIONS = [
   { value: 'single_elim', label: 'Single Elimination' },
   { value: 'double_elim', label: 'Double Elimination' },
@@ -6743,62 +6728,6 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
-      if (interaction.customId.startsWith('tournament_join:')) {
-        if (!interaction.guild) return;
-        const tournamentId = interaction.customId.split(':')[1];
-        const tournament = await findTournament(interaction.guild.id, tournamentId);
-        const settings = await getCurrencySettings(interaction.guild.id);
-
-        if (!tournament) {
-          await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
-          return;
-        }
-
-        if (tournament.status !== 'open') {
-          await interaction.reply({ content: 'That tournament is not open for registration.', ephemeral: true });
-          return;
-        }
-
-        const entries = await getTournamentEntries(tournament.id);
-        if (tournament.max_entries && entries.length >= Number(tournament.max_entries)) {
-          await interaction.reply({ content: 'That tournament is full.', ephemeral: true });
-          return;
-        }
-
-        if (entries.some(entry => entry.user_id === interaction.user.id)) {
-          await interaction.reply({ content: 'You are already registered for that tournament.', ephemeral: true });
-          return;
-        }
-
-        const buyIn = Number(tournament.buy_in || 0);
-        if (buyIn > 0) {
-          const removed = await removeCurrency(interaction.guild.id, interaction.user.id, buyIn, 'tournament_buy_in', `Buy-in: ${tournament.tournament_name}`, interaction.user.id);
-          if (!removed) {
-            await interaction.reply({ content: `You need **${settings.currency_icon} ${buyIn} ${settings.currency_name}** to join this tournament.`, ephemeral: true });
-            return;
-          }
-        }
-
-        await pool.query(
-          `INSERT INTO tournament_entries (tournament_id, guild_id, user_id, paid_buy_in)
-           VALUES ($1, $2, $3, $4)`,
-          [tournament.id, interaction.guild.id, interaction.user.id, buyIn]
-        );
-
-        if (buyIn > 0) {
-          await pool.query(`UPDATE tournaments SET prize_pool = prize_pool + $1, updated_at = NOW() WHERE id = $2`, [buyIn, tournament.id]);
-        }
-
-        const updatedTournament = await findTournament(interaction.guild.id, tournament.id);
-        const updatedEntries = await getTournamentEntries(tournament.id);
-        await interaction.update({
-          embeds: [buildTournamentAnnouncementEmbed(settings, updatedTournament || tournament, updatedEntries)],
-          components: [buildTournamentJoinButton(tournament.id, tournament.max_entries && updatedEntries.length >= Number(tournament.max_entries))],
-        });
-        await interaction.followUp({ content: `You joined **${tournament.tournament_name}**.`, ephemeral: true });
-        return;
-      }
-
       if (interaction.customId.startsWith('tourney_match_winner:')) {
         if (!interaction.guild) {
           await interaction.reply({ content: 'Tournament buttons must be used inside the server.', ephemeral: true });
@@ -7690,6 +7619,19 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
+      if (action === 'seasonhistory') {
+        const modal = new ModalBuilder()
+          .setCustomId('commissioner_seasonhistory_modal1:' + leagueId)
+          .setTitle('Season History (1 of 2)')
+          .addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('season').setLabel('Season label').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('e.g. Season 3')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('champion').setLabel('Champion').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('runner_up').setLabel('Runner-up (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
+          );
+        await interaction.showModal(modal);
+        return;
+      }
+
       if (action === 'toggle_autodetect') {
         await ensureMaddenAutoDetectColumns();
         const settings = await ensureMaddenLeagueSettings(league);
@@ -8180,6 +8122,61 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       await refreshLeagueRulesPanel(interaction.guild, league).catch(() => null);
       const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       await interaction.reply({ content: 'Rules updated.', embeds: [buildLeagueRulesEmbed(league, customSettings)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_seasonhistory_modal1:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to add season history.', ephemeral: true }); return; }
+      const token = randomBytes(6).toString('hex');
+      commissionerSeasonHistorySessions.set(token, {
+        leagueId,
+        seasonLabel: interaction.fields.getTextInputValue('season'),
+        champion: interaction.fields.getTextInputValue('champion'),
+        runnerUp: interaction.fields.getTextInputValue('runner_up') || null,
+      });
+      const continueRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('commissioner_seasonhistory_continue:' + token).setLabel('Continue to MVP/Awards/Notes').setStyle(ButtonStyle.Primary)
+      );
+      await interaction.reply({ content: '**Season History (1 of 2) complete.** Click below to finish.', components: [continueRow], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_seasonhistory_continue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('commissioner_seasonhistory_modal2:' + token)
+        .setTitle('Season History (2 of 2)')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('mvp').setLabel('MVP (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('awards').setLabel('Other awards (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('e.g. 6th Man: PlayerName, Cy Young: PlayerName')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Season notes (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_seasonhistory_modal2:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      const league = await getLeagueById(session.leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to add season history.', ephemeral: true }); return; }
+      const data = {
+        seasonLabel: session.seasonLabel,
+        champion: session.champion,
+        runnerUp: session.runnerUp,
+        mvp: interaction.fields.getTextInputValue('mvp') || null,
+        awards: interaction.fields.getTextInputValue('awards') || null,
+        notes: interaction.fields.getTextInputValue('notes') || null,
+      };
+      commissionerSeasonHistorySessions.delete(token);
+      await interaction.deferReply({ ephemeral: true });
+      const result = await postLeagueSeasonHistory(interaction, league, data);
+      await interaction.editReply({ content: result.message });
       return;
     }
 
@@ -8918,6 +8915,102 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_setseed:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const entries = await getTournamentEntries(tournamentId);
+      if (!entries.length) { await interaction.reply({ content: 'No entries to seed yet.', ephemeral: true }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('tourneypanel_setseed_pick:' + tournamentId)
+        .setPlaceholder('Choose an entry to seed')
+        .addOptions(entries.slice(0, 25).map(e => ({
+          label: (e.entry_name || `Entry`).slice(0, 100),
+          value: e.user_id.slice(0, 100),
+          description: `Current seed: ${e.seed || 'none'}`.slice(0, 100),
+        })));
+      await interaction.reply({ content: '**Set Seed** — choose an entry', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypanel_setseed_pick:')) {
+      const tournamentId = interaction.customId.split(':')[1];
+      const targetUserId = interaction.values[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`tourneypanel_setseed_modal:${tournamentId}:${targetUserId}`)
+        .setTitle('Set Seed')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('seed').setLabel('Seed number').setStyle(TextInputStyle.Short).setRequired(true))
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('tourneypanel_setseed_modal:')) {
+      const [, tournamentId, targetUserId] = interaction.customId.split(':');
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      if (!['open', 'closed'].includes(tournament.status)) { await interaction.reply({ content: 'You can only set seeds before a tournament starts.', ephemeral: true }); return; }
+      const matches = await getTournamentMatches(tournamentId);
+      if (matches.length) { await interaction.reply({ content: 'This tournament already has matches generated, so seeds can no longer be changed.', ephemeral: true }); return; }
+      const seed = Number.parseInt(interaction.fields.getTextInputValue('seed'), 10);
+      if (!Number.isInteger(seed) || seed <= 0) { await interaction.reply({ content: 'Seed must be a whole number greater than 0.', ephemeral: true }); return; }
+      await pool.query(`UPDATE tournament_entries SET seed = $3 WHERE tournament_id = $1 AND user_id = $2`, [tournamentId, targetUserId, seed]);
+      await interaction.deferReply({ ephemeral: true });
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.editReply({ content: `Seed set to **${seed}** for <@${targetUserId}>.`, ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_setmvp:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const entries = await getTournamentEntries(tournamentId);
+      if (!entries.length) { await interaction.reply({ content: 'No entries found for this tournament.', ephemeral: true }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('tourneypanel_setmvp_pick:' + tournamentId)
+        .setPlaceholder('Choose the MVP')
+        .addOptions(entries.slice(0, 25).map(e => ({
+          label: (e.entry_name || 'Entry').slice(0, 100),
+          value: e.user_id.slice(0, 100),
+        })));
+      await interaction.reply({ content: '**Set MVP** — choose an entry', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypanel_setmvp_pick:')) {
+      const tournamentId = interaction.customId.split(':')[1];
+      const targetUserId = interaction.values[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`tourneypanel_setmvp_modal:${tournamentId}:${targetUserId}`)
+        .setTitle('Set MVP')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('payout').setLabel('Payout (optional, 0 = none)').setStyle(TextInputStyle.Short).setRequired(false).setValue('0'))
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('tourneypanel_setmvp_modal:')) {
+      const [, tournamentId, targetUserId] = interaction.customId.split(':');
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      const historyResult = await pool.query(`SELECT * FROM tournament_history WHERE guild_id = $1 AND tournament_id = $2 ORDER BY completed_at DESC LIMIT 1`, [interaction.guild.id, tournamentId]);
+      if (!historyResult.rows.length) { await interaction.reply({ content: 'This tournament has not been completed yet, so an MVP cannot be recorded.', ephemeral: true }); return; }
+      const payoutRaw = interaction.fields.getTextInputValue('payout');
+      const payout = payoutRaw ? Number.parseInt(payoutRaw, 10) : 0;
+      if (!Number.isInteger(payout) || payout < 0) { await interaction.reply({ content: 'Payout must be a whole number 0 or greater.', ephemeral: true }); return; }
+      await pool.query(`UPDATE tournament_history SET mvp_user_id = $1, mvp_payout = $2 WHERE id = $3`, [targetUserId, payout, historyResult.rows[0].id]);
+      if (payout > 0) {
+        await addCurrency(interaction.guild.id, targetUserId, payout, 'tournament_mvp', `Tournament MVP: ${tournament.tournament_name}`, interaction.user.id);
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.editReply({ content: `<@${targetUserId}> set as MVP${payout > 0 ? ` and awarded **${payout}** currency.` : '.'}`, ...payload });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_shuffle:')) {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
       const tournamentId = interaction.customId.split(':')[1];
@@ -8968,10 +9061,19 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const configuredChannelId = await getGuildTournamentChannelId(interaction.guild.id);
       const channel = configuredChannelId ? await interaction.guild.channels.fetch(configuredChannelId).catch(() => null) : interaction.channel;
       const targetChannel = channel?.isTextBased?.() ? channel : interaction.channel;
-      const matches = await getTournamentMatches(tournamentId);
-      const message = await targetChannel.send({ embeds: [buildTournamentPanelEmbed(tournament, matches)] });
+      let embed;
+      let components = [];
+      if (tournament.status === 'open') {
+        const entries = await getTournamentEntries(tournamentId);
+        embed = buildTournamentRegistrationEmbed(tournament, entries);
+        components = buildTournamentRegistrationComponents(tournament);
+      } else {
+        const matches = await getTournamentMatches(tournamentId);
+        embed = buildTournamentPanelEmbed(tournament, matches);
+      }
+      const message = await targetChannel.send({ embeds: [embed], components });
       await saveTournamentPanel(tournamentId, interaction.guild.id, targetChannel.id, message.id);
-      await interaction.reply({ content: `Public bracket panel posted in ${targetChannel.toString()}.`, ephemeral: true });
+      await interaction.reply({ content: `Panel posted in ${targetChannel.toString()}.`, ephemeral: true });
       return;
     }
 
@@ -10773,7 +10875,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
           const standingsChannel = await interaction.guild.channels.fetch(league.standings_channel_id).catch(() => null);
           if (standingsChannel && standingsChannel.isTextBased()) {
             const standingsRows = await getStandingsRows(interaction.guild.id, league.league_id);
-            const standingsMessage = await standingsChannel.send({ embeds: [buildStandingsEmbed(league, standingsRows)] });
+            const standingsMessage = await standingsChannel.send({ embeds: [await buildStandingsEmbed(league, standingsRows)] });
             await savePanel(league, 'standings', standingsChannel.id, standingsMessage.id);
           }
         }
@@ -10809,83 +10911,6 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.commandName === 'commands') {
       await interaction.reply({ embeds: [buildCommandsGuideEmbed()], ephemeral: true });
-      return;
-    }
-
-    if (interaction.commandName === 'addseasonhistory') {
-      if (!interaction.guild) {
-        await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
-        return;
-      }
-      const leagueName = interaction.options.getString('league');
-      const activeLeague = await getLeagueByName(interaction.guild.id, leagueName);
-      if (!activeLeague) {
-        await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
-        return;
-      }
-      if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
-        await interaction.reply({ content: 'You do not have permission to add season history for this league.', ephemeral: true });
-        return;
-      }
-      if (!activeLeague.history_channel_id) {
-        await interaction.reply({ content: `No history channel is set for **${activeLeague.league_name}**. Use /league-sethistorychannel first.`, ephemeral: true });
-        return;
-      }
-      const historyChannel = await interaction.guild.channels.fetch(activeLeague.history_channel_id).catch(() => null);
-      const botMember = await interaction.guild.members.fetchMe();
-      const permissions = historyChannel?.permissionsFor(botMember);
-      if (!historyChannel || !historyChannel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
-        await interaction.reply({ content: 'I cannot post in the configured history channel. Check my permissions there.', ephemeral: true });
-        return;
-      }
-
-      const data = {
-        seasonLabel: interaction.options.getString('season'),
-        champion: interaction.options.getString('champion'),
-        runnerUp: interaction.options.getString('runner_up'),
-        mvp: interaction.options.getString('mvp'),
-        awards: interaction.options.getString('awards'),
-        notes: interaction.options.getString('notes'),
-      };
-
-      const embed = buildSeasonHistoryEmbed(activeLeague, data);
-      const postedMessage = await historyChannel.send({ embeds: [embed] });
-
-      await pool.query(
-        `INSERT INTO season_history (id, guild_id, league_id, season_label, champion, runner_up, mvp, awards, notes, posted_channel_id, posted_message_id, created_by_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, data.champion, data.runnerUp, data.mvp, data.awards, data.notes, historyChannel.id, postedMessage.id, interaction.user.id]
-      );
-
-      await pool.query(
-        `INSERT INTO franchise_legacy (guild_id, league_id, franchise_name, championships, finals_appearances, last_championship, updated_at)
-         VALUES ($1, $2, $3, 1, 1, $4, NOW())
-         ON CONFLICT (guild_id, league_id, franchise_name)
-         DO UPDATE SET championships = franchise_legacy.championships + 1, finals_appearances = franchise_legacy.finals_appearances + 1, last_championship = EXCLUDED.last_championship, updated_at = NOW()`,
-        [interaction.guild.id, activeLeague.league_id, data.champion, data.seasonLabel]
-      );
-
-      if (data.runnerUp) {
-        await pool.query(
-          `INSERT INTO franchise_legacy (guild_id, league_id, franchise_name, championships, finals_appearances, updated_at)
-           VALUES ($1, $2, $3, 0, 1, NOW())
-           ON CONFLICT (guild_id, league_id, franchise_name)
-           DO UPDATE SET finals_appearances = franchise_legacy.finals_appearances + 1, updated_at = NOW()`,
-          [interaction.guild.id, activeLeague.league_id, data.runnerUp]
-        );
-      }
-
-      const awardRows = [];
-      if (data.mvp) awardRows.push({ name: 'MVP / Top Player', value: data.mvp });
-      for (const award of parseCustomAwards(data.awards)) awardRows.push(award);
-      for (const award of awardRows) {
-        await pool.query(
-          `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, created_by_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, award.name, award.value, interaction.user.id]
-        );
-      }
-
-      await interaction.reply({ content: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.`, ephemeral: true });
       return;
     }
 
@@ -15363,7 +15388,27 @@ if (shopSubcommand === 'view') {
       }
 
       if (leagueSubcommand === 'seasonhistory') {
-        interaction.commandName = 'addseasonhistory';
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
+          await interaction.reply({ content: 'You do not have permission to add season history for this league.', ephemeral: true });
+          return;
+        }
+        const seasonHistoryLeagueName = interaction.options.getString('league');
+        const seasonHistoryLeague = await getLeagueByName(interaction.guild.id, seasonHistoryLeagueName);
+        if (!seasonHistoryLeague) {
+          await interaction.reply({ content: `Could not find league **${seasonHistoryLeagueName}**.`, ephemeral: true });
+          return;
+        }
+        const seasonHistoryData = {
+          seasonLabel: interaction.options.getString('season'),
+          champion: interaction.options.getString('champion'),
+          runnerUp: interaction.options.getString('runner_up'),
+          mvp: interaction.options.getString('mvp'),
+          awards: interaction.options.getString('awards'),
+          notes: interaction.options.getString('notes'),
+        };
+        const seasonHistoryResult = await postLeagueSeasonHistory(interaction, seasonHistoryLeague, seasonHistoryData);
+        await interaction.reply({ content: seasonHistoryResult.message, ephemeral: true });
+        return;
       } else if (leagueSubcommand === 'edit') {
         interaction.commandName = 'editleaguename';
       } else if (leagueSubcommand === 'ticketpanel') {
@@ -16747,7 +16792,7 @@ if (shopSubcommand === 'view') {
         return;
       }
       const rows = await getStandingsRows(interaction.guild.id, activeLeague.league_id);
-      const message = await channel.send({ embeds: [buildStandingsEmbed(activeLeague, rows)] });
+      const message = await channel.send({ embeds: [await buildStandingsEmbed(activeLeague, rows)] });
       await savePanel(activeLeague, 'standings', channel.id, message.id);
       await interaction.reply({ content: `Permanent standings panel created for **${activeLeague.league_name}** in ${channel}.`, ephemeral: true });
       return;
@@ -16961,7 +17006,7 @@ if (shopSubcommand === 'view') {
          ORDER BY ${isMlbLeague(activeLeague) ? 'standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC' : 'wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC'}`,
         [interaction.guild.id, activeLeague.league_id]
       );
-      await interaction.reply({ embeds: [buildStandingsEmbed(activeLeague, result.rows)], ephemeral: true });
+      await interaction.reply({ embeds: [await buildStandingsEmbed(activeLeague, result.rows)], ephemeral: true });
       return;
     }
 
@@ -17492,20 +17537,19 @@ if (shopSubcommand === 'view') {
         return;
       }
 
-      const settings = await getCurrencySettings(interaction.guild.id);
       const entries = await getTournamentEntries(tournament.id);
-      const message = await channel.send({
-        embeds: [buildTournamentAnnouncementEmbed(settings, tournament, entries)],
-        components: [buildTournamentJoinButton(tournament.id, tournament.max_entries && entries.length >= Number(tournament.max_entries))],
-      });
+      let embed;
+      let components = [];
+      if (tournament.status === 'open') {
+        embed = buildTournamentRegistrationEmbed(tournament, entries);
+        components = buildTournamentRegistrationComponents(tournament);
+      } else {
+        const matches = await getTournamentMatches(tournament.id);
+        embed = buildTournamentPanelEmbed(tournament, matches);
+      }
+      const message = await channel.send({ embeds: [embed], components });
 
-      await pool.query(
-        `INSERT INTO tournament_panels (tournament_id, guild_id, channel_id, message_id, announcement_channel_id, announcement_message_id, updated_at)
-         VALUES ($1, $2, $3, $4, $3, $4, NOW())
-         ON CONFLICT (tournament_id)
-         DO UPDATE SET announcement_channel_id = $3, announcement_message_id = $4, updated_at = NOW()`,
-        [tournament.id, interaction.guild.id, channel.id, message.id]
-      );
+      await saveTournamentPanel(tournament.id, interaction.guild.id, channel.id, message.id);
 
       await interaction.reply({ content: `Tournament announcement posted for **${tournament.tournament_name}** in ${channel}.`, ephemeral: true });
       return;
@@ -21470,6 +21514,57 @@ async function syncExpandedProfileBadges(guildId, userId, recognition = null) {
   }
 }
 
+async function postLeagueSeasonHistory(interaction, activeLeague, data) {
+  if (!activeLeague.history_channel_id) {
+    return { ok: false, message: `No history channel is set for **${activeLeague.league_name}**. Set it in the Commissioner Panel first.` };
+  }
+  const historyChannel = await interaction.guild.channels.fetch(activeLeague.history_channel_id).catch(() => null);
+  const botMember = await interaction.guild.members.fetchMe();
+  const permissions = historyChannel?.permissionsFor(botMember);
+  if (!historyChannel || !historyChannel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+    return { ok: false, message: 'I cannot post in the configured history channel. Check my permissions there.' };
+  }
+
+  const embed = buildSeasonHistoryEmbed(activeLeague, data);
+  const postedMessage = await historyChannel.send({ embeds: [embed] });
+
+  await pool.query(
+    `INSERT INTO season_history (id, guild_id, league_id, season_label, champion, runner_up, mvp, awards, notes, posted_channel_id, posted_message_id, created_by_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, data.champion, data.runnerUp, data.mvp, data.awards, data.notes, historyChannel.id, postedMessage.id, interaction.user.id]
+  );
+
+  await pool.query(
+    `INSERT INTO franchise_legacy (guild_id, league_id, franchise_name, championships, finals_appearances, last_championship, updated_at)
+     VALUES ($1, $2, $3, 1, 1, $4, NOW())
+     ON CONFLICT (guild_id, league_id, franchise_name)
+     DO UPDATE SET championships = franchise_legacy.championships + 1, finals_appearances = franchise_legacy.finals_appearances + 1, last_championship = EXCLUDED.last_championship, updated_at = NOW()`,
+    [interaction.guild.id, activeLeague.league_id, data.champion, data.seasonLabel]
+  );
+
+  if (data.runnerUp) {
+    await pool.query(
+      `INSERT INTO franchise_legacy (guild_id, league_id, franchise_name, championships, finals_appearances, updated_at)
+       VALUES ($1, $2, $3, 0, 1, NOW())
+       ON CONFLICT (guild_id, league_id, franchise_name)
+       DO UPDATE SET finals_appearances = franchise_legacy.finals_appearances + 1, updated_at = NOW()`,
+      [interaction.guild.id, activeLeague.league_id, data.runnerUp]
+    );
+  }
+
+  const awardRows = [];
+  if (data.mvp) awardRows.push({ name: 'MVP / Top Player', value: data.mvp });
+  for (const award of parseCustomAwards(data.awards)) awardRows.push(award);
+  for (const award of awardRows) {
+    await pool.query(
+      `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, created_by_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, award.name, award.value, interaction.user.id]
+    );
+  }
+
+  return { ok: true, message: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.` };
+}
+
 async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) {
   await ensureRecognitionProfile(guild.id, targetUser.id);
 
@@ -22216,7 +22311,7 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     if (error) return error;
 
     const rows = await getStandingsRows(interaction.guild.id, league.league_id);
-    const message = await channel.send({ embeds: [buildStandingsEmbed(league, rows)] });
+    const message = await channel.send({ embeds: [await buildStandingsEmbed(league, rows)] });
     await savePanel(league, 'standings', channel.id, message.id);
     return 'Standings panel created/refreshed in ' + channel.toString() + '.';
   }
@@ -51517,6 +51612,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
       new ButtonBuilder().setCustomId('commissioner_op:announce:' + leagueId).setLabel('League Announcement').setEmoji('📣').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('commissioner_op:rules:' + leagueId).setLabel('Rules').setEmoji('📖').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('commissioner_op:seasonhistory:' + leagueId).setLabel('Season History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
     )];
     if (isStructured) {
       rows.push(new ActionRowBuilder().addComponents(
