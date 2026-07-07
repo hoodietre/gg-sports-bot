@@ -3208,12 +3208,20 @@ async function registerCommands() {
   }
 }
 
+// Shared column list for every league+league_settings join. This exists because
+// getLeagueByName/getLeagueById/getLeagueByChannel/getDefaultLeague each used to
+// hand-maintain their own copy of this list, and new league_settings columns kept
+// getting added to only one or two of the four (see 7/3 trade_negotiation/player_search
+// bug, and the later game_threads/madden_* columns that were only ever added to
+// getLeagueById). Any new league_settings column must be added here ONCE.
+const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
+            s.trade_block_channel_id,
+            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id`;
+
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
-            s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+    `SELECT l.*, ${LEAGUE_SETTINGS_JOIN_COLUMNS}
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND LOWER(l.league_name) = LOWER($2) AND l.is_active = TRUE`,
@@ -3225,10 +3233,7 @@ async function getLeagueByName(guildId, leagueName) {
 async function getLeagueById(leagueId) {
   if (!leagueId) return null;
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
-            s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id
+    `SELECT l.*, ${LEAGUE_SETTINGS_JOIN_COLUMNS}
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.league_id = $1 AND l.is_active = TRUE`,
@@ -3239,10 +3244,7 @@ async function getLeagueById(leagueId) {
 
 async function getLeagueByChannel(guildId, channelId) {
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
-            s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+    `SELECT l.*, ${LEAGUE_SETTINGS_JOIN_COLUMNS}
      FROM leagues l
      JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE AND $2 IN (
@@ -3258,10 +3260,7 @@ async function getLeagueByChannel(guildId, channelId) {
 
 async function getDefaultLeague(guildId) {
   const result = await pool.query(
-    `SELECT l.*, s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.league_role_id, s.committee_role_id, s.live_channel_id,
-            s.team_owners_channel_id, s.trade_count_channel_id, s.trade_block_channel_id,
-            s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count
+    `SELECT l.*, ${LEAGUE_SETTINGS_JOIN_COLUMNS}
      FROM leagues l
      LEFT JOIN league_settings s ON s.league_id = l.league_id
      WHERE l.guild_id = $1 AND l.is_active = TRUE
@@ -15332,6 +15331,20 @@ if (shopSubcommand === 'view') {
           return;
         }
 
+        const infoCustomSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+        const infoStandingsSystem = infoCustomSettings.standings_system === 'points' || isMlbLeague(activeLeague)
+          ? 'points'
+          : infoCustomSettings.standings_system === 'point_differential' ? 'point_differential' : 'wl';
+        const infoUseConferences = infoCustomSettings.use_conferences ?? isNbaLeague(activeLeague);
+        const infoUseDivisions = infoCustomSettings.use_divisions ?? false;
+        const infoShowTies = infoCustomSettings.ties_allowed ?? false;
+        const standingsStyleParts = [
+          infoStandingsSystem === 'points' ? 'Points' : infoStandingsSystem === 'point_differential' ? 'Point Differential' : 'Standard Record',
+        ];
+        if (infoUseConferences) standingsStyleParts.push('Conferences');
+        if (infoUseDivisions) standingsStyleParts.push('Divisions');
+        if (infoShowTies) standingsStyleParts.push('Ties');
+
         const embed = new EmbedBuilder()
           .setTitle('League Settings • ' + activeLeague.league_name)
           .setColor(0x5865F2)
@@ -15343,7 +15356,7 @@ if (shopSubcommand === 'view') {
             { name: 'Tournament Channel', value: activeLeague.tournament_channel_id ? '<#' + activeLeague.tournament_channel_id + '>' : 'Not set', inline: true },
             { name: 'History Channel', value: activeLeague.history_channel_id ? '<#' + activeLeague.history_channel_id + '>' : 'Not set', inline: true },
             { name: 'Playoff Teams', value: String(activeLeague.playoff_team_count || 8), inline: true },
-            { name: 'Standings Style', value: isMlbLeague(activeLeague) ? 'MLB Points (3W/1L)' : isNbaLeague(activeLeague) ? 'NBA Conferences' : 'Standard Record', inline: true }
+            { name: 'Standings Style', value: standingsStyleParts.join(' • '), inline: true }
           )
           .setFooter({ text: 'GG Sports • League Hub' })
           .setTimestamp();
@@ -17060,13 +17073,8 @@ if (shopSubcommand === 'view') {
         await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
         return;
       }
-      const result = await pool.query(
-        `SELECT * FROM league_standings
-         WHERE guild_id = $1 AND league_id = $2
-         ORDER BY ${isMlbLeague(activeLeague) ? 'standings_points DESC, wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC' : 'wins DESC, losses ASC, (points_for - points_against) DESC, team_name ASC'}`,
-        [interaction.guild.id, activeLeague.league_id]
-      );
-      await interaction.reply({ embeds: [await buildStandingsEmbed(activeLeague, result.rows)], ephemeral: true });
+      const rows = await getStandingsRows(interaction.guild.id, activeLeague.league_id);
+      await interaction.reply({ embeds: [await buildStandingsEmbed(activeLeague, rows)], ephemeral: true });
       return;
     }
 
