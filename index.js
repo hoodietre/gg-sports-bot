@@ -1078,6 +1078,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS standings_points INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS ties INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS conference TEXT`);
+  await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS division TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS playoff_team_count INTEGER NOT NULL DEFAULT 8`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_custom_settings (
@@ -2532,8 +2533,8 @@ function buildCommands() {
       .setName('game')
       .setDescription('League game and standings commands')
       .addSubcommand(sc => sc.setName('add').setDescription('Add scheduled game').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true)).addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true)).addStringOption(o => o.setName('date').setDescription('Date/time').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
-      .addSubcommand(sc => sc.setName('report').setDescription('Report completed game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true)).addIntegerOption(o => o.setName('home_score').setDescription('Home score').setRequired(true)).addIntegerOption(o => o.setName('away_score').setDescription('Away score').setRequired(true)))
-      .addSubcommand(sc => sc.setName('reset').setDescription('Staff: reset a reported game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
+      .addSubcommand(sc => sc.setName('report').setDescription('Report completed game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addIntegerOption(o => o.setName('home_score').setDescription('Home score').setRequired(true)).addIntegerOption(o => o.setName('away_score').setDescription('Away score').setRequired(true)))
+      .addSubcommand(sc => sc.setName('reset').setDescription('Staff: reset a reported game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
       .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false))),
@@ -6082,6 +6083,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value);
             await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
+        if (commandName === 'game') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'game_id') {
+            const subcommand = interaction.options.getSubcommand();
+            const query = String(focused.value || '').trim();
+            const statusFilter = subcommand === 'reset' ? `status = 'final'` : `status != 'final'`;
+            const result = await pool.query(
+              `SELECT id, home_team_name, away_team_name, week_label FROM league_games
+               WHERE guild_id = $1 AND ${statusFilter} AND id::text LIKE $2
+               ORDER BY created_at DESC LIMIT 25`,
+              [interaction.guild.id, '%' + query + '%']
+            ).catch(() => ({ rows: [] }));
+            const choices = result.rows.map(g => ({
+              name: `${g.away_team_name} @ ${g.home_team_name}${g.week_label ? ' (' + g.week_label + ')' : ''}`.slice(0, 100),
+              value: g.id,
+            }));
+            await interaction.respond(choices.slice(0, 25));
             return;
           }
         }
@@ -11012,19 +11034,43 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
         const homeScore = Number(game.home_score || 0);
         const awayScore = Number(game.away_score || 0);
+        const wasTie = !game.winner_team_role_id;
         const homeWon = game.winner_team_role_id === game.home_team_role_id;
         const awayWon = game.winner_team_role_id === game.away_team_role_id;
+        const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
 
-        const winnerRoleId = homeWon ? game.home_team_role_id : game.away_team_role_id;
-        const loserRoleId = homeWon ? game.away_team_role_id : game.home_team_role_id;
-        const winnerPointsFor = homeWon ? homeScore : awayScore;
-        const winnerPointsAgainst = homeWon ? awayScore : homeScore;
-        const loserPointsFor = homeWon ? awayScore : homeScore;
-        const loserPointsAgainst = homeWon ? homeScore : awayScore;
-        const winnerStandingsPoints = isMlbLeague(activeLeague) ? 3 : 0;
-        const loserStandingsPoints = isMlbLeague(activeLeague) ? 1 : 0;
+        if (wasTie) {
+          const tiePoints = calculateStandingsPointsForLeague(activeLeague, 0, 0, 1, customSettings);
+          await pool.query(
+            `UPDATE league_standings
+             SET ties = GREATEST(0, ties - 1),
+                 standings_points = GREATEST(0, standings_points - $1),
+                 points_for = GREATEST(0, points_for - $2),
+                 points_against = GREATEST(0, points_against - $3),
+                 updated_at = NOW()
+             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+            [tiePoints, homeScore, awayScore, interaction.guild.id, game.league_id, game.home_team_role_id]
+          );
+          await pool.query(
+            `UPDATE league_standings
+             SET ties = GREATEST(0, ties - 1),
+                 standings_points = GREATEST(0, standings_points - $1),
+                 points_for = GREATEST(0, points_for - $2),
+                 points_against = GREATEST(0, points_against - $3),
+                 updated_at = NOW()
+             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+            [tiePoints, awayScore, homeScore, interaction.guild.id, game.league_id, game.away_team_role_id]
+          );
+        } else {
+          const winnerRoleId = homeWon ? game.home_team_role_id : game.away_team_role_id;
+          const loserRoleId = homeWon ? game.away_team_role_id : game.home_team_role_id;
+          const winnerPointsFor = homeWon ? homeScore : awayScore;
+          const winnerPointsAgainst = homeWon ? awayScore : homeScore;
+          const loserPointsFor = homeWon ? awayScore : homeScore;
+          const loserPointsAgainst = homeWon ? homeScore : awayScore;
+          const winnerStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 1, 0, 0, customSettings);
+          const loserStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 0, 1, 0, customSettings);
 
-        if (homeWon || awayWon) {
           await pool.query(
             `UPDATE league_standings
              SET wins = GREATEST(0, wins - 1),
@@ -11106,22 +11152,18 @@ if (gameSubcommand === 'report') {
           return;
         }
 
-        const homeWins = homeScore > awayScore;
-        const awayWins = awayScore > homeScore;
+        const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+        const isTie = homeScore === awayScore;
 
-        if (!homeWins && !awayWins) {
-          await interaction.reply({ content: 'Ties are not supported for standings. Please enter a winning score.', ephemeral: true });
+        if (isTie && !customSettings.ties_allowed) {
+          await interaction.reply({ content: 'Ties are not supported for standings in this league. Enable ties in League Customization → Standings, or enter a winning score.', ephemeral: true });
           return;
         }
 
-        const winnerRoleId = homeWins ? game.home_team_role_id : game.away_team_role_id;
-        const loserRoleId = homeWins ? game.away_team_role_id : game.home_team_role_id;
-        const winnerName = homeWins ? game.home_team_name : game.away_team_name;
-        const loserName = homeWins ? game.away_team_name : game.home_team_name;
-        const winnerStandingsPoints = isMlbLeague(activeLeague) ? 3 : 0;
-        const loserStandingsPoints = isMlbLeague(activeLeague) ? 1 : 0;
-        const winnerConference = isNbaLeague(activeLeague) ? getTeamConference(winnerName) : null;
-        const loserConference = isNbaLeague(activeLeague) ? getTeamConference(loserName) : null;
+        const homeWins = homeScore > awayScore;
+        const awayWins = awayScore > homeScore;
+        const winnerRoleId = isTie ? null : homeWins ? game.home_team_role_id : game.away_team_role_id;
+        const winnerName = isTie ? null : homeWins ? game.home_team_name : game.away_team_name;
 
         await pool.query(
           `UPDATE league_games
@@ -11130,30 +11172,44 @@ if (gameSubcommand === 'report') {
           [homeScore, awayScore, winnerRoleId, interaction.user.id, game.id]
         );
 
+        const { conference: homeConference, division: homeDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.home_team_name).catch(() => ({ conference: null, division: null }));
+        const { conference: awayConference, division: awayDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.away_team_name).catch(() => ({ conference: null, division: null }));
+
+        const homeWL = isTie ? { w: 0, l: 0, t: 1 } : homeWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
+        const awayWL = isTie ? { w: 0, l: 0, t: 1 } : awayWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
+        const homeStandingsPoints = calculateStandingsPointsForLeague(activeLeague, homeWL.w, homeWL.l, homeWL.t, customSettings);
+        const awayStandingsPoints = calculateStandingsPointsForLeague(activeLeague, awayWL.w, awayWL.l, awayWL.t, customSettings);
+
         await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points, conference)
-           VALUES ($1, $2, $3, $4, 1, 0, $5, $6, $7, $8)
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            ON CONFLICT (guild_id, league_id, team_role_id)
-           DO UPDATE SET wins = league_standings.wins + 1,
-                         standings_points = league_standings.standings_points + $7,
-                         conference = $8,
-                         points_for = league_standings.points_for + $5,
-                         points_against = league_standings.points_against + $6,
+           DO UPDATE SET wins = league_standings.wins + $5,
+                         losses = league_standings.losses + $6,
+                         ties = league_standings.ties + $7,
+                         standings_points = league_standings.standings_points + $10,
+                         conference = $11,
+                         division = $12,
+                         points_for = league_standings.points_for + $8,
+                         points_against = league_standings.points_against + $9,
                          updated_at = NOW()`,
-          [interaction.guild.id, game.league_id, winnerRoleId, winnerName, Math.max(homeScore, awayScore), Math.min(homeScore, awayScore), winnerStandingsPoints, winnerConference]
+          [interaction.guild.id, game.league_id, game.home_team_role_id, game.home_team_name, homeWL.w, homeWL.l, homeWL.t, homeScore, awayScore, homeStandingsPoints, homeConference, homeDivision]
         );
 
         await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, points_for, points_against, standings_points, conference)
-           VALUES ($1, $2, $3, $4, 0, 1, $5, $6, $7, $8)
+          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            ON CONFLICT (guild_id, league_id, team_role_id)
-           DO UPDATE SET losses = league_standings.losses + 1,
-                         standings_points = league_standings.standings_points + $7,
-                         conference = $8,
-                         points_for = league_standings.points_for + $5,
-                         points_against = league_standings.points_against + $6,
+           DO UPDATE SET wins = league_standings.wins + $5,
+                         losses = league_standings.losses + $6,
+                         ties = league_standings.ties + $7,
+                         standings_points = league_standings.standings_points + $10,
+                         conference = $11,
+                         division = $12,
+                         points_for = league_standings.points_for + $8,
+                         points_against = league_standings.points_against + $9,
                          updated_at = NOW()`,
-          [interaction.guild.id, game.league_id, loserRoleId, loserName, Math.min(homeScore, awayScore), Math.max(homeScore, awayScore), loserStandingsPoints, loserConference]
+          [interaction.guild.id, game.league_id, game.away_team_role_id, game.away_team_name, awayWL.w, awayWL.l, awayWL.t, awayScore, homeScore, awayStandingsPoints, awayConference, awayDivision]
         );
 
         if (typeof updateStandingsPanel === 'function') {
@@ -11198,10 +11254,13 @@ if (gameSubcommand === 'report') {
           payoutLines.push(settings.currency_icon + ' <@' + winnerOwner.id + '> earned **' + settings.win_payout + ' ' + settings.currency_name + '** win bonus.');
         }
 
-        const sportsbookSettlement = await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => {
-          console.error('Auto sportsbook settlement failed:', error);
-          return null;
-        });
+        const sportsbookSettlement = isTie
+          ? null
+          : await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => {
+              console.error('Auto sportsbook settlement failed:', error);
+              return null;
+            });
+        const tieSportsbookNote = isTie ? String.fromCharCode(10) + 'This game was a tie, so any sportsbook bets on it were left open — settle manually if this league books ties.' : '';
 
         const sportsbookText = sportsbookSettlement
           ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets, paid **' + settings.currency_icon + ' ' + sportsbookSettlement.totalPaid + '**.'
@@ -11211,8 +11270,9 @@ if (gameSubcommand === 'report') {
         }
 
         const payoutText = payoutLines.length ? String.fromCharCode(10) + payoutLines.join(String.fromCharCode(10)) : '';
+        const resultText = isTie ? 'It\'s a tie.' : 'Winner: **' + winnerName + '**.';
 
-        await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. Winner: **' + winnerName + '**.' + payoutText + sportsbookText, ephemeral: false });
+        await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. ' + resultText + payoutText + sportsbookText + tieSportsbookNote, ephemeral: false });
         return;
       }
 
@@ -17028,13 +17088,13 @@ if (shopSubcommand === 'view') {
       const ties = interaction.options.getInteger('ties') || 0;
       const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => null);
       const standingsPoints = calculateStandingsPointsForLeague(activeLeague, wins, losses, ties, customSettings);
-      const { conference } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, team.name);
+      const { conference, division } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, team.name);
       await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, standings_points, conference)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, standings_points, conference, division)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (guild_id, league_id, team_role_id)
-         DO UPDATE SET wins = $5, losses = $6, ties = $7, standings_points = $8, conference = $9, team_name = $4, updated_at = NOW()`,
-        [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses, ties, standingsPoints, conference]
+         DO UPDATE SET wins = $5, losses = $6, ties = $7, standings_points = $8, conference = $9, division = $10, team_name = $4, updated_at = NOW()`,
+        [interaction.guild.id, activeLeague.league_id, team.id, team.name, wins, losses, ties, standingsPoints, conference, division]
       );
       await updateStandingsPanel(interaction.guild, activeLeague);
       await interaction.reply({ content: `Standings adjusted: **${team.name}** is now **${wins}-${losses}${ties ? '-' + ties : ''}**.`, ephemeral: true });
