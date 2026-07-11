@@ -1720,14 +1720,14 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('madden')
       .setDescription('Madden franchise and league commands')
-      .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
-      .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('View Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
-      .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
-      .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('powerrankings').setDescription('View Madden power rankings with movement').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('setup').setDescription('Staff: configure Madden foundation for a league').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('console').setDescription('Console/platform notes').setRequired(false)).addStringOption(o => o.setName('advance').setDescription('Advance/sim schedule notes').setRequired(false)))
+      .addSubcommand(sc => sc.setName('league').setDescription('View Madden league setup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('teams').setDescription('List Madden team ownership mappings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('View Madden franchise hub, news, records, Hall of Fame, champions, or awards').addStringOption(o => o.setName('view').setDescription('Choose what to show').setRequired(false).addChoices({ name: 'Franchise Hub', value: 'hub' }, { name: 'News Feed', value: 'news' }, { name: 'League Records', value: 'records' }, { name: 'Hall of Fame', value: 'hof' }, { name: 'Championship History', value: 'championships' }, { name: 'Dynasty Tracker', value: 'dynasty' }, { name: 'Award History', value: 'award_history' }, { name: 'Season Close Preview', value: 'season_close' })).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(false)).addStringOption(o => o.setName('team_name').setDescription('Team name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('Coach/user').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('link').setDescription('Staff: link Madden franchise external sync source').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('source').setDescription('Source name: neon, neon_sportz, manual_api').setRequired(true)).addStringOption(o => o.setName('franchise_id').setDescription('External franchise/league ID').setRequired(false)).addStringOption(o => o.setName('url').setDescription('External league URL/API base URL').setRequired(false)).addStringOption(o => o.setName('api_key').setDescription('Optional API key/token').setRequired(false)))
+      .addSubcommand(sc => sc.setName('sync').setDescription('Staff: run Madden external sync/import placeholder').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('week').setDescription('Optional week label').setRequired(false)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View Madden external sync settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('powerrankings').setDescription('View Madden power rankings with movement').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('awards').setDescription('View Madden award races from imported stats')
         .addStringOption(o => o.setName('award').setDescription('Award race').setRequired(true)
           .addChoices(
@@ -1737,12 +1737,12 @@ function buildCommands() {
             { name: 'OROY', value: 'oroy' },
             { name: 'DROY', value: 'droy' }
           ))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('probe_player').setDescription('Debug: inspect rookie/experience fields for a player').setRequired(false)))
       .addSubcommand(sc => sc.setName('matchup').setDescription('Preview a Madden matchup with team stats, leaders, and prediction')
         .addStringOption(o => o.setName('home_team').setDescription('Current-week home team').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('away_team').setDescription('Current-week away team/opponent').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       
 
       
@@ -1757,13 +1757,13 @@ function buildCommands() {
             { name: 'Conference', value: 'conference' },
             { name: 'League', value: 'league' }
           ))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('schedule').setDescription('View imported Madden schedule/games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('schedule').setDescription('View imported Madden schedule/games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('game').setDescription('View Madden game center')
         .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('week').setDescription('Week label, for example Week 2').setRequired(false))
         .addStringOption(o => o.setName('opponent').setDescription('Opponent team name').setRequired(false).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('leaders').setDescription('View Madden league leaders from imported EA stats')
         .addStringOption(o => o.setName('category').setDescription('Leader category').setRequired(true)
           .addChoices(
@@ -1783,15 +1783,15 @@ function buildCommands() {
             { name: 'Punting Yards', value: 'punting' },
             { name: 'Punting Average', value: 'punting_avg' }
           ))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
         .addIntegerOption(o => o.setName('week').setDescription('Display week number, leave blank for season total').setRequired(false))
         .addIntegerOption(o => o.setName('limit').setDescription('Number of leaders to show').setRequired(false)))
       .addSubcommand(sc => sc.setName('player').setDescription('View an imported Madden player profile and season stats')
         .addStringOption(o => o.setName('name').setDescription('Player name').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
         .addStringOption(o => o.setName('team').setDescription('Optional team filter').setRequired(false)))
-      .addSubcommand(sc => sc.setName('players').setDescription('Search imported Madden players').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false)).addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false)))
-      .addSubcommand(sc => sc.setName('roster').setDescription('View an imported Madden team roster').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('position').setDescription('Filter by position').setRequired(false)).addStringOption(o => o.setName('dev').setDescription('Filter by dev trait').setRequired(false).addChoices({ name: 'X-Factor', value: 'xfactor' }, { name: 'Superstar', value: 'superstar' }, { name: 'Star', value: 'star' }, { name: 'Hidden', value: 'hidden' }, { name: 'Normal', value: 'normal' })).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))).addSubcommand(sc => sc.setName('compare').setDescription('Compare Madden players or teams')
+      .addSubcommand(sc => sc.setName('players').setDescription('Search imported Madden players').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false)).addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false)))
+      .addSubcommand(sc => sc.setName('roster').setDescription('View an imported Madden team roster').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('position').setDescription('Filter by position').setRequired(false)).addStringOption(o => o.setName('dev').setDescription('Filter by dev trait').setRequired(false).addChoices({ name: 'X-Factor', value: 'xfactor' }, { name: 'Superstar', value: 'superstar' }, { name: 'Star', value: 'star' }, { name: 'Hidden', value: 'hidden' }, { name: 'Normal', value: 'normal' })).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))).addSubcommand(sc => sc.setName('compare').setDescription('Compare Madden players or teams')
         .addStringOption(o => o.setName('type').setDescription('Comparison type').setRequired(true)
           .addChoices(
             { name: 'Player vs Player', value: 'player' },
@@ -1800,15 +1800,15 @@ function buildCommands() {
           ))
         .addStringOption(o => o.setName('first').setDescription('First player/team').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('second').setDescription('Second player/team').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))).addSubcommand(sc => sc.setName('team').setDescription('View imported Madden team profile').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('recentgames').setDescription('View recent imported Madden completed games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addIntegerOption(o => o.setName('limit').setDescription('Number of games').setRequired(false)))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))).addSubcommand(sc => sc.setName('team').setDescription('View imported Madden team profile').addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('recentgames').setDescription('View recent imported Madden completed games').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addIntegerOption(o => o.setName('limit').setDescription('Number of games').setRequired(false)))
 
-      .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
-      .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
+      .addSubcommand(sc => sc.setName('autosync').setDescription('Staff: configure Madden automatic external sync').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addBooleanOption(o => o.setName('enabled').setDescription('Enable autosync?').setRequired(true)).addIntegerOption(o => o.setName('minutes').setDescription('Sync interval in minutes, minimum 15').setRequired(false)))
+      .addSubcommand(sc => sc.setName('syncfeed').setDescription('Staff: set Madden sync result feed channel').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addChannelOption(o => o.setName('channel').setDescription('Sync feed channel').setRequired(true)))
 
-      .addSubcommand(sc => sc.setName('connect').setDescription('Start Discord-native EA Direct connection wizard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
-      .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
-      .addSubcommand(sc => sc.setName('disconnect').setDescription('Disconnect your EA Direct Madden connection').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)))
+      .addSubcommand(sc => sc.setName('connect').setDescription('Start Discord-native EA Direct connection wizard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('connections').setDescription('View Madden EA Direct connections').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('disconnect').setDescription('Disconnect your EA Direct Madden connection').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
 
 ,
 
@@ -2190,14 +2190,14 @@ function buildCommands() {
         { name: 'Postseason Result Promotion Audit', value: 'postseason_result_promotion_audit' },
         { name: 'Season Stage Probe (offseason/FA detector)', value: 'season_stage_probe' }
       ))
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
 
 ,
 
     new SlashCommandBuilder()
       .setName('maddenvalues')
       .setDescription('View Madden player value rankings')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
       .addStringOption(o => o.setName('team').setDescription('Team name filter').setRequired(false).setAutocomplete(true))
       .addStringOption(o => o.setName('position').setDescription('Position filter').setRequired(false)
         .addChoices(
@@ -2323,7 +2323,7 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('gm')
       .setDescription('Team GM dashboard')
-      .addSubcommand(sc => sc.setName('panel').setDescription('Open your GM panel').addStringOption(o => o.setName('team').setDescription('Team name (defaults to your owned team)').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open your GM panel').addStringOption(o => o.setName('team').setDescription('Team name (defaults to your owned team)').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('admin')
@@ -2360,7 +2360,7 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('whogotnext')
       .setDescription('Notify a league that you are ready to play')
-      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
       .addStringOption(o => o.setName('message').setDescription('Optional extra message').setRequired(false)),
 
     new SlashCommandBuilder()
@@ -2386,26 +2386,26 @@ function buildCommands() {
       .setName('trade')
       .setDescription('Trade system commands')
       .addSubcommand(sc => sc.setName('block').setDescription('Add a player to the trade block'))
-      .addSubcommand(sc => sc.setName('history').setDescription('Show recent approved trades').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('team').setDescription('Show approved trades involving a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('history').setDescription('Show recent approved trades').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('team').setDescription('Show approved trades involving a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('addcount').setDescription('Add 1 trade to a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)))
       .addSubcommand(sc => sc.setName('removecount').setDescription('Remove 1 trade from a team').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)))
       .addSubcommand(sc => sc.setName('tradecountpanel').setDescription('Create or refresh the Trade Count embed'))
       .addSubcommand(sc => sc.setName('offerpanel').setDescription('Create or refresh the Offer a Trade panel'))
-      .addSubcommand(sc => sc.setName('setup').setDescription('Staff: set trade channels/committee role').addStringOption(o => o.setName('type').setDescription('owners, offer, committee_role, committee_channel, approved, denied, count').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(false)).addRoleOption(o => o.setName('role').setDescription('Role for committee_role').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('settings').setDescription('View trade setup settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('setup').setDescription('Staff: set trade channels/committee role').addStringOption(o => o.setName('type').setDescription('owners, offer, committee_role, committee_channel, approved, denied, count').setRequired(true)).addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(false)).addRoleOption(o => o.setName('role').setDescription('Role for committee_role').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('settings').setDescription('View trade setup settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
 ,
 
     new SlashCommandBuilder()
       .setName('profile')
       .setDescription('Profile, stats, activity, and history commands')
-      .addSubcommand(sc => sc.setName('user').setDescription('Show a user profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('stats').setDescription('Show league stats').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('team').setDescription('Show a team profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('awards').setDescription('Show award history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
-      .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('franchise').setDescription('Show the full Franchise Hub profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('user').setDescription('Show a user profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('stats').setDescription('Show league stats').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('team').setDescription('Show a team profile').addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('legacy').setDescription('Show franchise history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('awards').setDescription('Show award history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addStringOption(o => o.setName('award').setDescription('Award filter').setRequired(false)))
+      .addSubcommand(sc => sc.setName('halloffame').setDescription('Show Hall of Fame leaderboard').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('franchise').setDescription('Show the full Franchise Hub profile').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('activity').setDescription('Show profile activity snapshot').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('earnings').setDescription('Show all-time economy and sportsbook earnings').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('milestones').setDescription('Show activity and legacy milestones').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
@@ -2470,15 +2470,15 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('list').setDescription('List active tournaments'))
       .addSubcommand(sc => sc.setName('info').setDescription('Show tournament info').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('panel').setDescription('Open the tournament manager, or a specific tournament panel').addStringOption(o => o.setName('tournament').setDescription('Tournament name or short ID').setRequired(false)))
-      .addSubcommand(sc => sc.setName('history').setDescription('Show tournament history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('rewards').setDescription('Show tournament rewards').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false))),
+      .addSubcommand(sc => sc.setName('history').setDescription('Show tournament history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('rewards').setDescription('Show tournament rewards').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('ticket')
       .setDescription('Ticket and support commands')
-      .addSubcommand(sc => sc.setName('open').setDescription('Open a support ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('dispute').setDescription('Open dispute ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('game').setDescription('Open game issue ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('open').setDescription('Open a support ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('dispute').setDescription('Open dispute ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('game').setDescription('Open game issue ticket').addStringOption(o => o.setName('subject').setDescription('Subject').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('close').setDescription('Close ticket').addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
       .addSubcommand(sc => sc.setName('list').setDescription('Staff: list tickets').addStringOption(o => o.setName('status').setDescription('Status').setRequired(false)).addStringOption(o => o.setName('priority').setDescription('Priority').setRequired(false)))
       .addSubcommand(sc => sc.setName('info').setDescription('Ticket details').addStringOption(o => o.setName('ticket_id').setDescription('Ticket short ID').setRequired(true)))
@@ -2494,7 +2494,7 @@ function buildCommands() {
       .setName('sportsbook')
       .setDescription('Sportsbook commands')
       .addSubcommand(sc => sc.setName('board').setDescription('View open sportsbook games'))
-      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create sportsbook game').addStringOption(o => o.setName('label').setDescription('Game label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create sportsbook game').addStringOption(o => o.setName('label').setDescription('Game label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('place').setDescription('Place moneyline bet').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)))
       .addSubcommand(sc => sc.setName('settle').setDescription('Staff: settle sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)))
       .addSubcommand(sc => sc.setName('refund').setDescription('Staff: refund open bets for a sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Refund reason').setRequired(false)))
@@ -2508,38 +2508,38 @@ function buildCommands() {
       .setDescription('League setup and management commands')
       .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game type: nba, mlb, madden, general').setRequired(false)))
       .addSubcommand(sc => sc.setName('delete').setDescription('Delete/deactivate a league').addStringOption(o => o.setName('name').setDescription('League name to delete').setRequired(true)))
-      .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('nba, mlb, madden, general').setRequired(true)))
-      .addSubcommand(sc => sc.setName('playoffsettings').setDescription('Set playoff team count for a league').addIntegerOption(o => o.setName('teams').setDescription('Number of teams that make playoffs').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('game').setDescription('nba, mlb, madden, general').setRequired(true)))
+      .addSubcommand(sc => sc.setName('playoffsettings').setDescription('Set playoff team count for a league').addIntegerOption(o => o.setName('teams').setDescription('Number of teams that make playoffs').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
+      .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
       .addSubcommand(sc => sc.setName('list').setDescription('List leagues'))
-      .addSubcommand(sc => sc.setName('staff').setDescription('Set staff role').addRoleOption(o => o.setName('role').setDescription('Staff role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('standingschannel').setDescription('Set standings channel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('standingspanel').setDescription('Create standings panel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('staff').setDescription('Set staff role').addRoleOption(o => o.setName('role').setDescription('Staff role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('standingschannel').setDescription('Set standings channel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('standingspanel').setDescription('Create standings panel').addChannelOption(o => o.setName('channel').setDescription('Standings channel').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('tournamentchannel').setDescription('Set tournament channel').addChannelOption(o => o.setName('channel').setDescription('Tournament channel').setRequired(true)))
       .addSubcommand(sc => sc.setName('tournamentpanel').setDescription('Create tournament panel').addChannelOption(o => o.setName('channel').setDescription('Tournament channel').setRequired(false)))
       .addSubcommand(sc => sc.setName('ticketpanel').setDescription('Create ticket dashboard').addChannelOption(o => o.setName('channel').setDescription('Ticket dashboard channel').setRequired(false)))
       .addSubcommand(sc => sc.setName('supportpanel').setDescription('Create support panel').addChannelOption(o => o.setName('channel').setDescription('Support panel channel').setRequired(false)))
       .addSubcommand(sc => sc.setName('sportsbookpanel').setDescription('Create sportsbook board').addChannelOption(o => o.setName('channel').setDescription('Sportsbook board channel').setRequired(false)))
-      .addSubcommand(sc => sc.setName('sportsbookchannel').setDescription('Set sportsbook live feed channel').addChannelOption(o => o.setName('channel').setDescription('Sportsbook feed channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('sportsbookfeed').setDescription('Enable or disable sportsbook live feed').addBooleanOption(o => o.setName('enabled').setDescription('Enable live feed?').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('sportsbooksettings').setDescription('View sportsbook live feed settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
+      .addSubcommand(sc => sc.setName('sportsbookchannel').setDescription('Set sportsbook live feed channel').addChannelOption(o => o.setName('channel').setDescription('Sportsbook feed channel').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('sportsbookfeed').setDescription('Enable or disable sportsbook live feed').addBooleanOption(o => o.setName('enabled').setDescription('Enable live feed?').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('sportsbooksettings').setDescription('View sportsbook live feed settings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('teamrole').setDescription('Add/register a team role for this league').addRoleOption(o => o.setName('role').setDescription('Team role').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('teamownerspanel').setDescription('Create Team Owners panel'))
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
-      .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('awards').setDescription('Open a customizable league awards form').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
+      .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('awards').setDescription('Open a customizable league awards form').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('game')
       .setDescription('League game and standings commands')
-      .addSubcommand(sc => sc.setName('add').setDescription('Add scheduled game').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true)).addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true)).addStringOption(o => o.setName('date').setDescription('Date/time').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
+      .addSubcommand(sc => sc.setName('add').setDescription('Add scheduled game').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true)).addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true)).addStringOption(o => o.setName('date').setDescription('Date/time').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
       .addSubcommand(sc => sc.setName('report').setDescription('Report completed game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addIntegerOption(o => o.setName('home_score').setDescription('Home score').setRequired(true)).addIntegerOption(o => o.setName('away_score').setDescription('Away score').setRequired(true)))
       .addSubcommand(sc => sc.setName('reset').setDescription('Staff: reset a reported game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
-      .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false)))
-      .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false))),
+      .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false))),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -6473,6 +6473,22 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
             );
 
             await interaction.respond(choices);
+            return;
+          }
+        }
+
+        // Generic fallback: any command whose 'league' option wasn't already
+        // handled by a more specific block above (most non-Madden commands,
+        // plus several Madden ones that only had team/player-specific
+        // autocomplete wired) still gets real suggestions instead of an empty
+        // response. Filters to Madden-only leagues for madden-prefixed
+        // commands, all leagues otherwise.
+        {
+          const fallbackFocused = interaction.options.getFocused(true);
+          if (fallbackFocused?.name === 'league') {
+            const gameKeyFilter = commandName.startsWith('madden') ? 'madden' : null;
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, fallbackFocused.value, gameKeyFilter);
+            await interaction.respond((choices || []).slice(0, 25));
             return;
           }
         }
@@ -21024,90 +21040,96 @@ function buildSetupGuideEmbed() {
     .setTitle('GG Sports Setup Guide')
     .setColor(0x5865F2)
     .setDescription(
-      'Use this guide in order when setting up a new server or new league. GG Sports is built around hubs, so most features live under /league, /game, /shop, /sportsbook, /profile, /activity, and /premium.'
+      'Use this guide in order when setting up a new server or new league. **Most of this is now done from `/commissioner panel`** — one interactive control panel covering channels/roles, live panels, operations, league customization, and (for Madden leagues) browsing transactions/retirements and auto-detect settings. Individual slash commands below still work as manual backups.'
     )
     .addFields(
       {
         name: '1. Create the League',
         value:
-          '**/league create** — creates the league record.\\n' +
-          '**/league info** — checks the league setup.\\n' +
-          '**/league settings** — reviews configured league settings.\\n' +
+          '**/league create** — creates the league record.\n' +
+          '**/commissioner panel** — open the control panel (also works via `/league info`/`/league settings` for a read-only check).\n' +
           '**/league delete** — disables/removes a league when needed.',
         inline: false,
       },
       {
         name: '2. Set Staff, League Roles, and Team Roles',
         value:
-          '**/league staff** — sets the staff role that can manage league tools.\\n' +
-          '**/league teamrole** — connects Discord team roles to the league.\\n' +
-          'Team roles are important for owners, standings, trades, game validation, playoffs, and preventing users from betting on their own games.',
+          '`/commissioner panel` → **Channels & Roles** covers staff role, league role, and team roles in one place.\n' +
+          'Manual backups: **/league staff**, **/league teamrole**.\n' +
+          'Team roles matter for owners, standings, trades, game validation, playoffs, and preventing users from betting on their own games.',
         inline: false,
       },
       {
-        name: '3. Configure Core Channels',
+        name: '3. Configure Core Channels & Panels',
         value:
-          '**/league standingschannel** — sets where standings panels post.\\n' +
-          '**/league sportsbookchannel** — sets live sportsbook feed alerts.\\n' +
-          '**/league sportsbookfeed** — enables/disables live betting feed.\\n' +
-          '**/league tournamentchannel** — sets tournament content channel.\\n' +
-          '**/ticket panel** and **/ticket supportpanel** — create support dashboards.',
+          '`/commissioner panel` → **Channels & Roles** sets every channel (standings, sportsbook, tournament, Game Center, tickets, and more); → **Panels** posts/refreshes the live boards for whichever channels you set.\n' +
+          'Manual backups: **/league standingschannel**, **/league sportsbookchannel**, **/league sportsbookfeed**, **/league tournamentchannel**, **/ticket panel**, **/ticket supportpanel**.',
         inline: false,
       },
       {
         name: '4. Configure Economy + Payouts',
         value:
-          '**/league currency** — sets currency name/icon and payout values.\\n' +
-          'Use this to control game played payout, win payout, and award payout.\\n' +
-          '**/economy balance** — checks balance.\\n' +
+          '**/league currency** — sets currency name/icon and payout values.\n' +
+          'Use this to control game played payout, win payout, and award payout.\n' +
+          '**/economy balance** — checks balance.\n' +
           '**/economy give/take/transfer** — manages currency.',
         inline: false,
       },
       {
         name: '5. Set Up the Shop',
         value:
-          '**/shop createitem** — creates an item for sale.\n**/shop createcosmetic** — creates a visual avatar cosmetic.\n**/shop preview** — previews cosmetics before purchase.\\n' +
-          '**/shop panel** — posts the permanent shop panel with item buttons.\\n' +
-          '**/shop cart** — users view their cart.\\n' +
-          '**/shop checkout** — users confirm purchases.\\n' +
+          '**/shop createitem** — creates an item for sale.\n**/shop createcosmetic** — creates a visual avatar cosmetic.\n**/shop preview** — previews cosmetics before purchase.\n' +
+          '**/shop panel** — posts the permanent shop panel with item buttons.\n' +
+          '**/shop cart** — users view their cart.\n' +
+          '**/shop checkout** — users confirm purchases.\n' +
           '**/shop inventory** — users/staff view owned items.',
         inline: false,
       },
       {
         name: '6. Set Up Sportsbook',
         value:
-          '**/league sportsbookchannel** — choose the feed channel.\\n' +
-          '**/league sportsbookfeed** — turn feed alerts on/off.\\n' +
-          '**/sportsbook create** — manually create a betting line.\\n' +
-          '**/sportsbook limits** — set max bet/max payout.\\n' +
-          '**/sportsbook refund** — refund open bets if a game is cancelled or created wrong.\\n' +
+          '**/league sportsbookchannel** — choose the feed channel.\n' +
+          '**/league sportsbookfeed** — turn feed alerts on/off.\n' +
+          '**/sportsbook create** — manually create a betting line.\n' +
+          '**/sportsbook limits** — set max bet/max payout.\n' +
+          '**/sportsbook refund** — refund open bets if a game is cancelled or created wrong.\n' +
           '**/sportsbook leaderboards** — view sportsbook performance.',
         inline: false,
       },
       {
         name: '7. Games, Standings, and Playoffs',
         value:
-          '**/game add** — adds a scheduled league game. Home team/staff validation applies.\\n' +
-          '**/game report** — reports the result, updates standings, payouts, and sportsbook settlement.\\n' +
-          '**/game standings** — shows current standings.\\n' +
-          '**/league playoffsettings** — sets playoff size/rules.\\n' +
-          '**/league playoffs** — generates a playoff bracket from standings.',
+          'Non-Madden, open-schedule leagues: `/commissioner panel` → **Channels & Roles** → set a **Game Center Channel**, then post the Game Center panel — click **Add Game** to schedule a matchup with no typing; it opens a private thread per game with Report Score/Reset Game buttons built in.\n' +
+          'Manual backups: **/game add**, **/game report**, **/game reset**, **/game standings**.\n' +
+          'Playoffs (all league types): `/commissioner panel` → **Operations** → **Playoffs** (Start/Report/Post Bracket Panel) — tracks real bracket state, series scores, and auto-advances rounds. `/league playoffsettings` sets team count.',
         inline: false,
       },
       {
-        name: '8. Awards, Activity, Legacy, and Profiles',
+        name: '8. League Customization',
         value:
-          '**/league awards** — opens the customizable awards form.\\n' +
-          '**/activity** — shows current engagement/activity tier.\\n' +
-          '**/activityleaderboard** — shows top active users.\\n' +
-          '**/legacy** — shows permanent greatness/legacy ranking.\\n' +
+          '`/commissioner panel` → **League Settings** → season length, schedule style, standings system (W/L, points, or point differential), ties, conferences/divisions, playoff seeding, CPU trades, trade limits, and which awards this league tracks. Everything here actually drives standings display, playoff seeding, and trade limits — not just labels.',
+        inline: false,
+      },
+      {
+        name: '9. Madden Leagues Only',
+        value:
+          '**/madden connect** then **/madden sync** to pull EA data. `/commissioner panel` → **Operations** for sync/scans/auto-detection and **Auto-Detect Settings** (threshold, review channel, ESPN news, sportsbook auto-lines) — or → **Browse Data** to view recent transactions/retirements by team without typing a command.',
+        inline: false,
+      },
+      {
+        name: '10. Awards, Activity, Legacy, and Profiles',
+        value:
+          '**/league awards** — opens the customizable awards form.\n' +
+          '**/activity** — shows current engagement/activity tier.\n' +
+          '**/activityleaderboard** — shows top active users.\n' +
+          '**/legacy** — shows permanent greatness/legacy ranking.\n' +
           '**/profile franchise/activity/earnings/milestones/badges** — shows long-term user identity.',
         inline: false,
       },
       {
-        name: '9. Recommended Launch Order',
+        name: '11. Recommended Launch Order',
         value:
-          'Create league → set roles → set channels → configure currency/payouts → create shop → create panels → configure sportsbook → add games → report games → generate playoffs → post awards.',
+          'Create league → `/commissioner panel` for roles/channels → configure currency/payouts → create shop → post panels → configure sportsbook → add games (or set up Game Center) → report games → run playoffs → post awards.',
         inline: false,
       }
     )
@@ -21119,17 +21141,17 @@ function buildQuickSetupEmbed() {
   return new EmbedBuilder()
     .setTitle('GG Sports Quick Setup')
     .setColor(0x57F287)
-    .setDescription('Fast checklist for setting up a new league.')
+    .setDescription('Fast checklist for setting up a new league. Everything below except league creation and currency can be done from `/commissioner panel`.')
     .addFields(
       { name: '1. Create league', value: '/league create', inline: true },
-      { name: '2. Set staff', value: '/league staff', inline: true },
-      { name: '3. Add team roles', value: '/league teamrole', inline: true },
-      { name: '4. Set channels', value: '/league standingschannel\\n/league sportsbookchannel', inline: true },
+      { name: '2. Open control panel', value: '/commissioner panel', inline: true },
+      { name: '3. Set roles + team roles', value: 'Panel → Channels & Roles', inline: true },
+      { name: '4. Set channels', value: 'Panel → Channels & Roles', inline: true },
       { name: '5. Configure currency', value: '/league currency', inline: true },
-      { name: '6. Create panels', value: '/shop panel\\n/sportsbook board\\n/ticket panel', inline: true },
-      { name: '7. Configure playoffs', value: '/league playoffsettings', inline: true },
-      { name: '8. Start season', value: '/game add\\n/game report', inline: true },
-      { name: '9. Track users', value: '/activity\\n/legacy\\n/profile franchise', inline: true }
+      { name: '6. Post panels', value: 'Panel → Panels', inline: true },
+      { name: '7. League Customization', value: 'Panel → League Settings', inline: true },
+      { name: '8. Start season', value: 'Panel → Game Center, or\n/game add + /game report', inline: true },
+      { name: '9. Track users', value: '/activity\n/legacy\n/profile franchise', inline: true }
     )
     .setFooter({ text: 'GG Sports • Quick Setup' })
     .setTimestamp();
@@ -21139,13 +21161,19 @@ function buildCommandsGuideEmbed() {
   return new EmbedBuilder()
     .setTitle('GG Sports Commands')
     .setColor(0x5865F2)
-    .setDescription('Commands are organized by hub. Use /commissioner panel for the interactive commissioner control panel or /setupguide for full setup instructions.')
+    .setDescription('Commands are organized by hub. Use /commissioner panel for the interactive commissioner control panel (channels/roles, live panels, operations, league customization, and Madden browse/auto-detect tools) or /setupguide for full setup instructions.')
     .addFields(
+      {
+        name: 'Commissioner Panel (recommended)',
+        value:
+          '**/commissioner panel** — one control panel covering everything below with no typing required: Channels & Roles, Panels, Operations (sync/scans/auto-detection/playoffs/Game Center), Browse Data (Madden transactions/retirements), and League Settings.',
+        inline: false,
+      },
       {
         name: 'League Setup',
         value:
-          '/league create, /league delete, /league info, /league list, /league settings\\n' +
-          '/league staff, /league teamrole, /league standingschannel, /league tournamentchannel\\n' +
+          '/league create, /league delete, /league info, /league list, /league settings\n' +
+          '/league staff, /league teamrole, /league standingschannel, /league tournamentchannel\n' +
           '/league sportsbookchannel, /league sportsbookfeed, /league currency, /league awards',
         inline: false,
       },
@@ -21158,21 +21186,22 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Games + Standings',
         value:
-          '/game add, /game report, /game schedule, /game standings, /game adjuststandings\\n' +
-          '/league playoffsettings, /league playoffs',
+          '/game add, /game report, /game reset, /game schedule, /game standings, /game adjuststandings\n' +
+          '/league playoffsettings — playoff team count; run playoffs from Commissioner Panel → Operations → Playoffs\n' +
+          'Open-schedule leagues without game threads: Commissioner Panel → Game Center panel (Add Game → private matchup thread with built-in Report/Reset buttons)',
         inline: false,
       },
       {
         name: 'Sportsbook',
         value:
-          '/sportsbook board, /sportsbook create, /sportsbook place, /sportsbook settle\\n' +
+          '/sportsbook board, /sportsbook create, /sportsbook place, /sportsbook settle\n' +
           '/sportsbook refund, /sportsbook limits, /sportsbook leaderboards, /sportsbook mybets, /sportsbook parlay',
         inline: false,
       },
       {
         name: 'Shop + Economy',
         value:
-          '/shop view, /shop panel, /shop createitem, /shop createcosmetic, /shop preview, /shop removeitem, /shop cart, /shop checkout, /shop inventory\\n' +
+          '/shop view, /shop panel, /shop createitem, /shop createcosmetic, /shop preview, /shop removeitem, /shop cart, /shop checkout, /shop inventory\n' +
           '/economy balance, /economy transfer, /economy give, /economy take, /economy richest, /economy transactions',
         inline: false,
       },
@@ -21185,14 +21214,14 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Tickets + Tournaments',
         value:
-          '/ticket open, /ticket dispute, /ticket game, /ticket list, /ticket panel, /ticket supportpanel\\n' +
-          '/tournament create, /tournament join, /tournament list, /tournament start, /tournament report',
+          '/ticket open, /ticket dispute, /ticket game, /ticket list, /ticket panel, /ticket supportpanel\n' +
+          '/tournament create, /tournament join, /tournament list, /tournament start, /tournament report — or Commissioner Panel → Panels → Tournament Panel',
         inline: false,
       },
       {
         name: 'Profiles, Activity, Legacy',
         value:
-          '/profile user, /profile franchise, /profile activity, /profile earnings, /profile milestones, /profile badges\\n' +
+          '/profile user, /profile franchise, /profile activity, /profile earnings, /profile milestones, /profile badges\n' +
           '/activity, /activityleaderboard, /legacy, /premium status, /premium features',
         inline: false,
       },
@@ -21212,30 +21241,31 @@ function buildHelpEmbed() {
     .setTitle('GG Sports Help')
     .setColor(0xFEE75C)
     .setDescription(
-      'GG Sports is a league management bot built around hubs. Start with /setupguide if you are setting up a server. Use /commands to browse command categories.'
+      'GG Sports is a league management bot built around hubs. Start with **/commissioner panel** if you are setting up a server — it covers setup, live panels, operations, and league customization without needing to memorize commands. Use /setupguide for a written walkthrough, or /commands to browse every command by category.'
     )
     .addFields(
       {
         name: 'New Server Owners',
         value:
-          '**/commissioner panel** — interactive commissioner control panel.\n**/setupguide** — full step-by-step setup guide.\\n' +
-          '**/quicksetup** — short setup checklist.\\n' +
+          '**/commissioner panel** — interactive commissioner control panel, the recommended starting point.\n' +
+          '**/setupguide** — full step-by-step setup guide.\n' +
+          '**/quicksetup** — short setup checklist.\n' +
           '**/commands** — categorized command directory.',
         inline: false,
       },
       {
         name: 'Regular League Members',
         value:
-          '**/game schedule** and **/game standings** — league info.\\n' +
-          '**/shop view**, **/shop cart**, **/shop checkout** — shop system.\\n' +
-          '**/sportsbook board**, **/sportsbook place**, **/sportsbook mybets** — betting.\\n' +
+          '**/game schedule** and **/game standings** — league info.\n' +
+          '**/shop view**, **/shop cart**, **/shop checkout** — shop system.\n' +
+          '**/sportsbook board**, **/sportsbook place**, **/sportsbook mybets** — betting.\n' +
           '**/activity**, **/legacy**, **/profile user** — progression.',
         inline: false,
       },
       {
         name: 'Staff / Admins',
         value:
-          'Use /setupguide for setup order. Most admin tools live in /league, /game, /shop, /sportsbook, /ticket, and /tournament.',
+          'Use **/commissioner panel** for setup order and day-to-day operations (sync, scans, auto-detection, playoffs, Game Center, browsing Madden data). /setupguide has the full written walkthrough. Individual slash commands under /league, /game, /shop, /sportsbook, /ticket, and /tournament still work as manual backups.',
         inline: false,
       }
     )
@@ -50950,7 +50980,7 @@ function buildMaddenLeagueEmbed(league, summary) {
       { name: 'External Franchise ID', value: summary.settings.external_franchise_id || 'Not set', inline: true },
       { name: 'Game Thread Channel', value: summary.settings.game_threads_channel_id ? '<#' + summary.settings.game_threads_channel_id + '>' : 'Not set — use /maddengames setup', inline: true },
       { name: 'League Bridge', value: 'Uses existing GG Sports league roles, standings, sportsbook, activity, legacy, shop, avatar, and badge systems.', inline: false },
-      { name: 'Next Commands', value: '/madden teams\\n/madden franchise\\n/game add\\n/game report', inline: false }
+      { name: 'Next Commands', value: '/madden teams\n/madden franchise\n/game add\n/game report', inline: false }
     )
     .setFooter({ text: 'GG Sports • Madden Foundation' })
     .setTimestamp();
