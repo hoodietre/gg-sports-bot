@@ -1155,6 +1155,8 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE league_games ADD COLUMN IF NOT EXISTS thread_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS game_center_channel_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guild_currency_settings (
@@ -3217,7 +3219,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -7886,6 +7888,152 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    // 7K-GC: Game Center panel handlers (Add Game team pickers + in-thread Report/Reset buttons)
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_add:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      const teamsResult = await pool.query(`SELECT * FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC`, [leagueId]);
+      if (!teamsResult.rows.length) {
+        await interaction.reply({ content: 'No team roles are configured for this league yet. Add team roles first (Admin Panel → League Setup → Add Team Role).', ephemeral: true });
+        return;
+      }
+      const rows = buildGameCenterTeamSelectRows(teamsResult.rows, 'gamecenter_home:' + leagueId);
+      await interaction.reply({ content: 'Choose the **home** team:', components: rows, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gamecenter_home:')) {
+      const [, leagueId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      const homeRoleId = interaction.values[0];
+      const homeRole = await interaction.guild.roles.fetch(homeRoleId).catch(() => null);
+      if (!homeRole) { await interaction.update({ content: 'That team role could not be found.', components: [] }); return; }
+
+      const isStaff = await userCanUseLeagueSetup(interaction, league);
+      const requestingMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!isStaff && !requestingMember?.roles.cache.has(homeRoleId)) {
+        await interaction.update({ content: 'Only staff or a member of the home team can schedule this game.', components: [] });
+        return;
+      }
+
+      const teamsResult = await pool.query(`SELECT * FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC`, [leagueId]);
+      const awayTeams = teamsResult.rows.filter(t => t.role_id !== homeRoleId);
+      if (!awayTeams.length) {
+        await interaction.update({ content: 'No other team roles are configured to play against.', components: [] });
+        return;
+      }
+      const rows = buildGameCenterTeamSelectRows(awayTeams, `gamecenter_away:${leagueId}:${homeRoleId}`);
+      await interaction.update({ content: `Home team: **${homeRole.name}**. Now choose the **away** team:`, components: rows });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('gamecenter_away:')) {
+      const [, leagueId, homeRoleId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      const awayRoleId = interaction.values[0];
+      const homeRole = await interaction.guild.roles.fetch(homeRoleId).catch(() => null);
+      const awayRole = await interaction.guild.roles.fetch(awayRoleId).catch(() => null);
+      if (!homeRole || !awayRole) { await interaction.update({ content: 'One of those team roles could not be found.', components: [] }); return; }
+
+      await interaction.update({ content: 'Creating matchup…', components: [] });
+
+      const createResult = await createLeagueGameCore(interaction, league, homeRole, awayRole, {});
+      if (!createResult.ok) {
+        await interaction.editReply({ content: createResult.message });
+        return;
+      }
+
+      const threadResult = await createGameCenterThread(interaction, league, createResult.game);
+      await updateGameCenterPanel(interaction.guild, league).catch(() => null);
+
+      await interaction.editReply({
+        content: `Game added: **${awayRole.name} @ ${homeRole.name}**.` + (threadResult.ok ? ` Matchup thread: <#${threadResult.thread.id}>` : ' Note: ' + threadResult.message),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_report:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      if (game.status === 'final') { await interaction.reply({ content: 'This game has already been reported.', ephemeral: true }); return; }
+
+      const modal = new ModalBuilder()
+        .setCustomId('gamecenter_report_submit:' + gameId)
+        .setTitle('Report Score')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('home_score').setLabel(`${game.home_team_name} score (home)`.slice(0, 45)).setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('away_score').setLabel(`${game.away_team_name} score (away)`.slice(0, 45)).setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('gamecenter_report_submit:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+
+      const homeScore = Number.parseInt(interaction.fields.getTextInputValue('home_score'), 10);
+      const awayScore = Number.parseInt(interaction.fields.getTextInputValue('away_score'), 10);
+      if (!Number.isInteger(homeScore) || !Number.isInteger(awayScore) || homeScore < 0 || awayScore < 0) {
+        await interaction.reply({ content: 'Scores must be whole numbers 0 or greater.', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+      const result = await reportLeagueGameCore(interaction, game, homeScore, awayScore);
+      await interaction.editReply({ content: result.message });
+
+      if (result.ok) {
+        const updatedGame = await findLeagueGameById(interaction.guild.id, gameId);
+        const league = await getLeagueById(game.league_id);
+        if (interaction.channel?.isThread?.()) {
+          const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+          const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+          await interaction.channel.send({
+            embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
+            components: buildGameCenterThreadComponents(gameId, true),
+          }).catch(() => null);
+        }
+        if (league) await updateGameCenterPanel(interaction.guild, league).catch(() => null);
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_reset:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only staff can reset a reported game.', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+      const result = await resetLeagueGameCore(interaction, game, 'Reset via Game Center');
+      await interaction.editReply({ content: result.message });
+
+      if (result.ok) {
+        const updatedGame = await findLeagueGameById(interaction.guild.id, gameId);
+        if (interaction.channel?.isThread?.()) {
+          const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+          const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+          await interaction.channel.send({
+            embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
+            components: buildGameCenterThreadComponents(gameId, false),
+          }).catch(() => null);
+        }
+        await updateGameCenterPanel(interaction.guild, league).catch(() => null);
+      }
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_tradelimit_modal:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -11040,110 +11188,8 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
           return;
         }
 
-        const game = gameResult.rows[0];
-        const activeLeague = await getLeagueById(game.league_id);
-
-        if (!activeLeague) {
-          await interaction.reply({ content: 'Could not find the league for that game.', ephemeral: true });
-          return;
-        }
-
-        if (game.status !== 'final') {
-          await interaction.reply({ content: 'Only completed/final games can be reset.', ephemeral: true });
-          return;
-        }
-
-        const homeScore = Number(game.home_score || 0);
-        const awayScore = Number(game.away_score || 0);
-        const wasTie = !game.winner_team_role_id;
-        const homeWon = game.winner_team_role_id === game.home_team_role_id;
-        const awayWon = game.winner_team_role_id === game.away_team_role_id;
-        const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
-
-        if (wasTie) {
-          const tiePoints = calculateStandingsPointsForLeague(activeLeague, 0, 0, 1, customSettings);
-          await pool.query(
-            `UPDATE league_standings
-             SET ties = GREATEST(0, ties - 1),
-                 standings_points = GREATEST(0, standings_points - $1),
-                 points_for = GREATEST(0, points_for - $2),
-                 points_against = GREATEST(0, points_against - $3),
-                 updated_at = NOW()
-             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
-            [tiePoints, homeScore, awayScore, interaction.guild.id, game.league_id, game.home_team_role_id]
-          );
-          await pool.query(
-            `UPDATE league_standings
-             SET ties = GREATEST(0, ties - 1),
-                 standings_points = GREATEST(0, standings_points - $1),
-                 points_for = GREATEST(0, points_for - $2),
-                 points_against = GREATEST(0, points_against - $3),
-                 updated_at = NOW()
-             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
-            [tiePoints, awayScore, homeScore, interaction.guild.id, game.league_id, game.away_team_role_id]
-          );
-        } else {
-          const winnerRoleId = homeWon ? game.home_team_role_id : game.away_team_role_id;
-          const loserRoleId = homeWon ? game.away_team_role_id : game.home_team_role_id;
-          const winnerPointsFor = homeWon ? homeScore : awayScore;
-          const winnerPointsAgainst = homeWon ? awayScore : homeScore;
-          const loserPointsFor = homeWon ? awayScore : homeScore;
-          const loserPointsAgainst = homeWon ? homeScore : awayScore;
-          const winnerStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 1, 0, 0, customSettings);
-          const loserStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 0, 1, 0, customSettings);
-
-          await pool.query(
-            `UPDATE league_standings
-             SET wins = GREATEST(0, wins - 1),
-                 standings_points = GREATEST(0, standings_points - $1),
-                 points_for = GREATEST(0, points_for - $2),
-                 points_against = GREATEST(0, points_against - $3),
-                 updated_at = NOW()
-             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
-            [winnerStandingsPoints, winnerPointsFor, winnerPointsAgainst, interaction.guild.id, game.league_id, winnerRoleId]
-          );
-
-          await pool.query(
-            `UPDATE league_standings
-             SET losses = GREATEST(0, losses - 1),
-                 standings_points = GREATEST(0, standings_points - $1),
-                 points_for = GREATEST(0, points_for - $2),
-                 points_against = GREATEST(0, points_against - $3),
-                 updated_at = NOW()
-             WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
-            [loserStandingsPoints, loserPointsFor, loserPointsAgainst, interaction.guild.id, game.league_id, loserRoleId]
-          );
-        }
-
-        await pool.query(
-          `UPDATE league_games
-           SET status = 'scheduled',
-               home_score = NULL,
-               away_score = NULL,
-               winner_team_role_id = NULL,
-               reported_by_user_id = NULL,
-               updated_at = NOW()
-           WHERE id = $1`,
-          [game.id]
-        );
-
-        if (typeof updateStandingsPanel === 'function') {
-          await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
-        }
-
-        const sportsbookReset = await resetSportsbookForLeagueGame(interaction.guild, game, interaction.user.id, reason).catch(error => {
-          console.error('Sportsbook reset failed:', error);
-          return null;
-        });
-
-        const resetText = sportsbookReset?.reset
-          ? ' Sportsbook reopened and **' + sportsbookReset.refundedCount + '** bets reset/refunded.'
-          : ' No linked sportsbook game found.';
-
-        await interaction.reply({
-          content: 'Game reset: **' + game.home_team_name + ' vs ' + game.away_team_name + '**. Standings rolled back.' + resetText,
-          ephemeral: false,
-        });
+        const result = await resetLeagueGameCore(interaction, gameResult.rows[0], reason);
+        await interaction.reply({ content: result.message, ephemeral: !result.ok });
         return;
       }
 
@@ -11165,135 +11211,8 @@ if (gameSubcommand === 'report') {
           return;
         }
 
-        const game = gameResult.rows[0];
-        const activeLeague = await getLeagueById(game.league_id);
-
-        if (!activeLeague) {
-          await interaction.reply({ content: 'Could not find the league for that game.', ephemeral: true });
-          return;
-        }
-
-        const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
-        const isTie = homeScore === awayScore;
-
-        if (isTie && !customSettings.ties_allowed) {
-          await interaction.reply({ content: 'Ties are not supported for standings in this league. Enable ties in League Customization → Standings, or enter a winning score.', ephemeral: true });
-          return;
-        }
-
-        const homeWins = homeScore > awayScore;
-        const awayWins = awayScore > homeScore;
-        const winnerRoleId = isTie ? null : homeWins ? game.home_team_role_id : game.away_team_role_id;
-        const winnerName = isTie ? null : homeWins ? game.home_team_name : game.away_team_name;
-
-        await pool.query(
-          `UPDATE league_games
-           SET status = 'final', home_score = $1, away_score = $2, winner_team_role_id = $3, reported_by_user_id = $4, updated_at = NOW()
-           WHERE id = $5`,
-          [homeScore, awayScore, winnerRoleId, interaction.user.id, game.id]
-        );
-
-        const { conference: homeConference, division: homeDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.home_team_name).catch(() => ({ conference: null, division: null }));
-        const { conference: awayConference, division: awayDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.away_team_name).catch(() => ({ conference: null, division: null }));
-
-        const homeWL = isTie ? { w: 0, l: 0, t: 1 } : homeWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
-        const awayWL = isTie ? { w: 0, l: 0, t: 1 } : awayWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
-        const homeStandingsPoints = calculateStandingsPointsForLeague(activeLeague, homeWL.w, homeWL.l, homeWL.t, customSettings);
-        const awayStandingsPoints = calculateStandingsPointsForLeague(activeLeague, awayWL.w, awayWL.l, awayWL.t, customSettings);
-
-        await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-           ON CONFLICT (guild_id, league_id, team_role_id)
-           DO UPDATE SET wins = league_standings.wins + $5,
-                         losses = league_standings.losses + $6,
-                         ties = league_standings.ties + $7,
-                         standings_points = league_standings.standings_points + $10,
-                         conference = $11,
-                         division = $12,
-                         points_for = league_standings.points_for + $8,
-                         points_against = league_standings.points_against + $9,
-                         updated_at = NOW()`,
-          [interaction.guild.id, game.league_id, game.home_team_role_id, game.home_team_name, homeWL.w, homeWL.l, homeWL.t, homeScore, awayScore, homeStandingsPoints, homeConference, homeDivision]
-        );
-
-        await pool.query(
-          `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-           ON CONFLICT (guild_id, league_id, team_role_id)
-           DO UPDATE SET wins = league_standings.wins + $5,
-                         losses = league_standings.losses + $6,
-                         ties = league_standings.ties + $7,
-                         standings_points = league_standings.standings_points + $10,
-                         conference = $11,
-                         division = $12,
-                         points_for = league_standings.points_for + $8,
-                         points_against = league_standings.points_against + $9,
-                         updated_at = NOW()`,
-          [interaction.guild.id, game.league_id, game.away_team_role_id, game.away_team_name, awayWL.w, awayWL.l, awayWL.t, awayScore, homeScore, awayStandingsPoints, awayConference, awayDivision]
-        );
-
-        if (typeof updateStandingsPanel === 'function') {
-          await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
-        }
-
-        const settings = await getCurrencySettings(interaction.guild.id);
-        const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
-        const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
-        const winnerOwner = await findTeamOwnerByRoleId(interaction.guild, winnerRoleId);
-        const payoutLines = [];
-
-        if (Number(settings.game_played_payout) > 0) {
-          const paidOwners = new Set();
-          for (const owner of [homeOwner, awayOwner]) {
-            if (owner && !paidOwners.has(owner.id)) {
-              paidOwners.add(owner.id);
-              await addCurrency(
-                interaction.guild.id,
-                owner.id,
-                Number(settings.game_played_payout),
-                'game_played',
-                'Game played: ' + game.away_team_name + ' @ ' + game.home_team_name,
-                interaction.user.id
-              );
-              await addActivityPoints(interaction.guild.id, owner.id, 3, 0).catch(() => null);
-              payoutLines.push(settings.currency_icon + ' <@' + owner.id + '> earned **' + settings.game_played_payout + ' ' + settings.currency_name + '** for playing.');
-            }
-          }
-        }
-
-        if (winnerOwner && Number(settings.win_payout) > 0) {
-          await addCurrency(
-            interaction.guild.id,
-            winnerOwner.id,
-            Number(settings.win_payout),
-            'game_win',
-            'Game win: ' + winnerName,
-            interaction.user.id
-          );
-          await addActivityPoints(interaction.guild.id, winnerOwner.id, 5, 1).catch(() => null);
-          payoutLines.push(settings.currency_icon + ' <@' + winnerOwner.id + '> earned **' + settings.win_payout + ' ' + settings.currency_name + '** win bonus.');
-        }
-
-        const sportsbookSettlement = isTie
-          ? null
-          : await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => {
-              console.error('Auto sportsbook settlement failed:', error);
-              return null;
-            });
-        const tieSportsbookNote = isTie ? String.fromCharCode(10) + 'This game was a tie, so any sportsbook bets on it were left open — settle manually if this league books ties.' : '';
-
-        const sportsbookText = sportsbookSettlement
-          ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets, paid **' + settings.currency_icon + ' ' + sportsbookSettlement.totalPaid + '**.'
-          : '';
-        if (!homeOwner || !awayOwner) {
-          payoutLines.push('Note: one or more team owners were not cached, so owner payout may be skipped. Have the owner run any command or retry later if needed.');
-        }
-
-        const payoutText = payoutLines.length ? String.fromCharCode(10) + payoutLines.join(String.fromCharCode(10)) : '';
-        const resultText = isTie ? 'It\'s a tie.' : 'Winner: **' + winnerName + '**.';
-
-        await interaction.reply({ content: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. ' + resultText + payoutText + sportsbookText + tieSportsbookNote, ephemeral: false });
+        const result = await reportLeagueGameCore(interaction, gameResult.rows[0], homeScore, awayScore);
+        await interaction.reply({ content: result.message, ephemeral: !result.ok });
         return;
       }
 
@@ -16917,43 +16836,14 @@ if (shopSubcommand === 'view') {
       }
       const scheduledFor = interaction.options.getString('date');
       const weekLabel = interaction.options.getString('week');
-      const gameId = randomUUID();
 
-      if (home.id === away.id) {
-        await interaction.reply({ content: 'Home and away teams must be different.', ephemeral: true });
+      const createResult = await createLeagueGameCore(interaction, activeLeague, home, away, { scheduledFor, weekLabel });
+      if (!createResult.ok) {
+        await interaction.reply({ content: createResult.message, ephemeral: true });
         return;
       }
 
-      await pool.query(
-        `INSERT INTO league_games (id, guild_id, league_id, home_team_role_id, home_team_name, away_team_role_id, away_team_name, scheduled_for, week_label, created_by_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [gameId, interaction.guild.id, activeLeague.league_id, home.id, home.name, away.id, away.name, scheduledFor, weekLabel, interaction.user.id]
-      );
-
-      await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (guild_id, league_id, team_role_id) DO NOTHING`,
-        [interaction.guild.id, activeLeague.league_id, home.id, home.name]
-      );
-      await pool.query(
-        `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (guild_id, league_id, team_role_id) DO NOTHING`,
-        [interaction.guild.id, activeLeague.league_id, away.id, away.name]
-      );
-
-      const createdGameResult = await pool.query(
-        `SELECT * FROM league_games WHERE id = $1 LIMIT 1`,
-        [gameId]
-      );
-
-      if (createdGameResult.rows.length) {
-        await createAutoSportsbookForLeagueGame(interaction, createdGameResult.rows[0], activeLeague)
-          .catch(error => console.error('Auto sportsbook creation failed:', error));
-      }
-
-      await interaction.reply({ content: `Game added: **${away.name} @ ${home.name}**. Game ID: **${shortGameId(gameId)}**`, ephemeral: true });
+      await interaction.reply({ content: `Game added: **${away.name} @ ${home.name}**. Game ID: **${shortGameId(createResult.game.id)}**`, ephemeral: true });
       return;
     }
 
@@ -20079,6 +19969,416 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
   return { sportsbookGame, winners, losers, totalPaid, parlayResult };
 }
 
+// 7K-GC: Game Center — shared game create/report/reset logic.
+// Extracted so /game add, /game report, /game reset, and the new Game Center
+// panel (buttons + matchup threads, built for open-schedule leagues that don't
+// use structured-schedule game threads) all run through exactly one copy of
+// this logic instead of duplicating anything that touches standings, currency,
+// or sportsbook settlement.
+
+async function createLeagueGameCore(interaction, activeLeague, home, away, { scheduledFor = null, weekLabel = null } = {}) {
+  if (home.id === away.id) {
+    return { ok: false, message: 'Home and away teams must be different.' };
+  }
+  const gameId = randomUUID();
+
+  await pool.query(
+    `INSERT INTO league_games (id, guild_id, league_id, home_team_role_id, home_team_name, away_team_role_id, away_team_name, scheduled_for, week_label, created_by_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [gameId, interaction.guild.id, activeLeague.league_id, home.id, home.name, away.id, away.name, scheduledFor, weekLabel, interaction.user.id]
+  );
+
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (guild_id, league_id, team_role_id) DO NOTHING`,
+    [interaction.guild.id, activeLeague.league_id, home.id, home.name]
+  );
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (guild_id, league_id, team_role_id) DO NOTHING`,
+    [interaction.guild.id, activeLeague.league_id, away.id, away.name]
+  );
+
+  const createdGameResult = await pool.query(`SELECT * FROM league_games WHERE id = $1 LIMIT 1`, [gameId]);
+  const game = createdGameResult.rows[0] || null;
+
+  if (game) {
+    await createAutoSportsbookForLeagueGame(interaction, game, activeLeague)
+      .catch(error => console.error('Auto sportsbook creation failed:', error));
+  }
+
+  return { ok: true, game };
+}
+
+async function reportLeagueGameCore(interaction, game, homeScore, awayScore) {
+  const activeLeague = await getLeagueById(game.league_id);
+  if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
+
+  if (game.status === 'final') {
+    return { ok: false, message: 'This game has already been reported. Reset it first if you need to correct the score.' };
+  }
+
+  const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+  const isTie = homeScore === awayScore;
+
+  if (isTie && !customSettings.ties_allowed) {
+    return { ok: false, message: 'Ties are not supported for standings in this league. Enable ties in League Customization → Standings, or enter a winning score.' };
+  }
+
+  const homeWins = homeScore > awayScore;
+  const awayWins = awayScore > homeScore;
+  const winnerRoleId = isTie ? null : homeWins ? game.home_team_role_id : game.away_team_role_id;
+  const winnerName = isTie ? null : homeWins ? game.home_team_name : game.away_team_name;
+
+  await pool.query(
+    `UPDATE league_games
+     SET status = 'final', home_score = $1, away_score = $2, winner_team_role_id = $3, reported_by_user_id = $4, updated_at = NOW()
+     WHERE id = $5`,
+    [homeScore, awayScore, winnerRoleId, interaction.user.id, game.id]
+  );
+
+  const { conference: homeConference, division: homeDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.home_team_name).catch(() => ({ conference: null, division: null }));
+  const { conference: awayConference, division: awayDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.away_team_name).catch(() => ({ conference: null, division: null }));
+
+  const homeWL = isTie ? { w: 0, l: 0, t: 1 } : homeWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
+  const awayWL = isTie ? { w: 0, l: 0, t: 1 } : awayWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
+  const homeStandingsPoints = calculateStandingsPointsForLeague(activeLeague, homeWL.w, homeWL.l, homeWL.t, customSettings);
+  const awayStandingsPoints = calculateStandingsPointsForLeague(activeLeague, awayWL.w, awayWL.l, awayWL.t, customSettings);
+
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT (guild_id, league_id, team_role_id)
+     DO UPDATE SET wins = league_standings.wins + $5,
+                   losses = league_standings.losses + $6,
+                   ties = league_standings.ties + $7,
+                   standings_points = league_standings.standings_points + $10,
+                   conference = $11,
+                   division = $12,
+                   points_for = league_standings.points_for + $8,
+                   points_against = league_standings.points_against + $9,
+                   updated_at = NOW()`,
+    [interaction.guild.id, game.league_id, game.home_team_role_id, game.home_team_name, homeWL.w, homeWL.l, homeWL.t, homeScore, awayScore, homeStandingsPoints, homeConference, homeDivision]
+  );
+
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT (guild_id, league_id, team_role_id)
+     DO UPDATE SET wins = league_standings.wins + $5,
+                   losses = league_standings.losses + $6,
+                   ties = league_standings.ties + $7,
+                   standings_points = league_standings.standings_points + $10,
+                   conference = $11,
+                   division = $12,
+                   points_for = league_standings.points_for + $8,
+                   points_against = league_standings.points_against + $9,
+                   updated_at = NOW()`,
+    [interaction.guild.id, game.league_id, game.away_team_role_id, game.away_team_name, awayWL.w, awayWL.l, awayWL.t, awayScore, homeScore, awayStandingsPoints, awayConference, awayDivision]
+  );
+
+  if (typeof updateStandingsPanel === 'function') {
+    await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
+  }
+
+  const settings = await getCurrencySettings(interaction.guild.id);
+  const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+  const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+  const winnerOwner = await findTeamOwnerByRoleId(interaction.guild, winnerRoleId);
+  const payoutLines = [];
+
+  if (Number(settings.game_played_payout) > 0) {
+    const paidOwners = new Set();
+    for (const owner of [homeOwner, awayOwner]) {
+      if (owner && !paidOwners.has(owner.id)) {
+        paidOwners.add(owner.id);
+        await addCurrency(
+          interaction.guild.id,
+          owner.id,
+          Number(settings.game_played_payout),
+          'game_played',
+          'Game played: ' + game.away_team_name + ' @ ' + game.home_team_name,
+          interaction.user.id
+        );
+        await addActivityPoints(interaction.guild.id, owner.id, 3, 0).catch(() => null);
+        payoutLines.push(settings.currency_icon + ' <@' + owner.id + '> earned **' + settings.game_played_payout + ' ' + settings.currency_name + '** for playing.');
+      }
+    }
+  }
+
+  if (winnerOwner && Number(settings.win_payout) > 0) {
+    await addCurrency(
+      interaction.guild.id,
+      winnerOwner.id,
+      Number(settings.win_payout),
+      'game_win',
+      'Game win: ' + winnerName,
+      interaction.user.id
+    );
+    await addActivityPoints(interaction.guild.id, winnerOwner.id, 5, 1).catch(() => null);
+    payoutLines.push(settings.currency_icon + ' <@' + winnerOwner.id + '> earned **' + settings.win_payout + ' ' + settings.currency_name + '** win bonus.');
+  }
+
+  const sportsbookSettlement = isTie
+    ? null
+    : await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => {
+        console.error('Auto sportsbook settlement failed:', error);
+        return null;
+      });
+  const tieSportsbookNote = isTie ? String.fromCharCode(10) + 'This game was a tie, so any sportsbook bets on it were left open — settle manually if this league books ties.' : '';
+
+  const sportsbookText = sportsbookSettlement
+    ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets, paid **' + settings.currency_icon + ' ' + sportsbookSettlement.totalPaid + '**.'
+    : '';
+  if (!homeOwner || !awayOwner) {
+    payoutLines.push('Note: one or more team owners were not cached, so owner payout may be skipped. Have the owner run any command or retry later if needed.');
+  }
+
+  const payoutText = payoutLines.length ? String.fromCharCode(10) + payoutLines.join(String.fromCharCode(10)) : '';
+  const resultText = isTie ? 'It\'s a tie.' : 'Winner: **' + winnerName + '**.';
+
+  return {
+    ok: true,
+    isTie,
+    winnerName,
+    message: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. ' + resultText + payoutText + sportsbookText + tieSportsbookNote,
+  };
+}
+
+async function resetLeagueGameCore(interaction, game, reason = 'Game reset') {
+  const activeLeague = await getLeagueById(game.league_id);
+  if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
+
+  if (game.status !== 'final') {
+    return { ok: false, message: 'Only completed/final games can be reset.' };
+  }
+
+  const homeScore = Number(game.home_score || 0);
+  const awayScore = Number(game.away_score || 0);
+  const wasTie = !game.winner_team_role_id;
+  const homeWon = game.winner_team_role_id === game.home_team_role_id;
+  const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+
+  if (wasTie) {
+    const tiePoints = calculateStandingsPointsForLeague(activeLeague, 0, 0, 1, customSettings);
+    await pool.query(
+      `UPDATE league_standings
+       SET ties = GREATEST(0, ties - 1),
+           standings_points = GREATEST(0, standings_points - $1),
+           points_for = GREATEST(0, points_for - $2),
+           points_against = GREATEST(0, points_against - $3),
+           updated_at = NOW()
+       WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+      [tiePoints, homeScore, awayScore, interaction.guild.id, game.league_id, game.home_team_role_id]
+    );
+    await pool.query(
+      `UPDATE league_standings
+       SET ties = GREATEST(0, ties - 1),
+           standings_points = GREATEST(0, standings_points - $1),
+           points_for = GREATEST(0, points_for - $2),
+           points_against = GREATEST(0, points_against - $3),
+           updated_at = NOW()
+       WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+      [tiePoints, awayScore, homeScore, interaction.guild.id, game.league_id, game.away_team_role_id]
+    );
+  } else {
+    const winnerRoleId = homeWon ? game.home_team_role_id : game.away_team_role_id;
+    const loserRoleId = homeWon ? game.away_team_role_id : game.home_team_role_id;
+    const winnerPointsFor = homeWon ? homeScore : awayScore;
+    const winnerPointsAgainst = homeWon ? awayScore : homeScore;
+    const loserPointsFor = homeWon ? awayScore : homeScore;
+    const loserPointsAgainst = homeWon ? homeScore : awayScore;
+    const winnerStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 1, 0, 0, customSettings);
+    const loserStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 0, 1, 0, customSettings);
+
+    await pool.query(
+      `UPDATE league_standings
+       SET wins = GREATEST(0, wins - 1),
+           standings_points = GREATEST(0, standings_points - $1),
+           points_for = GREATEST(0, points_for - $2),
+           points_against = GREATEST(0, points_against - $3),
+           updated_at = NOW()
+       WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+      [winnerStandingsPoints, winnerPointsFor, winnerPointsAgainst, interaction.guild.id, game.league_id, winnerRoleId]
+    );
+
+    await pool.query(
+      `UPDATE league_standings
+       SET losses = GREATEST(0, losses - 1),
+           standings_points = GREATEST(0, standings_points - $1),
+           points_for = GREATEST(0, points_for - $2),
+           points_against = GREATEST(0, points_against - $3),
+           updated_at = NOW()
+       WHERE guild_id = $4 AND league_id = $5 AND team_role_id = $6`,
+      [loserStandingsPoints, loserPointsFor, loserPointsAgainst, interaction.guild.id, game.league_id, loserRoleId]
+    );
+  }
+
+  await pool.query(
+    `UPDATE league_games
+     SET status = 'scheduled',
+         home_score = NULL,
+         away_score = NULL,
+         winner_team_role_id = NULL,
+         reported_by_user_id = NULL,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [game.id]
+  );
+
+  if (typeof updateStandingsPanel === 'function') {
+    await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
+  }
+
+  const sportsbookReset = await resetSportsbookForLeagueGame(interaction.guild, game, interaction.user.id, reason).catch(error => {
+    console.error('Sportsbook reset failed:', error);
+    return null;
+  });
+
+  const resetText = sportsbookReset?.reset
+    ? ' Sportsbook reopened and **' + sportsbookReset.refundedCount + '** bets reset/refunded.'
+    : ' No linked sportsbook game found.';
+
+  return {
+    ok: true,
+    message: 'Game reset: **' + game.home_team_name + ' vs ' + game.away_team_name + '**. Standings rolled back.' + resetText,
+  };
+}
+
+// 7K-GC panel: Game Center — for open-schedule leagues (no structured schedule/
+// game thread automation) to add games without typing `/game add`, and to open
+// a private matchup thread per game automatically.
+
+async function findLeagueGameById(guildId, gameId) {
+  const result = await pool.query(`SELECT * FROM league_games WHERE guild_id = $1 AND id = $2 LIMIT 1`, [guildId, gameId]);
+  return result.rows[0] || null;
+}
+
+async function getOpenLeagueGames(guildId, leagueId, limit = 15) {
+  const result = await pool.query(
+    `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND status != 'final' ORDER BY created_at DESC LIMIT $3`,
+    [guildId, leagueId, limit]
+  );
+  return result.rows;
+}
+
+function buildGameCenterPanelEmbed(league, openGames) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle(`🎮 ${league.league_name} • Game Center`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Game Center' })
+    .setTimestamp();
+
+  if (!openGames.length) {
+    embed.setDescription('No open games right now. Click **Add Game** below to schedule a matchup — a private thread with both teams opens automatically.');
+    return embed;
+  }
+
+  embed.setDescription(openGames.map(g => {
+    const extra = [g.week_label, g.scheduled_for].filter(Boolean).join(' • ');
+    return `**${g.away_team_name} @ ${g.home_team_name}**` + (extra ? ' — ' + extra : '') + (g.thread_id ? ' — <#' + g.thread_id + '>' : '');
+  }).join(NL));
+  return embed;
+}
+
+function buildGameCenterPanelComponents(leagueId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gamecenter_add:' + leagueId).setLabel('Add Game').setEmoji('➕').setStyle(ButtonStyle.Success),
+  )];
+}
+
+async function updateGameCenterPanel(guild, league) {
+  if (!guild || !league?.league_id) return;
+  const openGames = await getOpenLeagueGames(guild.id, league.league_id);
+  await updatePanel(guild, league, 'game_center', buildGameCenterPanelEmbed(league, openGames), buildGameCenterPanelComponents(league.league_id));
+}
+
+function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🎮 ${game.away_team_name} @ ${game.home_team_name}`)
+    .setColor(game.status === 'final' ? 0x57F287 : 0x5865F2)
+    .addFields(
+      { name: 'Home', value: game.home_team_name + (homeOwnerId ? ' — <@' + homeOwnerId + '>' : ''), inline: true },
+      { name: 'Away', value: game.away_team_name + (awayOwnerId ? ' — <@' + awayOwnerId + '>' : ''), inline: true },
+    );
+  const scheduleText = [game.week_label, game.scheduled_for].filter(Boolean).join(' • ');
+  if (scheduleText) embed.addFields({ name: 'Scheduled', value: scheduleText, inline: true });
+  if (game.status === 'final') {
+    embed.addFields({ name: 'Final Score', value: `${game.home_team_name} ${game.home_score} - ${game.away_score} ${game.away_team_name}`, inline: false });
+  } else {
+    embed.setDescription('When the game is finished, either team can report the score below.');
+  }
+  embed.setFooter({ text: `GG Sports • Game Center • ID ${shortGameId(game.id)}` }).setTimestamp();
+  return embed;
+}
+
+function buildGameCenterThreadComponents(gameId, isFinal) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
+    new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
+  )];
+}
+
+async function createGameCenterThread(interaction, league, game) {
+  const channelId = league.game_center_channel_id;
+  if (!channelId) return { ok: false, message: 'no Game Center channel is configured — set one in the setup dashboard to get matchup threads.' };
+
+  const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+  if (!channel || !channel.isTextBased?.()) {
+    return { ok: false, message: 'the configured Game Center channel could not be found.' };
+  }
+
+  const safeName = `${game.away_team_name}-at-${game.home_team_name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'matchup';
+  const thread = await channel.threads.create({
+    name: safeName,
+    type: ChannelType.PrivateThread,
+    invitable: false,
+    autoArchiveDuration: 10080,
+    reason: 'GG Sports Game Center matchup thread',
+  }).catch(async () => channel.threads.create({
+    name: safeName,
+    autoArchiveDuration: 10080,
+    reason: 'GG Sports Game Center matchup thread',
+  }).catch(() => null));
+
+  if (!thread) {
+    return { ok: false, message: 'I could not create a matchup thread. Check bot permissions: View Channel, Send Messages, Create Private Threads, and Send Messages in Threads.' };
+  }
+
+  const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+  const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+  if (homeOwner) await thread.members.add(homeOwner.id).catch(() => null);
+  if (awayOwner) await thread.members.add(awayOwner.id).catch(() => null);
+
+  await pool.query(`UPDATE league_games SET thread_id = $1, updated_at = NOW() WHERE id = $2`, [thread.id, game.id]);
+
+  const mentionText = [homeOwner ? `<@${homeOwner.id}>` : null, awayOwner ? `<@${awayOwner.id}>` : null].filter(Boolean).join(' ');
+  await thread.send({
+    content: (mentionText ? mentionText + ' ' : '') + 'Matchup thread opened. Report the score here once the game is finished.',
+    embeds: [buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id)],
+    components: buildGameCenterThreadComponents(game.id, false),
+    allowedMentions: { users: [homeOwner?.id, awayOwner?.id].filter(Boolean), roles: [] },
+  }).catch(() => null);
+
+  return { ok: true, thread };
+}
+
+function buildGameCenterTeamSelectRows(teams, customIdPrefix) {
+  const rows = [];
+  for (let i = 0; i < teams.length && rows.length < 4; i += 25) {
+    const chunk = teams.slice(i, i + 25);
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`${customIdPrefix}:${rows.length}`)
+      .setPlaceholder(teams.length > 25 ? `Choose a team (${i + 1}-${i + chunk.length})` : 'Choose a team')
+      .addOptions(chunk.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
+    rows.push(new ActionRowBuilder().addComponents(menu));
+  }
+  return rows;
+}
+
 
 
 async function userIsInLeagueGame(guild, userId, sportsbookGame) {
@@ -22128,6 +22428,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_rules_channel', label: 'League Rules Channel', description: 'Where the posted league rules embed lives', kind: 'channel' },
   { value: 'playoff_bracket_channel', label: 'Playoff Bracket Channel', description: 'Live, auto-updating playoff bracket embed', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
+  { value: 'game_center_channel', label: 'Game Center Channel', description: 'For open-schedule leagues: Add Game panel that opens a private matchup thread per game', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
@@ -22159,6 +22460,7 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'member_profile_starter_panel', label: 'Post/Refresh Member Profile Starter' },
   { value: 'bank_starter_panel', label: 'Post/Refresh Bank Starter' },
   { value: 'league_rules_panel', label: 'Post/Refresh League Rules Panel' },
+  { value: 'game_center_panel', label: 'Post/Refresh Game Center Panel' },
   { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
   { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
@@ -22187,6 +22489,7 @@ function setupDashboardColumn(settingKey) {
     league_rules_channel: 'league_rules_channel_id',
     playoff_bracket_channel: 'playoff_bracket_channel_id',
     game_thread_channel: 'game_threads_channel_id',
+    game_center_channel: 'game_center_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
     madden_power_rankings_channel: 'madden_power_rankings_channel_id',
@@ -22243,6 +22546,7 @@ function buildSetupDashboardEmbed(league) {
     ['league_rules_channel', 'League Rules'],
     ['playoff_bracket_channel', 'Playoff Bracket'],
     ['game_thread_channel', 'Game Threads'],
+    ['game_center_channel', 'Game Center'],
     ['madden_news_channel', 'Madden News'],
     ['madden_standings_channel', 'Madden Standings Board'],
     ['madden_power_rankings_channel', 'Madden Power Rankings Board'],
@@ -22404,6 +22708,19 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const message = await channel.send({ embeds: [await buildStandingsEmbed(league, rows)] });
     await savePanel(league, 'standings', channel.id, message.id);
     return 'Standings panel created/refreshed in ' + channel.toString() + '.';
+  }
+
+  if (panelType === 'game_center_panel') {
+    const { channel, error } = await requireTextChannel(league.game_center_channel_id, interaction.channel, 'Game Center channel');
+    if (error) return error;
+
+    const openGames = await getOpenLeagueGames(interaction.guild.id, league.league_id);
+    const message = await channel.send({
+      embeds: [buildGameCenterPanelEmbed(league, openGames)],
+      components: buildGameCenterPanelComponents(league.league_id),
+    });
+    await savePanel(league, 'game_center', channel.id, message.id);
+    return 'Game Center panel posted/refreshed in ' + channel.toString() + '. Click **Add Game** on it to schedule a matchup — a private thread with both teams opens automatically.';
   }
 
   if (panelType === 'madden_standings_panel') {
