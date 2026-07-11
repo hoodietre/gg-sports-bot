@@ -6074,6 +6074,135 @@ async function buildMaddenSchemaDiagnosticsEmbed7J10BYDB(guildId, league) {
 }
 
 
+// ---------------------------------------------------------------------------
+// DM Onboarding — new members joining a server, and server owners when the
+// bot is first added to a new server.
+// ---------------------------------------------------------------------------
+
+async function getActiveLeaguesForGuild(guildId) {
+  const result = await pool.query(
+    `SELECT league_id, league_name, game_key FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY league_name ASC LIMIT 25`,
+    [guildId]
+  ).catch(() => ({ rows: [] }));
+  return result.rows;
+}
+
+function buildNewMemberWelcomeEmbed(guild, leagues, league) {
+  const NL = String.fromCharCode(10);
+  const leagueNote = leagues.length > 1
+    ? `This server runs **${leagues.length} leagues** — pick one below to see teams.`
+    : league
+      ? `League: **${league.league_name}**`
+      : '';
+
+  const channelLines = [];
+  if (league) {
+    if (league.standings_channel_id) channelLines.push(`Standings: <#${league.standings_channel_id}>`);
+    if (league.tournament_channel_id) channelLines.push(`Tournament: <#${league.tournament_channel_id}>`);
+    if (league.trade_block_channel_id) channelLines.push(`Trade Block: <#${league.trade_block_channel_id}>`);
+    if (league.sportsbook_channel_id) channelLines.push(`Sportsbook: <#${league.sportsbook_channel_id}>`);
+  }
+
+  return new EmbedBuilder()
+    .setTitle(`👋 Welcome to ${guild.name}!`)
+    .setColor(0x5865F2)
+    .setDescription(
+      `${leagueNote}${leagueNote ? NL + NL : ''}` +
+      `Run **/help** any time for a menu, or **/commands** for the full command list.` +
+      (channelLines.length ? `${NL}${NL}**Key channels:**${NL}${channelLines.join(NL)}` : '')
+    )
+    .setFooter({ text: 'GG Sports' })
+    .setTimestamp();
+}
+
+function buildOnboardTeamSelectRows(teams, customIdPrefix) {
+  const rows = [];
+  for (let i = 0; i < teams.length && rows.length < 4; i += 25) {
+    const chunk = teams.slice(i, i + 25);
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`${customIdPrefix}:${rows.length}`)
+      .setPlaceholder(teams.length > 25 ? `Pick your team (${i + 1}-${i + chunk.length})` : 'Pick your team')
+      .addOptions(chunk.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
+    rows.push(new ActionRowBuilder().addComponents(menu));
+  }
+  return rows;
+}
+
+async function sendNewMemberOnboardingDM(member) {
+  if (member.user.bot) return;
+  const guild = member.guild;
+  const leagues = await getActiveLeaguesForGuild(guild.id);
+  if (!leagues.length) return; // Nothing configured yet — nothing useful to onboard into.
+
+  // Auto-assign the general league role if exactly one league is configured
+  // and it has one set — a passive convenience, not a choice worth a click.
+  if (leagues.length === 1) {
+    const soloLeague = await getLeagueById(leagues[0].league_id).catch(() => null);
+    if (soloLeague?.league_role_id) {
+      await member.roles.add(soloLeague.league_role_id).catch(() => null);
+    }
+  }
+
+  let components = [];
+  let soleLeague = null;
+  if (leagues.length > 1) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('onboard_league_select:' + guild.id)
+      .setPlaceholder('Choose your league')
+      .addOptions(leagues.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id })));
+    components = [new ActionRowBuilder().addComponents(menu)];
+  } else {
+    soleLeague = await getLeagueById(leagues[0].league_id).catch(() => null);
+    const teams = soleLeague ? await getLeagueTeamRoles(soleLeague.league_id) : [];
+    if (teams.length) {
+      components = buildOnboardTeamSelectRows(teams, `onboard_team_select:${guild.id}:${soleLeague.league_id}`);
+    }
+  }
+
+  const embed = buildNewMemberWelcomeEmbed(guild, leagues, soleLeague);
+
+  await member.send({ embeds: [embed], components }).catch(() => null); // DMs closed — skip silently, nothing to recover.
+}
+
+function buildNewServerOwnerWelcomeEmbed(guild) {
+  return new EmbedBuilder()
+    .setTitle(`👋 Thanks for adding GG Sports to ${guild.name}!`)
+    .setColor(0x5865F2)
+    .setDescription(
+      "Here's how to get set up:" + String.fromCharCode(10) + String.fromCharCode(10) +
+      '**1.** `/league create` — create your first league.' + String.fromCharCode(10) +
+      '**2.** `/commissioner panel` — the control panel for everything else: channels/roles, live boards, operations, and league customization.' + String.fromCharCode(10) + String.fromCharCode(10) +
+      "Prefer a written walkthrough? `/setupguide` has the full order, or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members."
+    )
+    .setFooter({ text: 'GG Sports' })
+    .setTimestamp();
+}
+
+async function sendNewServerOwnerOnboardingDM(guild) {
+  const owner = await guild.fetchOwner().catch(() => null);
+  const embed = buildNewServerOwnerWelcomeEmbed(guild);
+  if (owner) {
+    const sent = await owner.send({ embeds: [embed] }).catch(() => null);
+    if (sent) return;
+  }
+  // DM failed (or owner unreachable) — fall back to the system channel if we can post there.
+  const systemChannel = guild.systemChannel;
+  if (systemChannel?.isTextBased?.()) {
+    await systemChannel.send({
+      content: owner ? `<@${owner.id}>` : undefined,
+      embeds: [embed],
+    }).catch(() => null);
+  }
+}
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  await sendNewMemberOnboardingDM(member).catch(err => console.error('New member onboarding DM failed:', err?.message));
+});
+
+client.on(Events.GuildCreate, async (guild) => {
+  await sendNewServerOwnerOnboardingDM(guild).catch(err => console.error('New server owner onboarding DM failed:', err?.message));
+});
+
 client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isAutocomplete()) {
@@ -6505,6 +6634,47 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
 
   try {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('onboard_league_select:')) {
+      const guildId = interaction.customId.split(':')[1];
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild) { await interaction.update({ content: 'Could not find that server anymore.', components: [] }); return; }
+      const leagueId = interaction.values[0];
+      const league = await getLeagueById(leagueId).catch(() => null);
+      if (!league) { await interaction.update({ content: 'Could not find that league anymore.', components: [] }); return; }
+      const teams = await getLeagueTeamRoles(league.league_id);
+      if (!teams.length) {
+        await interaction.update({ content: `**${league.league_name}** doesn't have any team roles set up yet — ask a commissioner.`, components: [] });
+        return;
+      }
+      const rows = buildOnboardTeamSelectRows(teams, `onboard_team_select:${guildId}:${league.league_id}`);
+      await interaction.update({ content: `League: **${league.league_name}**. Pick your team:`, embeds: [], components: rows });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('onboard_team_select:')) {
+      const [, guildId, leagueId] = interaction.customId.split(':');
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild) { await interaction.update({ content: 'Could not find that server anymore.', components: [] }); return; }
+      const league = await getLeagueById(leagueId).catch(() => null);
+      const roleId = interaction.values[0];
+      const role = await guild.roles.fetch(roleId).catch(() => null);
+      const member = await guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!role || !member) {
+        await interaction.update({ content: 'Could not find that team or your membership in the server anymore.', components: [] });
+        return;
+      }
+      const existingOwner = role.members.find(m => !m.user.bot && m.id !== member.id);
+      await member.roles.add(role.id).catch(() => null);
+      const note = existingOwner ? ` Heads up — <@${existingOwner.id}> already has this role too; a commissioner can sort out ownership if that's not intended.` : '';
+      await interaction.update({
+        content: `You're set as **${role.name}**${league ? ' in ' + league.league_name : ''}.${note}`,
+        embeds: [],
+        components: [],
+      });
+      return;
+    }
+
+
     if (interaction.isModalSubmit()) {
       if (interaction.customId.startsWith('maddentrade_neg_analyze_modal:')) {
         if (!interaction.guild) return;
