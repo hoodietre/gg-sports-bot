@@ -2556,7 +2556,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('currency').setDescription('Configure server currency and payouts').addStringOption(o => o.setName('name').setDescription('Currency name').setRequired(false)).addStringOption(o => o.setName('icon').setDescription('Currency icon').setRequired(false)).addIntegerOption(o => o.setName('win_payout').setDescription('Currency paid to game winner').setRequired(false)).addIntegerOption(o => o.setName('game_played_payout').setDescription('Currency paid for playing a game').setRequired(false)).addIntegerOption(o => o.setName('award_payout').setDescription('Default currency paid for awards').setRequired(false)))
       .addSubcommand(sc => sc.setName('settings').setDescription('View/update league server setup settings').addRoleOption(o => o.setName('league_role').setDescription('Set league member role').setRequired(false)).addBooleanOption(o => o.setName('clear_league_role').setDescription('Clear league member role?').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('awards').setDescription('Open a customizable league awards form').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
-      .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false))),
+      .addSubcommand(sc => sc.setName('seasonhistory').setDescription('Post completed season history').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('season').setDescription('Season label').setRequired(true)).addStringOption(o => o.setName('champion').setDescription('Champion').setRequired(true)).addStringOption(o => o.setName('runner_up').setDescription('Runner-up').setRequired(false)).addStringOption(o => o.setName('mvp').setDescription('MVP').setRequired(false)).addStringOption(o => o.setName('awards').setDescription('Awards text').setRequired(false)).addStringOption(o => o.setName('notes').setDescription('Season notes').setRequired(false)))
+      .addSubcommand(sc => sc.setName('kick').setDescription('Staff: remove a user from the league (team + league roles)').addUserOption(o => o.setName('user').setDescription('User to remove').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false))),
 
     new SlashCommandBuilder()
       .setName('game')
@@ -5127,6 +5128,7 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
 // multi-step flow: selects first, then two bridged modals.
 // ---------------------------------------------------------------------------
 const tournamentCreateSessions = new Map();
+const leagueKickConfirmations = new Map();
 const commissionerSeasonHistorySessions = new Map();
 const TOURNAMENT_FORMAT_OPTIONS = [
   { value: 'single_elim', label: 'Single Elimination' },
@@ -6977,6 +6979,59 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('leaguekick_confirm:')) {
+        const confirmId = interaction.customId.split(':')[1];
+        const pending = leagueKickConfirmations.get(confirmId);
+        if (!pending) {
+          await interaction.update({ content: 'This confirmation has expired. Run `/league kick` again.', embeds: [], components: [] });
+          return;
+        }
+        if (interaction.user.id !== pending.requestedBy) {
+          await interaction.reply({ content: 'Only the person who ran this command can confirm it.', ephemeral: true });
+          return;
+        }
+        leagueKickConfirmations.delete(confirmId);
+
+        const targetMember = await interaction.guild.members.fetch(pending.targetUserId).catch(() => null);
+        if (!targetMember) {
+          await interaction.update({ content: 'Could not find that member anymore — they may have left the server.', embeds: [], components: [] });
+          return;
+        }
+
+        const kickTargetLeague = await getLeagueById(pending.leagueId).catch(() => null);
+
+        for (const roleId of pending.teamRoleIds) {
+          await targetMember.roles.remove(roleId).catch(() => null);
+        }
+        if (pending.removeLeagueRole && kickTargetLeague?.league_role_id) {
+          await targetMember.roles.remove(kickTargetLeague.league_role_id).catch(() => null);
+        }
+
+        await interaction.update({
+          content: `✅ Removed <@${pending.targetUserId}> from **${pending.leagueName}**. Reason: ${pending.reason}`,
+          embeds: [],
+          components: [],
+        });
+
+        if (kickTargetLeague?.league_announcement_channel_id) {
+          const announceChannel = await interaction.guild.channels.fetch(kickTargetLeague.league_announcement_channel_id).catch(() => null);
+          if (announceChannel?.isTextBased?.()) {
+            await announceChannel.send({
+              content: `<@${pending.targetUserId}> has been removed from **${pending.leagueName}**. Reason: ${pending.reason}`,
+              allowedMentions: { users: [], roles: [] },
+            }).catch(() => null);
+          }
+        }
+        return;
+      }
+
+      if (interaction.customId.startsWith('leaguekick_cancel:')) {
+        const confirmId = interaction.customId.split(':')[1];
+        leagueKickConfirmations.delete(confirmId);
+        await interaction.update({ content: 'Cancelled — no changes made.', embeds: [], components: [] });
+        return;
+      }
+
       if (interaction.customId.startsWith('activecheck_respond:')) {
         if (!interaction.guild) {
           await interaction.reply({ content: 'Active checks must be used inside the server.', ephemeral: true });
@@ -9997,6 +10052,36 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.isButton() && interaction.customId === 'memberprofile_back') {
       await showMemberProfileHome(interaction, interaction.user, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'memberprofile_stream') {
+      const existing = await getUserStreamUrl(interaction.guild?.id, interaction.user.id).catch(() => null);
+      const modal = new ModalBuilder()
+        .setCustomId('memberprofile_stream_modal')
+        .setTitle('Connect Your Stream')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('stream_url')
+              .setLabel('Stream URL (Twitch, YouTube, etc.)')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+              .setValue(existing || '')
+          )
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'memberprofile_stream_modal') {
+      const url = interaction.fields.getTextInputValue('stream_url').trim();
+      if (!/^https?:\/\//i.test(url)) {
+        await interaction.reply({ content: 'That doesn\'t look like a valid URL — it should start with http:// or https://.', ephemeral: true });
+        return;
+      }
+      await saveUserStreamLink(interaction.guild, interaction.user.id, url);
+      await interaction.reply({ content: `✅ Stream link saved: ${url}`, ephemeral: true });
       return;
     }
 
@@ -15983,6 +16068,71 @@ if (shopSubcommand === 'view') {
         return;
       }
 
+      if (leagueSubcommand === 'kick') {
+        const kickLeagueName = interaction.options.getString('league');
+        const kickLeague = kickLeagueName ? await getLeagueByName(interaction.guild.id, kickLeagueName) : await getDefaultLeague(interaction.guild.id);
+        if (!kickLeague) {
+          await interaction.reply({ content: 'No active league found.', ephemeral: true });
+          return;
+        }
+        if (!(await userCanUseLeagueSetup(interaction, kickLeague))) {
+          await interaction.reply({ content: 'You do not have permission to remove users from this league.', ephemeral: true });
+          return;
+        }
+        const targetUser = interaction.options.getUser('user');
+        const kickReason = interaction.options.getString('reason') || 'No reason given';
+        const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+        if (!targetMember) {
+          await interaction.reply({ content: 'Could not find that member in this server.', ephemeral: true });
+          return;
+        }
+
+        const kickTeamRoles = await getLeagueTeamRoles(kickLeague.league_id);
+        const heldTeamRoles = kickTeamRoles.filter(t => targetMember.roles.cache.has(t.role_id));
+        const hasLeagueRole = Boolean(kickLeague.league_role_id) && targetMember.roles.cache.has(kickLeague.league_role_id);
+
+        if (!heldTeamRoles.length && !hasLeagueRole) {
+          await interaction.reply({ content: `${targetUser.username} doesn't appear to hold any roles for **${kickLeague.league_name}**.`, ephemeral: true });
+          return;
+        }
+
+        const rolesSummary = [
+          heldTeamRoles.length ? `Team role(s): **${heldTeamRoles.map(t => t.role_name).join(', ')}**` : null,
+          hasLeagueRole ? 'League member role' : null,
+        ].filter(Boolean).join('\n');
+
+        const confirmId = randomUUID();
+        leagueKickConfirmations.set(confirmId, {
+          guildId: interaction.guild.id,
+          leagueId: kickLeague.league_id,
+          leagueName: kickLeague.league_name,
+          targetUserId: targetUser.id,
+          reason: kickReason,
+          teamRoleIds: heldTeamRoles.map(t => t.role_id),
+          removeLeagueRole: hasLeagueRole,
+          requestedBy: interaction.user.id,
+        });
+        setTimeout(() => leagueKickConfirmations.delete(confirmId), 5 * 60 * 1000); // Confirmation expires in 5 minutes.
+
+        const confirmEmbed = new EmbedBuilder()
+          .setTitle('⚠️ Confirm Removal')
+          .setColor(0xED4245)
+          .setDescription(`Remove **${targetUser.username}** from **${kickLeague.league_name}**?`)
+          .addFields(
+            { name: 'Roles to remove', value: rolesSummary, inline: false },
+            { name: 'Reason', value: kickReason, inline: false },
+          )
+          .setFooter({ text: 'This removes league/team roles only — it does not remove them from the Discord server.' });
+
+        const confirmRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('leaguekick_confirm:' + confirmId).setLabel('Confirm Removal').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('leaguekick_cancel:' + confirmId).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+        );
+
+        await interaction.reply({ embeds: [confirmEmbed], components: [confirmRow], ephemeral: true });
+        return;
+      }
+
       if (leagueSubcommand === 'seasonhistory') {
         if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'You do not have permission to add season history for this league.', ephemeral: true });
@@ -18893,17 +19043,7 @@ if (shopSubcommand === 'view') {
 
     if (interaction.commandName === 'linkstream') {
       const url = interaction.options.getString('url');
-      if (interaction.guild) {
-        await pool.query(`INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`, [interaction.guild.id, interaction.guild.name]);
-        await pool.query(
-          `INSERT INTO guild_stream_links (guild_id, user_id, stream_url, updated_at)
-           VALUES ($1, $2, $3, NOW())
-           ON CONFLICT (guild_id, user_id)
-           DO UPDATE SET stream_url = EXCLUDED.stream_url, updated_at = NOW()`,
-          [interaction.guild.id, interaction.user.id, url]
-        );
-      }
-      await pool.query(`INSERT INTO stream_links (user_id, stream_url) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET stream_url = EXCLUDED.stream_url`, [interaction.user.id, url]);
+      await saveUserStreamLink(interaction.guild, interaction.user.id, url);
       await interaction.reply({ content: 'Your stream link has been saved permanently.', ephemeral: true });
       return;
     }
@@ -21106,6 +21246,20 @@ async function endActiveCheck(interaction, league) {
   return { ok: true, message: `Active Check for **${league.league_name}** ended.` };
 }
 
+async function saveUserStreamLink(guild, userId, url) {
+  if (guild) {
+    await pool.query(`INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`, [guild.id, guild.name]);
+    await pool.query(
+      `INSERT INTO guild_stream_links (guild_id, user_id, stream_url, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (guild_id, user_id)
+       DO UPDATE SET stream_url = EXCLUDED.stream_url, updated_at = NOW()`,
+      [guild.id, userId, url]
+    );
+  }
+  await pool.query(`INSERT INTO stream_links (user_id, stream_url) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET stream_url = EXCLUDED.stream_url`, [userId, url]);
+}
+
 async function userIsInLeagueGame(guild, userId, sportsbookGame) {
   if (!guild || !userId || !sportsbookGame) return false;
 
@@ -22956,7 +23110,12 @@ function buildMemberProfileHomeComponents() {
     .setCustomId('memberprofile_category')
     .setPlaceholder('Choose a section')
     .addOptions(MEMBER_PROFILE_CATEGORIES.map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
-  return [new ActionRowBuilder().addComponents(menu)];
+  return [
+    new ActionRowBuilder().addComponents(menu),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('memberprofile_stream').setLabel('Connect Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary)
+    ),
+  ];
 }
 
 function buildMemberProfileBackRow() {
