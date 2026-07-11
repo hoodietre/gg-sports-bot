@@ -1080,6 +1080,33 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS conference TEXT`);
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS division TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS playoff_team_count INTEGER NOT NULL DEFAULT 8`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS active_check_channel_id TEXT`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_active_checks (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      channel_id TEXT NOT NULL,
+      message_id TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMP NOT NULL,
+      created_by_user_id TEXT NOT NULL,
+      ended_by_user_id TEXT,
+      ended_at TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_active_check_responses (
+      check_id UUID NOT NULL REFERENCES league_active_checks(id) ON DELETE CASCADE,
+      team_role_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      responded_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (check_id, team_role_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_active_checks_open ON league_active_checks (league_id, status)`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_custom_settings (
       league_id UUID PRIMARY KEY REFERENCES leagues(league_id) ON DELETE CASCADE,
@@ -2540,6 +2567,24 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false))),
+
+    new SlashCommandBuilder()
+      .setName('activecheck')
+      .setDescription('Commissioner: run an active check to see who is currently active in the league')
+      .addSubcommand(sc => sc
+        .setName('start')
+        .setDescription('Staff: start a new active check')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addIntegerOption(o => o.setName('hours').setDescription('Hours teams have to respond (e.g. 72 for 3 days)').setRequired(true).setMinValue(1).setMaxValue(720))
+        .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to configured/current channel)').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('end')
+        .setDescription('Staff: end the current active check early')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('status')
+        .setDescription('View the current/most recent active check')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -3219,7 +3264,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -6932,6 +6977,61 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('activecheck_respond:')) {
+        if (!interaction.guild) {
+          await interaction.reply({ content: 'Active checks must be used inside the server.', ephemeral: true });
+          return;
+        }
+        const checkId = interaction.customId.split(':')[1];
+        const checkResult = await pool.query(`SELECT * FROM league_active_checks WHERE id = $1`, [checkId]);
+        let check = checkResult.rows[0];
+        if (!check) {
+          await interaction.reply({ content: 'This active check could not be found.', ephemeral: true });
+          return;
+        }
+        const league = await getLeagueById(check.league_id);
+        if (!league) {
+          await interaction.reply({ content: 'League not found.', ephemeral: true });
+          return;
+        }
+
+        check = await closeExpiredActiveCheck(check);
+        if (check.status !== 'open') {
+          await interaction.reply({ content: 'This active check has ended.', ephemeral: true });
+          await refreshActiveCheckMessage(interaction.guild, league, check).catch(() => null);
+          return;
+        }
+
+        const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        if (!member) {
+          await interaction.reply({ content: 'Could not verify your membership in this server.', ephemeral: true });
+          return;
+        }
+
+        const teamRoles = await getLeagueTeamRoles(league.league_id);
+        const heldTeams = teamRoles.filter(t => member.roles.cache.has(t.role_id));
+        if (!heldTeams.length) {
+          await interaction.reply({ content: "You don't hold a team role in this league, so there's nothing to check in for.", ephemeral: true });
+          return;
+        }
+
+        for (const team of heldTeams) {
+          await pool.query(
+            `INSERT INTO league_active_check_responses (check_id, team_role_id, user_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (check_id, team_role_id) DO UPDATE SET user_id = $3, responded_at = NOW()`,
+            [checkId, team.role_id, interaction.user.id]
+          );
+        }
+
+        await interaction.reply({
+          content: `✅ Checked in as ${heldTeams.map(t => activeCheckTeamEmoji(t.role_name) + ' ' + t.role_name).join(', ')}.`,
+          ephemeral: true,
+        });
+        await refreshActiveCheckMessage(interaction.guild, league, check).catch(() => null);
+        return;
+      }
+
       if (interaction.customId.startsWith('maddengame_thread_')) {
         await handleMaddenGameThreadButton(interaction);
         return;
@@ -7921,6 +8021,24 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
+      if (action === 'activecheck') {
+        const existingCheck = await getOpenActiveCheck(interaction.guild.id, league.league_id);
+        if (existingCheck) {
+          await interaction.reply({ content: `An active check is already running for **${league.league_name}**. End it first (\`/activecheck end\`) before starting a new one.`, ephemeral: true });
+          return;
+        }
+        const modal = new ModalBuilder()
+          .setCustomId('commissioner_activecheck_modal:' + leagueId)
+          .setTitle('Start Active Check')
+          .addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('hours').setLabel('Hours to respond (e.g. 72 for 3 days)').setStyle(TextInputStyle.Short).setRequired(true).setValue('72')
+            )
+          );
+        await interaction.showModal(modal);
+        return;
+      }
+
       return;
     }
 
@@ -8783,6 +8901,30 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       } catch (err) {
         await interaction.editReply({ content: `Failed to post announcement: ${err?.message || 'Unknown error'}. Make sure the bot has Send Messages and Embed Links permissions in that channel.` });
       }
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_activecheck_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) {
+        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        return;
+      }
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to start an active check.', ephemeral: true });
+        return;
+      }
+      const hoursRaw = interaction.fields.getTextInputValue('hours');
+      const hours = Number.parseInt(hoursRaw, 10);
+      if (!Number.isInteger(hours) || hours < 1) {
+        await interaction.reply({ content: 'Hours must be a whole number of 1 or greater.', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const result = await startActiveCheck(interaction, league, hours, null)
+        .catch(err => ({ ok: false, message: 'Failed to start active check: ' + (err?.message || 'Unknown error') }));
+      await interaction.editReply({ content: result.message });
       return;
     }
 
@@ -11522,6 +11664,65 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         [interaction.guild.id, activeLeague.league_id]
       );
       await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.commandName === 'activecheck') {
+      if (!interaction.guild) return;
+      const subcommand = interaction.options.getSubcommand();
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.reply({ content: 'No active league found.', ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'start') {
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to start an active check.', ephemeral: true });
+          return;
+        }
+        const hours = interaction.options.getInteger('hours');
+        const channelOption = interaction.options.getChannel('channel');
+        await interaction.deferReply({ ephemeral: true });
+        const result = await startActiveCheck(interaction, activeLeague, hours, channelOption)
+          .catch(err => ({ ok: false, message: 'Failed to start active check: ' + (err?.message || 'Unknown error') }));
+        await interaction.editReply({ content: result.message });
+        return;
+      }
+
+      if (subcommand === 'end') {
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to end an active check.', ephemeral: true });
+          return;
+        }
+        await interaction.deferReply({ ephemeral: true });
+        const result = await endActiveCheck(interaction, activeLeague);
+        await interaction.editReply({ content: result.message });
+        return;
+      }
+
+      if (subcommand === 'status') {
+        await interaction.deferReply({ ephemeral: true });
+        let check = await getOpenActiveCheck(interaction.guild.id, activeLeague.league_id);
+        if (!check) {
+          const lastResult = await pool.query(
+            `SELECT * FROM league_active_checks WHERE guild_id = $1 AND league_id = $2 ORDER BY created_at DESC LIMIT 1`,
+            [interaction.guild.id, activeLeague.league_id]
+          );
+          check = lastResult.rows[0] || null;
+        }
+        if (!check) {
+          await interaction.editReply({ content: `No active check has been run for **${activeLeague.league_name}** yet.` });
+          return;
+        }
+        check = await closeExpiredActiveCheck(check);
+        const teams = await getActiveCheckEligibleTeams(interaction.guild, activeLeague);
+        const responses = await getActiveCheckResponses(check.id);
+        await interaction.editReply({ embeds: [buildActiveCheckEmbed(activeLeague, check, teams, responses)] });
+        return;
+      }
+
       return;
     }
 
@@ -20762,6 +20963,149 @@ function buildGameCenterTeamSelectRows(teams, customIdPrefix) {
 
 
 
+// 7K-AC: Active Checks — commissioner-run roll call of who's currently
+// active in the league. Tracked per TEAM (not per user, since a team role
+// can have more than one holder) — matches the reference design: a grid of
+// team emojis split into "responded" and "still to check in".
+
+async function getActiveCheckEligibleTeams(guild, league) {
+  const teamRoles = await getLeagueTeamRoles(league.league_id);
+  const withOwners = await Promise.all(teamRoles.map(async t => ({
+    ...t,
+    owner: await findTeamOwnerByRoleId(guild, t.role_id).catch(() => null),
+  })));
+  return withOwners.filter(t => t.owner); // Unclaimed/CPU teams have no one to check in — skip them.
+}
+
+async function getOpenActiveCheck(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT * FROM league_active_checks WHERE guild_id = $1 AND league_id = $2 AND status = 'open' ORDER BY created_at DESC LIMIT 1`,
+    [guildId, leagueId]
+  );
+  return result.rows[0] || null;
+}
+
+async function getActiveCheckResponses(checkId) {
+  const result = await pool.query(`SELECT * FROM league_active_check_responses WHERE check_id = $1`, [checkId]);
+  return result.rows;
+}
+
+function activeCheckTeamEmoji(teamName) {
+  return getMaddenTeamEmoji(teamName) || '🏳️';
+}
+
+function buildActiveCheckEmbed(league, check, teams, responses) {
+  const NL = String.fromCharCode(10);
+  const respondedIds = new Set(responses.map(r => r.team_role_id));
+  const responded = teams.filter(t => respondedIds.has(t.role_id));
+  const pending = teams.filter(t => !respondedIds.has(t.role_id));
+  const emojiLine = (list) => list.length ? list.map(t => activeCheckTeamEmoji(t.role_name)).join(' ') : '—';
+
+  const startedUnix = Math.floor(new Date(check.started_at).getTime() / 1000);
+  const expiresUnix = Math.floor(new Date(check.expires_at).getTime() / 1000);
+  const isOpen = check.status === 'open';
+
+  const windowText = isOpen
+    ? `Started <t:${startedUnix}:R>${NL}Expires <t:${expiresUnix}:R> (<t:${expiresUnix}:t>)`
+    : `Started <t:${startedUnix}:R>${NL}**Closed**`;
+
+  return new EmbedBuilder()
+    .setTitle('Active Check')
+    .setColor(isOpen ? 0x57F287 : 0x99AAB5)
+    .addFields(
+      { name: `✅ Responded (${responded.length})`, value: emojiLine(responded), inline: false },
+      { name: `⏳ Still to check in (${pending.length})`, value: emojiLine(pending), inline: false },
+      { name: 'Window', value: windowText, inline: false },
+    )
+    .setFooter({ text: `Active Check • ${league.league_name}` })
+    .setTimestamp(new Date(check.started_at));
+}
+
+function buildActiveCheckComponents(checkId, isOpen) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('activecheck_respond:' + checkId).setLabel("I'm Active").setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(!isOpen)
+  )];
+}
+
+async function closeExpiredActiveCheck(check) {
+  if (check.status !== 'open') return check;
+  if (new Date(check.expires_at).getTime() > Date.now()) return check;
+  await pool.query(`UPDATE league_active_checks SET status = 'closed', ended_at = NOW() WHERE id = $1`, [check.id]);
+  return { ...check, status: 'closed', ended_at: new Date() };
+}
+
+async function refreshActiveCheckMessage(guild, league, check) {
+  if (!check.message_id) return;
+  const channel = await guild.channels.fetch(check.channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) return;
+  const message = await channel.messages.fetch(check.message_id).catch(() => null);
+  if (!message) return;
+  const teams = await getActiveCheckEligibleTeams(guild, league);
+  const responses = await getActiveCheckResponses(check.id);
+  await message.edit({
+    embeds: [buildActiveCheckEmbed(league, check, teams, responses)],
+    components: buildActiveCheckComponents(check.id, check.status === 'open'),
+  }).catch(() => null);
+}
+
+async function startActiveCheck(interaction, league, hours, channelOverride = null) {
+  const existing = await getOpenActiveCheck(interaction.guild.id, league.league_id);
+  if (existing) {
+    const startedUnix = Math.floor(new Date(existing.started_at).getTime() / 1000);
+    return { ok: false, message: `An active check is already running for **${league.league_name}** (started <t:${startedUnix}:R>). End it with \`/activecheck end\` before starting a new one.` };
+  }
+
+  const teams = await getActiveCheckEligibleTeams(interaction.guild, league);
+  if (!teams.length) {
+    return { ok: false, message: 'No team roles with an assigned owner were found for this league — nothing to check.' };
+  }
+
+  const channelId = channelOverride?.id || league.active_check_channel_id;
+  const channel = channelId ? await interaction.guild.channels.fetch(channelId).catch(() => null) : interaction.channel;
+  if (!channel?.isTextBased?.()) {
+    return { ok: false, message: 'Could not find a valid channel to post the Active Check in. Set one in /commissioner panel → Channels & Roles, or run this in the channel you want it posted in.' };
+  }
+
+  const checkId = randomUUID();
+  const startedAt = new Date();
+  const expiresAt = new Date(startedAt.getTime() + hours * 60 * 60 * 1000);
+
+  await pool.query(
+    `INSERT INTO league_active_checks (id, guild_id, league_id, channel_id, status, started_at, expires_at, created_by_user_id)
+     VALUES ($1, $2, $3, $4, 'open', $5, $6, $7)`,
+    [checkId, interaction.guild.id, league.league_id, channel.id, startedAt, expiresAt, interaction.user.id]
+  );
+
+  const check = { id: checkId, status: 'open', started_at: startedAt, expires_at: expiresAt };
+  const leagueRoleId = league.league_role_id;
+
+  let posted;
+  try {
+    posted = await channel.send({
+      content: leagueRoleId ? `<@&${leagueRoleId}>` : undefined,
+      embeds: [buildActiveCheckEmbed(league, check, teams, [])],
+      components: buildActiveCheckComponents(checkId, true),
+      allowedMentions: leagueRoleId ? { roles: [leagueRoleId] } : { roles: [], users: [] },
+    });
+  } catch (err) {
+    await pool.query(`DELETE FROM league_active_checks WHERE id = $1`, [checkId]);
+    return { ok: false, message: `Failed to post in <#${channel.id}>: ${err?.message || 'Unknown error'}. Check bot permissions (Send Messages, Embed Links).` };
+  }
+
+  await pool.query(`UPDATE league_active_checks SET message_id = $2 WHERE id = $1`, [checkId, posted.id]);
+
+  return { ok: true, message: `Active Check posted in <#${channel.id}> — ${teams.length} team(s) to check in, expires in ${hours} hour(s).` };
+}
+
+async function endActiveCheck(interaction, league) {
+  const check = await getOpenActiveCheck(interaction.guild.id, league.league_id);
+  if (!check) return { ok: false, message: `No active check is currently running for **${league.league_name}**.` };
+  await pool.query(`UPDATE league_active_checks SET status = 'closed', ended_by_user_id = $2, ended_at = NOW() WHERE id = $1`, [check.id, interaction.user.id]);
+  const updated = { ...check, status: 'closed' };
+  await refreshActiveCheckMessage(interaction.guild, league, updated).catch(() => null);
+  return { ok: true, message: `Active Check for **${league.league_name}** ended.` };
+}
+
 async function userIsInLeagueGame(guild, userId, sportsbookGame) {
   if (!guild || !userId || !sportsbookGame) return false;
 
@@ -22824,6 +23168,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'playoff_bracket_channel', label: 'Playoff Bracket Channel', description: 'Live, auto-updating playoff bracket embed', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'game_center_channel', label: 'Game Center Channel', description: 'For open-schedule leagues: Add Game panel that opens a private matchup thread per game', kind: 'channel' },
+  { value: 'active_check_channel', label: 'Active Check Channel', description: 'Where Active Check posts go by default', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
@@ -22885,6 +23230,7 @@ function setupDashboardColumn(settingKey) {
     playoff_bracket_channel: 'playoff_bracket_channel_id',
     game_thread_channel: 'game_threads_channel_id',
     game_center_channel: 'game_center_channel_id',
+    active_check_channel: 'active_check_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
     madden_power_rankings_channel: 'madden_power_rankings_channel_id',
@@ -22942,6 +23288,7 @@ function buildSetupDashboardEmbed(league) {
     ['playoff_bracket_channel', 'Playoff Bracket'],
     ['game_thread_channel', 'Game Threads'],
     ['game_center_channel', 'Game Center'],
+    ['active_check_channel', 'Active Check'],
     ['madden_news_channel', 'Madden News'],
     ['madden_standings_channel', 'Madden Standings Board'],
     ['madden_power_rankings_channel', 'Madden Power Rankings Board'],
@@ -52449,6 +52796,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
       new ButtonBuilder().setCustomId('commissioner_op:rules:' + leagueId).setLabel('Rules').setEmoji('📖').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('commissioner_op:seasonhistory:' + leagueId).setLabel('Season History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
     )];
     if (isStructured) {
       rows.push(new ActionRowBuilder().addComponents(
@@ -52462,6 +52810,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     new ButtonBuilder().setCustomId('commissioner_op:connect:' + leagueId).setLabel('Connect to EA').setEmoji('🔗').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('commissioner_op:sync:' + leagueId).setLabel('Run Sync').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('commissioner_op:refresh:' + leagueId).setLabel('Refresh Boards').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
   );
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('commissioner_op:txn_preview:' + leagueId).setLabel('Preview Transactions').setStyle(ButtonStyle.Secondary),
