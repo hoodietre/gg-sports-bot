@@ -7864,6 +7864,28 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_conferences:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const current = customSettings.use_conferences ?? isNbaLeague(league);
+      await pool.query(`UPDATE league_custom_settings SET use_conferences = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, !current]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'conferences', { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_divisions:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const current = customSettings.use_divisions ?? false;
+      await pool.query(`UPDATE league_custom_settings SET use_divisions = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, !current]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'conferences', { update: true });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_tradelimit_modal:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -51751,7 +51773,7 @@ const LEAGUE_CUSTOMIZATION_SECTIONS = [
   { value: 'playoffs', label: 'Playoffs', description: 'Team count, seeding, series length per round', emoji: '🏆' },
   { value: 'trades', label: 'Trades', description: 'CPU trades, trade limit per season', emoji: '🔀' },
   { value: 'awards', label: 'Awards', description: 'Which awards this league tracks', emoji: '🎖️' },
-  { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Assign each team a conference/division', emoji: '🗺️' },
+  { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Turn conferences/divisions on/off, assign each team', emoji: '🗺️' },
 ];
 
 async function buildCommissionerLeagueEmbed(league) {
@@ -51926,15 +51948,26 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
     components = rows;
   } else if (section === 'conferences') {
     const teamsResult = await pool.query(`SELECT * FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC LIMIT 25`, [leagueId]);
+    const confUseConferences = customSettings.use_conferences ?? isNbaLeague(league);
+    const confUseDivisions = customSettings.use_divisions ?? false;
     embed = new EmbedBuilder()
       .setTitle(`🗺️ Team Conferences/Divisions • ${league.league_name}`)
       .setColor(0x5865F2)
+      .addFields(
+        { name: 'Conferences', value: confUseConferences ? '✅ On — grouped in standings/playoffs' : '❌ Off', inline: true },
+        { name: 'Divisions', value: confUseDivisions ? '✅ On — grouped in standings/playoffs' : '❌ Off', inline: true },
+      )
       .setDescription(teamsResult.rows.length
         ? teamsResult.rows.map(t => `**${t.role_name}** — ${t.conference || 'No conference'}${t.division ? ' / ' + t.division : ''}`).join('\n')
         : 'No team roles found for this league yet.')
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
-    components = [];
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_conferences:' + leagueId).setLabel(confUseConferences ? 'Disable Conferences' : 'Enable Conferences').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_divisions:' + leagueId).setLabel(confUseDivisions ? 'Disable Divisions' : 'Enable Divisions').setStyle(ButtonStyle.Secondary),
+      ),
+    ];
     if (teamsResult.rows.length) {
       const teamMenu = new StringSelectMenuBuilder()
         .setCustomId('leaguecustom_team_select:' + leagueId)
