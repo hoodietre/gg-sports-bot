@@ -7458,6 +7458,10 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await showCommissionerOperations(interaction, leagueId);
         return;
       }
+      if (category === 'browse') {
+        await showCommissionerBrowse(interaction, leagueId);
+        return;
+      }
       if (category === 'league') {
         await showCommissionerLeagueSettings(interaction, leagueId);
         return;
@@ -7480,6 +7484,65 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       }
 
       await showCommissionerHome(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_browse_back:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+      await showCommissionerBrowse(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('commissioner_browse_select:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+      const choice = interaction.values[0];
+
+      if (choice === 'txn_team' || choice === 'ret_team') {
+        const teamNames = await getMaddenTeamNamesForLeague(interaction.guild.id, league.league_id);
+        if (!teamNames.length) {
+          await interaction.update({ content: 'No teams found — run `/madden sync` first.', embeds: [], components: [buildCommissionerBrowseBackRow(leagueId)] });
+          return;
+        }
+        const rows = buildTeamNameSelectRows(teamNames, `commissioner_browse_team:${leagueId}:${choice}`);
+        rows.push(buildCommissionerBrowseBackRow(leagueId));
+        await interaction.update({ content: 'Choose a team:', embeds: [], components: rows });
+        return;
+      }
+
+      await interaction.deferUpdate();
+      let embed;
+      if (choice === 'txn_recent') embed = await buildMaddenTransactionsRecentEmbed(interaction.guild.id, league, { limit: 15 });
+      else if (choice === 'ret_recent') embed = await buildMaddenRetirementsEmbed(interaction.guild.id, league, { limit: 15 });
+      else if (choice === 'ret_season') embed = await buildMaddenRetirementsEmbed(interaction.guild.id, league, { limit: 25, season: true });
+      else { await showCommissionerBrowse(interaction, leagueId); return; }
+
+      await interaction.editReply({ content: null, embeds: [embed], components: [buildCommissionerBrowseBackRow(leagueId)] });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('commissioner_browse_team:')) {
+      const [, leagueId, type] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+      const team = interaction.values[0];
+      await interaction.deferUpdate();
+      const embed = type === 'txn_team'
+        ? await buildMaddenTransactionsRecentEmbed(interaction.guild.id, league, { team, limit: 15 })
+        : await buildMaddenRetirementsEmbed(interaction.guild.id, league, { team, limit: 15 });
+      await interaction.editReply({ content: null, embeds: [embed], components: [buildCommissionerBrowseBackRow(leagueId)] });
       return;
     }
 
@@ -7667,6 +7730,121 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
+      if (action === 'autodetect_settings') {
+        await showCommissionerAutoDetectSettings(interaction, leagueId);
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_autodetect_back:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+      await showCommissionerOperations(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_autodetect_threshold_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
+        return;
+      }
+      await ensureMaddenAutoDetectColumns();
+      const settings = await ensureMaddenLeagueSettings(league);
+      const modal = new ModalBuilder()
+        .setCustomId('commissioner_autodetect_threshold_submit:' + leagueId)
+        .setTitle('Auto-Detect Threshold')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('threshold')
+              .setLabel('Max transactions before flagging for review')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+              .setValue(String(settings.auto_detect_threshold || 30))
+          )
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_autodetect_threshold_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
+        return;
+      }
+      const raw = interaction.fields.getTextInputValue('threshold');
+      const threshold = Number.parseInt(raw, 10);
+      if (!Number.isInteger(threshold) || threshold < 1) {
+        await interaction.reply({ content: 'Threshold must be a whole number of 1 or greater.', ephemeral: true });
+        return;
+      }
+      await ensureMaddenAutoDetectColumns();
+      await pool.query(
+        `UPDATE madden_league_settings SET auto_detect_threshold = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, threshold]
+      );
+      await interaction.deferUpdate();
+      await showCommissionerAutoDetectSettings(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_autodetect_toggle_espn:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
+        return;
+      }
+      await ensureMaddenAutoDetectColumns();
+      const settings = await ensureMaddenLeagueSettings(league);
+      await pool.query(
+        `UPDATE madden_league_settings SET espn_news_enabled = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, settings.espn_news_enabled === false]
+      );
+      await showCommissionerAutoDetectSettings(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_autodetect_toggle_sblines:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
+        return;
+      }
+      await ensureMaddenAutoDetectColumns();
+      const settings = await ensureMaddenLeagueSettings(league);
+      await pool.query(
+        `UPDATE madden_league_settings SET sportsbook_auto_lines_enabled = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, !settings.sportsbook_auto_lines_enabled]
+      );
+      await showCommissionerAutoDetectSettings(interaction, leagueId);
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('commissioner_autodetect_review:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
+        return;
+      }
+      await ensureMaddenAutoDetectColumns();
+      await pool.query(
+        `UPDATE madden_league_settings SET auto_detect_review_channel_id = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, interaction.values[0]]
+      );
+      await showCommissionerAutoDetectSettings(interaction, leagueId);
       return;
     }
 
@@ -11754,9 +11932,26 @@ if (gameSubcommand === 'report') {
         setCol('madden_sportsbook_channel_id',  interaction.options.getChannel('sportsbook_channel')?.id);
         const standCh = interaction.options.getChannel('standings_channel');
         const rankCh  = interaction.options.getChannel('power_rankings_channel');
-        setCol('standings_channel_id', standCh?.id);
+        // Standings/power rankings board channel lives on league_settings (same
+        // column the setup dashboard and "Post/Refresh Madden Standings Board"
+        // panel option use) — NOT on madden_league_settings, which used to have
+        // its own separate copy that refreshPersistentMaddenEmbeds never actually
+        // read. Writing both the channel (league_settings) and clearing the
+        // stored message id (madden_league_settings) keeps the two tables' worth
+        // of state consistent so a channel change triggers a fresh post.
+        if (standCh || rankCh) {
+          const leagueSettingsUpdates = [];
+          const leagueSettingsVals = [activeLeague.league_id];
+          if (standCh) { leagueSettingsVals.push(standCh.id); leagueSettingsUpdates.push(`madden_standings_channel_id = $${leagueSettingsVals.length}`); }
+          if (rankCh) { leagueSettingsVals.push(rankCh.id); leagueSettingsUpdates.push(`madden_power_rankings_channel_id = $${leagueSettingsVals.length}`); }
+          leagueSettingsUpdates.push('updated_at = NOW()');
+          await pool.query(
+            `INSERT INTO league_settings (league_id, updated_at) VALUES ($1, NOW())
+             ON CONFLICT (league_id) DO UPDATE SET ${leagueSettingsUpdates.join(', ')}`,
+            leagueSettingsVals
+          );
+        }
         if (standCh) setCol('standings_message_id', null);
-        setCol('power_rankings_channel_id', rankCh?.id);
         if (rankCh) setCol('power_rankings_message_id', null);
         const resetWeek = interaction.options.getString('reset_week');
         if (resetWeek) setCol('last_auto_detect_week_label', resetWeek.trim());
@@ -51016,14 +51211,13 @@ async function markMaddenAdvanceProcessed(guildId, leagueId, weekLabel) {
 // Persistent embed updater
 // Edits the stored message in place, or posts a new one and saves the new ID.
 // ---------------------------------------------------------------------------
-async function updatePersistentMaddenEmbed(guild, league, channelIdKey, messageIdKey, buildEmbedFn, buildComponentsFn = null) {
-  const settings = await ensureMaddenLeagueSettings(league);
-  const channelId = settings[channelIdKey];
+async function updatePersistentMaddenEmbed(guild, league, channelId, messageIdKey, buildEmbedFn, buildComponentsFn = null) {
   if (!channelId) return null; // Not configured, skip
 
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased?.()) return null;
 
+  const settings = await ensureMaddenLeagueSettings(league);
   const embed = await buildEmbedFn(settings).catch(() => null);
   if (!embed) return null;
   const components = buildComponentsFn ? await buildComponentsFn(settings).catch(() => undefined) : undefined;
@@ -51066,10 +51260,10 @@ async function refreshPersistentMaddenEmbeds(guild, league) {
   ).then(r => r.rows).catch(() => []);
 
   await Promise.allSettled([
-    updatePersistentMaddenEmbed(guild, league, 'standings_channel_id', 'standings_message_id',
+    updatePersistentMaddenEmbed(guild, league, league.madden_standings_channel_id, 'standings_message_id',
       (settings) => buildMaddenImportedStandingsEmbed(league, standingsRows, (settings && settings.standings_scope) || 'conference'),
       (settings) => buildMaddenStandingsScopeComponents(league.league_id, (settings && settings.standings_scope) || 'conference')),
-    updatePersistentMaddenEmbed(guild, league, 'power_rankings_channel_id', 'power_rankings_message_id',
+    updatePersistentMaddenEmbed(guild, league, league.madden_power_rankings_channel_id, 'power_rankings_message_id',
       async () => {
         const rows = await pool.query(
           `SELECT * FROM madden_power_rankings WHERE league_id::text = $1::text ORDER BY rank ASC`,
@@ -51077,17 +51271,14 @@ async function refreshPersistentMaddenEmbeds(guild, league) {
         ).then(r => r.rows).catch(() => []);
         return buildMaddenPowerRankingsEmbed(league, rows);
       }),
-    updatePersistentMaddenEmbed(guild, league, 'madden_free_agents_channel_id', 'free_agents_message_id',
-      async () => {
-        const fas = await pool.query(
-          `SELECT * FROM madden_players
-           WHERE guild_id = $1 AND league_id::text = $2::text
-             AND (team_name IS NULL OR LOWER(team_name) IN ('fa','free agent','free agents',''))
-           ORDER BY overall DESC NULLS LAST LIMIT 50`,
-          [guild.id, String(league.league_id)]
-        ).then(r => r.rows).catch(() => []);
-        return buildMaddenFreeAgentsEmbed(league, fas);
-      }),
+    // Free agents board is intentionally NOT refreshed here. It has its own
+    // separate, correct auto-refresh path (refreshMaddenFreeAgentsPanelForLeague,
+    // called right after sync, backed by the madden_free_agent_panels table).
+    // This function used to also call updatePersistentMaddenEmbed for free
+    // agents using a madden_league_settings.madden_free_agents_channel_id
+    // column that was never actually populated (the real column lives on
+    // league_settings) — so it silently no-op'd. Removed rather than "fixed"
+    // to avoid running two competing refresh systems against the same board.
     refreshMaddenTradeBlockBoardForLeague(guild, league),
     refreshMaddenLeagueLeadersPanelForLeague(guild, league),
     refreshMaddenAwardRacePanelForLeague(guild, league),
@@ -51933,13 +52124,50 @@ function buildMaddenAutoDetectSettingsEmbed(league, settings) {
       { name: 'ESPN News', value: settings.espn_news_enabled !== false ? '✅ On' : '❌ Off', inline: true },
       { name: 'Sportsbook Auto-Lines', value: settings.sportsbook_auto_lines_enabled ? '✅ On' : '❌ Off', inline: true },
       { name: 'Sportsbook Channel', value: settings.madden_sportsbook_channel_id ? `<#${settings.madden_sportsbook_channel_id}>` : 'Not set', inline: true },
-      { name: 'Standings Board', value: settings.standings_channel_id ? `<#${settings.standings_channel_id}>` : 'Not set', inline: true },
-      { name: 'Power Rankings Board', value: settings.power_rankings_channel_id ? `<#${settings.power_rankings_channel_id}>` : 'Not set', inline: true },
+      { name: 'Standings Board', value: league.madden_standings_channel_id ? `<#${league.madden_standings_channel_id}>` : 'Not set', inline: true },
+      { name: 'Power Rankings Board', value: league.madden_power_rankings_channel_id ? `<#${league.madden_power_rankings_channel_id}>` : 'Not set', inline: true },
       { name: 'Last Processed Week', value: settings.last_auto_detect_week_label || 'None yet', inline: true },
-      { name: 'How to enable', value: 'Use the **Toggle Auto-Detection** button in /commissioner panel → Operations, or run `/maddengames autodetect enabled:True`. Set a transaction threshold that matches your typical advance size (default: 30) with `/maddengames autodetect threshold:`. The system will hold anomalous advances for commissioner review instead of auto-posting.', inline: false },
+      { name: 'How to enable', value: 'Use **Toggle Auto-Detection** in /commissioner panel → Operations to turn this on/off. Use **Auto-Detect Settings** (next to it) to edit the threshold, review channel, and the ESPN News / Sportsbook Auto-Lines toggles without typing a command. `/maddengames autodetect` still works as a manual backup.', inline: false },
     )
     .setFooter({ text: 'GG Sports • 7J-10BY-GT3 Auto Detection' })
     .setTimestamp();
+}
+
+function buildCommissionerAutoDetectSettingsComponents(leagueId, settings) {
+  const channelMenu = new ChannelSelectMenuBuilder()
+    .setCustomId('commissioner_autodetect_review:' + leagueId)
+    .setPlaceholder(settings.auto_detect_review_channel_id ? 'Change review channel' : 'Set review channel (defaults to news channel)')
+    .setChannelTypes(ChannelType.GuildText);
+  const row1 = new ActionRowBuilder().addComponents(channelMenu);
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_autodetect_threshold_modal:' + leagueId).setLabel('Edit Threshold').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('commissioner_autodetect_toggle_espn:' + leagueId).setLabel(settings.espn_news_enabled !== false ? 'Disable ESPN News' : 'Enable ESPN News').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('commissioner_autodetect_toggle_sblines:' + leagueId).setLabel(settings.sportsbook_auto_lines_enabled ? 'Disable Sportsbook Lines' : 'Enable Sportsbook Lines').setStyle(ButtonStyle.Secondary),
+  );
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_autodetect_back:' + leagueId).setLabel('⬅ Back to Operations').setStyle(ButtonStyle.Secondary),
+  );
+  return [row1, row2, row3];
+}
+
+async function showCommissionerAutoDetectSettings(interaction, leagueId) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+    return;
+  }
+  await ensureMaddenAutoDetectColumns();
+  const settings = await ensureMaddenLeagueSettings(league);
+  const payload = {
+    content: null,
+    embeds: [buildMaddenAutoDetectSettingsEmbed(league, settings)],
+    components: buildCommissionerAutoDetectSettingsComponents(leagueId, settings),
+  };
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload);
+  } else {
+    await interaction.update(payload);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -51949,6 +52177,7 @@ const COMMISSIONER_CATEGORIES = [
   { value: 'setup', label: 'Channels & Roles', description: 'Configure channels and roles', emoji: '🛠️' },
   { value: 'panels', label: 'Panels', description: 'Create/refresh live boards', emoji: '🖼️' },
   { value: 'operations', label: 'Operations', description: 'Run sync, run scans, toggle auto-detection, refresh boards', emoji: '⚙️' },
+  { value: 'browse', label: 'Browse Data', description: 'Recent transactions, retirements — by team or league-wide', emoji: '🔍' },
   { value: 'league', label: 'League Settings', description: 'Season length and other league-level settings', emoji: '📋' },
 ];
 
@@ -52044,6 +52273,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     new ButtonBuilder().setCustomId('commissioner_op:announce:' + leagueId).setLabel('League Announcement').setEmoji('📣').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('commissioner_op:rules:' + leagueId).setLabel('Rules').setEmoji('📖').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('commissioner_op:autodetect_settings:' + leagueId).setLabel('Auto-Detect Settings').setEmoji('🎛️').setStyle(ButtonStyle.Secondary),
   );
   const rows = [row1, row2, row3];
   if (isStructured) {
@@ -52077,6 +52307,88 @@ async function showCommissionerOperations(interaction, leagueId) {
     ? buildMaddenAutoDetectSettingsEmbed(league, await ensureMaddenLeagueSettings(league).catch(() => ({})))
     : buildCommissionerGenericOperationsEmbed(league);
   const payload = { embeds: [embed], components: buildCommissionerOperationsComponents(leagueId, isMadden, isStructured) };
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload);
+  } else {
+    await interaction.update(payload);
+  }
+}
+
+// 7K-BR: Browse Data category — folds /maddentransactions recent/team and
+// /maddenretirements recent/season/team into the commissioner panel, reusing
+// the exact same embed builders the slash commands already call.
+
+async function getMaddenTeamNamesForLeague(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT DISTINCT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text ORDER BY team_name ASC`,
+    [String(guildId), String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  return result.rows.map(r => r.team_name).filter(Boolean);
+}
+
+function buildTeamNameSelectRows(teamNames, customIdPrefix) {
+  const rows = [];
+  for (let i = 0; i < teamNames.length && rows.length < 4; i += 25) {
+    const chunk = teamNames.slice(i, i + 25);
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`${customIdPrefix}:${rows.length}`)
+      .setPlaceholder(teamNames.length > 25 ? `Choose a team (${i + 1}-${i + chunk.length})` : 'Choose a team')
+      .addOptions(chunk.map(name => ({ label: name.slice(0, 100), value: name.slice(0, 100) })));
+    rows.push(new ActionRowBuilder().addComponents(menu));
+  }
+  return rows;
+}
+
+function buildCommissionerGenericBrowseEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle(`🔍 Browse Data • ${league.league_name}`)
+    .setColor(0x5865F2)
+    .setDescription('This league is not a Madden league, so there\'s no transaction/retirement feed to browse here.')
+    .setFooter({ text: 'GG Sports • Commissioner Panel' })
+    .setTimestamp();
+}
+
+function buildCommissionerBrowseMenuEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle(`🔍 Browse Data • ${league.league_name}`)
+    .setColor(0x5865F2)
+    .setDescription('Pick what to view. These read the same saved data as `/maddentransactions` and `/maddenretirements` — nothing here re-scans or changes anything.')
+    .setFooter({ text: 'GG Sports • Commissioner Panel' })
+    .setTimestamp();
+}
+
+const COMMISSIONER_BROWSE_OPTIONS = [
+  { value: 'txn_recent', label: 'Recent Transactions', description: 'Most recent transactions, league-wide', emoji: '🔄' },
+  { value: 'txn_team', label: 'Team Transactions', description: 'Transactions for one team', emoji: '🔄' },
+  { value: 'ret_recent', label: 'Recent Retirements', description: 'Most recently detected retirements', emoji: '📜' },
+  { value: 'ret_season', label: 'Season Retirements', description: 'All retirements saved this season', emoji: '📜' },
+  { value: 'ret_team', label: 'Team Retirements', description: 'Retirements for one team', emoji: '📜' },
+];
+
+function buildCommissionerBrowseMenuComponents(leagueId) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('commissioner_browse_select:' + leagueId)
+    .setPlaceholder('Choose what to view')
+    .addOptions(COMMISSIONER_BROWSE_OPTIONS.map(o => ({ label: o.label, value: o.value, description: o.description, emoji: o.emoji })));
+  return [new ActionRowBuilder().addComponents(menu), buildCommissionerBackRow(leagueId)];
+}
+
+function buildCommissionerBrowseBackRow(leagueId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_browse_back:' + leagueId).setLabel('⬅ Back to Browse Menu').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function showCommissionerBrowse(interaction, leagueId) {
+  const league = await getLeagueById(leagueId);
+  if (!league) {
+    await interaction.update({ content: 'League not found.', embeds: [], components: [] });
+    return;
+  }
+  const isMadden = getLeagueSportKey(league) === 'madden';
+  const payload = isMadden
+    ? { content: null, embeds: [buildCommissionerBrowseMenuEmbed(league)], components: buildCommissionerBrowseMenuComponents(leagueId) }
+    : { content: null, embeds: [buildCommissionerGenericBrowseEmbed(league)], components: [buildCommissionerBackRow(leagueId)] };
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply(payload);
   } else {
