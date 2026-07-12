@@ -37,6 +37,13 @@ const client = new Client({
   ],
 });
 
+// 7K-MON: Bot owner monitoring state.
+const BOT_STARTED_AT = new Date();
+let botOwnerUserId = process.env.BOT_OWNER_ID || null;
+let lastMaddenAutosyncTickAt = null;
+let lastTradeThreadCleanupAt = null;
+let lastTradeThreadCleanupDeleted = 0;
+
 const CLIENT_ID = process.env.CLIENT_ID || '1407760487151833200';
 const DEV_GUILD_ID = process.env.GUILD_ID || '1486545386649686068';
 const COMMAND_GUILD_IDS = (process.env.GUILD_IDS || process.env.GUILD_ID || DEV_GUILD_ID)
@@ -1081,6 +1088,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS division TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS playoff_team_count INTEGER NOT NULL DEFAULT 8`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS active_check_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS draft_recap_channel_id TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_active_checks (
       id UUID PRIMARY KEY,
@@ -1128,9 +1136,25 @@ async function initDatabase() {
       rules_text TEXT,
       schedule JSONB NOT NULL DEFAULT '[]',
       current_round INTEGER NOT NULL DEFAULT 0,
+      use_team_roster BOOLEAN NOT NULL DEFAULT FALSE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS use_team_roster BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_team_roster (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      team_role_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      position TEXT NOT NULL DEFAULT 'player',
+      added_by_user_id TEXT NOT NULL,
+      added_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (league_id, team_role_id, user_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_team_roster_user ON league_team_roster (league_id, user_id)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS playoff_brackets (
@@ -2586,6 +2610,43 @@ function buildCommands() {
         .setName('status')
         .setDescription('View the current/most recent active check')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
+
+    new SlashCommandBuilder()
+      .setName('botowner')
+      .setDescription('Bot owner only: monitoring and health')
+      .addSubcommand(sc => sc.setName('status').setDescription('Uptime, database health, memory, and background job status'))
+      .addSubcommand(sc => sc.setName('guilds').setDescription('List servers the bot is currently in')),
+
+    new SlashCommandBuilder()
+      .setName('teamroster')
+      .setDescription('Add other members to your team as a player, coach, or GM (Pro-Am/Club style)')
+      .addSubcommand(sc => sc
+        .setName('add')
+        .setDescription('Add a member to a team roster')
+        .addUserOption(o => o.setName('user').setDescription('Member to add').setRequired(true))
+        .addStringOption(o => o.setName('position').setDescription('Role on the team').setRequired(true).addChoices(
+          { name: 'Player', value: 'player' },
+          { name: 'Coach', value: 'coach' },
+          { name: 'GM (can report scores/trades like the owner)', value: 'gm' },
+        ))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
+        .addRoleOption(o => o.setName('team').setDescription('Team role (staff only — defaults to your own team)').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('remove')
+        .setDescription('Remove a member from a team roster')
+        .addUserOption(o => o.setName('user').setDescription('Member to remove').setRequired(true))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('list')
+        .setDescription('View a team roster')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
+        .addRoleOption(o => o.setName('team').setDescription('Team role (defaults to your own team)').setRequired(false))),
+
+    new SlashCommandBuilder()
+      .setName('draftrecap')
+      .setDescription('Madden: draft class recap with value-based grades')
+      .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
+      .addRoleOption(o => o.setName('team').setDescription('Team role (leave blank for a league-wide summary)').setRequired(false)),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -3265,7 +3326,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -3404,11 +3465,61 @@ async function findTeamOwnerByRoleName(guild, teamRoleName) {
   return null;
 }
 
+// 7K-ROSTER: Pro-Am/Club style team rosters — lets a team owner add other
+// members as player/coach/GM. GM is treated as functionally equivalent to
+// the owner for actions gated on "do you own this team" (score reporting,
+// trades, etc.) — player/coach are organizational only, no permission
+// change. Off by default per-league via league_custom_settings.use_team_roster.
+
+async function isTeamRosterEnabled(league) {
+  if (!league?.league_id) return false;
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  return Boolean(customSettings.use_team_roster);
+}
+
+async function getTeamRosterEntries(leagueId, teamRoleId) {
+  const result = await pool.query(
+    `SELECT * FROM league_team_roster WHERE league_id = $1 AND team_role_id = $2 ORDER BY position ASC, added_at ASC`,
+    [leagueId, teamRoleId]
+  ).catch(() => ({ rows: [] }));
+  return result.rows;
+}
+
+async function getUserGmTeamForLeague(leagueId, userId) {
+  const result = await pool.query(
+    `SELECT * FROM league_team_roster WHERE league_id = $1 AND user_id = $2 AND position = 'gm' LIMIT 1`,
+    [leagueId, userId]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
+// True if userId can act as this team's owner — either they hold the
+// Discord team role, or (if the league's roster toggle is on) they're
+// registered as that team's GM.
+async function canActForTeam(guild, league, teamRoleId, userId) {
+  if (!teamRoleId || !userId) return false;
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (member?.roles.cache.has(teamRoleId)) return true;
+  if (await isTeamRosterEnabled(league)) {
+    const gmEntry = await getUserGmTeamForLeague(league.league_id, userId);
+    if (gmEntry?.team_role_id === teamRoleId) return true;
+  }
+  return false;
+}
+
 async function getMemberTeamForLeague(member, league) {
   if (league?.league_id) {
     const teamRoles = await getLeagueTeamRoles(league.league_id);
     const match = teamRoles.find(team => member.roles.cache.has(team.role_id));
     if (match) return { roleId: match.role_id, name: match.role_name };
+
+    if (await isTeamRosterEnabled(league)) {
+      const gmEntry = await getUserGmTeamForLeague(league.league_id, member.id);
+      if (gmEntry) {
+        const gmTeam = teamRoles.find(team => team.role_id === gmEntry.team_role_id);
+        if (gmTeam) return { roleId: gmTeam.role_id, name: gmTeam.role_name };
+      }
+    }
   }
   const legacyRole = member.roles.cache.find(role => isLegacyTeamRole(role.name));
   return legacyRole ? { roleId: legacyRole.id, name: legacyRole.name } : null;
@@ -5514,6 +5625,12 @@ client.once(Events.ClientReady, async () => {
     startGGSportsInternalApiServer();
     startMaddenAutosyncLoop(client);
     console.log('Madden autosync loop started.');
+    startTradeThreadCleanupLoop(client);
+    console.log('Trade negotiation thread cleanup loop started.');
+
+    const application = await client.application?.fetch().catch(() => null);
+    if (application?.owner?.id && !botOwnerUserId) botOwnerUserId = application.owner.id;
+    console.log('Bot owner ID for /botowner commands:', botOwnerUserId || '(not set — set BOT_OWNER_ID env var, or team-owned apps need it set explicitly)');
   } catch (error) {
     console.error('Startup failed:', error);
   }
@@ -7865,6 +7982,10 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       if (choice === 'txn_recent') embed = await buildMaddenTransactionsRecentEmbed(interaction.guild.id, league, { limit: 15 });
       else if (choice === 'ret_recent') embed = await buildMaddenRetirementsEmbed(interaction.guild.id, league, { limit: 15 });
       else if (choice === 'ret_season') embed = await buildMaddenRetirementsEmbed(interaction.guild.id, league, { limit: 25, season: true });
+      else if (choice === 'draft_recap') {
+        const rookies = await getMaddenDraftClass(interaction.guild.id, league.league_id);
+        embed = buildDraftRecapEmbed(league, rookies);
+      }
       else { await showCommissionerBrowse(interaction, leagueId); return; }
 
       await interaction.editReply({ content: null, embeds: [embed], components: [buildCommissionerBrowseBackRow(leagueId)] });
@@ -8403,6 +8524,17 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_roster:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const next = !customSettings.use_team_roster;
+      await pool.query(`UPDATE league_custom_settings SET use_team_roster = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, next]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'trades', { update: true });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_conferences:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -8450,9 +8582,9 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       if (!homeRole) { await interaction.update({ content: 'That team role could not be found.', components: [] }); return; }
 
       const isStaff = await userCanUseLeagueSetup(interaction, league);
-      const requestingMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      if (!isStaff && !requestingMember?.roles.cache.has(homeRoleId)) {
-        await interaction.update({ content: 'Only staff or a member of the home team can schedule this game.', components: [] });
+      const canActAsHomeTeam = isStaff || await canActForTeam(interaction.guild, league, homeRoleId, interaction.user.id);
+      if (!canActAsHomeTeam) {
+        await interaction.update({ content: 'Only staff, the home team owner, or the home team\'s GM can schedule this game.', components: [] });
         return;
       }
 
@@ -8570,6 +8702,58 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       }
       return;
     }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_forcewin:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only staff can force a game result.', ephemeral: true });
+        return;
+      }
+      if (game.status === 'final') {
+        await interaction.reply({ content: 'This game has already been reported.', ephemeral: true });
+        return;
+      }
+
+      const pickRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('gamecenter_forcewin_pick:' + gameId + ':home').setLabel(`${game.home_team_name} wins`).setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('gamecenter_forcewin_pick:' + gameId + ':away').setLabel(`${game.away_team_name} wins`).setStyle(ButtonStyle.Success),
+      );
+      await interaction.reply({ content: 'No score, no currency payout — this just credits the win/loss to standings. Who won?', components: [pickRow], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_forcewin_pick:')) {
+      const [, gameId, winnerSide] = interaction.customId.split(':');
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.update({ content: 'Could not find that game.', components: [] }); return; }
+      const league = await getLeagueById(game.league_id);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.update({ content: 'Only staff can force a game result.', components: [] });
+        return;
+      }
+
+      await interaction.update({ content: 'Recording forced result…', components: [] });
+      const result = await forceLeagueGameResult(interaction, game, winnerSide);
+      await interaction.editReply({ content: result.message });
+
+      if (result.ok) {
+        const updatedGame = await findLeagueGameById(interaction.guild.id, gameId);
+        if (interaction.channel?.isThread?.()) {
+          const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+          const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+          await interaction.channel.send({
+            embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
+            components: buildGameCenterThreadComponents(gameId, true),
+          }).catch(() => null);
+        }
+        await updateGameCenterPanel(interaction.guild, league).catch(() => null);
+      }
+      return;
+    }
+
 
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_tradelimit_modal:')) {
       const leagueId = interaction.customId.split(':')[1];
@@ -11808,6 +11992,155 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
+      return;
+    }
+
+    if (interaction.commandName === 'botowner') {
+      if (!botOwnerUserId || interaction.user.id !== botOwnerUserId) {
+        await interaction.reply({ content: 'This command is restricted to the bot owner.', ephemeral: true });
+        return;
+      }
+      const subcommand = interaction.options.getSubcommand();
+
+      if (subcommand === 'status') {
+        await interaction.deferReply({ ephemeral: true });
+        const embed = await buildBotOwnerStatusEmbed(client);
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (subcommand === 'guilds') {
+        await interaction.deferReply({ ephemeral: true });
+        const embed = buildBotOwnerGuildsEmbed(client);
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.commandName === 'teamroster') {
+      if (!interaction.guild) return;
+      const subcommand = interaction.options.getSubcommand();
+      const rosterLeagueName = interaction.options.getString('league');
+      const rosterLeague = rosterLeagueName ? await getLeagueByName(interaction.guild.id, rosterLeagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!rosterLeague) {
+        await interaction.reply({ content: 'No active league found.', ephemeral: true });
+        return;
+      }
+
+      if (!(await isTeamRosterEnabled(rosterLeague))) {
+        await interaction.reply({ content: 'Team rosters aren\'t enabled for this league. A commissioner can turn this on in `/commissioner panel` → League Settings → League Customization.', ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'add' || subcommand === 'remove') {
+        const targetUser = interaction.options.getUser('user');
+        const teamRoleOption = interaction.options.getRole('team');
+        const isStaff = await userCanUseLeagueSetup(interaction, rosterLeague);
+
+        let teamRoleId, teamRoleName;
+        if (teamRoleOption) {
+          if (!isStaff) {
+            await interaction.reply({ content: "Only staff can manage another team's roster directly — team owners manage their own team without specifying one.", ephemeral: true });
+            return;
+          }
+          teamRoleId = teamRoleOption.id;
+          teamRoleName = teamRoleOption.name;
+        } else {
+          const requestingMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+          const ownedTeam = requestingMember ? await getMemberTeamForLeague(requestingMember, rosterLeague) : null;
+          if (!ownedTeam) {
+            await interaction.reply({ content: "You don't own a team in this league, so there's no roster for you to manage. Staff can specify a `team` option to manage one directly.", ephemeral: true });
+            return;
+          }
+          teamRoleId = ownedTeam.roleId;
+          teamRoleName = ownedTeam.name;
+        }
+
+        if (subcommand === 'add') {
+          const position = interaction.options.getString('position');
+          await pool.query(
+            `INSERT INTO league_team_roster (id, guild_id, league_id, team_role_id, user_id, position, added_by_user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (league_id, team_role_id, user_id) DO UPDATE SET position = $6, added_by_user_id = $7, added_at = NOW()`,
+            [randomUUID(), interaction.guild.id, rosterLeague.league_id, teamRoleId, targetUser.id, position, interaction.user.id]
+          );
+          const positionLabel = position === 'gm' ? 'GM' : position.charAt(0).toUpperCase() + position.slice(1);
+          const gmNote = position === 'gm' ? ' — they can now report scores and manage trades for this team, same as the owner.' : '.';
+          await interaction.reply({ content: `✅ Added <@${targetUser.id}> to **${teamRoleName}** as **${positionLabel}**${gmNote}`, ephemeral: true });
+          return;
+        }
+
+        const deleted = await pool.query(
+          `DELETE FROM league_team_roster WHERE league_id = $1 AND team_role_id = $2 AND user_id = $3 RETURNING *`,
+          [rosterLeague.league_id, teamRoleId, targetUser.id]
+        );
+        if (!deleted.rows.length) {
+          await interaction.reply({ content: `<@${targetUser.id}> wasn't on **${teamRoleName}**'s roster.`, ephemeral: true });
+          return;
+        }
+        await interaction.reply({ content: `✅ Removed <@${targetUser.id}> from **${teamRoleName}**'s roster.`, ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'list') {
+        const teamRoleOption = interaction.options.getRole('team');
+        let teamRoleId, teamRoleName;
+        if (teamRoleOption) {
+          teamRoleId = teamRoleOption.id;
+          teamRoleName = teamRoleOption.name;
+        } else {
+          const requestingMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+          const ownedTeam = requestingMember ? await getMemberTeamForLeague(requestingMember, rosterLeague) : null;
+          if (!ownedTeam) {
+            await interaction.reply({ content: 'Specify a `team` to view, or run this as a team owner/GM to see your own roster.', ephemeral: true });
+            return;
+          }
+          teamRoleId = ownedTeam.roleId;
+          teamRoleName = ownedTeam.name;
+        }
+
+        const entries = await getTeamRosterEntries(rosterLeague.league_id, teamRoleId);
+        const owner = await findTeamOwnerByRoleId(interaction.guild, teamRoleId);
+        const NL = String.fromCharCode(10);
+        const lines = [
+          owner ? `👑 Owner: <@${owner.id}>` : '👑 Owner: Unassigned',
+          ...entries.map(e => {
+            const label = e.position === 'gm' ? '🧢 GM' : e.position === 'coach' ? '📋 Coach' : '🎮 Player';
+            return `${label}: <@${e.user_id}>`;
+          }),
+        ];
+        const rosterEmbed = new EmbedBuilder()
+          .setTitle(`${teamRoleName} Roster`)
+          .setColor(0x5865F2)
+          .setDescription(lines.join(NL))
+          .setFooter({ text: `GG Sports • ${rosterLeague.league_name}` })
+          .setTimestamp();
+        await interaction.reply({ embeds: [rosterEmbed], ephemeral: true });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.commandName === 'draftrecap') {
+      if (!interaction.guild) return;
+      const recapLeagueName = interaction.options.getString('league');
+      const recapLeague = recapLeagueName ? await getLeagueByName(interaction.guild.id, recapLeagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!recapLeague) {
+        await interaction.reply({ content: 'No active league found.', ephemeral: true });
+        return;
+      }
+      if (getLeagueSportKey(recapLeague) !== 'madden') {
+        await interaction.reply({ content: 'Draft Recap is only available for Madden leagues — it reads draft round/pick from synced EA data.', ephemeral: true });
+        return;
+      }
+      const teamRole = interaction.options.getRole('team');
+      await interaction.deferReply();
+      const rookies = await getMaddenDraftClass(interaction.guild.id, recapLeague.league_id, teamRole?.name || null);
+      const embed = buildDraftRecapEmbed(recapLeague, rookies, teamRole?.name || null);
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 
@@ -20869,6 +21202,74 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore) {
   };
 }
 
+async function forceLeagueGameResult(interaction, game, winnerSide) {
+  const activeLeague = await getLeagueById(game.league_id);
+  if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
+
+  if (game.status === 'final') {
+    return { ok: false, message: 'This game has already been reported. Reset it first if you need to change the result.' };
+  }
+
+  const winnerRoleId = winnerSide === 'home' ? game.home_team_role_id : game.away_team_role_id;
+  const winnerName = winnerSide === 'home' ? game.home_team_name : game.away_team_name;
+  const loserRoleId = winnerSide === 'home' ? game.away_team_role_id : game.home_team_role_id;
+  const loserName = winnerSide === 'home' ? game.away_team_name : game.home_team_name;
+
+  await pool.query(
+    `UPDATE league_games
+     SET status = 'final', home_score = NULL, away_score = NULL, winner_team_role_id = $1, reported_by_user_id = $2, updated_at = NOW()
+     WHERE id = $3`,
+    [winnerRoleId, interaction.user.id, game.id]
+  );
+
+  const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+  const winnerStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 1, 0, 0, customSettings);
+  const loserStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 0, 1, 0, customSettings);
+  const { conference: winnerConf, division: winnerDiv } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, winnerName).catch(() => ({ conference: null, division: null }));
+  const { conference: loserConf, division: loserDiv } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, loserName).catch(() => ({ conference: null, division: null }));
+
+  // Deliberately no points_for/points_against change — there's no real score
+  // to attribute, and adding zeros either way would still skew games-played
+  // math elsewhere, so both sides get exactly a win/loss and nothing more.
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, standings_points, conference, division)
+     VALUES ($1, $2, $3, $4, 1, 0, 0, $5, $6, $7)
+     ON CONFLICT (guild_id, league_id, team_role_id)
+     DO UPDATE SET wins = league_standings.wins + 1,
+                   standings_points = league_standings.standings_points + $5,
+                   conference = $6, division = $7, updated_at = NOW()`,
+    [interaction.guild.id, game.league_id, winnerRoleId, winnerName, winnerStandingsPoints, winnerConf, winnerDiv]
+  );
+  await pool.query(
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, standings_points, conference, division)
+     VALUES ($1, $2, $3, $4, 0, 1, 0, $5, $6, $7)
+     ON CONFLICT (guild_id, league_id, team_role_id)
+     DO UPDATE SET losses = league_standings.losses + 1,
+                   standings_points = league_standings.standings_points + $5,
+                   conference = $6, division = $7, updated_at = NOW()`,
+    [interaction.guild.id, game.league_id, loserRoleId, loserName, loserStandingsPoints, loserConf, loserDiv]
+  );
+
+  if (typeof updateStandingsPanel === 'function') {
+    await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
+  }
+
+  // No currency payout here on purpose — a forced win means no game was
+  // actually played (forfeit/no-show/dispute), so there's nothing to reward.
+  const sportsbookSettlement = await autoSettleSportsbookForLeagueGame(interaction, game, winnerSide).catch(error => {
+    console.error('Auto sportsbook settlement (forced win) failed:', error);
+    return null;
+  });
+  const sportsbookText = sportsbookSettlement
+    ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets.'
+    : '';
+
+  return {
+    ok: true,
+    message: `🔨 Forced win recorded: **${winnerName}** over ${loserName}. No score, no currency payout — standings updated.${sportsbookText}`,
+  };
+}
+
 async function resetLeagueGameCore(interaction, game, reason = 'Game reset') {
   const activeLeague = await getLeagueById(game.league_id);
   if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
@@ -21028,7 +21429,10 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
     );
   const scheduleText = [game.week_label, game.scheduled_for].filter(Boolean).join(' • ');
   if (scheduleText) embed.addFields({ name: 'Scheduled', value: scheduleText, inline: true });
-  if (game.status === 'final') {
+  if (game.status === 'final' && game.home_score === null && game.away_score === null) {
+    const winnerName = game.winner_team_role_id === game.home_team_role_id ? game.home_team_name : game.away_team_name;
+    embed.addFields({ name: 'Result', value: `🔨 Forced win: **${winnerName}** (no score reported)`, inline: false });
+  } else if (game.status === 'final') {
     embed.addFields({ name: 'Final Score', value: `${game.home_team_name} ${game.home_score} - ${game.away_score} ${game.away_team_name}`, inline: false });
   } else {
     embed.setDescription('When the game is finished, either team can report the score below.');
@@ -21038,10 +21442,15 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
 }
 
 function buildGameCenterThreadComponents(gameId, isFinal) {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
-    new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
-  )];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
+      new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
+    ),
+  ];
 }
 
 async function createGameCenterThread(interaction, league, game) {
@@ -23328,6 +23737,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
   { value: 'game_center_channel', label: 'Game Center Channel', description: 'For open-schedule leagues: Add Game panel that opens a private matchup thread per game', kind: 'channel' },
   { value: 'active_check_channel', label: 'Active Check Channel', description: 'Where Active Check posts go by default', kind: 'channel' },
+  { value: 'draft_recap_channel', label: 'Draft Recap Channel', description: 'Madden: auto-posts here when the league advances past the draft', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
@@ -23390,6 +23800,7 @@ function setupDashboardColumn(settingKey) {
     game_thread_channel: 'game_threads_channel_id',
     game_center_channel: 'game_center_channel_id',
     active_check_channel: 'active_check_channel_id',
+    draft_recap_channel: 'draft_recap_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
     madden_power_rankings_channel: 'madden_power_rankings_channel_id',
@@ -23448,6 +23859,7 @@ function buildSetupDashboardEmbed(league) {
     ['game_thread_channel', 'Game Threads'],
     ['game_center_channel', 'Game Center'],
     ['active_check_channel', 'Active Check'],
+    ['draft_recap_channel', 'Draft Recap'],
     ['madden_news_channel', 'Madden News'],
     ['madden_standings_channel', 'Madden Standings Board'],
     ['madden_power_rankings_channel', 'Madden Power Rankings Board'],
@@ -28578,6 +28990,26 @@ async function getMaddenTeamOwnedByUser(guildId, leagueId, userId) {
           return { team_name: roleRow.role_name, team_role_id: roleRow.role_id };
         }
       }
+    }
+  }
+
+  // GM roster fallback: if this league has team rosters enabled and this
+  // user is registered as a team's GM, treat that the same as owning the
+  // team (even if they don't hold the Discord role).
+  const league = await getLeagueById(leagueId).catch(() => null);
+  if (league && await isTeamRosterEnabled(league)) {
+    const gmEntry = await getUserGmTeamForLeague(leagueId, String(userId));
+    if (gmEntry) {
+      const gmTeamResult = await pool.query(
+        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3 LIMIT 1`,
+        [String(guildId), String(leagueId), gmEntry.team_role_id]
+      ).catch(() => ({ rows: [] }));
+      if (gmTeamResult.rows?.[0]) return gmTeamResult.rows[0];
+      const gmRoleResult = await pool.query(
+        `SELECT role_id, role_name FROM league_team_roles WHERE league_id::text = $1::text AND role_id = $2 LIMIT 1`,
+        [String(leagueId), gmEntry.team_role_id]
+      ).catch(() => ({ rows: [] }));
+      if (gmRoleResult.rows?.[0]) return { team_name: gmRoleResult.rows[0].role_name, team_role_id: gmRoleResult.rows[0].role_id };
     }
   }
 
@@ -35944,6 +36376,148 @@ function maddenRetirementYearsPro(row = {}) {
     if (Number.isFinite(n) && n >= 0) return Math.round(n);
   }
   return null;
+}
+
+// 7K-DRAFT: Draft Recap with Grades — Madden leagues only, since this needs
+// the draftRound/draftPick fields EA includes in the raw player payload.
+// There's no explicit "draft year" field per player, so a rookie's draft
+// class is identified as yearsPro === 0 with a valid draft slot (same
+// definition already used by the auto-detection transaction scanner).
+
+function extractMaddenDraftInfo(row) {
+  const raw = maddenBydRaw(row.raw_payload || row.attributes || {});
+  const rawDraftRound = raw.draftRound ?? raw.draft_round ?? raw.draftingRound ?? null;
+  const rawDraftPick = raw.draftPick ?? raw.draft_pick ?? raw.draftingPick ?? null;
+  // EA offsets round/pick by +1 — same correction used by the transaction scanner.
+  const draftRound = rawDraftRound != null && Number.isFinite(Number(rawDraftRound)) && Number(rawDraftRound) > 0 ? Number(rawDraftRound) - 1 : null;
+  const draftPick = rawDraftPick != null && Number.isFinite(Number(rawDraftPick)) && Number(rawDraftPick) > 0 ? Number(rawDraftPick) - 1 : null;
+  return { draftRound, draftPick };
+}
+
+// Rough baseline overall a rookie "should" have coming in at each round —
+// there's no external scouting-grade data to grade against, so grades are
+// value-based: how much a pick's actual overall beats or misses the
+// baseline for where they were drafted. These baselines are an approximation
+// (Madden's own rookie generation trends lower by round in a similar shape),
+// not official EA data.
+const MADDEN_DRAFT_ROUND_BASELINE_OVERALL = { 1: 74, 2: 70, 3: 67, 4: 64, 5: 61, 6: 59, 7: 57 };
+function expectedMaddenOverallForRound(round) {
+  if (MADDEN_DRAFT_ROUND_BASELINE_OVERALL[round]) return MADDEN_DRAFT_ROUND_BASELINE_OVERALL[round];
+  return Math.max(50, 57 - (round - 7) * 2);
+}
+
+const DRAFT_GRADE_POINTS = { 'A+': 4.3, 'A': 4.0, 'B+': 3.3, 'B': 3.0, 'C': 2.0, 'D': 1.0, 'F': 0.0 };
+function gradeForValueDelta(delta) {
+  if (delta >= 8) return 'A+';
+  if (delta >= 4) return 'A';
+  if (delta >= 1) return 'B+';
+  if (delta >= -2) return 'B';
+  if (delta >= -5) return 'C';
+  if (delta >= -8) return 'D';
+  return 'F';
+}
+
+function gradeMaddenDraftPick(overall, round) {
+  const expected = expectedMaddenOverallForRound(round);
+  const delta = Number(overall || 0) - expected;
+  return { expected, delta, grade: gradeForValueDelta(delta) };
+}
+
+function averageDraftGrade(grades) {
+  if (!grades.length) return 'N/A';
+  const avgPoints = grades.reduce((sum, g) => sum + (DRAFT_GRADE_POINTS[g] ?? 2), 0) / grades.length;
+  let closest = 'F';
+  let closestDiff = Infinity;
+  for (const [letter, points] of Object.entries(DRAFT_GRADE_POINTS)) {
+    const diff = Math.abs(points - avgPoints);
+    if (diff < closestDiff) { closestDiff = diff; closest = letter; }
+  }
+  return closest;
+}
+
+async function getMaddenDraftClass(guildId, leagueId, teamName = null) {
+  const result = await pool.query(
+    teamName
+      ? `SELECT * FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(team_name) = LOWER($3)`
+      : `SELECT * FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text`,
+    teamName ? [guildId, String(leagueId), teamName] : [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+
+  const rookies = [];
+  for (const row of result.rows) {
+    const yearsPro = maddenRetirementYearsPro(row);
+    if (yearsPro !== 0) continue;
+    const { draftRound, draftPick } = extractMaddenDraftInfo(row);
+    if (draftRound === null || draftRound < 1) continue;
+    const { expected, delta, grade } = gradeMaddenDraftPick(row.overall, draftRound);
+    rookies.push({
+      player_name: row.full_name || `${row.first_name || ''} ${row.last_name || ''}`.trim() || 'Unknown Player',
+      team_name: row.team_name,
+      position: row.position,
+      overall: row.overall,
+      draft_round: draftRound,
+      draft_pick: draftPick,
+      expected_overall: expected,
+      value_delta: delta,
+      grade,
+    });
+  }
+  rookies.sort((a, b) => (a.draft_round - b.draft_round) || ((a.draft_pick ?? 0) - (b.draft_pick ?? 0)));
+  return rookies;
+}
+
+function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Draft Recap • Grades are value-based (overall vs. typical for that draft slot), not official EA data' })
+    .setTimestamp();
+
+  if (!rookies.length) {
+    embed.setTitle(`📋 Draft Recap • ${league.league_name}${teamFilter ? ' • ' + teamFilter : ''}`);
+    embed.setDescription('No drafted rookies found for this league yet — run `/madden sync` after your draft completes.');
+    return embed;
+  }
+
+  if (teamFilter) {
+    embed.setTitle(`📋 Draft Recap • ${teamFilter}`);
+    const teamGrade = averageDraftGrade(rookies.map(r => r.grade));
+    embed.setDescription(`**Team Draft Grade: ${teamGrade}** (${rookies.length} pick${rookies.length === 1 ? '' : 's'})`);
+    embed.addFields(rookies.slice(0, 25).map(r => ({
+      name: `Rd ${r.draft_round}, Pk ${r.draft_pick ?? '?'} — ${r.player_name}`,
+      value: `${r.position || '?'} • OVR ${r.overall ?? '?'} (expected ~${r.expected_overall}) • **Grade: ${r.grade}**`,
+      inline: false,
+    })));
+    return embed;
+  }
+
+  embed.setTitle(`📋 Draft Recap • ${league.league_name}`);
+  const byTeam = new Map();
+  for (const r of rookies) {
+    const key = r.team_name || 'Unknown Team';
+    if (!byTeam.has(key)) byTeam.set(key, []);
+    byTeam.get(key).push(r);
+  }
+  const teamSummaries = [...byTeam.entries()]
+    .map(([team, picks]) => ({ team, picks, grade: averageDraftGrade(picks.map(p => p.grade)) }))
+    .sort((a, b) => (DRAFT_GRADE_POINTS[b.grade] ?? 0) - (DRAFT_GRADE_POINTS[a.grade] ?? 0));
+
+  const bestValue = [...rookies].sort((a, b) => b.value_delta - a.value_delta)[0];
+  const worstValue = [...rookies].sort((a, b) => a.value_delta - b.value_delta)[0];
+
+  embed.setDescription(
+    `${rookies.length} rookies drafted across ${byTeam.size} teams.` + NL + NL +
+    (bestValue ? `🏆 **Steal of the Draft:** ${bestValue.player_name} (${bestValue.team_name}) — Rd ${bestValue.draft_round} Pk ${bestValue.draft_pick ?? '?'}, OVR ${bestValue.overall}, Grade **${bestValue.grade}**` + NL : '') +
+    (worstValue ? `📉 **Biggest Reach:** ${worstValue.player_name} (${worstValue.team_name}) — Rd ${worstValue.draft_round} Pk ${worstValue.draft_pick ?? '?'}, OVR ${worstValue.overall}, Grade **${worstValue.grade}**` : '')
+  );
+
+  embed.addFields(teamSummaries.slice(0, 25).map(t => ({
+    name: `${t.team} — Grade: ${t.grade}`,
+    value: `${t.picks.length} pick${t.picks.length === 1 ? '' : 's'}`,
+    inline: true,
+  })));
+
+  return embed;
 }
 
 function isLikelyMaddenRetirementCandidate(row = {}) {
@@ -51307,6 +51881,8 @@ async function runDueMaddenAutosyncs(client) {
        LIMIT 10`
     );
 
+    lastMaddenAutosyncTickAt = new Date();
+
     for (const row of due.rows) {
       const guildId = row.guild_id || row.league_guild_id;
       const guild = await client.guilds.fetch(guildId).catch(() => null);
@@ -51350,6 +51926,145 @@ function startMaddenAutosyncLoop(client) {
     runDueMaddenAutosyncs(client).catch(error => console.error('Madden autosync tick failed:', error));
   }, 60 * 1000);
   setTimeout(() => runDueMaddenAutosyncs(client).catch(() => null), 10 * 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Trade negotiation thread cleanup — deletes negotiation threads that have
+// had no real Discord activity for a few days. Checks actual message
+// timestamps rather than the negotiation row's updated_at, since a thread
+// can have live chat happening in it without ever touching that row.
+// ---------------------------------------------------------------------------
+const TRADE_THREAD_INACTIVITY_DAYS = 3;
+let tradeThreadCleanupTimer = null;
+let tradeThreadCleanupRunning = false;
+
+async function cleanupInactiveTradeNegotiationThreads(client) {
+  if (tradeThreadCleanupRunning) return;
+  tradeThreadCleanupRunning = true;
+  try {
+    const result = await pool.query(
+      `SELECT id, guild_id, thread_id, player_name FROM madden_trade_negotiations WHERE thread_id IS NOT NULL`
+    ).catch(() => ({ rows: [] }));
+
+    const cutoffMs = TRADE_THREAD_INACTIVITY_DAYS * 24 * 60 * 60 * 1000;
+    let deletedCount = 0;
+
+    for (const row of result.rows) {
+      const guild = client.guilds.cache.get(row.guild_id);
+      if (!guild) continue;
+
+      const thread = await guild.channels.fetch(row.thread_id).catch(() => null);
+      if (!thread || !thread.isThread?.()) {
+        // Thread already gone (deleted manually, etc.) — clear the stale reference so we stop checking it.
+        await pool.query(`UPDATE madden_trade_negotiations SET thread_id = NULL WHERE id = $1`, [row.id]).catch(() => null);
+        continue;
+      }
+
+      const recentMessages = await thread.messages.fetch({ limit: 1 }).catch(() => null);
+      const lastMessage = recentMessages?.first();
+      const lastActivityMs = lastMessage?.createdTimestamp || thread.createdTimestamp || Date.now();
+
+      if (Date.now() - lastActivityMs > cutoffMs) {
+        await thread.delete(`GG Sports: inactive trade negotiation thread (${TRADE_THREAD_INACTIVITY_DAYS}+ days no activity)`).catch(() => null);
+        await pool.query(`UPDATE madden_trade_negotiations SET thread_id = NULL WHERE id = $1`, [row.id]).catch(() => null);
+        console.log(`[TRADE THREAD CLEANUP] Deleted inactive thread for ${row.player_name} (guild ${row.guild_id})`);
+        deletedCount += 1;
+      }
+    }
+    lastTradeThreadCleanupAt = new Date();
+    lastTradeThreadCleanupDeleted = deletedCount;
+  } catch (error) {
+    console.error('Trade negotiation thread cleanup failed:', error);
+  } finally {
+    tradeThreadCleanupRunning = false;
+  }
+}
+
+function startTradeThreadCleanupLoop(client) {
+  if (tradeThreadCleanupTimer) clearInterval(tradeThreadCleanupTimer);
+  tradeThreadCleanupTimer = setInterval(() => {
+    cleanupInactiveTradeNegotiationThreads(client).catch(error => console.error('Trade thread cleanup tick failed:', error));
+  }, 6 * 60 * 60 * 1000); // Every 6 hours — this is housekeeping, not time-sensitive.
+  setTimeout(() => cleanupInactiveTradeNegotiationThreads(client).catch(() => null), 60 * 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Bot owner monitoring — /botowner, restricted to botOwnerUserId.
+// ---------------------------------------------------------------------------
+
+function formatDurationMs(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  if (!days && !hours) parts.push(`${seconds}s`);
+  return parts.join(' ') || '0s';
+}
+
+async function buildBotOwnerStatusEmbed(client) {
+  const uptimeMs = Date.now() - BOT_STARTED_AT.getTime();
+  const mem = process.memoryUsage();
+  const formatMb = (bytes) => (bytes / 1024 / 1024).toFixed(1) + ' MB';
+
+  let dbStatus = '❌ Unreachable';
+  let dbHealthy = false;
+  try {
+    const dbStart = Date.now();
+    await pool.query('SELECT 1');
+    dbHealthy = true;
+    dbStatus = `✅ Connected (${Date.now() - dbStart}ms)`;
+  } catch (error) {
+    dbStatus = `❌ Unreachable: ${error?.message || 'Unknown error'}`;
+  }
+
+  const [leagueCountResult, guildCountResult] = await Promise.all([
+    pool.query(`SELECT COUNT(*)::int AS count FROM leagues WHERE is_active = TRUE`).catch(() => ({ rows: [{ count: 0 }] })),
+    pool.query(`SELECT COUNT(*)::int AS count FROM guilds`).catch(() => ({ rows: [{ count: 0 }] })),
+  ]);
+
+  const startedUnix = Math.floor(BOT_STARTED_AT.getTime() / 1000);
+  const autosyncText = lastMaddenAutosyncTickAt
+    ? `<t:${Math.floor(lastMaddenAutosyncTickAt.getTime() / 1000)}:R>`
+    : 'Not run yet';
+  const cleanupText = lastTradeThreadCleanupAt
+    ? `<t:${Math.floor(lastTradeThreadCleanupAt.getTime() / 1000)}:R> (${lastTradeThreadCleanupDeleted} deleted last run)`
+    : 'Not run yet';
+
+  return new EmbedBuilder()
+    .setTitle('🩺 GG Sports Bot Status')
+    .setColor(dbHealthy ? 0x57F287 : 0xED4245)
+    .addFields(
+      { name: 'Uptime', value: `${formatDurationMs(uptimeMs)}\nStarted <t:${startedUnix}:R>`, inline: true },
+      { name: 'Discord Latency', value: `${Math.round(client.ws.ping)}ms`, inline: true },
+      { name: 'Database', value: dbStatus, inline: true },
+      { name: 'Memory (RSS)', value: formatMb(mem.rss), inline: true },
+      { name: 'Memory (Heap)', value: `${formatMb(mem.heapUsed)} / ${formatMb(mem.heapTotal)}`, inline: true },
+      { name: 'Node Version', value: process.version, inline: true },
+      { name: 'Servers (live)', value: String(client.guilds.cache.size), inline: true },
+      { name: 'Servers (DB)', value: String(guildCountResult.rows[0]?.count || 0), inline: true },
+      { name: 'Active Leagues', value: String(leagueCountResult.rows[0]?.count || 0), inline: true },
+      { name: 'Last Madden Autosync Tick', value: autosyncText, inline: true },
+      { name: 'Last Trade Thread Cleanup', value: cleanupText, inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Owner Monitoring' })
+    .setTimestamp();
+}
+
+function buildBotOwnerGuildsEmbed(client) {
+  const NL = String.fromCharCode(10);
+  const guilds = [...client.guilds.cache.values()].sort((a, b) => b.memberCount - a.memberCount).slice(0, 40);
+  const lines = guilds.map(g => `**${g.name}** — ${g.memberCount} members (\`${g.id}\`)`);
+  return new EmbedBuilder()
+    .setTitle(`🌐 Servers (${client.guilds.cache.size} total)`)
+    .setColor(0x5865F2)
+    .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'No servers.')
+    .setFooter({ text: 'GG Sports • Owner Monitoring' + (client.guilds.cache.size > 40 ? ' • showing top 40 by member count' : '') })
+    .setTimestamp();
 }
 
 
@@ -52712,6 +53427,25 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
     }
   }
 
+  // 4. Post Draft Recap — the draft happens during preseason, so the
+  // preseason → regular season transition is the reliable signal that it's
+  // over. Falls back to the news channel if no dedicated Draft Recap
+  // channel is configured, same fallback pattern as the announcement above.
+  const draftRecapChannelId = league.draft_recap_channel_id || newsChannelId;
+  if (draftRecapChannelId) {
+    const draftRecapChannel = await guild.channels.fetch(draftRecapChannelId).catch(() => null);
+    if (draftRecapChannel?.isTextBased?.()) {
+      const rookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
+      if (rookies.length) {
+        await draftRecapChannel.send({ embeds: [buildDraftRecapEmbed(league, rookies)] }).catch(err => {
+          console.error('[SEASON TRANSITION] Draft recap post failed:', err?.message);
+        });
+      } else {
+        console.log('[SEASON TRANSITION] No rookies found for draft recap — skipping post.');
+      }
+    }
+  }
+
   console.log('[SEASON TRANSITION] Complete — regular season is live.');
 }
 
@@ -53071,6 +53805,7 @@ const COMMISSIONER_BROWSE_OPTIONS = [
   { value: 'ret_recent', label: 'Recent Retirements', description: 'Most recently detected retirements', emoji: '📜' },
   { value: 'ret_season', label: 'Season Retirements', description: 'All retirements saved this season', emoji: '📜' },
   { value: 'ret_team', label: 'Team Retirements', description: 'Retirements for one team', emoji: '📜' },
+  { value: 'draft_recap', label: 'Draft Recap', description: 'League-wide draft grades (use /draftrecap team: for one team)', emoji: '📋' },
 ];
 
 function buildCommissionerBrowseMenuComponents(leagueId) {
@@ -53252,6 +53987,7 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       .addFields(
         { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
         { name: 'Trade Limit Per Season', value: customSettings.trade_limit_per_season ? `${customSettings.trade_limit_per_season} trades` : 'Unlimited', inline: true },
+        { name: 'Team Rosters (Pro-Am/Club)', value: customSettings.use_team_roster ? 'On — owners can add players/coaches/GMs' : 'Off', inline: true },
       )
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
@@ -53259,6 +53995,7 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('leaguecustom_toggle_cpu:' + leagueId).setLabel(customSettings.cpu_trades_allowed === false ? 'Allow CPU Trades' : 'Disallow CPU Trades').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('leaguecustom_tradelimit_modal:' + leagueId).setLabel('Edit Trade Limit').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_roster:' + leagueId).setLabel(customSettings.use_team_roster ? 'Disable Team Rosters' : 'Enable Team Rosters').setStyle(ButtonStyle.Secondary),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
