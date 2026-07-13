@@ -1733,8 +1733,39 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfillment_note TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS fulfilled_by_user_id TEXT`);
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+  // Marketplace: achievement/award items are bound to the winner and can never be listed —
+  // preserves the "owning this proves you won it" signal. Nothing sets this TRUE yet (the
+  // achievement auto-mint pipeline is separate future work), but the flag and the enforcement
+  // check both need to exist now so there's no gap once that pipeline lands.
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS is_trade_locked BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS description TEXT`);
   await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS tier TEXT`);
+
+  // Marketplace — fixed-price resale of owned inventory items. Ownership itself lives on
+  // user_inventory (reassigning inventory_id.user_id IS the sale); this table is just the
+  // listing/offer records. origin_guild_id is where the /marketplace list command was run
+  // from — metadata only, the listing pool itself is global (any user, any server, per the
+  // Universal Marketplace design decision).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS marketplace_listings (
+      id UUID PRIMARY KEY,
+      inventory_id UUID NOT NULL REFERENCES user_inventory(id) ON DELETE CASCADE,
+      seller_user_id TEXT NOT NULL,
+      item_id UUID REFERENCES shop_items(id) ON DELETE SET NULL,
+      item_name TEXT NOT NULL,
+      asking_price INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      origin_guild_id TEXT NOT NULL,
+      buyer_user_id TEXT,
+      sale_price INTEGER,
+      fee_amount INTEGER,
+      listed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      sold_at TIMESTAMP,
+      cancelled_at TIMESTAMP
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS marketplace_listings_status_idx ON marketplace_listings (status)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS marketplace_listings_seller_idx ON marketplace_listings (seller_user_id)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_avatar (
@@ -2664,6 +2695,19 @@ function buildCommands() {
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false))),
+
+    new SlashCommandBuilder()
+      .setName('marketplace')
+      .setDescription('Buy and sell owned items with other users (global, across every server)')
+      .addSubcommand(sc => sc
+        .setName('list')
+        .setDescription('List an owned item for sale')
+        .addStringOption(o => o.setName('item').setDescription('Inventory item name or short ID').setRequired(true))
+        .addIntegerOption(o => o.setName('price').setDescription('Asking price').setRequired(true)))
+      .addSubcommand(sc => sc.setName('browse').setDescription('Browse active marketplace listings'))
+      .addSubcommand(sc => sc.setName('buy').setDescription('Buy a listing').addStringOption(o => o.setName('listing').setDescription('Listing name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('cancel').setDescription('Cancel one of your active listings').addStringOption(o => o.setName('listing').setDescription('Listing name or short ID').setRequired(true)))
+      .addSubcommand(sc => sc.setName('mylistings').setDescription('View your own marketplace listings')),
 
     new SlashCommandBuilder()
       .setName('tournament')
@@ -4907,14 +4951,17 @@ function buildTransactionsEmbed(settings, title, rows) {
   return embed;
 }
 
+// guildId is kept as a parameter purely for call-site compatibility — ownership is global
+// per user (Universal Avatar/Marketplace decision), not scoped to the guild the command
+// was run from.
 async function findInventoryItem(guildId, userId, itemInput) {
   const result = await pool.query(
     `SELECT * FROM user_inventory
-     WHERE guild_id = $1 AND user_id = $2
-       AND (LOWER(item_name) = LOWER($3) OR id::text LIKE $4)
+     WHERE user_id = $1
+       AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3)
      ORDER BY purchased_at DESC
      LIMIT 1`,
-    [guildId, userId, itemInput, `${itemInput}%`]
+    [userId, itemInput, `${itemInput}%`]
   );
   return result.rows[0] || null;
 }
@@ -15571,10 +15618,10 @@ if (shopSubcommand === 'view') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const result = await pool.query(
           `SELECT * FROM user_inventory
-           WHERE guild_id = $1 AND user_id = $2
+           WHERE user_id = $1
            ORDER BY purchased_at DESC
            LIMIT 50`,
-          [interaction.guild.id, targetUser.id]
+          [targetUser.id]
         );
 
         const NL = String.fromCharCode(10);
@@ -15617,10 +15664,10 @@ if (shopSubcommand === 'view') {
         const note = interaction.options.getString('note') || null;
         const result = await pool.query(
           `SELECT * FROM user_inventory
-           WHERE guild_id = $1 AND user_id = $2 AND (id::text LIKE $3 OR LOWER(item_name) = LOWER($4))
+           WHERE user_id = $1 AND (id::text LIKE $2 OR LOWER(item_name) = LOWER($3))
            ORDER BY purchased_at DESC
            LIMIT 1`,
-          [interaction.guild.id, interaction.user.id, itemInput + '%', itemInput]
+          [interaction.user.id, itemInput + '%', itemInput]
         );
 
         if (!result.rows.length) {
@@ -15659,10 +15706,10 @@ if (shopSubcommand === 'view') {
 
         const result = await pool.query(
           `SELECT * FROM user_inventory
-           WHERE guild_id = $1 AND user_id = $2 AND (id::text LIKE $3 OR LOWER(item_name) = LOWER($4))
+           WHERE user_id = $1 AND (id::text LIKE $2 OR LOWER(item_name) = LOWER($3))
            ORDER BY purchased_at DESC
            LIMIT 1`,
-          [interaction.guild.id, targetUser.id, itemInput + '%', itemInput]
+          [targetUser.id, itemInput + '%', itemInput]
         );
 
         if (!result.rows.length) {
@@ -15681,6 +15728,227 @@ if (shopSubcommand === 'view') {
         await interaction.reply({ content: 'Updated **' + inventoryItem.item_name + '** for ' + targetUser.toString() + ' to **' + status + '**.', ephemeral: true });
         return;
       }
+    }
+
+    if (interaction.commandName === 'marketplace') {
+      if (!interaction.guild) return;
+      const subcommand = interaction.options.getSubcommand();
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (subcommand === 'list') {
+        const itemInput = interaction.options.getString('item');
+        const askingPrice = interaction.options.getInteger('price');
+
+        if (!Number.isInteger(askingPrice) || askingPrice <= 0) {
+          await interaction.reply({ content: 'Price must be a positive whole number.', ephemeral: true });
+          return;
+        }
+
+        const item = await findInventoryItem(interaction.guild.id, interaction.user.id, itemInput);
+        if (!item) {
+          await interaction.reply({ content: 'Could not find that item in your inventory. Use /shop inventory to see your item IDs.', ephemeral: true });
+          return;
+        }
+
+        if (item.is_trade_locked) {
+          await interaction.reply({ content: `**${item.item_name}** is trade-locked (an achievement/award item) and cannot be listed on the marketplace.`, ephemeral: true });
+          return;
+        }
+
+        const alreadyListed = await pool.query(
+          `SELECT 1 FROM marketplace_listings WHERE inventory_id = $1 AND status = 'active' LIMIT 1`,
+          [item.id]
+        );
+        if (alreadyListed.rows.length) {
+          await interaction.reply({ content: `**${item.item_name}** already has an active listing. Cancel it first if you want to re-list at a different price.`, ephemeral: true });
+          return;
+        }
+
+        const activeCountResult = await pool.query(
+          `SELECT COUNT(*)::int AS count FROM marketplace_listings WHERE seller_user_id = $1 AND status = 'active'`,
+          [interaction.user.id]
+        );
+        if ((activeCountResult.rows[0]?.count || 0) >= MARKETPLACE_LISTING_CAP) {
+          await interaction.reply({ content: `You already have ${MARKETPLACE_LISTING_CAP} active listings, the max allowed. Cancel one with /marketplace cancel before listing another.`, ephemeral: true });
+          return;
+        }
+
+        const priceFloor = await getMarketplacePriceFloor(item.item_id);
+        if (priceFloor > 0 && askingPrice < priceFloor) {
+          await interaction.reply({ content: `Asking price must be at least **${settings.currency_icon} ${priceFloor}** (50% of this item's current shop price).`, ephemeral: true });
+          return;
+        }
+
+        const listingId = randomUUID();
+        await pool.query(
+          `INSERT INTO marketplace_listings (id, inventory_id, seller_user_id, item_id, item_name, asking_price, origin_guild_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [listingId, item.id, interaction.user.id, item.item_id, item.item_name, askingPrice, interaction.guild.id]
+        );
+
+        await interaction.reply({
+          content: `Listed **${item.item_name}** for **${settings.currency_icon} ${askingPrice}**. Listing ID: \`${shortListingId(listingId)}\`. Anyone on any server can now buy it.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (subcommand === 'browse') {
+        const payload = await buildMarketplaceBrowsePayload(settings, 0);
+        await interaction.reply({ ...payload, ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'buy') {
+        const listingInput = interaction.options.getString('listing');
+        const listing = await findMarketplaceListing(listingInput, { activeOnly: true });
+        if (!listing) {
+          await interaction.reply({ content: 'Could not find an active listing matching that.', ephemeral: true });
+          return;
+        }
+
+        if (listing.seller_user_id === interaction.user.id) {
+          await interaction.reply({ content: 'You cannot buy your own listing — cancel it instead with /marketplace cancel.', ephemeral: true });
+          return;
+        }
+
+        const buyerBalance = await getBalance(interaction.guild.id, interaction.user.id);
+        if (Number(buyerBalance.balance) < listing.asking_price) {
+          await interaction.reply({ content: `You do not have enough ${settings.currency_name} to buy **${listing.item_name}** for ${settings.currency_icon} ${listing.asking_price}.`, ephemeral: true });
+          return;
+        }
+
+        const client = await pool.connect();
+        let outcome;
+        try {
+          await client.query('BEGIN');
+
+          const lockedListingResult = await client.query(
+            `SELECT * FROM marketplace_listings WHERE id = $1 AND status = 'active' FOR UPDATE`,
+            [listing.id]
+          );
+
+          if (!lockedListingResult.rows.length) {
+            await client.query('ROLLBACK');
+            outcome = { ok: false, reason: 'race' };
+          } else {
+            const lockedRow = lockedListingResult.rows[0];
+
+            const buyerRowResult = await client.query(
+              `SELECT balance FROM user_currency_balances WHERE user_id = $1 FOR UPDATE`,
+              [interaction.user.id]
+            );
+            const buyerCurrentBalance = Number(buyerRowResult.rows[0]?.balance || 0);
+
+            if (buyerCurrentBalance < lockedRow.asking_price) {
+              await client.query('ROLLBACK');
+              outcome = { ok: false, reason: 'insufficient' };
+            } else {
+              const feeAmount = Math.floor(lockedRow.asking_price * MARKETPLACE_FEE_RATE);
+              const sellerProceeds = lockedRow.asking_price - feeAmount;
+
+              await client.query(
+                `UPDATE user_currency_balances SET balance = balance - $2, lifetime_spent = lifetime_spent + $2, updated_at = NOW() WHERE user_id = $1`,
+                [interaction.user.id, lockedRow.asking_price]
+              );
+              await client.query(
+                `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
+                 VALUES ($1, $2, $3, $4, 'marketplace_purchase', $5, $6)`,
+                [randomUUID(), interaction.guild.id, interaction.user.id, -lockedRow.asking_price, `Bought ${lockedRow.item_name} on marketplace`, interaction.user.id]
+              );
+
+              await client.query(
+                `INSERT INTO user_currency_balances (user_id, balance, lifetime_earned)
+                 VALUES ($1, $2, $2)
+                 ON CONFLICT (user_id) DO UPDATE SET
+                   balance = user_currency_balances.balance + $2,
+                   lifetime_earned = user_currency_balances.lifetime_earned + $2,
+                   updated_at = NOW()`,
+                [lockedRow.seller_user_id, sellerProceeds]
+              );
+              await client.query(
+                `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
+                 VALUES ($1, $2, $3, $4, 'marketplace_sale', $5, $6)`,
+                [randomUUID(), interaction.guild.id, lockedRow.seller_user_id, sellerProceeds, `Sold ${lockedRow.item_name} on marketplace (fee ${feeAmount}, burned)`, interaction.user.id]
+              );
+
+              await client.query(
+                `UPDATE user_inventory SET user_id = $1, price_paid = $2, status = 'owned', updated_at = NOW() WHERE id = $3`,
+                [interaction.user.id, lockedRow.asking_price, lockedRow.inventory_id]
+              );
+
+              await client.query(
+                `UPDATE marketplace_listings SET status = 'sold', buyer_user_id = $1, sale_price = $2, fee_amount = $3, sold_at = NOW() WHERE id = $4`,
+                [interaction.user.id, lockedRow.asking_price, feeAmount, lockedRow.id]
+              );
+
+              await client.query('COMMIT');
+              outcome = { ok: true, row: lockedRow, feeAmount, sellerProceeds };
+            }
+          }
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => null);
+          console.error('[Marketplace] Buy transaction failed:', error?.message || error);
+          outcome = { ok: false, reason: 'error' };
+        } finally {
+          client.release();
+        }
+
+        if (!outcome.ok) {
+          const message = outcome.reason === 'race' ? 'That listing was just bought or cancelled by someone else.'
+            : outcome.reason === 'insufficient' ? `You do not have enough ${settings.currency_name} anymore to buy this listing.`
+            : 'Something went wrong completing that purchase. Nothing was charged — please try again.';
+          await interaction.reply({ content: message, ephemeral: true });
+          return;
+        }
+
+        await unequipItemByNameIfEquipped(listing.origin_guild_id, listing.seller_user_id, listing.item_name).catch(() => null);
+
+        await interaction.reply({
+          content: `Bought **${outcome.row.item_name}** for **${settings.currency_icon} ${outcome.row.asking_price}** from <@${outcome.row.seller_user_id}>. (Seller received ${settings.currency_icon} ${outcome.sellerProceeds} after the 10% marketplace fee.)`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (subcommand === 'cancel') {
+        const listingInput = interaction.options.getString('listing');
+        const listing = await findMarketplaceListing(listingInput, { activeOnly: true });
+        if (!listing) {
+          await interaction.reply({ content: 'Could not find an active listing matching that.', ephemeral: true });
+          return;
+        }
+        if (listing.seller_user_id !== interaction.user.id) {
+          await interaction.reply({ content: 'You can only cancel your own listings.', ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `UPDATE marketplace_listings SET status = 'cancelled', cancelled_at = NOW() WHERE id = $1 AND status = 'active'`,
+          [listing.id]
+        );
+        await interaction.reply({ content: `Cancelled your listing for **${listing.item_name}**.`, ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'mylistings') {
+        const result = await pool.query(
+          `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 ORDER BY listed_at DESC LIMIT 20`,
+          [interaction.user.id]
+        );
+        await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('marketplace_browse:')) {
+      const page = Number.parseInt(interaction.customId.split(':')[1], 10) || 0;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const payload = await buildMarketplaceBrowsePayload(settings, page);
+      await interaction.update(payload);
+      return;
     }
 
     if (interaction.commandName === 'tournament') {
@@ -18645,8 +18913,8 @@ if (shopSubcommand === 'view') {
       const targetUser = interaction.options.getUser('user') || interaction.user;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
-        `SELECT * FROM user_inventory WHERE guild_id = $1 AND user_id = $2 ORDER BY purchased_at DESC LIMIT 50`,
-        [interaction.guild.id, targetUser.id]
+        `SELECT * FROM user_inventory WHERE user_id = $1 ORDER BY purchased_at DESC LIMIT 50`,
+        [targetUser.id]
       );
       await interaction.reply({ embeds: [buildInventoryEmbed(settings, targetUser, result.rows)], ephemeral: true });
       return;
@@ -23430,6 +23698,146 @@ function inferAvatarSlotFromItem(item) {
   return 'accessory';
 }
 
+// ---------------------------------------------------------------------------
+// Marketplace — fixed-price resale of owned user_inventory items. Global listing
+// pool (any seller/buyer, any server) per the Universal Marketplace design decision.
+// Known, deliberate scope limit: this does NOT touch user_avatar_inventory (the
+// separate, still-guild-scoped table gating what the *current* placeholder avatar
+// system lets a user equip) beyond clearing a matching equipped_* slot by name on
+// the seller's side. Making a marketplace-acquired item equippable everywhere is
+// blocked on the real Avatar rebuild (build order #3), which replaces this whole
+// placeholder equip system with a global one — wiring cross-server equip-ability
+// into the system being replaced isn't worth doing twice.
+// ---------------------------------------------------------------------------
+
+const MARKETPLACE_FEE_RATE = 0.10;
+const MARKETPLACE_PRICE_FLOOR_RATE = 0.50;
+const MARKETPLACE_LISTING_CAP = 10;
+const MARKETPLACE_BROWSE_PAGE_SIZE = 8;
+
+function shortListingId(id) {
+  return String(id || '').split('-')[0];
+}
+
+// Price floor is 50% of the item's current shop_items.price (catalog price today, not
+// what this particular seller happened to pay historically) — confirmed basis.
+async function getMarketplacePriceFloor(itemId) {
+  if (!itemId) return 0;
+  const result = await pool.query(`SELECT price FROM shop_items WHERE id = $1 LIMIT 1`, [itemId]);
+  const price = Number(result.rows[0]?.price);
+  if (!Number.isFinite(price)) return 0;
+  return Math.ceil(price * MARKETPLACE_PRICE_FLOOR_RATE);
+}
+
+async function findMarketplaceListing(listingInput, { activeOnly = false } = {}) {
+  const result = await pool.query(
+    `SELECT * FROM marketplace_listings
+     WHERE (id::text LIKE $1 OR LOWER(item_name) = LOWER($2))
+       ${activeOnly ? "AND status = 'active'" : ''}
+     ORDER BY listed_at DESC
+     LIMIT 1`,
+    [`${listingInput}%`, listingInput]
+  );
+  return result.rows[0] || null;
+}
+
+const VISUAL_AVATAR_SLOT_DEFAULTS = {
+  headwear: 'none',
+  top: 'Basic Tee',
+  bottom: 'Plain Shorts',
+  accessory: 'Ghost Wristband',
+  footwear: 'Basic Sneakers',
+  pet: 'none',
+  effect: 'none',
+  background: 'Locker Room',
+};
+
+// Best-effort: if the seller currently has this item name equipped in the guild the
+// item originated in, reset that slot to its default. Failures are swallowed by the
+// caller — this is cosmetic cleanup, not part of the money-safe transaction.
+async function unequipItemByNameIfEquipped(guildId, userId, itemName) {
+  const result = await pool.query(
+    `SELECT * FROM user_avatar WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guildId, userId]
+  );
+  const row = result.rows[0];
+  if (!row) return;
+
+  for (const slot of Object.keys(VISUAL_AVATAR_SLOT_DEFAULTS)) {
+    const column = `equipped_${slot}`;
+    if (row[column] && String(row[column]).toLowerCase() === String(itemName).toLowerCase()) {
+      await pool.query(
+        `UPDATE user_avatar SET ${column} = $1, updated_at = NOW() WHERE guild_id = $2 AND user_id = $3`,
+        [VISUAL_AVATAR_SLOT_DEFAULTS[slot], guildId, userId]
+      );
+    }
+  }
+}
+
+function buildMarketplaceBrowseEmbed(settings, rows, page, totalCount) {
+  const NL = String.fromCharCode(10);
+  const totalPages = Math.max(1, Math.ceil(totalCount / MARKETPLACE_BROWSE_PAGE_SIZE));
+  const embed = new EmbedBuilder()
+    .setTitle(`${settings.currency_icon} Marketplace (Global)`)
+    .setColor(0xFEE75C)
+    .setFooter({ text: `GG Sports • Marketplace • Page ${page + 1}/${totalPages} • ${totalCount} active listing${totalCount === 1 ? '' : 's'}` })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No active listings right now. List an owned item with `/marketplace list`.');
+    return embed;
+  }
+
+  embed.setDescription(rows.map(row =>
+    `**${shortListingId(row.id)} • ${row.item_name}**${NL}${settings.currency_icon} ${row.asking_price} • Seller: <@${row.seller_user_id}>`
+  ).join(`${NL}${NL}`));
+  return embed;
+}
+
+function buildMarketplaceBrowseComponents(page, totalCount) {
+  const totalPages = Math.max(1, Math.ceil(totalCount / MARKETPLACE_BROWSE_PAGE_SIZE));
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`marketplace_browse:${page - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+    new ButtonBuilder().setCustomId(`marketplace_browse:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page + 1 >= totalPages),
+  )];
+}
+
+async function buildMarketplaceBrowsePayload(settings, page) {
+  const safePage = Math.max(0, page);
+  const countResult = await pool.query(`SELECT COUNT(*)::int AS count FROM marketplace_listings WHERE status = 'active'`);
+  const totalCount = countResult.rows[0]?.count || 0;
+  const listingsResult = await pool.query(
+    `SELECT * FROM marketplace_listings WHERE status = 'active' ORDER BY listed_at DESC LIMIT $1 OFFSET $2`,
+    [MARKETPLACE_BROWSE_PAGE_SIZE, safePage * MARKETPLACE_BROWSE_PAGE_SIZE]
+  );
+  return {
+    embeds: [buildMarketplaceBrowseEmbed(settings, listingsResult.rows, safePage, totalCount)],
+    components: buildMarketplaceBrowseComponents(safePage, totalCount),
+  };
+}
+
+function buildMyMarketplaceListingsEmbed(settings, user, rows) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle(`${user.username} • My Marketplace Listings`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Marketplace' })
+    .setTimestamp();
+
+  if (!rows.length) {
+    embed.setDescription('No listings yet.');
+    return embed;
+  }
+
+  embed.setDescription(rows.map(row => {
+    const statusLabel = row.status === 'sold' ? `Sold to <@${row.buyer_user_id}> for ${settings.currency_icon} ${row.sale_price}`
+      : row.status === 'cancelled' ? 'Cancelled'
+      : 'Active';
+    return `**${shortListingId(row.id)} • ${row.item_name}** — ${settings.currency_icon} ${row.asking_price} • ${statusLabel}`;
+  }).join(NL));
+  return embed;
+}
+
 
 
 function getTradeSetupColumn(type) {
@@ -23556,8 +23964,8 @@ async function syncExpandedProfileBadges(guildId, userId, recognition = null) {
   if (gamesPlayed >= 25) await awardProfileBadge(guildId, userId, 'league_grinder', 'activity');
 
   const inventoryCount = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM user_inventory WHERE guild_id = $1 AND user_id = $2`,
-    [guildId, userId]
+    `SELECT COUNT(*)::int AS count FROM user_inventory WHERE user_id = $1`,
+    [userId]
   ).catch(() => ({ rows: [{ count: 0 }] }));
   if (Number(inventoryCount.rows[0]?.count || 0) >= 5) await awardProfileBadge(guildId, userId, 'collector', 'shop');
 
@@ -23965,8 +24373,8 @@ async function showBankHome(interaction, targetUser, { update = false } = {}) {
 async function buildBankPurchasesEmbed(guild, targetUser) {
   const settings = await getCurrencySettings(guild.id);
   const result = await pool.query(
-    `SELECT * FROM user_inventory WHERE guild_id = $1 AND user_id = $2 ORDER BY purchased_at DESC LIMIT 15`,
-    [guild.id, targetUser.id]
+    `SELECT * FROM user_inventory WHERE user_id = $1 ORDER BY purchased_at DESC LIMIT 15`,
+    [targetUser.id]
   );
   return new EmbedBuilder()
     .setTitle(`${targetUser.username} • Recent Purchases`)
