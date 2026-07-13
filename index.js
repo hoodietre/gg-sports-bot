@@ -1767,6 +1767,27 @@ async function initDatabase() {
   await pool.query(`CREATE INDEX IF NOT EXISTS marketplace_listings_status_idx ON marketplace_listings (status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS marketplace_listings_seller_idx ON marketplace_listings (seller_user_id)`);
 
+  // Multi-channel panels — lets a "live board" (Marketplace, Sportsbook, Shop, Bank,
+  // Member Profile starters) be posted/refreshed in more than one channel at once,
+  // instead of the single-configured-channel model the rest of the panel system still
+  // uses (league_panels / shop_panels / sportsbook_panels are all PRIMARY KEY on one
+  // channel per league). Deliberately scoped to just these 5 panel types — converting
+  // every panel type in the bot to multi-channel wasn't asked for and would be a much
+  // larger, riskier change than this feature needs.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS multi_channel_panels (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      panel_type TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (guild_id, panel_type, channel_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS multi_channel_panels_lookup_idx ON multi_channel_panels (guild_id, panel_type)`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_avatar (
       guild_id TEXT NOT NULL,
@@ -1888,6 +1909,7 @@ async function initDatabase() {
 
   await loadCurrencyConfig();
   await migrateGuildCurrencyBalancesToGlobal();
+  await migrateSingleChannelPanelsToMultiChannel();
 
   console.log('Database ready.');
 }
@@ -1937,6 +1959,77 @@ async function migrateGuildCurrencyBalancesToGlobal() {
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('[Currency Migration] Failed, will retry on next restart:', error?.message || error);
+  } finally {
+    client.release();
+  }
+}
+
+// One-time carry-forward of the existing single-channel Shop/Sportsbook/Bank/Member
+// Profile postings into multi_channel_panels, so upgrading those 4 (+ new Marketplace)
+// to multi-channel doesn't orphan panels servers already have live. Guarded by
+// system_migrations, safe to leave guild rows without a match (ON CONFLICT DO NOTHING —
+// a server simply won't have a pre-existing posting for that type).
+async function migrateSingleChannelPanelsToMultiChannel() {
+  const MIGRATION_KEY = 'multi_channel_panels_carry_forward_v1';
+
+  const already = await pool.query(
+    `SELECT 1 FROM system_migrations WHERE migration_key = $1`,
+    [MIGRATION_KEY]
+  );
+  if (already.rows.length > 0) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const shopPanelRows = await client.query(`SELECT * FROM shop_panels`);
+    for (const row of shopPanelRows.rows) {
+      await client.query(
+        `INSERT INTO multi_channel_panels (id, guild_id, panel_type, channel_id, message_id, created_at, updated_at)
+         VALUES ($1, $2, 'shop', $3, $4, COALESCE($5, NOW()), COALESCE($6, NOW()))
+         ON CONFLICT (guild_id, panel_type, channel_id) DO NOTHING`,
+        [randomUUID(), row.guild_id, row.channel_id, row.message_id, row.created_at, row.updated_at]
+      );
+    }
+
+    const sportsbookRows = await client.query(`SELECT * FROM sportsbook_panels`);
+    for (const row of sportsbookRows.rows) {
+      await client.query(
+        `INSERT INTO multi_channel_panels (id, guild_id, panel_type, channel_id, message_id, created_at, updated_at)
+         VALUES ($1, $2, 'sportsbook', $3, $4, COALESCE($5, NOW()), COALESCE($6, NOW()))
+         ON CONFLICT (guild_id, panel_type, channel_id) DO NOTHING`,
+        [randomUUID(), row.guild_id, row.channel_id, row.message_id, row.created_at, row.updated_at]
+      );
+    }
+
+    // Bank/Member Profile starters live in league_panels (keyed by league, not guild) —
+    // join back to leagues to get guild_id.
+    const legacyStarterRows = await client.query(
+      `SELECT lp.*, l.guild_id AS resolved_guild_id
+       FROM league_panels lp
+       JOIN leagues l ON l.league_id = lp.league_id
+       WHERE lp.panel_key IN ('bank_starter', 'member_profile_starter')`
+    );
+    for (const row of legacyStarterRows.rows) {
+      const panelType = row.panel_key === 'bank_starter' ? 'bank' : 'profile';
+      await client.query(
+        `INSERT INTO multi_channel_panels (id, guild_id, panel_type, channel_id, message_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), COALESCE($7, NOW()))
+         ON CONFLICT (guild_id, panel_type, channel_id) DO NOTHING`,
+        [randomUUID(), row.resolved_guild_id, panelType, row.channel_id, row.message_id, row.created_at, row.updated_at]
+      );
+    }
+
+    await client.query(
+      `INSERT INTO system_migrations (migration_key) VALUES ($1)`,
+      [MIGRATION_KEY]
+    );
+
+    await client.query('COMMIT');
+    console.log('[Panel Migration] Carried forward existing shop/sportsbook/bank/profile postings into multi_channel_panels.');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('[Panel Migration] Failed, will retry on next restart:', error?.message || error);
   } finally {
     client.release();
   }
@@ -6037,26 +6130,137 @@ async function ggBuildPermanentShopPayload(guildId) {
   return { embeds: [embed], components: rows };
 }
 
-async function ggUpdatePermanentShopPanel(guild) {
-  if (!guild) return null;
-  const panelResult = await pool.query(`SELECT * FROM shop_panels WHERE guild_id = $1 LIMIT 1`, [guild.id]);
-  const panel = panelResult.rows[0];
-  if (!panel) return null;
+// ---------------------------------------------------------------------------
+// Multi-channel panels — Shop, Sportsbook, Bank, Member Profile, and Marketplace
+// can each be posted/refreshed in more than one channel at once (multi_channel_panels),
+// instead of the single-configured-channel model the rest of the panel system uses.
+// getMultiChannelPanelInfo() is the one place each panel type's display payload is
+// defined; everything else (post, refresh-all, list, remove) is generic.
+// ---------------------------------------------------------------------------
 
-  const channel = await guild.channels.fetch(panel.channel_id).catch(() => null);
-  if (!channel || !channel.isTextBased()) return null;
+function getMultiChannelPanelInfo(panelType) {
+  const registry = {
+    shop: {
+      label: 'Shop Panel',
+      build: async (guild) => ggBuildPermanentShopPayload(guild.id),
+    },
+    sportsbook: {
+      label: 'Sportsbook Board',
+      build: async (guild) => {
+        const openResult = await pool.query(
+          `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
+          [guild.id]
+        );
+        return { embeds: [await buildSportsbookPanelEmbed(guild.id)], components: buildSportsbookBetBoardButtons(openResult.rows) };
+      },
+    },
+    bank: {
+      label: 'Bank Starter',
+      build: async () => ({ embeds: [buildBankStarterEmbed()], components: buildBankStarterComponents() }),
+    },
+    profile: {
+      label: 'Member Profile Starter',
+      build: async () => ({ embeds: [buildMemberProfileStarterEmbed()], components: buildMemberProfileStarterComponents() }),
+    },
+    marketplace: {
+      label: 'Marketplace',
+      build: async () => ({ embeds: [buildMarketplaceStarterEmbed()], components: buildMarketplaceStarterComponents() }),
+    },
+  };
+  return registry[panelType] || null;
+}
 
-  const payload = await ggBuildPermanentShopPayload(guild.id);
-  const message = await channel.messages.fetch(panel.message_id).catch(() => null);
+// Posts a fresh copy in `channel` if this panel type isn't already posted there, or
+// edits the existing message in place if it is. Either way, upserts the DB row.
+async function postOrRefreshMultiChannelPanel(guild, panelType, channel) {
+  const info = getMultiChannelPanelInfo(panelType);
+  if (!info) return null;
 
-  if (message) {
-    await message.edit(payload).catch(() => null);
-    return message;
+  const existingResult = await pool.query(
+    `SELECT * FROM multi_channel_panels WHERE guild_id = $1 AND panel_type = $2 AND channel_id = $3 LIMIT 1`,
+    [guild.id, panelType, channel.id]
+  );
+  const existing = existingResult.rows[0];
+  const payload = await info.build(guild);
+
+  if (existing) {
+    const message = await channel.messages.fetch(existing.message_id).catch(() => null);
+    if (message) {
+      await message.edit(payload).catch(() => null);
+      await pool.query(`UPDATE multi_channel_panels SET updated_at = NOW() WHERE id = $1`, [existing.id]);
+      return message;
+    }
   }
 
   const newMessage = await channel.send(payload);
-  await pool.query(`UPDATE shop_panels SET message_id = $1, updated_at = NOW() WHERE guild_id = $2`, [newMessage.id, guild.id]);
+  await pool.query(
+    `INSERT INTO multi_channel_panels (id, guild_id, panel_type, channel_id, message_id)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (guild_id, panel_type, channel_id) DO UPDATE SET message_id = $5, updated_at = NOW()`,
+    [randomUUID(), guild.id, panelType, channel.id, newMessage.id]
+  );
   return newMessage;
+}
+
+// Refreshes every channel this panel type is currently posted in. If a message was
+// deleted out from under it, reposts fresh in that same channel rather than silently
+// dropping it. Used both by the manual "Refresh All" button and by auto-refresh call
+// sites (after a purchase, a new open game, etc.) that used to target a single panel.
+async function refreshAllMultiChannelPanelPostings(guild, panelType) {
+  const info = getMultiChannelPanelInfo(panelType);
+  if (!info || !guild) return { refreshed: 0, reposted: 0, failed: 0, total: 0 };
+
+  const result = await pool.query(
+    `SELECT * FROM multi_channel_panels WHERE guild_id = $1 AND panel_type = $2`,
+    [guild.id, panelType]
+  );
+  if (!result.rows.length) return { refreshed: 0, reposted: 0, failed: 0, total: 0 };
+
+  const payload = await info.build(guild);
+  let refreshed = 0, reposted = 0, failed = 0;
+
+  for (const row of result.rows) {
+    const channel = await guild.channels.fetch(row.channel_id).catch(() => null);
+    if (!channel || !channel.isTextBased()) { failed++; continue; }
+
+    const message = await channel.messages.fetch(row.message_id).catch(() => null);
+    if (message) {
+      await message.edit(payload).catch(() => null);
+      await pool.query(`UPDATE multi_channel_panels SET updated_at = NOW() WHERE id = $1`, [row.id]);
+      refreshed++;
+    } else {
+      const newMessage = await channel.send(payload).catch(() => null);
+      if (newMessage) {
+        await pool.query(`UPDATE multi_channel_panels SET message_id = $1, updated_at = NOW() WHERE id = $2`, [newMessage.id, row.id]);
+        reposted++;
+      } else {
+        failed++;
+      }
+    }
+  }
+
+  return { refreshed, reposted, failed, total: result.rows.length };
+}
+
+async function listMultiChannelPanelPostings(guildId, panelType) {
+  const result = await pool.query(
+    `SELECT * FROM multi_channel_panels WHERE guild_id = $1 AND panel_type = $2 ORDER BY created_at ASC`,
+    [guildId, panelType]
+  );
+  return result.rows;
+}
+
+async function removeMultiChannelPanelPosting(guildId, panelType, channelId) {
+  await pool.query(
+    `DELETE FROM multi_channel_panels WHERE guild_id = $1 AND panel_type = $2 AND channel_id = $3`,
+    [guildId, panelType, channelId]
+  );
+}
+
+async function ggUpdatePermanentShopPanel(guild) {
+  if (!guild) return null;
+  await refreshAllMultiChannelPanelPostings(guild, 'shop');
+  return null;
 }
 
 
@@ -8101,11 +8305,101 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
+      const multiChannelPanelType = MULTI_CHANNEL_SETUP_PANEL_MAP[panelType];
+      if (multiChannelPanelType) {
+        const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, multiChannelPanelType);
+        await interaction.update(payload);
+        return;
+      }
+
       const message = await createConfiguredPanelFromSetup(interaction, league, panelType);
       const embed = buildSetupPanelMenuEmbed(league);
       embed.setDescription(embed.data.description + '\n\n' + message);
       await interaction.update({
         embeds: [embed],
+        components: buildSetupPanelMenuComponents(leagueId, getLeagueSportKey(league) === 'madden'),
+      });
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('multipanel_post:')) {
+      const [, leagueId, panelType] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
+        return;
+      }
+
+      const info = getMultiChannelPanelInfo(panelType);
+      if (!info) {
+        await interaction.reply({ content: 'Unknown panel type.', ephemeral: true });
+        return;
+      }
+
+      const channelId = interaction.values[0];
+      const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.isTextBased()) {
+        await interaction.reply({ content: 'That channel is not usable for a panel.', ephemeral: true });
+        return;
+      }
+
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel.permissionsFor(botMember);
+      if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: `I need View Channel, Send Messages, and Embed Links permissions in ${channel.toString()}.`, ephemeral: true });
+        return;
+      }
+
+      await interaction.deferUpdate();
+      await postOrRefreshMultiChannelPanel(interaction.guild, panelType, channel);
+      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType);
+      payload.content = `Posted/refreshed **${info.label}** in ${channel.toString()}.`;
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('multipanel_refreshall:')) {
+      const [, leagueId, panelType] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferUpdate();
+      const result = await refreshAllMultiChannelPanelPostings(interaction.guild, panelType);
+      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType);
+      payload.content = `Refreshed ${result.refreshed}, reposted ${result.reposted}` + (result.failed ? `, ${result.failed} failed (channel deleted or missing permissions)` : '') + '.';
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('multipanel_remove:')) {
+      const [, leagueId, panelType] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
+        return;
+      }
+
+      const channelId = interaction.values[0];
+      await removeMultiChannelPanelPosting(interaction.guild.id, panelType, channelId);
+      await interaction.deferUpdate();
+      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType);
+      payload.content = `Stopped tracking the posting in <#${channelId}> (the old message itself isn't auto-deleted from Discord — remove it manually if you want it gone).`;
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('multipanel_back:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+      await interaction.update({
+        embeds: [buildSetupPanelMenuEmbed(league)],
         components: buildSetupPanelMenuComponents(leagueId, getLeagueSportKey(league) === 'madden'),
       });
       return;
@@ -15736,60 +16030,7 @@ if (shopSubcommand === 'view') {
       const settings = await getCurrencySettings(interaction.guild.id);
 
       if (subcommand === 'list') {
-        const itemInput = interaction.options.getString('item');
-        const askingPrice = interaction.options.getInteger('price');
-
-        if (!Number.isInteger(askingPrice) || askingPrice <= 0) {
-          await interaction.reply({ content: 'Price must be a positive whole number.', ephemeral: true });
-          return;
-        }
-
-        const item = await findInventoryItem(interaction.guild.id, interaction.user.id, itemInput);
-        if (!item) {
-          await interaction.reply({ content: 'Could not find that item in your inventory. Use /shop inventory to see your item IDs.', ephemeral: true });
-          return;
-        }
-
-        if (item.is_trade_locked) {
-          await interaction.reply({ content: `**${item.item_name}** is trade-locked (an achievement/award item) and cannot be listed on the marketplace.`, ephemeral: true });
-          return;
-        }
-
-        const alreadyListed = await pool.query(
-          `SELECT 1 FROM marketplace_listings WHERE inventory_id = $1 AND status = 'active' LIMIT 1`,
-          [item.id]
-        );
-        if (alreadyListed.rows.length) {
-          await interaction.reply({ content: `**${item.item_name}** already has an active listing. Cancel it first if you want to re-list at a different price.`, ephemeral: true });
-          return;
-        }
-
-        const activeCountResult = await pool.query(
-          `SELECT COUNT(*)::int AS count FROM marketplace_listings WHERE seller_user_id = $1 AND status = 'active'`,
-          [interaction.user.id]
-        );
-        if ((activeCountResult.rows[0]?.count || 0) >= MARKETPLACE_LISTING_CAP) {
-          await interaction.reply({ content: `You already have ${MARKETPLACE_LISTING_CAP} active listings, the max allowed. Cancel one with /marketplace cancel before listing another.`, ephemeral: true });
-          return;
-        }
-
-        const priceFloor = await getMarketplacePriceFloor(item.item_id);
-        if (priceFloor > 0 && askingPrice < priceFloor) {
-          await interaction.reply({ content: `Asking price must be at least **${settings.currency_icon} ${priceFloor}** (50% of this item's current shop price).`, ephemeral: true });
-          return;
-        }
-
-        const listingId = randomUUID();
-        await pool.query(
-          `INSERT INTO marketplace_listings (id, inventory_id, seller_user_id, item_id, item_name, asking_price, origin_guild_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [listingId, item.id, interaction.user.id, item.item_id, item.item_name, askingPrice, interaction.guild.id]
-        );
-
-        await interaction.reply({
-          content: `Listed **${item.item_name}** for **${settings.currency_icon} ${askingPrice}**. Listing ID: \`${shortListingId(listingId)}\`. Anyone on any server can now buy it.`,
-          ephemeral: true,
-        });
+        await performMarketplaceList(interaction, settings, interaction.options.getString('item'), interaction.options.getInteger('price'));
         return;
       }
 
@@ -15800,134 +16041,12 @@ if (shopSubcommand === 'view') {
       }
 
       if (subcommand === 'buy') {
-        const listingInput = interaction.options.getString('listing');
-        const listing = await findMarketplaceListing(listingInput, { activeOnly: true });
-        if (!listing) {
-          await interaction.reply({ content: 'Could not find an active listing matching that.', ephemeral: true });
-          return;
-        }
-
-        if (listing.seller_user_id === interaction.user.id) {
-          await interaction.reply({ content: 'You cannot buy your own listing — cancel it instead with /marketplace cancel.', ephemeral: true });
-          return;
-        }
-
-        const buyerBalance = await getBalance(interaction.guild.id, interaction.user.id);
-        if (Number(buyerBalance.balance) < listing.asking_price) {
-          await interaction.reply({ content: `You do not have enough ${settings.currency_name} to buy **${listing.item_name}** for ${settings.currency_icon} ${listing.asking_price}.`, ephemeral: true });
-          return;
-        }
-
-        const client = await pool.connect();
-        let outcome;
-        try {
-          await client.query('BEGIN');
-
-          const lockedListingResult = await client.query(
-            `SELECT * FROM marketplace_listings WHERE id = $1 AND status = 'active' FOR UPDATE`,
-            [listing.id]
-          );
-
-          if (!lockedListingResult.rows.length) {
-            await client.query('ROLLBACK');
-            outcome = { ok: false, reason: 'race' };
-          } else {
-            const lockedRow = lockedListingResult.rows[0];
-
-            const buyerRowResult = await client.query(
-              `SELECT balance FROM user_currency_balances WHERE user_id = $1 FOR UPDATE`,
-              [interaction.user.id]
-            );
-            const buyerCurrentBalance = Number(buyerRowResult.rows[0]?.balance || 0);
-
-            if (buyerCurrentBalance < lockedRow.asking_price) {
-              await client.query('ROLLBACK');
-              outcome = { ok: false, reason: 'insufficient' };
-            } else {
-              const feeAmount = Math.floor(lockedRow.asking_price * MARKETPLACE_FEE_RATE);
-              const sellerProceeds = lockedRow.asking_price - feeAmount;
-
-              await client.query(
-                `UPDATE user_currency_balances SET balance = balance - $2, lifetime_spent = lifetime_spent + $2, updated_at = NOW() WHERE user_id = $1`,
-                [interaction.user.id, lockedRow.asking_price]
-              );
-              await client.query(
-                `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
-                 VALUES ($1, $2, $3, $4, 'marketplace_purchase', $5, $6)`,
-                [randomUUID(), interaction.guild.id, interaction.user.id, -lockedRow.asking_price, `Bought ${lockedRow.item_name} on marketplace`, interaction.user.id]
-              );
-
-              await client.query(
-                `INSERT INTO user_currency_balances (user_id, balance, lifetime_earned)
-                 VALUES ($1, $2, $2)
-                 ON CONFLICT (user_id) DO UPDATE SET
-                   balance = user_currency_balances.balance + $2,
-                   lifetime_earned = user_currency_balances.lifetime_earned + $2,
-                   updated_at = NOW()`,
-                [lockedRow.seller_user_id, sellerProceeds]
-              );
-              await client.query(
-                `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
-                 VALUES ($1, $2, $3, $4, 'marketplace_sale', $5, $6)`,
-                [randomUUID(), interaction.guild.id, lockedRow.seller_user_id, sellerProceeds, `Sold ${lockedRow.item_name} on marketplace (fee ${feeAmount}, burned)`, interaction.user.id]
-              );
-
-              await client.query(
-                `UPDATE user_inventory SET user_id = $1, price_paid = $2, status = 'owned', updated_at = NOW() WHERE id = $3`,
-                [interaction.user.id, lockedRow.asking_price, lockedRow.inventory_id]
-              );
-
-              await client.query(
-                `UPDATE marketplace_listings SET status = 'sold', buyer_user_id = $1, sale_price = $2, fee_amount = $3, sold_at = NOW() WHERE id = $4`,
-                [interaction.user.id, lockedRow.asking_price, feeAmount, lockedRow.id]
-              );
-
-              await client.query('COMMIT');
-              outcome = { ok: true, row: lockedRow, feeAmount, sellerProceeds };
-            }
-          }
-        } catch (error) {
-          await client.query('ROLLBACK').catch(() => null);
-          console.error('[Marketplace] Buy transaction failed:', error?.message || error);
-          outcome = { ok: false, reason: 'error' };
-        } finally {
-          client.release();
-        }
-
-        if (!outcome.ok) {
-          const message = outcome.reason === 'race' ? 'That listing was just bought or cancelled by someone else.'
-            : outcome.reason === 'insufficient' ? `You do not have enough ${settings.currency_name} anymore to buy this listing.`
-            : 'Something went wrong completing that purchase. Nothing was charged — please try again.';
-          await interaction.reply({ content: message, ephemeral: true });
-          return;
-        }
-
-        await unequipItemByNameIfEquipped(listing.origin_guild_id, listing.seller_user_id, listing.item_name).catch(() => null);
-
-        await interaction.reply({
-          content: `Bought **${outcome.row.item_name}** for **${settings.currency_icon} ${outcome.row.asking_price}** from <@${outcome.row.seller_user_id}>. (Seller received ${settings.currency_icon} ${outcome.sellerProceeds} after the 10% marketplace fee.)`,
-          ephemeral: true,
-        });
+        await performMarketplaceBuy(interaction, settings, interaction.options.getString('listing'));
         return;
       }
 
       if (subcommand === 'cancel') {
-        const listingInput = interaction.options.getString('listing');
-        const listing = await findMarketplaceListing(listingInput, { activeOnly: true });
-        if (!listing) {
-          await interaction.reply({ content: 'Could not find an active listing matching that.', ephemeral: true });
-          return;
-        }
-        if (listing.seller_user_id !== interaction.user.id) {
-          await interaction.reply({ content: 'You can only cancel your own listings.', ephemeral: true });
-          return;
-        }
-
-        await pool.query(
-          `UPDATE marketplace_listings SET status = 'cancelled', cancelled_at = NOW() WHERE id = $1 AND status = 'active'`,
-          [listing.id]
-        );
-        await interaction.reply({ content: `Cancelled your listing for **${listing.item_name}**.`, ephemeral: true });
+        await performMarketplaceCancel(interaction, interaction.options.getString('listing'));
         return;
       }
 
@@ -15948,6 +16067,85 @@ if (shopSubcommand === 'view') {
       const settings = await getCurrencySettings(interaction.guild.id);
       const payload = await buildMarketplaceBrowsePayload(settings, page);
       await interaction.update(payload);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_browse') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const payload = await buildMarketplaceBrowsePayload(settings, 0);
+      await interaction.reply({ ...payload, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_list') {
+      const modal = new ModalBuilder()
+        .setCustomId('marketplacepanel_list_modal')
+        .setTitle('List an Item for Sale')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('item').setLabel('Item name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Asking price').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_list_modal') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const itemInput = interaction.fields.getTextInputValue('item');
+      const priceInput = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
+      if (!Number.isInteger(priceInput)) {
+        await interaction.reply({ content: 'Price must be a whole number.', ephemeral: true });
+        return;
+      }
+      await performMarketplaceList(interaction, settings, itemInput, priceInput);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_buy') {
+      const modal = new ModalBuilder()
+        .setCustomId('marketplacepanel_buy_modal')
+        .setTitle('Buy a Listing')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_buy_modal') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      await performMarketplaceBuy(interaction, settings, interaction.fields.getTextInputValue('listing'));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_cancel') {
+      const modal = new ModalBuilder()
+        .setCustomId('marketplacepanel_cancel_modal')
+        .setTitle('Cancel a Listing')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_cancel_modal') {
+      if (!interaction.guild) return;
+      await performMarketplaceCancel(interaction, interaction.fields.getTextInputValue('listing'));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_mylistings') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 ORDER BY listed_at DESC LIMIT 20`,
+        [interaction.user.id]
+      );
+      await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
       return;
     }
 
@@ -20758,21 +20956,8 @@ async function saveSportsbookPanel(guildId, channelId, messageId) {
 }
 
 async function updateSportsbookPanel(guild) {
-  const panelResult = await pool.query(
-    `SELECT channel_id, message_id FROM sportsbook_panels WHERE guild_id = $1`,
-    [guild.id]
-  );
-
-  if (!panelResult.rows.length) return;
-  const channel = await guild.channels.fetch(panelResult.rows[0].channel_id).catch(() => null);
-  if (!channel || !channel.isTextBased()) return;
-  const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
-  if (!message) return;
-  const openResult = await pool.query(
-    `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
-    [guild.id]
-  );
-  await message.edit({ embeds: [await buildSportsbookPanelEmbed(guild.id)], components: buildSportsbookBetBoardButtons(openResult.rows) }).catch(() => null);
+  if (!guild) return;
+  await refreshAllMultiChannelPanelPostings(guild, 'sportsbook');
 }
 
 function buildMyBetsEmbed(settings, rows) {
@@ -23838,6 +24023,212 @@ function buildMyMarketplaceListingsEmbed(settings, user, rows) {
   return embed;
 }
 
+// Shared between the /marketplace slash command and the button/modal-driven Marketplace
+// Panel below — one implementation, two entry points, so they can't drift apart.
+async function performMarketplaceList(interaction, settings, itemInput, askingPrice) {
+  if (!Number.isInteger(askingPrice) || askingPrice <= 0) {
+    await interaction.reply({ content: 'Price must be a positive whole number.', ephemeral: true });
+    return;
+  }
+
+  const item = await findInventoryItem(interaction.guild.id, interaction.user.id, itemInput);
+  if (!item) {
+    await interaction.reply({ content: 'Could not find that item in your inventory. Use /shop inventory to see your item IDs.', ephemeral: true });
+    return;
+  }
+
+  if (item.is_trade_locked) {
+    await interaction.reply({ content: `**${item.item_name}** is trade-locked (an achievement/award item) and cannot be listed on the marketplace.`, ephemeral: true });
+    return;
+  }
+
+  const alreadyListed = await pool.query(
+    `SELECT 1 FROM marketplace_listings WHERE inventory_id = $1 AND status = 'active' LIMIT 1`,
+    [item.id]
+  );
+  if (alreadyListed.rows.length) {
+    await interaction.reply({ content: `**${item.item_name}** already has an active listing. Cancel it first if you want to re-list at a different price.`, ephemeral: true });
+    return;
+  }
+
+  const activeCountResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM marketplace_listings WHERE seller_user_id = $1 AND status = 'active'`,
+    [interaction.user.id]
+  );
+  if ((activeCountResult.rows[0]?.count || 0) >= MARKETPLACE_LISTING_CAP) {
+    await interaction.reply({ content: `You already have ${MARKETPLACE_LISTING_CAP} active listings, the max allowed. Cancel one before listing another.`, ephemeral: true });
+    return;
+  }
+
+  const priceFloor = await getMarketplacePriceFloor(item.item_id);
+  if (priceFloor > 0 && askingPrice < priceFloor) {
+    await interaction.reply({ content: `Asking price must be at least **${settings.currency_icon} ${priceFloor}** (50% of this item's current shop price).`, ephemeral: true });
+    return;
+  }
+
+  const listingId = randomUUID();
+  await pool.query(
+    `INSERT INTO marketplace_listings (id, inventory_id, seller_user_id, item_id, item_name, asking_price, origin_guild_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [listingId, item.id, interaction.user.id, item.item_id, item.item_name, askingPrice, interaction.guild.id]
+  );
+
+  await interaction.reply({
+    content: `Listed **${item.item_name}** for **${settings.currency_icon} ${askingPrice}**. Listing ID: \`${shortListingId(listingId)}\`. Anyone on any server can now buy it.`,
+    ephemeral: true,
+  });
+}
+
+async function performMarketplaceBuy(interaction, settings, listingInput) {
+  const listing = await findMarketplaceListing(listingInput, { activeOnly: true });
+  if (!listing) {
+    await interaction.reply({ content: 'Could not find an active listing matching that.', ephemeral: true });
+    return;
+  }
+
+  if (listing.seller_user_id === interaction.user.id) {
+    await interaction.reply({ content: 'You cannot buy your own listing — cancel it instead.', ephemeral: true });
+    return;
+  }
+
+  const buyerBalance = await getBalance(interaction.guild.id, interaction.user.id);
+  if (Number(buyerBalance.balance) < listing.asking_price) {
+    await interaction.reply({ content: `You do not have enough ${settings.currency_name} to buy **${listing.item_name}** for ${settings.currency_icon} ${listing.asking_price}.`, ephemeral: true });
+    return;
+  }
+
+  const client = await pool.connect();
+  let outcome;
+  try {
+    await client.query('BEGIN');
+
+    const lockedListingResult = await client.query(
+      `SELECT * FROM marketplace_listings WHERE id = $1 AND status = 'active' FOR UPDATE`,
+      [listing.id]
+    );
+
+    if (!lockedListingResult.rows.length) {
+      await client.query('ROLLBACK');
+      outcome = { ok: false, reason: 'race' };
+    } else {
+      const lockedRow = lockedListingResult.rows[0];
+
+      const buyerRowResult = await client.query(
+        `SELECT balance FROM user_currency_balances WHERE user_id = $1 FOR UPDATE`,
+        [interaction.user.id]
+      );
+      const buyerCurrentBalance = Number(buyerRowResult.rows[0]?.balance || 0);
+
+      if (buyerCurrentBalance < lockedRow.asking_price) {
+        await client.query('ROLLBACK');
+        outcome = { ok: false, reason: 'insufficient' };
+      } else {
+        const feeAmount = Math.floor(lockedRow.asking_price * MARKETPLACE_FEE_RATE);
+        const sellerProceeds = lockedRow.asking_price - feeAmount;
+
+        await client.query(
+          `UPDATE user_currency_balances SET balance = balance - $2, lifetime_spent = lifetime_spent + $2, updated_at = NOW() WHERE user_id = $1`,
+          [interaction.user.id, lockedRow.asking_price]
+        );
+        await client.query(
+          `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
+           VALUES ($1, $2, $3, $4, 'marketplace_purchase', $5, $6)`,
+          [randomUUID(), interaction.guild.id, interaction.user.id, -lockedRow.asking_price, `Bought ${lockedRow.item_name} on marketplace`, interaction.user.id]
+        );
+
+        await client.query(
+          `INSERT INTO user_currency_balances (user_id, balance, lifetime_earned)
+           VALUES ($1, $2, $2)
+           ON CONFLICT (user_id) DO UPDATE SET
+             balance = user_currency_balances.balance + $2,
+             lifetime_earned = user_currency_balances.lifetime_earned + $2,
+             updated_at = NOW()`,
+          [lockedRow.seller_user_id, sellerProceeds]
+        );
+        await client.query(
+          `INSERT INTO currency_transactions (id, guild_id, user_id, amount, transaction_type, reason, issued_by_user_id)
+           VALUES ($1, $2, $3, $4, 'marketplace_sale', $5, $6)`,
+          [randomUUID(), interaction.guild.id, lockedRow.seller_user_id, sellerProceeds, `Sold ${lockedRow.item_name} on marketplace (fee ${feeAmount}, burned)`, interaction.user.id]
+        );
+
+        await client.query(
+          `UPDATE user_inventory SET user_id = $1, price_paid = $2, status = 'owned', updated_at = NOW() WHERE id = $3`,
+          [interaction.user.id, lockedRow.asking_price, lockedRow.inventory_id]
+        );
+
+        await client.query(
+          `UPDATE marketplace_listings SET status = 'sold', buyer_user_id = $1, sale_price = $2, fee_amount = $3, sold_at = NOW() WHERE id = $4`,
+          [interaction.user.id, lockedRow.asking_price, feeAmount, lockedRow.id]
+        );
+
+        await client.query('COMMIT');
+        outcome = { ok: true, row: lockedRow, feeAmount, sellerProceeds };
+      }
+    }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => null);
+    console.error('[Marketplace] Buy transaction failed:', error?.message || error);
+    outcome = { ok: false, reason: 'error' };
+  } finally {
+    client.release();
+  }
+
+  if (!outcome.ok) {
+    const message = outcome.reason === 'race' ? 'That listing was just bought or cancelled by someone else.'
+      : outcome.reason === 'insufficient' ? `You do not have enough ${settings.currency_name} anymore to buy this listing.`
+      : 'Something went wrong completing that purchase. Nothing was charged — please try again.';
+    await interaction.reply({ content: message, ephemeral: true });
+    return;
+  }
+
+  await unequipItemByNameIfEquipped(listing.origin_guild_id, listing.seller_user_id, listing.item_name).catch(() => null);
+
+  await interaction.reply({
+    content: `Bought **${outcome.row.item_name}** for **${settings.currency_icon} ${outcome.row.asking_price}** from <@${outcome.row.seller_user_id}>. (Seller received ${settings.currency_icon} ${outcome.sellerProceeds} after the 10% marketplace fee.)`,
+    ephemeral: true,
+  });
+}
+
+async function performMarketplaceCancel(interaction, listingInput) {
+  const listing = await findMarketplaceListing(listingInput, { activeOnly: true });
+  if (!listing) {
+    await interaction.reply({ content: 'Could not find an active listing matching that.', ephemeral: true });
+    return;
+  }
+  if (listing.seller_user_id !== interaction.user.id) {
+    await interaction.reply({ content: 'You can only cancel your own listings.', ephemeral: true });
+    return;
+  }
+
+  await pool.query(
+    `UPDATE marketplace_listings SET status = 'cancelled', cancelled_at = NOW() WHERE id = $1 AND status = 'active'`,
+    [listing.id]
+  );
+  await interaction.reply({ content: `Cancelled your listing for **${listing.item_name}**.`, ephemeral: true });
+}
+
+// "Starter panel" — same lightweight pattern as Bank/Member Profile: a static embed with
+// buttons that open modals/ephemeral views, posted somewhere permanent so nobody has to
+// remember /marketplace subcommands.
+function buildMarketplaceStarterEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🛒 Marketplace')
+    .setColor(0xFEE75C)
+    .setDescription('Buy and sell owned items with other users — global, across every server. Use the buttons below, no commands to remember.')
+    .setFooter({ text: 'GG Sports • Marketplace' })
+    .setTimestamp();
+}
+
+function buildMarketplaceStarterComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('marketplacepanel_browse').setLabel('Browse').setEmoji('🔍').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('marketplacepanel_list').setLabel('List an Item').setEmoji('🏷️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('marketplacepanel_buy').setLabel('Buy a Listing').setEmoji('💳').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('marketplacepanel_cancel').setLabel('Cancel a Listing').setEmoji('🗑️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('marketplacepanel_mylistings').setLabel('My Listings').setEmoji('📄').setStyle(ButtonStyle.Secondary),
+  )];
+}
+
 
 
 function getTradeSetupColumn(type) {
@@ -24530,17 +24921,76 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'gm_panel_starter_panel', label: 'Post/Refresh GM Panel Starter' },
   { value: 'league_leaders_panel', label: 'Post/Refresh League Leaders Board' },
   { value: 'award_race_panel', label: 'Post/Refresh Award Race Board' },
-  { value: 'member_profile_starter_panel', label: 'Post/Refresh Member Profile Starter' },
-  { value: 'bank_starter_panel', label: 'Post/Refresh Bank Starter' },
+  { value: 'member_profile_starter_panel', label: 'Manage Member Profile Starter (multi-channel)' },
+  { value: 'bank_starter_panel', label: 'Manage Bank Starter (multi-channel)' },
   { value: 'league_rules_panel', label: 'Post/Refresh League Rules Panel' },
   { value: 'game_center_panel', label: 'Post/Refresh Game Center Panel' },
-  { value: 'shop_panel', label: 'Create/Refresh Shop Panel' },
-  { value: 'sportsbook_panel', label: 'Create/Refresh Sportsbook Board' },
+  { value: 'shop_panel', label: 'Manage Shop Panel (multi-channel)' },
+  { value: 'sportsbook_panel', label: 'Manage Sportsbook Board (multi-channel)' },
+  { value: 'marketplace_panel', label: 'Manage Marketplace Panel (multi-channel)' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
   { value: 'trade_offer_panel', label: 'Create/Refresh Trade Offer Panel' },
   { value: 'trade_count_panel', label: 'Create/Refresh Trade Count Panel' },
   { value: 'ticket_panel', label: 'Create/Refresh Ticket Panel' },
 ];
+
+// Setup-menu keys that route to the multi-channel manager instead of
+// createConfiguredPanelFromSetup's single-configured-channel flow.
+const MULTI_CHANNEL_SETUP_PANEL_MAP = {
+  shop_panel: 'shop',
+  sportsbook_panel: 'sportsbook',
+  bank_starter_panel: 'bank',
+  member_profile_starter_panel: 'profile',
+  marketplace_panel: 'marketplace',
+};
+
+async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType) {
+  const info = getMultiChannelPanelInfo(panelType);
+  const postings = await listMultiChannelPanelPostings(guild.id, panelType);
+  const NL = String.fromCharCode(10);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🖼️ ${info?.label || panelType} — Channels`)
+    .setColor(0x5865F2)
+    .setDescription(postings.length
+      ? 'Currently posted in:' + NL + postings.map(p => `• <#${p.channel_id}>`).join(NL)
+      : 'Not posted anywhere yet. Pick a channel below to post it there — this panel can live in as many channels as you want, all kept in sync.')
+    .setFooter({ text: 'GG Sports • Panels' })
+    .setTimestamp();
+
+  const rows = [new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder()
+      .setCustomId(`multipanel_post:${leagueId}:${panelType}`)
+      .setPlaceholder('Post/refresh in a channel')
+      .setChannelTypes(ChannelType.GuildText)
+      .setMinValues(1)
+      .setMaxValues(1)
+  )];
+
+  if (postings.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`multipanel_refreshall:${leagueId}:${panelType}`).setLabel('🔄 Refresh All Postings').setStyle(ButtonStyle.Primary)
+    ));
+
+    const channelLabels = await Promise.all(postings.map(async p => {
+      const ch = await guild.channels.fetch(p.channel_id).catch(() => null);
+      return ch ? `#${ch.name}` : `Unknown channel (${p.channel_id})`;
+    }));
+
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`multipanel_remove:${leagueId}:${panelType}`)
+        .setPlaceholder('Remove a posting')
+        .addOptions(postings.slice(0, 25).map((p, i) => ({ label: channelLabels[i].slice(0, 100), value: p.channel_id })))
+    ));
+  }
+
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`multipanel_back:${leagueId}`).setLabel('⬅ Back to Panels').setStyle(ButtonStyle.Secondary)
+  ));
+
+  return { content: null, embeds: [embed], components: rows };
+}
 
 function setupDashboardColumn(settingKey) {
   const map = {
@@ -24902,29 +25352,11 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     return result?.message || ('Award Race board posted/refreshed in ' + channel.toString() + '.');
   }
 
-  if (panelType === 'member_profile_starter_panel') {
-    const configuredChannelId = league.member_profile_channel_id;
-    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'member profile channel');
-    if (error) return error + ' Set **Member Profile Channel** from this setup dashboard first.';
-    const message = await channel.send({
-      embeds: [buildMemberProfileStarterEmbed()],
-      components: buildMemberProfileStarterComponents(),
-    });
-    await savePanel(league, 'member_profile_starter', channel.id, message.id);
-    return 'Member profile starter posted/refreshed in ' + channel.toString() + '.';
-  }
-
-  if (panelType === 'bank_starter_panel') {
-    const configuredChannelId = league.bank_channel_id;
-    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'bank channel');
-    if (error) return error + ' Set **Bank Channel** from this setup dashboard first.';
-    const message = await channel.send({
-      embeds: [buildBankStarterEmbed()],
-      components: buildBankStarterComponents(),
-    });
-    await savePanel(league, 'bank_starter', channel.id, message.id);
-    return 'Bank starter posted/refreshed in ' + channel.toString() + '.';
-  }
+  // member_profile_starter_panel, bank_starter_panel, shop_panel, and sportsbook_panel
+  // are now handled by the multi-channel panel manager (MULTI_CHANNEL_SETUP_PANEL_MAP /
+  // buildMultiChannelPanelManagerPayload) instead of this single-configured-channel flow —
+  // see the setup_create_panel select handler, which routes them there before ever
+  // reaching this function.
 
   if (panelType === 'league_rules_panel') {
     const configuredChannelId = league.league_rules_channel_id;
@@ -24938,52 +25370,6 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
       [league.league_id, channel.id, message.id]
     );
     return 'League Rules panel posted/refreshed in ' + channel.toString() + '.';
-  }
-
-  if (panelType === 'shop_panel') {
-    const channelId = league.shop_channel_id || null;
-    const { channel, error } = await requireTextChannel(channelId, interaction.channel, 'shop channel');
-    if (error) return error;
-
-    const payload = await buildPermanentShopPayload(interaction.guild.id);
-    const message = await channel.send(payload);
-
-    await pool.query(
-      `DELETE FROM shop_panels WHERE guild_id = $1`,
-      [interaction.guild.id]
-    ).catch(() => null);
-
-    await pool.query(
-      `INSERT INTO shop_panels (guild_id, league_id, channel_id, message_id, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [interaction.guild.id, league.league_id, channel.id, message.id]
-    ).catch(async () => {
-      await pool.query(
-        `INSERT INTO shop_panels (guild_id, channel_id, message_id, updated_at)
-         VALUES ($1, $2, $3, NOW())`,
-        [interaction.guild.id, channel.id, message.id]
-      ).catch(() => null);
-    });
-
-    return 'Shop panel created/refreshed in ' + channel.toString() + '.';
-  }
-
-  if (panelType === 'sportsbook_panel') {
-    const { channel, error } = await requireTextChannel(league.sportsbook_channel_id, interaction.channel, 'sportsbook channel');
-    if (error) return error;
-
-    const openSportsbookResult = await pool.query(
-      `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
-      [interaction.guild.id]
-    );
-
-    const message = await channel.send({
-      embeds: [await buildSportsbookPanelEmbed(interaction.guild.id)],
-      components: buildSportsbookBetBoardButtons(openSportsbookResult.rows),
-    });
-
-    await saveSportsbookPanel(interaction.guild.id, channel.id, message.id);
-    return 'Sportsbook board created/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'team_owners_panel') {
