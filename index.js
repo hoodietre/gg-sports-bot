@@ -1803,6 +1803,29 @@ async function initDatabase() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS multi_channel_panels_lookup_idx ON multi_channel_panels (guild_id, panel_type)`);
 
+  // Real avatar equip state — global per user (Universal Avatar decision), referencing
+  // actual owned user_inventory rows per slot instead of name strings. This replaces
+  // the old user_avatar/user_avatar_inventory tables as the source of truth going
+  // forward; those are left untouched as historical data (no clean migration path from
+  // name-string equip state to real inventory-row references).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS avatar_profiles (
+      user_id TEXT PRIMARY KEY,
+      build TEXT NOT NULL DEFAULT 'athletic',
+      silhouette TEXT NOT NULL DEFAULT 'a',
+      skin_tone TEXT NOT NULL DEFAULT 'medium',
+      equipped_headwear_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      equipped_top_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      equipped_bottom_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      equipped_accessory_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      equipped_footwear_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      equipped_pet_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      equipped_effect_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      equipped_background_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_avatar (
       guild_id TEXT NOT NULL,
@@ -1853,6 +1876,11 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS preview_style TEXT`);
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS rarity TEXT NOT NULL DEFAULT 'common'`);
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_cosmetic BOOLEAN NOT NULL DEFAULT FALSE`);
+  // Minimal seasonal/exclusive tag for the Avatar Shop's Exclusives section — ahead of
+  // the fuller acquisition_type/source_tag/season_key tagging system planned for Shop
+  // Catalog Tooling (build order #5). This column isn't superseded by that later work,
+  // just narrower; it can keep meaning "currently featured as exclusive" alongside it.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_exclusive BOOLEAN NOT NULL DEFAULT FALSE`);
 
 
   await pool.query(`
@@ -2691,10 +2719,10 @@ function buildCommands() {
 
     new SlashCommandBuilder()
       .setName('avatar')
-      .setDescription('Visual avatar and cosmetic commands')
+      .setDescription('Visual avatar, locker room, and avatar shop')
       .addSubcommand(sc => sc.setName('view').setDescription('View your full-body avatar').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
-      .addSubcommand(sc => sc.setName('wardrobe').setDescription('View your unlocked cosmetics'))
-      .addSubcommand(sc => sc.setName('equip').setDescription('Equip an unlocked cosmetic').addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Cosmetic item name').setRequired(true))),
+      .addSubcommand(sc => sc.setName('locker').setDescription('Equip/swap your owned items and customize your body'))
+      .addSubcommand(sc => sc.setName('shop').setDescription('Go shopping — browse and preview cosmetics before buying')),
 
 
     new SlashCommandBuilder()
@@ -15367,11 +15395,10 @@ if (interaction.commandName === 'avatar') {
 
       if (avatarSubcommand === 'view') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
-        await syncVisualAvatarUnlocks(interaction.guild.id, targetUser.id).catch(() => null);
-        const avatar = await ensureVisualAvatar(interaction.guild.id, targetUser.id);
-        const attachment = buildAvatarAttachment(targetUser, avatar);
-        const embed = buildVisualAvatarEmbed(targetUser, avatar);
-        const avatarBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id);
+        const { profile, equipped } = await getAvatarProfileWithEquipment(targetUser.id);
+        const attachment = buildAvatarProfileAttachment(profile, equipped);
+        const embed = buildAvatarLockerEmbed(targetUser, profile, equipped).setTitle(`${targetUser.username} • Avatar`);
+        const avatarBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id).catch(() => []);
         if (avatarBadges.length) {
           embed.addFields({ name: '🏅 Avatar Badges', value: avatarBadges.slice(0, 8).map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(' • '), inline: false });
         }
@@ -15379,19 +15406,167 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      if (avatarSubcommand === 'wardrobe') {
-        const items = await getVisualAvatarInventory(interaction.guild.id, interaction.user.id);
-        await interaction.reply({ embeds: [buildVisualWardrobeEmbed(interaction.user, items)], ephemeral: true });
+      if (avatarSubcommand === 'locker') {
+        const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+        await interaction.reply({
+          embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+          files: [buildAvatarProfileAttachment(profile, equipped)],
+          components: buildAvatarLockerComponents(),
+          ephemeral: true,
+        });
         return;
       }
 
-      if (avatarSubcommand === 'equip') {
-        const slot = interaction.options.getString('slot');
-        const item = interaction.options.getString('item');
-        const result = await equipVisualAvatarItem(interaction.guild.id, interaction.user.id, slot, item);
-        await interaction.reply({ content: result.message, ephemeral: true });
+      if (avatarSubcommand === 'shop') {
+        const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+        await interaction.reply({
+          embeds: [buildAvatarShopHomeEmbed(interaction.user)],
+          files: [buildAvatarProfileAttachment(profile, equipped)],
+          components: buildAvatarShopHomeComponents(),
+          ephemeral: true,
+        });
         return;
       }
+    }
+
+    // ---- Locker Room interactions ----
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_slot_select') {
+      const slot = interaction.values[0];
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const payload = await buildAvatarLockerSlotPayload(interaction.user, profile, equipped, slot);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_item_select:')) {
+      const slot = interaction.customId.split(':')[1];
+      const chosen = interaction.values[0];
+      if (chosen === '__unequip__') {
+        await unequipAvatarSlot(interaction.user.id, slot);
+      } else {
+        await equipAvatarItem(interaction.user.id, slot, chosen);
+      }
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarLockerComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_customize') {
+      await interaction.update({ components: buildAvatarCustomizeComponents() });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_build') {
+      await updateAvatarBodyCustomization(interaction.user.id, { build: interaction.values[0] });
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarCustomizeComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_silhouette') {
+      await updateAvatarBodyCustomization(interaction.user.id, { silhouette: interaction.values[0] });
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarCustomizeComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_skin') {
+      await updateAvatarBodyCustomization(interaction.user.id, { skinTone: interaction.values[0] });
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarCustomizeComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_back') {
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarLockerComponents(),
+      });
+      return;
+    }
+
+    // ---- Avatar Shop interactions ----
+
+    if (interaction.isButton() && interaction.customId === 'avatarshop_home') {
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarShopHomeEmbed(interaction.user)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarShopHomeComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_category:')) {
+      const [, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const { items, total } = await fetchAvatarShopItems(interaction.guild.id, categorySlot, page);
+      await interaction.update({
+        embeds: [buildAvatarShopCategoryEmbed(categorySlot, items, page, total, settings)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarShopCategoryComponents(categorySlot, items, page, total),
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_preview_select:')) {
+      const [, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const itemId = interaction.values[0];
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
+      const item = itemResult.rows[0];
+      if (!item) {
+        await interaction.reply({ content: 'That item is no longer available.', ephemeral: true });
+        return;
+      }
+      await interaction.update(buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_buy:')) {
+      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const outcome = await performAvatarShopPurchase(interaction, itemId);
+
+      if (!outcome.ok) {
+        await interaction.reply({ content: outcome.message, ephemeral: true });
+        return;
+      }
+
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        content: `Bought and equipped **${outcome.item.item_name}**!`,
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
+        files: [buildAvatarProfileAttachment(profile, equipped)],
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page}`).setLabel('Keep Shopping').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('avatarshop_home').setLabel('⬅ Shop Hub').setStyle(ButtonStyle.Secondary),
+        )],
+      });
+      return;
     }
 
 if (interaction.commandName === 'trade') {
@@ -23957,6 +24132,533 @@ function avatarTriangle(buffer, width, height, points, color) {
       if (a >= 0 && b >= 0 && c >= 0) avatarPixel(buffer, width, height, x, y, color);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Real avatar system (Universal Avatar) — global per-user profile, real owned
+// user_inventory rows per slot instead of name strings. Placeholder rendering reuses
+// the existing hand-rolled pixel/PNG primitives above (avatarRect/avatarEllipse/
+// avatarTriangle/avatarLine/avatarCanvas/avatarEncodePng) rather than adding a new
+// dependency — when real AI-generated art lands, only renderAvatarProfilePng's
+// internals need to change (draw calls -> layered PNG composites); the schema, equip
+// logic, Locker Room, and Shop Hub below don't need to change at all.
+// ---------------------------------------------------------------------------
+
+const AVATAR_SLOTS = ['background', 'effect', 'pet', 'footwear', 'bottom', 'top', 'headwear', 'accessory'];
+const AVATAR_SLOT_LABELS = {
+  background: 'Background', effect: 'Aura', pet: 'Pet', footwear: 'Shoes',
+  bottom: 'Bottoms', top: 'Tops', headwear: 'Hats', accessory: 'Accessories',
+};
+const AVATAR_BUILD_SCALE = { slim: 0.85, athletic: 1.0, built: 1.15, heavy: 1.3 };
+const AVATAR_BUILDS = ['slim', 'athletic', 'built', 'heavy'];
+const AVATAR_SKIN_TONES = {
+  light: [240, 205, 172, 255],
+  medium: [216, 164, 127, 255],
+  tan: [186, 128, 86, 255],
+  deep: [117, 79, 54, 255],
+};
+const AVATAR_SILHOUETTES = ['a', 'b'];
+
+// Deterministic color for items avatarColorForItem's keyword list doesn't recognize —
+// so two different unrecognized cosmetics still render visually distinct instead of
+// both collapsing onto the same fallback color.
+function avatarDeterministicColor(seed) {
+  const str = String(seed || 'item');
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+  const hue = hash % 360;
+  const s = 0.55, l = 0.55;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((hue / 60) % 2 - 1));
+  const m = l - c / 2;
+  let r, g, b;
+  if (hue < 60) [r, g, b] = [c, x, 0];
+  else if (hue < 120) [r, g, b] = [x, c, 0];
+  else if (hue < 180) [r, g, b] = [0, c, x];
+  else if (hue < 240) [r, g, b] = [0, x, c];
+  else if (hue < 300) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255), 255];
+}
+
+async function getOrCreateAvatarProfile(userId) {
+  await pool.query(
+    `INSERT INTO avatar_profiles (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+    [userId]
+  );
+  const result = await pool.query(`SELECT * FROM avatar_profiles WHERE user_id = $1`, [userId]);
+  return result.rows[0];
+}
+
+async function getAvatarProfileWithEquipment(userId) {
+  const profile = await getOrCreateAvatarProfile(userId);
+  const result = await pool.query(
+    `SELECT
+       bg.item_name AS background_name, bg.id AS background_id,
+       eff.item_name AS effect_name, eff.id AS effect_id,
+       pet.item_name AS pet_name, pet.id AS pet_id,
+       foot.item_name AS footwear_name, foot.id AS footwear_id,
+       bot.item_name AS bottom_name, bot.id AS bottom_id,
+       top.item_name AS top_name, top.id AS top_id,
+       head.item_name AS headwear_name, head.id AS headwear_id,
+       acc.item_name AS accessory_name, acc.id AS accessory_id
+     FROM avatar_profiles ap
+     LEFT JOIN user_inventory bg   ON bg.id = ap.equipped_background_id
+     LEFT JOIN user_inventory eff  ON eff.id = ap.equipped_effect_id
+     LEFT JOIN user_inventory pet  ON pet.id = ap.equipped_pet_id
+     LEFT JOIN user_inventory foot ON foot.id = ap.equipped_footwear_id
+     LEFT JOIN user_inventory bot  ON bot.id = ap.equipped_bottom_id
+     LEFT JOIN user_inventory top  ON top.id = ap.equipped_top_id
+     LEFT JOIN user_inventory head ON head.id = ap.equipped_headwear_id
+     LEFT JOIN user_inventory acc  ON acc.id = ap.equipped_accessory_id
+     WHERE ap.user_id = $1`,
+    [userId]
+  );
+  const row = result.rows[0] || {};
+  const equipped = {};
+  for (const slot of AVATAR_SLOTS) {
+    equipped[slot] = row[`${slot}_name`] ? { item_name: row[`${slot}_name`], inventory_id: row[`${slot}_id`] } : null;
+  }
+  return { profile, equipped };
+}
+
+// Validates ownership + slot match, then equips. Returns { ok, message }.
+async function equipAvatarItem(userId, slot, inventoryId) {
+  if (!AVATAR_SLOTS.includes(slot)) return { ok: false, message: 'Unknown slot.' };
+
+  const itemResult = await pool.query(
+    `SELECT ui.*, si.avatar_slot AS shop_avatar_slot
+     FROM user_inventory ui
+     LEFT JOIN shop_items si ON si.id = ui.item_id
+     WHERE ui.id = $1 AND ui.user_id = $2
+     LIMIT 1`,
+    [inventoryId, userId]
+  );
+  const item = itemResult.rows[0];
+  if (!item) return { ok: false, message: 'You do not own that item.' };
+
+  const resolvedSlot = item.shop_avatar_slot || inferAvatarSlotFromItem(item);
+  if (resolvedSlot !== slot) {
+    return { ok: false, message: `**${item.item_name}** is a ${AVATAR_SLOT_LABELS[resolvedSlot] || resolvedSlot} item, not ${AVATAR_SLOT_LABELS[slot] || slot}.` };
+  }
+
+  await getOrCreateAvatarProfile(userId);
+  await pool.query(
+    `UPDATE avatar_profiles SET equipped_${slot}_id = $1, updated_at = NOW() WHERE user_id = $2`,
+    [inventoryId, userId]
+  );
+  return { ok: true, message: `Equipped **${item.item_name}**.` };
+}
+
+async function unequipAvatarSlot(userId, slot) {
+  if (!AVATAR_SLOTS.includes(slot)) return { ok: false, message: 'Unknown slot.' };
+  await getOrCreateAvatarProfile(userId);
+  await pool.query(`UPDATE avatar_profiles SET equipped_${slot}_id = NULL, updated_at = NOW() WHERE user_id = $1`, [userId]);
+  return { ok: true, message: `Unequipped ${AVATAR_SLOT_LABELS[slot] || slot}.` };
+}
+
+async function updateAvatarBodyCustomization(userId, { build, silhouette, skinTone }) {
+  await getOrCreateAvatarProfile(userId);
+  const sets = [];
+  const values = [];
+  let i = 1;
+  if (build) { sets.push(`build = $${i++}`); values.push(build); }
+  if (silhouette) { sets.push(`silhouette = $${i++}`); values.push(silhouette); }
+  if (skinTone) { sets.push(`skin_tone = $${i++}`); values.push(skinTone); }
+  if (!sets.length) return;
+  sets.push('updated_at = NOW()');
+  values.push(userId);
+  await pool.query(`UPDATE avatar_profiles SET ${sets.join(', ')} WHERE user_id = $${i}`, values);
+}
+
+// Uses avatarColorForItem's keyword match if the item name matches something
+// recognized, otherwise falls back to a deterministic hash color so unrecognized
+// items still render visually distinct instead of collapsing onto one default.
+function avatarResolvedColor(itemName, fallbackHex) {
+  const matched = avatarColorForItem(itemName, null);
+  if (matched) return [...avatarHexToRgb(matched, avatarHexToRgb(fallbackHex)), 255];
+  return [...avatarDeterministicColor(itemName).slice(0, 3), 255];
+}
+
+// equipped: { top: {item_name}|null, bottom: ..., headwear: ..., accessory: ...,
+// footwear: ..., pet: ..., effect: ..., background: ... } — caller resolves which set
+// to pass (real equip state, or real state with one slot swapped for a shop preview).
+function renderAvatarProfilePng(profile, equipped) {
+  const width = 900;
+  const height = 1200;
+  const scale = AVATAR_BUILD_SCALE[profile.build] || 1.0;
+  const skin = AVATAR_SKIN_TONES[profile.skin_tone] || AVATAR_SKIN_TONES.medium;
+  const silhouette = AVATAR_SILHOUETTES.includes(profile.silhouette) ? profile.silhouette : 'a';
+
+  const topName = equipped.top?.item_name || 'Basic Tee';
+  const bottomName = equipped.bottom?.item_name || 'Plain Shorts';
+  const headwearName = equipped.headwear?.item_name || null;
+  const accessoryName = equipped.accessory?.item_name || null;
+  const footwearName = equipped.footwear?.item_name || 'Basic Sneakers';
+  const petName = equipped.pet?.item_name || null;
+  const effectName = equipped.effect?.item_name || null;
+  const backgroundName = equipped.background?.item_name || 'Locker Room';
+
+  const bgLower = String(backgroundName).toLowerCase();
+  const bg = bgLower.includes('court') ? [120, 53, 15, 255]
+    : bgLower.includes('tunnel') ? [17, 24, 39, 255]
+    : bgLower.includes('locker') ? [24, 24, 27, 255]
+    : avatarDeterministicColor(backgroundName).slice(0, 3).concat(255);
+
+  const img = avatarCanvas(width, height, bg);
+  const gold = [250, 204, 21, 255];
+  const black = [15, 23, 42, 255];
+  const topColor = avatarResolvedColor(topName, '#ffffff');
+  const bottomColor = avatarResolvedColor(bottomName, '#2f3542');
+  const shoeColor = avatarResolvedColor(footwearName, '#f8fafc');
+  const accColor = accessoryName ? avatarResolvedColor(accessoryName, '#f5d742') : gold;
+  const headColor = headwearName ? avatarResolvedColor(headwearName, '#374151') : null;
+
+  // panel/background frame
+  avatarRect(img, width, height, 65, 75, 770, 1050, [0, 0, 0, 55]);
+  avatarRect(img, width, height, 70, 80, 10, 1040, gold);
+
+  // effect/aura — any equipped effect glows, not just keyword-matched names
+  if (effectName) {
+    for (let r = 260; r > 0; r -= 8) {
+      avatarEllipse(img, width, height, 450, 570, r, r, [...avatarDeterministicColor(effectName).slice(0, 3), Math.max(8, Math.floor(60 * (1 - r / 270)))]);
+    }
+  }
+
+  // shadow
+  avatarEllipse(img, width, height, 450, 1015, 220, 38, [0, 0, 0, 95]);
+
+  // legs and body (thickness scaled by build)
+  const limbW = Math.round(40 * scale);
+  avatarLine(img, width, height, 385, 675, 380, 960, limbW, skin);
+  avatarLine(img, width, height, 515, 675, 520, 960, limbW, skin);
+
+  // shorts/bottom (width scaled by build)
+  const legW = Math.round(105 * Math.min(scale, 1.2));
+  avatarRect(img, width, height, 345, 655, legW, 210, bottomColor);
+  avatarRect(img, width, height, 450, 655, legW, 210, bottomColor);
+  avatarRect(img, width, height, 345, 655, 210, 70, bottomColor);
+
+  // shoes
+  avatarEllipse(img, width, height, 375, 995, 70, 35, shoeColor);
+  avatarEllipse(img, width, height, 525, 995, 70, 35, shoeColor);
+  avatarRect(img, width, height, 330, 1000, 95, 8, black);
+  avatarRect(img, width, height, 475, 1000, 95, 8, black);
+
+  // arms (thickness scaled by build)
+  const armW = Math.round(28 * scale);
+  avatarLine(img, width, height, 345, 465, 250, 675, armW, skin);
+  avatarLine(img, width, height, 555, 465, 650, 675, armW, skin);
+  avatarEllipse(img, width, height, 245, 685, 30, 30, skin);
+  avatarEllipse(img, width, height, 655, 685, 30, 30, skin);
+
+  // torso/top (width scaled by build — wider shoulders for built/heavy)
+  const torsoSpread = Math.round(30 * (scale - 1));
+  avatarTriangle(img, width, height, [[320 - torsoSpread, 455], [580 + torsoSpread, 455], [545 + torsoSpread / 2, 690]], topColor);
+  avatarTriangle(img, width, height, [[320 - torsoSpread, 455], [545 + torsoSpread / 2, 690], [355 - torsoSpread / 2, 690]], topColor);
+  avatarLine(img, width, height, 340, 470, 255, 650, 32, topColor);
+  avatarLine(img, width, height, 560, 470, 645, 650, 32, topColor);
+
+  // neck/head/hair — silhouette 'a' vs 'b' gives a different hair shape
+  avatarRect(img, width, height, 410, 400, 80, 80, skin);
+  avatarEllipse(img, width, height, 450, 330, 90, 95, skin);
+  if (silhouette === 'b') {
+    avatarEllipse(img, width, height, 450, 270, 105, 60, black);
+    avatarRect(img, width, height, 345, 270, 210, 40, black);
+  } else {
+    avatarEllipse(img, width, height, 450, 285, 92, 45, black);
+  }
+
+  // face
+  const hasShades = headwearName && (String(headwearName).toLowerCase().includes('shades') || String(headwearName).toLowerCase().includes('betting'));
+  if (hasShades) {
+    avatarRect(img, width, height, 385, 315, 55, 28, black);
+    avatarRect(img, width, height, 460, 315, 55, 28, black);
+    avatarRect(img, width, height, 435, 327, 30, 8, black);
+  } else {
+    avatarEllipse(img, width, height, 420, 330, 7, 7, black);
+    avatarEllipse(img, width, height, 480, 330, 7, 7, black);
+  }
+  avatarLine(img, width, height, 420, 370, 480, 370, 3, [124, 45, 18, 255]);
+
+  // headwear — any equipped hat draws a generic cap; recognized keywords add a bonus
+  if (headwearName && !hasShades) {
+    avatarEllipse(img, width, height, 450, 275, 100, 55, headColor);
+    avatarRect(img, width, height, 350, 275, 200, 15, headColor);
+    if (String(headwearName).toLowerCase().includes('crown')) {
+      avatarTriangle(img, width, height, [[370, 250], [405, 170], [430, 250]], gold);
+      avatarTriangle(img, width, height, [[425, 250], [450, 180], [480, 250]], gold);
+      avatarTriangle(img, width, height, [[475, 250], [510, 170], [535, 250]], gold);
+      avatarRect(img, width, height, 370, 245, 165, 30, gold);
+    }
+  }
+
+  // accessory — any equipped accessory draws a generic neck accent; recognized
+  // keywords add bonus shapes
+  if (accessoryName) {
+    avatarLine(img, width, height, 395, 455, 450, 500, 7, accColor);
+    avatarLine(img, width, height, 505, 455, 450, 500, 7, accColor);
+    const accLower = String(accessoryName).toLowerCase();
+    if (accLower.includes('watch')) avatarRect(img, width, height, 625, 640, 50, 30, gold);
+    if (accLower.includes('wristband')) avatarRect(img, width, height, 220, 640, 55, 30, gold);
+  }
+
+  // GG on shirt
+  avatarRect(img, width, height, 405, 530, 90, 55, [0, 0, 0, 70]);
+
+  // pet — any equipped pet draws a generic companion shape
+  if (petName) {
+    const petColor = [...avatarDeterministicColor(petName).slice(0, 3), 255];
+    avatarEllipse(img, width, height, 675, 930, 75, 50, petColor);
+    avatarEllipse(img, width, height, 640, 895, 35, 35, petColor);
+    avatarEllipse(img, width, height, 630, 888, 5, 5, black);
+    avatarEllipse(img, width, height, 650, 888, 5, 5, black);
+  }
+
+  return avatarEncodePng(width, height, img);
+}
+
+function buildAvatarProfileAttachment(profile, equipped) {
+  const png = renderAvatarProfilePng(profile, equipped);
+  return new AttachmentBuilder(png, { name: 'avatar.png' });
+}
+
+// ---------------------------------------------------------------------------
+// Locker Room — equip/swap owned items. No shopping here by design (separate panel,
+// per the "locker room vs shop" decision).
+// ---------------------------------------------------------------------------
+
+function buildAvatarLockerEmbed(user, profile, equipped) {
+  const NL = String.fromCharCode(10);
+  const lines = AVATAR_SLOTS.map(slot => `${AVATAR_SLOT_LABELS[slot]}: ${equipped[slot]?.item_name || 'none'}`);
+  return new EmbedBuilder()
+    .setTitle(`🔒 ${user.username} • Locker Room`)
+    .setColor(0xFEE75C)
+    .setImage('attachment://avatar.png')
+    .setDescription(lines.join(NL))
+    .setFooter({ text: `GG Sports • Build: ${profile.build} • Silhouette: ${profile.silhouette.toUpperCase()} • Skin: ${profile.skin_tone}` })
+    .setTimestamp();
+}
+
+function buildAvatarLockerComponents() {
+  const slotMenu = new StringSelectMenuBuilder()
+    .setCustomId('avatarlocker_slot_select')
+    .setPlaceholder('Manage a slot')
+    .addOptions(AVATAR_SLOTS.map(slot => ({ label: AVATAR_SLOT_LABELS[slot], value: slot })));
+  return [
+    new ActionRowBuilder().addComponents(slotMenu),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('avatarlocker_customize').setLabel('Customize Body').setEmoji('🧍').setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+async function getOwnedItemsForAvatarSlot(userId, slot) {
+  const result = await pool.query(
+    `SELECT ui.id, ui.item_name, si.avatar_slot AS shop_avatar_slot, si.item_category
+     FROM user_inventory ui
+     LEFT JOIN shop_items si ON si.id = ui.item_id
+     WHERE ui.user_id = $1
+     ORDER BY ui.purchased_at DESC`,
+    [userId]
+  );
+  return result.rows.filter(row => (row.shop_avatar_slot || inferAvatarSlotFromItem(row)) === slot);
+}
+
+async function buildAvatarLockerSlotPayload(user, profile, equipped, slot) {
+  const ownedItems = await getOwnedItemsForAvatarSlot(user.id, slot);
+  const options = [
+    { label: 'Unequip', value: '__unequip__', description: `Remove ${AVATAR_SLOT_LABELS[slot]}`, emoji: '🚫' },
+    ...ownedItems.slice(0, 24).map(item => ({ label: item.item_name.slice(0, 100), value: item.id })),
+  ];
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`avatarlocker_item_select:${slot}`)
+    .setPlaceholder(ownedItems.length ? `Choose a ${AVATAR_SLOT_LABELS[slot]} item` : `No owned ${AVATAR_SLOT_LABELS[slot]} items yet`)
+    .addOptions(options);
+  return {
+    content: null,
+    embeds: [buildAvatarLockerEmbed(user, profile, equipped)],
+    files: [buildAvatarProfileAttachment(profile, equipped)],
+    components: [
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)),
+    ],
+  };
+}
+
+function buildAvatarCustomizeComponents() {
+  const buildMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_build').setPlaceholder('Choose build')
+    .addOptions(AVATAR_BUILDS.map(b => ({ label: b.charAt(0).toUpperCase() + b.slice(1), value: b })));
+  const silhouetteMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_silhouette').setPlaceholder('Choose silhouette')
+    .addOptions([{ label: 'Silhouette A', value: 'a' }, { label: 'Silhouette B', value: 'b' }]);
+  const skinMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_skin').setPlaceholder('Choose skin tone')
+    .addOptions(Object.keys(AVATAR_SKIN_TONES).map(t => ({ label: t.charAt(0).toUpperCase() + t.slice(1), value: t })));
+  return [
+    new ActionRowBuilder().addComponents(buildMenu),
+    new ActionRowBuilder().addComponents(silhouetteMenu),
+    new ActionRowBuilder().addComponents(skinMenu),
+    new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Avatar Shop — "Go Shopping": category hub + dressing-room preview before buying.
+// Items still come from the current guild's local shop_items catalog (avatar_slot +
+// is_cosmetic) — full cross-server catalog visibility is Shop Catalog Tooling (build
+// order #5), not required for this to work.
+// ---------------------------------------------------------------------------
+
+const AVATAR_SHOP_CATEGORIES = [
+  { slot: 'top', label: 'Tops', emoji: '👕' },
+  { slot: 'bottom', label: 'Bottoms', emoji: '🩳' },
+  { slot: 'footwear', label: 'Shoes', emoji: '👟' },
+  { slot: 'headwear', label: 'Hats', emoji: '🧢' },
+  { slot: 'accessory', label: 'Accessories', emoji: '💍' },
+  { slot: 'background', label: 'Backgrounds', emoji: '🖼️' },
+  { slot: 'effect', label: 'Auras', emoji: '✨' },
+  { slot: 'exclusive', label: 'Exclusives', emoji: '🌟' },
+];
+const AVATAR_SHOP_PAGE_SIZE = 10;
+
+function buildAvatarShopHomeEmbed(user) {
+  return new EmbedBuilder()
+    .setTitle(`🛍️ ${user.username} • Avatar Shop`)
+    .setColor(0xFEE75C)
+    .setImage('attachment://avatar.png')
+    .setDescription('Pick a section to browse. Selecting an item previews it on your avatar before you buy — nothing charges until you hit Buy.')
+    .setFooter({ text: 'GG Sports • Avatar Shop' })
+    .setTimestamp();
+}
+
+function buildAvatarShopHomeComponents() {
+  const rows = [];
+  for (let i = 0; i < AVATAR_SHOP_CATEGORIES.length; i += 4) {
+    rows.push(new ActionRowBuilder().addComponents(
+      AVATAR_SHOP_CATEGORIES.slice(i, i + 4).map(cat =>
+        new ButtonBuilder().setCustomId(`avatarshop_category:${cat.slot}:0`).setLabel(cat.label).setEmoji(cat.emoji).setStyle(ButtonStyle.Primary)
+      )
+    ));
+  }
+  return rows;
+}
+
+async function fetchAvatarShopItems(guildId, categorySlot, page) {
+  const offset = page * AVATAR_SHOP_PAGE_SIZE;
+  if (categorySlot === 'exclusive') {
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE`,
+      [guildId]
+    );
+    const itemsResult = await pool.query(
+      `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE ORDER BY price ASC LIMIT $2 OFFSET $3`,
+      [guildId, AVATAR_SHOP_PAGE_SIZE, offset]
+    );
+    return { items: itemsResult.rows, total: countResult.rows[0]?.count || 0 };
+  }
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2`,
+    [guildId, categorySlot]
+  );
+  const itemsResult = await pool.query(
+    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 ORDER BY price ASC LIMIT $3 OFFSET $4`,
+    [guildId, categorySlot, AVATAR_SHOP_PAGE_SIZE, offset]
+  );
+  return { items: itemsResult.rows, total: countResult.rows[0]?.count || 0 };
+}
+
+function buildAvatarShopCategoryEmbed(categorySlot, items, page, total, settings) {
+  const cat = AVATAR_SHOP_CATEGORIES.find(c => c.slot === categorySlot) || { label: categorySlot, emoji: '🛍️' };
+  const totalPages = Math.max(1, Math.ceil(total / AVATAR_SHOP_PAGE_SIZE));
+  const NL = String.fromCharCode(10);
+  return new EmbedBuilder()
+    .setTitle(`${cat.emoji} ${cat.label}`)
+    .setColor(0xFEE75C)
+    .setImage('attachment://avatar.png')
+    .setDescription(items.length
+      ? items.map(item => `${rarityIcon(item.rarity)} **${item.item_name}** — ${settings.currency_icon} ${item.price}`).join(NL)
+      : 'Nothing here yet.')
+    .setFooter({ text: `GG Sports • Avatar Shop • Page ${page + 1}/${totalPages}` })
+    .setTimestamp();
+}
+
+function buildAvatarShopCategoryComponents(categorySlot, items, page, total) {
+  const totalPages = Math.max(1, Math.ceil(total / AVATAR_SHOP_PAGE_SIZE));
+  const rows = [];
+  if (items.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`avatarshop_preview_select:${categorySlot}:${page}`)
+        .setPlaceholder('Preview an item')
+        .addOptions(items.slice(0, 25).map(item => ({
+          label: item.item_name.slice(0, 100),
+          description: `${item.price} • ${item.rarity || 'common'}`.slice(0, 100),
+          value: item.id,
+        })))
+    ));
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page - 1}`).setLabel('◀ Prev').setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+    new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(page + 1 >= totalPages),
+    new ButtonBuilder().setCustomId('avatarshop_home').setLabel('⬅ Shop Hub').setStyle(ButtonStyle.Secondary),
+  ));
+  return rows;
+}
+
+function buildAvatarShopPreviewPayload(profile, equipped, previewItem, categorySlot, page, settings) {
+  const slotForPreview = categorySlot === 'exclusive' ? (previewItem.avatar_slot || inferAvatarSlotFromItem(previewItem)) : categorySlot;
+  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name } };
+  const embed = new EmbedBuilder()
+    .setTitle(`👗 Dressing Room • ${previewItem.item_name}`)
+    .setColor(0xFEE75C)
+    .setImage('attachment://avatar.png')
+    .addFields(
+      { name: 'Price', value: `${settings.currency_icon} ${previewItem.price}`, inline: true },
+      { name: 'Rarity', value: `${rarityIcon(previewItem.rarity)} ${previewItem.rarity || 'common'}`, inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Avatar Shop • Dressing room preview — nothing purchased yet' })
+    .setTimestamp();
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`avatarshop_buy:${previewItem.id}:${categorySlot}:${page}`).setLabel('Buy').setEmoji('💳').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page}`).setLabel('⬅ Back').setStyle(ButtonStyle.Secondary),
+  );
+  return {
+    content: null,
+    embeds: [embed],
+    files: [buildAvatarProfileAttachment(profile, previewEquipped)],
+    components: [buttons],
+  };
+}
+
+// Deducts currency, creates the owned inventory row, and auto-equips it. Returns
+// { ok, message } or { ok, item, inventoryId }.
+async function performAvatarShopPurchase(interaction, itemId) {
+  const settings = await getCurrencySettings(interaction.guild.id);
+  const itemResult = await pool.query(
+    `SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 AND is_active = TRUE LIMIT 1`,
+    [itemId, interaction.guild.id]
+  );
+  const item = itemResult.rows[0];
+  if (!item) return { ok: false, message: 'That item is no longer available.' };
+
+  const balance = await getBalance(interaction.guild.id, interaction.user.id);
+  if (Number(balance.balance) < item.price) {
+    return { ok: false, message: `You do not have enough ${settings.currency_name} for **${item.item_name}** (${settings.currency_icon} ${item.price}).` };
+  }
+
+  const removed = await removeCurrency(interaction.guild.id, interaction.user.id, item.price, 'avatar_shop_purchase', `Bought ${item.item_name}`, interaction.user.id);
+  if (!removed) return { ok: false, message: 'Purchase failed — insufficient balance.' };
+
+  const inventoryId = randomUUID();
+  await pool.query(
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status)
+     VALUES ($1, $2, $3, $4, $5, $6, 'owned')`,
+    [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+  );
+
+  const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
+  await equipAvatarItem(interaction.user.id, slot, inventoryId);
+
+  return { ok: true, item, inventoryId };
 }
 
 function buildVisualAvatarPng(userLabel, avatar, preview = {}) {
