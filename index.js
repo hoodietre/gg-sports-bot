@@ -2781,7 +2781,8 @@ function buildCommands() {
         ))
         .addIntegerOption(o => o.setName('min').setDescription('Minimum allowed value').setRequired(true))
         .addIntegerOption(o => o.setName('max').setDescription('Maximum allowed value').setRequired(true)))
-      .addSubcommand(sc => sc.setName('currencyconfig').setDescription('View the current global currency identity and payout bounds')),
+      .addSubcommand(sc => sc.setName('currencyconfig').setDescription('View the current global currency identity and payout bounds'))
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open the bot owner control panel (buttons instead of typing subcommands)')),
 
     new SlashCommandBuilder()
       .setName('teamroster')
@@ -12253,21 +12254,140 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       if (subcommand === 'currencyconfig') {
         await loadCurrencyConfig();
-        const embed = new EmbedBuilder()
-          .setTitle('Global Currency Configuration')
-          .setColor(0xFEE75C)
-          .addFields(
-            { name: 'Currency', value: `${currencyConfigCache.currency_icon} ${currencyConfigCache.currency_name}`, inline: false },
-            { name: 'Win Payout Range', value: `${currencyConfigCache.win_payout_min}–${currencyConfigCache.win_payout_max}`, inline: true },
-            { name: 'Game Played Payout Range', value: `${currencyConfigCache.game_played_payout_min}–${currencyConfigCache.game_played_payout_max}`, inline: true },
-            { name: 'Award Payout Range', value: `${currencyConfigCache.award_payout_min}–${currencyConfigCache.award_payout_max}`, inline: true },
-          )
-          .setFooter({ text: 'GG Sports • Bot Owner • Applies to every server' })
-          .setTimestamp();
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.reply({ embeds: [buildBotOwnerCurrencyConfigEmbed()], ephemeral: true });
         return;
       }
 
+      if (subcommand === 'panel') {
+        await showBotOwnerPanelHome(interaction, { update: false });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_back') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      await showBotOwnerPanelHome(interaction, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_status') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      await interaction.deferUpdate();
+      const embed = await buildBotOwnerStatusEmbed(client);
+      await interaction.editReply({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_guilds') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      const embed = buildBotOwnerGuildsEmbed(client);
+      await interaction.update({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyconfig') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      await loadCurrencyConfig();
+      await interaction.update({ embeds: [buildBotOwnerCurrencyConfigEmbed()], components: [buildBotOwnerPanelBackRow()] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyidentity_edit') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('botownerpanel_currencyidentity_modal')
+        .setTitle('Edit Global Currency Identity')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Currency name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40).setValue(currencyConfigCache.currency_name)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('icon').setLabel('Currency icon/emoji').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(16).setValue(currencyConfigCache.currency_icon)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'botownerpanel_currencyidentity_modal') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      const name = interaction.fields.getTextInputValue('name').trim();
+      const icon = interaction.fields.getTextInputValue('icon').trim();
+
+      if (!name || name.length > 40) { await interaction.reply({ content: 'Currency name must be 1-40 characters.', ephemeral: true }); return; }
+      if (!icon || icon.length > 16) { await interaction.reply({ content: 'Currency icon must be 1-16 characters.', ephemeral: true }); return; }
+
+      await pool.query(
+        `UPDATE system_currency_config SET currency_name = $1, currency_icon = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
+        [name, icon, interaction.user.id]
+      );
+      await loadCurrencyConfig();
+
+      await interaction.reply({
+        content: `Global currency identity updated to **${icon} ${name}**. Applies across every server immediately.`,
+        embeds: [buildBotOwnerCurrencyConfigEmbed()],
+        components: [buildBotOwnerPanelBackRow()],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_payoutbounds_edit') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('botownerpanel_payoutbounds_select')
+        .setPlaceholder('Choose a payout type to edit')
+        .addOptions(CURRENCY_PAYOUT_TYPES.map(type => ({
+          label: CURRENCY_PAYOUT_TYPE_LABELS[type],
+          value: type,
+          description: `Current range: ${currencyConfigCache[`${type}_min`]}–${currencyConfigCache[`${type}_max`]}`,
+        })));
+      await interaction.update({
+        content: null,
+        embeds: [buildBotOwnerCurrencyConfigEmbed()],
+        components: [new ActionRowBuilder().addComponents(menu), buildBotOwnerPanelBackRow()],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_payoutbounds_select') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      const type = interaction.values[0];
+      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', ephemeral: true }); return; }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`botownerpanel_payoutbounds_modal:${type}`)
+        .setTitle(`Edit ${CURRENCY_PAYOUT_TYPE_LABELS[type]} Bounds`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('min').setLabel('Minimum allowed value').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currencyConfigCache[`${type}_min`]))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max').setLabel('Maximum allowed value').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currencyConfigCache[`${type}_max`]))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_payoutbounds_modal:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      const type = interaction.customId.split(':')[1];
+      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', ephemeral: true }); return; }
+
+      const min = Number.parseInt(interaction.fields.getTextInputValue('min'), 10);
+      const max = Number.parseInt(interaction.fields.getTextInputValue('max'), 10);
+      if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max < 0 || min > max) {
+        await interaction.reply({ content: 'min/max must be whole numbers, min ≥ 0, and min cannot exceed max.', ephemeral: true });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE system_currency_config SET ${type}_min = $1, ${type}_max = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
+        [min, max, interaction.user.id]
+      );
+      await loadCurrencyConfig();
+
+      await interaction.reply({
+        content: `Global bounds for **${CURRENCY_PAYOUT_TYPE_LABELS[type]}** set to **${min}–${max}**. Existing per-server rates outside this range will be clamped the next time they're read or saved.`,
+        embeds: [buildBotOwnerCurrencyConfigEmbed()],
+        components: [buildBotOwnerPanelBackRow()],
+        ephemeral: true,
+      });
       return;
     }
 
@@ -52302,6 +52422,72 @@ function buildBotOwnerGuildsEmbed(client) {
     .setFooter({ text: 'GG Sports • Owner Monitoring' + (client.guilds.cache.size > 40 ? ' • showing top 40 by member count' : '') })
     .setTimestamp();
 }
+
+// ---------------------------------------------------------------------------
+// Bot Owner Panel — button/modal-driven front end over the /botowner
+// subcommands above, so the bot owner doesn't have to retype full slash
+// commands with options each time. Same pattern as the Admin/Commissioner/GM
+// panels: a home view with navigation, every interaction re-checks
+// isBotOwnerInteraction() independently (never trusts that only the owner can
+// see the ephemeral message).
+// ---------------------------------------------------------------------------
+
+function isBotOwnerInteraction(interaction) {
+  return !!botOwnerUserId && interaction.user.id === botOwnerUserId;
+}
+
+function buildBotOwnerPanelHomeEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🛠️ Bot Owner Panel')
+    .setColor(0x5865F2)
+    .setDescription('Bot-wide controls — not tied to any one server. Pick a button below. The underlying `/botowner` subcommands still work as manual backups.')
+    .setFooter({ text: 'GG Sports • Owner Monitoring' })
+    .setTimestamp();
+}
+
+function buildBotOwnerPanelHomeComponents() {
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('botownerpanel_status').setLabel('Status').setEmoji('🩺').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('botownerpanel_guilds').setLabel('Servers').setEmoji('🌐').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('botownerpanel_currencyconfig').setLabel('Currency Config').setEmoji('💰').setStyle(ButtonStyle.Primary),
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('botownerpanel_currencyidentity_edit').setLabel('Edit Currency Identity').setEmoji('✏️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('botownerpanel_payoutbounds_edit').setLabel('Edit Payout Bounds').setEmoji('📏').setStyle(ButtonStyle.Secondary),
+  );
+  return [row1, row2];
+}
+
+function buildBotOwnerPanelBackRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('botownerpanel_back').setLabel('⬅ Back to Panel').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+async function showBotOwnerPanelHome(interaction, { update = true } = {}) {
+  const payload = { content: null, embeds: [buildBotOwnerPanelHomeEmbed()], components: buildBotOwnerPanelHomeComponents() };
+  return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+}
+
+function buildBotOwnerCurrencyConfigEmbed() {
+  return new EmbedBuilder()
+    .setTitle('Global Currency Configuration')
+    .setColor(0xFEE75C)
+    .addFields(
+      { name: 'Currency', value: `${currencyConfigCache.currency_icon} ${currencyConfigCache.currency_name}`, inline: false },
+      { name: 'Win Payout Range', value: `${currencyConfigCache.win_payout_min}–${currencyConfigCache.win_payout_max}`, inline: true },
+      { name: 'Game Played Payout Range', value: `${currencyConfigCache.game_played_payout_min}–${currencyConfigCache.game_played_payout_max}`, inline: true },
+      { name: 'Award Payout Range', value: `${currencyConfigCache.award_payout_min}–${currencyConfigCache.award_payout_max}`, inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Bot Owner • Applies to every server' })
+    .setTimestamp();
+}
+
+const CURRENCY_PAYOUT_TYPE_LABELS = {
+  win_payout: 'Win Payout',
+  game_played_payout: 'Game Played Payout',
+  award_payout: 'Award Payout',
+};
 
 
 async function runMaddenExternalFetchSync(guild, league, options = {}) {
