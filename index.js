@@ -4252,12 +4252,25 @@ function isFcLeague(league) {
   return key.includes('fc ') || key.startsWith('fc') || key.includes('soccer') || key.includes('fifa') || key.includes('efootball');
 }
 
+// This was missing entirely — every check elsewhere in the bot that gates a
+// Madden-only feature behind `getLeagueSportKey(league) === 'madden'` was silently
+// always false, because nothing here ever returned 'madden'. A league explicitly set
+// to game_key = 'madden' (via /league game or /league create) fell through every
+// is*League() check above and landed on the generic 'other' fallback. That's the root
+// cause of Madden-only Commissioner Panel settings (League Leaders, Award Race, Madden
+// Free Agents, etc.) not appearing even for genuine Madden leagues.
+function isMaddenLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return key.includes('madden');
+}
+
 function getLeagueSportKey(league) {
   if (isMlbLeague(league)) return 'mlb';
   if (isNbaLeague(league)) return 'nba';
   if (isNhlLeague(league)) return 'nhl';
   if (isCfbLeague(league)) return 'cfb';
   if (isFcLeague(league)) return 'fc';
+  if (isMaddenLeague(league)) return 'madden';
   return 'other';
 }
 
@@ -8242,6 +8255,13 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         return;
       }
 
+      if (setupDashboardKind(selectedSetting) === 'multichannel') {
+        const panelType = MULTI_CHANNEL_DASHBOARD_MAP[selectedSetting];
+        const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType, 'dashboard');
+        await interaction.update(payload);
+        return;
+      }
+
       await refreshSetupDashboardInteraction(interaction, leagueId, selectedSetting, 'Selected setting: **' + setupDashboardLabel(selectedSetting) + '**. Now choose the role/channel below.');
       return;
     }
@@ -8380,7 +8400,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('multipanel_post:')) {
-      const [, leagueId, panelType] = interaction.customId.split(':');
+      const [, leagueId, panelType, origin] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
@@ -8409,14 +8429,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       await interaction.deferUpdate();
       await postOrRefreshMultiChannelPanel(interaction.guild, panelType, channel);
-      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType);
+      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType, origin);
       payload.content = `Posted/refreshed **${info.label}** in ${channel.toString()}.`;
       await interaction.editReply(payload);
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('multipanel_refreshall:')) {
-      const [, leagueId, panelType] = interaction.customId.split(':');
+      const [, leagueId, panelType, origin] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
@@ -8425,14 +8445,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       await interaction.deferUpdate();
       const result = await refreshAllMultiChannelPanelPostings(interaction.guild, panelType);
-      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType);
+      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType, origin);
       payload.content = `Refreshed ${result.refreshed}, reposted ${result.reposted}` + (result.failed ? `, ${result.failed} failed (channel deleted or missing permissions)` : '') + '.';
       await interaction.editReply(payload);
       return;
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('multipanel_remove:')) {
-      const [, leagueId, panelType] = interaction.customId.split(':');
+      const [, leagueId, panelType, origin] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
@@ -8442,17 +8462,21 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const channelId = interaction.values[0];
       await removeMultiChannelPanelPosting(interaction.guild.id, panelType, channelId);
       await interaction.deferUpdate();
-      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType);
+      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, leagueId, panelType, origin);
       payload.content = `Stopped tracking the posting in <#${channelId}> (the old message itself isn't auto-deleted from Discord — remove it manually if you want it gone).`;
       await interaction.editReply(payload);
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('multipanel_back:')) {
-      const leagueId = interaction.customId.split(':')[1];
+      const [, leagueId, origin] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+      if (origin === 'dashboard') {
+        await refreshSetupDashboardInteraction(interaction, leagueId, null);
         return;
       }
       await interaction.update({
@@ -8479,7 +8503,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       if (category === 'setup') {
         await interaction.update({
-          embeds: [buildSetupDashboardEmbed(league)],
+          embeds: [await buildSetupDashboardEmbed(interaction.guild, league)],
           components: buildSetupDashboardComponents(leagueId, null, getLeagueSportKey(league) === 'madden'),
         });
         return;
@@ -25162,8 +25186,6 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_announcement_channel', label: 'League Announcement Channel', description: 'Where announcements posted from the commissioner panel go', kind: 'channel' },
   { value: 'league_leaders_channel', label: 'League Leaders Channel', description: 'Live, switchable stat leaders board', kind: 'channel' },
   { value: 'award_race_channel', label: 'Award Race Channel', description: 'Live, switchable MVP/OPOY/DPOY/OROY/DROY race board', kind: 'channel' },
-  { value: 'member_profile_channel', label: 'Member Profile Channel', description: 'Panel for members to open their profile', kind: 'channel' },
-  { value: 'bank_channel', label: 'Bank Channel', description: 'Panel for members to check balance, transfer currency, view purchases', kind: 'channel' },
   { value: 'league_rules_channel', label: 'League Rules Channel', description: 'Where the posted league rules embed lives', kind: 'channel' },
   { value: 'playoff_bracket_channel', label: 'Playoff Bracket Channel', description: 'Live, auto-updating playoff bracket embed', kind: 'channel' },
   { value: 'game_thread_channel', label: 'Game Thread Channel', description: 'Channel where weekly game threads are auto-created', kind: 'channel' },
@@ -25174,8 +25196,12 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
   { value: 'madden_sportsbook_channel', label: 'Madden Sportsbook Channel', description: 'Channel for Madden betting lines (user vs user games)', kind: 'channel' },
-  { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed', kind: 'channel' },
-  { value: 'shop_channel', label: 'Shop Channel', description: 'Permanent shop panel channel', kind: 'channel' },
+  { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed only — not where the board itself posts, see "Sportsbook Board" below', kind: 'channel' },
+  { value: 'shop_panel_channels', label: 'Shop Panel', description: 'Manage which channel(s) the shop panel is posted in — can be more than one', kind: 'multichannel' },
+  { value: 'sportsbook_panel_channels', label: 'Sportsbook Board', description: 'Manage which channel(s) the live sportsbook board is posted in — can be more than one', kind: 'multichannel' },
+  { value: 'marketplace_panel_channels', label: 'Marketplace Panel', description: 'Manage which channel(s) the marketplace panel is posted in — can be more than one', kind: 'multichannel' },
+  { value: 'bank_panel_channels', label: 'Bank Starter', description: 'Manage which channel(s) the bank starter panel is posted in — can be more than one', kind: 'multichannel' },
+  { value: 'profile_panel_channels', label: 'Member Profile Starter', description: 'Manage which channel(s) the member profile starter panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
   { value: 'trade_offer_channel', label: 'Trade Offer Channel', description: 'Trade offer panel channel', kind: 'channel' },
   { value: 'trade_committee_channel', label: 'Trade Committee Channel', description: 'Trade voting channel', kind: 'channel' },
@@ -25186,6 +25212,16 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'ticket_channel', label: 'Ticket Channel', description: 'Ticket panel channel', kind: 'channel' },
   { value: 'support_channel', label: 'Support Channel', description: 'Support panel channel', kind: 'channel' },
 ];
+
+// Dashboard keys that open the multi-channel panel manager instead of a plain
+// role/channel select — see MULTI_CHANNEL_SETUP_PANEL_MAP's panelType values.
+const MULTI_CHANNEL_DASHBOARD_MAP = {
+  shop_panel_channels: 'shop',
+  sportsbook_panel_channels: 'sportsbook',
+  marketplace_panel_channels: 'marketplace',
+  bank_panel_channels: 'bank',
+  profile_panel_channels: 'profile',
+};
 
 const SETUP_PANEL_OPTIONS = [
   { value: 'standings_panel', label: 'Create/Refresh Standings Panel (generic, non-Madden)' },
@@ -25221,7 +25257,7 @@ const MULTI_CHANNEL_SETUP_PANEL_MAP = {
   marketplace_panel: 'marketplace',
 };
 
-async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType) {
+async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType, origin = 'panels') {
   const info = getMultiChannelPanelInfo(panelType);
   const postings = await listMultiChannelPanelPostings(guild.id, panelType);
   const NL = String.fromCharCode(10);
@@ -25237,7 +25273,7 @@ async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType) 
 
   const rows = [new ActionRowBuilder().addComponents(
     new ChannelSelectMenuBuilder()
-      .setCustomId(`multipanel_post:${leagueId}:${panelType}`)
+      .setCustomId(`multipanel_post:${leagueId}:${panelType}:${origin}`)
       .setPlaceholder('Post/refresh in a channel')
       .setChannelTypes(ChannelType.GuildText)
       .setMinValues(1)
@@ -25246,7 +25282,7 @@ async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType) 
 
   if (postings.length) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`multipanel_refreshall:${leagueId}:${panelType}`).setLabel('🔄 Refresh All Postings').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId(`multipanel_refreshall:${leagueId}:${panelType}:${origin}`).setLabel('🔄 Refresh All Postings').setStyle(ButtonStyle.Primary)
     ));
 
     const channelLabels = await Promise.all(postings.map(async p => {
@@ -25256,14 +25292,14 @@ async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType) 
 
     rows.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId(`multipanel_remove:${leagueId}:${panelType}`)
+        .setCustomId(`multipanel_remove:${leagueId}:${panelType}:${origin}`)
         .setPlaceholder('Remove a posting')
         .addOptions(postings.slice(0, 25).map((p, i) => ({ label: channelLabels[i].slice(0, 100), value: p.channel_id })))
     ));
   }
 
   rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`multipanel_back:${leagueId}`).setLabel('⬅ Back to Panels').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`multipanel_back:${leagueId}:${origin}`).setLabel(origin === 'dashboard' ? '⬅ Back to Channels & Roles' : '⬅ Back to Panels').setStyle(ButtonStyle.Secondary)
   ));
 
   return { content: null, embeds: [embed], components: rows };
@@ -25330,7 +25366,7 @@ function setupDashboardFormatValue(league, settingKey) {
   return setupDashboardKind(settingKey) === 'role' ? '<@&' + value + '>' : '<#' + value + '>';
 }
 
-function buildSetupDashboardEmbed(league) {
+async function buildSetupDashboardEmbed(guild, league) {
   const isMadden = getLeagueSportKey(league) === 'madden';
   const channelKeyLabels = [
     ['standings_channel', 'Standings'],
@@ -25343,8 +25379,6 @@ function buildSetupDashboardEmbed(league) {
     ['league_announcement_channel', 'League Announcement'],
     ['league_leaders_channel', 'League Leaders'],
     ['award_race_channel', 'Award Race'],
-    ['member_profile_channel', 'Member Profile'],
-    ['bank_channel', 'Bank'],
     ['league_rules_channel', 'League Rules'],
     ['playoff_bracket_channel', 'Playoff Bracket'],
     ['game_thread_channel', 'Game Threads'],
@@ -25355,8 +25389,7 @@ function buildSetupDashboardEmbed(league) {
     ['madden_standings_channel', 'Madden Standings Board'],
     ['madden_power_rankings_channel', 'Madden Power Rankings Board'],
     ['madden_sportsbook_channel', 'Madden Sportsbook'],
-    ['sportsbook_channel', 'Sportsbook'],
-    ['shop_channel', 'Shop'],
+    ['sportsbook_channel', 'Sportsbook Feed'],
     ['tournament_channel', 'Tournament'],
     ['ticket_channel', 'Tickets'],
     ['support_channel', 'Support'],
@@ -25380,6 +25413,19 @@ function buildSetupDashboardEmbed(league) {
     'Trade Committee: ' + setupDashboardFormatValue(league, 'trade_committee_role'),
   ];
 
+  const multiChannelPanelTypes = [
+    ['shop', 'Shop'],
+    ['sportsbook', 'Sportsbook Board'],
+    ['marketplace', 'Marketplace'],
+    ['bank', 'Bank Starter'],
+    ['profile', 'Member Profile Starter'],
+  ];
+  const multiChannelCounts = await Promise.all(multiChannelPanelTypes.map(([panelType]) => listMultiChannelPanelPostings(guild.id, panelType)));
+  const multiChannelLines = multiChannelPanelTypes.map(([, label], i) => {
+    const count = multiChannelCounts[i].length;
+    return `${label}: ` + (count ? `posted in ${count} channel${count === 1 ? '' : 's'}` : 'Not posted anywhere yet');
+  });
+
   return new EmbedBuilder()
     .setTitle(`${GG_EMOJI} GG Sports Setup Dashboard`)
     .setColor(0x5865F2)
@@ -25387,6 +25433,7 @@ function buildSetupDashboardEmbed(league) {
     .addFields(
       { name: 'Roles', value: roleLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Core Channels', value: channelLines.join(String.fromCharCode(10)), inline: false },
+      { name: 'Multi-Channel Panels', value: multiChannelLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Trade Setup', value: tradeLines.join(String.fromCharCode(10)), inline: false }
     )
     .setFooter({ text: 'GG Sports • Interactive Setup' })
@@ -25455,7 +25502,7 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMadde
           .setMinValues(1)
           .setMaxValues(1)
       ));
-    } else {
+    } else if (kind === 'channel') {
       rows.push(new ActionRowBuilder().addComponents(
         new ChannelSelectMenuBuilder()
           .setCustomId('setup_pick_channel:' + leagueId + ':' + selectedSetting)
@@ -25465,6 +25512,8 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMadde
           .setMaxValues(1)
       ));
     }
+    // kind === 'multichannel' is handled by swapping to buildMultiChannelPanelManagerPayload
+    // entirely (see the setup_select_setting handler) rather than an inline picker here.
   }
 
   rows.push(buildCommissionerBackRow(leagueId));
@@ -25478,7 +25527,7 @@ async function refreshSetupDashboardInteraction(interaction, leagueId, selectedS
     return;
   }
 
-  const embed = buildSetupDashboardEmbed(league);
+  const embed = await buildSetupDashboardEmbed(interaction.guild, league);
   if (note) embed.setDescription(embed.data.description + '\n\n' + note);
 
   await interaction.update({
