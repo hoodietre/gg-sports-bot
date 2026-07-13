@@ -1583,6 +1583,21 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'`);
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS settled_by_game_report BOOLEAN NOT NULL DEFAULT FALSE`);
+  // Props extend the same sportsbook_games/sportsbook_bets spine rather than being a
+  // separate system — differentiated by bet_type. home_label/home_odds and
+  // away_label/away_odds are reused as the two sides of a prop market (Over/Under for
+  // stat_prop, or the two named outcomes for freeform_prop) so the existing bet-side,
+  // parlay-leg, and settlement machinery all work unchanged for props.
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS bet_type TEXT NOT NULL DEFAULT 'moneyline'`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS subject_type TEXT`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS subject_ref TEXT`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS subject_display_name TEXT`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS stat_key TEXT`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS stat_threshold NUMERIC`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS stat_line TEXT`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS prop_week_index INTEGER`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS prop_stage_index INTEGER`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS auto_settle_preview JSONB`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sportsbook_games_league_game_id ON sportsbook_games(league_game_id)`);
 
 
@@ -2832,7 +2847,32 @@ function buildCommands() {
       .setName('sportsbook')
       .setDescription('Sportsbook commands')
       .addSubcommand(sc => sc.setName('board').setDescription('View open sportsbook games'))
-      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create sportsbook game').addStringOption(o => o.setName('label').setDescription('Game label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create sportsbook game').addStringOption(o => o.setName('label').setDescription('Game label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addStringOption(o => o.setName('bet_type').setDescription('Moneyline (default) or freeform prop').setRequired(false).addChoices({ name: 'Moneyline', value: 'moneyline' }, { name: 'Freeform Prop', value: 'freeform_prop' })))
+      .addSubcommand(sc => sc
+        .setName('createprop')
+        .setDescription('Staff: create a stat-based player prop (auto-settles from synced box scores)')
+        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('stat').setDescription('Stat to bet on').setRequired(true).addChoices(
+          { name: 'Passing Yards', value: 'passing_yards' },
+          { name: 'Passing TDs', value: 'passing_tds' },
+          { name: 'Rushing Yards', value: 'rushing_yards' },
+          { name: 'Rushing TDs', value: 'rushing_tds' },
+          { name: 'Receiving Yards', value: 'receiving_yards' },
+          { name: 'Receiving TDs', value: 'receiving_tds' },
+          { name: 'Receptions', value: 'receptions' },
+          { name: 'Sacks', value: 'sacks' },
+          { name: 'Interceptions (Defense)', value: 'interceptions' },
+        ))
+        .addNumberOption(o => o.setName('threshold').setDescription('Over/under line, e.g. 275.5').setRequired(true))
+        .addIntegerOption(o => o.setName('week').setDescription('Week index this prop is for (must match the synced week it will settle against)').setRequired(true))
+        .addIntegerOption(o => o.setName('home_odds').setDescription('Over odds (American, default -110)').setRequired(false))
+        .addIntegerOption(o => o.setName('away_odds').setDescription('Under odds (American, default -110)').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('settleprops')
+        .setDescription('Staff: auto-settle open stat props from synced box scores (preview first)')
+        .addBooleanOption(o => o.setName('confirm').setDescription('Set true to actually pay out — defaults to a preview only').setRequired(false))
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('place').setDescription('Place moneyline bet').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('side').setDescription('home or away').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)))
       .addSubcommand(sc => sc.setName('settle').setDescription('Staff: settle sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('winner').setDescription('home or away').setRequired(true)))
       .addSubcommand(sc => sc.setName('refund').setDescription('Staff: refund open bets for a sportsbook game').addStringOption(o => o.setName('game_id').setDescription('Game short ID').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Refund reason').setRequired(false)))
@@ -6830,6 +6870,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
               value: g.id,
             }));
             await interaction.respond(choices.slice(0, 25));
+            return;
+          }
+        }
+
+        if (commandName === 'sportsbook') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+          if (focused?.name === 'player') {
+            const leagueName = interaction.options.getString('league');
+            const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+            if (!activeLeague) { await interaction.respond([]); return; }
+            const choices = await getMaddenPlayerAutocompleteChoices(interaction.guild.id, activeLeague.league_id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
             return;
           }
         }
@@ -18268,6 +18325,7 @@ if (shopSubcommand === 'view') {
         const homeOdds = interaction.options.getInteger('home_odds') ?? -110;
         const awayOdds = interaction.options.getInteger('away_odds') ?? -110;
         const leagueName = interaction.options.getString('league');
+        const betType = interaction.options.getString('bet_type') || 'moneyline';
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
 
         if (leagueName && !activeLeague) {
@@ -18282,13 +18340,95 @@ if (shopSubcommand === 'view') {
 
         const sportsbookGameId = randomUUID();
         await pool.query(
-          `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id]
+          `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id, bet_type, subject_type)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id, betType, betType === 'freeform_prop' ? 'freeform' : null]
         );
 
         await updateSportsbookPanel(interaction.guild).catch(() => null);
-        await interaction.reply({ content: 'Sportsbook game created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**.', ephemeral: true });
+        await interaction.reply({ content: (betType === 'freeform_prop' ? 'Prop' : 'Sportsbook game') + ' created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**.', ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'createprop') {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
+          await interaction.reply({ content: 'You do not have permission to create props.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+        if (!activeLeague) {
+          await interaction.reply({ content: 'Could not find a league to create this prop for.', ephemeral: true });
+          return;
+        }
+
+        const playerName = interaction.options.getString('player');
+        const statKey = interaction.options.getString('stat');
+        const threshold = interaction.options.getNumber('threshold');
+        const weekIndex = interaction.options.getInteger('week');
+        const homeOdds = interaction.options.getInteger('home_odds') ?? -110;
+        const awayOdds = interaction.options.getInteger('away_odds') ?? -110;
+
+        const statConfig = SPORTSBOOK_PROP_STAT_TYPES[statKey];
+        if (!statConfig) {
+          await interaction.reply({ content: 'Unknown stat.', ephemeral: true });
+          return;
+        }
+        if (homeOdds === 0 || awayOdds === 0) {
+          await interaction.reply({ content: 'Odds cannot be 0. Use American odds like -110, -150, +120, or 120.', ephemeral: true });
+          return;
+        }
+
+        const player = await findMaddenImportedPlayer(interaction.guild.id, activeLeague.league_id, playerName);
+        if (!player) {
+          await interaction.reply({ content: `Could not find a player matching "${playerName}" — pick one from the autocomplete list instead of typing it fully.`, ephemeral: true });
+          return;
+        }
+
+        const subjectRef = player.roster_id || player.presentation_id || null;
+        if (!subjectRef) {
+          await interaction.reply({ content: `Found **${maddenPlayerDisplayName(player)}**, but this league's synced data doesn't have a roster ID or presentation ID for them, so this prop couldn't be auto-settled later. Use /sportsbook create with a manual label instead.`, ephemeral: true });
+          return;
+        }
+
+        const subjectDisplayName = maddenPlayerDisplayName(player);
+        const statLine = `${subjectDisplayName} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
+        const homeLabel = `Over ${threshold} ${statConfig.label}`;
+        const awayLabel = `Under ${threshold} ${statConfig.label}`;
+        const sportsbookGameId = randomUUID();
+
+        await pool.query(
+          `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id, bet_type, subject_type, subject_ref, subject_display_name, stat_key, stat_threshold, stat_line, prop_week_index)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'stat_prop', 'player', $10, $11, $12, $13, $14, $15)`,
+          [sportsbookGameId, interaction.guild.id, activeLeague.league_id, statLine, homeLabel, awayLabel, homeOdds, awayOdds, interaction.user.id, subjectRef, subjectDisplayName, statKey, threshold, statLine, weekIndex]
+        );
+
+        await updateSportsbookPanel(interaction.guild).catch(() => null);
+        await interaction.reply({
+          content: `Created stat prop: **${statLine}**. Short ID: \`${shortSportsbookId(sportsbookGameId)}\`. It'll auto-settle via /sportsbook settleprops once Week ${weekIndex} stats are synced — or settle it manually with /sportsbook settle at any time.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (subcommand === 'settleprops') {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
+          await interaction.reply({ content: 'You do not have permission to settle props.', ephemeral: true });
+          return;
+        }
+
+        const confirm = interaction.options.getBoolean('confirm') || false;
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
+        if (leagueName && !activeLeague) {
+          await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
+          return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+        const result = await autoSettleOpenStatProps(interaction, activeLeague, { confirm });
+        await interaction.editReply({ embeds: [buildPropAutoSettlePreviewEmbed(result, confirm)] });
         return;
       }
 
@@ -18562,13 +18702,14 @@ if (shopSubcommand === 'view') {
       let totalPaid = 0;
       for (const bet of bets.rows) {
         if (bet.side === winner) {
-          await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, interaction.user.id);
+          const { payout, feeAmount } = computeSportsbookNetPayout(bet.potential_payout, bet.amount);
+          await addCurrency(interaction.guild.id, bet.user_id, payout, 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), interaction.user.id);
           await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_wins', 1);
-          await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', Number(bet.potential_payout) - Number(bet.amount));
+          await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', payout - Number(bet.amount));
           await addRecognitionPoints(interaction.guild.id, bet.user_id, 10, 5);
-          await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
+          await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
           winners += 1;
-          totalPaid += Number(bet.potential_payout);
+          totalPaid += payout;
         } else {
           await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
           losers += 1;
@@ -20795,6 +20936,35 @@ function calculateParlayPayout(amount, oddsList) {
   return { combinedDecimal, payout: Math.floor(stake * combinedDecimal) };
 }
 
+// Booking fee — 10% of NET winnings only (not the stake), mirroring real sportsbook
+// vig/rake. Doesn't double-punish losers on top of the odds-based house edge already
+// baked into -110/-110 lines. Burned (not redistributed) — same deflationary treatment
+// as the Marketplace fee; together they're the economy's two real currency sinks.
+// Applies uniformly to straight bets, parlays, and props — settlement is settlement.
+const SPORTSBOOK_BOOKING_FEE_RATE = 0.10;
+
+function computeSportsbookNetPayout(potentialPayout, stake) {
+  const gross = Number(potentialPayout) || 0;
+  const netWinnings = Math.max(0, gross - (Number(stake) || 0));
+  const feeAmount = Math.floor(netWinnings * SPORTSBOOK_BOOKING_FEE_RATE);
+  return { payout: gross - feeAmount, feeAmount };
+}
+
+// Stat props reuse the existing sportsbook spine (bet_type = 'stat_prop', home = Over,
+// away = Under). statType/field map straight onto madden_player_weekly_stats'
+// stat_type + raw_payload keys, so settlement is a direct lookup — no new stat pipeline.
+const SPORTSBOOK_PROP_STAT_TYPES = {
+  passing_yards: { label: 'Passing Yards', statType: 'passing', field: 'passYds' },
+  passing_tds: { label: 'Passing TDs', statType: 'passing', field: 'passTDs' },
+  rushing_yards: { label: 'Rushing Yards', statType: 'rushing', field: 'rushYds' },
+  rushing_tds: { label: 'Rushing TDs', statType: 'rushing', field: 'rushTDs' },
+  receiving_yards: { label: 'Receiving Yards', statType: 'receiving', field: 'recYds' },
+  receiving_tds: { label: 'Receiving TDs', statType: 'receiving', field: 'recTDs' },
+  receptions: { label: 'Receptions', statType: 'receiving', field: 'recCatches' },
+  sacks: { label: 'Sacks', statType: 'defense', field: 'defSacks' },
+  interceptions: { label: 'Interceptions (Defense)', statType: 'defense', field: 'defInts' },
+};
+
 async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerSide, issuedByUserId) {
   const parlayResult = await pool.query(
     `SELECT DISTINCT p.*
@@ -20825,17 +20995,19 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
       settledCount += 1;
     } else if (allSettled) {
       await pool.query(`UPDATE sportsbook_parlays SET status = 'won', settled_at = NOW() WHERE id = $1`, [parlay.id]);
-      await addCurrency(guildId, parlay.user_id, Number(parlay.potential_payout), 'sportsbook_parlay_win', 'Won parlay', issuedByUserId);
+      const { payout, feeAmount } = computeSportsbookNetPayout(parlay.potential_payout, parlay.amount);
+      await addCurrency(guildId, parlay.user_id, payout, 'sportsbook_parlay_win', 'Won parlay' + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), issuedByUserId);
       await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_wins', 1);
-      await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_profit', Number(parlay.potential_payout) - Number(parlay.amount));
+      await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_profit', payout - Number(parlay.amount));
       await addRecognitionPoints(guildId, parlay.user_id, 50, 25);
+      await pool.query(`UPDATE sportsbook_parlays SET potential_payout = $2 WHERE id = $1`, [parlay.id, payout]);
       settledCount += 1;
-      parlayPaid += Number(parlay.potential_payout);
+      parlayPaid += payout;
       wonParlays.push({
         id: parlay.id,
         user_id: parlay.user_id,
         amount: Number(parlay.amount),
-        potential_payout: Number(parlay.potential_payout),
+        potential_payout: payout,
         leg_count: legs.rows.length,
       });
     }
@@ -20873,6 +21045,12 @@ function buildSportsbookSideButtons(game) {
   );
 }
 
+// "ML -110" reads fine for moneylines but oddly for a prop line ("Under 275.5 Passing
+// Yards ML -110") — use plain odds for props instead.
+function sportsbookOddsLabelSuffix(row) {
+  return row.bet_type && row.bet_type !== 'moneyline' ? '' : ' ML';
+}
+
 function buildSportsbookEmbed(settings, rows) {
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
@@ -20887,8 +21065,9 @@ function buildSportsbookEmbed(settings, rows) {
   }
 
   const lines = rows.map(row => {
+    const oddsSuffix = sportsbookOddsLabelSuffix(row);
     return '**' + shortSportsbookId(row.id) + ' • ' + row.game_label + '**' + NL +
-      row.away_label + ' ML ' + row.away_odds + ' vs ' + row.home_label + ' ML ' + row.home_odds + NL +
+      row.away_label + oddsSuffix + ' ' + row.away_odds + ' vs ' + row.home_label + oddsSuffix + ' ' + row.home_odds + NL +
       'Status: **' + row.status + '** • Bet with `/placebet`';
   });
 
@@ -20921,8 +21100,9 @@ async function buildSportsbookPanelEmbed(guildId) {
 
   const openLines = openResult.rows.length
     ? openResult.rows.map(row => {
+        const oddsSuffix = sportsbookOddsLabelSuffix(row);
         return '**' + shortSportsbookId(row.id) + ' • ' + row.game_label + '**' + NL +
-          row.away_label + ' ML ' + row.away_odds + ' vs ' + row.home_label + ' ML ' + row.home_odds + NL +
+          row.away_label + oddsSuffix + ' ' + row.away_odds + ' vs ' + row.home_label + oddsSuffix + ' ' + row.home_odds + NL +
           'Bets: ' + row.bet_count + ' • Handle: ' + row.total_handle;
       }).join(NL + NL)
     : 'No open sportsbook lines.';
@@ -21796,11 +21976,12 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
 
   for (const bet of bets.rows) {
     if (bet.side === winnerSide) {
-      await addCurrency(interaction.guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Auto-settled bet: ' + sportsbookGame.game_label, interaction.user.id);
-      await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
+      const { payout, feeAmount } = computeSportsbookNetPayout(bet.potential_payout, bet.amount);
+      await addCurrency(interaction.guild.id, bet.user_id, payout, 'sportsbook_win', 'Auto-settled bet: ' + sportsbookGame.game_label + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), interaction.user.id);
+      await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
       await addActivityPoints(interaction.guild.id, bet.user_id, 5, 2).catch(() => null);
       winners += 1;
-      totalPaid += Number(bet.potential_payout);
+      totalPaid += payout;
     } else {
       await pool.query(`UPDATE sportsbook_bets SET status = 'lost', settled_at = NOW() WHERE id = $1`, [bet.id]);
       losers += 1;
@@ -22564,16 +22745,17 @@ async function performSportsbookSettlement(guild, sportsbookGame, winner, actorU
   const lostBets = [];
   for (const bet of bets.rows) {
     if (bet.side === winner) {
-      await addCurrency(guild.id, bet.user_id, Number(bet.potential_payout), 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label, actorUserId);
+      const { payout, feeAmount } = computeSportsbookNetPayout(bet.potential_payout, bet.amount);
+      await addCurrency(guild.id, bet.user_id, payout, 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), actorUserId);
       await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_wins', 1).catch(() => null);
-      await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', Number(bet.potential_payout) - Number(bet.amount)).catch(() => null);
+      await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', payout - Number(bet.amount)).catch(() => null);
       await addRecognitionPoints(guild.id, bet.user_id, 10, 2).catch(() => null);
       winningUserIds.add(bet.user_id);
-      await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW() WHERE id = $1`, [bet.id]);
+      await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
       winners += 1;
-      totalPaid += Number(bet.potential_payout);
+      totalPaid += payout;
       const winSideLabel = bet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-      await postSportsbookFeed(guild, buildSportsbookWinAlertEmbed(settings, bet, sportsbookGame, winSideLabel));
+      await postSportsbookFeed(guild, buildSportsbookWinAlertEmbed(settings, { ...bet, potential_payout: payout }, sportsbookGame, winSideLabel));
     } else {
       await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', -Number(bet.amount)).catch(() => null);
       lostBets.push(bet);
@@ -22611,6 +22793,101 @@ async function performSportsbookSettlement(guild, sportsbookGame, winner, actorU
   }
 
   return { winners, losers, totalPaid, parlayResult, winnerLabel };
+}
+
+// Stat prop auto-settlement — scans open stat_prop games, looks up the matching
+// madden_player_weekly_stats row (guild + league + week + stat_type + player), and
+// compares the actual value to the line. confirm:false (the default) only builds a
+// preview of what WOULD settle; confirm:true actually runs performSportsbookSettlement
+// for each match. Same safety protocol as transaction scanning this offseason — a
+// stat-data false positive here is a financial bug, not just a display bug.
+async function autoSettleOpenStatProps(interaction, league, { confirm = false } = {}) {
+  const guildId = interaction.guild.id;
+
+  const openPropsResult = await pool.query(
+    league
+      ? `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' AND bet_type = 'stat_prop' AND league_id = $2 ORDER BY created_at ASC`
+      : `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' AND bet_type = 'stat_prop' ORDER BY created_at ASC`,
+    league ? [guildId, league.league_id] : [guildId]
+  );
+
+  const settled = [];
+  const skipped = [];
+
+  for (const prop of openPropsResult.rows) {
+    const statConfig = SPORTSBOOK_PROP_STAT_TYPES[prop.stat_key];
+    if (!statConfig) { skipped.push({ prop, reason: 'Unknown stat key on this prop.' }); continue; }
+    if (prop.prop_week_index == null) { skipped.push({ prop, reason: 'No week set on this prop.' }); continue; }
+    if (!prop.subject_ref) { skipped.push({ prop, reason: 'No subject player recorded on this prop.' }); continue; }
+
+    const statRowResult = await pool.query(
+      `SELECT * FROM madden_player_weekly_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3 AND week_index = $4
+         AND (roster_id = $5 OR presentation_id = $5)
+       ORDER BY imported_at DESC
+       LIMIT 1`,
+      [guildId, prop.league_id, statConfig.statType, prop.prop_week_index, prop.subject_ref]
+    );
+
+    if (!statRowResult.rows.length) {
+      skipped.push({ prop, reason: `No synced ${statConfig.label} data yet for Week ${prop.prop_week_index}.` });
+      continue;
+    }
+
+    const rawValue = statRowResult.rows[0].raw_payload?.[statConfig.field];
+    const actualValue = Number(rawValue);
+    if (!Number.isFinite(actualValue)) {
+      skipped.push({ prop, reason: `Synced data found but "${statConfig.field}" wasn't a usable number.` });
+      continue;
+    }
+
+    const threshold = Number(prop.stat_threshold);
+    if (actualValue === threshold) {
+      skipped.push({ prop, reason: `Push — actual value (${actualValue}) exactly equals the line (${threshold}). Settle manually (refund recommended).` });
+      continue;
+    }
+
+    settled.push({ prop, actualValue, winnerSide: actualValue > threshold ? 'home' : 'away', statConfig });
+  }
+
+  if (confirm && settled.length) {
+    const settings = await getCurrencySettings(guildId);
+    for (const item of settled) {
+      await performSportsbookSettlement(interaction.guild, item.prop, item.winnerSide, interaction.user.id, settings);
+    }
+  }
+
+  return { settled, skipped, confirm };
+}
+
+function buildPropAutoSettlePreviewEmbed(result, confirm) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle(confirm ? '✅ Props Auto-Settled' : '👀 Props Auto-Settle Preview')
+    .setColor(confirm ? 0x57F287 : 0xFEE75C)
+    .setFooter({ text: 'GG Sports • Sportsbook Props' + (confirm ? '' : ' — run again with confirm:true to actually pay out') })
+    .setTimestamp();
+
+  if (result.settled.length) {
+    embed.addFields({
+      name: (confirm ? 'Settled' : 'Would Settle') + ` (${result.settled.length})`,
+      value: result.settled.map(item => {
+        const winLabel = item.winnerSide === 'home' ? item.prop.home_label : item.prop.away_label;
+        return `**${shortSportsbookId(item.prop.id)}** ${item.prop.subject_display_name} — actual **${item.actualValue}** vs line **${item.prop.stat_threshold}** → ${winLabel}`;
+      }).join(NL).slice(0, 1024),
+    });
+  } else {
+    embed.addFields({ name: 'Nothing to settle', value: 'No open stat props currently have matching synced data.' });
+  }
+
+  if (result.skipped.length) {
+    embed.addFields({
+      name: `Skipped (${result.skipped.length})`,
+      value: result.skipped.map(item => `**${shortSportsbookId(item.prop.id)}** ${item.prop.subject_display_name || item.prop.game_label} — ${item.reason}`).join(NL).slice(0, 1024),
+    });
+  }
+
+  return embed;
 }
 
 async function findSportsbookGame(guildId, input) {
