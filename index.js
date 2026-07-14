@@ -15527,7 +15527,17 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarlocker_customize') {
-      await interaction.update({ components: buildAvatarCustomizeComponents() });
+      try {
+        const components = buildAvatarCustomizeComponents();
+        console.log('[Avatar] avatarlocker_customize: components built OK, count:', components.length);
+        await interaction.update({ components });
+        console.log('[Avatar] avatarlocker_customize: update() completed OK.');
+      } catch (error) {
+        console.error('[Avatar] avatarlocker_customize failed:', error);
+        await interaction.reply({ content: 'Diagnostic: avatarlocker_customize threw — check logs for `[Avatar] avatarlocker_customize failed`.', ephemeral: true }).catch((e2) => {
+          console.error('[Avatar] avatarlocker_customize: even the fallback reply failed:', e2);
+        });
+      }
       return;
     }
 
