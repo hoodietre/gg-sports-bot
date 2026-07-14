@@ -1962,6 +1962,7 @@ async function initDatabase() {
   await migrateSingleChannelPanelsToMultiChannel();
 
   console.log('Database ready.');
+  console.log('[Avatar] BUILD CHECK: avatarpanel_locker/avatarpanel_shop handlers + step tracing are present in this deployment (2026-07-14-trace-1). If you do not see this exact line on every boot, the running process is NOT the file you think it is — redeploy.');
 }
 
 // One-time consolidation of the old per-guild guild_currency_balances into the new
