@@ -24,6 +24,9 @@ import pkg from 'pg';
 import { randomUUID, randomBytes, createHash, constants as cryptoConstants } from 'crypto';
 import zlib from 'zlib';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import sharp from 'sharp';
 import http from 'http';
 
 const { Pool } = pkg;
@@ -1825,6 +1828,11 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  // body_key selects one of the 8 real base-body art assets directly (e.g.
+  // 'male_athletic') now that real art exists — replaces the old build+silhouette
+  // procedural-scale concept. build/silhouette columns above are left in place but
+  // unused going forward (harmless, avoids a destructive column drop).
+  await pool.query(`ALTER TABLE avatar_profiles ADD COLUMN IF NOT EXISTS body_key TEXT NOT NULL DEFAULT 'male_athletic'`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_avatar (
@@ -6204,7 +6212,8 @@ async function ggBuildPermanentShopPayload(guildId) {
 
   if (rows.length < 5) {
     rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('shop_view_cart').setLabel('View Cart').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId('shop_view_cart').setLabel('View Cart').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('avatarpanel_shop').setLabel('Go Shopping').setEmoji('🛍️').setStyle(ButtonStyle.Primary)
     ));
   }
 
@@ -15401,7 +15410,7 @@ if (interaction.commandName === 'avatar') {
         await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const { profile, equipped } = await getAvatarProfileWithEquipment(targetUser.id);
-        const attachment = buildAvatarProfileAttachment(profile, equipped);
+        const attachment = await buildAvatarProfileAttachment(profile, equipped);
         const embed = buildAvatarLockerEmbed(targetUser, profile, equipped).setTitle(`${targetUser.username} • Avatar`);
         const avatarBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id).catch(() => []);
         if (avatarBadges.length) {
@@ -15426,13 +15435,23 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId === 'avatarpanel_locker') {
       await interaction.deferReply({ ephemeral: true });
-      await openAvatarLockerPanel(interaction);
+      try {
+        await openAvatarLockerPanel(interaction);
+      } catch (error) {
+        console.error('[Avatar] avatarpanel_locker failed:', error);
+        await interaction.editReply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.' }).catch(() => null);
+      }
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
       await interaction.deferReply({ ephemeral: true });
-      await openAvatarShopPanel(interaction);
+      try {
+        await openAvatarShopPanel(interaction);
+      } catch (error) {
+        console.error('[Avatar] avatarpanel_shop failed:', error);
+        await interaction.editReply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.' }).catch(() => null);
+      }
       return;
     }
 
@@ -15462,7 +15481,7 @@ if (interaction.commandName === 'avatar') {
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarLockerComponents(),
       });
       return;
@@ -15473,25 +15492,34 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_build') {
+    // Showcase pipeline (build order #4) — bakes the user's actual equipped outfit
+    // into a full-detail hero shot on demand, posted publicly. Kept separate from the
+    // always-on locker/shop render so those stay cheap; this is the intentionally
+    // heavier, celebratory one.
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_flex') {
       await interaction.deferUpdate();
-      await updateAvatarBodyCustomization(interaction.user.id, { build: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.editReply({
-        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarCustomizeComponents(),
+      const attachment = await buildAvatarProfileAttachment(profile, equipped, { showcase: true });
+      const embed = new EmbedBuilder()
+        .setTitle(`🎉 ${interaction.user.username} is flexing`)
+        .setColor(0xFEE75C)
+        .setImage('attachment://avatar.png')
+        .setFooter({ text: 'GG Sports • Showcase' })
+        .setTimestamp();
+      await interaction.followUp({ embeds: [embed], files: [attachment], ephemeral: false }).catch(async (error) => {
+        console.error('[Avatar] Showcase followUp failed (likely missing channel send permission):', error?.message || error);
+        await interaction.followUp({ content: 'Could not post the showcase publicly — I may be missing permission to post in this channel.', ephemeral: true }).catch(() => null);
       });
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_silhouette') {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_body') {
       await interaction.deferUpdate();
-      await updateAvatarBodyCustomization(interaction.user.id, { silhouette: interaction.values[0] });
+      await updateAvatarBodyCustomization(interaction.user.id, { bodyKey: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarCustomizeComponents(),
       });
       return;
@@ -15503,7 +15531,7 @@ if (interaction.commandName === 'avatar') {
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarCustomizeComponents(),
       });
       return;
@@ -15514,7 +15542,7 @@ if (interaction.commandName === 'avatar') {
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarLockerComponents(),
       });
       return;
@@ -15527,7 +15555,7 @@ if (interaction.commandName === 'avatar') {
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       await interaction.editReply({
         embeds: [buildAvatarShopHomeEmbed(interaction.user)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarShopHomeComponents(),
       });
       return;
@@ -15542,7 +15570,7 @@ if (interaction.commandName === 'avatar') {
       const { items, total } = await fetchAvatarShopItems(interaction.guild.id, categorySlot, page);
       await interaction.editReply({
         embeds: [buildAvatarShopCategoryEmbed(categorySlot, items, page, total, settings)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarShopCategoryComponents(categorySlot, items, page, total),
       });
       return;
@@ -15561,7 +15589,7 @@ if (interaction.commandName === 'avatar') {
         await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
         return;
       }
-      await interaction.editReply(buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
+      await interaction.editReply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
       return;
     }
 
@@ -15580,7 +15608,7 @@ if (interaction.commandName === 'avatar') {
       await interaction.editReply({
         content: `Bought and equipped **${outcome.item.item_name}**!`,
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
-        files: [buildAvatarProfileAttachment(profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: [new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page}`).setLabel('Keep Shopping').setStyle(ButtonStyle.Primary),
           new ButtonBuilder().setCustomId('avatarshop_home').setLabel('⬅ Shop Hub').setStyle(ButtonStyle.Secondary),
@@ -24277,13 +24305,12 @@ async function unequipAvatarSlot(userId, slot) {
   return { ok: true, message: `Unequipped ${AVATAR_SLOT_LABELS[slot] || slot}.` };
 }
 
-async function updateAvatarBodyCustomization(userId, { build, silhouette, skinTone }) {
+async function updateAvatarBodyCustomization(userId, { bodyKey, skinTone }) {
   await getOrCreateAvatarProfile(userId);
   const sets = [];
   const values = [];
   let i = 1;
-  if (build) { sets.push(`build = $${i++}`); values.push(build); }
-  if (silhouette) { sets.push(`silhouette = $${i++}`); values.push(silhouette); }
+  if (bodyKey) { sets.push(`body_key = $${i++}`); values.push(bodyKey); }
   if (skinTone) { sets.push(`skin_tone = $${i++}`); values.push(skinTone); }
   if (!sets.length) return;
   sets.push('updated_at = NOW()');
@@ -24303,7 +24330,7 @@ function avatarResolvedColor(itemName, fallbackHex) {
 // equipped: { top: {item_name}|null, bottom: ..., headwear: ..., accessory: ...,
 // footwear: ..., pet: ..., effect: ..., background: ... } — caller resolves which set
 // to pass (real equip state, or real state with one slot swapped for a shop preview).
-function renderAvatarProfilePng(profile, equipped) {
+function renderAvatarProfilePngPlaceholder(profile, equipped) {
   const width = 900;
   const height = 1200;
   const scale = AVATAR_BUILD_SCALE[profile.build] || 1.0;
@@ -24441,8 +24468,152 @@ function renderAvatarProfilePng(profile, equipped) {
   return avatarEncodePng(width, height, img);
 }
 
-function buildAvatarProfileAttachment(profile, equipped) {
-  const png = renderAvatarProfilePng(profile, equipped);
+// ---------------------------------------------------------------------------
+// Real-art renderer — composites the actual generated base-body PNGs via sharp.
+// Falls back to the procedural placeholder above if the art files haven't been
+// deployed yet, so an update to this code doesn't hard-crash a server that hasn't
+// added the asset files to its repo yet.
+//
+// Known, deliberate scope limits for this pass:
+// - Cosmetic items (tops/bottoms/shoes/hats/accessories/pets) are NOT yet visually
+//   composited onto the real body — no real cosmetic art exists yet, and overlaying
+//   the old procedural shapes onto photoreal art looked worse than just leaving them
+//   off. They're still fully tracked/equippable and listed in the embed text field;
+//   only the visual layer is pending real cosmetic art.
+// - Skin tone is an approximate sharp .tint() over already-toned art, not true
+//   programmatic tinting of neutral-toned art (the design doc's original plan) —
+//   the generated reference sheet has one baked-in tone, not a neutral base.
+// ---------------------------------------------------------------------------
+
+const AVATAR_BODY_KEYS = ['male_slim', 'male_athletic', 'male_built', 'male_heavy', 'female_slim', 'female_athletic', 'female_built', 'female_heavy'];
+const AVATAR_BODY_LABELS = {
+  male_slim: 'Male • Slim', male_athletic: 'Male • Athletic', male_built: 'Male • Built', male_heavy: 'Male • Heavy',
+  female_slim: 'Female • Slim', female_athletic: 'Female • Athletic', female_built: 'Female • Built', female_heavy: 'Female • Heavy',
+};
+// 'medium' matches the reference sheet's native tone, so it's a pass-through (no
+// tint applied) rather than tinting toward itself.
+const AVATAR_SKIN_TONE_TINTS = {
+  light: { r: 235, g: 205, b: 180 },
+  medium: null,
+  tan: { r: 195, g: 145, b: 105 },
+  deep: { r: 130, g: 88, b: 62 },
+};
+
+const AVATAR_BODY_ASSET_DIR = path.join(process.cwd(), 'assets', 'avatar', 'bodies');
+const avatarBodyBufferCache = new Map();
+
+async function loadAvatarBodyBuffer(bodyKey) {
+  if (avatarBodyBufferCache.has(bodyKey)) return avatarBodyBufferCache.get(bodyKey);
+  const filePath = path.join(AVATAR_BODY_ASSET_DIR, `${bodyKey}.png`);
+  try {
+    const buffer = await fs.promises.readFile(filePath);
+    avatarBodyBufferCache.set(bodyKey, buffer);
+    return buffer;
+  } catch (error) {
+    console.error(`[Avatar] Missing body asset for "${bodyKey}" at ${filePath} — falling back to placeholder renderer.`);
+    return null;
+  }
+}
+
+// Soft radial glow, rasterized from SVG rather than a per-pixel JS loop — much
+// cheaper than the placeholder renderer's concentric-ellipse approach, and
+// composited with a 'screen' blend so it reads as light coming off the character
+// rather than a translucent disc sitting on top of it.
+async function buildAvatarAuraGlowBuffer(width, height, effectName) {
+  const [r, g, b] = avatarDeterministicColor(effectName);
+  const cx = Math.round(width / 2);
+  const cy = Math.round(height * 0.55);
+  const radius = Math.round(Math.min(width, height) * 0.42);
+  const svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="rgb(${r},${g},${b})" stop-opacity="0.55"/>
+        <stop offset="100%" stop-color="rgb(${r},${g},${b})" stop-opacity="0"/>
+      </radialGradient>
+    </defs>
+    <circle cx="${cx}" cy="${cy}" r="${radius}" fill="url(#glow)"/>
+  </svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+function avatarBackgroundColorFor(backgroundName) {
+  const bgLower = String(backgroundName || 'Locker Room').toLowerCase();
+  if (bgLower.includes('court')) return { r: 120, g: 53, b: 15, alpha: 1 };
+  if (bgLower.includes('tunnel')) return { r: 17, g: 24, b: 39, alpha: 1 };
+  if (bgLower.includes('locker')) return { r: 24, g: 24, b: 27, alpha: 1 };
+  const [r, g, b] = avatarDeterministicColor(backgroundName);
+  return { r, g, b, alpha: 1 };
+}
+
+// options.showcase renders a larger, more dramatic hero-shot canvas (build order #4,
+// the "Flex" showcase pipeline) using the same body art and equip state — no
+// pose-specific art exists yet, so this is a stylized presentation of the standard
+// pose rather than a true alternate pose. True multi-pose showcase needs its own art
+// pass later; this delivers the on-demand "hero shot" value now without waiting on it.
+async function renderAvatarProfilePng(profile, equipped, options = {}) {
+  try {
+    return await renderAvatarProfilePngRealArt(profile, equipped, options);
+  } catch (error) {
+    console.error('[Avatar] Real-art render failed, falling back to placeholder renderer:', error);
+    return renderAvatarProfilePngPlaceholder(profile, equipped);
+  }
+}
+
+async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
+  const bodyKey = AVATAR_BODY_KEYS.includes(profile.body_key) ? profile.body_key : 'male_athletic';
+  const bodyBuffer = await loadAvatarBodyBuffer(bodyKey);
+  if (!bodyBuffer) return renderAvatarProfilePngPlaceholder(profile, equipped);
+
+  const width = options.showcase ? 1000 : 700;
+  const height = options.showcase ? 1400 : 1000;
+  const bgColor = avatarBackgroundColorFor(equipped.background?.item_name);
+
+  const targetHeight = Math.floor(height * (options.showcase ? 0.92 : 0.88));
+  let bodyImage = sharp(bodyBuffer).resize({ height: targetHeight });
+
+  const tint = AVATAR_SKIN_TONE_TINTS[profile.skin_tone];
+  if (tint) bodyImage = bodyImage.tint(tint);
+
+  const bodyResizedBuffer = await bodyImage.png().toBuffer();
+  const bodyMeta = await sharp(bodyResizedBuffer).metadata();
+  const left = Math.floor((width - bodyMeta.width) / 2);
+  const top = height - bodyMeta.height - Math.floor(height * (options.showcase ? 0.02 : 0.03));
+
+  const composites = [];
+
+  if (options.showcase) {
+    // Dramatic spotlight/vignette backdrop for the hero shot — cheap SVG rasterize,
+    // no new art needed.
+    const spotlightSvg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <radialGradient id="spot" cx="50%" cy="38%" r="65%">
+          <stop offset="0%" stop-color="rgb(255,255,255)" stop-opacity="0.18"/>
+          <stop offset="100%" stop-color="rgb(255,255,255)" stop-opacity="0"/>
+        </radialGradient>
+        <radialGradient id="vig" cx="50%" cy="50%" r="75%">
+          <stop offset="60%" stop-color="rgb(0,0,0)" stop-opacity="0"/>
+          <stop offset="100%" stop-color="rgb(0,0,0)" stop-opacity="0.45"/>
+        </radialGradient>
+      </defs>
+      <rect width="${width}" height="${height}" fill="url(#spot)"/>
+      <rect width="${width}" height="${height}" fill="url(#vig)"/>
+    </svg>`;
+    composites.push({ input: await sharp(Buffer.from(spotlightSvg)).png().toBuffer(), left: 0, top: 0 });
+  }
+
+  composites.push({ input: bodyResizedBuffer, left, top });
+
+  const effectName = equipped.effect?.item_name;
+  if (effectName) {
+    composites.push({ input: await buildAvatarAuraGlowBuffer(width, height, effectName), left: 0, top: 0, blend: 'screen' });
+  }
+
+  const canvas = sharp({ create: { width, height, channels: 4, background: bgColor } });
+  return canvas.composite(composites).png().toBuffer();
+}
+
+async function buildAvatarProfileAttachment(profile, equipped, options = {}) {
+  const png = await renderAvatarProfilePng(profile, equipped, options);
   return new AttachmentBuilder(png, { name: 'avatar.png' });
 }
 
@@ -24459,7 +24630,7 @@ function buildAvatarLockerEmbed(user, profile, equipped) {
     .setColor(0xFEE75C)
     .setImage('attachment://avatar.png')
     .setDescription(lines.join(NL))
-    .setFooter({ text: `GG Sports • Build: ${profile.build} • Silhouette: ${profile.silhouette.toUpperCase()} • Skin: ${profile.skin_tone}` })
+    .setFooter({ text: `GG Sports • ${AVATAR_BODY_LABELS[profile.body_key] || profile.body_key} • Skin: ${profile.skin_tone}` })
     .setTimestamp();
 }
 
@@ -24471,7 +24642,8 @@ function buildAvatarLockerComponents() {
   return [
     new ActionRowBuilder().addComponents(slotMenu),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('avatarlocker_customize').setLabel('Customize Body').setEmoji('🧍').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId('avatarlocker_customize').setLabel('Customize Body').setEmoji('🧍').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('avatarlocker_flex').setLabel('Flex').setEmoji('📸').setStyle(ButtonStyle.Primary)
     ),
   ];
 }
@@ -24501,7 +24673,7 @@ async function buildAvatarLockerSlotPayload(user, profile, equipped, slot) {
   return {
     content: null,
     embeds: [buildAvatarLockerEmbed(user, profile, equipped)],
-    files: [buildAvatarProfileAttachment(profile, equipped)],
+    files: [await buildAvatarProfileAttachment(profile, equipped)],
     components: [
       new ActionRowBuilder().addComponents(menu),
       new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)),
@@ -24510,15 +24682,12 @@ async function buildAvatarLockerSlotPayload(user, profile, equipped, slot) {
 }
 
 function buildAvatarCustomizeComponents() {
-  const buildMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_build').setPlaceholder('Choose build')
-    .addOptions(AVATAR_BUILDS.map(b => ({ label: b.charAt(0).toUpperCase() + b.slice(1), value: b })));
-  const silhouetteMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_silhouette').setPlaceholder('Choose silhouette')
-    .addOptions([{ label: 'Silhouette A', value: 'a' }, { label: 'Silhouette B', value: 'b' }]);
+  const bodyMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_body').setPlaceholder('Choose your body')
+    .addOptions(AVATAR_BODY_KEYS.map(key => ({ label: AVATAR_BODY_LABELS[key], value: key })));
   const skinMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_skin').setPlaceholder('Choose skin tone')
-    .addOptions(Object.keys(AVATAR_SKIN_TONES).map(t => ({ label: t.charAt(0).toUpperCase() + t.slice(1), value: t })));
+    .addOptions(Object.keys(AVATAR_SKIN_TONE_TINTS).map(t => ({ label: t.charAt(0).toUpperCase() + t.slice(1), value: t })));
   return [
-    new ActionRowBuilder().addComponents(buildMenu),
-    new ActionRowBuilder().addComponents(silhouetteMenu),
+    new ActionRowBuilder().addComponents(bodyMenu),
     new ActionRowBuilder().addComponents(skinMenu),
     new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)),
   ];
@@ -24627,7 +24796,7 @@ function buildAvatarShopCategoryComponents(categorySlot, items, page, total) {
   return rows;
 }
 
-function buildAvatarShopPreviewPayload(profile, equipped, previewItem, categorySlot, page, settings) {
+async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, categorySlot, page, settings) {
   const slotForPreview = categorySlot === 'exclusive' ? (previewItem.avatar_slot || inferAvatarSlotFromItem(previewItem)) : categorySlot;
   const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name } };
   const embed = new EmbedBuilder()
@@ -24647,7 +24816,7 @@ function buildAvatarShopPreviewPayload(profile, equipped, previewItem, categoryS
   return {
     content: null,
     embeds: [embed],
-    files: [buildAvatarProfileAttachment(profile, previewEquipped)],
+    files: [await buildAvatarProfileAttachment(profile, previewEquipped)],
     components: [buttons],
   };
 }
@@ -24691,7 +24860,7 @@ async function openAvatarLockerPanel(interaction) {
   const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
   await interaction.editReply({
     embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-    files: [buildAvatarProfileAttachment(profile, equipped)],
+    files: [await buildAvatarProfileAttachment(profile, equipped)],
     components: buildAvatarLockerComponents(),
   });
 }
@@ -24700,7 +24869,7 @@ async function openAvatarShopPanel(interaction) {
   const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
   await interaction.editReply({
     embeds: [buildAvatarShopHomeEmbed(interaction.user)],
-    files: [buildAvatarProfileAttachment(profile, equipped)],
+    files: [await buildAvatarProfileAttachment(profile, equipped)],
     components: buildAvatarShopHomeComponents(),
   });
 }
