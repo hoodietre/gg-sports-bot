@@ -15433,23 +15433,33 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarpanel_locker') {
-      await interaction.deferReply({ ephemeral: true });
+      console.log('[Avatar] avatarpanel_locker: received, deferring...');
       try {
+        await interaction.deferReply({ ephemeral: true });
+        console.log('[Avatar] avatarpanel_locker: deferred OK, opening panel...');
         await openAvatarLockerPanel(interaction);
+        console.log('[Avatar] avatarpanel_locker: editReply completed OK.');
       } catch (error) {
         console.error('[Avatar] avatarpanel_locker failed:', error);
-        await interaction.editReply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.' }).catch(() => null);
+        await interaction.editReply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.' }).catch((e2) => {
+          console.error('[Avatar] avatarpanel_locker: even the error editReply failed:', e2);
+        });
       }
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
-      await interaction.deferReply({ ephemeral: true });
+      console.log('[Avatar] avatarpanel_shop: received, deferring...');
       try {
+        await interaction.deferReply({ ephemeral: true });
+        console.log('[Avatar] avatarpanel_shop: deferred OK, opening panel...');
         await openAvatarShopPanel(interaction);
+        console.log('[Avatar] avatarpanel_shop: editReply completed OK.');
       } catch (error) {
         console.error('[Avatar] avatarpanel_shop failed:', error);
-        await interaction.editReply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.' }).catch(() => null);
+        await interaction.editReply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.' }).catch((e2) => {
+          console.error('[Avatar] avatarpanel_shop: even the error editReply failed:', e2);
+        });
       }
       return;
     }
@@ -24880,21 +24890,31 @@ async function performAvatarShopPurchase(interaction, itemId) {
 // Shopping" buttons — one implementation, multiple entry points. Caller must have
 // already deferred (deferReply or deferUpdate) before calling these.
 async function openAvatarLockerPanel(interaction) {
+  console.log('[Avatar] openAvatarLockerPanel: fetching profile...');
   const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+  console.log('[Avatar] openAvatarLockerPanel: profile fetched, rendering attachment...');
+  const attachment = await buildAvatarProfileAttachment(profile, equipped);
+  console.log('[Avatar] openAvatarLockerPanel: attachment rendered, calling editReply...');
   await interaction.editReply({
     embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-    files: [await buildAvatarProfileAttachment(profile, equipped)],
+    files: [attachment],
     components: buildAvatarLockerComponents(),
   });
+  console.log('[Avatar] openAvatarLockerPanel: editReply returned.');
 }
 
 async function openAvatarShopPanel(interaction) {
+  console.log('[Avatar] openAvatarShopPanel: fetching profile...');
   const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+  console.log('[Avatar] openAvatarShopPanel: profile fetched, rendering attachment...');
+  const attachment = await buildAvatarProfileAttachment(profile, equipped);
+  console.log('[Avatar] openAvatarShopPanel: attachment rendered, calling editReply...');
   await interaction.editReply({
     embeds: [buildAvatarShopHomeEmbed(interaction.user)],
-    files: [await buildAvatarProfileAttachment(profile, equipped)],
+    files: [attachment],
     components: buildAvatarShopHomeComponents(),
   });
+  console.log('[Avatar] openAvatarShopPanel: editReply returned.');
 }
 
 // Starter panel — same lightweight pattern as Bank/Member Profile/Marketplace: a
