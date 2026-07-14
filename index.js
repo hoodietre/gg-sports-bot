@@ -1963,7 +1963,6 @@ async function initDatabase() {
   await migrateSingleChannelPanelsToMultiChannel();
 
   console.log('Database ready.');
-  console.log('[Avatar] BUILD CHECK: avatarpanel_locker/avatarpanel_shop handlers + step tracing are present in this deployment (2026-07-14-trace-1). If you do not see this exact line on every boot, the running process is NOT the file you think it is — redeploy.');
 }
 
 // One-time consolidation of the old per-guild guild_currency_balances into the new
@@ -3028,13 +3027,6 @@ function buildCommands() {
       .setDescription('Madden: draft class recap with value-based grades')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
       .addRoleOption(o => o.setName('team').setDescription('Team role (leave blank for a league-wide summary)').setRequired(false)),
-
-    // Temporary diagnostic command — isolates whether button interactions in general
-    // are broken vs something specific to avatar/botowner code. Safe to remove once
-    // the "This interaction failed" mystery is resolved.
-    new SlashCommandBuilder()
-      .setName('zzztest')
-      .setDescription('Temporary diagnostic — click the button it posts'),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -7349,62 +7341,6 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
 
   try {
-    // Temporary diagnostic — see the /zzztest command definition for context.
-    if (interaction.commandName === 'zzztest') {
-      const sharpLib = await getSharp();
-      const testBuffer = sharpLib
-        ? await sharpLib({ create: { width: 200, height: 200, channels: 4, background: { r: 88, g: 101, b: 242, alpha: 1 } } }).png().toBuffer()
-        : Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001080600000021f9c53f0000000a4944415478da62000100000500010d0a2db40000000049454e44ae426082', 'hex');
-      // Matches Avatar's exact message shape: an embed referencing attachment://,
-      // not a raw file attachment with no embed (that's the one thing zzztest hadn't
-      // replicated yet, and the one remaining structural difference from Avatar).
-      const testEmbed = new EmbedBuilder().setTitle('zzztest embed').setColor(0xFEE75C).setImage('attachment://zzztest.png');
-      await interaction.reply({
-        content: 'zzztest command received (embed + attachment:// image, matching Avatar exactly).',
-        embeds: [testEmbed],
-        files: [new AttachmentBuilder(testBuffer, { name: 'zzztest.png' })],
-        components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('zzztest_button').setLabel('Update components only').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId('zzztest_customize_copy').setLabel('Customize-copy test').setStyle(ButtonStyle.Danger)
-        )],
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'zzztest_button') {
-      await interaction.update({ content: 'zzztest button click received — updated WITHOUT touching the attachment.' });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'zzztest_button_reattach') {
-      const sharpLib2 = await getSharp();
-      const testBuffer2 = sharpLib2
-        ? await sharpLib2({ create: { width: 200, height: 200, channels: 4, background: { r: 87, g: 242, b: 135, alpha: 1 } } }).png().toBuffer()
-        : Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001080600000021f9c53f0000000a4944415478da62000100000500010d0a2db40000000049454e44ae426082', 'hex');
-      await interaction.update({
-        content: 'zzztest button click received — updated WITH a fresh attachment.',
-        files: [new AttachmentBuilder(testBuffer2, { name: 'zzztest2.png' })],
-      });
-      return;
-    }
-
-    // Exact copy of avatarlocker_customize's logic, positioned here (near the very
-    // top of the dispatch) instead of thousands of lines deeper. Isolates whether
-    // this is about the code itself or something about its position in the file.
-    if (interaction.isButton() && interaction.customId === 'zzztest_customize_copy') {
-      console.log('[Avatar] zzztest_customize_copy: handler entered.');
-      try {
-        const components = buildAvatarCustomizeComponents();
-        console.log('[Avatar] zzztest_customize_copy: components built OK, count:', components.length);
-        await interaction.update({ components });
-        console.log('[Avatar] zzztest_customize_copy: update() completed OK.');
-      } catch (error) {
-        console.error('[Avatar] zzztest_customize_copy failed:', error);
-      }
-      return;
-    }
-
 if (interaction.commandName === 'avatar') {
       if (!interaction.guild) return;
       const avatarSubcommand = interaction.options.getSubcommand();
@@ -7489,15 +7425,10 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId === 'avatarlocker_customize') {
       try {
-        const components = buildAvatarCustomizeComponents();
-        console.log('[Avatar] avatarlocker_customize: components built OK, count:', components.length);
-        await interaction.update({ components });
-        console.log('[Avatar] avatarlocker_customize: update() completed OK.');
+        await interaction.update({ components: buildAvatarCustomizeComponents() });
       } catch (error) {
         console.error('[Avatar] avatarlocker_customize failed:', error);
-        await interaction.reply({ content: 'Diagnostic: avatarlocker_customize threw — check logs for `[Avatar] avatarlocker_customize failed`.', ephemeral: true }).catch((e2) => {
-          console.error('[Avatar] avatarlocker_customize: even the fallback reply failed:', e2);
-        });
+        await interaction.reply({ content: 'Something went wrong opening customization.', ephemeral: true }).catch(() => null);
       }
       return;
     }
@@ -7795,6 +7726,7 @@ if (interaction.commandName === 'avatar') {
 
       const modal = new ModalBuilder()
         .setCustomId(`botownerpanel_payoutbounds_modal:${type}`)
+
         .setTitle(`Edit ${CURRENCY_PAYOUT_TYPE_LABELS[type]} Bounds`)
         .addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('min').setLabel('Minimum allowed value').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currencyConfigCache[`${type}_min`]))),
@@ -7830,6 +7762,132 @@ if (interaction.commandName === 'avatar') {
       });
       return;
     }
+
+    if (interaction.commandName === 'marketplace') {
+      if (!interaction.guild) return;
+      const subcommand = interaction.options.getSubcommand();
+      const settings = await getCurrencySettings(interaction.guild.id);
+
+      if (subcommand === 'list') {
+        await performMarketplaceList(interaction, settings, interaction.options.getString('item'), interaction.options.getInteger('price'));
+        return;
+      }
+
+      if (subcommand === 'browse') {
+        const payload = await buildMarketplaceBrowsePayload(settings, 0);
+        await interaction.reply({ ...payload, ephemeral: true });
+        return;
+      }
+
+      if (subcommand === 'buy') {
+        await performMarketplaceBuy(interaction, settings, interaction.options.getString('listing'));
+        return;
+      }
+
+      if (subcommand === 'cancel') {
+        await performMarketplaceCancel(interaction, interaction.options.getString('listing'));
+        return;
+      }
+
+      if (subcommand === 'mylistings') {
+        const result = await pool.query(
+          `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 ORDER BY listed_at DESC LIMIT 20`,
+          [interaction.user.id]
+        );
+        await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('marketplace_browse:')) {
+      const page = Number.parseInt(interaction.customId.split(':')[1], 10) || 0;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const payload = await buildMarketplaceBrowsePayload(settings, page);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_browse') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const payload = await buildMarketplaceBrowsePayload(settings, 0);
+      await interaction.reply({ ...payload, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_list') {
+      const modal = new ModalBuilder()
+        .setCustomId('marketplacepanel_list_modal')
+        .setTitle('List an Item for Sale')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('item').setLabel('Item name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Asking price').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_list_modal') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const itemInput = interaction.fields.getTextInputValue('item');
+      const priceInput = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
+      if (!Number.isInteger(priceInput)) {
+        await interaction.reply({ content: 'Price must be a whole number.', ephemeral: true });
+        return;
+      }
+      await performMarketplaceList(interaction, settings, itemInput, priceInput);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_buy') {
+      const modal = new ModalBuilder()
+        .setCustomId('marketplacepanel_buy_modal')
+        .setTitle('Buy a Listing')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_buy_modal') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      await performMarketplaceBuy(interaction, settings, interaction.fields.getTextInputValue('listing'));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_cancel') {
+      const modal = new ModalBuilder()
+        .setCustomId('marketplacepanel_cancel_modal')
+        .setTitle('Cancel a Listing')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_cancel_modal') {
+      if (!interaction.guild) return;
+      await performMarketplaceCancel(interaction, interaction.fields.getTextInputValue('listing'));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_mylistings') {
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 ORDER BY listed_at DESC LIMIT 20`,
+        [interaction.user.id]
+      );
+      await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
+      return;
+    }
+
 
 
 
@@ -16390,131 +16448,6 @@ if (shopSubcommand === 'view') {
         await interaction.reply({ content: 'Updated **' + inventoryItem.item_name + '** for ' + targetUser.toString() + ' to **' + status + '**.', ephemeral: true });
         return;
       }
-    }
-
-    if (interaction.commandName === 'marketplace') {
-      if (!interaction.guild) return;
-      const subcommand = interaction.options.getSubcommand();
-      const settings = await getCurrencySettings(interaction.guild.id);
-
-      if (subcommand === 'list') {
-        await performMarketplaceList(interaction, settings, interaction.options.getString('item'), interaction.options.getInteger('price'));
-        return;
-      }
-
-      if (subcommand === 'browse') {
-        const payload = await buildMarketplaceBrowsePayload(settings, 0);
-        await interaction.reply({ ...payload, ephemeral: true });
-        return;
-      }
-
-      if (subcommand === 'buy') {
-        await performMarketplaceBuy(interaction, settings, interaction.options.getString('listing'));
-        return;
-      }
-
-      if (subcommand === 'cancel') {
-        await performMarketplaceCancel(interaction, interaction.options.getString('listing'));
-        return;
-      }
-
-      if (subcommand === 'mylistings') {
-        const result = await pool.query(
-          `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 ORDER BY listed_at DESC LIMIT 20`,
-          [interaction.user.id]
-        );
-        await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
-        return;
-      }
-
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('marketplace_browse:')) {
-      const page = Number.parseInt(interaction.customId.split(':')[1], 10) || 0;
-      const settings = await getCurrencySettings(interaction.guild.id);
-      const payload = await buildMarketplaceBrowsePayload(settings, page);
-      await interaction.update(payload);
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'marketplacepanel_browse') {
-      if (!interaction.guild) return;
-      const settings = await getCurrencySettings(interaction.guild.id);
-      const payload = await buildMarketplaceBrowsePayload(settings, 0);
-      await interaction.reply({ ...payload, ephemeral: true });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'marketplacepanel_list') {
-      const modal = new ModalBuilder()
-        .setCustomId('marketplacepanel_list_modal')
-        .setTitle('List an Item for Sale')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('item').setLabel('Item name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Asking price').setStyle(TextInputStyle.Short).setRequired(true)),
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_list_modal') {
-      if (!interaction.guild) return;
-      const settings = await getCurrencySettings(interaction.guild.id);
-      const itemInput = interaction.fields.getTextInputValue('item');
-      const priceInput = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
-      if (!Number.isInteger(priceInput)) {
-        await interaction.reply({ content: 'Price must be a whole number.', ephemeral: true });
-        return;
-      }
-      await performMarketplaceList(interaction, settings, itemInput, priceInput);
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'marketplacepanel_buy') {
-      const modal = new ModalBuilder()
-        .setCustomId('marketplacepanel_buy_modal')
-        .setTitle('Buy a Listing')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_buy_modal') {
-      if (!interaction.guild) return;
-      const settings = await getCurrencySettings(interaction.guild.id);
-      await performMarketplaceBuy(interaction, settings, interaction.fields.getTextInputValue('listing'));
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'marketplacepanel_cancel') {
-      const modal = new ModalBuilder()
-        .setCustomId('marketplacepanel_cancel_modal')
-        .setTitle('Cancel a Listing')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_cancel_modal') {
-      if (!interaction.guild) return;
-      await performMarketplaceCancel(interaction, interaction.fields.getTextInputValue('listing'));
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'marketplacepanel_mylistings') {
-      if (!interaction.guild) return;
-      const settings = await getCurrencySettings(interaction.guild.id);
-      const result = await pool.query(
-        `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 ORDER BY listed_at DESC LIMIT 20`,
-        [interaction.user.id]
-      );
-      await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
-      return;
     }
 
     if (interaction.commandName === 'tournament') {
