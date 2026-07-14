@@ -7405,6 +7405,434 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
+if (interaction.commandName === 'avatar') {
+      if (!interaction.guild) return;
+      const avatarSubcommand = interaction.options.getSubcommand();
+
+      if (avatarSubcommand === 'view') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const { profile, equipped } = await getAvatarProfileWithEquipment(targetUser.id);
+        const attachment = await buildAvatarProfileAttachment(profile, equipped);
+        const embed = buildAvatarLockerEmbed(targetUser, profile, equipped).setTitle(`${targetUser.username} • Avatar`);
+        const avatarBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id).catch(() => []);
+        if (avatarBadges.length) {
+          embed.addFields({ name: '🏅 Avatar Badges', value: avatarBadges.slice(0, 8).map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(' • '), inline: false });
+        }
+        await interaction.reply({ embeds: [embed], files: [attachment], flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (avatarSubcommand === 'locker') {
+        await openAvatarLockerPanel(interaction, { mode: 'reply' });
+        return;
+      }
+
+      if (avatarSubcommand === 'shop') {
+        await openAvatarShopPanel(interaction, { mode: 'reply' });
+        return;
+      }
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarpanel_locker') {
+      try {
+        await openAvatarLockerPanel(interaction, { mode: 'reply' });
+      } catch (error) {
+        console.error('[Avatar] avatarpanel_locker failed:', error);
+        await interaction.reply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
+          console.error('[Avatar] avatarpanel_locker: fallback reply also failed:', e2);
+        });
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
+      try {
+        await openAvatarShopPanel(interaction, { mode: 'reply' });
+      } catch (error) {
+        console.error('[Avatar] avatarpanel_shop failed:', error);
+        await interaction.reply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
+          console.error('[Avatar] avatarpanel_shop: fallback reply also failed:', e2);
+        });
+      }
+      return;
+    }
+
+    // ---- Locker Room interactions ----
+    // Direct reply()/update() (no deferReply/deferUpdate) — matches the pattern every
+    // other working panel in this bot uses (Bank, GM, Ticket). sharp-based rendering is
+    // fast enough now that the original defer-for-slow-render concern doesn't apply.
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_slot_select') {
+      const slot = interaction.values[0];
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const payload = await buildAvatarLockerSlotPayload(interaction.user, profile, equipped, slot);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_item_select:')) {
+      const slot = interaction.customId.split(':')[1];
+      const chosen = interaction.values[0];
+      if (chosen === '__unequip__') {
+        await unequipAvatarSlot(interaction.user.id, slot);
+      } else {
+        await equipAvatarItem(interaction.user.id, slot, chosen);
+      }
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarLockerComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_customize') {
+      try {
+        const components = buildAvatarCustomizeComponents();
+        console.log('[Avatar] avatarlocker_customize: components built OK, count:', components.length);
+        await interaction.update({ components });
+        console.log('[Avatar] avatarlocker_customize: update() completed OK.');
+      } catch (error) {
+        console.error('[Avatar] avatarlocker_customize failed:', error);
+        await interaction.reply({ content: 'Diagnostic: avatarlocker_customize threw — check logs for `[Avatar] avatarlocker_customize failed`.', ephemeral: true }).catch((e2) => {
+          console.error('[Avatar] avatarlocker_customize: even the fallback reply failed:', e2);
+        });
+      }
+      return;
+    }
+
+    // Showcase pipeline (build order #4) — bakes the user's actual equipped outfit
+    // into a full-detail hero shot on demand, posted publicly. Kept separate from the
+    // always-on locker/shop render so those stay cheap; this is the intentionally
+    // heavier, celebratory one.
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_flex') {
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const attachment = await buildAvatarProfileAttachment(profile, equipped, { showcase: true });
+      const embed = new EmbedBuilder()
+        .setTitle(`🎉 ${interaction.user.username} is flexing`)
+        .setColor(0xFEE75C)
+        .setImage('attachment://avatar.png')
+        .setFooter({ text: 'GG Sports • Showcase' })
+        .setTimestamp();
+      await interaction.reply({ embeds: [embed], files: [attachment] }).catch(async (error) => {
+        console.error('[Avatar] Showcase reply failed (likely missing channel send permission):', error?.message || error);
+        await interaction.followUp({ content: 'Could not post the showcase publicly — I may be missing permission to post in this channel.', flags: MessageFlags.Ephemeral }).catch(() => null);
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_body') {
+      await updateAvatarBodyCustomization(interaction.user.id, { bodyKey: interaction.values[0] });
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarCustomizeComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_skin') {
+      await updateAvatarBodyCustomization(interaction.user.id, { skinTone: interaction.values[0] });
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarCustomizeComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_back') {
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarLockerComponents(),
+      });
+      return;
+    }
+
+    // ---- Avatar Shop interactions ----
+
+    if (interaction.isButton() && interaction.customId === 'avatarshop_home') {
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarShopHomeEmbed(interaction.user)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarShopHomeComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_category:')) {
+      const [, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const { items, total } = await fetchAvatarShopItems(interaction.guild.id, categorySlot, page);
+      await interaction.update({
+        embeds: [buildAvatarShopCategoryEmbed(categorySlot, items, page, total, settings)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarShopCategoryComponents(categorySlot, items, page, total),
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_preview_select:')) {
+      const [, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const itemId = interaction.values[0];
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
+      const item = itemResult.rows[0];
+      if (!item) {
+        await interaction.update({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
+        return;
+      }
+      await interaction.update(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_buy:')) {
+      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const outcome = await performAvatarShopPurchase(interaction, itemId);
+
+      if (!outcome.ok) {
+        await interaction.update({ content: outcome.message, embeds: [], files: [], components: [] });
+        return;
+      }
+
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        content: `Bought and equipped **${outcome.item.item_name}**!`,
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page}`).setLabel('Keep Shopping').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('avatarshop_home').setLabel('⬅ Shop Hub').setStyle(ButtonStyle.Secondary),
+        )],
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'botowner') {
+      if (!botOwnerUserId || interaction.user.id !== botOwnerUserId) {
+        await interaction.reply({ content: 'This command is restricted to the bot owner.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const subcommand = interaction.options.getSubcommand();
+
+      if (subcommand === 'status') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const embed = await buildBotOwnerStatusEmbed(client);
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (subcommand === 'guilds') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const embed = buildBotOwnerGuildsEmbed(client);
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (subcommand === 'currencyidentity') {
+        const name = interaction.options.getString('name').trim();
+        const icon = interaction.options.getString('icon').trim();
+
+        if (!name || name.length > 40) {
+          await interaction.reply({ content: 'Currency name must be 1-40 characters.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (!icon || icon.length > 16) {
+          await interaction.reply({ content: 'Currency icon must be 1-16 characters (a single emoji works best).', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        await pool.query(
+          `UPDATE system_currency_config SET currency_name = $1, currency_icon = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
+          [name, icon, interaction.user.id]
+        );
+        await loadCurrencyConfig();
+
+        await interaction.reply({
+          content: `Global currency identity updated to **${icon} ${name}**. This applies across every server immediately — no per-server override exists.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (subcommand === 'payoutbounds') {
+        const type = interaction.options.getString('type');
+        const min = interaction.options.getInteger('min');
+        const max = interaction.options.getInteger('max');
+
+        if (!CURRENCY_PAYOUT_TYPES.includes(type)) {
+          await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (min < 0 || max < 0 || min > max) {
+          await interaction.reply({ content: 'min must be 0 or greater, and min cannot exceed max.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        await pool.query(
+          `UPDATE system_currency_config SET ${type}_min = $1, ${type}_max = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
+          [min, max, interaction.user.id]
+        );
+        await loadCurrencyConfig();
+
+        await interaction.reply({
+          content: `Global bounds for **${type}** set to **${min}–${max}**. Any per-server rate outside this range will be clamped the next time it's read or saved (existing stored values aren't retroactively rewritten until then).`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (subcommand === 'currencyconfig') {
+        await loadCurrencyConfig();
+        await interaction.reply({ embeds: [buildBotOwnerCurrencyConfigEmbed()], flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (subcommand === 'panel') {
+        await showBotOwnerPanelHome(interaction, { update: false });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_back') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await showBotOwnerPanelHome(interaction, { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_status') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const embed = await buildBotOwnerStatusEmbed(client);
+      await interaction.update({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_guilds') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const embed = buildBotOwnerGuildsEmbed(client);
+      await interaction.update({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyconfig') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await loadCurrencyConfig();
+      await interaction.update({ embeds: [buildBotOwnerCurrencyConfigEmbed()], components: [buildBotOwnerPanelBackRow()] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyidentity_edit') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('botownerpanel_currencyidentity_modal')
+        .setTitle('Edit Global Currency Identity')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Currency name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40).setValue(currencyConfigCache.currency_name)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('icon').setLabel('Currency icon/emoji').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(16).setValue(currencyConfigCache.currency_icon)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'botownerpanel_currencyidentity_modal') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const name = interaction.fields.getTextInputValue('name').trim();
+      const icon = interaction.fields.getTextInputValue('icon').trim();
+
+      if (!name || name.length > 40) { await interaction.reply({ content: 'Currency name must be 1-40 characters.', flags: MessageFlags.Ephemeral }); return; }
+      if (!icon || icon.length > 16) { await interaction.reply({ content: 'Currency icon must be 1-16 characters.', flags: MessageFlags.Ephemeral }); return; }
+
+      await pool.query(
+        `UPDATE system_currency_config SET currency_name = $1, currency_icon = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
+        [name, icon, interaction.user.id]
+      );
+      await loadCurrencyConfig();
+
+      await interaction.reply({
+        content: `Global currency identity updated to **${icon} ${name}**. Applies across every server immediately.`,
+        embeds: [buildBotOwnerCurrencyConfigEmbed()],
+        components: [buildBotOwnerPanelBackRow()],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_payoutbounds_edit') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('botownerpanel_payoutbounds_select')
+        .setPlaceholder('Choose a payout type to edit')
+        .addOptions(CURRENCY_PAYOUT_TYPES.map(type => ({
+          label: CURRENCY_PAYOUT_TYPE_LABELS[type],
+          value: type,
+          description: `Current range: ${currencyConfigCache[`${type}_min`]}–${currencyConfigCache[`${type}_max`]}`,
+        })));
+      await interaction.update({
+        content: null,
+        embeds: [buildBotOwnerCurrencyConfigEmbed()],
+        components: [new ActionRowBuilder().addComponents(menu), buildBotOwnerPanelBackRow()],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_payoutbounds_select') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const type = interaction.values[0];
+      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`botownerpanel_payoutbounds_modal:${type}`)
+        .setTitle(`Edit ${CURRENCY_PAYOUT_TYPE_LABELS[type]} Bounds`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('min').setLabel('Minimum allowed value').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currencyConfigCache[`${type}_min`]))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max').setLabel('Maximum allowed value').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currencyConfigCache[`${type}_max`]))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_payoutbounds_modal:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const type = interaction.customId.split(':')[1];
+      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
+
+      const min = Number.parseInt(interaction.fields.getTextInputValue('min'), 10);
+      const max = Number.parseInt(interaction.fields.getTextInputValue('max'), 10);
+      if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max < 0 || min > max) {
+        await interaction.reply({ content: 'min/max must be whole numbers, min ≥ 0, and min cannot exceed max.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE system_currency_config SET ${type}_min = $1, ${type}_max = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
+        [min, max, interaction.user.id]
+      );
+      await loadCurrencyConfig();
+
+      await interaction.reply({
+        content: `Global bounds for **${CURRENCY_PAYOUT_TYPE_LABELS[type]}** set to **${min}–${max}**. Existing per-server rates outside this range will be clamped the next time they're read or saved.`,
+        embeds: [buildBotOwnerCurrencyConfigEmbed()],
+        components: [buildBotOwnerPanelBackRow()],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+
+
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('onboard_league_select:')) {
       const guildId = interaction.customId.split(':')[1];
       const guild = client.guilds.cache.get(guildId);
@@ -12705,218 +13133,6 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       return;
     }
 
-    if (interaction.commandName === 'botowner') {
-      if (!botOwnerUserId || interaction.user.id !== botOwnerUserId) {
-        await interaction.reply({ content: 'This command is restricted to the bot owner.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-      const subcommand = interaction.options.getSubcommand();
-
-      if (subcommand === 'status') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const embed = await buildBotOwnerStatusEmbed(client);
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (subcommand === 'guilds') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const embed = buildBotOwnerGuildsEmbed(client);
-        await interaction.editReply({ embeds: [embed] });
-        return;
-      }
-
-      if (subcommand === 'currencyidentity') {
-        const name = interaction.options.getString('name').trim();
-        const icon = interaction.options.getString('icon').trim();
-
-        if (!name || name.length > 40) {
-          await interaction.reply({ content: 'Currency name must be 1-40 characters.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!icon || icon.length > 16) {
-          await interaction.reply({ content: 'Currency icon must be 1-16 characters (a single emoji works best).', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        await pool.query(
-          `UPDATE system_currency_config SET currency_name = $1, currency_icon = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
-          [name, icon, interaction.user.id]
-        );
-        await loadCurrencyConfig();
-
-        await interaction.reply({
-          content: `Global currency identity updated to **${icon} ${name}**. This applies across every server immediately — no per-server override exists.`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-
-      if (subcommand === 'payoutbounds') {
-        const type = interaction.options.getString('type');
-        const min = interaction.options.getInteger('min');
-        const max = interaction.options.getInteger('max');
-
-        if (!CURRENCY_PAYOUT_TYPES.includes(type)) {
-          await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (min < 0 || max < 0 || min > max) {
-          await interaction.reply({ content: 'min must be 0 or greater, and min cannot exceed max.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        await pool.query(
-          `UPDATE system_currency_config SET ${type}_min = $1, ${type}_max = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
-          [min, max, interaction.user.id]
-        );
-        await loadCurrencyConfig();
-
-        await interaction.reply({
-          content: `Global bounds for **${type}** set to **${min}–${max}**. Any per-server rate outside this range will be clamped the next time it's read or saved (existing stored values aren't retroactively rewritten until then).`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-
-      if (subcommand === 'currencyconfig') {
-        await loadCurrencyConfig();
-        await interaction.reply({ embeds: [buildBotOwnerCurrencyConfigEmbed()], flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      if (subcommand === 'panel') {
-        await showBotOwnerPanelHome(interaction, { update: false });
-        return;
-      }
-
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'botownerpanel_back') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      await showBotOwnerPanelHome(interaction, { update: true });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'botownerpanel_status') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const embed = await buildBotOwnerStatusEmbed(client);
-      await interaction.update({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'botownerpanel_guilds') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const embed = buildBotOwnerGuildsEmbed(client);
-      await interaction.update({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyconfig') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      await loadCurrencyConfig();
-      await interaction.update({ embeds: [buildBotOwnerCurrencyConfigEmbed()], components: [buildBotOwnerPanelBackRow()] });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyidentity_edit') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const modal = new ModalBuilder()
-        .setCustomId('botownerpanel_currencyidentity_modal')
-        .setTitle('Edit Global Currency Identity')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Currency name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40).setValue(currencyConfigCache.currency_name)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('icon').setLabel('Currency icon/emoji').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(16).setValue(currencyConfigCache.currency_icon)),
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId === 'botownerpanel_currencyidentity_modal') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const name = interaction.fields.getTextInputValue('name').trim();
-      const icon = interaction.fields.getTextInputValue('icon').trim();
-
-      if (!name || name.length > 40) { await interaction.reply({ content: 'Currency name must be 1-40 characters.', flags: MessageFlags.Ephemeral }); return; }
-      if (!icon || icon.length > 16) { await interaction.reply({ content: 'Currency icon must be 1-16 characters.', flags: MessageFlags.Ephemeral }); return; }
-
-      await pool.query(
-        `UPDATE system_currency_config SET currency_name = $1, currency_icon = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
-        [name, icon, interaction.user.id]
-      );
-      await loadCurrencyConfig();
-
-      await interaction.reply({
-        content: `Global currency identity updated to **${icon} ${name}**. Applies across every server immediately.`,
-        embeds: [buildBotOwnerCurrencyConfigEmbed()],
-        components: [buildBotOwnerPanelBackRow()],
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'botownerpanel_payoutbounds_edit') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId('botownerpanel_payoutbounds_select')
-        .setPlaceholder('Choose a payout type to edit')
-        .addOptions(CURRENCY_PAYOUT_TYPES.map(type => ({
-          label: CURRENCY_PAYOUT_TYPE_LABELS[type],
-          value: type,
-          description: `Current range: ${currencyConfigCache[`${type}_min`]}–${currencyConfigCache[`${type}_max`]}`,
-        })));
-      await interaction.update({
-        content: null,
-        embeds: [buildBotOwnerCurrencyConfigEmbed()],
-        components: [new ActionRowBuilder().addComponents(menu), buildBotOwnerPanelBackRow()],
-      });
-      return;
-    }
-
-    if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_payoutbounds_select') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const type = interaction.values[0];
-      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
-
-      const modal = new ModalBuilder()
-        .setCustomId(`botownerpanel_payoutbounds_modal:${type}`)
-        .setTitle(`Edit ${CURRENCY_PAYOUT_TYPE_LABELS[type]} Bounds`)
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('min').setLabel('Minimum allowed value').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currencyConfigCache[`${type}_min`]))),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max').setLabel('Maximum allowed value').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(currencyConfigCache[`${type}_max`]))),
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_payoutbounds_modal:')) {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const type = interaction.customId.split(':')[1];
-      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
-
-      const min = Number.parseInt(interaction.fields.getTextInputValue('min'), 10);
-      const max = Number.parseInt(interaction.fields.getTextInputValue('max'), 10);
-      if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max < 0 || min > max) {
-        await interaction.reply({ content: 'min/max must be whole numbers, min ≥ 0, and min cannot exceed max.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      await pool.query(
-        `UPDATE system_currency_config SET ${type}_min = $1, ${type}_max = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
-        [min, max, interaction.user.id]
-      );
-      await loadCurrencyConfig();
-
-      await interaction.reply({
-        content: `Global bounds for **${CURRENCY_PAYOUT_TYPE_LABELS[type]}** set to **${min}–${max}**. Existing per-server rates outside this range will be clamped the next time they're read or saved.`,
-        embeds: [buildBotOwnerCurrencyConfigEmbed()],
-        components: [buildBotOwnerPanelBackRow()],
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-
     if (interaction.commandName === 'teamroster') {
       if (!interaction.guild) return;
       const subcommand = interaction.options.getSubcommand();
@@ -15463,220 +15679,6 @@ if (interaction.commandName === 'badges') {
         await interaction.reply({ embeds: [buildBadgeProgressEmbed(targetUser, recognition)], flags: MessageFlags.Ephemeral });
         return;
       }
-    }
-
-if (interaction.commandName === 'avatar') {
-      if (!interaction.guild) return;
-      const avatarSubcommand = interaction.options.getSubcommand();
-
-      if (avatarSubcommand === 'view') {
-        const targetUser = interaction.options.getUser('user') || interaction.user;
-        const { profile, equipped } = await getAvatarProfileWithEquipment(targetUser.id);
-        const attachment = await buildAvatarProfileAttachment(profile, equipped);
-        const embed = buildAvatarLockerEmbed(targetUser, profile, equipped).setTitle(`${targetUser.username} • Avatar`);
-        const avatarBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id).catch(() => []);
-        if (avatarBadges.length) {
-          embed.addFields({ name: '🏅 Avatar Badges', value: avatarBadges.slice(0, 8).map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(' • '), inline: false });
-        }
-        await interaction.reply({ embeds: [embed], files: [attachment], flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      if (avatarSubcommand === 'locker') {
-        await openAvatarLockerPanel(interaction, { mode: 'reply' });
-        return;
-      }
-
-      if (avatarSubcommand === 'shop') {
-        await openAvatarShopPanel(interaction, { mode: 'reply' });
-        return;
-      }
-    }
-
-    if (interaction.isButton() && interaction.customId === 'avatarpanel_locker') {
-      try {
-        await openAvatarLockerPanel(interaction, { mode: 'reply' });
-      } catch (error) {
-        console.error('[Avatar] avatarpanel_locker failed:', error);
-        await interaction.reply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
-          console.error('[Avatar] avatarpanel_locker: fallback reply also failed:', e2);
-        });
-      }
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
-      try {
-        await openAvatarShopPanel(interaction, { mode: 'reply' });
-      } catch (error) {
-        console.error('[Avatar] avatarpanel_shop failed:', error);
-        await interaction.reply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
-          console.error('[Avatar] avatarpanel_shop: fallback reply also failed:', e2);
-        });
-      }
-      return;
-    }
-
-    // ---- Locker Room interactions ----
-    // Direct reply()/update() (no deferReply/deferUpdate) — matches the pattern every
-    // other working panel in this bot uses (Bank, GM, Ticket). sharp-based rendering is
-    // fast enough now that the original defer-for-slow-render concern doesn't apply.
-
-    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_slot_select') {
-      const slot = interaction.values[0];
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      const payload = await buildAvatarLockerSlotPayload(interaction.user, profile, equipped, slot);
-      await interaction.update(payload);
-      return;
-    }
-
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_item_select:')) {
-      const slot = interaction.customId.split(':')[1];
-      const chosen = interaction.values[0];
-      if (chosen === '__unequip__') {
-        await unequipAvatarSlot(interaction.user.id, slot);
-      } else {
-        await equipAvatarItem(interaction.user.id, slot, chosen);
-      }
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
-        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarLockerComponents(),
-      });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'avatarlocker_customize') {
-      try {
-        const components = buildAvatarCustomizeComponents();
-        console.log('[Avatar] avatarlocker_customize: components built OK, count:', components.length);
-        await interaction.update({ components });
-        console.log('[Avatar] avatarlocker_customize: update() completed OK.');
-      } catch (error) {
-        console.error('[Avatar] avatarlocker_customize failed:', error);
-        await interaction.reply({ content: 'Diagnostic: avatarlocker_customize threw — check logs for `[Avatar] avatarlocker_customize failed`.', ephemeral: true }).catch((e2) => {
-          console.error('[Avatar] avatarlocker_customize: even the fallback reply failed:', e2);
-        });
-      }
-      return;
-    }
-
-    // Showcase pipeline (build order #4) — bakes the user's actual equipped outfit
-    // into a full-detail hero shot on demand, posted publicly. Kept separate from the
-    // always-on locker/shop render so those stay cheap; this is the intentionally
-    // heavier, celebratory one.
-    if (interaction.isButton() && interaction.customId === 'avatarlocker_flex') {
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      const attachment = await buildAvatarProfileAttachment(profile, equipped, { showcase: true });
-      const embed = new EmbedBuilder()
-        .setTitle(`🎉 ${interaction.user.username} is flexing`)
-        .setColor(0xFEE75C)
-        .setImage('attachment://avatar.png')
-        .setFooter({ text: 'GG Sports • Showcase' })
-        .setTimestamp();
-      await interaction.reply({ embeds: [embed], files: [attachment] }).catch(async (error) => {
-        console.error('[Avatar] Showcase reply failed (likely missing channel send permission):', error?.message || error);
-        await interaction.followUp({ content: 'Could not post the showcase publicly — I may be missing permission to post in this channel.', flags: MessageFlags.Ephemeral }).catch(() => null);
-      });
-      return;
-    }
-
-    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_body') {
-      await updateAvatarBodyCustomization(interaction.user.id, { bodyKey: interaction.values[0] });
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
-        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarCustomizeComponents(),
-      });
-      return;
-    }
-
-    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_skin') {
-      await updateAvatarBodyCustomization(interaction.user.id, { skinTone: interaction.values[0] });
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
-        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarCustomizeComponents(),
-      });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId === 'avatarlocker_back') {
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
-        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-        files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarLockerComponents(),
-      });
-      return;
-    }
-
-    // ---- Avatar Shop interactions ----
-
-    if (interaction.isButton() && interaction.customId === 'avatarshop_home') {
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
-        embeds: [buildAvatarShopHomeEmbed(interaction.user)],
-        files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarShopHomeComponents(),
-      });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_category:')) {
-      const [, categorySlot, pageStr] = interaction.customId.split(':');
-      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
-      const settings = await getCurrencySettings(interaction.guild.id);
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      const { items, total } = await fetchAvatarShopItems(interaction.guild.id, categorySlot, page);
-      await interaction.update({
-        embeds: [buildAvatarShopCategoryEmbed(categorySlot, items, page, total, settings)],
-        files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarShopCategoryComponents(categorySlot, items, page, total),
-      });
-      return;
-    }
-
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_preview_select:')) {
-      const [, categorySlot, pageStr] = interaction.customId.split(':');
-      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
-      const itemId = interaction.values[0];
-      const settings = await getCurrencySettings(interaction.guild.id);
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
-      const item = itemResult.rows[0];
-      if (!item) {
-        await interaction.update({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
-        return;
-      }
-      await interaction.update(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_buy:')) {
-      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
-      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
-      const outcome = await performAvatarShopPurchase(interaction, itemId);
-
-      if (!outcome.ok) {
-        await interaction.update({ content: outcome.message, embeds: [], files: [], components: [] });
-        return;
-      }
-
-      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
-        content: `Bought and equipped **${outcome.item.item_name}**!`,
-        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
-        files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page}`).setLabel('Keep Shopping').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId('avatarshop_home').setLabel('⬅ Shop Hub').setStyle(ButtonStyle.Secondary),
-        )],
-      });
-      return;
     }
 
 if (interaction.commandName === 'trade') {
