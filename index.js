@@ -16111,22 +16111,14 @@ if (interaction.commandName === 'trade') {
 
         await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
 
-        const avatar = await ensureVisualAvatar(interaction.guild.id, interaction.user.id);
-        const previewAvatar = { ...avatar };
-        const columnMap = {
-          headwear: 'equipped_headwear',
-          top: 'equipped_top',
-          bottom: 'equipped_bottom',
-          accessory: 'equipped_accessory',
-          footwear: 'equipped_footwear',
-          pet: 'equipped_pet',
-          effect: 'equipped_effect',
-          background: 'equipped_background',
-        };
-        previewAvatar[columnMap[slot]] = name;
+        const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name } };
 
-        const attachment = buildAvatarAttachment(interaction.user, previewAvatar);
-        const embed = buildVisualAvatarEmbed(interaction.user, previewAvatar, name)
+        const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
+        const embed = new EmbedBuilder()
+          .setTitle(`${interaction.user.username} • Preview`)
+          .setColor(0xFEE75C)
+          .setImage('attachment://avatar.png')
           .addFields(
             { name: 'Created Cosmetic', value: rarityIcon(rarity) + ' **' + name + '**', inline: true },
             { name: 'Slot', value: slot, inline: true },
@@ -16148,31 +16140,20 @@ if (interaction.commandName === 'trade') {
           return;
         }
 
-        const avatar = await ensureVisualAvatar(interaction.guild.id, interaction.user.id);
-        const slot = inferAvatarSlotFromItem(item);
-        const preview = {};
-        preview[slot] = item.item_name;
+        const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+        const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name } };
 
-        const previewAvatar = { ...avatar };
-        const columnMap = {
-          headwear: 'equipped_headwear',
-          top: 'equipped_top',
-          bottom: 'equipped_bottom',
-          accessory: 'equipped_accessory',
-          footwear: 'equipped_footwear',
-          pet: 'equipped_pet',
-          effect: 'equipped_effect',
-          background: 'equipped_background',
-        };
-        previewAvatar[columnMap[slot]] = item.item_name;
-
-        const attachment = buildAvatarAttachment(interaction.user, previewAvatar);
-        const embed = buildVisualAvatarEmbed(interaction.user, previewAvatar, item.item_name)
+        const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
+        const embed = new EmbedBuilder()
+          .setTitle(`${interaction.user.username} • Preview • ${item.item_name}`)
+          .setColor(0xFEE75C)
+          .setImage('attachment://avatar.png')
           .addFields(
             { name: 'Preview Slot', value: slot, inline: true },
             { name: 'Rarity', value: rarityIcon(item.rarity) + ' ' + (item.rarity || 'common'), inline: true },
             { name: 'Price', value: item.price !== undefined && item.price !== null ? String(item.price) : 'Unlock/Not for sale', inline: true },
-            { name: 'How to Buy', value: 'Use the numbered button on /shop panel or add it to your cart, then equip with /avatar equip.', inline: false }
+            { name: 'How to Buy', value: 'Use `/avatar shop` to browse and buy, or the "Go Shopping" button on the Avatar Panel.', inline: false }
           );
 
         await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
@@ -20379,10 +20360,8 @@ if (shopSubcommand === 'view') {
       const profileLegacyTier = typeof getLegacyTier === 'function' ? getLegacyTier(Number(profileRecognition.legacy_score || 0)) : { name: 'Rising Star' };
       const profileBadges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, profileRecognition);
       const profileStreamUrl = await getUserStreamUrl(interaction.guild.id, targetUser.id);
-      const profileAvatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
-
-      const mappedProfileAvatar = await ensureUserAvatar(interaction.guild.id, targetUser.id);
-      const mappedProfileAvatarAttachment = buildAvatarAttachment(targetUser, mappedProfileAvatar);
+      const { profile: mappedAvatarProfile, equipped: mappedAvatarEquipped } = await getAvatarProfileWithEquipment(targetUser.id);
+      const mappedProfileAvatarAttachment = await buildAvatarProfileAttachment(mappedAvatarProfile, mappedAvatarEquipped);
 
       await interaction.reply({
         embeds: [buildUserProfileEmbed(activeLeague, targetUser, {
@@ -20400,7 +20379,7 @@ if (shopSubcommand === 'view') {
           activityDisplay: getActivityTierIcon(profileActivityTier) + ' ' + normalizeActivityTierName(profileActivityTier) + ' • ' + String(profileRecognition.activity_points || 0) + ' pts',
           badgesDisplay: profileBadges.length ? profileBadges.map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(String.fromCharCode(10)).slice(0, 1024) : 'No badges unlocked yet.',
           streamDisplay: profileStreamUrl || 'No stream linked. Use /linkstream to add one.',
-          avatarDisplay: 'Visual avatar rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.',
+          avatarDisplay: 'Avatar rendered below. Use `/avatar locker` to equip owned items, `/avatar shop` to buy more.',
         })],
         files: [mappedProfileAvatarAttachment],
         ephemeral: true,
@@ -25741,8 +25720,8 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
   const settings = await getCurrencySettings(guild.id);
   const badges = await getExpandedUserBadges(guild.id, targetUser.id, recognition);
   const streamUrl = await getUserStreamUrl(guild.id, targetUser.id);
-  const avatar = await ensureUserAvatar(guild.id, targetUser.id);
-  const profileAvatarAttachment = buildAvatarAttachment(targetUser, avatar);
+  const { profile: avatarProfile, equipped: avatarEquipped } = await getAvatarProfileWithEquipment(targetUser.id);
+  const profileAvatarAttachment = await buildAvatarProfileAttachment(avatarProfile, avatarEquipped);
   const legacyIcon = getLegacyTierIcon(legacyTier);
   const activityIcon = getActivityTierIcon(activityTier);
   const normalizedActivityTier = normalizeActivityTierName(activityTier);
@@ -25766,7 +25745,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false },
       { name: 'Badges', value: badgesDisplay.slice(0, 1024), inline: false },
       { name: 'Stream', value: streamUrl || 'No stream linked. Use /linkstream to add one.', inline: false },
-      { name: 'Visual Avatar', value: 'Rendered below. Use /avatar view, /avatar wardrobe, and /avatar equip to customize.', inline: false }
+      { name: 'Avatar', value: 'Rendered below. Use `/avatar locker` to equip owned items, `/avatar shop` to buy more.', inline: false }
     )
     .setFooter({ text: 'GG Sports • Franchise Hub Foundation' })
     .setTimestamp();
