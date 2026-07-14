@@ -7355,12 +7355,16 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const testBuffer = sharpLib
         ? await sharpLib({ create: { width: 200, height: 200, channels: 4, background: { r: 88, g: 101, b: 242, alpha: 1 } } }).png().toBuffer()
         : Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001080600000021f9c53f0000000a4944415478da62000100000500010d0a2db40000000049454e44ae426082', 'hex');
+      // Matches Avatar's exact message shape: an embed referencing attachment://,
+      // not a raw file attachment with no embed (that's the one thing zzztest hadn't
+      // replicated yet, and the one remaining structural difference from Avatar).
+      const testEmbed = new EmbedBuilder().setTitle('zzztest embed').setColor(0xFEE75C).setImage('attachment://zzztest.png');
       await interaction.reply({
-        content: 'zzztest command received (with attachment).',
+        content: 'zzztest command received (embed + attachment:// image, matching Avatar exactly).',
+        embeds: [testEmbed],
         files: [new AttachmentBuilder(testBuffer, { name: 'zzztest.png' })],
         components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('zzztest_button').setLabel('Click me (update, no attachment change)').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId('zzztest_button_reattach').setLabel('Click me (update, re-attach)').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('zzztest_button').setLabel('Update components only').setStyle(ButtonStyle.Primary),
           new ButtonBuilder().setCustomId('zzztest_customize_copy').setLabel('Customize-copy test').setStyle(ButtonStyle.Danger)
         )],
         ephemeral: true,
