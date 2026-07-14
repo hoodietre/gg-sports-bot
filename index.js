@@ -26,7 +26,6 @@ import zlib from 'zlib';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import sharp from 'sharp';
 import http from 'http';
 
 const { Pool } = pkg;
@@ -24519,7 +24518,7 @@ async function loadAvatarBodyBuffer(bodyKey) {
 // cheaper than the placeholder renderer's concentric-ellipse approach, and
 // composited with a 'screen' blend so it reads as light coming off the character
 // rather than a translucent disc sitting on top of it.
-async function buildAvatarAuraGlowBuffer(width, height, effectName) {
+async function buildAvatarAuraGlowBuffer(sharp, width, height, effectName) {
   const [r, g, b] = avatarDeterministicColor(effectName);
   const cx = Math.round(width / 2);
   const cy = Math.round(height * 0.55);
@@ -24550,6 +24549,27 @@ function avatarBackgroundColorFor(backgroundName) {
 // pose-specific art exists yet, so this is a stylized presentation of the standard
 // pose rather than a true alternate pose. True multi-pose showcase needs its own art
 // pass later; this delivers the on-demand "hero shot" value now without waiting on it.
+// sharp is loaded lazily and defensively — a missing/broken native dependency for a
+// cosmetic art feature must never be able to crash the whole bot (this exact failure
+// mode happened with a static top-level import). Loaded once, cached either way; if it
+// fails, every render call below transparently falls back to the placeholder renderer
+// instead of the bot refusing to boot.
+let sharpModule = null;
+let sharpLoadAttempted = false;
+async function getSharp() {
+  if (sharpLoadAttempted) return sharpModule;
+  sharpLoadAttempted = true;
+  try {
+    const mod = await import('sharp');
+    sharpModule = mod.default;
+    console.log('[Avatar] sharp loaded — real-art avatar rendering enabled.');
+  } catch (error) {
+    console.error('[Avatar] sharp is not installed/loadable — avatar rendering will use the placeholder renderer until this is fixed. Run `npm install` with sharp in package.json and redeploy. Error:', error?.message || error);
+    sharpModule = null;
+  }
+  return sharpModule;
+}
+
 async function renderAvatarProfilePng(profile, equipped, options = {}) {
   try {
     return await renderAvatarProfilePngRealArt(profile, equipped, options);
@@ -24560,6 +24580,9 @@ async function renderAvatarProfilePng(profile, equipped, options = {}) {
 }
 
 async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
+  const sharp = await getSharp();
+  if (!sharp) return renderAvatarProfilePngPlaceholder(profile, equipped);
+
   const bodyKey = AVATAR_BODY_KEYS.includes(profile.body_key) ? profile.body_key : 'male_athletic';
   const bodyBuffer = await loadAvatarBodyBuffer(bodyKey);
   if (!bodyBuffer) return renderAvatarProfilePngPlaceholder(profile, equipped);
@@ -24605,7 +24628,7 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
 
   const effectName = equipped.effect?.item_name;
   if (effectName) {
-    composites.push({ input: await buildAvatarAuraGlowBuffer(width, height, effectName), left: 0, top: 0, blend: 'screen' });
+    composites.push({ input: await buildAvatarAuraGlowBuffer(sharp, width, height, effectName), left: 0, top: 0, blend: 'screen' });
   }
 
   const canvas = sharp({ create: { width, height, channels: 4, background: bgColor } });
