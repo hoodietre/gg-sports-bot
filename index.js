@@ -6247,6 +6247,10 @@ function getMultiChannelPanelInfo(panelType) {
       label: 'Marketplace',
       build: async () => ({ embeds: [buildMarketplaceStarterEmbed()], components: buildMarketplaceStarterComponents() }),
     },
+    avatar: {
+      label: 'Avatar',
+      build: async () => ({ embeds: [buildAvatarStarterEmbed()], components: buildAvatarStarterComponents() }),
+    },
   };
   return registry[panelType] || null;
 }
@@ -15394,6 +15398,7 @@ if (interaction.commandName === 'avatar') {
       const avatarSubcommand = interaction.options.getSubcommand();
 
       if (avatarSubcommand === 'view') {
+        await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const { profile, equipped } = await getAvatarProfileWithEquipment(targetUser.id);
         const attachment = buildAvatarProfileAttachment(profile, equipped);
@@ -15402,44 +15407,51 @@ if (interaction.commandName === 'avatar') {
         if (avatarBadges.length) {
           embed.addFields({ name: '🏅 Avatar Badges', value: avatarBadges.slice(0, 8).map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(' • '), inline: false });
         }
-        await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], files: [attachment] });
         return;
       }
 
       if (avatarSubcommand === 'locker') {
-        const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-        await interaction.reply({
-          embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
-          files: [buildAvatarProfileAttachment(profile, equipped)],
-          components: buildAvatarLockerComponents(),
-          ephemeral: true,
-        });
+        await interaction.deferReply({ ephemeral: true });
+        await openAvatarLockerPanel(interaction);
         return;
       }
 
       if (avatarSubcommand === 'shop') {
-        const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-        await interaction.reply({
-          embeds: [buildAvatarShopHomeEmbed(interaction.user)],
-          files: [buildAvatarProfileAttachment(profile, equipped)],
-          components: buildAvatarShopHomeComponents(),
-          ephemeral: true,
-        });
+        await interaction.deferReply({ ephemeral: true });
+        await openAvatarShopPanel(interaction);
         return;
       }
     }
 
+    if (interaction.isButton() && interaction.customId === 'avatarpanel_locker') {
+      await interaction.deferReply({ ephemeral: true });
+      await openAvatarLockerPanel(interaction);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
+      await interaction.deferReply({ ephemeral: true });
+      await openAvatarShopPanel(interaction);
+      return;
+    }
+
     // ---- Locker Room interactions ----
+    // Every handler here defers FIRST, before any DB query or image render — rendering
+    // is synchronous pixel math + a blocking zlib deflate on a ~4MB buffer, easily slow
+    // enough to blow Discord's 3-second interaction ACK window if done before acking.
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_slot_select') {
+      await interaction.deferUpdate();
       const slot = interaction.values[0];
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       const payload = await buildAvatarLockerSlotPayload(interaction.user, profile, equipped, slot);
-      await interaction.update(payload);
+      await interaction.editReply(payload);
       return;
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_item_select:')) {
+      await interaction.deferUpdate();
       const slot = interaction.customId.split(':')[1];
       const chosen = interaction.values[0];
       if (chosen === '__unequip__') {
@@ -15448,7 +15460,7 @@ if (interaction.commandName === 'avatar') {
         await equipAvatarItem(interaction.user.id, slot, chosen);
       }
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
+      await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarLockerComponents(),
@@ -15462,9 +15474,10 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_build') {
+      await interaction.deferUpdate();
       await updateAvatarBodyCustomization(interaction.user.id, { build: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
+      await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarCustomizeComponents(),
@@ -15473,9 +15486,10 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_silhouette') {
+      await interaction.deferUpdate();
       await updateAvatarBodyCustomization(interaction.user.id, { silhouette: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
+      await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarCustomizeComponents(),
@@ -15484,9 +15498,10 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_skin') {
+      await interaction.deferUpdate();
       await updateAvatarBodyCustomization(interaction.user.id, { skinTone: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
+      await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarCustomizeComponents(),
@@ -15495,8 +15510,9 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarlocker_back') {
+      await interaction.deferUpdate();
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
+      await interaction.editReply({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarLockerComponents(),
@@ -15507,8 +15523,9 @@ if (interaction.commandName === 'avatar') {
     // ---- Avatar Shop interactions ----
 
     if (interaction.isButton() && interaction.customId === 'avatarshop_home') {
+      await interaction.deferUpdate();
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
+      await interaction.editReply({
         embeds: [buildAvatarShopHomeEmbed(interaction.user)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarShopHomeComponents(),
@@ -15517,12 +15534,13 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('avatarshop_category:')) {
+      await interaction.deferUpdate();
       const [, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const settings = await getCurrencySettings(interaction.guild.id);
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       const { items, total } = await fetchAvatarShopItems(interaction.guild.id, categorySlot, page);
-      await interaction.update({
+      await interaction.editReply({
         embeds: [buildAvatarShopCategoryEmbed(categorySlot, items, page, total, settings)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarShopCategoryComponents(categorySlot, items, page, total),
@@ -15531,6 +15549,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_preview_select:')) {
+      await interaction.deferUpdate();
       const [, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const itemId = interaction.values[0];
@@ -15539,25 +15558,26 @@ if (interaction.commandName === 'avatar') {
       const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
-        await interaction.reply({ content: 'That item is no longer available.', ephemeral: true });
+        await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
         return;
       }
-      await interaction.update(buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
+      await interaction.editReply(buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('avatarshop_buy:')) {
+      await interaction.deferUpdate();
       const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const outcome = await performAvatarShopPurchase(interaction, itemId);
 
       if (!outcome.ok) {
-        await interaction.reply({ content: outcome.message, ephemeral: true });
+        await interaction.editReply({ content: outcome.message, embeds: [], files: [], components: [] });
         return;
       }
 
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.update({
+      await interaction.editReply({
         content: `Bought and equipped **${outcome.item.item_name}**!`,
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
         files: [buildAvatarProfileAttachment(profile, equipped)],
@@ -24318,9 +24338,12 @@ function renderAvatarProfilePng(profile, equipped) {
   avatarRect(img, width, height, 65, 75, 770, 1050, [0, 0, 0, 55]);
   avatarRect(img, width, height, 70, 80, 10, 1040, gold);
 
-  // effect/aura — any equipped effect glows, not just keyword-matched names
+  // effect/aura — any equipped effect glows, not just keyword-matched names.
+  // Coarser step than the old renderer (20 vs 8) — each pass is a full ellipse
+  // rasterize, and rendering happens on every button click, so keeping this cheap
+  // matters more here than it did for a one-off /shop preview.
   if (effectName) {
-    for (let r = 260; r > 0; r -= 8) {
+    for (let r = 260; r > 0; r -= 20) {
       avatarEllipse(img, width, height, 450, 570, r, r, [...avatarDeterministicColor(effectName).slice(0, 3), Math.max(8, Math.floor(60 * (1 - r / 270)))]);
     }
   }
@@ -24659,6 +24682,45 @@ async function performAvatarShopPurchase(interaction, itemId) {
   await equipAvatarItem(interaction.user.id, slot, inventoryId);
 
   return { ok: true, item, inventoryId };
+}
+
+// Shared by /avatar locker, /avatar shop, and the Avatar Panel's "Locker Room"/"Go
+// Shopping" buttons — one implementation, multiple entry points. Caller must have
+// already deferred (deferReply or deferUpdate) before calling these.
+async function openAvatarLockerPanel(interaction) {
+  const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+  await interaction.editReply({
+    embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+    files: [buildAvatarProfileAttachment(profile, equipped)],
+    components: buildAvatarLockerComponents(),
+  });
+}
+
+async function openAvatarShopPanel(interaction) {
+  const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+  await interaction.editReply({
+    embeds: [buildAvatarShopHomeEmbed(interaction.user)],
+    files: [buildAvatarProfileAttachment(profile, equipped)],
+    components: buildAvatarShopHomeComponents(),
+  });
+}
+
+// Starter panel — same lightweight pattern as Bank/Member Profile/Marketplace: a
+// static embed with buttons that open personal ephemeral views.
+function buildAvatarStarterEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🧍 Avatar')
+    .setColor(0xFEE75C)
+    .setDescription('Customize your character, equip what you own, and go shopping for more — all from the buttons below.')
+    .setFooter({ text: 'GG Sports • Avatar' })
+    .setTimestamp();
+}
+
+function buildAvatarStarterComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('avatarpanel_shop').setLabel('Go Shopping').setEmoji('🛍️').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('avatarpanel_locker').setLabel('Locker Room').setEmoji('🔒').setStyle(ButtonStyle.Secondary),
+  )];
 }
 
 function buildVisualAvatarPng(userLabel, avatar, preview = {}) {
@@ -25902,6 +25964,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'shop_panel_channels', label: 'Shop Panel', description: 'Manage which channel(s) the shop panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'sportsbook_panel_channels', label: 'Sportsbook Board', description: 'Manage which channel(s) the live sportsbook board is posted in — can be more than one', kind: 'multichannel' },
   { value: 'marketplace_panel_channels', label: 'Marketplace Panel', description: 'Manage which channel(s) the marketplace panel is posted in — can be more than one', kind: 'multichannel' },
+  { value: 'avatar_panel_channels', label: 'Avatar Panel', description: 'Manage which channel(s) the avatar panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'bank_panel_channels', label: 'Bank Starter', description: 'Manage which channel(s) the bank starter panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'profile_panel_channels', label: 'Member Profile Starter', description: 'Manage which channel(s) the member profile starter panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
@@ -25921,6 +25984,7 @@ const MULTI_CHANNEL_DASHBOARD_MAP = {
   shop_panel_channels: 'shop',
   sportsbook_panel_channels: 'sportsbook',
   marketplace_panel_channels: 'marketplace',
+  avatar_panel_channels: 'avatar',
   bank_panel_channels: 'bank',
   profile_panel_channels: 'profile',
 };
@@ -25943,6 +26007,7 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'shop_panel', label: 'Manage Shop Panel (multi-channel)' },
   { value: 'sportsbook_panel', label: 'Manage Sportsbook Board (multi-channel)' },
   { value: 'marketplace_panel', label: 'Manage Marketplace Panel (multi-channel)' },
+  { value: 'avatar_panel', label: 'Manage Avatar Panel (multi-channel)' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
   { value: 'trade_offer_panel', label: 'Create/Refresh Trade Offer Panel' },
   { value: 'trade_count_panel', label: 'Create/Refresh Trade Count Panel' },
@@ -25957,6 +26022,7 @@ const MULTI_CHANNEL_SETUP_PANEL_MAP = {
   bank_starter_panel: 'bank',
   member_profile_starter_panel: 'profile',
   marketplace_panel: 'marketplace',
+  avatar_panel: 'avatar',
 };
 
 async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType, origin = 'panels') {
@@ -26121,6 +26187,7 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['marketplace', 'Marketplace'],
     ['bank', 'Bank Starter'],
     ['profile', 'Member Profile Starter'],
+    ['avatar', 'Avatar'],
   ];
   const multiChannelCounts = await Promise.all(multiChannelPanelTypes.map(([panelType]) => listMultiChannelPanelPostings(guild.id, panelType)));
   const multiChannelLines = multiChannelPanelTypes.map(([, label], i) => {
