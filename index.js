@@ -19,6 +19,7 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  MessageFlags,
 } from 'discord.js';
 import pkg from 'pg';
 import { randomUUID, randomBytes, createHash, constants as cryptoConstants } from 'crypto';
@@ -3027,6 +3028,13 @@ function buildCommands() {
       .setDescription('Madden: draft class recap with value-based grades')
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
       .addRoleOption(o => o.setName('team').setDescription('Team role (leave blank for a league-wide summary)').setRequired(false)),
+
+    // Temporary diagnostic command — isolates whether button interactions in general
+    // are broken vs something specific to avatar/botowner code. Safe to remove once
+    // the "This interaction failed" mystery is resolved.
+    new SlashCommandBuilder()
+      .setName('zzztest')
+      .setDescription('Temporary diagnostic — click the button it posts'),
   ].map(cmd => cmd.toJSON());
 }
 
@@ -12204,7 +12212,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) {
-        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        await interaction.reply({ content: 'League not found.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12271,7 +12279,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) {
-        await interaction.reply({ content: 'League not found.', ephemeral: true });
+        await interaction.reply({ content: 'League not found.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12339,11 +12347,11 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.commandName.startsWith('league-')) {
       if (!interaction.guild) {
-        await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+        await interaction.reply({ content: 'This command can only be used in a server.', flags: MessageFlags.Ephemeral });
         return;
       }
       if (!(await userCanUseLeagueSetup(interaction))) {
-        await interaction.reply({ content: 'You need server admin, Manage Server, or a configured league staff role to use league setup commands.', ephemeral: true });
+        await interaction.reply({ content: 'You need server admin, Manage Server, or a configured league staff role to use league setup commands.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12355,21 +12363,21 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         await pool.query(`INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`, [interaction.guild.id, interaction.guild.name]);
         await pool.query(`INSERT INTO leagues (league_id, guild_id, league_name, game_key, season_length) VALUES ($1, $2, $3, $4, $5)`, [leagueId, interaction.guild.id, name, game, seasonLength]);
         await pool.query(`INSERT INTO league_settings (league_id) VALUES ($1) ON CONFLICT (league_id) DO NOTHING`, [leagueId]);
-        await interaction.reply({ content: `Created league **${name}** for **${game}**${seasonLength ? ` with a ${seasonLength}-game season` : ''}.`, ephemeral: true });
+        await interaction.reply({ content: `Created league **${name}** for **${game}**${seasonLength ? ` with a ${seasonLength}-game season` : ''}.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (interaction.commandName === 'league-list') {
         const result = await pool.query(`SELECT league_name, game_key, season_length FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY league_name ASC`, [interaction.guild.id]);
         const text = result.rows.length ? result.rows.map(row => `• **${row.league_name}** (${row.game_key}${row.season_length ? ` • ${row.season_length} games` : ''})`).join('\n') : 'No leagues configured yet.';
-        await interaction.reply({ content: text, ephemeral: true });
+        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
         return;
       }
 
       const leagueName = interaction.options.getString('league');
       const league = await getLeagueByName(interaction.guild.id, leagueName);
       if (!league) {
-        await interaction.reply({ content: `Could not find league **${leagueName}**.`, ephemeral: true });
+        await interaction.reply({ content: `Could not find league **${leagueName}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12378,7 +12386,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const staffRole = interaction.options.getRole('staff_role');
         const committeeRole = interaction.options.getRole('committee_role');
         await pool.query(`UPDATE league_settings SET league_role_id = $1, staff_role_id = $2, committee_role_id = $3, updated_at = NOW() WHERE league_id = $4`, [leagueRole.id, staffRole.id, committeeRole.id, league.league_id]);
-        await interaction.reply({ content: `Roles saved for **${league.league_name}**.`, ephemeral: true });
+        await interaction.reply({ content: `Roles saved for **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12395,7 +12403,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
           `UPDATE league_settings SET live_channel_id = $1, team_owners_channel_id = $2, trade_count_channel_id = $3, trade_block_channel_id = $4, offer_a_trade_channel_id = $5, committee_channel_id = $6, approved_channel_id = $7, denied_channel_id = $8, updated_at = NOW() WHERE league_id = $9`,
           [live.id, teamOwners.id, tradeCount.id, tradeBlock.id, offerTrade.id, committee.id, approved.id, denied.id, league.league_id]
         );
-        await interaction.reply({ content: `Channels saved for **${league.league_name}**.`, ephemeral: true });
+        await interaction.reply({ content: `Channels saved for **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12404,11 +12412,11 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const botMember = await interaction.guild.members.fetchMe();
         const permissions = channel?.permissionsFor(botMember);
         if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
-          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that history channel.', ephemeral: true });
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that history channel.', flags: MessageFlags.Ephemeral });
           return;
         }
         await pool.query(`UPDATE league_settings SET history_channel_id = $1, updated_at = NOW() WHERE league_id = $2`, [channel.id, league.league_id]);
-        await interaction.reply({ content: `History channel for **${league.league_name}** set to ${channel}.`, ephemeral: true });
+        await interaction.reply({ content: `History channel for **${league.league_name}** set to ${channel}.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12417,11 +12425,11 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const botMember = await interaction.guild.members.fetchMe();
         const permissions = channel?.permissionsFor(botMember);
         if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
-          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that standings channel.', ephemeral: true });
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that standings channel.', flags: MessageFlags.Ephemeral });
           return;
         }
         await pool.query(`UPDATE league_settings SET standings_channel_id = $1, updated_at = NOW() WHERE league_id = $2`, [channel.id, league.league_id]);
-        await interaction.reply({ content: `Standings channel for **${league.league_name}** set to ${channel}.`, ephemeral: true });
+        await interaction.reply({ content: `Standings channel for **${league.league_name}** set to ${channel}.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12430,11 +12438,11 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const botMember = await interaction.guild.members.fetchMe();
         const permissions = channel?.permissionsFor(botMember);
         if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
-          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that tournament channel.', ephemeral: true });
+          await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that tournament channel.', flags: MessageFlags.Ephemeral });
           return;
         }
         await pool.query(`UPDATE league_settings SET tournament_channel_id = $1, updated_at = NOW() WHERE league_id = $2`, [channel.id, league.league_id]);
-        await interaction.reply({ content: `Tournament channel for **${league.league_name}** set to ${channel}.`, ephemeral: true });
+        await interaction.reply({ content: `Tournament channel for **${league.league_name}** set to ${channel}.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12442,14 +12450,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const role = interaction.options.getRole('role');
         await pool.query(`INSERT INTO league_team_roles (league_id, role_id, role_name) VALUES ($1, $2, $3) ON CONFLICT (league_id, role_id) DO UPDATE SET role_name = EXCLUDED.role_name`, [league.league_id, role.id, role.name]);
         await pool.query(`INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count) VALUES ($1, $2, $3, 0) ON CONFLICT (league_id, role_id) DO NOTHING`, [league.league_id, role.id, role.name]);
-        await interaction.reply({ content: `Added team role **${role.name}** to **${league.league_name}**.`, ephemeral: true });
+        await interaction.reply({ content: `Added team role **${role.name}** to **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (interaction.commandName === 'league-listteamroles') {
         const roles = await getLeagueTeamRoles(league.league_id);
         const text = roles.length ? roles.map(role => `• <@&${role.role_id}>`).join('\n') : 'No team roles configured yet.';
-        await interaction.reply({ content: text, ephemeral: true });
+        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12459,7 +12467,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         if (!league.trade_count_channel_id) missing.push('trade count channel');
         if (!league.offer_a_trade_channel_id) missing.push('offer-a-trade channel');
         if (missing.length > 0) {
-          await interaction.reply({ content: `This league is missing: ${missing.join(', ')}. Run /league-setchannels for **${league.league_name}** first.`, ephemeral: true });
+          await interaction.reply({ content: `This league is missing: ${missing.join(', ')}. Run /league-setchannels for **${league.league_name}** first.`, flags: MessageFlags.Ephemeral });
           return;
         }
         const teamOwnersChannel = await interaction.guild.channels.fetch(league.team_owners_channel_id).catch(() => null);
@@ -12476,7 +12484,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         if (!canPostIn(tradeCountChannel)) inaccessible.push(`trade count channel (<#${league.trade_count_channel_id}>)`);
         if (!canPostIn(offerTradeChannel)) inaccessible.push(`offer-a-trade channel (<#${league.offer_a_trade_channel_id}>)`);
         if (inaccessible.length > 0) {
-          await interaction.reply({ content: `I cannot post in: ${inaccessible.join(', ')}. Give the bot View Channel, Send Messages, and Embed Links permissions there.`, ephemeral: true });
+          await interaction.reply({ content: `I cannot post in: ${inaccessible.join(', ')}. Give the bot View Channel, Send Messages, and Embed Links permissions there.`, flags: MessageFlags.Ephemeral });
           return;
         }
         const teamOwnersMessage = await teamOwnersChannel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
@@ -12493,7 +12501,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         }
         const offerTradeMessage = await offerTradeChannel.send({ embeds: [buildOfferTradePanelEmbed(league.league_name)], components: [buildOfferTradePanelButton(league.league_id)] });
         await savePanel(league, 'offer_trade', offerTradeChannel.id, offerTradeMessage.id);
-        await interaction.reply({ content: `Panels created for **${league.league_name}**.`, ephemeral: true });
+        await interaction.reply({ content: `Panels created for **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
     }
@@ -12502,27 +12510,27 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     const member = interaction.guild ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null) : null;
 
     if (interaction.commandName === 'ping') {
-      await interaction.reply({ content: 'GG Sports is live.', ephemeral: true });
+      await interaction.reply({ content: 'GG Sports is live.', flags: MessageFlags.Ephemeral });
       return;
     }
 
     if (interaction.commandName === 'help') {
-      await interaction.reply({ embeds: [buildHelpEmbed()], ephemeral: true });
+      await interaction.reply({ embeds: [buildHelpEmbed()], flags: MessageFlags.Ephemeral });
       return;
     }
 
     if (interaction.commandName === 'setupguide') {
-      await interaction.reply({ embeds: [buildSetupGuideEmbed()], ephemeral: true });
+      await interaction.reply({ embeds: [buildSetupGuideEmbed()], flags: MessageFlags.Ephemeral });
       return;
     }
 
     if (interaction.commandName === 'quicksetup') {
-      await interaction.reply({ embeds: [buildQuickSetupEmbed()], ephemeral: true });
+      await interaction.reply({ embeds: [buildQuickSetupEmbed()], flags: MessageFlags.Ephemeral });
       return;
     }
 
     if (interaction.commandName === 'commands') {
-      await interaction.reply({ embeds: [buildCommandsGuideEmbed()], ephemeral: true });
+      await interaction.reply({ embeds: [buildCommandsGuideEmbed()], flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -12531,7 +12539,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const requestedLeagueName = interaction.options.getString('league');
       const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
       if (!activeLeague) {
-        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', flags: MessageFlags.Ephemeral });
         return;
       }
       const result = await pool.query(
@@ -12542,7 +12550,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
          LIMIT 50`,
         [interaction.guild.id, activeLeague.league_id]
       );
-      await interaction.reply({ embeds: [buildFranchiseLegacyEmbed(activeLeague, result.rows)], ephemeral: true });
+      await interaction.reply({ embeds: [buildFranchiseLegacyEmbed(activeLeague, result.rows)], flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -12552,13 +12560,13 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const awardFilter = interaction.options.getString('award');
       const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
       if (!activeLeague) {
-        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', flags: MessageFlags.Ephemeral });
         return;
       }
       const result = awardFilter
         ? await pool.query(`SELECT season_label, award_name, winner FROM award_history WHERE guild_id = $1 AND league_id = $2 AND LOWER(award_name) = LOWER($3) ORDER BY created_at DESC LIMIT 50`, [interaction.guild.id, activeLeague.league_id, awardFilter])
         : await pool.query(`SELECT season_label, award_name, winner FROM award_history WHERE guild_id = $1 AND league_id = $2 ORDER BY created_at DESC LIMIT 50`, [interaction.guild.id, activeLeague.league_id]);
-      await interaction.reply({ embeds: [buildAwardHistoryEmbed(activeLeague, result.rows, awardFilter)], ephemeral: true });
+      await interaction.reply({ embeds: [buildAwardHistoryEmbed(activeLeague, result.rows, awardFilter)], flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -12567,7 +12575,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const requestedLeagueName = interaction.options.getString('league');
       const activeLeague = requestedLeagueName ? await getLeagueByName(interaction.guild.id, requestedLeagueName) : league;
       if (!activeLeague) {
-        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', ephemeral: true });
+        await interaction.reply({ content: 'No league found. Use this in a league channel or provide a league name.', flags: MessageFlags.Ephemeral });
         return;
       }
       const franchiseResult = await pool.query(
@@ -12578,7 +12586,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         `SELECT winner, COUNT(*)::int AS award_count FROM award_history WHERE guild_id = $1 AND league_id = $2 GROUP BY winner ORDER BY award_count DESC, winner ASC LIMIT 10`,
         [interaction.guild.id, activeLeague.league_id]
       );
-      await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], ephemeral: true });
+      await interaction.reply({ embeds: [buildHallOfFameEmbed(activeLeague, franchiseResult.rows, awardResult.rows)], flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -12588,18 +12596,18 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.reply({ content: 'No active league found.', ephemeral: true });
+        await interaction.reply({ content: 'No active league found.', flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (subcommand === 'start') {
         if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
-          await interaction.reply({ content: 'You do not have permission to start an active check.', ephemeral: true });
+          await interaction.reply({ content: 'You do not have permission to start an active check.', flags: MessageFlags.Ephemeral });
           return;
         }
         const hours = interaction.options.getInteger('hours');
         const channelOption = interaction.options.getChannel('channel');
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const result = await startActiveCheck(interaction, activeLeague, hours, channelOption)
           .catch(err => ({ ok: false, message: 'Failed to start active check: ' + (err?.message || 'Unknown error') }));
         await interaction.editReply({ content: result.message });
@@ -12608,17 +12616,17 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
       if (subcommand === 'end') {
         if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
-          await interaction.reply({ content: 'You do not have permission to end an active check.', ephemeral: true });
+          await interaction.reply({ content: 'You do not have permission to end an active check.', flags: MessageFlags.Ephemeral });
           return;
         }
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const result = await endActiveCheck(interaction, activeLeague);
         await interaction.editReply({ content: result.message });
         return;
       }
 
       if (subcommand === 'status') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         let check = await getOpenActiveCheck(interaction.guild.id, activeLeague.league_id);
         if (!check) {
           const lastResult = await pool.query(
@@ -12643,20 +12651,20 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
     if (interaction.commandName === 'botowner') {
       if (!botOwnerUserId || interaction.user.id !== botOwnerUserId) {
-        await interaction.reply({ content: 'This command is restricted to the bot owner.', ephemeral: true });
+        await interaction.reply({ content: 'This command is restricted to the bot owner.', flags: MessageFlags.Ephemeral });
         return;
       }
       const subcommand = interaction.options.getSubcommand();
 
       if (subcommand === 'status') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const embed = await buildBotOwnerStatusEmbed(client);
         await interaction.editReply({ embeds: [embed] });
         return;
       }
 
       if (subcommand === 'guilds') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const embed = buildBotOwnerGuildsEmbed(client);
         await interaction.editReply({ embeds: [embed] });
         return;
@@ -12667,11 +12675,11 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const icon = interaction.options.getString('icon').trim();
 
         if (!name || name.length > 40) {
-          await interaction.reply({ content: 'Currency name must be 1-40 characters.', ephemeral: true });
+          await interaction.reply({ content: 'Currency name must be 1-40 characters.', flags: MessageFlags.Ephemeral });
           return;
         }
         if (!icon || icon.length > 16) {
-          await interaction.reply({ content: 'Currency icon must be 1-16 characters (a single emoji works best).', ephemeral: true });
+          await interaction.reply({ content: 'Currency icon must be 1-16 characters (a single emoji works best).', flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -12683,7 +12691,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
         await interaction.reply({
           content: `Global currency identity updated to **${icon} ${name}**. This applies across every server immediately — no per-server override exists.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -12694,11 +12702,11 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         const max = interaction.options.getInteger('max');
 
         if (!CURRENCY_PAYOUT_TYPES.includes(type)) {
-          await interaction.reply({ content: 'Unknown payout type.', ephemeral: true });
+          await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral });
           return;
         }
         if (min < 0 || max < 0 || min > max) {
-          await interaction.reply({ content: 'min must be 0 or greater, and min cannot exceed max.', ephemeral: true });
+          await interaction.reply({ content: 'min must be 0 or greater, and min cannot exceed max.', flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -12710,14 +12718,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
         await interaction.reply({
           content: `Global bounds for **${type}** set to **${min}–${max}**. Any per-server rate outside this range will be clamped the next time it's read or saved (existing stored values aren't retroactively rewritten until then).`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
 
       if (subcommand === 'currencyconfig') {
         await loadCurrencyConfig();
-        await interaction.reply({ embeds: [buildBotOwnerCurrencyConfigEmbed()], ephemeral: true });
+        await interaction.reply({ embeds: [buildBotOwnerCurrencyConfigEmbed()], flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12730,35 +12738,34 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_back') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       await showBotOwnerPanelHome(interaction, { update: true });
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_status') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
-      await interaction.deferUpdate();
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const embed = await buildBotOwnerStatusEmbed(client);
-      await interaction.editReply({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
+      await interaction.update({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_guilds') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const embed = buildBotOwnerGuildsEmbed(client);
       await interaction.update({ embeds: [embed], components: [buildBotOwnerPanelBackRow()] });
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyconfig') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       await loadCurrencyConfig();
       await interaction.update({ embeds: [buildBotOwnerCurrencyConfigEmbed()], components: [buildBotOwnerPanelBackRow()] });
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_currencyidentity_edit') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const modal = new ModalBuilder()
         .setCustomId('botownerpanel_currencyidentity_modal')
         .setTitle('Edit Global Currency Identity')
@@ -12771,12 +12778,12 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'botownerpanel_currencyidentity_modal') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const name = interaction.fields.getTextInputValue('name').trim();
       const icon = interaction.fields.getTextInputValue('icon').trim();
 
-      if (!name || name.length > 40) { await interaction.reply({ content: 'Currency name must be 1-40 characters.', ephemeral: true }); return; }
-      if (!icon || icon.length > 16) { await interaction.reply({ content: 'Currency icon must be 1-16 characters.', ephemeral: true }); return; }
+      if (!name || name.length > 40) { await interaction.reply({ content: 'Currency name must be 1-40 characters.', flags: MessageFlags.Ephemeral }); return; }
+      if (!icon || icon.length > 16) { await interaction.reply({ content: 'Currency icon must be 1-16 characters.', flags: MessageFlags.Ephemeral }); return; }
 
       await pool.query(
         `UPDATE system_currency_config SET currency_name = $1, currency_icon = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
@@ -12788,13 +12795,13 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         content: `Global currency identity updated to **${icon} ${name}**. Applies across every server immediately.`,
         embeds: [buildBotOwnerCurrencyConfigEmbed()],
         components: [buildBotOwnerPanelBackRow()],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_payoutbounds_edit') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const menu = new StringSelectMenuBuilder()
         .setCustomId('botownerpanel_payoutbounds_select')
         .setPlaceholder('Choose a payout type to edit')
@@ -12812,9 +12819,9 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_payoutbounds_select') {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const type = interaction.values[0];
-      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', ephemeral: true }); return; }
+      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
 
       const modal = new ModalBuilder()
         .setCustomId(`botownerpanel_payoutbounds_modal:${type}`)
@@ -12828,14 +12835,14 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_payoutbounds_modal:')) {
-      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', ephemeral: true }); return; }
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const type = interaction.customId.split(':')[1];
-      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', ephemeral: true }); return; }
+      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
 
       const min = Number.parseInt(interaction.fields.getTextInputValue('min'), 10);
       const max = Number.parseInt(interaction.fields.getTextInputValue('max'), 10);
       if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max < 0 || min > max) {
-        await interaction.reply({ content: 'min/max must be whole numbers, min ≥ 0, and min cannot exceed max.', ephemeral: true });
+        await interaction.reply({ content: 'min/max must be whole numbers, min ≥ 0, and min cannot exceed max.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -12849,7 +12856,7 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         content: `Global bounds for **${CURRENCY_PAYOUT_TYPE_LABELS[type]}** set to **${min}–${max}**. Existing per-server rates outside this range will be clamped the next time they're read or saved.`,
         embeds: [buildBotOwnerCurrencyConfigEmbed()],
         components: [buildBotOwnerPanelBackRow()],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -15391,13 +15398,13 @@ if (interaction.commandName === 'badges') {
 
       if (badgeSubcommand === 'view') {
         const badges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, recognition);
-        await interaction.reply({ embeds: [buildBadgesEmbed(targetUser, badges)], ephemeral: true });
+        await interaction.reply({ embeds: [buildBadgesEmbed(targetUser, badges)], flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (badgeSubcommand === 'progress') {
         await syncExpandedProfileBadges(interaction.guild.id, targetUser.id, recognition).catch(() => null);
-        await interaction.reply({ embeds: [buildBadgeProgressEmbed(targetUser, recognition)], ephemeral: true });
+        await interaction.reply({ embeds: [buildBadgeProgressEmbed(targetUser, recognition)], flags: MessageFlags.Ephemeral });
         return;
       }
     }
@@ -15407,7 +15414,6 @@ if (interaction.commandName === 'avatar') {
       const avatarSubcommand = interaction.options.getSubcommand();
 
       if (avatarSubcommand === 'view') {
-        await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const { profile, equipped } = await getAvatarProfileWithEquipment(targetUser.id);
         const attachment = await buildAvatarProfileAttachment(profile, equipped);
@@ -15416,71 +15422,59 @@ if (interaction.commandName === 'avatar') {
         if (avatarBadges.length) {
           embed.addFields({ name: '🏅 Avatar Badges', value: avatarBadges.slice(0, 8).map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(' • '), inline: false });
         }
-        await interaction.editReply({ embeds: [embed], files: [attachment] });
+        await interaction.reply({ embeds: [embed], files: [attachment], flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (avatarSubcommand === 'locker') {
-        await interaction.deferReply({ ephemeral: true });
-        await openAvatarLockerPanel(interaction);
+        await openAvatarLockerPanel(interaction, { mode: 'reply' });
         return;
       }
 
       if (avatarSubcommand === 'shop') {
-        await interaction.deferReply({ ephemeral: true });
-        await openAvatarShopPanel(interaction);
+        await openAvatarShopPanel(interaction, { mode: 'reply' });
         return;
       }
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarpanel_locker') {
-      console.log('[Avatar] avatarpanel_locker: received, deferring...');
       try {
-        await interaction.deferReply({ ephemeral: true });
-        console.log('[Avatar] avatarpanel_locker: deferred OK, opening panel...');
-        await openAvatarLockerPanel(interaction);
-        console.log('[Avatar] avatarpanel_locker: editReply completed OK.');
+        await openAvatarLockerPanel(interaction, { mode: 'reply' });
       } catch (error) {
         console.error('[Avatar] avatarpanel_locker failed:', error);
-        await interaction.editReply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.' }).catch((e2) => {
-          console.error('[Avatar] avatarpanel_locker: even the error editReply failed:', e2);
+        await interaction.reply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
+          console.error('[Avatar] avatarpanel_locker: fallback reply also failed:', e2);
         });
       }
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
-      console.log('[Avatar] avatarpanel_shop: received, deferring...');
       try {
-        await interaction.deferReply({ ephemeral: true });
-        console.log('[Avatar] avatarpanel_shop: deferred OK, opening panel...');
-        await openAvatarShopPanel(interaction);
-        console.log('[Avatar] avatarpanel_shop: editReply completed OK.');
+        await openAvatarShopPanel(interaction, { mode: 'reply' });
       } catch (error) {
         console.error('[Avatar] avatarpanel_shop failed:', error);
-        await interaction.editReply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.' }).catch((e2) => {
-          console.error('[Avatar] avatarpanel_shop: even the error editReply failed:', e2);
+        await interaction.reply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
+          console.error('[Avatar] avatarpanel_shop: fallback reply also failed:', e2);
         });
       }
       return;
     }
 
     // ---- Locker Room interactions ----
-    // Every handler here defers FIRST, before any DB query or image render — rendering
-    // is synchronous pixel math + a blocking zlib deflate on a ~4MB buffer, easily slow
-    // enough to blow Discord's 3-second interaction ACK window if done before acking.
+    // Direct reply()/update() (no deferReply/deferUpdate) — matches the pattern every
+    // other working panel in this bot uses (Bank, GM, Ticket). sharp-based rendering is
+    // fast enough now that the original defer-for-slow-render concern doesn't apply.
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_slot_select') {
-      await interaction.deferUpdate();
       const slot = interaction.values[0];
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       const payload = await buildAvatarLockerSlotPayload(interaction.user, profile, equipped, slot);
-      await interaction.editReply(payload);
+      await interaction.update(payload);
       return;
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_item_select:')) {
-      await interaction.deferUpdate();
       const slot = interaction.customId.split(':')[1];
       const chosen = interaction.values[0];
       if (chosen === '__unequip__') {
@@ -15489,7 +15483,7 @@ if (interaction.commandName === 'avatar') {
         await equipAvatarItem(interaction.user.id, slot, chosen);
       }
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.editReply({
+      await interaction.update({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarLockerComponents(),
@@ -15507,7 +15501,6 @@ if (interaction.commandName === 'avatar') {
     // always-on locker/shop render so those stay cheap; this is the intentionally
     // heavier, celebratory one.
     if (interaction.isButton() && interaction.customId === 'avatarlocker_flex') {
-      await interaction.deferUpdate();
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       const attachment = await buildAvatarProfileAttachment(profile, equipped, { showcase: true });
       const embed = new EmbedBuilder()
@@ -15516,18 +15509,17 @@ if (interaction.commandName === 'avatar') {
         .setImage('attachment://avatar.png')
         .setFooter({ text: 'GG Sports • Showcase' })
         .setTimestamp();
-      await interaction.followUp({ embeds: [embed], files: [attachment], ephemeral: false }).catch(async (error) => {
-        console.error('[Avatar] Showcase followUp failed (likely missing channel send permission):', error?.message || error);
-        await interaction.followUp({ content: 'Could not post the showcase publicly — I may be missing permission to post in this channel.', ephemeral: true }).catch(() => null);
+      await interaction.reply({ embeds: [embed], files: [attachment] }).catch(async (error) => {
+        console.error('[Avatar] Showcase reply failed (likely missing channel send permission):', error?.message || error);
+        await interaction.followUp({ content: 'Could not post the showcase publicly — I may be missing permission to post in this channel.', flags: MessageFlags.Ephemeral }).catch(() => null);
       });
       return;
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_body') {
-      await interaction.deferUpdate();
       await updateAvatarBodyCustomization(interaction.user.id, { bodyKey: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.editReply({
+      await interaction.update({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarCustomizeComponents(),
@@ -15536,10 +15528,9 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_skin') {
-      await interaction.deferUpdate();
       await updateAvatarBodyCustomization(interaction.user.id, { skinTone: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.editReply({
+      await interaction.update({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarCustomizeComponents(),
@@ -15548,9 +15539,8 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'avatarlocker_back') {
-      await interaction.deferUpdate();
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.editReply({
+      await interaction.update({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarLockerComponents(),
@@ -15561,9 +15551,8 @@ if (interaction.commandName === 'avatar') {
     // ---- Avatar Shop interactions ----
 
     if (interaction.isButton() && interaction.customId === 'avatarshop_home') {
-      await interaction.deferUpdate();
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.editReply({
+      await interaction.update({
         embeds: [buildAvatarShopHomeEmbed(interaction.user)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarShopHomeComponents(),
@@ -15572,13 +15561,12 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('avatarshop_category:')) {
-      await interaction.deferUpdate();
       const [, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const settings = await getCurrencySettings(interaction.guild.id);
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       const { items, total } = await fetchAvatarShopItems(interaction.guild.id, categorySlot, page);
-      await interaction.editReply({
+      await interaction.update({
         embeds: [buildAvatarShopCategoryEmbed(categorySlot, items, page, total, settings)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarShopCategoryComponents(categorySlot, items, page, total),
@@ -15587,7 +15575,6 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_preview_select:')) {
-      await interaction.deferUpdate();
       const [, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const itemId = interaction.values[0];
@@ -15596,26 +15583,25 @@ if (interaction.commandName === 'avatar') {
       const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
-        await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
+        await interaction.update({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
         return;
       }
-      await interaction.editReply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
+      await interaction.update(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('avatarshop_buy:')) {
-      await interaction.deferUpdate();
       const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const outcome = await performAvatarShopPurchase(interaction, itemId);
 
       if (!outcome.ok) {
-        await interaction.editReply({ content: outcome.message, embeds: [], files: [], components: [] });
+        await interaction.update({ content: outcome.message, embeds: [], files: [], components: [] });
         return;
       }
 
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      await interaction.editReply({
+      await interaction.update({
         content: `Bought and equipped **${outcome.item.item_name}**!`,
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
@@ -24891,31 +24877,25 @@ async function performAvatarShopPurchase(interaction, itemId) {
 // Shopping" buttons — one implementation, multiple entry points. Caller must have
 // already deferred (deferReply or deferUpdate) before calling these.
 async function openAvatarLockerPanel(interaction) {
-  console.log('[Avatar] openAvatarLockerPanel: fetching profile...');
   const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-  console.log('[Avatar] openAvatarLockerPanel: profile fetched, rendering attachment...');
   const attachment = await buildAvatarProfileAttachment(profile, equipped);
-  console.log('[Avatar] openAvatarLockerPanel: attachment rendered, calling editReply...');
-  await interaction.editReply({
+  await interaction.reply({
     embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
     files: [attachment],
     components: buildAvatarLockerComponents(),
+    ephemeral: true,
   });
-  console.log('[Avatar] openAvatarLockerPanel: editReply returned.');
 }
 
 async function openAvatarShopPanel(interaction) {
-  console.log('[Avatar] openAvatarShopPanel: fetching profile...');
   const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-  console.log('[Avatar] openAvatarShopPanel: profile fetched, rendering attachment...');
   const attachment = await buildAvatarProfileAttachment(profile, equipped);
-  console.log('[Avatar] openAvatarShopPanel: attachment rendered, calling editReply...');
-  await interaction.editReply({
+  await interaction.reply({
     embeds: [buildAvatarShopHomeEmbed(interaction.user)],
     files: [attachment],
     components: buildAvatarShopHomeComponents(),
+    ephemeral: true,
   });
-  console.log('[Avatar] openAvatarShopPanel: editReply returned.');
 }
 
 // Starter panel — same lightweight pattern as Bank/Member Profile/Marketplace: a
