@@ -7360,7 +7360,8 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         files: [new AttachmentBuilder(testBuffer, { name: 'zzztest.png' })],
         components: [new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('zzztest_button').setLabel('Click me (update, no attachment change)').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId('zzztest_button_reattach').setLabel('Click me (update, re-attach)').setStyle(ButtonStyle.Secondary)
+          new ButtonBuilder().setCustomId('zzztest_button_reattach').setLabel('Click me (update, re-attach)').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('zzztest_customize_copy').setLabel('Customize-copy test').setStyle(ButtonStyle.Danger)
         )],
         ephemeral: true,
       });
@@ -7381,6 +7382,22 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
         content: 'zzztest button click received — updated WITH a fresh attachment.',
         files: [new AttachmentBuilder(testBuffer2, { name: 'zzztest2.png' })],
       });
+      return;
+    }
+
+    // Exact copy of avatarlocker_customize's logic, positioned here (near the very
+    // top of the dispatch) instead of thousands of lines deeper. Isolates whether
+    // this is about the code itself or something about its position in the file.
+    if (interaction.isButton() && interaction.customId === 'zzztest_customize_copy') {
+      console.log('[Avatar] zzztest_customize_copy: handler entered.');
+      try {
+        const components = buildAvatarCustomizeComponents();
+        console.log('[Avatar] zzztest_customize_copy: components built OK, count:', components.length);
+        await interaction.update({ components });
+        console.log('[Avatar] zzztest_customize_copy: update() completed OK.');
+      } catch (error) {
+        console.error('[Avatar] zzztest_customize_copy failed:', error);
+      }
       return;
     }
 
