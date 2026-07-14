@@ -7351,10 +7351,16 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
   try {
     // Temporary diagnostic — see the /zzztest command definition for context.
     if (interaction.commandName === 'zzztest') {
+      const sharpLib = await getSharp();
+      const testBuffer = sharpLib
+        ? await sharpLib({ create: { width: 200, height: 200, channels: 4, background: { r: 88, g: 101, b: 242, alpha: 1 } } }).png().toBuffer()
+        : Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001080600000021f9c53f0000000a4944415478da62000100000500010d0a2db40000000049454e44ae426082', 'hex');
       await interaction.reply({
-        content: 'zzztest command received.',
+        content: 'zzztest command received (with attachment).',
+        files: [new AttachmentBuilder(testBuffer, { name: 'zzztest.png' })],
         components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('zzztest_button').setLabel('Click me').setStyle(ButtonStyle.Primary)
+          new ButtonBuilder().setCustomId('zzztest_button').setLabel('Click me (update, no attachment change)').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('zzztest_button_reattach').setLabel('Click me (update, re-attach)').setStyle(ButtonStyle.Secondary)
         )],
         ephemeral: true,
       });
@@ -7362,7 +7368,19 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     }
 
     if (interaction.isButton() && interaction.customId === 'zzztest_button') {
-      await interaction.reply({ content: 'zzztest button click received — this works!', ephemeral: true });
+      await interaction.update({ content: 'zzztest button click received — updated WITHOUT touching the attachment.' });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'zzztest_button_reattach') {
+      const sharpLib2 = await getSharp();
+      const testBuffer2 = sharpLib2
+        ? await sharpLib2({ create: { width: 200, height: 200, channels: 4, background: { r: 87, g: 242, b: 135, alpha: 1 } } }).png().toBuffer()
+        : Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001080600000021f9c53f0000000a4944415478da62000100000500010d0a2db40000000049454e44ae426082', 'hex');
+      await interaction.update({
+        content: 'zzztest button click received — updated WITH a fresh attachment.',
+        files: [new AttachmentBuilder(testBuffer2, { name: 'zzztest2.png' })],
+      });
       return;
     }
 
