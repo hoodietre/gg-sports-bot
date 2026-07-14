@@ -7349,6 +7349,23 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
 
   try {
+    // Temporary diagnostic — see the /zzztest command definition for context.
+    if (interaction.commandName === 'zzztest') {
+      await interaction.reply({
+        content: 'zzztest command received.',
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('zzztest_button').setLabel('Click me').setStyle(ButtonStyle.Primary)
+        )],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'zzztest_button') {
+      await interaction.reply({ content: 'zzztest button click received — this works!', ephemeral: true });
+      return;
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('onboard_league_select:')) {
       const guildId = interaction.customId.split(':')[1];
       const guild = client.guilds.cache.get(guildId);
