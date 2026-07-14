@@ -1889,6 +1889,11 @@ async function initDatabase() {
   // Catalog Tooling (build order #5). This column isn't superseded by that later work,
   // just narrower; it can keep meaning "currently featured as exclusive" alongside it.
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_exclusive BOOLEAN NOT NULL DEFAULT FALSE`);
+  // Links a cosmetic item to real layer art at assets/avatar/layers/{avatar_slot}/{art_asset_key}/{body_key}.png.
+  // Null (the default for every existing item) means "no real art yet" — the item is
+  // still fully equippable/ownable, it just doesn't render a visual layer, matching
+  // behavior before any real cosmetic art existed.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS art_asset_key TEXT`);
 
 
   await pool.query(`
@@ -2835,7 +2840,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Staff: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Staff: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false))),
@@ -16080,6 +16085,7 @@ if (interaction.commandName === 'trade') {
         const rarity = String(interaction.options.getString('rarity') || 'common').toLowerCase();
         const stock = interaction.options.getInteger('stock');
         const description = interaction.options.getString('description') || 'Visual avatar cosmetic. Use /shop preview before buying.';
+        const artKey = (interaction.options.getString('art_key') || name).toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 
         if (!VISUAL_AVATAR_SLOTS.includes(slot)) {
           await interaction.reply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', '), ephemeral: true });
@@ -16096,11 +16102,16 @@ if (interaction.commandName === 'trade') {
           return;
         }
 
+        // Check whether real art actually exists for this key before linking it — a
+        // typo'd or not-yet-uploaded art_key would otherwise silently render nothing.
+        const artAssetExists = await loadAvatarLayerBuffer(slot, artKey, 'male_athletic').then(buf => !!buf).catch(() => false);
+        const finalArtKey = artAssetExists ? artKey : null;
+
         const itemId = randomUUID();
         await pool.query(
-          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10)`,
-          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id]
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11)`,
+          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey]
         );
 
         await pool.query(
@@ -16112,7 +16123,7 @@ if (interaction.commandName === 'trade') {
         await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name } };
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -16122,7 +16133,8 @@ if (interaction.commandName === 'trade') {
           .addFields(
             { name: 'Created Cosmetic', value: rarityIcon(rarity) + ' **' + name + '**', inline: true },
             { name: 'Slot', value: slot, inline: true },
-            { name: 'Price', value: String(price), inline: true }
+            { name: 'Price', value: String(price), inline: true },
+            { name: 'Art', value: finalArtKey ? `✅ Linked to \`${finalArtKey}\`` : (artKey ? `⚠️ No art found at \`assets/avatar/layers/${slot}/${artKey}/\` — item created without visual art` : '—'), inline: false }
           );
 
         await interaction.reply({ content: 'Cosmetic shop item created.', embeds: [embed], files: [attachment], ephemeral: true });
@@ -16142,7 +16154,7 @@ if (interaction.commandName === 'trade') {
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name } };
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -24218,30 +24230,40 @@ async function getAvatarProfileWithEquipment(userId) {
   const profile = await getOrCreateAvatarProfile(userId);
   const result = await pool.query(
     `SELECT
-       bg.item_name AS background_name, bg.id AS background_id,
-       eff.item_name AS effect_name, eff.id AS effect_id,
-       pet.item_name AS pet_name, pet.id AS pet_id,
-       foot.item_name AS footwear_name, foot.id AS footwear_id,
-       bot.item_name AS bottom_name, bot.id AS bottom_id,
-       top.item_name AS top_name, top.id AS top_id,
-       head.item_name AS headwear_name, head.id AS headwear_id,
-       acc.item_name AS accessory_name, acc.id AS accessory_id
+       bg.item_name AS background_name, bg.id AS background_id, bg_si.art_asset_key AS background_art_key,
+       eff.item_name AS effect_name, eff.id AS effect_id, eff_si.art_asset_key AS effect_art_key,
+       pet.item_name AS pet_name, pet.id AS pet_id, pet_si.art_asset_key AS pet_art_key,
+       foot.item_name AS footwear_name, foot.id AS footwear_id, foot_si.art_asset_key AS footwear_art_key,
+       bot.item_name AS bottom_name, bot.id AS bottom_id, bot_si.art_asset_key AS bottom_art_key,
+       top.item_name AS top_name, top.id AS top_id, top_si.art_asset_key AS top_art_key,
+       head.item_name AS headwear_name, head.id AS headwear_id, head_si.art_asset_key AS headwear_art_key,
+       acc.item_name AS accessory_name, acc.id AS accessory_id, acc_si.art_asset_key AS accessory_art_key
      FROM avatar_profiles ap
      LEFT JOIN user_inventory bg   ON bg.id = ap.equipped_background_id
+     LEFT JOIN shop_items bg_si    ON bg_si.id = bg.item_id
      LEFT JOIN user_inventory eff  ON eff.id = ap.equipped_effect_id
+     LEFT JOIN shop_items eff_si   ON eff_si.id = eff.item_id
      LEFT JOIN user_inventory pet  ON pet.id = ap.equipped_pet_id
+     LEFT JOIN shop_items pet_si   ON pet_si.id = pet.item_id
      LEFT JOIN user_inventory foot ON foot.id = ap.equipped_footwear_id
+     LEFT JOIN shop_items foot_si  ON foot_si.id = foot.item_id
      LEFT JOIN user_inventory bot  ON bot.id = ap.equipped_bottom_id
+     LEFT JOIN shop_items bot_si   ON bot_si.id = bot.item_id
      LEFT JOIN user_inventory top  ON top.id = ap.equipped_top_id
+     LEFT JOIN shop_items top_si   ON top_si.id = top.item_id
      LEFT JOIN user_inventory head ON head.id = ap.equipped_headwear_id
+     LEFT JOIN shop_items head_si  ON head_si.id = head.item_id
      LEFT JOIN user_inventory acc  ON acc.id = ap.equipped_accessory_id
+     LEFT JOIN shop_items acc_si   ON acc_si.id = acc.item_id
      WHERE ap.user_id = $1`,
     [userId]
   );
   const row = result.rows[0] || {};
   const equipped = {};
   for (const slot of AVATAR_SLOTS) {
-    equipped[slot] = row[`${slot}_name`] ? { item_name: row[`${slot}_name`], inventory_id: row[`${slot}_id`] } : null;
+    equipped[slot] = row[`${slot}_name`]
+      ? { item_name: row[`${slot}_name`], inventory_id: row[`${slot}_id`], art_asset_key: row[`${slot}_art_key`] || null }
+      : null;
   }
   return { profile, equipped };
 }
@@ -24491,6 +24513,29 @@ async function loadAvatarBodyBuffer(bodyKey) {
   }
 }
 
+// Cosmetic layer art — assets/avatar/layers/{slot}/{artKey}/{bodyKey}.png. Cropped to
+// the exact same canvas/offset as the base body it corresponds to, so it can be
+// composited at the same {left, top} the body itself uses. Missing file -> null,
+// handled gracefully (item just doesn't render a visual layer yet) rather than
+// throwing, since most cosmetics won't have real art for a while.
+const AVATAR_LAYER_ASSET_DIR = path.join(process.cwd(), 'assets', 'avatar', 'layers');
+const avatarLayerBufferCache = new Map();
+
+async function loadAvatarLayerBuffer(slot, artKey, bodyKey) {
+  if (!artKey) return null;
+  const cacheKey = `${slot}/${artKey}/${bodyKey}`;
+  if (avatarLayerBufferCache.has(cacheKey)) return avatarLayerBufferCache.get(cacheKey);
+  const filePath = path.join(AVATAR_LAYER_ASSET_DIR, slot, artKey, `${bodyKey}.png`);
+  try {
+    const buffer = await fs.promises.readFile(filePath);
+    avatarLayerBufferCache.set(cacheKey, buffer);
+    return buffer;
+  } catch (error) {
+    avatarLayerBufferCache.set(cacheKey, null);
+    return null;
+  }
+}
+
 // Soft radial glow, rasterized from SVG rather than a per-pixel JS loop — much
 // cheaper than the placeholder renderer's concentric-ellipse approach, and
 // composited with a 'screen' blend so it reads as light coming off the character
@@ -24602,6 +24647,21 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
   }
 
   composites.push({ input: bodyResizedBuffer, left, top });
+
+  // Wearable layers, in z-order (pet -> footwear -> bottom -> top -> headwear ->
+  // accessory), each resized identically to the body so they align at the same
+  // {left, top} — they were extracted from a source image cropped the same way as
+  // the base bodies. Items without real art (art_asset_key null) simply don't
+  // contribute a layer; they're still fully equipped/owned, just not drawn yet.
+  const wearableLayerOrder = ['pet', 'footwear', 'bottom', 'top', 'headwear', 'accessory'];
+  for (const slot of wearableLayerOrder) {
+    const item = equipped[slot];
+    if (!item?.art_asset_key) continue;
+    const layerBuffer = await loadAvatarLayerBuffer(slot, item.art_asset_key, bodyKey);
+    if (!layerBuffer) continue;
+    const layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
+    composites.push({ input: layerResizedBuffer, left, top });
+  }
 
   const effectName = equipped.effect?.item_name;
   if (effectName) {
@@ -24798,7 +24858,7 @@ function buildAvatarShopCategoryComponents(categorySlot, items, page, total) {
 
 async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, categorySlot, page, settings) {
   const slotForPreview = categorySlot === 'exclusive' ? (previewItem.avatar_slot || inferAvatarSlotFromItem(previewItem)) : categorySlot;
-  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name } };
+  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name, art_asset_key: previewItem.art_asset_key || null } };
   const embed = new EmbedBuilder()
     .setTitle(`👗 Dressing Room • ${previewItem.item_name}`)
     .setColor(0xFEE75C)
