@@ -24766,27 +24766,42 @@ async function applyAvatarColorize(sharpLib, buffer, targetRgb) {
   return sharpLib(out, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
 }
 
-// Skin tones use a direct weighted blend (mix toward the target color) rather than
-// the Overlay math applyAvatarColorize uses for garments. Overlay amplifies contrast
-// and saturation to reach true black/white, which garments need — but on skin that
-// same amplification read as artificially orange/oversaturated (confirmed visually).
-// Skin doesn't need that extreme range, so a gentler direct mix stays natural while
-// still preserving the base art's shading/highlight variation at the (1-strength)
-// portion of the blend.
+// A flat blend-toward-target (previous approach) provably destroyed detail: measured
+// the shading variation (std dev) of skin pixels before/after and an 80%-strength
+// blend cut it by exactly 80%, which is why facial shadow lines and definition
+// visibly flattened. This scales each pixel by (target / this body's own native
+// average skin tone) instead — a pure multiplicative ratio, so relative shading stays
+// exactly proportional (verified: coefficient of variation is unchanged, not just
+// "less flattened"). Shadows stay proportionally darker, highlights stay
+// proportionally brighter, only the overall balance shifts.
 async function applyAvatarSkinToneColorize(sharpLib, buffer, targetRgb) {
   const { data, info } = await sharpLib(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const out = Buffer.from(data);
   const target = [targetRgb.r, targetRgb.g, targetRgb.b];
-  const strength = 0.8;
+
+  // First pass: find this body's own native average skin tone as the reference point.
+  // Threshold raised to r>110 (was 80) so darker shadow/outline strokes are excluded
+  // from detection entirely — they should never be recolored to begin with.
+  let sumR = 0, sumG = 0, sumB = 0, count = 0;
   for (let i = 0; i < data.length; i += 4) {
     const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
     if (a < 10) continue;
-    const isSkinLike = r > g && g >= b && r > 80 && (r - b) > 15;
-    if (!isSkinLike) continue;
-    for (let c = 0; c < 3; c++) {
-      const blended = data[i + c] * (1 - strength) + target[c] * strength;
-      out[i + c] = Math.round(Math.min(255, Math.max(0, blended)));
+    if (r > g && g >= b && r > 110 && (r - b) > 15) {
+      sumR += r; sumG += g; sumB += b; count++;
     }
+  }
+  if (count === 0) return sharpLib(data, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
+  const nativeAvg = [sumR / count, sumG / count, sumB / count];
+  const ratio = [target[0] / nativeAvg[0], target[1] / nativeAvg[1], target[2] / nativeAvg[2]];
+
+  // Second pass: apply the ratio only to skin-like pixels.
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+    if (a < 10) continue;
+    if (!(r > g && g >= b && r > 110 && (r - b) > 15)) continue;
+    out[i] = Math.round(Math.min(255, Math.max(0, r * ratio[0])));
+    out[i + 1] = Math.round(Math.min(255, Math.max(0, g * ratio[1])));
+    out[i + 2] = Math.round(Math.min(255, Math.max(0, b * ratio[2])));
   }
   return sharpLib(out, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
 }
