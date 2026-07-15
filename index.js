@@ -24638,8 +24638,8 @@ const AVATAR_BODY_LABELS = {
 const AVATAR_SKIN_TONE_TINTS = {
   light: { r: 235, g: 205, b: 180 },
   medium: null,
-  tan: { r: 195, g: 145, b: 105 },
-  deep: { r: 130, g: 88, b: 62 },
+  tan: { r: 170, g: 124, b: 92 },
+  deep: { r: 92, g: 62, b: 45 },
 };
 
 // Preset swatches for colorable items — tap-to-select, no typing required. "Custom
@@ -24741,6 +24741,56 @@ async function buildAvatarAuraGlowBuffer(sharp, width, height, effectName) {
   return sharp(Buffer.from(svg)).png().toBuffer();
 }
 
+// sharp's built-in .tint() preserves the base image's original lightness and only
+// shifts hue — confirmed broken for our purposes (black rendered as light gray, navy
+// and blue were nearly identical). A pure multiply blend was tried next and fixed
+// that, but multiply can only ever DARKEN — it mathematically cannot produce
+// anything brighter than the base pixel's own value, so "white" stayed stuck looking
+// like the gray base fabric. This uses a real Overlay blend instead (the same formula
+// Photoshop's Overlay/Color blend modes use): darkens below mid-gray, brightens above
+// it, so it can reach genuine black AND genuine white while still preserving the
+// garment's own fold/shading detail as light/dark variation. Alpha is untouched.
+async function applyAvatarColorize(sharpLib, buffer, targetRgb) {
+  const { data, info } = await sharpLib(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const out = Buffer.alloc(data.length);
+  const target = [targetRgb.r, targetRgb.g, targetRgb.b];
+  for (let i = 0; i < data.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      const base = data[i + c] / 255;
+      const t = target[c] / 255;
+      const blended = base < 0.5 ? (2 * base * t) : (1 - 2 * (1 - base) * (1 - t));
+      out[i + c] = Math.round(Math.min(255, Math.max(0, blended * 255)));
+    }
+    out[i + 3] = data[i + 3];
+  }
+  return sharpLib(out, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
+}
+
+// Skin tones use a direct weighted blend (mix toward the target color) rather than
+// the Overlay math applyAvatarColorize uses for garments. Overlay amplifies contrast
+// and saturation to reach true black/white, which garments need — but on skin that
+// same amplification read as artificially orange/oversaturated (confirmed visually).
+// Skin doesn't need that extreme range, so a gentler direct mix stays natural while
+// still preserving the base art's shading/highlight variation at the (1-strength)
+// portion of the blend.
+async function applyAvatarSkinToneColorize(sharpLib, buffer, targetRgb) {
+  const { data, info } = await sharpLib(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const out = Buffer.from(data);
+  const target = [targetRgb.r, targetRgb.g, targetRgb.b];
+  const strength = 0.8;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+    if (a < 10) continue;
+    const isSkinLike = r > g && g >= b && r > 80 && (r - b) > 15;
+    if (!isSkinLike) continue;
+    for (let c = 0; c < 3; c++) {
+      const blended = data[i + c] * (1 - strength) + target[c] * strength;
+      out[i + c] = Math.round(Math.min(255, Math.max(0, blended)));
+    }
+  }
+  return sharpLib(out, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
+}
+
 function avatarBackgroundColorFor(backgroundName) {
   const bgLower = String(backgroundName || 'Locker Room').toLowerCase();
   if (bgLower.includes('court')) return { r: 120, g: 53, b: 15, alpha: 1 };
@@ -24799,11 +24849,11 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
 
   const targetHeight = Math.floor(height * (options.showcase ? 0.92 : 0.88));
   let bodyImage = sharp(bodyBuffer).resize({ height: targetHeight });
+  let bodyResizedBuffer = await bodyImage.png().toBuffer();
 
   const tint = AVATAR_SKIN_TONE_TINTS[profile.skin_tone];
-  if (tint) bodyImage = bodyImage.tint(tint);
+  if (tint) bodyResizedBuffer = await applyAvatarSkinToneColorize(sharp, bodyResizedBuffer, tint);
 
-  const bodyResizedBuffer = await bodyImage.png().toBuffer();
   const bodyMeta = await sharp(bodyResizedBuffer).metadata();
   const left = Math.floor((width - bodyMeta.width) / 2);
   const top = height - bodyMeta.height - Math.floor(height * (options.showcase ? 0.02 : 0.03));
@@ -24843,10 +24893,9 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
     if (!item?.art_asset_key) continue;
     const layerBuffer = await loadAvatarLayerBuffer(slot, item.art_asset_key, bodyKey);
     if (!layerBuffer) continue;
-    let layerImage = sharp(layerBuffer).resize({ height: targetHeight });
+    let layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
     const colorRgb = parseAvatarHexColor(item.color_hex);
-    if (colorRgb) layerImage = layerImage.tint(colorRgb);
-    const layerResizedBuffer = await layerImage.png().toBuffer();
+    if (colorRgb) layerResizedBuffer = await applyAvatarColorize(sharp, layerResizedBuffer, colorRgb);
     composites.push({ input: layerResizedBuffer, left, top });
   }
 
