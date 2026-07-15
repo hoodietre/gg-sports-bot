@@ -1756,6 +1756,11 @@ async function initDatabase() {
   // achievement auto-mint pipeline is separate future work), but the flag and the enforcement
   // check both need to exist now so there's no gap once that pipeline lands.
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS is_trade_locked BOOLEAN NOT NULL DEFAULT FALSE`);
+  // Color choice lives on the owned copy, not the shop catalog listing — "my red
+  // hoodie" and someone else's blue one are the same catalog item, different owned
+  // instances. Null for non-colorable items, or a colorable item that hasn't had a
+  // color chosen yet (falls back to the base gray art as-is).
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS color_hex TEXT`);
   await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS description TEXT`);
   await pool.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS tier TEXT`);
 
@@ -1894,6 +1899,9 @@ async function initDatabase() {
   // still fully equippable/ownable, it just doesn't render a visual layer, matching
   // behavior before any real cosmetic art existed.
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS art_asset_key TEXT`);
+  // Colorable items use a single neutral-gray art asset tinted at render time instead of
+  // needing separate art per color — see AVATAR_COLOR_PALETTE / applyAvatarColorTint.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_colorable BOOLEAN NOT NULL DEFAULT FALSE`);
 
 
   await pool.query(`
@@ -2840,7 +2848,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Staff: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Staff: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false))),
@@ -7438,6 +7446,87 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // Recolor flow — change the color of an already-owned colorable item at any time,
+    // not just at purchase. Color lives on the owned copy (user_inventory.color_hex),
+    // so this updates that row directly and re-renders.
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_recolor') {
+      const { equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const components = buildAvatarRecolorSlotComponents(equipped);
+      const hasColorable = AVATAR_SLOTS.some(slot => equipped[slot]?.is_colorable);
+      await interaction.update({
+        content: hasColorable ? null : "None of your currently equipped items support recoloring yet.",
+        components,
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_recolor_slot_select') {
+      const slot = interaction.values[0];
+      const { equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const currentColorHex = normalizeAvatarHexColor(equipped[slot]?.color_hex) || AVATAR_COLOR_PALETTE[0].hex;
+      await interaction.update({ content: null, components: buildAvatarRecolorColorComponents(slot, currentColorHex) });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_recolor_color_select:')) {
+      const slot = interaction.customId.split(':')[1];
+      const chosen = interaction.values[0];
+
+      if (chosen === 'custom') {
+        const modal = new ModalBuilder()
+          .setCustomId(`avatarlocker_recolor_custom_modal:${slot}`)
+          .setTitle('Custom Color')
+          .addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('hex').setLabel('Hex code (e.g. FF5733 or #FF5733)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7)
+          ));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      const { equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const inventoryId = equipped[slot]?.inventory_id;
+      if (!inventoryId) {
+        await interaction.update({ content: 'Nothing is equipped in that slot anymore.', components: buildAvatarLockerComponents() });
+        return;
+      }
+      await pool.query(`UPDATE user_inventory SET color_hex = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, [`#${chosen}`, inventoryId, interaction.user.id]);
+      const { profile, equipped: updatedEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        content: `Recolored **${updatedEquipped[slot].item_name}**.`,
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, updatedEquipped)],
+        files: [await buildAvatarProfileAttachment(profile, updatedEquipped)],
+        components: buildAvatarRecolorColorComponents(slot, `#${chosen}`),
+      });
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('avatarlocker_recolor_custom_modal:')) {
+      const slot = interaction.customId.split(':')[1];
+      const rawHex = interaction.fields.getTextInputValue('hex');
+      const normalized = normalizeAvatarHexColor(rawHex);
+      if (!normalized) {
+        await interaction.reply({ content: `"${rawHex}" isn't a valid hex color. Try something like FF5733 or #FF5733.`, ephemeral: true });
+        return;
+      }
+
+      const { equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const inventoryId = equipped[slot]?.inventory_id;
+      if (!inventoryId) {
+        await interaction.reply({ content: 'Nothing is equipped in that slot anymore.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE user_inventory SET color_hex = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, [normalized, inventoryId, interaction.user.id]);
+      const { profile, equipped: updatedEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.reply({
+        content: `Recolored **${updatedEquipped[slot].item_name}**.`,
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, updatedEquipped)],
+        files: [await buildAvatarProfileAttachment(profile, updatedEquipped)],
+        components: buildAvatarRecolorColorComponents(slot, normalized),
+        ephemeral: true,
+      });
+      return;
+    }
+
     // Showcase pipeline (build order #4) — bakes the user's actual equipped outfit
     // into a full-detail hero shot on demand, posted publicly. Kept separate from the
     // always-on locker/shop render so those stay cheap; this is the intentionally
@@ -7532,10 +7621,61 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_buy:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_color_select:')) {
       const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
-      const outcome = await performAvatarShopPurchase(interaction, itemId);
+      const chosen = interaction.values[0];
+
+      if (chosen === 'custom') {
+        const modal = new ModalBuilder()
+          .setCustomId(`avatarshop_custom_color_modal:${itemId}:${categorySlot}:${page}`)
+          .setTitle('Custom Color')
+          .addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('hex').setLabel('Hex code (e.g. FF5733 or #FF5733)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7)
+          ));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
+      const item = itemResult.rows[0];
+      if (!item) {
+        await interaction.update({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
+        return;
+      }
+      await interaction.update(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings, chosen));
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('avatarshop_custom_color_modal:')) {
+      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const rawHex = interaction.fields.getTextInputValue('hex');
+      const normalized = normalizeAvatarHexColor(rawHex);
+      if (!normalized) {
+        await interaction.reply({ content: `"${rawHex}" isn't a valid hex color. Try something like FF5733 or #FF5733.`, ephemeral: true });
+        return;
+      }
+
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
+      const item = itemResult.rows[0];
+      if (!item) {
+        await interaction.reply({ content: 'That item is no longer available.', ephemeral: true });
+        return;
+      }
+      await interaction.reply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings, normalized));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_buy:')) {
+      const [, itemId, categorySlot, pageStr, colorToken] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const colorHex = colorToken && colorToken !== 'none' ? `#${colorToken}` : null;
+      const outcome = await performAvatarShopPurchase(interaction, itemId, colorHex);
 
       if (!outcome.ok) {
         await interaction.update({ content: outcome.message, embeds: [], files: [], components: [] });
@@ -16086,6 +16226,7 @@ if (interaction.commandName === 'trade') {
         const stock = interaction.options.getInteger('stock');
         const description = interaction.options.getString('description') || 'Visual avatar cosmetic. Use /shop preview before buying.';
         const artKey = (interaction.options.getString('art_key') || name).toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+        const isColorable = interaction.options.getBoolean('colorable') || false;
 
         if (!VISUAL_AVATAR_SLOTS.includes(slot)) {
           await interaction.reply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', '), ephemeral: true });
@@ -16109,9 +16250,9 @@ if (interaction.commandName === 'trade') {
 
         const itemId = randomUUID();
         await pool.query(
-          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11)`,
-          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey]
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12)`,
+          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable]
         );
 
         await pool.query(
@@ -16123,7 +16264,8 @@ if (interaction.commandName === 'trade') {
         await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey } };
+        const previewColorHex = isColorable ? AVATAR_COLOR_PALETTE[0].hex : null;
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -16134,7 +16276,8 @@ if (interaction.commandName === 'trade') {
             { name: 'Created Cosmetic', value: rarityIcon(rarity) + ' **' + name + '**', inline: true },
             { name: 'Slot', value: slot, inline: true },
             { name: 'Price', value: String(price), inline: true },
-            { name: 'Art', value: finalArtKey ? `✅ Linked to \`${finalArtKey}\`` : (artKey ? `⚠️ No art found at \`assets/avatar/layers/${slot}/${artKey}/\` — item created without visual art` : '—'), inline: false }
+            { name: 'Art', value: finalArtKey ? `✅ Linked to \`${finalArtKey}\`` : (artKey ? `⚠️ No art found at \`assets/avatar/layers/${slot}/${artKey}/\` — item created without visual art` : '—'), inline: false },
+            ...(isColorable ? [{ name: 'Colorable', value: `✅ Buyers pick any color (preview shown in ${AVATAR_COLOR_PALETTE[0].name})`, inline: false }] : [])
           );
 
         await interaction.reply({ content: 'Cosmetic shop item created.', embeds: [embed], files: [attachment], ephemeral: true });
@@ -16154,7 +16297,8 @@ if (interaction.commandName === 'trade') {
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null } };
+        const previewColorHex = item.is_colorable ? AVATAR_COLOR_PALETTE[0].hex : null;
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -16165,6 +16309,7 @@ if (interaction.commandName === 'trade') {
             { name: 'Preview Slot', value: slot, inline: true },
             { name: 'Rarity', value: rarityIcon(item.rarity) + ' ' + (item.rarity || 'common'), inline: true },
             { name: 'Price', value: item.price !== undefined && item.price !== null ? String(item.price) : 'Unlock/Not for sale', inline: true },
+            ...(item.is_colorable ? [{ name: 'Colors', value: `Shown in ${AVATAR_COLOR_PALETTE[0].name} — pick any color when you buy it in \`/avatar shop\`.`, inline: false }] : []),
             { name: 'How to Buy', value: 'Use `/avatar shop` to browse and buy, or the "Go Shopping" button on the Avatar Panel.', inline: false }
           );
 
@@ -24230,14 +24375,14 @@ async function getAvatarProfileWithEquipment(userId) {
   const profile = await getOrCreateAvatarProfile(userId);
   const result = await pool.query(
     `SELECT
-       bg.item_name AS background_name, bg.id AS background_id, bg_si.art_asset_key AS background_art_key,
-       eff.item_name AS effect_name, eff.id AS effect_id, eff_si.art_asset_key AS effect_art_key,
-       pet.item_name AS pet_name, pet.id AS pet_id, pet_si.art_asset_key AS pet_art_key,
-       foot.item_name AS footwear_name, foot.id AS footwear_id, foot_si.art_asset_key AS footwear_art_key,
-       bot.item_name AS bottom_name, bot.id AS bottom_id, bot_si.art_asset_key AS bottom_art_key,
-       top.item_name AS top_name, top.id AS top_id, top_si.art_asset_key AS top_art_key,
-       head.item_name AS headwear_name, head.id AS headwear_id, head_si.art_asset_key AS headwear_art_key,
-       acc.item_name AS accessory_name, acc.id AS accessory_id, acc_si.art_asset_key AS accessory_art_key
+       bg.item_name AS background_name, bg.id AS background_id, bg_si.art_asset_key AS background_art_key, bg.color_hex AS background_color_hex, COALESCE(bg_si.is_colorable, FALSE) AS background_is_colorable,
+       eff.item_name AS effect_name, eff.id AS effect_id, eff_si.art_asset_key AS effect_art_key, eff.color_hex AS effect_color_hex, COALESCE(eff_si.is_colorable, FALSE) AS effect_is_colorable,
+       pet.item_name AS pet_name, pet.id AS pet_id, pet_si.art_asset_key AS pet_art_key, pet.color_hex AS pet_color_hex, COALESCE(pet_si.is_colorable, FALSE) AS pet_is_colorable,
+       foot.item_name AS footwear_name, foot.id AS footwear_id, foot_si.art_asset_key AS footwear_art_key, foot.color_hex AS footwear_color_hex, COALESCE(foot_si.is_colorable, FALSE) AS footwear_is_colorable,
+       bot.item_name AS bottom_name, bot.id AS bottom_id, bot_si.art_asset_key AS bottom_art_key, bot.color_hex AS bottom_color_hex, COALESCE(bot_si.is_colorable, FALSE) AS bottom_is_colorable,
+       top.item_name AS top_name, top.id AS top_id, top_si.art_asset_key AS top_art_key, top.color_hex AS top_color_hex, COALESCE(top_si.is_colorable, FALSE) AS top_is_colorable,
+       head.item_name AS headwear_name, head.id AS headwear_id, head_si.art_asset_key AS headwear_art_key, head.color_hex AS headwear_color_hex, COALESCE(head_si.is_colorable, FALSE) AS headwear_is_colorable,
+       acc.item_name AS accessory_name, acc.id AS accessory_id, acc_si.art_asset_key AS accessory_art_key, acc.color_hex AS accessory_color_hex, COALESCE(acc_si.is_colorable, FALSE) AS accessory_is_colorable
      FROM avatar_profiles ap
      LEFT JOIN user_inventory bg   ON bg.id = ap.equipped_background_id
      LEFT JOIN shop_items bg_si    ON bg_si.id = bg.item_id
@@ -24262,7 +24407,7 @@ async function getAvatarProfileWithEquipment(userId) {
   const equipped = {};
   for (const slot of AVATAR_SLOTS) {
     equipped[slot] = row[`${slot}_name`]
-      ? { item_name: row[`${slot}_name`], inventory_id: row[`${slot}_id`], art_asset_key: row[`${slot}_art_key`] || null }
+      ? { item_name: row[`${slot}_name`], inventory_id: row[`${slot}_id`], art_asset_key: row[`${slot}_art_key`] || null, color_hex: row[`${slot}_color_hex`] || null, is_colorable: !!row[`${slot}_is_colorable`] }
       : null;
   }
   return { profile, equipped };
@@ -24497,6 +24642,45 @@ const AVATAR_SKIN_TONE_TINTS = {
   deep: { r: 130, g: 88, b: 62 },
 };
 
+// Preset swatches for colorable items — tap-to-select, no typing required. "Custom
+// Color" (handled separately via parseAvatarHexColor) covers everything else.
+const AVATAR_COLOR_PALETTE = [
+  { name: 'White', hex: '#F5F5F5' },
+  { name: 'Black', hex: '#1A1A1A' },
+  { name: 'Red', hex: '#C62828' },
+  { name: 'Green', hex: '#2E7D32' },
+  { name: 'Blue', hex: '#1565C0' },
+  { name: 'Grey', hex: '#757575' },
+  { name: 'Navy', hex: '#1A2A52' },
+  { name: 'Pink', hex: '#E91E8C' },
+  { name: 'Purple', hex: '#7B1FA2' },
+  { name: 'Orange', hex: '#EF6C00' },
+];
+
+// Validates and parses any hex color string (with or without '#', 3 or 6 digits) into
+// an {r,g,b} object for sharp's .tint(), or null if invalid. Backs the "Custom Color"
+// option so the palette above isn't actually a hard limit.
+function parseAvatarHexColor(input) {
+  if (!input) return null;
+  const clean = String(input).trim().replace(/^#/, '');
+  let hex = clean;
+  if (/^[0-9a-fA-F]{3}$/.test(clean)) {
+    hex = clean.split('').map(c => c + c).join('');
+  }
+  if (!/^[0-9a-fA-F]{6}$/.test(hex)) return null;
+  return {
+    r: parseInt(hex.slice(0, 2), 16),
+    g: parseInt(hex.slice(2, 4), 16),
+    b: parseInt(hex.slice(4, 6), 16),
+  };
+}
+
+function normalizeAvatarHexColor(input) {
+  const rgb = parseAvatarHexColor(input);
+  if (!rgb) return null;
+  return '#' + [rgb.r, rgb.g, rgb.b].map(n => n.toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
 const AVATAR_BODY_ASSET_DIR = path.join(process.cwd(), 'assets', 'avatar', 'bodies');
 const avatarBodyBufferCache = new Map();
 
@@ -24659,7 +24843,10 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
     if (!item?.art_asset_key) continue;
     const layerBuffer = await loadAvatarLayerBuffer(slot, item.art_asset_key, bodyKey);
     if (!layerBuffer) continue;
-    const layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
+    let layerImage = sharp(layerBuffer).resize({ height: targetHeight });
+    const colorRgb = parseAvatarHexColor(item.color_hex);
+    if (colorRgb) layerImage = layerImage.tint(colorRgb);
+    const layerResizedBuffer = await layerImage.png().toBuffer();
     composites.push({ input: layerResizedBuffer, left, top });
   }
 
@@ -24703,8 +24890,38 @@ function buildAvatarLockerComponents() {
     new ActionRowBuilder().addComponents(slotMenu),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('avatarlocker_customize').setLabel('Customize Body').setEmoji('🧍').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('avatarlocker_recolor').setLabel('Recolor').setEmoji('🎨').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('avatarlocker_flex').setLabel('Flex').setEmoji('📸').setStyle(ButtonStyle.Primary)
     ),
+  ];
+}
+
+// Slot-select for recoloring — only lists slots where the CURRENTLY EQUIPPED item is
+// colorable, since recolor changes that specific owned copy's color_hex.
+function buildAvatarRecolorSlotComponents(equipped) {
+  const colorableSlots = AVATAR_SLOTS.filter(slot => equipped[slot]?.is_colorable);
+  const backRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)
+  );
+  if (!colorableSlots.length) return [backRow];
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('avatarlocker_recolor_slot_select')
+    .setPlaceholder('Which item do you want to recolor?')
+    .addOptions(colorableSlots.map(slot => ({ label: `${AVATAR_SLOT_LABELS[slot]} — ${equipped[slot].item_name}`, value: slot })));
+  return [new ActionRowBuilder().addComponents(menu), backRow];
+}
+
+function buildAvatarRecolorColorComponents(slot, currentColorHex) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`avatarlocker_recolor_color_select:${slot}`)
+    .setPlaceholder('Choose a color')
+    .addOptions([
+      ...AVATAR_COLOR_PALETTE.map(c => ({ label: c.name, value: c.hex.replace('#', ''), default: c.hex === currentColorHex })),
+      { label: '🎨 Custom Color…', value: 'custom' },
+    ]);
+  return [
+    new ActionRowBuilder().addComponents(menu),
+    new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_recolor').setLabel('⬅ Back').setStyle(ButtonStyle.Secondary)),
   ];
 }
 
@@ -24856,9 +25073,11 @@ function buildAvatarShopCategoryComponents(categorySlot, items, page, total) {
   return rows;
 }
 
-async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, categorySlot, page, settings) {
+async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, categorySlot, page, settings, selectedColorHex = null) {
   const slotForPreview = categorySlot === 'exclusive' ? (previewItem.avatar_slot || inferAvatarSlotFromItem(previewItem)) : categorySlot;
-  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name, art_asset_key: previewItem.art_asset_key || null } };
+  const isColorable = !!previewItem.is_colorable;
+  const activeColorHex = isColorable ? (normalizeAvatarHexColor(selectedColorHex) || AVATAR_COLOR_PALETTE[0].hex) : null;
+  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name, art_asset_key: previewItem.art_asset_key || null, color_hex: activeColorHex } };
   const embed = new EmbedBuilder()
     .setTitle(`👗 Dressing Room • ${previewItem.item_name}`)
     .setColor(0xFEE75C)
@@ -24866,24 +25085,40 @@ async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, cat
     .addFields(
       { name: 'Price', value: `${settings.currency_icon} ${previewItem.price}`, inline: true },
       { name: 'Rarity', value: `${rarityIcon(previewItem.rarity)} ${previewItem.rarity || 'common'}`, inline: true },
+      ...(isColorable ? [{ name: 'Color', value: activeColorHex, inline: true }] : []),
     )
     .setFooter({ text: 'GG Sports • Avatar Shop • Dressing room preview — nothing purchased yet' })
     .setTimestamp();
-  const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`avatarshop_buy:${previewItem.id}:${categorySlot}:${page}`).setLabel('Buy').setEmoji('💳').setStyle(ButtonStyle.Success),
+
+  const colorToken = isColorable ? activeColorHex.replace('#', '') : 'none';
+  const rows = [];
+  if (isColorable) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`avatarshop_color_select:${previewItem.id}:${categorySlot}:${page}`)
+        .setPlaceholder('Choose a color')
+        .addOptions([
+          ...AVATAR_COLOR_PALETTE.map(c => ({ label: c.name, value: c.hex.replace('#', ''), default: c.hex === activeColorHex })),
+          { label: '🎨 Custom Color…', value: 'custom' },
+        ])
+    ));
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`avatarshop_buy:${previewItem.id}:${categorySlot}:${page}:${colorToken}`).setLabel('Buy').setEmoji('💳').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`avatarshop_category:${categorySlot}:${page}`).setLabel('⬅ Back').setStyle(ButtonStyle.Secondary),
-  );
+  ));
+
   return {
     content: null,
     embeds: [embed],
     files: [await buildAvatarProfileAttachment(profile, previewEquipped)],
-    components: [buttons],
+    components: rows,
   };
 }
 
 // Deducts currency, creates the owned inventory row, and auto-equips it. Returns
 // { ok, message } or { ok, item, inventoryId }.
-async function performAvatarShopPurchase(interaction, itemId) {
+async function performAvatarShopPurchase(interaction, itemId, colorHex = null) {
   const settings = await getCurrencySettings(interaction.guild.id);
   const itemResult = await pool.query(
     `SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 AND is_active = TRUE LIMIT 1`,
@@ -24900,11 +25135,13 @@ async function performAvatarShopPurchase(interaction, itemId) {
   const removed = await removeCurrency(interaction.guild.id, interaction.user.id, item.price, 'avatar_shop_purchase', `Bought ${item.item_name}`, interaction.user.id);
   if (!removed) return { ok: false, message: 'Purchase failed — insufficient balance.' };
 
+  const finalColorHex = item.is_colorable ? (normalizeAvatarHexColor(colorHex) || AVATAR_COLOR_PALETTE[0].hex) : null;
+
   const inventoryId = randomUUID();
   await pool.query(
-    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status)
-     VALUES ($1, $2, $3, $4, $5, $6, 'owned')`,
-    [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, color_hex)
+     VALUES ($1, $2, $3, $4, $5, $6, 'owned', $7)`,
+    [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, finalColorHex]
   );
 
   const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
