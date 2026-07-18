@@ -6042,6 +6042,7 @@ function startGGSportsInternalApiServer() {
 
 client.once(Events.ClientReady, async () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
+  console.log(`BOOT MARKER: jeans-fix-check @ ${new Date().toISOString()}`);
   try {
     await initDatabase();
     await registerCommands();
