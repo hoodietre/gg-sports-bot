@@ -1903,6 +1903,59 @@ async function initDatabase() {
   // needing separate art per color — see AVATAR_COLOR_PALETTE / applyAvatarColorTint.
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_colorable BOOLEAN NOT NULL DEFAULT FALSE`);
 
+  // --- Avatar Item Build Roadmap migrations (hair slot, multi-accessory, serial
+  // numbers, lookup tags, exclusive scheduling windows, award grants) ---
+
+  // Hair is its own equip slot (not shared with headwear) so future paid hairstyles
+  // get the same shop/catalog machinery as every other cosmetic. Headwear still wins
+  // visually — the renderer skips drawing the hair layer whenever headwear is equipped,
+  // so there's no clipping (e.g. ponytail/afro poking through a cap) without needing
+  // the two to actually compete for the same inventory slot.
+  await pool.query(`ALTER TABLE avatar_profiles ADD COLUMN IF NOT EXISTS equipped_hair_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL`);
+
+  // Accessories move from a single equipped_accessory_id column to a proper multi-equip
+  // table, since players can now wear more than one at once (necklace + bracelet +
+  // glasses). accessory_type groups items so only one of each type can be equipped
+  // simultaneously (can't wear two necklaces), while the app-level cap (see
+  // ACCESSORY_EQUIP_CAP below) limits total simultaneous accessories regardless of type.
+  // The old equipped_accessory_id column on avatar_profiles is left in place (unused
+  // going forward) rather than dropped, matching the non-destructive-migration pattern
+  // used elsewhere in this file (see body_key comment above).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS avatar_equipped_accessories (
+      user_id TEXT NOT NULL,
+      item_id UUID REFERENCES user_inventory(id) ON DELETE CASCADE,
+      accessory_type TEXT NOT NULL,
+      equipped_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, accessory_type)
+    )
+  `);
+  // Only meaningful when shop_items.avatar_slot = 'accessory' — identifies which
+  // accessory_type slot (neck/wrist/face/etc.) the item occupies when equipped.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS accessory_type TEXT`);
+
+  // Serial numbers for limited-stock items: assigned once at purchase time as
+  // (units already sold + 1), so buyer sees "#7/50" immediately and can look it up
+  // later. NULL for items with unlimited stock (nothing to number).
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS serial_number INTEGER`);
+  // Short unique lookup code surfaced in the Locker Room so a player can pull up an
+  // item's full details (rarity, exclusive status, serial number, purchase date,
+  // price paid) on demand rather than only seeing them at purchase time.
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS lookup_tag TEXT UNIQUE`);
+  // Tags award grants (MVP, Champion, Rookie of the Year, etc.) distinctly from normal
+  // purchases — these bypass the shop entirely (price_paid = 0, no stock decrement).
+  // NULL for anything bought normally.
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS award_type TEXT`);
+
+  // Powers auto-scheduling for both holiday exclusives and championship-window
+  // exclusives: a scheduled check compares NOW() against this window and flips
+  // is_active accordingly. Floating-date holidays (Easter, Mother's/Father's Day,
+  // Thanksgiving) and championship windows (dates unknown until each season) need
+  // these updated by an admin/bot owner each year; fixed-date holidays (Christmas,
+  // Halloween, New Year's, etc.) can be set once and left alone indefinitely.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS exclusive_window_start TIMESTAMP`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS exclusive_window_end TIMESTAMP`);
+
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_badges (
@@ -23951,7 +24004,47 @@ function formatAvatarLoadout(avatar) {
 
 
 
-const VISUAL_AVATAR_SLOTS = ['headwear', 'top', 'bottom', 'accessory', 'footwear', 'pet', 'effect', 'background'];
+const VISUAL_AVATAR_SLOTS = ['hair', 'headwear', 'top', 'bottom', 'accessory', 'footwear', 'pet', 'effect', 'background'];
+
+// Accessory items (avatar_slot = 'accessory') are further grouped by type so a player
+// can equip one of each type at once (necklace + bracelet + glasses) via
+// avatar_equipped_accessories, rather than being limited to a single accessory overall.
+const ACCESSORY_TYPES = ['neck', 'wrist', 'face', 'other'];
+// Total simultaneous accessories a player can have equipped at once, regardless of how
+// many distinct types exist — keeps avatars from getting visually cluttered as more
+// accessory types get added later.
+const ACCESSORY_EQUIP_CAP = 4;
+
+// Render order, back to front — headwear is drawn after hair specifically so it visually
+// covers/replaces it; the renderer additionally skips the hair layer outright whenever
+// headwear is equipped (see buildAvatarProfileAttachment) rather than relying on draw
+// order alone, since some headwear art may not fully occlude hair drawn beneath it.
+const AVATAR_LAYER_RENDER_ORDER = ['background', 'pet', 'body', 'hair', 'bottom', 'top', 'footwear', 'headwear', 'accessory', 'effect'];
+
+// Short, human-typeable lookup code for a purchased/awarded inventory item (e.g.
+// "GG-7F3K9Q"), surfaced in the Locker Room so a player can pull up an item's full
+// details (rarity, exclusive status, serial number, purchase date, price paid) later.
+function generateInventoryLookupTag() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I to avoid ambiguity
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return `GG-${code}`;
+}
+
+// Assigns the next serial number for a limited-stock item: (units already sold + 1).
+// Returns null for items with unlimited stock (nothing to number). Call this inside the
+// same purchase flow that decrements shop_items.stock, before the decrement, so the
+// count reflects units sold prior to this purchase.
+async function getNextSerialNumber(dbPool, itemId) {
+  const itemResult = await dbPool.query(`SELECT stock FROM shop_items WHERE id = $1`, [itemId]);
+  const item = itemResult.rows[0];
+  if (!item || item.stock === null || item.stock === undefined) return null; // unlimited stock, not numbered
+  const soldResult = await dbPool.query(
+    `SELECT COUNT(*)::int AS count FROM user_inventory WHERE item_id = $1 AND serial_number IS NOT NULL`,
+    [itemId]
+  );
+  return Number(soldResult.rows[0].count) + 1;
+}
 
 const VISUAL_AVATAR_STARTERS = [
   { item: 'Plain Shorts', slot: 'bottom', source: 'starter' },
@@ -25458,7 +25551,15 @@ function rarityIcon(rarity) {
 
 function normalizeAvatarSlot(slot) {
   const s = String(slot || '').toLowerCase();
-  if (s === 'hat' || s === 'glasses' || s === 'hair') return 'headwear';
+  if (s === 'hat' || s === 'cap' || s === 'beanie') return 'headwear';
+  // Hair is its own slot now (see Avatar Item Build Roadmap) — no longer aliased to
+  // headwear. Headwear still visually wins at render time (hair layer is skipped
+  // whenever headwear is equipped), it just isn't the same inventory slot anymore.
+  if (s === 'hairstyle' || s === 'hairstyles') return 'hair';
+  // Glasses are an accessory (face type) now, not headwear — see roadmap's multi-accessory
+  // system. accessory_type itself is set explicitly at item-creation time, not inferred
+  // from the name here; this only routes the top-level slot.
+  if (s === 'glasses' || s === 'necklace' || s === 'chain' || s === 'wristband' || s === 'bracelet') return 'accessory';
   if (s === 'tops' || s === 'shirt' || s === 'hoodie' || s === 'jersey') return 'top';
   if (s === 'bottoms' || s === 'shorts' || s === 'pants') return 'bottom';
   if (s === 'accessories') return 'accessory';
