@@ -1955,6 +1955,37 @@ async function initDatabase() {
   // Halloween, New Year's, etc.) can be set once and left alone indefinitely.
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS exclusive_window_start TIMESTAMP`);
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS exclusive_window_end TIMESTAMP`);
+  // Immutable snapshot of the original stock count at creation time, separate from
+  // `stock` (which decrements on purchase). Needed to show accurate "#7/50" serial
+  // totals — back-computing a total from current remaining stock breaks the moment an
+  // admin manually adjusts `stock` later. NULL means unlimited (same convention as stock).
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS max_stock INTEGER`);
+  await pool.query(`UPDATE shop_items SET max_stock = stock WHERE max_stock IS NULL AND stock IS NOT NULL`);
+  // Trigger (rather than touching every INSERT INTO shop_items call site individually)
+  // guarantees max_stock is captured consistently no matter which code path creates the
+  // item, including any future ones.
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION set_shop_item_max_stock() RETURNS TRIGGER AS $$
+    BEGIN
+      IF NEW.max_stock IS NULL AND NEW.stock IS NOT NULL THEN
+        NEW.max_stock := NEW.stock;
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+  await pool.query(`DROP TRIGGER IF EXISTS trg_set_shop_item_max_stock ON shop_items`);
+  await pool.query(`
+    CREATE TRIGGER trg_set_shop_item_max_stock
+    BEFORE INSERT ON shop_items
+    FOR EACH ROW EXECUTE FUNCTION set_shop_item_max_stock();
+  `);
+  // Award items (MVP, Champion, Rookie of the Year, etc.) still live in shop_items so
+  // they get the same rarity/art/preview machinery as everything else, but are never
+  // purchasable or shop-browsable — only granted via grantAwardItem(). findShopItem /
+  // shop browsing should filter this out; not yet wired into those call sites (flagged
+  // separately, see Avatar Item Build Roadmap wiring status).
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_award_only BOOLEAN NOT NULL DEFAULT FALSE`);
 
 
   await pool.query(`
@@ -6104,6 +6135,8 @@ client.once(Events.ClientReady, async () => {
     console.log('Madden autosync loop started.');
     startTradeThreadCleanupLoop(client);
     console.log('Trade negotiation thread cleanup loop started.');
+    startExclusiveWindowSchedulerLoop();
+    console.log('Exclusive window scheduler loop started.');
 
     const application = await client.application?.fetch().catch(() => null);
     if (application?.owner?.id && !botOwnerUserId) botOwnerUserId = application.owner.id;
@@ -7737,8 +7770,11 @@ if (interaction.commandName === 'avatar') {
       }
 
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const serialNote = outcome.serialNumber !== null && outcome.serialNumber !== undefined
+        ? ` You got **#${outcome.serialNumber}${outcome.item.max_stock !== null && outcome.item.max_stock !== undefined ? '/' + outcome.item.max_stock : ''}**!`
+        : '';
       await interaction.update({
-        content: `Bought and equipped **${outcome.item.item_name}**!`,
+        content: `Bought and equipped **${outcome.item.item_name}**!${serialNote}`,
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: [new ActionRowBuilder().addComponents(
@@ -8851,11 +8887,16 @@ if (interaction.commandName === 'avatar') {
         }
 
         for (const item of cartPayload.items) {
+          // Compute the starting serial number once per item (not per unit) so buying
+          // multiple of the same limited item in one cart checkout assigns consecutive
+          // numbers (e.g. #7, #8, #9) instead of repeating one lookup.
+          const startingSerial = await getNextSerialNumber(pool, item.id);
           for (let i = 0; i < Number(item.quantity); i++) {
+            const serialNumber = startingSerial === null ? null : startingSerial + i;
             await pool.query(
-              `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
-               VALUES ($1, $2, $3, $4, $5, $6)`,
-              [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+              `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, lookup_tag)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+              [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, serialNumber, generateInventoryLookupTag()]
             );
           }
 
@@ -16509,10 +16550,11 @@ if (shopSubcommand === 'view') {
         }
 
         const inventoryId = randomUUID();
+        const serialNumber = await getNextSerialNumber(pool, item.id);
         await pool.query(
-          `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+          `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, lookup_tag)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, serialNumber, generateInventoryLookupTag()]
         );
 
         if (item.stock !== null) {
@@ -16522,7 +16564,8 @@ if (shopSubcommand === 'view') {
         const avatarSlot = inferAvatarSlotFromItem(item);
         await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_purchase').catch(() => null);
 
-        await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.', ephemeral: true });
+        const serialSuffix = serialNumber !== null ? ` — you got **#${serialNumber}${item.max_stock !== null && item.max_stock !== undefined ? '/' + item.max_stock : ''}**!` : '';
+        await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.' + serialSuffix, ephemeral: true });
         return;
       }
 
@@ -19666,10 +19709,11 @@ if (shopSubcommand === 'view') {
         return;
       }
 
+      const purchaseSerialNumber = await getNextSerialNumber(pool, item.id);
       await pool.query(
-        `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price]
+        `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, lookup_tag)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, purchaseSerialNumber, generateInventoryLookupTag()]
       );
 
       if (item.stock !== null) {
@@ -19679,7 +19723,8 @@ if (shopSubcommand === 'view') {
         );
       }
 
-      await interaction.reply({ content: `Purchased **${item.item_name}** for **${settings.currency_icon} ${item.price} ${settings.currency_name}**.`, ephemeral: true });
+      const purchaseSerialSuffix = purchaseSerialNumber !== null ? ` — you got **#${purchaseSerialNumber}${item.max_stock !== null && item.max_stock !== undefined ? '/' + item.max_stock : ''}**!` : '';
+      await interaction.reply({ content: `Purchased **${item.item_name}** for **${settings.currency_icon} ${item.price} ${settings.currency_name}**.${purchaseSerialSuffix}`, ephemeral: true });
       return;
     }
 
@@ -24419,10 +24464,10 @@ function avatarTriangle(buffer, width, height, points, color) {
 // logic, Locker Room, and Shop Hub below don't need to change at all.
 // ---------------------------------------------------------------------------
 
-const AVATAR_SLOTS = ['background', 'effect', 'pet', 'footwear', 'bottom', 'top', 'headwear', 'accessory'];
+const AVATAR_SLOTS = ['background', 'effect', 'pet', 'footwear', 'bottom', 'top', 'hair', 'headwear', 'accessory'];
 const AVATAR_SLOT_LABELS = {
   background: 'Background', effect: 'Aura', pet: 'Pet', footwear: 'Shoes',
-  bottom: 'Bottoms', top: 'Tops', headwear: 'Hats', accessory: 'Accessories',
+  bottom: 'Bottoms', top: 'Tops', hair: 'Hair', headwear: 'Hats', accessory: 'Accessories',
 };
 const AVATAR_BUILD_SCALE = { slim: 0.85, athletic: 1.0, built: 1.15, heavy: 1.3 };
 const AVATAR_BUILDS = ['slim', 'athletic', 'built', 'heavy'];
@@ -24475,6 +24520,7 @@ async function getAvatarProfileWithEquipment(userId) {
        foot.item_name AS footwear_name, foot.id AS footwear_id, foot_si.art_asset_key AS footwear_art_key, foot.color_hex AS footwear_color_hex, COALESCE(foot_si.is_colorable, FALSE) AS footwear_is_colorable,
        bot.item_name AS bottom_name, bot.id AS bottom_id, bot_si.art_asset_key AS bottom_art_key, bot.color_hex AS bottom_color_hex, COALESCE(bot_si.is_colorable, FALSE) AS bottom_is_colorable,
        top.item_name AS top_name, top.id AS top_id, top_si.art_asset_key AS top_art_key, top.color_hex AS top_color_hex, COALESCE(top_si.is_colorable, FALSE) AS top_is_colorable,
+       hair.item_name AS hair_name, hair.id AS hair_id, hair_si.art_asset_key AS hair_art_key, hair.color_hex AS hair_color_hex, COALESCE(hair_si.is_colorable, FALSE) AS hair_is_colorable,
        head.item_name AS headwear_name, head.id AS headwear_id, head_si.art_asset_key AS headwear_art_key, head.color_hex AS headwear_color_hex, COALESCE(head_si.is_colorable, FALSE) AS headwear_is_colorable,
        acc.item_name AS accessory_name, acc.id AS accessory_id, acc_si.art_asset_key AS accessory_art_key, acc.color_hex AS accessory_color_hex, COALESCE(acc_si.is_colorable, FALSE) AS accessory_is_colorable
      FROM avatar_profiles ap
@@ -24490,6 +24536,8 @@ async function getAvatarProfileWithEquipment(userId) {
      LEFT JOIN shop_items bot_si   ON bot_si.id = bot.item_id
      LEFT JOIN user_inventory top  ON top.id = ap.equipped_top_id
      LEFT JOIN shop_items top_si   ON top_si.id = top.item_id
+     LEFT JOIN user_inventory hair ON hair.id = ap.equipped_hair_id
+     LEFT JOIN shop_items hair_si  ON hair_si.id = hair.item_id
      LEFT JOIN user_inventory head ON head.id = ap.equipped_headwear_id
      LEFT JOIN shop_items head_si  ON head_si.id = head.item_id
      LEFT JOIN user_inventory acc  ON acc.id = ap.equipped_accessory_id
@@ -24504,6 +24552,23 @@ async function getAvatarProfileWithEquipment(userId) {
       ? { item_name: row[`${slot}_name`], inventory_id: row[`${slot}_id`], art_asset_key: row[`${slot}_art_key`] || null, color_hex: row[`${slot}_color_hex`] || null, is_colorable: !!row[`${slot}_is_colorable`] }
       : null;
   }
+  // Accessories are multi-equip (see avatar_equipped_accessories) — the legacy single
+  // equipped.accessory field above still reflects the old equipped_accessory_id column
+  // (left in place, unused going forward) so nothing relying on it breaks; new code
+  // should use equipped.accessories (plural, array) instead.
+  const accessoryRows = await pool.query(
+    `SELECT eq.accessory_type, ui.id AS inventory_id, ui.item_name, ui.color_hex, si.art_asset_key, COALESCE(si.is_colorable, FALSE) AS is_colorable
+     FROM avatar_equipped_accessories eq
+     JOIN user_inventory ui ON ui.id = eq.item_id
+     LEFT JOIN shop_items si ON si.id = ui.item_id
+     WHERE eq.user_id = $1
+     ORDER BY eq.accessory_type`,
+    [userId]
+  );
+  equipped.accessories = accessoryRows.rows.map(r => ({
+    accessory_type: r.accessory_type, item_name: r.item_name, inventory_id: r.inventory_id,
+    art_asset_key: r.art_asset_key || null, color_hex: r.color_hex || null, is_colorable: !!r.is_colorable,
+  }));
   return { profile, equipped };
 }
 
@@ -24540,6 +24605,104 @@ async function unequipAvatarSlot(userId, slot) {
   await getOrCreateAvatarProfile(userId);
   await pool.query(`UPDATE avatar_profiles SET equipped_${slot}_id = NULL, updated_at = NOW() WHERE user_id = $1`, [userId]);
   return { ok: true, message: `Unequipped ${AVATAR_SLOT_LABELS[slot] || slot}.` };
+}
+
+// Multi-equip accessories (necklace + bracelet + glasses simultaneously) — separate
+// from equipAvatarItem/unequipAvatarSlot above, which only handle single-column slots.
+// One item per accessory_type at a time (equipping a second necklace replaces the
+// first, via the table's PRIMARY KEY (user_id, accessory_type)); total simultaneous
+// accessories across all types capped at ACCESSORY_EQUIP_CAP.
+async function equipAvatarAccessory(userId, inventoryId) {
+  const itemResult = await pool.query(
+    `SELECT ui.*, si.avatar_slot AS shop_avatar_slot, si.accessory_type
+     FROM user_inventory ui
+     LEFT JOIN shop_items si ON si.id = ui.item_id
+     WHERE ui.id = $1 AND ui.user_id = $2
+     LIMIT 1`,
+    [inventoryId, userId]
+  );
+  const item = itemResult.rows[0];
+  if (!item) return { ok: false, message: 'You do not own that item.' };
+
+  const resolvedSlot = item.shop_avatar_slot || inferAvatarSlotFromItem(item);
+  if (resolvedSlot !== 'accessory') {
+    return { ok: false, message: `**${item.item_name}** is not an accessory.` };
+  }
+  const accessoryType = ACCESSORY_TYPES.includes(item.accessory_type) ? item.accessory_type : 'other';
+
+  const existingResult = await pool.query(`SELECT accessory_type FROM avatar_equipped_accessories WHERE user_id = $1`, [userId]);
+  const alreadyHasThisType = existingResult.rows.some(r => r.accessory_type === accessoryType);
+  if (!alreadyHasThisType && existingResult.rows.length >= ACCESSORY_EQUIP_CAP) {
+    return { ok: false, message: `You can only have ${ACCESSORY_EQUIP_CAP} accessories equipped at once. Unequip one first.` };
+  }
+
+  await pool.query(
+    `INSERT INTO avatar_equipped_accessories (user_id, item_id, accessory_type, equipped_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (user_id, accessory_type) DO UPDATE SET item_id = EXCLUDED.item_id, equipped_at = NOW()`,
+    [userId, inventoryId, accessoryType]
+  );
+  return { ok: true, message: `Equipped **${item.item_name}**.` };
+}
+
+async function unequipAvatarAccessory(userId, accessoryType) {
+  await pool.query(`DELETE FROM avatar_equipped_accessories WHERE user_id = $1 AND accessory_type = $2`, [userId, accessoryType]);
+  return { ok: true, message: `Unequipped ${accessoryType}.` };
+}
+
+// Grants an award item (MVP, Champion, Rookie of the Year, etc.) directly into a
+// user's inventory, bypassing the shop entirely — no currency deducted, no stock
+// decremented (award items aren't expected to set a stock limit; if one is set anyway,
+// it's intentionally not enforced here since awards are earned, not bought). Tags the
+// row with award_type so it's distinguishable from a normal purchase in the Locker Room
+// / lookup-tag detail view. Does not auto-equip, matching how other grants work.
+async function grantAwardItem(guildId, userId, itemId, awardType) {
+  const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, guildId]);
+  const item = itemResult.rows[0];
+  if (!item) return { ok: false, message: 'Could not find that item.' };
+
+  const inventoryId = randomUUID();
+  await pool.query(
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, award_type, lookup_tag)
+     VALUES ($1, $2, $3, $4, $5, 0, 'owned', $6, $7)`,
+    [inventoryId, guildId, userId, item.id, item.item_name, awardType, generateInventoryLookupTag()]
+  );
+  return { ok: true, item, inventoryId };
+}
+
+// ---------------------------------------------------------------------------
+// Holiday & championship exclusive auto-scheduling — periodically flips is_active on
+// any shop_items row with an exclusive_window_start/end set, based on whether NOW()
+// falls inside that window. Fixed-date holidays (Christmas, Halloween, etc.) can have
+// their window set once per year and left alone; floating-date holidays (Easter,
+// Mother's/Father's Day, Thanksgiving) and championship windows (dates unknown until
+// each season) need an admin/bot owner to update the window before each occurrence —
+// see Avatar Item Build Roadmap.
+// ---------------------------------------------------------------------------
+async function runExclusiveWindowSchedulerTick() {
+  await pool.query(
+    `UPDATE shop_items SET is_active = TRUE, updated_at = NOW()
+     WHERE is_exclusive = TRUE AND is_active = FALSE
+       AND exclusive_window_start IS NOT NULL AND exclusive_window_end IS NOT NULL
+       AND NOW() BETWEEN exclusive_window_start AND exclusive_window_end`
+  );
+  await pool.query(
+    `UPDATE shop_items SET is_active = FALSE, updated_at = NOW()
+     WHERE is_exclusive = TRUE AND is_active = TRUE
+       AND exclusive_window_start IS NOT NULL AND exclusive_window_end IS NOT NULL
+       AND NOW() NOT BETWEEN exclusive_window_start AND exclusive_window_end`
+  );
+}
+
+let exclusiveWindowSchedulerTimer = null;
+function startExclusiveWindowSchedulerLoop() {
+  if (exclusiveWindowSchedulerTimer) clearInterval(exclusiveWindowSchedulerTimer);
+  // 15-minute tick — exclusive windows don't need per-minute precision like Madden
+  // autosync does, and this keeps it cheap to run continuously.
+  exclusiveWindowSchedulerTimer = setInterval(() => {
+    runExclusiveWindowSchedulerTick().catch(error => console.error('Exclusive window scheduler tick failed:', error));
+  }, 15 * 60 * 1000);
+  setTimeout(() => runExclusiveWindowSchedulerTick().catch(() => null), 15 * 1000);
 }
 
 async function updateAvatarBodyCustomization(userId, { bodyKey, skinTone }) {
@@ -24991,19 +25154,33 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
 
   composites.push({ input: bodyResizedBuffer, left, top });
 
-  // Wearable layers, in z-order (pet -> footwear -> bottom -> top -> headwear ->
+  // Wearable layers, in z-order (pet -> footwear -> bottom -> top -> hair -> headwear ->
   // accessory), each resized identically to the body so they align at the same
   // {left, top} — they were extracted from a source image cropped the same way as
   // the base bodies. Items without real art (art_asset_key null) simply don't
   // contribute a layer; they're still fully equipped/owned, just not drawn yet.
-  const wearableLayerOrder = ['pet', 'footwear', 'bottom', 'top', 'headwear', 'accessory'];
+  // Hair is skipped outright whenever headwear is equipped (rather than relying on
+  // headwear art visually covering it), since some headwear art may not fully occlude
+  // hair drawn beneath it — see Avatar Item Build Roadmap. Accessories are multi-equip
+  // (see equipped.accessories) so they're composited as a list, not a single slot.
+  const wearableLayerOrder = ['pet', 'footwear', 'bottom', 'top', 'hair', 'headwear'];
   for (const slot of wearableLayerOrder) {
+    if (slot === 'hair' && equipped.headwear?.art_asset_key) continue;
     const item = equipped[slot];
     if (!item?.art_asset_key) continue;
     const layerBuffer = await loadAvatarLayerBuffer(slot, item.art_asset_key, bodyKey);
     if (!layerBuffer) continue;
     let layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
     const colorRgb = parseAvatarHexColor(item.color_hex);
+    if (colorRgb) layerResizedBuffer = await applyAvatarColorize(sharp, layerResizedBuffer, colorRgb);
+    composites.push({ input: layerResizedBuffer, left, top });
+  }
+  for (const accessory of (equipped.accessories || [])) {
+    if (!accessory.art_asset_key) continue;
+    const layerBuffer = await loadAvatarLayerBuffer('accessory', accessory.art_asset_key, bodyKey);
+    if (!layerBuffer) continue;
+    let layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
+    const colorRgb = parseAvatarHexColor(accessory.color_hex);
     if (colorRgb) layerResizedBuffer = await applyAvatarColorize(sharp, layerResizedBuffer, colorRgb);
     composites.push({ input: layerResizedBuffer, left, top });
   }
@@ -25029,7 +25206,11 @@ async function buildAvatarProfileAttachment(profile, equipped, options = {}) {
 
 function buildAvatarLockerEmbed(user, profile, equipped) {
   const NL = String.fromCharCode(10);
-  const lines = AVATAR_SLOTS.map(slot => `${AVATAR_SLOT_LABELS[slot]}: ${equipped[slot]?.item_name || 'none'}`);
+  const lines = AVATAR_SLOTS.filter(slot => slot !== 'accessory').map(slot => `${AVATAR_SLOT_LABELS[slot]}: ${equipped[slot]?.item_name || 'none'}`);
+  const accessoryList = (equipped.accessories || []).length
+    ? equipped.accessories.map(a => a.item_name).join(', ')
+    : 'none';
+  lines.push(`${AVATAR_SLOT_LABELS.accessory}: ${accessoryList}`);
   return new EmbedBuilder()
     .setTitle(`🔒 ${user.username} • Locker Room`)
     .setColor(0xFEE75C)
@@ -25275,7 +25456,7 @@ async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, cat
 }
 
 // Deducts currency, creates the owned inventory row, and auto-equips it. Returns
-// { ok, message } or { ok, item, inventoryId }.
+// { ok, message } or { ok, item, inventoryId, serialNumber }.
 async function performAvatarShopPurchase(interaction, itemId, colorHex = null) {
   const settings = await getCurrencySettings(interaction.guild.id);
   const itemResult = await pool.query(
@@ -25284,6 +25465,14 @@ async function performAvatarShopPurchase(interaction, itemId, colorHex = null) {
   );
   const item = itemResult.rows[0];
   if (!item) return { ok: false, message: 'That item is no longer available.' };
+
+  // Pre-existing gap: this purchase path never checked or decremented stock, unlike the
+  // other 3 purchase call sites — meaning limited-stock items could be oversold through
+  // the Avatar Shop dressing room specifically. Fixed here since serial numbers only
+  // mean anything if stock is actually enforced everywhere a purchase can happen.
+  if (item.stock !== null && Number(item.stock) <= 0) {
+    return { ok: false, message: `**${item.item_name}** is out of stock.` };
+  }
 
   const balance = await getBalance(interaction.guild.id, interaction.user.id);
   if (Number(balance.balance) < item.price) {
@@ -25296,16 +25485,21 @@ async function performAvatarShopPurchase(interaction, itemId, colorHex = null) {
   const finalColorHex = item.is_colorable ? (normalizeAvatarHexColor(colorHex) || AVATAR_COLOR_PALETTE[0].hex) : null;
 
   const inventoryId = randomUUID();
+  const dressingRoomSerialNumber = await getNextSerialNumber(pool, item.id);
   await pool.query(
-    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, color_hex)
-     VALUES ($1, $2, $3, $4, $5, $6, 'owned', $7)`,
-    [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, finalColorHex]
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, color_hex, serial_number, lookup_tag)
+     VALUES ($1, $2, $3, $4, $5, $6, 'owned', $7, $8, $9)`,
+    [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, finalColorHex, dressingRoomSerialNumber, generateInventoryLookupTag()]
   );
+
+  if (item.stock !== null) {
+    await pool.query(`UPDATE shop_items SET stock = GREATEST(0, stock - 1), updated_at = NOW() WHERE id = $1`, [item.id]);
+  }
 
   const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
   await equipAvatarItem(interaction.user.id, slot, inventoryId);
 
-  return { ok: true, item, inventoryId };
+  return { ok: true, item, inventoryId, serialNumber: dressingRoomSerialNumber };
 }
 
 // Shared by /avatar locker, /avatar shop, and the Avatar Panel's "Locker Room"/"Go
