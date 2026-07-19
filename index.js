@@ -2932,10 +2932,12 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Staff: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
-      .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false))),
+      .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false)))
+      .addSubcommand(sc => sc.setName('grantaward').setDescription('Staff: grant an award item directly to a user (bypasses the shop — no charge, no stock decrement)').addUserOption(o => o.setName('user').setDescription('User to award').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Award item name or short ID (must be marked award-only)').setRequired(true)).addStringOption(o => o.setName('award_type').setDescription('e.g. MVP, Champion, Rookie of the Year').setRequired(true)))
+      .addSubcommand(sc => sc.setName('setexclusivewindow').setDescription('Bot owner: set/update the active date window for a holiday or championship exclusive').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('start').setDescription('Start date/time, e.g. 2026-12-20 or 2026-12-20T09:00:00').setRequired(true)).addStringOption(o => o.setName('end').setDescription('End date/time, e.g. 2026-12-26').setRequired(true))),
 
     new SlashCommandBuilder()
       .setName('marketplace')
@@ -5113,7 +5115,7 @@ function shortItemId(itemId) {
 async function findShopItem(guildId, itemInput) {
   const result = await pool.query(
     `SELECT * FROM shop_items
-     WHERE guild_id = $1 AND is_active = TRUE
+     WHERE guild_id = $1 AND is_active = TRUE AND is_award_only = FALSE
        AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3)
      ORDER BY created_at DESC
      LIMIT 1`,
@@ -6276,7 +6278,7 @@ function ggBuildShopItemButtonId(itemId) {
 async function ggBuildPermanentShopPayload(guildId) {
   const settings = await getCurrencySettings(guildId);
   const result = await pool.query(
-    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY price ASC, item_name ASC LIMIT 10`,
+    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE AND is_award_only = FALSE ORDER BY price ASC, item_name ASC LIMIT 10`,
     [guildId]
   );
 
@@ -7520,6 +7522,48 @@ if (interaction.commandName === 'avatar') {
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: buildAvatarLockerComponents(),
       });
+      return;
+    }
+
+    // Accessories: type picker -> item picker (multi-equip, see equipAvatarAccessory).
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_accessory_type_select') {
+      const accessoryType = interaction.values[0];
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const payload = await buildAvatarLockerAccessoryItemPayload(interaction.user, profile, equipped, accessoryType);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_accessory_item_select:')) {
+      const accessoryType = interaction.customId.split(':')[1];
+      const chosen = interaction.values[0];
+      let outcomeMessage = null;
+      if (chosen === '__unequip__') {
+        await unequipAvatarAccessory(interaction.user.id, accessoryType);
+      } else {
+        const result = await equipAvatarAccessory(interaction.user.id, chosen);
+        if (!result.ok) outcomeMessage = result.message;
+      }
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      if (outcomeMessage) {
+        // Equip was rejected (e.g. cap reached) — show the type list again with the error,
+        // rather than silently returning to the top-level locker view.
+        const payload = await buildAvatarLockerAccessoryItemPayload(interaction.user, profile, equipped, accessoryType);
+        await interaction.update({ ...payload, content: outcomeMessage });
+        return;
+      }
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarLockerComponents(),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_accessory_back') {
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const payload = await buildAvatarLockerAccessoryTypePayload(interaction.user, profile, equipped);
+      await interaction.update(payload);
       return;
     }
 
@@ -9570,7 +9614,7 @@ if (interaction.commandName === 'avatar') {
         }
 
         if (currentRound >= schedule.length) {
-          await interaction.editReply({ content: `Season schedule complete — all ${schedule.length} round(s) have been played. Start a new season to generate a new schedule.` });
+          await interaction.editReply({ content: `Season schedule complete — all ${schedule.length} round(s) have been played.\n\n**Next steps:**\n• Run \`/league seasonhistory\` to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)\n• Start a new season to generate a new schedule.` });
           return;
         }
 
@@ -10418,7 +10462,10 @@ if (interaction.commandName === 'avatar') {
             `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
             [leagueId, JSON.stringify(bracket), champion]
           );
-          statusNote += `\n\n🏆 **${champion}** win the championship!`;
+          // Non-Madden leagues don't have an automatic year-end sync to hook into like
+          // Madden does — the commissioner has to manually record season history and
+          // hand out awards, so prompt them here rather than leaving it undiscoverable.
+          statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Run \`/league seasonhistory\` to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
         } else {
           const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
           const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
@@ -16308,8 +16355,8 @@ if (interaction.commandName === 'trade') {
       if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
       if (shopSubcommand === 'createcosmetic') {
-        if (!(await userCanUseLeagueSetup(interaction, league))) {
-          await interaction.reply({ content: 'You do not have permission to create cosmetic shop items.', ephemeral: true });
+        if (!isBotOwnerInteraction(interaction)) {
+          await interaction.reply({ content: 'Creating cosmetic shop items is restricted to the bot owner.', ephemeral: true });
           return;
         }
 
@@ -16322,6 +16369,7 @@ if (interaction.commandName === 'trade') {
         const description = interaction.options.getString('description') || 'Visual avatar cosmetic. Use /shop preview before buying.';
         const artKey = (interaction.options.getString('art_key') || name).toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
         const isColorable = interaction.options.getBoolean('colorable') || false;
+        const isAwardOnly = interaction.options.getBoolean('award_only') || false;
 
         if (!VISUAL_AVATAR_SLOTS.includes(slot)) {
           await interaction.reply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', '), ephemeral: true });
@@ -16345,9 +16393,9 @@ if (interaction.commandName === 'trade') {
 
         const itemId = randomUUID();
         await pool.query(
-          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12)`,
-          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable]
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13)`,
+          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly]
         );
 
         await pool.query(
@@ -16681,6 +16729,88 @@ if (shopSubcommand === 'view') {
         );
 
         await interaction.reply({ content: 'Updated **' + inventoryItem.item_name + '** for ' + targetUser.toString() + ' to **' + status + '**.', ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'grantaward') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) {
+          await interaction.reply({ content: 'You do not have permission to grant awards.', ephemeral: true });
+          return;
+        }
+
+        const targetUser = interaction.options.getUser('user');
+        const itemInput = interaction.options.getString('item');
+        const awardType = interaction.options.getString('award_type');
+
+        const itemResult = await pool.query(
+          `SELECT * FROM shop_items
+           WHERE guild_id = $1 AND is_award_only = TRUE
+             AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3)
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [interaction.guild.id, itemInput, `${itemInput}%`]
+        );
+        const awardItem = itemResult.rows[0];
+        if (!awardItem) {
+          await interaction.reply({ content: 'Could not find an award-only item with that name/ID. Create one with `/shop createcosmetic award_only:True`.', ephemeral: true });
+          return;
+        }
+
+        const grantResult = await grantAwardItem(interaction.guild.id, targetUser.id, awardItem.id, awardType);
+        if (!grantResult.ok) {
+          await interaction.reply({ content: grantResult.message, ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({ content: `🏆 Granted **${awardItem.item_name}** (${awardType}) to ${targetUser.toString()}.`, ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'setexclusivewindow') {
+        if (!isBotOwnerInteraction(interaction)) {
+          await interaction.reply({ content: 'Setting exclusive windows is restricted to the bot owner.', ephemeral: true });
+          return;
+        }
+
+        const itemInput = interaction.options.getString('item');
+        const startInput = interaction.options.getString('start');
+        const endInput = interaction.options.getString('end');
+
+        const startDate = new Date(startInput);
+        const endDate = new Date(endInput);
+        if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+          await interaction.reply({ content: 'Could not parse those dates. Try a format like `2026-12-20` or `2026-12-20T09:00:00`.', ephemeral: true });
+          return;
+        }
+        if (endDate <= startDate) {
+          await interaction.reply({ content: 'End date must be after the start date.', ephemeral: true });
+          return;
+        }
+
+        const itemResult = await pool.query(
+          `SELECT * FROM shop_items WHERE guild_id = $1 AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3) ORDER BY created_at DESC LIMIT 1`,
+          [interaction.guild.id, itemInput, `${itemInput}%`]
+        );
+        const targetItem = itemResult.rows[0];
+        if (!targetItem) {
+          await interaction.reply({ content: 'Could not find that shop item.', ephemeral: true });
+          return;
+        }
+        if (!targetItem.is_exclusive) {
+          await interaction.reply({ content: `**${targetItem.item_name}** isn't marked exclusive — the auto-scheduler only affects exclusive items. Mark it exclusive first, then set the window.`, ephemeral: true });
+          return;
+        }
+
+        await pool.query(
+          `UPDATE shop_items SET exclusive_window_start = $1, exclusive_window_end = $2, updated_at = NOW() WHERE id = $3`,
+          [startDate.toISOString(), endDate.toISOString(), targetItem.id]
+        );
+
+        const isCurrentlyInWindow = Date.now() >= startDate.getTime() && Date.now() <= endDate.getTime();
+        await interaction.reply({
+          content: `Set **${targetItem.item_name}**'s exclusive window: <t:${Math.floor(startDate.getTime() / 1000)}:D> → <t:${Math.floor(endDate.getTime() / 1000)}:D>. It will ${isCurrentlyInWindow ? 'go active within 15 minutes (currently inside the window)' : 'auto-activate/deactivate on schedule'}.`,
+          ephemeral: true,
+        });
         return;
       }
     }
@@ -19680,7 +19810,7 @@ if (shopSubcommand === 'view') {
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
-        `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY created_at DESC LIMIT 50`,
+        `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE AND is_award_only = FALSE ORDER BY created_at DESC LIMIT 50`,
         [interaction.guild.id]
       );
       await interaction.reply({ embeds: [buildShopEmbed(settings, result.rows)], ephemeral: true });
@@ -25276,7 +25406,28 @@ async function getOwnedItemsForAvatarSlot(userId, slot) {
   return result.rows.filter(row => (row.shop_avatar_slot || inferAvatarSlotFromItem(row)) === slot);
 }
 
+// Owned accessories filtered to one accessory_type (neck/wrist/face/other) — used by the
+// Locker Room's multi-accessory equip flow, since each type is equipped independently.
+async function getOwnedAccessoryItemsByType(userId, accessoryType) {
+  const result = await pool.query(
+    `SELECT ui.id, ui.item_name, si.avatar_slot AS shop_avatar_slot, si.accessory_type
+     FROM user_inventory ui
+     LEFT JOIN shop_items si ON si.id = ui.item_id
+     WHERE ui.user_id = $1
+     ORDER BY ui.purchased_at DESC`,
+    [userId]
+  );
+  return result.rows.filter(row => {
+    const slot = row.shop_avatar_slot || inferAvatarSlotFromItem(row);
+    if (slot !== 'accessory') return false;
+    const type = ACCESSORY_TYPES.includes(row.accessory_type) ? row.accessory_type : 'other';
+    return type === accessoryType;
+  });
+}
+
 async function buildAvatarLockerSlotPayload(user, profile, equipped, slot) {
+  if (slot === 'accessory') return buildAvatarLockerAccessoryTypePayload(user, profile, equipped);
+
   const ownedItems = await getOwnedItemsForAvatarSlot(user.id, slot);
   const options = [
     { label: 'Unequip', value: '__unequip__', description: `Remove ${AVATAR_SLOT_LABELS[slot]}`, emoji: '🚫' },
@@ -25293,6 +25444,54 @@ async function buildAvatarLockerSlotPayload(user, profile, equipped, slot) {
     components: [
       new ActionRowBuilder().addComponents(menu),
       new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)),
+    ],
+  };
+}
+
+// Accessories are multi-equip (one item per type, up to ACCESSORY_EQUIP_CAP total), so
+// unlike every other slot this needs a type picker first, rather than going straight to
+// an item list — see equipAvatarAccessory/unequipAvatarAccessory.
+async function buildAvatarLockerAccessoryTypePayload(user, profile, equipped) {
+  const equippedByType = {};
+  for (const a of (equipped.accessories || [])) equippedByType[a.accessory_type] = a.item_name;
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('avatarlocker_accessory_type_select')
+    .setPlaceholder(`Manage an accessory type (${(equipped.accessories || []).length}/${ACCESSORY_EQUIP_CAP} equipped)`)
+    .addOptions(ACCESSORY_TYPES.map(type => ({
+      label: type.charAt(0).toUpperCase() + type.slice(1),
+      value: type,
+      description: equippedByType[type] ? `Equipped: ${equippedByType[type]}`.slice(0, 100) : 'Nothing equipped',
+    })));
+  return {
+    content: null,
+    embeds: [buildAvatarLockerEmbed(user, profile, equipped)],
+    files: [await buildAvatarProfileAttachment(profile, equipped)],
+    components: [
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)),
+    ],
+  };
+}
+
+async function buildAvatarLockerAccessoryItemPayload(user, profile, equipped, accessoryType) {
+  const ownedItems = await getOwnedAccessoryItemsByType(user.id, accessoryType);
+  const typeLabel = accessoryType.charAt(0).toUpperCase() + accessoryType.slice(1);
+  const options = [
+    { label: 'Unequip', value: '__unequip__', description: `Remove your equipped ${typeLabel}`, emoji: '🚫' },
+    ...ownedItems.slice(0, 24).map(item => ({ label: item.item_name.slice(0, 100), value: item.id })),
+  ];
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`avatarlocker_accessory_item_select:${accessoryType}`)
+    .setPlaceholder(ownedItems.length ? `Choose a ${typeLabel} item` : `No owned ${typeLabel} items yet`)
+    .addOptions(options);
+  return {
+    content: null,
+    embeds: [buildAvatarLockerEmbed(user, profile, equipped)],
+    files: [await buildAvatarProfileAttachment(profile, equipped)],
+    components: [
+      new ActionRowBuilder().addComponents(menu),
+      new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_accessory_back').setLabel('⬅ Back to Accessory Types').setStyle(ButtonStyle.Secondary)),
     ],
   };
 }
@@ -25354,21 +25553,21 @@ async function fetchAvatarShopItems(guildId, categorySlot, page) {
   const offset = page * AVATAR_SHOP_PAGE_SIZE;
   if (categorySlot === 'exclusive') {
     const countResult = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE`,
+      `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE AND is_award_only = FALSE`,
       [guildId]
     );
     const itemsResult = await pool.query(
-      `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE ORDER BY price ASC LIMIT $2 OFFSET $3`,
+      `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE AND is_award_only = FALSE ORDER BY price ASC LIMIT $2 OFFSET $3`,
       [guildId, AVATAR_SHOP_PAGE_SIZE, offset]
     );
     return { items: itemsResult.rows, total: countResult.rows[0]?.count || 0 };
   }
   const countResult = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2`,
+    `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 AND is_award_only = FALSE`,
     [guildId, categorySlot]
   );
   const itemsResult = await pool.query(
-    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 ORDER BY price ASC LIMIT $3 OFFSET $4`,
+    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 AND is_award_only = FALSE ORDER BY price ASC LIMIT $3 OFFSET $4`,
     [guildId, categorySlot, AVATAR_SHOP_PAGE_SIZE, offset]
   );
   return { items: itemsResult.rows, total: countResult.rows[0]?.count || 0 };
@@ -56510,6 +56709,47 @@ function maddenIsRegularSeasonWeek(weekLabel) {
   return maddenWeekLabelSortKey(weekLabel)[0] === 1;
 }
 
+// Regular/playoffs -> offseason transition, mirroring the preseason -> regular pattern
+// above. Per user instruction: for Madden leagues, league history should post
+// automatically once the league has advanced past Super Bowl week and synced — no
+// manual `/maddenseason yearend confirm:true` needed. Guarded by current_season_stage
+// so this only fires once per season even though autosync runs every 60 seconds; the
+// stage is reset back to 'preseason' the moment next year's preseason weeks are
+// detected (see the reset branch below), so the cycle repeats correctly year over year.
+async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  const stage = settings.current_season_stage || 'preseason';
+
+  // Reset for next year: once a new preseason begins after an offseason was finalized,
+  // clear the flag so the next Super Bowl can trigger this again.
+  if (stage === 'offseason' && maddenIsPreseasonWeek(newWeekLabel)) {
+    await pool.query(
+      `UPDATE madden_league_settings SET current_season_stage = 'preseason', updated_at = NOW() WHERE league_id = $1`,
+      [league.league_id]
+    ).catch(() => null);
+    return;
+  }
+
+  if (stage === 'offseason') return; // already finalized this season, nothing to do
+
+  const sb = await getMaddenSuperBowlResult(guild.id, league.league_id).catch(() => null);
+  if (!sb?.isFinal) return;
+
+  console.log('[SEASON TRANSITION] Super Bowl final detected for league', league.league_id, '— auto-finalizing year-end.');
+  try {
+    await buildMaddenYearEndPrepEmbed(guild, league, true, null);
+  } catch (error) {
+    console.error('[SEASON TRANSITION] Auto year-end finalization failed:', error?.message || error);
+    return; // don't flip the stage flag if it failed — retry next sync tick
+  }
+
+  await pool.query(
+    `UPDATE madden_league_settings SET current_season_stage = 'offseason', updated_at = NOW() WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => null);
+  console.log('[SEASON TRANSITION] Offseason finalization complete for league', league.league_id);
+}
+
 async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel) {
   if (!previousWeekLabel || !newWeekLabel) return;
   const wasPreseason = maddenIsPreseasonWeek(previousWeekLabel);
@@ -56614,6 +56854,11 @@ async function autoDetectAfterSync(guild, league) {
   // Check for preseason → regular season transition before anything else
   await handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel).catch(err =>
     console.error('[AUTO DETECT] Season transition handler failed:', err?.message));
+
+  // Check for regular/playoffs → offseason transition (Super Bowl final) — auto-posts
+  // league history and finalizes awards/champion, no manual command needed.
+  await handleMaddenOffseasonTransition(guild, league, newWeekLabel).catch(err =>
+    console.error('[AUTO DETECT] Offseason transition handler failed:', err?.message));
 
   // 1. Transaction auto-detect
   await autoDetectMaddenTransactions(guild, league).catch(err =>
