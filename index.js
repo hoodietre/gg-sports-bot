@@ -1915,11 +1915,12 @@ async function initDatabase() {
 
   // Free default hairstyle + natural color — lives directly on avatar_profiles,
   // same pattern as body_key/skin_tone, NOT the shop/inventory machinery above.
-  // These 6 starter styles (3 male, 3 female — see HAIR_STYLES_BY_GENDER) are picked
-  // in the Customize Body panel alongside body/skin tone, at no cost, with no
-  // purchase/ownership record. Paid future hairstyles still go through the normal
-  // shop_items/user_inventory/equipped_hair_id path above and take visual priority
-  // over these defaults whenever one is equipped (see renderAvatarProfilePngRealArt).
+  // 6 real starter styles (3 male, 3 female) plus Buzzcut (available to both
+  // genders — see HAIR_STYLES_BY_GENDER) are picked in the Customize Body panel
+  // alongside body/skin tone, at no cost, with no purchase/ownership record. Paid
+  // future hairstyles still go through the normal shop_items/user_inventory/
+  // equipped_hair_id path above and take visual priority over these defaults
+  // whenever one is equipped (see renderAvatarProfilePngRealArt).
   // Default is NULL for hair_style until first customization write, at which point
   // getAvatarProfileWithEquipment/render code falls back to a gender-appropriate
   // default (see DEFAULT_HAIR_STYLE_FOR_GENDER) rather than needing a hardcoded
@@ -25090,20 +25091,26 @@ const AVATAR_COLOR_PALETTE = [
   { name: 'Orange', hex: '#EF6C00' },
 ];
 
-// The 6 free default hairstyles (3 per gender), art_asset_key values matching
-// assets/avatar/layers/hair/{key}/{bodyKey}.png exactly (see Avatar Item Build
-// Roadmap). Gender-gated in the Customize Body picker since each style's art only
-// exists for one gender's body files — picking a style not in the current body's
-// list would render nothing.
+// The 6 free default hairstyles (3 per gender) plus Buzzcut, art_asset_key values
+// matching assets/avatar/layers/hair/{key}/{bodyKey}.png exactly (see Avatar Item
+// Build Roadmap), except Buzzcut which is a sentinel, not a real art key — the real
+// body files already have a buzzed/bald look baked in, so "Buzzcut" just means
+// "render no hair layer at all" rather than pointing at real art. It's available to
+// both genders (unlike the other 6, which are gender-gated) since it's just "go back
+// to what the body already looks like".
+const BUZZCUT_HAIR_STYLE = 'buzzcut';
 const HAIR_STYLES_BY_GENDER = {
-  male: ['caesar', 'faux_hawk', 'afro'],
-  female: ['high_ponytail', 'long_curly', 'messy_bun'],
+  male: [BUZZCUT_HAIR_STYLE, 'caesar', 'faux_hawk', 'afro'],
+  female: [BUZZCUT_HAIR_STYLE, 'high_ponytail', 'long_curly', 'messy_bun'],
 };
 const HAIR_STYLE_LABELS = {
+  [BUZZCUT_HAIR_STYLE]: 'Buzzcut (Default)',
   caesar: 'Caesar', faux_hawk: 'Faux Hawk', afro: 'Afro',
   high_ponytail: 'High Ponytail', long_curly: 'Long Curly', messy_bun: 'Messy Bun',
 };
-const DEFAULT_HAIR_STYLE_FOR_GENDER = { male: 'caesar', female: 'high_ponytail' };
+// Buzzcut is the starting default for both genders now, rather than a named style —
+// matches the actual out-of-the-box body art with zero extra layer drawn.
+const DEFAULT_HAIR_STYLE_FOR_GENDER = { male: BUZZCUT_HAIR_STYLE, female: BUZZCUT_HAIR_STYLE };
 
 // Natural tap-to-select tones for the free default hairstyles — a deliberately
 // constrained palette (unlike AVATAR_COLOR_PALETTE's arbitrary-color shop items),
@@ -25399,9 +25406,16 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
     // hair_color) whenever no paid shop hair item is equipped — a paid item, if
     // equipped, always wins. This is the only slot with a non-inventory fallback;
     // every other slot simply renders nothing when unequipped, same as before.
+    // Buzzcut is explicitly skipped here (rather than left to fail loadAvatarLayerBuffer's
+    // file-not-found catch) since it's a real, common selection, not an edge case —
+    // no assets/avatar/layers/hair/buzzcut/ folder exists or ever will, since Buzzcut
+    // means "the body's own baked-in look, draw nothing extra."
     if (slot === 'hair' && !artAssetKey) {
-      artAssetKey = resolveDefaultHairStyle(profile);
-      colorHex = profile.hair_color;
+      const defaultStyle = resolveDefaultHairStyle(profile);
+      if (defaultStyle !== BUZZCUT_HAIR_STYLE) {
+        artAssetKey = defaultStyle;
+        colorHex = profile.hair_color;
+      }
     }
 
     if (!artAssetKey) continue;
@@ -25450,6 +25464,7 @@ function buildAvatarLockerEmbed(user, profile, equipped) {
     // misleading "none".
     if (slot === 'hair' && !equipped.hair) {
       const styleKey = resolveDefaultHairStyle(profile);
+      if (styleKey === BUZZCUT_HAIR_STYLE) return `${AVATAR_SLOT_LABELS.hair}: ${HAIR_STYLE_LABELS[styleKey]}`;
       const colorName = HAIR_COLOR_PALETTE.find(c => c.hex.toUpperCase() === String(profile.hair_color || '').toUpperCase())?.name || 'Custom';
       return `${AVATAR_SLOT_LABELS.hair}: ${HAIR_STYLE_LABELS[styleKey]} (${colorName})`;
     }
@@ -25623,9 +25638,9 @@ function buildAvatarCustomizeComponents(profile) {
   const skinMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_skin').setPlaceholder('Choose skin tone')
     .addOptions(Object.keys(AVATAR_SKIN_TONE_TINTS).map(t => ({ label: t.charAt(0).toUpperCase() + t.slice(1), value: t, default: t === profile.skin_tone })));
 
-  // Hairstyle choices only show the 3 styles matching the current body's gender —
-  // switching Male<->Female bodies switches this list too (see genderFromBodyKey).
-  // If the profile's stored hair_style isn't valid for the current gender (e.g. body
+  // Hairstyle choices only show the 4 styles matching the current body's gender
+  // (Buzzcut + the 3 named styles) — switching Male<->Female bodies switches this
+  // list too (see genderFromBodyKey). If the profile's stored hair_style isn't valid for the current gender (e.g. body
   // was just switched), resolveDefaultHairStyle picks the gender's default so the
   // menu always has a real current selection rather than defaulting to nothing.
   const gender = genderFromBodyKey(profile.body_key);
