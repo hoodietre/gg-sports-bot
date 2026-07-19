@@ -1913,6 +1913,22 @@ async function initDatabase() {
   // the two to actually compete for the same inventory slot.
   await pool.query(`ALTER TABLE avatar_profiles ADD COLUMN IF NOT EXISTS equipped_hair_id UUID REFERENCES user_inventory(id) ON DELETE SET NULL`);
 
+  // Free default hairstyle + natural color — lives directly on avatar_profiles,
+  // same pattern as body_key/skin_tone, NOT the shop/inventory machinery above.
+  // These 6 starter styles (3 male, 3 female — see HAIR_STYLES_BY_GENDER) are picked
+  // in the Customize Body panel alongside body/skin tone, at no cost, with no
+  // purchase/ownership record. Paid future hairstyles still go through the normal
+  // shop_items/user_inventory/equipped_hair_id path above and take visual priority
+  // over these defaults whenever one is equipped (see renderAvatarProfilePngRealArt).
+  // Default is NULL for hair_style until first customization write, at which point
+  // getAvatarProfileWithEquipment/render code falls back to a gender-appropriate
+  // default (see DEFAULT_HAIR_STYLE_FOR_GENDER) rather than needing a hardcoded
+  // migration default that could mismatch a later body_key change.
+  await pool.query(`ALTER TABLE avatar_profiles ADD COLUMN IF NOT EXISTS hair_style TEXT`);
+  // Stores a hex string (e.g. '#0B0A09'), same format as user_inventory.color_hex
+  // elsewhere, NOT a color name — default matches HAIR_COLOR_PALETTE's "Black".
+  await pool.query(`ALTER TABLE avatar_profiles ADD COLUMN IF NOT EXISTS hair_color TEXT NOT NULL DEFAULT '#0B0A09'`);
+
   // Accessories move from a single equipped_accessory_id column to a proper multi-equip
   // table, since players can now wear more than one at once (necklace + bracelet +
   // glasses). accessory_type groups items so only one of each type can be equipped
@@ -7569,7 +7585,8 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId === 'avatarlocker_customize') {
       try {
-        await interaction.update({ components: buildAvatarCustomizeComponents() });
+        const { profile } = await getAvatarProfileWithEquipment(interaction.user.id);
+        await interaction.update({ components: buildAvatarCustomizeComponents(profile) });
       } catch (error) {
         console.error('[Avatar] avatarlocker_customize failed:', error);
         await interaction.reply({ content: 'Something went wrong opening customization.', ephemeral: true }).catch(() => null);
@@ -7684,7 +7701,7 @@ if (interaction.commandName === 'avatar') {
       await interaction.update({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarCustomizeComponents(),
+        components: buildAvatarCustomizeComponents(profile),
       });
       return;
     }
@@ -7695,7 +7712,34 @@ if (interaction.commandName === 'avatar') {
       await interaction.update({
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
-        components: buildAvatarCustomizeComponents(),
+        components: buildAvatarCustomizeComponents(profile),
+      });
+      return;
+    }
+
+    // Free default hairstyle picker — separate from the paid-shop hair machinery
+    // (avatarlocker_slot_select -> hair). Writes directly to avatar_profiles.hair_style,
+    // same pattern as body/skin above, no purchase/ownership involved.
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_hairstyle') {
+      await updateAvatarBodyCustomization(interaction.user.id, { hairStyle: interaction.values[0] });
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarCustomizeComponents(profile),
+      });
+      return;
+    }
+
+    // Free default hair color picker — constrained natural-tone palette
+    // (HAIR_COLOR_PALETTE), values are hex without '#' same as the recolor menus.
+    if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_haircolor') {
+      await updateAvatarBodyCustomization(interaction.user.id, { hairColor: `#${interaction.values[0]}` });
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped)],
+        files: [await buildAvatarProfileAttachment(profile, equipped)],
+        components: buildAvatarCustomizeComponents(profile),
       });
       return;
     }
@@ -24835,13 +24879,15 @@ function startExclusiveWindowSchedulerLoop() {
   setTimeout(() => runExclusiveWindowSchedulerTick().catch(() => null), 15 * 1000);
 }
 
-async function updateAvatarBodyCustomization(userId, { bodyKey, skinTone }) {
+async function updateAvatarBodyCustomization(userId, { bodyKey, skinTone, hairStyle, hairColor }) {
   await getOrCreateAvatarProfile(userId);
   const sets = [];
   const values = [];
   let i = 1;
   if (bodyKey) { sets.push(`body_key = $${i++}`); values.push(bodyKey); }
   if (skinTone) { sets.push(`skin_tone = $${i++}`); values.push(skinTone); }
+  if (hairStyle) { sets.push(`hair_style = $${i++}`); values.push(hairStyle); }
+  if (hairColor) { sets.push(`hair_color = $${i++}`); values.push(hairColor); }
   if (!sets.length) return;
   sets.push('updated_at = NOW()');
   values.push(userId);
@@ -25043,6 +25089,55 @@ const AVATAR_COLOR_PALETTE = [
   { name: 'Purple', hex: '#7B1FA2' },
   { name: 'Orange', hex: '#EF6C00' },
 ];
+
+// The 6 free default hairstyles (3 per gender), art_asset_key values matching
+// assets/avatar/layers/hair/{key}/{bodyKey}.png exactly (see Avatar Item Build
+// Roadmap). Gender-gated in the Customize Body picker since each style's art only
+// exists for one gender's body files — picking a style not in the current body's
+// list would render nothing.
+const HAIR_STYLES_BY_GENDER = {
+  male: ['caesar', 'faux_hawk', 'afro'],
+  female: ['high_ponytail', 'long_curly', 'messy_bun'],
+};
+const HAIR_STYLE_LABELS = {
+  caesar: 'Caesar', faux_hawk: 'Faux Hawk', afro: 'Afro',
+  high_ponytail: 'High Ponytail', long_curly: 'Long Curly', messy_bun: 'Messy Bun',
+};
+const DEFAULT_HAIR_STYLE_FOR_GENDER = { male: 'caesar', female: 'high_ponytail' };
+
+// Natural tap-to-select tones for the free default hairstyles — a deliberately
+// constrained palette (unlike AVATAR_COLOR_PALETTE's arbitrary-color shop items),
+// since real hair only comes in real hair colors. More styles/colors arrive later
+// as purchasable shop cosmetics (is_colorable, full AVATAR_COLOR_PALETTE) — this
+// palette is for the free starter styles only.
+const HAIR_COLOR_PALETTE = [
+  { name: 'Black', hex: '#0B0A09' },
+  { name: 'Dark Brown', hex: '#3B2314' },
+  { name: 'Medium Brown', hex: '#5C3A21' },
+  { name: 'Light Brown', hex: '#8D5B3F' },
+  { name: 'Dirty Blonde', hex: '#A98358' },
+  { name: 'Blonde', hex: '#D9B36C' },
+  { name: 'Strawberry Blonde', hex: '#C98550' },
+  { name: 'Red', hex: '#8C3B23' },
+  { name: 'Auburn', hex: '#6B2E1E' },
+  { name: 'Grey', hex: '#9B9B9B' },
+  { name: 'White', hex: '#E8E4DD' },
+];
+
+function genderFromBodyKey(bodyKey) {
+  return String(bodyKey || '').startsWith('female') ? 'female' : 'male';
+}
+
+// Resolves the profile's effective default hair style, falling back to a
+// gender-appropriate default and self-correcting if the stored style doesn't match
+// the current body's gender (e.g. after a body_key change) rather than rendering
+// nothing.
+function resolveDefaultHairStyle(profile) {
+  const gender = genderFromBodyKey(profile.body_key);
+  const allowed = HAIR_STYLES_BY_GENDER[gender];
+  if (profile.hair_style && allowed.includes(profile.hair_style)) return profile.hair_style;
+  return DEFAULT_HAIR_STYLE_FOR_GENDER[gender];
+}
 
 // Validates and parses any hex color string (with or without '#', 3 or 6 digits) into
 // an {r,g,b} object for sharp's .tint(), or null if invalid. Backs the "Custom Color"
@@ -25296,12 +25391,24 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
   const wearableLayerOrder = ['pet', 'footwear', 'bottom', 'top', 'hair', 'headwear'];
   for (const slot of wearableLayerOrder) {
     if (slot === 'hair' && equipped.headwear?.art_asset_key) continue;
-    const item = equipped[slot];
-    if (!item?.art_asset_key) continue;
-    const layerBuffer = await loadAvatarLayerBuffer(slot, item.art_asset_key, bodyKey);
+
+    let artAssetKey = equipped[slot]?.art_asset_key || null;
+    let colorHex = equipped[slot]?.color_hex || null;
+
+    // Hair falls back to the free default hairstyle (avatar_profiles.hair_style/
+    // hair_color) whenever no paid shop hair item is equipped — a paid item, if
+    // equipped, always wins. This is the only slot with a non-inventory fallback;
+    // every other slot simply renders nothing when unequipped, same as before.
+    if (slot === 'hair' && !artAssetKey) {
+      artAssetKey = resolveDefaultHairStyle(profile);
+      colorHex = profile.hair_color;
+    }
+
+    if (!artAssetKey) continue;
+    const layerBuffer = await loadAvatarLayerBuffer(slot, artAssetKey, bodyKey);
     if (!layerBuffer) continue;
     let layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
-    const colorRgb = parseAvatarHexColor(item.color_hex);
+    const colorRgb = parseAvatarHexColor(colorHex);
     if (colorRgb) layerResizedBuffer = await applyAvatarColorize(sharp, layerResizedBuffer, colorRgb);
     composites.push({ input: layerResizedBuffer, left, top });
   }
@@ -25336,7 +25443,18 @@ async function buildAvatarProfileAttachment(profile, equipped, options = {}) {
 
 function buildAvatarLockerEmbed(user, profile, equipped) {
   const NL = String.fromCharCode(10);
-  const lines = AVATAR_SLOTS.filter(slot => slot !== 'accessory').map(slot => `${AVATAR_SLOT_LABELS[slot]}: ${equipped[slot]?.item_name || 'none'}`);
+  const lines = AVATAR_SLOTS.filter(slot => slot !== 'accessory').map(slot => {
+    // Hair is special-cased: equipped.hair is only populated for a PAID shop item
+    // (equipped_hair_id). With no paid item equipped, the free default hairstyle is
+    // still rendering (see resolveDefaultHairStyle) — show that instead of a
+    // misleading "none".
+    if (slot === 'hair' && !equipped.hair) {
+      const styleKey = resolveDefaultHairStyle(profile);
+      const colorName = HAIR_COLOR_PALETTE.find(c => c.hex.toUpperCase() === String(profile.hair_color || '').toUpperCase())?.name || 'Custom';
+      return `${AVATAR_SLOT_LABELS.hair}: ${HAIR_STYLE_LABELS[styleKey]} (${colorName})`;
+    }
+    return `${AVATAR_SLOT_LABELS[slot]}: ${equipped[slot]?.item_name || 'none'}`;
+  });
   const accessoryList = (equipped.accessories || []).length
     ? equipped.accessories.map(a => a.item_name).join(', ')
     : 'none';
@@ -25496,14 +25614,32 @@ async function buildAvatarLockerAccessoryItemPayload(user, profile, equipped, ac
   };
 }
 
-function buildAvatarCustomizeComponents() {
+// profile is required (not optional) so the hairstyle menu can be gender-gated to
+// the current body_key and both new menus can show the user's actual current
+// selection as the default-highlighted option, same pattern as the body/skin menus.
+function buildAvatarCustomizeComponents(profile) {
   const bodyMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_body').setPlaceholder('Choose your body')
-    .addOptions(AVATAR_BODY_KEYS.map(key => ({ label: AVATAR_BODY_LABELS[key], value: key })));
+    .addOptions(AVATAR_BODY_KEYS.map(key => ({ label: AVATAR_BODY_LABELS[key], value: key, default: key === profile.body_key })));
   const skinMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_skin').setPlaceholder('Choose skin tone')
-    .addOptions(Object.keys(AVATAR_SKIN_TONE_TINTS).map(t => ({ label: t.charAt(0).toUpperCase() + t.slice(1), value: t })));
+    .addOptions(Object.keys(AVATAR_SKIN_TONE_TINTS).map(t => ({ label: t.charAt(0).toUpperCase() + t.slice(1), value: t, default: t === profile.skin_tone })));
+
+  // Hairstyle choices only show the 3 styles matching the current body's gender —
+  // switching Male<->Female bodies switches this list too (see genderFromBodyKey).
+  // If the profile's stored hair_style isn't valid for the current gender (e.g. body
+  // was just switched), resolveDefaultHairStyle picks the gender's default so the
+  // menu always has a real current selection rather than defaulting to nothing.
+  const gender = genderFromBodyKey(profile.body_key);
+  const effectiveHairStyle = resolveDefaultHairStyle(profile);
+  const hairStyleMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_hairstyle').setPlaceholder('Choose your hairstyle')
+    .addOptions(HAIR_STYLES_BY_GENDER[gender].map(key => ({ label: HAIR_STYLE_LABELS[key], value: key, default: key === effectiveHairStyle })));
+  const hairColorMenu = new StringSelectMenuBuilder().setCustomId('avatarlocker_customize_haircolor').setPlaceholder('Choose your hair color')
+    .addOptions(HAIR_COLOR_PALETTE.map(c => ({ label: c.name, value: c.hex.replace('#', ''), default: c.hex.replace('#', '').toUpperCase() === String(profile.hair_color || '').replace('#', '').toUpperCase() })));
+
   return [
     new ActionRowBuilder().addComponents(bodyMenu),
     new ActionRowBuilder().addComponents(skinMenu),
+    new ActionRowBuilder().addComponents(hairStyleMenu),
+    new ActionRowBuilder().addComponents(hairColorMenu),
     new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('avatarlocker_back').setLabel('⬅ Back to Locker').setStyle(ButtonStyle.Secondary)),
   ];
 }
