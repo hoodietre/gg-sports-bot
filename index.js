@@ -8198,7 +8198,7 @@ if (interaction.commandName === 'avatar') {
       if (!['common', 'uncommon', 'rare', 'epic', 'legendary'].includes(rarity)) { await interaction.reply({ content: 'Invalid rarity. Use common, uncommon, rare, epic, or legendary.', ephemeral: true }); return; }
       if (!Number.isInteger(price) || price < 0) { await interaction.reply({ content: 'Price must be 0 or higher.', ephemeral: true }); return; }
 
-      const artAssetExists = await loadAvatarLayerBuffer(slot, artKey, 'male_athletic').then(buf => !!buf).catch(() => false);
+      const artAssetExists = await avatarArtExistsForSlot(slot, artKey);
       const finalArtKey = artAssetExists ? artKey : null;
 
       const itemId = randomUUID();
@@ -16784,7 +16784,7 @@ if (interaction.commandName === 'trade') {
 
         // Check whether real art actually exists for this key before linking it — a
         // typo'd or not-yet-uploaded art_key would otherwise silently render nothing.
-        const artAssetExists = await loadAvatarLayerBuffer(slot, artKey, 'male_athletic').then(buf => !!buf).catch(() => false);
+        const artAssetExists = await avatarArtExistsForSlot(slot, artKey);
         const finalArtKey = artAssetExists ? artKey : null;
 
         const itemId = randomUUID();
@@ -25717,6 +25717,44 @@ async function loadAvatarLayerBuffer(slot, artKey, bodyKey) {
   }
 }
 
+// Background/effect art — assets/avatar/layers/{slot}/{artKey}.png (a single file,
+// NOT per-bodyKey like loadAvatarLayerBuffer above) since these cover the whole
+// canvas and don't fit a specific body's silhouette — a nightclub backdrop or a
+// confetti burst looks the same behind a Slim or Heavy build. Resized with
+// fit:'cover' at render time to whatever canvas size is in play (700x1000 normal,
+// 1000x1400 showcase), so one reasonably high-res source image covers both.
+const AVATAR_FULLCANVAS_ASSET_DIR = path.join(process.cwd(), 'assets', 'avatar', 'layers');
+const avatarFullCanvasBufferCache = new Map();
+
+async function loadAvatarFullCanvasBuffer(slot, artKey) {
+  if (!artKey) return null;
+  const cacheKey = `${slot}/${artKey}`;
+  if (avatarFullCanvasBufferCache.has(cacheKey)) return avatarFullCanvasBufferCache.get(cacheKey);
+  const filePath = path.join(AVATAR_FULLCANVAS_ASSET_DIR, slot, `${artKey}.png`);
+  try {
+    const buffer = await fs.promises.readFile(filePath);
+    avatarFullCanvasBufferCache.set(cacheKey, buffer);
+    return buffer;
+  } catch (error) {
+    avatarFullCanvasBufferCache.set(cacheKey, null);
+    return null;
+  }
+}
+
+// Used by createcosmetic (both the slash command and the Bot Owner Panel button) to
+// warn if an item is created with no matching art on disk yet. background/effect use
+// the single-file full-canvas loader above; every other slot is body-keyed, checked
+// against one representative body (male_athletic) since art either exists for all 8
+// bodies or none.
+const AVATAR_FULLCANVAS_SLOTS = ['background', 'effect'];
+async function avatarArtExistsForSlot(slot, artKey) {
+  if (!artKey) return false;
+  if (AVATAR_FULLCANVAS_SLOTS.includes(slot)) {
+    return loadAvatarFullCanvasBuffer(slot, artKey).then(buf => !!buf).catch(() => false);
+  }
+  return loadAvatarLayerBuffer(slot, artKey, 'male_athletic').then(buf => !!buf).catch(() => false);
+}
+
 // Soft radial glow, rasterized from SVG rather than a per-pixel JS loop — much
 // cheaper than the placeholder renderer's concentric-ellipse approach, and
 // composited with a 'screen' blend so it reads as light coming off the character
@@ -25872,6 +25910,17 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
 
   const composites = [];
 
+  // Background art (assets/avatar/layers/background/{artKey}.png) replaces the flat
+  // color fill when it exists — falls back to the keyword-matched solid color
+  // (avatarBackgroundColorFor) for any background item that doesn't have real art
+  // yet, so nothing breaks for existing/placeholder background items.
+  const backgroundArtKey = equipped.background?.art_asset_key || null;
+  const backgroundBuffer = await loadAvatarFullCanvasBuffer('background', backgroundArtKey);
+  if (backgroundBuffer) {
+    const backgroundResized = await sharp(backgroundBuffer).resize({ width, height, fit: 'cover' }).png().toBuffer();
+    composites.push({ input: backgroundResized, left: 0, top: 0 });
+  }
+
   if (options.showcase) {
     // Dramatic spotlight/vignette backdrop for the hero shot — cheap SVG rasterize,
     // no new art needed.
@@ -25945,7 +25994,20 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
   }
 
   const effectName = equipped.effect?.item_name;
-  if (effectName) {
+  const effectArtKey = equipped.effect?.art_asset_key || null;
+  if (effectArtKey) {
+    // Real effect art (assets/avatar/layers/effect/{artKey}.png) — a transparent
+    // full-canvas overlay (confetti, sparks, etc.), composited normally (not
+    // 'screen') since it's expected to already look right on its own, unlike the
+    // procedural glow below which relies on 'screen' blending to read as light.
+    const effectBuffer = await loadAvatarFullCanvasBuffer('effect', effectArtKey);
+    if (effectBuffer) {
+      const effectResized = await sharp(effectBuffer).resize({ width, height, fit: 'cover' }).png().toBuffer();
+      composites.push({ input: effectResized, left: 0, top: 0 });
+    } else if (effectName) {
+      composites.push({ input: await buildAvatarAuraGlowBuffer(sharp, width, height, effectName), left: 0, top: 0, blend: 'screen' });
+    }
+  } else if (effectName) {
     composites.push({ input: await buildAvatarAuraGlowBuffer(sharp, width, height, effectName), left: 0, top: 0, blend: 'screen' });
   }
 
