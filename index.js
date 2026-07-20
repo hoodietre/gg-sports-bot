@@ -1139,6 +1139,7 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS standings_points INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS ties INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS otl INTEGER NOT NULL DEFAULT 0`); // overtime losses — 4th record type (W-L-T-OTL), see league_custom_settings.otl_allowed
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS conference TEXT`);
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS division TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS playoff_team_count INTEGER NOT NULL DEFAULT 8`);
@@ -1196,6 +1197,12 @@ async function initDatabase() {
     )
   `);
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS use_team_roster BOOLEAN NOT NULL DEFAULT FALSE`);
+  // OTL toggle — 4th standings record type (W-L-T-OTL) alongside ties_allowed above,
+  // same "customizable point value" pattern as win_points/loss_points/tie_points.
+  // Off by default; NHL-style leagues are the expected use case but it's a manual
+  // per-league toggle, not sport-gated, same as ties_allowed.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS otl_allowed BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS otl_points INTEGER NOT NULL DEFAULT 1`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_team_roster (
       id UUID PRIMARY KEY,
@@ -2003,6 +2010,25 @@ async function initDatabase() {
   // shop browsing should filter this out; not yet wired into those call sites (flagged
   // separately, see Avatar Item Build Roadmap wiring status).
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_award_only BOOLEAN NOT NULL DEFAULT FALSE`);
+
+  // Birthday/Christmas gift items — a distinct item per year (2026's birthday item
+  // differs from 2027's, same idea as year-specific holiday exclusives) so recipients
+  // can tell which year's gift they got. Auto-granted, never purchasable — createcosmetic
+  // forces is_award_only=TRUE whenever gift_type is set. See runBirthdayChristmasGiftSchedulerTick.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS gift_type TEXT`); // 'birthday' | 'christmas' | NULL
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS gift_year INTEGER`);
+
+  // Global (not per-guild) — same pattern as stream_links, since a birthday is a
+  // personal attribute, not something tied to one server. Only month/day are needed;
+  // no birth year, since the gift is about which day recurs each year, not age.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_birthdays (
+      user_id TEXT PRIMARY KEY,
+      birthday_month INTEGER NOT NULL CHECK (birthday_month BETWEEN 1 AND 12),
+      birthday_day INTEGER NOT NULL CHECK (birthday_day BETWEEN 1 AND 31),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
 
   await pool.query(`
@@ -2949,7 +2975,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false)))
@@ -3066,7 +3092,7 @@ function buildCommands() {
       .setName('game')
       .setDescription('League game and standings commands')
       .addSubcommand(sc => sc.setName('add').setDescription('Add scheduled game').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('home').setDescription('Home team role').setRequired(true)).addRoleOption(o => o.setName('away').setDescription('Away team role').setRequired(true)).addStringOption(o => o.setName('date').setDescription('Date/time').setRequired(false)).addStringOption(o => o.setName('week').setDescription('Week label').setRequired(false)))
-      .addSubcommand(sc => sc.setName('report').setDescription('Report completed game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addIntegerOption(o => o.setName('home_score').setDescription('Home score').setRequired(true)).addIntegerOption(o => o.setName('away_score').setDescription('Away score').setRequired(true)))
+      .addSubcommand(sc => sc.setName('report').setDescription('Report completed game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addIntegerOption(o => o.setName('home_score').setDescription('Home score').setRequired(true)).addIntegerOption(o => o.setName('away_score').setDescription('Away score').setRequired(true)).addBooleanOption(o => o.setName('overtime_loss').setDescription('Was the loss in overtime? Only counts if this league has OTL enabled.').setRequired(false)))
       .addSubcommand(sc => sc.setName('reset').setDescription('Staff: reset a reported game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
       .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
@@ -4444,6 +4470,35 @@ const LEAGUE_SPORT_DEFAULT_SETTINGS = {
   other: {},
 };
 
+// League settings changelog — posts a small embed to the league's announcement
+// channel (league_announcement_channel_id) whenever a commissioner/admin changes a
+// league_custom_settings value through the League Customization panel. Best-effort:
+// silently no-ops if the channel isn't configured or the bot can't post there, same
+// defensive pattern used for every other optional-channel post in this codebase.
+// Not every single settings mutation in the file calls this yet — wired into the
+// standings section (ties/OTL toggles, point values) as the initial pass; extending
+// to the rest of League Customization's sections is straightforward follow-up work,
+// same call shape each time.
+async function logLeagueSettingChange(league, userId, settingLabel, oldValue, newValue) {
+  if (!league?.league_announcement_channel_id || !league?.guild_id) return;
+  if (String(oldValue) === String(newValue)) return; // no-op toggle back to the same value, nothing to log
+  try {
+    const guild = client.guilds.cache.get(league.guild_id) || await client.guilds.fetch(league.guild_id).catch(() => null);
+    if (!guild) return;
+    const channel = await guild.channels.fetch(league.league_announcement_channel_id).catch(() => null);
+    if (!channel?.isTextBased?.()) return;
+    const embed = new EmbedBuilder()
+      .setTitle(`⚙️ Settings Updated • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .setDescription(`**${settingLabel}**: ${oldValue} → ${newValue}`)
+      .setFooter({ text: `Changed by ${userId ? '<@' + userId + '>' : 'unknown'}` })
+      .setTimestamp();
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error('League settings changelog post failed:', error);
+  }
+}
+
 async function ensureLeagueCustomSettings(league) {
   const existing = await pool.query(`SELECT * FROM league_custom_settings WHERE league_id = $1`, [league.league_id]);
   if (existing.rows[0]) return existing.rows[0];
@@ -4687,9 +4742,9 @@ async function getTeamConferenceDivisionForLeague(guildId, leagueId, teamName) {
   return { conference: getTeamConference(teamName), division: null };
 }
 
-function calculateStandingsPointsForLeague(league, wins, losses, ties = 0, customSettings = null) {
+function calculateStandingsPointsForLeague(league, wins, losses, ties = 0, customSettings = null, otl = 0) {
   if (customSettings?.standings_system === 'points') {
-    return (Number(wins || 0) * Number(customSettings.win_points ?? 2)) + (Number(losses || 0) * Number(customSettings.loss_points ?? 0)) + (Number(ties || 0) * Number(customSettings.tie_points ?? 1));
+    return (Number(wins || 0) * Number(customSettings.win_points ?? 2)) + (Number(losses || 0) * Number(customSettings.loss_points ?? 0)) + (Number(ties || 0) * Number(customSettings.tie_points ?? 1)) + (customSettings.otl_allowed ? Number(otl || 0) * Number(customSettings.otl_points ?? 1) : 0);
   }
   return isMlbLeague(league) ? (Number(wins || 0) * 3) + Number(losses || 0) : 0;
 }
@@ -4761,6 +4816,7 @@ async function buildStandingsEmbed(league, rows) {
   const useConferences = customSettings.use_conferences ?? isNbaLeague(league);
   const useDivisions = customSettings.use_divisions ?? false;
   const showTies = customSettings.ties_allowed ?? false;
+  const showOtl = customSettings.otl_allowed ?? false;
 
   const systemLabel = standingsSystem === 'points' ? 'Points Standings' : standingsSystem === 'point_differential' ? 'Point Differential Standings' : 'W/L Standings';
   const embed = new EmbedBuilder()
@@ -4775,11 +4831,15 @@ async function buildStandingsEmbed(league, rows) {
   }
 
   const formatLine = (row, index) => {
-    const games = Number(row.wins) + Number(row.losses) + Number(row.ties || 0);
+    const games = Number(row.wins) + Number(row.losses) + Number(row.ties || 0) + Number(row.otl || 0);
     const winPct = games > 0 ? ((Number(row.wins) + Number(row.ties || 0) * 0.5) / games).toFixed(3).replace(/^0/, '') : '.000';
     const diff = Number(row.points_for || 0) - Number(row.points_against || 0);
-    const standingsPoints = Number(row.standings_points ?? calculateStandingsPointsForLeague(league, row.wins, row.losses, row.ties, customSettings));
-    const record = showTies ? `${row.wins}-${row.losses}-${row.ties || 0}` : `${row.wins}-${row.losses}`;
+    const standingsPoints = Number(row.standings_points ?? calculateStandingsPointsForLeague(league, row.wins, row.losses, row.ties, customSettings, row.otl));
+    // Record string builds up whichever extra columns this league has turned on —
+    // W-L, W-L-T, W-L-OTL, or the full W-L-T-OTL, never showing a column that's off.
+    let record = `${row.wins}-${row.losses}`;
+    if (showTies) record += `-${row.ties || 0}`;
+    if (showOtl) record += `-${row.otl || 0}`;
     const pointsText = standingsSystem === 'points' ? ' • ' + standingsPoints + ' PTS' : '';
     return `**${index + 1}. ${row.team_name}** — ${record} (${winPct})${pointsText} • DIFF ${diff >= 0 ? '+' : ''}${diff}`;
   };
@@ -6156,6 +6216,8 @@ client.once(Events.ClientReady, async () => {
     console.log('Trade negotiation thread cleanup loop started.');
     startExclusiveWindowSchedulerLoop();
     console.log('Exclusive window scheduler loop started.');
+    startBirthdayChristmasGiftSchedulerLoop(client);
+    console.log('Birthday/Christmas gift scheduler loop started.');
 
     const application = await client.application?.fetch().catch(() => null);
     if (application?.owner?.id && !botOwnerUserId) botOwnerUserId = application.owner.id;
@@ -8022,6 +8084,59 @@ if (interaction.commandName === 'avatar') {
         components: [buildBotOwnerPanelBackRow()],
         flags: MessageFlags.Ephemeral,
       });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_createcosmetic') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      if (!interaction.guild) { await interaction.reply({ content: 'Use this from inside a server — cosmetics are tied to the server whose shop they belong to.', flags: MessageFlags.Ephemeral }); return; }
+      // Condensed to the 5 fields a modal allows. Stock/colorable/description/
+      // award_only/gift_type default to unlimited/false/generic/false/none here —
+      // use the full /shop createcosmetic command for those.
+      const modal = new ModalBuilder()
+        .setCustomId('botownerpanel_createcosmetic_modal')
+        .setTitle('Create Cosmetic')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Cosmetic name').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('slot').setLabel('Slot (headwear/top/bottom/accessory/etc)').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rarity').setLabel('Rarity (common/uncommon/rare/epic/legendary)').setStyle(TextInputStyle.Short).setRequired(false).setValue('common')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('art_key').setLabel('Art key (blank = name, slugified)').setStyle(TextInputStyle.Short).setRequired(false)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'botownerpanel_createcosmetic_modal') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const name = interaction.fields.getTextInputValue('name');
+      const slot = normalizeAvatarSlot(interaction.fields.getTextInputValue('slot'));
+      const price = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
+      const rarity = String(interaction.fields.getTextInputValue('rarity') || 'common').toLowerCase();
+      const artKey = (interaction.fields.getTextInputValue('art_key') || name).toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+
+      if (!VISUAL_AVATAR_SLOTS.includes(slot)) { await interaction.reply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', '), ephemeral: true }); return; }
+      if (!['common', 'uncommon', 'rare', 'epic', 'legendary'].includes(rarity)) { await interaction.reply({ content: 'Invalid rarity. Use common, uncommon, rare, epic, or legendary.', ephemeral: true }); return; }
+      if (!Number.isInteger(price) || price < 0) { await interaction.reply({ content: 'Price must be 0 or higher.', ephemeral: true }); return; }
+
+      const artAssetExists = await loadAvatarLayerBuffer(slot, artKey, 'male_athletic').then(buf => !!buf).catch(() => false);
+      const finalArtKey = artAssetExists ? artKey : null;
+
+      const itemId = randomUUID();
+      await pool.query(
+        `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only)
+         VALUES ($1, $2, $3, $4, $5, NULL, TRUE, $6, $6, $7, TRUE, $8, $9, $10, FALSE, FALSE)`,
+        [itemId, interaction.guild.id, name, 'Visual avatar cosmetic. Use /shop preview before buying.', price, slot, rarity, name, interaction.user.id, finalArtKey]
+      );
+      await pool.query(
+        `INSERT INTO avatar_catalog (id, guild_id, item_name, slot, rarity, source, price, is_active)
+         VALUES ($1, $2, $3, $4, $5, 'shop', $6, TRUE)`,
+        [randomUUID(), interaction.guild.id, name, slot, rarity, price]
+      ).catch(() => null);
+      await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+
+      const artNote = finalArtKey ? '' : ' ⚠️ No art found at that key — item created but will render as a placeholder until art is uploaded.';
+      await interaction.reply({ content: `Cosmetic created: **${name}** (${slot}, ${rarity}) for **${price}**.${artNote} For stock limits, colorable, award-only, or gift items, use \`/shop createcosmetic\`.`, ephemeral: true });
       return;
     }
 
@@ -9939,6 +10054,7 @@ if (interaction.commandName === 'avatar') {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const winPoints = Number.parseInt(interaction.fields.getTextInputValue('win_points'), 10);
       const lossPoints = Number.parseInt(interaction.fields.getTextInputValue('loss_points'), 10);
       const tiePoints = Number.parseInt(interaction.fields.getTextInputValue('tie_points'), 10);
@@ -9947,6 +10063,7 @@ if (interaction.commandName === 'avatar') {
         return;
       }
       await pool.query(`UPDATE league_custom_settings SET win_points = $2, loss_points = $3, tie_points = $4, updated_at = NOW() WHERE league_id = $1`, [leagueId, winPoints, lossPoints, tiePoints]);
+      await logLeagueSettingChange(league, interaction.user.id, 'Win/Loss/Tie Points', `${customSettings.win_points ?? 2}/${customSettings.loss_points ?? 0}/${customSettings.tie_points ?? 1}`, `${winPoints}/${lossPoints}/${tiePoints}`);
       await interaction.deferUpdate();
       await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: false });
       return;
@@ -9958,7 +10075,51 @@ if (interaction.commandName === 'avatar') {
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
       const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       await pool.query(`UPDATE league_custom_settings SET ties_allowed = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, !customSettings.ties_allowed]);
+      await logLeagueSettingChange(league, interaction.user.id, 'Ties Allowed', customSettings.ties_allowed ? 'Yes' : 'No', !customSettings.ties_allowed ? 'Yes' : 'No');
       await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_otl:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      await pool.query(`UPDATE league_custom_settings SET otl_allowed = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, !customSettings.otl_allowed]);
+      await logLeagueSettingChange(league, interaction.user.id, 'OTL Allowed', customSettings.otl_allowed ? 'Yes' : 'No', !customSettings.otl_allowed ? 'Yes' : 'No');
+      await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_otlpoints_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_otlpoints_submit:' + leagueId)
+        .setTitle('OTL Point Value')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('otl_points').setLabel('Points for an overtime loss').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(customSettings.otl_points ?? 1))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_otlpoints_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const otlPoints = Number.parseInt(interaction.fields.getTextInputValue('otl_points'), 10);
+      if (!Number.isInteger(otlPoints)) {
+        await interaction.reply({ content: 'OTL points must be a whole number.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE league_custom_settings SET otl_points = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, otlPoints]);
+      await logLeagueSettingChange(league, interaction.user.id, 'OTL Points', String(customSettings.otl_points ?? 1), String(otlPoints));
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: false });
       return;
     }
 
@@ -11795,6 +11956,45 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId === 'memberprofile_birthday') {
+      const existing = await getUserBirthday(interaction.user.id).catch(() => null);
+      const modal = new ModalBuilder()
+        .setCustomId('memberprofile_birthday_modal')
+        .setTitle('Set Your Birthday')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('birthday_value')
+              .setLabel('Birthday (MM/DD, e.g. 03/17)')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+              .setValue(existing ? `${String(existing.birthday_month).padStart(2, '0')}/${String(existing.birthday_day).padStart(2, '0')}` : '')
+          )
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'memberprofile_birthday_modal') {
+      const raw = interaction.fields.getTextInputValue('birthday_value').trim();
+      const match = raw.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+      if (!match) {
+        await interaction.reply({ content: 'That doesn\'t look right — use MM/DD, like `03/17` for March 17th.', ephemeral: true });
+        return;
+      }
+      const month = Number.parseInt(match[1], 10);
+      const day = Number.parseInt(match[2], 10);
+      const daysInMonth = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]; // Feb allows 29 so leap-year birthdays always recur cleanly
+      if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]) {
+        await interaction.reply({ content: 'That date doesn\'t exist — double check the month and day.', ephemeral: true });
+        return;
+      }
+      await saveUserBirthday(interaction.user.id, month, day);
+      const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      await interaction.reply({ content: `🎂 Birthday saved: **${MONTH_NAMES[month - 1]} ${day}**. If your server has a birthday gift set up for this year, it'll land automatically on the day.`, ephemeral: true });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'adminpanel_league_create') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true }); return; }
       const modal = new ModalBuilder()
@@ -12124,6 +12324,13 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: '**Refund Sportsbook Game** — choose a game', components, ephemeral: true });
         return;
       }
+
+      if (action === 'limits') {
+        const components = await buildAdminSportsbookGamePickerComponents(interaction.guild, 'adminpanel_sb_limits_game');
+        if (!components) { await interaction.reply({ content: 'No open sportsbook games to set limits on.', ephemeral: true }); return; }
+        await interaction.reply({ content: '**Set Sportsbook Limits** — choose a game', components, ephemeral: true });
+        return;
+      }
       return;
     }
 
@@ -12187,6 +12394,54 @@ if (interaction.commandName === 'avatar') {
       }
       const refunded = await refundSportsbookGameBets(interaction.guild, sportsbookGame, interaction.user.id, 'Admin panel refund');
       await interaction.editReply({ content: `Refunded **${refunded.refundedCount}** bets for **${sportsbookGame.game_label}**.`, components: [] });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_sb_limits_game') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const gameId = interaction.values[0];
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+      if (!sportsbookGame) { await interaction.update({ content: 'Could not find that sportsbook game.', components: [] }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('adminpanel_sb_limits_modal:' + gameId)
+        .setTitle('Sportsbook Limits')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_bet').setLabel('Max bet (blank = leave unchanged)').setStyle(TextInputStyle.Short).setRequired(false).setValue(sportsbookGame.max_bet != null ? String(sportsbookGame.max_bet) : '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_payout').setLabel('Max payout (blank = leave unchanged)').setStyle(TextInputStyle.Short).setRequired(false).setValue(sportsbookGame.max_payout != null ? String(sportsbookGame.max_payout) : '')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('adminpanel_sb_limits_modal:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to update sportsbook limits.', ephemeral: true }); return; }
+      const gameId = interaction.customId.split(':')[1];
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+      if (!sportsbookGame) { await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true }); return; }
+
+      const maxBetRaw = interaction.fields.getTextInputValue('max_bet');
+      const maxPayoutRaw = interaction.fields.getTextInputValue('max_payout');
+      const maxBet = maxBetRaw ? Number.parseInt(maxBetRaw, 10) : null;
+      const maxPayout = maxPayoutRaw ? Number.parseInt(maxPayoutRaw, 10) : null;
+
+      if (maxBetRaw && (!Number.isInteger(maxBet) || maxBet <= 0)) { await interaction.reply({ content: 'Max bet must be greater than 0.', ephemeral: true }); return; }
+      if (maxPayoutRaw && (!Number.isInteger(maxPayout) || maxPayout <= 0)) { await interaction.reply({ content: 'Max payout must be greater than 0.', ephemeral: true }); return; }
+
+      await pool.query(
+        `UPDATE sportsbook_games
+         SET max_bet = COALESCE($1, max_bet),
+             max_payout = COALESCE($2, max_payout)
+         WHERE id = $3`,
+        [maxBet, maxPayout, sportsbookGame.id]
+      );
+      await updateSportsbookPanel(interaction.guild).catch(() => null);
+
+      await interaction.reply({
+        content: 'Updated limits for **' + sportsbookGame.game_label + '**.' +
+          (maxBet !== null ? ' Max bet: **' + maxBet + '**.' : '') +
+          (maxPayout !== null ? ' Max payout: **' + maxPayout + '**.' : ''),
+        ephemeral: true,
+      });
       return;
     }
 
@@ -13684,6 +13939,7 @@ if (gameSubcommand === 'report') {
         const gameInput = interaction.options.getString('game_id');
         const homeScore = interaction.options.getInteger('home_score');
         const awayScore = interaction.options.getInteger('away_score');
+        const overtimeLoss = interaction.options.getBoolean('overtime_loss') || false;
 
         const gameResult = await pool.query(
           `SELECT * FROM league_games
@@ -13698,7 +13954,7 @@ if (gameSubcommand === 'report') {
           return;
         }
 
-        const result = await reportLeagueGameCore(interaction, gameResult.rows[0], homeScore, awayScore);
+        const result = await reportLeagueGameCore(interaction, gameResult.rows[0], homeScore, awayScore, overtimeLoss);
         await interaction.reply({ content: result.message, ephemeral: !result.ok });
         return;
       }
@@ -16414,7 +16670,12 @@ if (interaction.commandName === 'trade') {
         const description = interaction.options.getString('description') || 'Visual avatar cosmetic. Use /shop preview before buying.';
         const artKey = (interaction.options.getString('art_key') || name).toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
         const isColorable = interaction.options.getBoolean('colorable') || false;
-        const isAwardOnly = interaction.options.getBoolean('award_only') || false;
+        const giftType = interaction.options.getString('gift_type') || null;
+        const giftYear = giftType ? (interaction.options.getInteger('gift_year') || new Date().getFullYear()) : null;
+        // Gift items (birthday/Christmas) are always award-only — granted automatically
+        // by runBirthdayChristmasGiftSchedulerTick, never purchasable/shop-browsable —
+        // regardless of what the award_only option was set to.
+        const isAwardOnly = giftType ? true : (interaction.options.getBoolean('award_only') || false);
 
         if (!VISUAL_AVATAR_SLOTS.includes(slot)) {
           await interaction.reply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', '), ephemeral: true });
@@ -16438,9 +16699,9 @@ if (interaction.commandName === 'trade') {
 
         const itemId = randomUUID();
         await pool.query(
-          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13)`,
-          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly]
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only, gift_type, gift_year)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13, $14, $15)`,
+          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly, giftType, giftYear]
         );
 
         await pool.query(
@@ -22718,7 +22979,7 @@ async function createLeagueGameCore(interaction, activeLeague, home, away, { sch
   return { ok: true, game };
 }
 
-async function reportLeagueGameCore(interaction, game, homeScore, awayScore) {
+async function reportLeagueGameCore(interaction, game, homeScore, awayScore, overtimeLoss = false) {
   const activeLeague = await getLeagueById(game.league_id);
   if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
 
@@ -22737,6 +22998,12 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore) {
   const awayWins = awayScore > homeScore;
   const winnerRoleId = isTie ? null : homeWins ? game.home_team_role_id : game.away_team_role_id;
   const winnerName = isTie ? null : homeWins ? game.home_team_name : game.away_team_name;
+  // OTL only ever applies to the losing side of a decided (non-tie) game, and only
+  // when this league has turned it on — otherwise the overtime_loss flag is silently
+  // treated as a no-op (regular loss), noted in the returned message rather than
+  // rejecting the report outright.
+  const otlRequestedButDisabled = !isTie && overtimeLoss && !customSettings.otl_allowed;
+  const useOtl = !isTie && overtimeLoss && customSettings.otl_allowed;
 
   await pool.query(
     `UPDATE league_games
@@ -22748,41 +23015,43 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore) {
   const { conference: homeConference, division: homeDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.home_team_name).catch(() => ({ conference: null, division: null }));
   const { conference: awayConference, division: awayDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.away_team_name).catch(() => ({ conference: null, division: null }));
 
-  const homeWL = isTie ? { w: 0, l: 0, t: 1 } : homeWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
-  const awayWL = isTie ? { w: 0, l: 0, t: 1 } : awayWins ? { w: 1, l: 0, t: 0 } : { w: 0, l: 1, t: 0 };
-  const homeStandingsPoints = calculateStandingsPointsForLeague(activeLeague, homeWL.w, homeWL.l, homeWL.t, customSettings);
-  const awayStandingsPoints = calculateStandingsPointsForLeague(activeLeague, awayWL.w, awayWL.l, awayWL.t, customSettings);
+  const homeWL = isTie ? { w: 0, l: 0, t: 1, otl: 0 } : homeWins ? { w: 1, l: 0, t: 0, otl: 0 } : useOtl ? { w: 0, l: 0, t: 0, otl: 1 } : { w: 0, l: 1, t: 0, otl: 0 };
+  const awayWL = isTie ? { w: 0, l: 0, t: 1, otl: 0 } : awayWins ? { w: 1, l: 0, t: 0, otl: 0 } : useOtl ? { w: 0, l: 0, t: 0, otl: 1 } : { w: 0, l: 1, t: 0, otl: 0 };
+  const homeStandingsPoints = calculateStandingsPointsForLeague(activeLeague, homeWL.w, homeWL.l, homeWL.t, customSettings, homeWL.otl);
+  const awayStandingsPoints = calculateStandingsPointsForLeague(activeLeague, awayWL.w, awayWL.l, awayWL.t, customSettings, awayWL.otl);
 
   await pool.query(
-    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, otl, points_for, points_against, standings_points, conference, division)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (guild_id, league_id, team_role_id)
      DO UPDATE SET wins = league_standings.wins + $5,
                    losses = league_standings.losses + $6,
                    ties = league_standings.ties + $7,
-                   standings_points = league_standings.standings_points + $10,
-                   conference = $11,
-                   division = $12,
-                   points_for = league_standings.points_for + $8,
-                   points_against = league_standings.points_against + $9,
+                   otl = league_standings.otl + $8,
+                   standings_points = league_standings.standings_points + $11,
+                   conference = $12,
+                   division = $13,
+                   points_for = league_standings.points_for + $9,
+                   points_against = league_standings.points_against + $10,
                    updated_at = NOW()`,
-    [interaction.guild.id, game.league_id, game.home_team_role_id, game.home_team_name, homeWL.w, homeWL.l, homeWL.t, homeScore, awayScore, homeStandingsPoints, homeConference, homeDivision]
+    [interaction.guild.id, game.league_id, game.home_team_role_id, game.home_team_name, homeWL.w, homeWL.l, homeWL.t, homeWL.otl, homeScore, awayScore, homeStandingsPoints, homeConference, homeDivision]
   );
 
   await pool.query(
-    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, points_for, points_against, standings_points, conference, division)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    `INSERT INTO league_standings (guild_id, league_id, team_role_id, team_name, wins, losses, ties, otl, points_for, points_against, standings_points, conference, division)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (guild_id, league_id, team_role_id)
      DO UPDATE SET wins = league_standings.wins + $5,
                    losses = league_standings.losses + $6,
                    ties = league_standings.ties + $7,
-                   standings_points = league_standings.standings_points + $10,
-                   conference = $11,
-                   division = $12,
-                   points_for = league_standings.points_for + $8,
-                   points_against = league_standings.points_against + $9,
+                   otl = league_standings.otl + $8,
+                   standings_points = league_standings.standings_points + $11,
+                   conference = $12,
+                   division = $13,
+                   points_for = league_standings.points_for + $9,
+                   points_against = league_standings.points_against + $10,
                    updated_at = NOW()`,
-    [interaction.guild.id, game.league_id, game.away_team_role_id, game.away_team_name, awayWL.w, awayWL.l, awayWL.t, awayScore, homeScore, awayStandingsPoints, awayConference, awayDivision]
+    [interaction.guild.id, game.league_id, game.away_team_role_id, game.away_team_name, awayWL.w, awayWL.l, awayWL.t, awayWL.otl, awayScore, homeScore, awayStandingsPoints, awayConference, awayDivision]
   );
 
   if (typeof updateStandingsPanel === 'function') {
@@ -22844,12 +23113,13 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore) {
 
   const payoutText = payoutLines.length ? String.fromCharCode(10) + payoutLines.join(String.fromCharCode(10)) : '';
   const resultText = isTie ? 'It\'s a tie.' : 'Winner: **' + winnerName + '**.';
+  const otlIgnoredNote = otlRequestedButDisabled ? String.fromCharCode(10) + 'Note: overtime_loss was set but OTL isn\'t enabled for this league, so it was recorded as a regular loss. Enable it in League Customization → Standings if you want OTL tracked.' : '';
 
   return {
     ok: true,
     isTie,
     winnerName,
-    message: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. ' + resultText + payoutText + sportsbookText + tieSportsbookNote,
+    message: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. ' + resultText + payoutText + sportsbookText + tieSportsbookNote + otlIgnoredNote,
   };
 }
 
@@ -23304,6 +23574,20 @@ async function endActiveCheck(interaction, league) {
   const updated = { ...check, status: 'closed' };
   await refreshActiveCheckMessage(interaction.guild, league, updated).catch(() => null);
   return { ok: true, message: `Active Check for **${league.league_name}** ended.` };
+}
+
+async function saveUserBirthday(userId, month, day) {
+  await pool.query(
+    `INSERT INTO user_birthdays (user_id, birthday_month, birthday_day, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET birthday_month = EXCLUDED.birthday_month, birthday_day = EXCLUDED.birthday_day, updated_at = NOW()`,
+    [userId, month, day]
+  );
+}
+
+async function getUserBirthday(userId) {
+  const result = await pool.query(`SELECT birthday_month, birthday_day FROM user_birthdays WHERE user_id = $1 LIMIT 1`, [userId]);
+  return result.rows[0] || null;
 }
 
 async function saveUserStreamLink(guild, userId, url) {
@@ -24843,6 +25127,96 @@ async function grantAwardItem(guildId, userId, itemId, awardType) {
     [inventoryId, guildId, userId, item.id, item.item_name, awardType, generateInventoryLookupTag()]
   );
   return { ok: true, item, inventoryId };
+}
+
+// Grants a specific gift item to a specific user, once. Dedupes by checking whether
+// this user already owns THIS item row — safe to call every scheduler tick without
+// re-granting, since each year's gift is a distinct shop_items row (this year's
+// Christmas item is a different id than last year's), so "already owns this exact
+// item" is equivalent to "already got this year's gift."
+async function grantGiftItemOnce(guildId, userId, item, giftType) {
+  const existing = await pool.query(`SELECT id FROM user_inventory WHERE user_id = $1 AND item_id = $2 LIMIT 1`, [userId, item.id]);
+  if (existing.rows.length) return false;
+  const inventoryId = randomUUID();
+  await pool.query(
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, award_type, lookup_tag)
+     VALUES ($1, $2, $3, $4, $5, 0, 'owned', $6, $7)`,
+    [inventoryId, guildId, userId, item.id, item.item_name, giftType, generateInventoryLookupTag()]
+  );
+  return true;
+}
+
+// Christmas: grant to every non-bot member of the guild that owns this item's row.
+// Full member fetch only happens on Dec 25 itself (see tick below), not every tick.
+async function grantChristmasGiftToGuildMembers(guild, item) {
+  const members = await guild.members.fetch().catch(() => null);
+  if (!members) return 0;
+  let granted = 0;
+  for (const [, member] of members) {
+    if (member.user.bot) continue;
+    if (await grantGiftItemOnce(guild.id, member.id, item, 'christmas')) granted++;
+  }
+  return granted;
+}
+
+// ---------------------------------------------------------------------------
+// Birthday & Christmas gift scheduler — checks once a day whether today is
+// Christmas and/or anyone's stored birthday, and auto-grants that year's gift item
+// (see shop_items.gift_type/gift_year, createcosmetic gift_type option) if one
+// exists for this guild. Both are opt-in per guild: nothing is granted unless a bot
+// owner has created that year's gift item for that specific guild via
+// /shop createcosmetic gift_type:birthday|christmas.
+// ---------------------------------------------------------------------------
+async function runBirthdayChristmasGiftSchedulerTick(client) {
+  const now = new Date();
+  const month = now.getUTCMonth() + 1;
+  const day = now.getUTCDate();
+  const year = now.getUTCFullYear();
+
+  if (month === 12 && day === 25) {
+    const christmasItems = await pool.query(
+      `SELECT * FROM shop_items WHERE gift_type = 'christmas' AND gift_year = $1 AND is_active = TRUE`,
+      [year]
+    );
+    for (const item of christmasItems.rows) {
+      const guild = client.guilds.cache.get(item.guild_id);
+      if (!guild) continue;
+      await grantChristmasGiftToGuildMembers(guild, item).catch(error =>
+        console.error(`Christmas gift grant failed for guild ${item.guild_id}:`, error));
+    }
+  }
+
+  const birthdayUsers = await pool.query(
+    `SELECT user_id FROM user_birthdays WHERE birthday_month = $1 AND birthday_day = $2`,
+    [month, day]
+  );
+  if (birthdayUsers.rows.length) {
+    const birthdayItems = await pool.query(
+      `SELECT * FROM shop_items WHERE gift_type = 'birthday' AND gift_year = $1 AND is_active = TRUE`,
+      [year]
+    );
+    for (const item of birthdayItems.rows) {
+      const guild = client.guilds.cache.get(item.guild_id);
+      if (!guild) continue;
+      for (const row of birthdayUsers.rows) {
+        const member = await guild.members.fetch(row.user_id).catch(() => null);
+        if (!member || member.user.bot) continue;
+        await grantGiftItemOnce(guild.id, row.user_id, item, 'birthday').catch(error =>
+          console.error(`Birthday gift grant failed for user ${row.user_id} in guild ${guild.id}:`, error));
+      }
+    }
+  }
+}
+
+let birthdayChristmasGiftSchedulerTimer = null;
+function startBirthdayChristmasGiftSchedulerLoop(client) {
+  if (birthdayChristmasGiftSchedulerTimer) clearInterval(birthdayChristmasGiftSchedulerTimer);
+  // Hourly tick — a gift only needs to land sometime during the right day, not to the
+  // minute, and grantGiftItemOnce's dedupe makes repeat ticks on the same day free.
+  birthdayChristmasGiftSchedulerTimer = setInterval(() => {
+    runBirthdayChristmasGiftSchedulerTick(client).catch(error => console.error('Birthday/Christmas gift scheduler tick failed:', error));
+  }, 60 * 60 * 1000);
+  setTimeout(() => runBirthdayChristmasGiftSchedulerTick(client).catch(() => null), 30 * 1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -26922,7 +27296,8 @@ function buildMemberProfileHomeComponents() {
   return [
     new ActionRowBuilder().addComponents(menu),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('memberprofile_stream').setLabel('Connect Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId('memberprofile_stream').setLabel('Connect Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('memberprofile_birthday').setLabel('Set Birthday').setEmoji('🎂').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -32842,6 +33217,7 @@ async function buildAdminSportsbookPayload(guild) {
     new ButtonBuilder().setCustomId('adminpanel_sb:create').setLabel('Create Game').setEmoji('➕').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('adminpanel_sb:settle').setLabel('Settle Game').setEmoji('🏁').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('adminpanel_sb:refund').setLabel('Refund Game').setEmoji('↩️').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('adminpanel_sb:limits').setLabel('Limits').setEmoji('📏').setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row1, buildAdminPanelBackRow()] };
 }
@@ -55523,6 +55899,7 @@ function buildBotOwnerPanelHomeComponents() {
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('botownerpanel_currencyidentity_edit').setLabel('Edit Currency Identity').setEmoji('✏️').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('botownerpanel_payoutbounds_edit').setLabel('Edit Payout Bounds').setEmoji('📏').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('botownerpanel_createcosmetic').setLabel('Create Cosmetic').setEmoji('🎨').setStyle(ButtonStyle.Success),
   );
   return [row1, row2];
 }
@@ -57470,6 +57847,7 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
         { name: 'System', value: customSettings.standings_system === 'points' ? 'Points-based' : customSettings.standings_system === 'point_differential' ? 'Point Differential' : 'W/L Record', inline: true },
         { name: 'Win / Loss / Tie Points', value: `${customSettings.win_points ?? 2} / ${customSettings.loss_points ?? 0} / ${customSettings.tie_points ?? 1}`, inline: true },
         { name: 'Ties Allowed', value: customSettings.ties_allowed ? 'Yes' : 'No', inline: true },
+        { name: 'OTL Allowed', value: customSettings.otl_allowed ? `Yes (${customSettings.otl_points ?? 1} pts)` : 'No', inline: true },
       )
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
@@ -57486,6 +57864,10 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('leaguecustom_points_modal:' + leagueId).setLabel('Edit Win/Loss/Tie Points').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('leaguecustom_toggle_ties:' + leagueId).setLabel(customSettings.ties_allowed ? 'Disable Ties' : 'Enable Ties').setStyle(ButtonStyle.Secondary),
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_otl:' + leagueId).setLabel(customSettings.otl_allowed ? 'Disable OTL' : 'Enable OTL').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('leaguecustom_otlpoints_modal:' + leagueId).setLabel('Edit OTL Points').setStyle(ButtonStyle.Primary).setDisabled(!customSettings.otl_allowed),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
