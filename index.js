@@ -97,6 +97,15 @@ const pool = new Pool({
 // /botowner currencyidentity and /botowner payoutbounds, backed by system_currency_config.
 // These are just the seed defaults for that table's first row.
 const CURRENCY_PAYOUT_TYPES = ['win_payout', 'game_played_payout', 'award_payout'];
+// Sportsbook bounds reuse the exact same bot-owner-global / per-server-clamped
+// pattern as currency payouts above — same system_currency_config table,
+// clampPayoutRate(), and Bot Owner Panel "Edit Payout Bounds" flow, just two more
+// {type}_min/{type}_max pairs. Per-server values live in guild_currency_settings
+// (sportsbook_min_bet etc.) and get clamped into these bounds on save — see
+// Admin Panel sportsbook "Limits" button. Currency is universal/global, so these
+// bounds are too, same reasoning as the currency payout bounds.
+const SPORTSBOOK_BOUND_TYPES = ['sportsbook_bet', 'sportsbook_payout'];
+const ALL_PAYOUT_BOUND_TYPES = [...CURRENCY_PAYOUT_TYPES, ...SPORTSBOOK_BOUND_TYPES];
 const CURRENCY_CONFIG_DEFAULTS = {
   currency_name: 'GG Coins',
   currency_icon: '🪙',
@@ -106,6 +115,10 @@ const CURRENCY_CONFIG_DEFAULTS = {
   game_played_payout_max: 100,
   award_payout_min: 10,
   award_payout_max: 300,
+  sportsbook_bet_min: 5,
+  sportsbook_bet_max: 5000,
+  sportsbook_payout_min: 5,
+  sportsbook_payout_max: 25000,
 };
 
 // In-memory cache of system_currency_config, loaded at startup and refreshed whenever
@@ -666,6 +679,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS player_search_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS gm_panel_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_announcement_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS staff_channel_id TEXT`); // staff-only notices, e.g. league settings changelog
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_leaders_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS award_race_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS member_profile_channel_id TEXT`);
@@ -1297,6 +1311,17 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS game_played_payout INTEGER NOT NULL DEFAULT 25`);
   await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS award_payout INTEGER NOT NULL DEFAULT 50`);
+  // Server-wide sportsbook betting/payout limits (distinct from sportsbook_games'
+  // per-game max_bet/max_payout, which stays a separate, more granular override — see
+  // /sportsbook limits). These are the server's defaults/ceiling, clamped on save to
+  // the bot-owner-global sportsbook_bet_min/max, sportsbook_payout_min/max bounds
+  // (system_currency_config, clampPayoutRate) since currency is universal. Nullable —
+  // NULL means "no server-specific bound set", so nothing is enforced until an admin
+  // actually configures these via the Admin Panel → Sportsbook → Limits button.
+  await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS sportsbook_min_bet INTEGER`);
+  await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS sportsbook_max_bet INTEGER`);
+  await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS sportsbook_min_payout INTEGER`);
+  await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS sportsbook_max_payout INTEGER`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS currency_transactions (
@@ -1355,6 +1380,10 @@ async function initDatabase() {
       CONSTRAINT system_currency_config_single_row CHECK (id = 1)
     )
   `);
+  await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS sportsbook_bet_min INTEGER NOT NULL DEFAULT 5`);
+  await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS sportsbook_bet_max INTEGER NOT NULL DEFAULT 5000`);
+  await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS sportsbook_payout_min INTEGER NOT NULL DEFAULT 5`);
+  await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS sportsbook_payout_max INTEGER NOT NULL DEFAULT 25000`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shop_items (
@@ -2027,6 +2056,16 @@ async function initDatabase() {
       birthday_month INTEGER NOT NULL CHECK (birthday_month BETWEEN 1 AND 12),
       birthday_day INTEGER NOT NULL CHECK (birthday_day BETWEEN 1 AND 31),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Generic single-row-per-key dedupe tracker for scheduled reminders (e.g. the
+  // Dec 1 gift-item reminder DM) — avoids re-sending the same annual reminder every
+  // tick within Dec 1, or every year the tick happens to fall on the same day again.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS system_reminder_state (
+      reminder_key TEXT PRIMARY KEY,
+      last_sent_year INTEGER NOT NULL
     )
   `);
 
@@ -3133,6 +3172,8 @@ function buildCommands() {
           { name: 'Win Payout', value: 'win_payout' },
           { name: 'Game Played Payout', value: 'game_played_payout' },
           { name: 'Award Payout', value: 'award_payout' },
+          { name: 'Sportsbook Bet', value: 'sportsbook_bet' },
+          { name: 'Sportsbook Payout', value: 'sportsbook_payout' },
         ))
         .addIntegerOption(o => o.setName('min').setDescription('Minimum allowed value').setRequired(true))
         .addIntegerOption(o => o.setName('max').setDescription('Maximum allowed value').setRequired(true)))
@@ -3848,7 +3889,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -4470,22 +4511,23 @@ const LEAGUE_SPORT_DEFAULT_SETTINGS = {
   other: {},
 };
 
-// League settings changelog — posts a small embed to the league's announcement
-// channel (league_announcement_channel_id) whenever a commissioner/admin changes a
-// league_custom_settings value through the League Customization panel. Best-effort:
-// silently no-ops if the channel isn't configured or the bot can't post there, same
-// defensive pattern used for every other optional-channel post in this codebase.
+// League settings changelog — posts a small embed to the league's staff channel
+// (league_settings.staff_channel_id, configurable via the Setup Dashboard like any
+// other league channel) whenever a commissioner/admin changes a league_custom_settings
+// value through the League Customization panel. Best-effort: silently no-ops if the
+// channel isn't configured or the bot can't post there, same defensive pattern used
+// for every other optional-channel post in this codebase.
 // Not every single settings mutation in the file calls this yet — wired into the
 // standings section (ties/OTL toggles, point values) as the initial pass; extending
 // to the rest of League Customization's sections is straightforward follow-up work,
 // same call shape each time.
 async function logLeagueSettingChange(league, userId, settingLabel, oldValue, newValue) {
-  if (!league?.league_announcement_channel_id || !league?.guild_id) return;
+  if (!league?.staff_channel_id || !league?.guild_id) return;
   if (String(oldValue) === String(newValue)) return; // no-op toggle back to the same value, nothing to log
   try {
     const guild = client.guilds.cache.get(league.guild_id) || await client.guilds.fetch(league.guild_id).catch(() => null);
     if (!guild) return;
-    const channel = await guild.channels.fetch(league.league_announcement_channel_id).catch(() => null);
+    const channel = await guild.channels.fetch(league.staff_channel_id).catch(() => null);
     if (!channel?.isTextBased?.()) return;
     const embed = new EmbedBuilder()
       .setTitle(`⚙️ Settings Updated • ${league.league_name}`)
@@ -5091,6 +5133,43 @@ async function getCurrencySettings(guildId) {
     game_played_payout: clampPayoutRate('game_played_payout', row.game_played_payout),
     award_payout: clampPayoutRate('award_payout', row.award_payout),
   };
+}
+
+// Server-wide sportsbook betting/payout bounds — distinct from a single game's
+// max_bet/max_payout (sportsbook_games, set via /sportsbook limits or the older
+// per-game admin panel flow). NULL fields mean "this server hasn't set a bound," in
+// which case nothing is enforced at that level (a game's own max_bet/max_payout, if
+// set, still applies on its own). Non-null fields are always re-clamped against the
+// bot-owner-global range on read, same defense-in-depth as getCurrencySettings, in
+// case the bot owner tightened the global bounds after a server set its own value.
+async function getGuildSportsbookBounds(guildId) {
+  await pool.query(`INSERT INTO guild_currency_settings (guild_id) VALUES ($1) ON CONFLICT (guild_id) DO NOTHING`, [guildId]);
+  const result = await pool.query(
+    `SELECT sportsbook_min_bet, sportsbook_max_bet, sportsbook_min_payout, sportsbook_max_payout FROM guild_currency_settings WHERE guild_id = $1`,
+    [guildId]
+  );
+  const row = result.rows[0] || {};
+  return {
+    min_bet: row.sportsbook_min_bet != null ? clampPayoutRate('sportsbook_bet', row.sportsbook_min_bet) : null,
+    max_bet: row.sportsbook_max_bet != null ? clampPayoutRate('sportsbook_bet', row.sportsbook_max_bet) : null,
+    min_payout: row.sportsbook_min_payout != null ? clampPayoutRate('sportsbook_payout', row.sportsbook_min_payout) : null,
+    max_payout: row.sportsbook_max_payout != null ? clampPayoutRate('sportsbook_payout', row.sportsbook_max_payout) : null,
+  };
+}
+
+// Validates a bet amount + computed payout against this guild's sportsbook bounds
+// (see getGuildSportsbookBounds). Called alongside — not instead of — each game's own
+// max_bet/max_payout checks; whichever limit is tighter wins. min_payout is stored
+// for completeness/display but not enforced here: payout is derived from bet × odds,
+// not something a bettor sets directly, so there's no single natural enforcement
+// point for a payout floor without also picking a bet-amount minimum for it, which
+// would double up with min_bet in a confusing way. Flagged as a known gap.
+async function validateSportsbookBetAmount(guildId, amount, payout) {
+  const bounds = await getGuildSportsbookBounds(guildId);
+  if (bounds.min_bet != null && amount < bounds.min_bet) return { ok: false, message: `Minimum bet for this server is **${bounds.min_bet}**.` };
+  if (bounds.max_bet != null && amount > bounds.max_bet) return { ok: false, message: `Maximum bet for this server is **${bounds.max_bet}**.` };
+  if (bounds.max_payout != null && payout > bounds.max_payout) return { ok: false, message: `That bet would exceed this server's max payout of **${bounds.max_payout}**.` };
+  return { ok: true };
 }
 
 function buildCurrencySettingsEmbed(settings) {
@@ -7988,7 +8067,7 @@ if (interaction.commandName === 'avatar') {
         const min = interaction.options.getInteger('min');
         const max = interaction.options.getInteger('max');
 
-        if (!CURRENCY_PAYOUT_TYPES.includes(type)) {
+        if (!ALL_PAYOUT_BOUND_TYPES.includes(type)) {
           await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral });
           return;
         }
@@ -8145,7 +8224,7 @@ if (interaction.commandName === 'avatar') {
       const menu = new StringSelectMenuBuilder()
         .setCustomId('botownerpanel_payoutbounds_select')
         .setPlaceholder('Choose a payout type to edit')
-        .addOptions(CURRENCY_PAYOUT_TYPES.map(type => ({
+        .addOptions(ALL_PAYOUT_BOUND_TYPES.map(type => ({
           label: CURRENCY_PAYOUT_TYPE_LABELS[type],
           value: type,
           description: `Current range: ${currencyConfigCache[`${type}_min`]}–${currencyConfigCache[`${type}_max`]}`,
@@ -8161,7 +8240,7 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_payoutbounds_select') {
       if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const type = interaction.values[0];
-      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
+      if (!ALL_PAYOUT_BOUND_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
 
       const modal = new ModalBuilder()
         .setCustomId(`botownerpanel_payoutbounds_modal:${type}`)
@@ -8178,7 +8257,7 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_payoutbounds_modal:')) {
       if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       const type = interaction.customId.split(':')[1];
-      if (!CURRENCY_PAYOUT_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
+      if (!ALL_PAYOUT_BOUND_TYPES.includes(type)) { await interaction.reply({ content: 'Unknown payout type.', flags: MessageFlags.Ephemeral }); return; }
 
       const min = Number.parseInt(interaction.fields.getTextInputValue('min'), 10);
       const max = Number.parseInt(interaction.fields.getTextInputValue('max'), 10);
@@ -8551,6 +8630,11 @@ if (interaction.commandName === 'avatar') {
         }
         if (sportsbookGame.max_payout && payout > Number(sportsbookGame.max_payout)) {
           await interaction.reply({ content: 'That bet would exceed the max payout of **' + sportsbookGame.max_payout + '** for this line.', ephemeral: true });
+          return;
+        }
+        const boundsCheck = await validateSportsbookBetAmount(interaction.guild.id, amount, payout);
+        if (!boundsCheck.ok) {
+          await interaction.reply({ content: boundsCheck.message, ephemeral: true });
           return;
         }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
@@ -12326,9 +12410,20 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (action === 'limits') {
-        const components = await buildAdminSportsbookGamePickerComponents(interaction.guild, 'adminpanel_sb_limits_game');
-        if (!components) { await interaction.reply({ content: 'No open sportsbook games to set limits on.', ephemeral: true }); return; }
-        await interaction.reply({ content: '**Set Sportsbook Limits** — choose a game', components, ephemeral: true });
+        // Server-wide sportsbook betting/payout limits (guild_currency_settings),
+        // not a single game's max_bet/max_payout — those are still set per-game via
+        // /sportsbook limits, unrelated to this button.
+        const bounds = await getGuildSportsbookBounds(interaction.guild.id);
+        const modal = new ModalBuilder()
+          .setCustomId('adminpanel_sb_serverlimits_modal')
+          .setTitle('Server Sportsbook Limits')
+          .addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('min_bet').setLabel('Minimum bet (blank = no minimum)').setStyle(TextInputStyle.Short).setRequired(false).setValue(bounds.min_bet != null ? String(bounds.min_bet) : '')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_bet').setLabel('Maximum bet (blank = no maximum)').setStyle(TextInputStyle.Short).setRequired(false).setValue(bounds.max_bet != null ? String(bounds.max_bet) : '')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('min_payout').setLabel('Minimum payout (blank = no minimum)').setStyle(TextInputStyle.Short).setRequired(false).setValue(bounds.min_payout != null ? String(bounds.min_payout) : '')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_payout').setLabel('Maximum payout (blank = no maximum)').setStyle(TextInputStyle.Short).setRequired(false).setValue(bounds.max_payout != null ? String(bounds.max_payout) : '')),
+          );
+        await interaction.showModal(modal);
         return;
       }
       return;
@@ -12397,49 +12492,44 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_sb_limits_game') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
-      const gameId = interaction.values[0];
-      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
-      if (!sportsbookGame) { await interaction.update({ content: 'Could not find that sportsbook game.', components: [] }); return; }
-      const modal = new ModalBuilder()
-        .setCustomId('adminpanel_sb_limits_modal:' + gameId)
-        .setTitle('Sportsbook Limits')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_bet').setLabel('Max bet (blank = leave unchanged)').setStyle(TextInputStyle.Short).setRequired(false).setValue(sportsbookGame.max_bet != null ? String(sportsbookGame.max_bet) : '')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_payout').setLabel('Max payout (blank = leave unchanged)').setStyle(TextInputStyle.Short).setRequired(false).setValue(sportsbookGame.max_payout != null ? String(sportsbookGame.max_payout) : '')),
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('adminpanel_sb_limits_modal:')) {
+    if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_sb_serverlimits_modal') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to update sportsbook limits.', ephemeral: true }); return; }
-      const gameId = interaction.customId.split(':')[1];
-      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
-      if (!sportsbookGame) { await interaction.reply({ content: 'Could not find that sportsbook game.', ephemeral: true }); return; }
 
+      const parseOrNull = (raw) => (raw ? Number.parseInt(raw, 10) : null);
+      const minBetRaw = interaction.fields.getTextInputValue('min_bet');
       const maxBetRaw = interaction.fields.getTextInputValue('max_bet');
+      const minPayoutRaw = interaction.fields.getTextInputValue('min_payout');
       const maxPayoutRaw = interaction.fields.getTextInputValue('max_payout');
-      const maxBet = maxBetRaw ? Number.parseInt(maxBetRaw, 10) : null;
-      const maxPayout = maxPayoutRaw ? Number.parseInt(maxPayoutRaw, 10) : null;
+      const minBet = parseOrNull(minBetRaw);
+      const maxBet = parseOrNull(maxBetRaw);
+      const minPayout = parseOrNull(minPayoutRaw);
+      const maxPayout = parseOrNull(maxPayoutRaw);
 
-      if (maxBetRaw && (!Number.isInteger(maxBet) || maxBet <= 0)) { await interaction.reply({ content: 'Max bet must be greater than 0.', ephemeral: true }); return; }
-      if (maxPayoutRaw && (!Number.isInteger(maxPayout) || maxPayout <= 0)) { await interaction.reply({ content: 'Max payout must be greater than 0.', ephemeral: true }); return; }
+      for (const [raw, val, label] of [[minBetRaw, minBet, 'Minimum bet'], [maxBetRaw, maxBet, 'Maximum bet'], [minPayoutRaw, minPayout, 'Minimum payout'], [maxPayoutRaw, maxPayout, 'Maximum payout']]) {
+        if (raw && (!Number.isInteger(val) || val < 0)) { await interaction.reply({ content: `${label} must be a whole number 0 or greater.`, ephemeral: true }); return; }
+      }
+      if (minBet != null && maxBet != null && minBet > maxBet) { await interaction.reply({ content: 'Minimum bet cannot exceed maximum bet.', ephemeral: true }); return; }
+      if (minPayout != null && maxPayout != null && minPayout > maxPayout) { await interaction.reply({ content: 'Minimum payout cannot exceed maximum payout.', ephemeral: true }); return; }
+
+      // Clamp into the bot-owner-global range on save, same defense-in-depth as
+      // currency payout rates — currency is universal, so are these bounds.
+      const clampedMinBet = minBet != null ? clampPayoutRate('sportsbook_bet', minBet) : null;
+      const clampedMaxBet = maxBet != null ? clampPayoutRate('sportsbook_bet', maxBet) : null;
+      const clampedMinPayout = minPayout != null ? clampPayoutRate('sportsbook_payout', minPayout) : null;
+      const clampedMaxPayout = maxPayout != null ? clampPayoutRate('sportsbook_payout', maxPayout) : null;
 
       await pool.query(
-        `UPDATE sportsbook_games
-         SET max_bet = COALESCE($1, max_bet),
-             max_payout = COALESCE($2, max_payout)
-         WHERE id = $3`,
-        [maxBet, maxPayout, sportsbookGame.id]
+        `INSERT INTO guild_currency_settings (guild_id, sportsbook_min_bet, sportsbook_max_bet, sportsbook_min_payout, sportsbook_max_payout)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (guild_id) DO UPDATE SET sportsbook_min_bet = $2, sportsbook_max_bet = $3, sportsbook_min_payout = $4, sportsbook_max_payout = $5, updated_at = NOW()`,
+        [interaction.guild.id, clampedMinBet, clampedMaxBet, clampedMinPayout, clampedMaxPayout]
       );
-      await updateSportsbookPanel(interaction.guild).catch(() => null);
 
+      const boundsNote = (currencyConfigCache.sportsbook_bet_min != null)
+        ? ` (bot-owner global range: bet ${currencyConfigCache.sportsbook_bet_min}–${currencyConfigCache.sportsbook_bet_max}, payout ${currencyConfigCache.sportsbook_payout_min}–${currencyConfigCache.sportsbook_payout_max})`
+        : '';
       await interaction.reply({
-        content: 'Updated limits for **' + sportsbookGame.game_label + '**.' +
-          (maxBet !== null ? ' Max bet: **' + maxBet + '**.' : '') +
-          (maxPayout !== null ? ' Max payout: **' + maxPayout + '**.' : ''),
+        content: `Server sportsbook limits updated — bet: **${clampedMinBet ?? 'none'}–${clampedMaxBet ?? 'none'}**, payout: **${clampedMinPayout ?? 'none'}–${clampedMaxPayout ?? 'none'}**.${boundsNote}`,
         ephemeral: true,
       });
       return;
@@ -19378,10 +19468,23 @@ if (shopSubcommand === 'view') {
           return;
         }
 
+        const sportsbookBounds = await getGuildSportsbookBounds(interaction.guild.id);
+        if (sportsbookBounds.min_bet != null && amount < sportsbookBounds.min_bet) {
+          await interaction.reply({ content: 'Minimum bet for this server is **' + sportsbookBounds.min_bet + '**.', ephemeral: true });
+          return;
+        }
+        if (sportsbookBounds.max_bet != null && amount > sportsbookBounds.max_bet) {
+          await interaction.reply({ content: 'Maximum bet for this server is **' + sportsbookBounds.max_bet + '**.', ephemeral: true });
+          return;
+        }
+
         const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
         let payout = calculateAmericanOddsPayout(amount, odds);
         if (sportsbookGame.max_payout !== null && sportsbookGame.max_payout !== undefined && payout > Number(sportsbookGame.max_payout)) {
           payout = Number(sportsbookGame.max_payout);
+        }
+        if (sportsbookBounds.max_payout != null && payout > sportsbookBounds.max_payout) {
+          payout = sportsbookBounds.max_payout;
         }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
 
@@ -19555,6 +19658,11 @@ if (shopSubcommand === 'view') {
       }
       if (sportsbookGame.max_payout && payout > Number(sportsbookGame.max_payout)) {
         await interaction.reply({ content: 'That bet would exceed the max payout of **' + sportsbookGame.max_payout + '** for this line.', ephemeral: true });
+        return;
+      }
+      const sportsbookBoundsCheck = await validateSportsbookBetAmount(interaction.guild.id, amount, payout);
+      if (!sportsbookBoundsCheck.ok) {
+        await interaction.reply({ content: sportsbookBoundsCheck.message, ephemeral: true });
         return;
       }
       const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
@@ -25167,11 +25275,37 @@ async function grantChristmasGiftToGuildMembers(guild, item) {
 // owner has created that year's gift item for that specific guild via
 // /shop createcosmetic gift_type:birthday|christmas.
 // ---------------------------------------------------------------------------
+// Sends a DM to the bot owner at most once per calendar year per reminder_key —
+// dedupes via system_reminder_state so an hourly-ticking scheduler doesn't spam the
+// same reminder all day, and a restart doesn't re-send one already sent this year.
+async function sendAnnualReminderOnce(client, reminderKey, year, message) {
+  if (!botOwnerUserId) return;
+  const existing = await pool.query(`SELECT last_sent_year FROM system_reminder_state WHERE reminder_key = $1`, [reminderKey]);
+  if (existing.rows[0]?.last_sent_year === year) return;
+  const owner = await client.users.fetch(botOwnerUserId).catch(() => null);
+  if (!owner) return;
+  await owner.send({ content: message }).catch(error => console.error(`Failed to DM bot owner reminder '${reminderKey}':`, error));
+  await pool.query(
+    `INSERT INTO system_reminder_state (reminder_key, last_sent_year) VALUES ($1, $2)
+     ON CONFLICT (reminder_key) DO UPDATE SET last_sent_year = $2`,
+    [reminderKey, year]
+  );
+}
+
 async function runBirthdayChristmasGiftSchedulerTick(client) {
   const now = new Date();
   const month = now.getUTCMonth() + 1;
   const day = now.getUTCDate();
   const year = now.getUTCFullYear();
+
+  if (month === 12 && day === 1) {
+    await sendAnnualReminderOnce(client, 'december_gift_items', year,
+      `🎁 **Reminder: it's December 1st.** Time to create this year's gift items if you haven't yet — ` +
+      `\`/shop createcosmetic gift_type:christmas gift_year:${year}\` for Christmas (auto-grants Dec 25), and ` +
+      `\`/shop createcosmetic gift_type:birthday gift_year:${year}\` for birthdays, per server that wants them. ` +
+      `Nothing grants automatically until these exist for a given server.`
+    ).catch(error => console.error('December 1 gift-item reminder failed:', error));
+  }
 
   if (month === 12 && day === 25) {
     const christmasItems = await pool.query(
@@ -27503,6 +27637,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'player_search_channel', label: 'Player Search Channel', description: 'Panel to search/browse all players', kind: 'channel' },
   { value: 'gm_panel_channel', label: 'GM Panel Channel', description: 'Panel for team owners to open their GM dashboard', kind: 'channel' },
   { value: 'league_announcement_channel', label: 'League Announcement Channel', description: 'Where announcements posted from the commissioner panel go', kind: 'channel' },
+  { value: 'staff_channel', label: 'Staff Channel', description: 'Where league settings changes and other staff-only notices post', kind: 'channel' },
   { value: 'league_leaders_channel', label: 'League Leaders Channel', description: 'Live, switchable stat leaders board', kind: 'channel' },
   { value: 'award_race_channel', label: 'Award Race Channel', description: 'Live, switchable MVP/OPOY/DPOY/OROY/DROY race board', kind: 'channel' },
   { value: 'league_rules_channel', label: 'League Rules Channel', description: 'Where the posted league rules embed lives', kind: 'channel' },
@@ -27641,6 +27776,7 @@ function setupDashboardColumn(settingKey) {
     player_search_channel: 'player_search_channel_id',
     gm_panel_channel: 'gm_panel_channel_id',
     league_announcement_channel: 'league_announcement_channel_id',
+    staff_channel: 'staff_channel_id',
     league_leaders_channel: 'league_leaders_channel_id',
     award_race_channel: 'award_race_channel_id',
     member_profile_channel: 'member_profile_channel_id',
@@ -27700,6 +27836,7 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['player_search_channel', 'Player Search'],
     ['gm_panel_channel', 'GM Panel'],
     ['league_announcement_channel', 'League Announcement'],
+    ['staff_channel', 'Staff Channel'],
     ['league_leaders_channel', 'League Leaders'],
     ['award_race_channel', 'Award Race'],
     ['league_rules_channel', 'League Rules'],
@@ -33213,6 +33350,12 @@ async function buildAdminSportsbookPayload(guild) {
     [guild.id]
   );
   const embed = buildSportsbookEmbed(settings, games.rows);
+  const bounds = await getGuildSportsbookBounds(guild.id);
+  embed.addFields({
+    name: 'Server Bet/Payout Limits',
+    value: `Bet: ${bounds.min_bet ?? 'none'}–${bounds.max_bet ?? 'none'} • Payout: ${bounds.min_payout ?? 'none'}–${bounds.max_payout ?? 'none'}`,
+    inline: false,
+  });
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('adminpanel_sb:create').setLabel('Create Game').setEmoji('➕').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('adminpanel_sb:settle').setLabel('Settle Game').setEmoji('🏁').setStyle(ButtonStyle.Primary),
@@ -55933,6 +56076,8 @@ const CURRENCY_PAYOUT_TYPE_LABELS = {
   win_payout: 'Win Payout',
   game_played_payout: 'Game Played Payout',
   award_payout: 'Award Payout',
+  sportsbook_bet: 'Sportsbook Bet',
+  sportsbook_payout: 'Sportsbook Payout',
 };
 
 
