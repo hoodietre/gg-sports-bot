@@ -442,6 +442,10 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_id TEXT`);
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS thread_created_at TIMESTAMPTZ`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_imported_games_thread_lookup ON madden_imported_games (guild_id, league_id, week_label, thread_id)`);
+  // Dedup flag for the "post both owners' avatars once both sides are claimed" game
+  // thread feature (see maybePostGameThreadOwnersAvatar) — prevents re-posting on
+  // every subsequent role change once it's already gone out for a given game.
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS owners_avatar_posted BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
@@ -21420,6 +21424,24 @@ if (shopSubcommand === 'view') {
              AND team_role_id = $4`,
           [interaction.guild.id, String(league.league_id), newOwnerId, role.id]
         ).catch(() => null);
+
+        // If this role's team has an existing game thread waiting on both owners to
+        // be set, check whether this newly-claimed role is the missing piece —
+        // covers the "team claimed after the thread already exists" case (thread
+        // creation itself already handles the "both already claimed" case).
+        if (newOwnerId) {
+          const pendingGames = await pool.query(
+            `SELECT * FROM madden_imported_games
+             WHERE guild_id = $1 AND league_id::text = $2::text
+               AND thread_id IS NOT NULL AND owners_avatar_posted = FALSE
+               AND (away_team_role_id = $3 OR home_team_role_id = $3)`,
+            [interaction.guild.id, String(league.league_id), role.id]
+          ).catch(() => ({ rows: [] }));
+          for (const pendingGame of pendingGames.rows) {
+            await maybePostGameThreadOwnersAvatar(interaction.guild, league, pendingGame).catch(error =>
+              console.error('[Game Thread Owners Avatar] post-assignrole check failed:', error));
+          }
+        }
       }
       await interaction.reply({ content: `${interaction.commandName === 'assignrole' ? 'Assigned' : 'Removed'} ${role} ${interaction.commandName === 'assignrole' ? 'to' : 'from'} ${targetMember}.`, ephemeral: true });
       return;
@@ -37338,6 +37360,89 @@ async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId =
 
   return null;
 }
+
+// Side-by-side composite of both game-thread owners' avatars with a "VS" divider —
+// used by maybePostGameThreadOwnersAvatar below. Reuses the normal (non-showcase)
+// render size for each side to keep the combined image a reasonable width.
+async function buildGameThreadOwnersAvatarComposite(awayOwnerId, homeOwnerId) {
+  const sharp = await getSharp();
+  if (!sharp) return null;
+
+  const [awayData, homeData] = await Promise.all([
+    getAvatarProfileWithEquipment(awayOwnerId),
+    getAvatarProfileWithEquipment(homeOwnerId),
+  ]);
+  const [awayPng, homePng] = await Promise.all([
+    renderAvatarProfilePng(awayData.profile, awayData.equipped),
+    renderAvatarProfilePng(homeData.profile, homeData.equipped),
+  ]);
+
+  const awayMeta = await sharp(awayPng).metadata();
+  const homeMeta = await sharp(homePng).metadata();
+  const panelHeight = Math.max(awayMeta.height, homeMeta.height);
+  const panelWidth = Math.max(awayMeta.width, homeMeta.width);
+  const gap = 60; // room for the "VS" badge between the two renders
+  const canvasWidth = panelWidth * 2 + gap;
+
+  const vsBadgeSvg = `<svg width="${gap}" height="${panelHeight}" xmlns="http://www.w3.org/2000/svg">
+    <text x="50%" y="50%" font-family="sans-serif" font-size="34" font-weight="bold" fill="#FFFFFF"
+      stroke="#000000" stroke-width="2" text-anchor="middle" dominant-baseline="middle">VS</text>
+  </svg>`;
+
+  const composite = await sharp({
+    create: { width: canvasWidth, height: panelHeight, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+  })
+    .composite([
+      { input: awayPng, left: 0, top: 0 },
+      { input: Buffer.from(vsBadgeSvg), left: panelWidth, top: 0 },
+      { input: homePng, left: panelWidth + gap, top: 0 },
+    ])
+    .png()
+    .toBuffer();
+
+  return new AttachmentBuilder(composite, { name: 'matchup_owners.png' });
+}
+
+// Posts a "both owners are set" avatar showcase into a game's thread, once both the
+// away and home teams have an assigned owner — whether that happens all at once
+// before thread creation, or later via /assignrole after the thread already exists.
+// Dedup via owners_avatar_posted so a subsequent unrelated role change on the same
+// team doesn't repost it. Best-effort throughout: any missing piece (no thread, no
+// owner yet, thread inaccessible) just quietly skips rather than erroring.
+async function maybePostGameThreadOwnersAvatar(guild, league, game) {
+  if (!game?.thread_id || game.owners_avatar_posted) return;
+
+  const owners = {
+    away: await getMaddenTeamOwnerForGameThread(guild, league, game.away_team, game.away_team_role_id),
+    home: await getMaddenTeamOwnerForGameThread(guild, league, game.home_team, game.home_team_role_id),
+  };
+  if (!owners.away?.id || !owners.home?.id) return; // still waiting on one side
+
+  const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+  if (!thread?.isTextBased?.()) return;
+
+  const attachment = await buildGameThreadOwnersAvatarComposite(owners.away.id, owners.home.id).catch(error => {
+    console.error('[Game Thread Owners Avatar] composite failed:', error);
+    return null;
+  });
+  if (!attachment) return;
+
+  const label = `${maddenTeamDisplayName(game.away_team)} @ ${maddenTeamDisplayName(game.home_team)}`;
+  await thread.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(`🎮 Both Owners Set — ${label}`)
+        .setColor(0x5865F2)
+        .setImage('attachment://matchup_owners.png')
+        .setFooter({ text: 'GG Sports • Auto Game Threads' })
+        .setTimestamp(),
+    ],
+    files: [attachment],
+  }).catch(error => console.error('[Game Thread Owners Avatar] post failed:', error));
+
+  await pool.query(`UPDATE madden_imported_games SET owners_avatar_posted = TRUE WHERE id = $1`, [game.id]).catch(() => null);
+}
+
 function maddenGameHasRealScore(game) {
   const status = String(game?.status || '').toLowerCase();
   const away = game?.away_score;
@@ -37675,6 +37780,8 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
         [thread.id, game.id]
       );
       out.created.push({ label, threadId: thread.id });
+      await maybePostGameThreadOwnersAvatar(guild, league, { ...game, thread_id: thread.id, owners_avatar_posted: false }).catch(error =>
+        console.error('[Game Thread Owners Avatar] post-creation check failed:', error));
     } catch (error) {
       console.error('[7J-10BY-GT GAME THREAD] create failed:', error?.stack || error?.message || error);
       out.failed.push({ label, reason: String(error?.message || error).slice(0, 140) });
