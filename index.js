@@ -7952,6 +7952,10 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_preview_select:')) {
+      // Deferred immediately — buildAvatarShopPreviewPayload does real image
+      // compositing, which can exceed Discord's response window if called before
+      // any acknowledgment (same issue as the createcosmetic/preview slash commands).
+      await interaction.deferUpdate();
       const [, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const itemId = interaction.values[0];
@@ -7960,10 +7964,10 @@ if (interaction.commandName === 'avatar') {
       const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
-        await interaction.update({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
+        await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
         return;
       }
-      await interaction.update(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
+      await interaction.editReply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings));
       return;
     }
 
@@ -7983,25 +7987,30 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      // Deferred immediately — same reasoning as avatarshop_preview_select above.
+      await interaction.deferUpdate();
       const settings = await getCurrencySettings(interaction.guild.id);
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
-        await interaction.update({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
+        await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
         return;
       }
-      await interaction.update(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings, chosen));
+      await interaction.editReply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings, chosen));
       return;
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('avatarshop_custom_color_modal:')) {
+      // Deferred immediately — same image-compositing timing risk as the other
+      // avatar shop preview flows above.
+      await interaction.deferReply({ ephemeral: true });
       const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
       const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
       const rawHex = interaction.fields.getTextInputValue('hex');
       const normalized = normalizeAvatarHexColor(rawHex);
       if (!normalized) {
-        await interaction.reply({ content: `"${rawHex}" isn't a valid hex color. Try something like FF5733 or #FF5733.`, ephemeral: true });
+        await interaction.editReply({ content: `"${rawHex}" isn't a valid hex color. Try something like FF5733 or #FF5733.` });
         return;
       }
 
@@ -8010,10 +8019,10 @@ if (interaction.commandName === 'avatar') {
       const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
-        await interaction.reply({ content: 'That item is no longer available.', ephemeral: true });
+        await interaction.editReply({ content: 'That item is no longer available.' });
         return;
       }
-      await interaction.reply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings, normalized));
+      await interaction.editReply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings, normalized));
       return;
     }
 
@@ -16775,8 +16784,18 @@ if (interaction.commandName === 'trade') {
       if (!interaction.guild) return;
       const shopSubcommand = interaction.options.getSubcommand();
       if (shopSubcommand === 'createcosmetic') {
+        // Deferred immediately — this handler does multiple DB queries plus a full
+        // avatar image composite (buildAvatarProfileAttachment, real sharp work) before
+        // it has anything to say, which can easily exceed Discord's 3-second initial
+        // response window (especially under any host resource pressure) and silently
+        // orphan the interaction ("The application did not respond" / error code 10062
+        // Unknown interaction on whatever tries to reply afterward). Deferring buys the
+        // full 15-minute follow-up window instead. Every exit path below uses editReply,
+        // never reply, since the interaction is already acknowledged past this point.
+        await interaction.deferReply({ ephemeral: true });
+
         if (!isBotOwnerInteraction(interaction)) {
-          await interaction.reply({ content: 'Creating cosmetic shop items is restricted to the bot owner.', ephemeral: true });
+          await interaction.editReply({ content: 'Creating cosmetic shop items is restricted to the bot owner.' });
           return;
         }
 
@@ -16800,22 +16819,22 @@ if (interaction.commandName === 'trade') {
         const bodyVariant = interaction.options.getString('body_variant') || null;
 
         if (!VISUAL_AVATAR_SLOTS.includes(slot)) {
-          await interaction.reply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', '), ephemeral: true });
+          await interaction.editReply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', ') });
           return;
         }
 
         if ((heelLiftPx || genderLock || bodyVariant) && slot !== 'footwear') {
-          await interaction.reply({ content: 'heel_lift_px, gender_lock, and body_variant only apply to footwear items.', ephemeral: true });
+          await interaction.editReply({ content: 'heel_lift_px, gender_lock, and body_variant only apply to footwear items.' });
           return;
         }
 
         if (!['common', 'uncommon', 'rare', 'epic', 'legendary'].includes(rarity)) {
-          await interaction.reply({ content: 'Invalid rarity. Use common, uncommon, rare, epic, or legendary.', ephemeral: true });
+          await interaction.editReply({ content: 'Invalid rarity. Use common, uncommon, rare, epic, or legendary.' });
           return;
         }
 
         if (!Number.isInteger(price) || price < 0) {
-          await interaction.reply({ content: 'Price must be 0 or higher.', ephemeral: true });
+          await interaction.editReply({ content: 'Price must be 0 or higher.' });
           return;
         }
 
@@ -16841,7 +16860,7 @@ if (interaction.commandName === 'trade') {
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const previewColorHex = isColorable ? AVATAR_COLOR_PALETTE[0].hex : null;
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex } };
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex, heel_lift_px: heelLiftPx, body_variant: bodyVariant } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -16856,25 +16875,30 @@ if (interaction.commandName === 'trade') {
             ...(isColorable ? [{ name: 'Colorable', value: `✅ Buyers pick any color (preview shown in ${AVATAR_COLOR_PALETTE[0].name})`, inline: false }] : [])
           );
 
-        await interaction.reply({ content: 'Cosmetic shop item created.', embeds: [embed], files: [attachment], ephemeral: true });
+        await interaction.editReply({ content: 'Cosmetic shop item created.', embeds: [embed], files: [attachment] });
         return;
       }
 
 
 
       if (shopSubcommand === 'preview') {
+        // Deferred immediately — same reasoning as createcosmetic above: DB lookups
+        // plus a full avatar image composite before any reply risks exceeding
+        // Discord's 3-second window and orphaning the interaction.
+        await interaction.deferReply({ ephemeral: true });
+
         const itemName = interaction.options.getString('item');
         const item = await getShopPreviewItem(interaction.guild.id, itemName);
 
         if (!item) {
-          await interaction.reply({ content: 'Could not find an active shop/cosmetic item named **' + itemName + '**.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find an active shop/cosmetic item named **' + itemName + '**.' });
           return;
         }
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
         const previewColorHex = item.is_colorable ? AVATAR_COLOR_PALETTE[0].hex : null;
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex } };
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex, heel_lift_px: item.heel_lift_px || 0, body_variant: item.body_variant || null } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -16889,7 +16913,7 @@ if (interaction.commandName === 'trade') {
             { name: 'How to Buy', value: 'Use `/avatar shop` to browse and buy, or the "Go Shopping" button on the Avatar Panel.', inline: false }
           );
 
-        await interaction.reply({ embeds: [embed], files: [attachment], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], files: [attachment] });
         return;
       }
 
@@ -26433,7 +26457,7 @@ async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, cat
   const slotForPreview = categorySlot === 'exclusive' ? (previewItem.avatar_slot || inferAvatarSlotFromItem(previewItem)) : categorySlot;
   const isColorable = !!previewItem.is_colorable;
   const activeColorHex = isColorable ? (normalizeAvatarHexColor(selectedColorHex) || AVATAR_COLOR_PALETTE[0].hex) : null;
-  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name, art_asset_key: previewItem.art_asset_key || null, color_hex: activeColorHex } };
+  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name, art_asset_key: previewItem.art_asset_key || null, color_hex: activeColorHex, heel_lift_px: previewItem.heel_lift_px || 0, body_variant: previewItem.body_variant || null } };
   const embed = new EmbedBuilder()
     .setTitle(`👗 Dressing Room • ${previewItem.item_name}`)
     .setColor(0xFEE75C)
