@@ -2076,6 +2076,23 @@ async function initDatabase() {
   // renderAvatarProfilePngRealArt.
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS body_variant TEXT`);
 
+  // Pet-only: where the pet renders relative to the wearer. Deliberately not tied to
+  // the art canvas convention other slots use (same-size-as-body, resized together) —
+  // that trick breaks for anything positioned outside the body's own bounding box
+  // (floating above the head would need a taller canvas, which changes the resize
+  // scale and throws off alignment with every other layer). Pets are instead stored
+  // as simple standalone cropped images and positioned by formula at render time —
+  // see the PET_POSITIONS placement logic in renderAvatarProfilePngRealArt.
+  // 'left' | 'right' | 'front' | 'shoulder' | 'float_left' | 'float_right' | 'float_center'
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS pet_position TEXT DEFAULT 'left'`);
+
+  // Pet-only: how tall the pet renders as a fraction of the wearer's own rendered
+  // height — e.g. 0.35 for a dog standing beside them, 0.12 for a parrot on the
+  // shoulder. Determined per item by comparing the pet to a human reference figure
+  // in its source art (see the pets art-generation prompt doc). NULL falls back to a
+  // generic default in code so an item still renders reasonably before this is tuned.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS pet_scale REAL`);
+
   // Global (not per-guild) — same pattern as stream_links, since a birthday is a
   // personal attribute, not something tied to one server. Only month/day are needed;
   // no birth year, since the gift is about which day recurs each year, not age.
@@ -3043,7 +3060,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false)))
@@ -16817,6 +16834,8 @@ if (interaction.commandName === 'trade') {
         const heelLiftPx = interaction.options.getInteger('heel_lift_px') || 0;
         const genderLock = interaction.options.getString('gender_lock') || null;
         const bodyVariant = interaction.options.getString('body_variant') || null;
+        const petPosition = interaction.options.getString('pet_position') || null;
+        const petScale = interaction.options.getNumber('pet_scale') || null;
 
         if (!VISUAL_AVATAR_SLOTS.includes(slot)) {
           await interaction.editReply({ content: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', ') });
@@ -16825,6 +16844,16 @@ if (interaction.commandName === 'trade') {
 
         if ((heelLiftPx || genderLock || bodyVariant) && slot !== 'footwear') {
           await interaction.editReply({ content: 'heel_lift_px, gender_lock, and body_variant only apply to footwear items.' });
+          return;
+        }
+
+        if ((petPosition || petScale) && slot !== 'pet') {
+          await interaction.editReply({ content: 'pet_position and pet_scale only apply to pet items.' });
+          return;
+        }
+
+        if (petScale !== null && (petScale <= 0 || petScale > 2)) {
+          await interaction.editReply({ content: 'pet_scale should be a fraction of the wearer\'s height — something like 0.1 to 1.0. Got a value outside a sane range.' });
           return;
         }
 
@@ -16845,9 +16874,9 @@ if (interaction.commandName === 'trade') {
 
         const itemId = randomUUID();
         await pool.query(
-          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only, gift_type, gift_year, heel_lift_px, gender_lock, body_variant)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
-          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly, giftType, giftYear, heelLiftPx, genderLock, bodyVariant]
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only, gift_type, gift_year, heel_lift_px, gender_lock, body_variant, pet_position, pet_scale)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
+          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly, giftType, giftYear, heelLiftPx, genderLock, bodyVariant, petPosition, petScale]
         );
 
         await pool.query(
@@ -16860,7 +16889,7 @@ if (interaction.commandName === 'trade') {
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const previewColorHex = isColorable ? AVATAR_COLOR_PALETTE[0].hex : null;
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex, heel_lift_px: heelLiftPx, body_variant: bodyVariant } };
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex, heel_lift_px: heelLiftPx, body_variant: bodyVariant, pet_position: petPosition, pet_scale: petScale } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -16898,7 +16927,7 @@ if (interaction.commandName === 'trade') {
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
         const previewColorHex = item.is_colorable ? AVATAR_COLOR_PALETTE[0].hex : null;
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex, heel_lift_px: item.heel_lift_px || 0, body_variant: item.body_variant || null } };
+        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex, heel_lift_px: item.heel_lift_px || 0, body_variant: item.body_variant || null, pet_position: item.pet_position || 'left', pet_scale: item.pet_scale || null } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -25162,7 +25191,7 @@ async function getAvatarProfileWithEquipment(userId) {
     `SELECT
        bg.item_name AS background_name, bg.id AS background_id, bg_si.art_asset_key AS background_art_key, bg.color_hex AS background_color_hex, COALESCE(bg_si.is_colorable, FALSE) AS background_is_colorable,
        eff.item_name AS effect_name, eff.id AS effect_id, eff_si.art_asset_key AS effect_art_key, eff.color_hex AS effect_color_hex, COALESCE(eff_si.is_colorable, FALSE) AS effect_is_colorable,
-       pet.item_name AS pet_name, pet.id AS pet_id, pet_si.art_asset_key AS pet_art_key, pet.color_hex AS pet_color_hex, COALESCE(pet_si.is_colorable, FALSE) AS pet_is_colorable,
+       pet.item_name AS pet_name, pet.id AS pet_id, pet_si.art_asset_key AS pet_art_key, pet.color_hex AS pet_color_hex, COALESCE(pet_si.is_colorable, FALSE) AS pet_is_colorable, COALESCE(pet_si.pet_position, 'left') AS pet_position, pet_si.pet_scale AS pet_scale,
        foot.item_name AS footwear_name, foot.id AS footwear_id, foot_si.art_asset_key AS footwear_art_key, foot.color_hex AS footwear_color_hex, COALESCE(foot_si.is_colorable, FALSE) AS footwear_is_colorable, COALESCE(foot_si.heel_lift_px, 0) AS footwear_heel_lift_px, foot_si.body_variant AS footwear_body_variant,
        bot.item_name AS bottom_name, bot.id AS bottom_id, bot_si.art_asset_key AS bottom_art_key, bot.color_hex AS bottom_color_hex, COALESCE(bot_si.is_colorable, FALSE) AS bottom_is_colorable,
        top.item_name AS top_name, top.id AS top_id, top_si.art_asset_key AS top_art_key, top.color_hex AS top_color_hex, COALESCE(top_si.is_colorable, FALSE) AS top_is_colorable,
@@ -25204,6 +25233,11 @@ async function getAvatarProfileWithEquipment(userId) {
   if (equipped.footwear) {
     equipped.footwear.heel_lift_px = Number(row.footwear_heel_lift_px) || 0;
     equipped.footwear.body_variant = row.footwear_body_variant || null;
+  }
+  // pet_position/pet_scale only exist on pet, same reasoning.
+  if (equipped.pet) {
+    equipped.pet.pet_position = row.pet_position || 'left';
+    equipped.pet.pet_scale = row.pet_scale !== null && row.pet_scale !== undefined ? Number(row.pet_scale) : null;
   }
   // Accessories are multi-equip (see avatar_equipped_accessories) — the legacy single
   // equipped.accessory field above still reflects the old equipped_accessory_id column
@@ -25849,7 +25883,7 @@ async function loadAvatarFullCanvasBuffer(slot, artKey) {
 // the single-file full-canvas loader above; every other slot is body-keyed, checked
 // against one representative body (male_athletic) since art either exists for all 8
 // bodies or none.
-const AVATAR_FULLCANVAS_SLOTS = ['background', 'effect'];
+const AVATAR_FULLCANVAS_SLOTS = ['background', 'effect', 'pet'];
 async function avatarArtExistsForSlot(slot, artKey) {
   if (!artKey) return false;
   if (AVATAR_FULLCANVAS_SLOTS.includes(slot)) {
@@ -26060,7 +26094,7 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
 
   composites.push({ input: bodyResizedBuffer, left, top: liftedTop });
 
-  // Wearable layers, in z-order (pet -> footwear -> bottom -> top -> hair -> headwear ->
+  // Wearable layers, in z-order (footwear -> bottom -> top -> hair -> headwear ->
   // accessory), each resized identically to the body so they align at the same
   // {left, top} — they were extracted from a source image cropped the same way as
   // the base bodies. Items without real art (art_asset_key null) simply don't
@@ -26069,10 +26103,10 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
   // headwear art visually covering it), since some headwear art may not fully occlude
   // hair drawn beneath it — see Avatar Item Build Roadmap. Accessories are multi-equip
   // (see equipped.accessories) so they're composited as a list, not a single slot.
-  // 'pet' and 'footwear' are excluded from the heel-lift shift below — footwear has to
-  // stay planted at the true ground line (it IS the thing creating the lift), and pet
-  // stays at ground level rather than standing on an invisible platform with the wearer.
-  const wearableLayerOrder = ['pet', 'footwear', 'bottom', 'top', 'hair', 'headwear'];
+  // 'footwear' is excluded from the heel-lift shift below — it has to stay planted at
+  // the true ground line, since it IS the thing creating the lift. Pet is handled
+  // separately after this loop — see PET_POSITIONS below.
+  const wearableLayerOrder = ['footwear', 'bottom', 'top', 'hair', 'headwear'];
   for (const slot of wearableLayerOrder) {
     if (slot === 'hair' && equipped.headwear?.art_asset_key) continue;
 
@@ -26101,7 +26135,7 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
     let layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
     const colorRgb = parseAvatarHexColor(colorHex);
     if (colorRgb) layerResizedBuffer = await applyAvatarColorize(sharp, layerResizedBuffer, colorRgb);
-    const slotTop = (slot === 'pet' || slot === 'footwear') ? top : liftedTop;
+    const slotTop = slot === 'footwear' ? top : liftedTop;
     composites.push({ input: layerResizedBuffer, left, top: slotTop });
   }
   for (const accessory of (equipped.accessories || [])) {
@@ -26112,6 +26146,70 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
     const colorRgb = parseAvatarHexColor(accessory.color_hex);
     if (colorRgb) layerResizedBuffer = await applyAvatarColorize(sharp, layerResizedBuffer, colorRgb);
     composites.push({ input: layerResizedBuffer, left, top: liftedTop });
+  }
+
+  // Pet — positioned by formula rather than the shared same-canvas-as-body trick
+  // every other slot uses (see the pet_position/pet_scale schema comments for why:
+  // floating-above-head needs a taller effective canvas, which would change the
+  // resize scale and break alignment with every other layer if done the "normal"
+  // way). Composited last/frontmost for every position — 'left'/'right' never
+  // overlap the body so front-vs-behind doesn't matter for them, and every other
+  // position needs to be in front regardless, so one unified pass covers all of them.
+  const petArtKey = equipped.pet?.art_asset_key || null;
+  if (petArtKey) {
+    const petBuffer = await loadAvatarFullCanvasBuffer('pet', petArtKey); // pets aren't body-specific art — same single-file convention as background/effect
+    if (petBuffer) {
+      const petPosition = equipped.pet?.pet_position || 'left';
+      const petScale = equipped.pet?.pet_scale || 0.3; // generic fallback until tuned per item
+      const petTargetHeight = Math.max(1, Math.round(targetHeight * petScale));
+      let petResizedBuffer = await sharp(petBuffer).resize({ height: petTargetHeight }).png().toBuffer();
+      const petColorRgb = parseAvatarHexColor(equipped.pet?.color_hex);
+      if (petColorRgb) petResizedBuffer = await applyAvatarColorize(sharp, petResizedBuffer, petColorRgb);
+      const petMeta = await sharp(petResizedBuffer).metadata();
+      const pw = petMeta.width, ph = petMeta.height;
+      const gapX = Math.round(bodyMeta.width * 0.05);
+      const gapY = Math.round(bodyMeta.height * 0.02);
+
+      // Ground positions anchor on the body's true (unlifted) top so the pet stays
+      // planted on the floor even when the wearer is elevated by heels/skates — same
+      // rationale as footwear. Body-anchored positions (shoulder, floating) use
+      // liftedTop instead, since they move with the wearer's actual body position.
+      let petLeft, petTop;
+      switch (petPosition) {
+        case 'right':
+          petLeft = left + bodyMeta.width + gapX;
+          petTop = top + bodyMeta.height - ph;
+          break;
+        case 'front':
+          petLeft = left + Math.round(bodyMeta.width / 2 - pw / 2);
+          petTop = top + bodyMeta.height - ph;
+          break;
+        case 'shoulder':
+          // Right shoulder, roughly upper-torso height. Tunable constants — nothing
+          // architectural depends on these exact fractions.
+          petLeft = left + Math.round(bodyMeta.width * 0.68 - pw / 2);
+          petTop = liftedTop + Math.round(bodyMeta.height * 0.12 - ph * 0.5);
+          break;
+        case 'float_left':
+          petLeft = left + Math.round(bodyMeta.width * 0.05 - pw * 0.3);
+          petTop = liftedTop - Math.round(ph * 0.85) - gapY;
+          break;
+        case 'float_right':
+          petLeft = left + Math.round(bodyMeta.width * 0.95 - pw * 0.7);
+          petTop = liftedTop - Math.round(ph * 0.85) - gapY;
+          break;
+        case 'float_center':
+          petLeft = left + Math.round(bodyMeta.width / 2 - pw / 2);
+          petTop = liftedTop - ph - gapY;
+          break;
+        case 'left':
+        default:
+          petLeft = left - pw - gapX;
+          petTop = top + bodyMeta.height - ph;
+          break;
+      }
+      composites.push({ input: petResizedBuffer, left: petLeft, top: petTop });
+    }
   }
 
   const effectName = equipped.effect?.item_name;
@@ -26457,7 +26555,7 @@ async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, cat
   const slotForPreview = categorySlot === 'exclusive' ? (previewItem.avatar_slot || inferAvatarSlotFromItem(previewItem)) : categorySlot;
   const isColorable = !!previewItem.is_colorable;
   const activeColorHex = isColorable ? (normalizeAvatarHexColor(selectedColorHex) || AVATAR_COLOR_PALETTE[0].hex) : null;
-  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name, art_asset_key: previewItem.art_asset_key || null, color_hex: activeColorHex, heel_lift_px: previewItem.heel_lift_px || 0, body_variant: previewItem.body_variant || null } };
+  const previewEquipped = { ...equipped, [slotForPreview]: { item_name: previewItem.item_name, art_asset_key: previewItem.art_asset_key || null, color_hex: activeColorHex, heel_lift_px: previewItem.heel_lift_px || 0, body_variant: previewItem.body_variant || null, pet_position: previewItem.pet_position || 'left', pet_scale: previewItem.pet_scale || null } };
   const embed = new EmbedBuilder()
     .setTitle(`👗 Dressing Room • ${previewItem.item_name}`)
     .setColor(0xFEE75C)
