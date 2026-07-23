@@ -26196,7 +26196,7 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
           // placed the perch itself too high (looked like it was on the ear, not
           // the shoulder). Tunable constants — nothing architectural depends on
           // these exact fractions.
-          petLeft = left + Math.round(bodyMeta.width * 0.66 - pw / 2);
+          petLeft = left + Math.round(bodyMeta.width * 0.85 - pw / 2);
           petTop = liftedTop + Math.round(bodyMeta.height * 0.22 - ph * 0.18);
           break;
         }
