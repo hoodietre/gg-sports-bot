@@ -1988,8 +1988,20 @@ async function initDatabase() {
     )
   `);
   // Only meaningful when shop_items.avatar_slot = 'accessory' — identifies which
-  // accessory_type slot (neck/wrist/face/etc.) the item occupies when equipped.
+  // accessory_type slot (neck/wrist/face/ears/legs/other) the item occupies when equipped.
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS accessory_type TEXT`);
+  // Backfill: Silver Chain, Gold Chain, Ghost Wristband, and High Roller Watch were all
+  // created before /shop createcosmetic exposed an accessory_type option (it didn't exist
+  // yet), so they were stuck defaulting to 'other' at equip/render time (see
+  // ACCESSORY_TYPES.includes(...) ? ... : 'other' fallback throughout). One-time fix now
+  // that real accessory_type values can be set going forward.
+  await pool.query(`UPDATE shop_items SET accessory_type = 'neck' WHERE avatar_slot = 'accessory' AND item_name IN ('Silver Chain', 'Gold Chain') AND accessory_type IS NULL`);
+  await pool.query(`UPDATE shop_items SET accessory_type = 'wrist' WHERE avatar_slot = 'accessory' AND item_name IN ('Ghost Wristband', 'High Roller Watch') AND accessory_type IS NULL`);
+  // Sock length is a per-owned-item, changeable-anytime attribute — same pattern as
+  // color_hex above (not fixed at purchase, editable in the dressing room). Only
+  // meaningful for the Socks item; ankle/mid/crew/high. NULL = not a length-variant item
+  // or not yet chosen, in which case render code should fall back to a default (crew).
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS sock_length TEXT`);
 
   // Serial numbers for limited-stock items: assigned once at purchase time as
   // (units already sold + 1), so buyer sees "#7/50" immediately and can look it up
@@ -3060,7 +3072,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('accessory_type').setDescription('Accessory only: which sub-slot this occupies (required for accessory items).').setRequired(false).addChoices({ name: 'neck', value: 'neck' }, { name: 'wrist', value: 'wrist' }, { name: 'face', value: 'face' }, { name: 'ears', value: 'ears' }, { name: 'legs', value: 'legs' }, { name: 'other', value: 'other' })).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false)))
@@ -16834,6 +16846,7 @@ if (interaction.commandName === 'trade') {
         const heelLiftPx = interaction.options.getInteger('heel_lift_px') || 0;
         const genderLock = interaction.options.getString('gender_lock') || null;
         const bodyVariant = interaction.options.getString('body_variant') || null;
+        const accessoryType = interaction.options.getString('accessory_type') || null;
         const petPosition = interaction.options.getString('pet_position') || null;
         const petScale = interaction.options.getNumber('pet_scale') || null;
 
@@ -16844,6 +16857,16 @@ if (interaction.commandName === 'trade') {
 
         if ((heelLiftPx || genderLock || bodyVariant) && slot !== 'footwear') {
           await interaction.editReply({ content: 'heel_lift_px, gender_lock, and body_variant only apply to footwear items.' });
+          return;
+        }
+
+        if (accessoryType && slot !== 'accessory') {
+          await interaction.editReply({ content: 'accessory_type only applies to accessory items.' });
+          return;
+        }
+
+        if (slot === 'accessory' && !accessoryType) {
+          await interaction.editReply({ content: 'accessory_type is required for accessory items — choose neck, wrist, face, ears, legs, or other.' });
           return;
         }
 
@@ -16874,9 +16897,9 @@ if (interaction.commandName === 'trade') {
 
         const itemId = randomUUID();
         await pool.query(
-          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only, gift_type, gift_year, heel_lift_px, gender_lock, body_variant, pet_position, pet_scale)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
-          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly, giftType, giftYear, heelLiftPx, genderLock, bodyVariant, petPosition, petScale]
+          `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only, gift_type, gift_year, heel_lift_px, gender_lock, body_variant, accessory_type, pet_position, pet_scale)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
+          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly, giftType, giftYear, heelLiftPx, genderLock, bodyVariant, accessoryType, petPosition, petScale]
         );
 
         await pool.query(
@@ -16889,7 +16912,17 @@ if (interaction.commandName === 'trade') {
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const previewColorHex = isColorable ? AVATAR_COLOR_PALETTE[0].hex : null;
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex, heel_lift_px: heelLiftPx, body_variant: bodyVariant, pet_position: petPosition, pet_scale: petScale } };
+        // Accessory slot is multi-equip — the renderer reads equipped.accessories (an
+        // array), not equipped.accessory (a single object), so it needs its own branch
+        // here rather than the generic [slot]: {...} spread every other slot uses.
+        // Replaces any existing preview accessory of the same accessory_type so
+        // previewing e.g. two neck items in a row doesn't stack them.
+        const previewSlotEquipped = slot === 'accessory'
+          ? { ...previewEquipped, accessories: [
+              ...(previewEquipped.accessories || []).filter(a => a.accessory_type !== accessoryType),
+              { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex, accessory_type: accessoryType },
+            ] }
+          : { ...previewEquipped, [slot]: { item_name: name, art_asset_key: finalArtKey, color_hex: previewColorHex, heel_lift_px: heelLiftPx, body_variant: bodyVariant, pet_position: petPosition, pet_scale: petScale } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -16898,7 +16931,7 @@ if (interaction.commandName === 'trade') {
           .setImage('attachment://avatar.png')
           .addFields(
             { name: 'Created Cosmetic', value: rarityIcon(rarity) + ' **' + name + '**', inline: true },
-            { name: 'Slot', value: slot, inline: true },
+            { name: 'Slot', value: slot + (accessoryType ? ` (${accessoryType})` : ''), inline: true },
             { name: 'Price', value: String(price), inline: true },
             { name: 'Art', value: finalArtKey ? `✅ Linked to \`${finalArtKey}\`` : (artKey ? `⚠️ No art found at \`assets/avatar/layers/${slot}/${artKey}/\` — item created without visual art` : '—'), inline: false },
             ...(isColorable ? [{ name: 'Colorable', value: `✅ Buyers pick any color (preview shown in ${AVATAR_COLOR_PALETTE[0].name})`, inline: false }] : [])
@@ -16927,7 +16960,15 @@ if (interaction.commandName === 'trade') {
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
         const previewColorHex = item.is_colorable ? AVATAR_COLOR_PALETTE[0].hex : null;
-        const previewSlotEquipped = { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex, heel_lift_px: item.heel_lift_px || 0, body_variant: item.body_variant || null, pet_position: item.pet_position || 'left', pet_scale: item.pet_scale || null } };
+        // Same accessory-is-multi-equip fix as createcosmetic's preview above — see
+        // that comment for why this can't use the generic [slot]: {...} spread.
+        const previewAccessoryType = ACCESSORY_TYPES.includes(item.accessory_type) ? item.accessory_type : 'other';
+        const previewSlotEquipped = slot === 'accessory'
+          ? { ...previewEquipped, accessories: [
+              ...(previewEquipped.accessories || []).filter(a => a.accessory_type !== previewAccessoryType),
+              { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex, accessory_type: previewAccessoryType },
+            ] }
+          : { ...previewEquipped, [slot]: { item_name: item.item_name, art_asset_key: item.art_asset_key || null, color_hex: previewColorHex, heel_lift_px: item.heel_lift_px || 0, body_variant: item.body_variant || null, pet_position: item.pet_position || 'left', pet_scale: item.pet_scale || null } };
 
         const attachment = await buildAvatarProfileAttachment(previewProfile, previewSlotEquipped);
         const embed = new EmbedBuilder()
@@ -24729,7 +24770,7 @@ const VISUAL_AVATAR_SLOTS = ['hair', 'headwear', 'top', 'bottom', 'accessory', '
 // Accessory items (avatar_slot = 'accessory') are further grouped by type so a player
 // can equip one of each type at once (necklace + bracelet + glasses) via
 // avatar_equipped_accessories, rather than being limited to a single accessory overall.
-const ACCESSORY_TYPES = ['neck', 'wrist', 'face', 'other'];
+const ACCESSORY_TYPES = ['neck', 'wrist', 'face', 'ears', 'legs', 'other'];
 // Total simultaneous accessories a player can have equipped at once, regardless of how
 // many distinct types exist — keeps avatars from getting visually cluttered as more
 // accessory types get added later.
