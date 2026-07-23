@@ -26197,7 +26197,7 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
           // the shoulder). Tunable constants — nothing architectural depends on
           // these exact fractions.
           petLeft = left + Math.round(bodyMeta.width * 0.85 - pw / 2);
-          petTop = liftedTop + Math.round(bodyMeta.height * 0.22 - ph * 0.18);
+          petTop = liftedTop + Math.round(bodyMeta.height * 0.16 - ph * 0.18);
           break;
         }
         case 'float_left':
