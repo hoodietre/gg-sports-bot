@@ -26481,6 +26481,7 @@ const AVATAR_SHOP_CATEGORIES = [
   { slot: 'footwear', label: 'Shoes', emoji: '👟' },
   { slot: 'headwear', label: 'Hats', emoji: '🧢' },
   { slot: 'accessory', label: 'Accessories', emoji: '💍' },
+  { slot: 'pet', label: 'Pets', emoji: '🐾' },
   { slot: 'background', label: 'Backgrounds', emoji: '🖼️' },
   { slot: 'effect', label: 'Auras', emoji: '✨' },
   { slot: 'exclusive', label: 'Exclusives', emoji: '🌟' },
