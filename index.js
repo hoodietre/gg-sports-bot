@@ -26167,8 +26167,9 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
       if (petColorRgb) petResizedBuffer = await applyAvatarColorize(sharp, petResizedBuffer, petColorRgb);
       const petMeta = await sharp(petResizedBuffer).metadata();
       const pw = petMeta.width, ph = petMeta.height;
-      const gapX = Math.round(bodyMeta.width * 0.05);
+      const gapX = Math.round(bodyMeta.width * 0.02);
       const gapY = Math.round(bodyMeta.height * 0.02);
+      const edgePad = 5; // never let a pet render fully flush against the canvas edge
 
       // Ground positions anchor on the body's true (unlifted) top so the pet stays
       // planted on the floor even when the wearer is elevated by heels/skates — same
@@ -26177,34 +26178,53 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
       let petLeft, petTop;
       switch (petPosition) {
         case 'right':
-          petLeft = left + bodyMeta.width + gapX;
+          // Clamped so a wide pet (relative to the ~180px canvas margin outside the
+          // body) never renders partially off the right edge — it'll sit closer to
+          // the body instead of clipping.
+          petLeft = Math.min(left + bodyMeta.width + gapX, width - pw - edgePad);
           petTop = top + bodyMeta.height - ph;
           break;
         case 'front':
           petLeft = left + Math.round(bodyMeta.width / 2 - pw / 2);
           petTop = top + bodyMeta.height - ph;
           break;
-        case 'shoulder':
-          // Right shoulder, roughly upper-torso height. Tunable constants — nothing
-          // architectural depends on these exact fractions.
-          petLeft = left + Math.round(bodyMeta.width * 0.68 - pw / 2);
-          petTop = liftedTop + Math.round(bodyMeta.height * 0.12 - ph * 0.5);
+        case 'shoulder': {
+          // Right shoulder. Anchored near the TOP of the pet's own bounding box,
+          // not its vertical center — a perching pose (e.g. a bird with a long
+          // tail hanging below its feet) has most of its visual mass below the
+          // actual perch point, so centering the whole bbox on the target height
+          // placed the perch itself too high (looked like it was on the ear, not
+          // the shoulder). Tunable constants — nothing architectural depends on
+          // these exact fractions.
+          petLeft = left + Math.round(bodyMeta.width * 0.66 - pw / 2);
+          petTop = liftedTop + Math.round(bodyMeta.height * 0.22 - ph * 0.18);
           break;
+        }
         case 'float_left':
-          petLeft = left + Math.round(bodyMeta.width * 0.05 - pw * 0.3);
-          petTop = liftedTop - Math.round(ph * 0.85) - gapY;
-          break;
         case 'float_right':
-          petLeft = left + Math.round(bodyMeta.width * 0.95 - pw * 0.7);
-          petTop = liftedTop - Math.round(ph * 0.85) - gapY;
+        case 'float_center': {
+          // Clamped to the actual clear space above the head (liftedTop is exactly
+          // that distance from the canvas top) rather than a fixed fraction of the
+          // pet's height — a fixed fraction clipped badly for a tall pet like the
+          // dragon, since there's usually only ~90px of headroom regardless of how
+          // big the pet's own art is. A pet too tall to fully clear the head within
+          // that space will overlap down into the hair instead of clipping off
+          // the top of the canvas entirely. The gap has to be included INSIDE the
+          // clamped budget, not added after it — adding it separately pushed the
+          // result back off-canvas even when the clamp itself looked correct.
+          const maxTotalOffset = Math.max(edgePad, liftedTop - edgePad);
+          const desiredTotalOffset = (petPosition === 'float_center' ? ph * 0.55 : ph * 0.45) + gapY;
+          const totalOffset = Math.min(desiredTotalOffset, maxTotalOffset);
+          petTop = Math.round(liftedTop - totalOffset);
+          if (petPosition === 'float_left') petLeft = left + Math.round(bodyMeta.width * 0.05 - pw * 0.3);
+          else if (petPosition === 'float_right') petLeft = left + Math.round(bodyMeta.width * 0.95 - pw * 0.7);
+          else petLeft = left + Math.round(bodyMeta.width / 2 - pw / 2);
           break;
-        case 'float_center':
-          petLeft = left + Math.round(bodyMeta.width / 2 - pw / 2);
-          petTop = liftedTop - ph - gapY;
-          break;
+        }
         case 'left':
         default:
-          petLeft = left - pw - gapX;
+          // Same clamping as 'right', mirrored — never off the left edge.
+          petLeft = Math.max(edgePad, left - pw - gapX);
           petTop = top + bodyMeta.height - ph;
           break;
       }
