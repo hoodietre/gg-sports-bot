@@ -13413,6 +13413,7 @@ if (interaction.commandName === 'avatar') {
     }
 
 
+    if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_shop_create_modal') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const name = interaction.fields.getTextInputValue('name');
       const price = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
@@ -28090,7 +28091,7 @@ async function buildAvatarShopWhatsNewPayload(guild) {
   return { embeds: [embed], components: [continueRow] };
 }
 
-
+function rarityIcon(rarity) {
   const r = String(rarity || 'common').toLowerCase();
   if (r === 'legendary') return '👑';
   if (r === 'epic') return '💎';
