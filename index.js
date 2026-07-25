@@ -6675,6 +6675,19 @@ async function ggUpdatePermanentShopPanel(guild) {
   return null;
 }
 
+// Universal (guild_id IS NULL) shop items are visible/purchasable in every server,
+// so creating/editing/removing one needs every guild's shop panel refreshed — not
+// just whichever guild the bot owner happened to run the command in. Per-guild
+// failures are caught individually so one bad guild can't block the rest.
+async function ggUpdatePermanentShopPanelAllGuilds() {
+  for (const guild of client.guilds.cache.values()) {
+    await refreshAllMultiChannelPanelPostings(guild, 'shop').catch(error => {
+      console.error(`[Shop] Universal item panel refresh failed for guild ${guild.id}:`, error);
+    });
+  }
+  return null;
+}
+
 
 
 // 7J-10BY-DC: Attribute extraction repair helpers.
@@ -8271,21 +8284,142 @@ if (interaction.commandName === 'avatar') {
       const artAssetExists = await avatarArtExistsForSlot(slot, artKey);
       const finalArtKey = artAssetExists ? artKey : null;
 
+      // guild_id is NULL — bot-owner-created cosmetics are universal, available in
+      // every server the bot is in, not just wherever the owner panel was opened.
       const itemId = randomUUID();
       await pool.query(
         `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only)
-         VALUES ($1, $2, $3, $4, $5, NULL, TRUE, $6, $6, $7, TRUE, $8, $9, $10, FALSE, FALSE)`,
-        [itemId, interaction.guild.id, name, 'Visual avatar cosmetic. Use /shop preview before buying.', price, slot, rarity, name, interaction.user.id, finalArtKey]
+         VALUES ($1, NULL, $2, $3, $4, NULL, TRUE, $5, $5, $6, TRUE, $7, $8, $9, FALSE, FALSE)`,
+        [itemId, name, 'Visual avatar cosmetic. Use /shop preview before buying.', price, slot, rarity, name, interaction.user.id, finalArtKey]
       );
       await pool.query(
         `INSERT INTO avatar_catalog (id, guild_id, item_name, slot, rarity, source, price, is_active)
-         VALUES ($1, $2, $3, $4, $5, 'shop', $6, TRUE)`,
-        [randomUUID(), interaction.guild.id, name, slot, rarity, price]
+         VALUES ($1, NULL, $2, $3, $4, 'shop', $5, TRUE)`,
+        [randomUUID(), name, slot, rarity, price]
       ).catch(() => null);
-      await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
 
       const artNote = finalArtKey ? '' : ' ⚠️ No art found at that key — item created but will render as a placeholder until art is uploaded.';
       await interaction.reply({ content: `Cosmetic created: **${name}** (${slot}, ${rarity}) for **${price}**.${artNote} For stock limits, colorable, award-only, or gift items, use \`/shop createcosmetic\`.`, ephemeral: true });
+      return;
+    }
+
+    // ---- Owner Panel: universal (non-cosmetic) shop item CRUD ----
+    // Everything below creates/edits/removes items with guild_id = NULL — visible and
+    // purchasable in every server the bot is in. Contrast with the per-guild admin
+    // panel's shop create/remove, which is scoped to a single server. All three
+    // buttons are restricted to the bot owner via isBotOwnerInteraction.
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_createitem') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('botownerpanel_createitem_modal')
+        .setTitle('Create Universal Shop Item')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Item name').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stock').setLabel('Stock (optional, blank = unlimited)').setStyle(TextInputStyle.Short).setRequired(false)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'botownerpanel_createitem_modal') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const name = interaction.fields.getTextInputValue('name');
+      const price = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
+      const description = interaction.fields.getTextInputValue('description') || null;
+      const stockRaw = interaction.fields.getTextInputValue('stock');
+      const stock = stockRaw ? Number.parseInt(stockRaw, 10) : null;
+      if (!Number.isInteger(price) || price <= 0) { await interaction.editReply({ content: 'Price must be a whole number greater than 0.' }); return; }
+      if (stock !== null && (!Number.isInteger(stock) || stock < 0)) { await interaction.editReply({ content: 'Stock must be a whole number 0 or greater.' }); return; }
+      const itemId = randomUUID();
+      await pool.query(
+        `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, created_by_user_id)
+         VALUES ($1, NULL, $2, $3, $4, $5, $6)`,
+        [itemId, name, description, price, stock, interaction.user.id]
+      );
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+      await interaction.editReply({ content: `Universal shop item created: **${shortShopItemId(itemId)} • ${name}** for **${price}**. Available in every server.` });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_removeitem') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id IS NULL AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`);
+      if (!items.rows.length) { await interaction.reply({ content: 'No active universal shop items to remove.', flags: MessageFlags.Ephemeral }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('botownerpanel_removeitem_select')
+        .setPlaceholder('Choose a universal item to remove')
+        .addOptions(items.rows.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: `Price: ${item.price}`.slice(0, 100) })));
+      await interaction.reply({ content: '**Remove Universal Shop Item**', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_removeitem_select') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const itemId = interaction.values[0];
+      await interaction.update({ content: 'Removing item…', components: [] });
+      const item = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!item.rows.length) { await interaction.editReply({ content: 'Could not find that universal shop item.', components: [] }); return; }
+      await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [itemId]);
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+      await interaction.editReply({ content: `Removed/deactivated universal shop item **${item.rows[0].item_name}**.`, components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_edititem') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id IS NULL AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`);
+      if (!items.rows.length) { await interaction.reply({ content: 'No active universal shop items to edit.', flags: MessageFlags.Ephemeral }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('botownerpanel_edititem_select')
+        .setPlaceholder('Choose a universal item to edit')
+        .addOptions(items.rows.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: `Price: ${item.price}`.slice(0, 100) })));
+      await interaction.reply({ content: '**Edit Universal Shop Item** — name, price, description, and stock only. Cosmetic-specific fields (slot, rarity, art) aren\'t editable here; recreate the cosmetic if those need to change.', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_edititem_select') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const itemId = interaction.values[0];
+      const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!result.rows.length) { await interaction.reply({ content: 'Could not find that universal shop item.', flags: MessageFlags.Ephemeral }); return; }
+      const item = result.rows[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`botownerpanel_edititem_modal:${itemId}`)
+        .setTitle('Edit Universal Shop Item')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Item name').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.item_name.slice(0, 4000))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(item.price))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((item.description || '').slice(0, 4000))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stock').setLabel('Stock (optional, blank = unlimited)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.stock === null || item.stock === undefined ? '' : String(item.stock))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_edititem_modal:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const itemId = interaction.customId.split(':')[1];
+      const existing = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!existing.rows.length) { await interaction.editReply({ content: 'Could not find that universal shop item — it may have been removed.' }); return; }
+      const name = interaction.fields.getTextInputValue('name');
+      const price = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
+      const description = interaction.fields.getTextInputValue('description') || null;
+      const stockRaw = interaction.fields.getTextInputValue('stock');
+      const stock = stockRaw ? Number.parseInt(stockRaw, 10) : null;
+      if (!Number.isInteger(price) || price <= 0) { await interaction.editReply({ content: 'Price must be a whole number greater than 0.' }); return; }
+      if (stock !== null && (!Number.isInteger(stock) || stock < 0)) { await interaction.editReply({ content: 'Stock must be a whole number 0 or greater.' }); return; }
+      await pool.query(
+        `UPDATE shop_items SET item_name = $1, price = $2, description = $3, stock = $4, updated_at = NOW() WHERE id = $5`,
+        [name, price, description, stock, itemId]
+      );
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+      await interaction.editReply({ content: `Updated universal shop item: **${name}** — **${price}**.` });
       return;
     }
 
@@ -12272,6 +12406,14 @@ if (interaction.commandName === 'avatar') {
       const action = interaction.customId.split(':')[1];
 
       if (action === 'give' || action === 'take') {
+        // Anti-abuse: only the bot owner can grant currency out of thin air — a server
+        // admin/commissioner with give access could otherwise fund their own super-team
+        // or inflate their way to exclusive rewards. Taking currency away carries no
+        // such risk, so it stays open to admins/commissioners.
+        if (action === 'give' && !isBotOwnerInteraction(interaction)) {
+          await interaction.reply({ content: 'Granting currency is restricted to the bot owner. Server admins/commissioners can still **Take Currency** or issue refunds.', ephemeral: true });
+          return;
+        }
         const userMenu = new UserSelectMenuBuilder().setCustomId(`adminpanel_econ_user:${action}`).setPlaceholder(`Choose a user to ${action} currency`);
         await interaction.reply({ content: `**${action === 'give' ? 'Give' : 'Take'} Currency** — choose a user`, components: [new ActionRowBuilder().addComponents(userMenu)], ephemeral: true });
         return;
@@ -12350,6 +12492,10 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isUserSelectMenu() && interaction.customId.startsWith('adminpanel_econ_user:')) {
       const action = interaction.customId.split(':')[1];
+      if (action === 'give' && !isBotOwnerInteraction(interaction)) {
+        await interaction.reply({ content: 'Granting currency is restricted to the bot owner.', ephemeral: true });
+        return;
+      }
       const targetUserId = interaction.values[0];
       const modal = new ModalBuilder()
         .setCustomId(`adminpanel_econ_modal:${action}:${targetUserId}`)
@@ -12369,6 +12515,7 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isModalSubmit() && interaction.customId.startsWith('adminpanel_econ_modal:')) {
       const [, action, targetUserId] = interaction.customId.split(':');
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (action === 'give' && !isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'Granting currency is restricted to the bot owner.', ephemeral: true }); return; }
       const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
       const reason = interaction.fields.getTextInputValue('reason') || (action === 'give' ? 'Staff currency adjustment' : 'Staff currency adjustment');
       if (!Number.isInteger(amount) || amount <= 0) {
@@ -12409,8 +12556,11 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (action === 'remove') {
-        const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`, [interaction.guild.id]);
-        if (!items.rows.length) { await interaction.reply({ content: 'No active shop items to remove.', ephemeral: true }); return; }
+        // Scoped to items this admin personally created for this server — universal
+        // (bot-owner) items and other admins' items never show up here, so there's
+        // nothing to select-and-delete outside what's actually theirs to remove.
+        const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id = $1 AND created_by_user_id = $2 AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`, [interaction.guild.id, interaction.user.id]);
+        if (!items.rows.length) { await interaction.reply({ content: 'No active shop items to remove. You can only remove items you personally created for this server.', ephemeral: true }); return; }
         const menu = new StringSelectMenuBuilder()
           .setCustomId('adminpanel_shop_remove_select')
           .setPlaceholder('Choose an item to remove')
@@ -12447,6 +12597,12 @@ if (interaction.commandName === 'avatar') {
       await interaction.update({ content: 'Removing item…', components: [] });
       const item = await findShopItem(interaction.guild.id, itemId);
       if (!item) { await interaction.editReply({ content: 'Could not find that shop item.', components: [] }); return; }
+      // Re-verify even though the select list was already scoped — never trust a
+      // component value alone for a destructive action.
+      if (item.guild_id === null || String(item.guild_id) !== String(interaction.guild.id) || String(item.created_by_user_id) !== String(interaction.user.id)) {
+        await interaction.editReply({ content: 'You can only remove shop items you created yourself for this server.', components: [] });
+        return;
+      }
       await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
       await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
       await interaction.editReply({ content: `Removed/deactivated shop item **${item.item_name}**.`, components: [] });
@@ -16746,6 +16902,13 @@ if (interaction.commandName === 'trade') {
           return;
         }
 
+        // Anti-abuse: only the bot owner can grant currency. See adminpanel_econ:give
+        // for the full reasoning — same restriction, different entry point.
+        if (economySubcommand === 'give' && !isBotOwnerInteraction(interaction)) {
+          await interaction.reply({ content: 'Granting currency is restricted to the bot owner. You can still use /economy take.', ephemeral: true });
+          return;
+        }
+
         const targetUser = interaction.options.getUser('user');
         const amount = interaction.options.getInteger('amount');
         const reason = interaction.options.getString('reason') || 'Staff currency adjustment';
@@ -16921,20 +17084,22 @@ if (interaction.commandName === 'trade') {
         const artAssetExists = await avatarArtExistsForSlot(slot, artKey);
         const finalArtKey = artAssetExists ? artKey : null;
 
+        // guild_id is NULL — bot-owner-created cosmetics are universal, available for
+        // purchase in every server the bot is in, not just wherever this was run.
         const itemId = randomUUID();
         await pool.query(
           `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, preview_style, created_by_user_id, art_asset_key, is_colorable, is_award_only, gift_type, gift_year, heel_lift_px, gender_lock, body_variant, accessory_type, pet_position, pet_scale)
-           VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $7, $8, TRUE, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
-          [itemId, interaction.guild.id, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly, giftType, giftYear, heelLiftPx, genderLock, bodyVariant, accessoryType, petPosition, petScale]
+           VALUES ($1, NULL, $2, $3, $4, $5, TRUE, $6, $6, $7, TRUE, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
+          [itemId, name, description, price, stock, slot, rarity, name, interaction.user.id, finalArtKey, isColorable, isAwardOnly, giftType, giftYear, heelLiftPx, genderLock, bodyVariant, accessoryType, petPosition, petScale]
         );
 
         await pool.query(
           `INSERT INTO avatar_catalog (id, guild_id, item_name, slot, rarity, source, price, is_active)
-           VALUES ($1, $2, $3, $4, $5, 'shop', $6, TRUE)`,
-          [randomUUID(), interaction.guild.id, name, slot, rarity, price]
+           VALUES ($1, NULL, $2, $3, $4, 'shop', $5, TRUE)`,
+          [randomUUID(), name, slot, rarity, price]
         ).catch(() => null);
 
-        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+        await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
 
         const { profile: previewProfile, equipped: previewEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
         const previewColorHex = isColorable ? AVATAR_COLOR_PALETTE[0].hex : null;
@@ -17211,8 +17376,28 @@ if (shopSubcommand === 'view') {
           return;
         }
 
+        // findShopItem intentionally matches universal items (guild_id IS NULL) too, so
+        // it can't be trusted alone to scope what a regular admin is allowed to delete.
+        // Anti-abuse: admins can only remove items they personally created for their own
+        // server — never universal (bot-owner) items, never another admin's items. The
+        // bot owner bypasses this entirely and can remove anything from anywhere.
+        if (!isBotOwnerInteraction(interaction)) {
+          if (item.guild_id === null) {
+            await interaction.reply({ content: 'That is a universal item created by the bot owner — it can\'t be removed by server admins.', ephemeral: true });
+            return;
+          }
+          if (String(item.guild_id) !== String(interaction.guild.id) || String(item.created_by_user_id) !== String(interaction.user.id)) {
+            await interaction.reply({ content: 'You can only remove shop items you created yourself for this server.', ephemeral: true });
+            return;
+          }
+        }
+
         await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
-        await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+        if (item.guild_id === null) {
+          await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+        } else {
+          await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+        }
         await interaction.reply({ content: 'Removed/deactivated shop item **' + item.item_name + '**.', ephemeral: true });
         return;
       }
@@ -20332,6 +20517,13 @@ if (shopSubcommand === 'view') {
       if (!interaction.guild) return;
       if (!(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'You do not have permission to use bank controls.', ephemeral: true });
+        return;
+      }
+
+      // Anti-abuse: only the bot owner can grant currency through the bank. See
+      // adminpanel_econ:give for the full reasoning — same restriction, different entry point.
+      if (interaction.commandName === 'givecurrency' && !isBotOwnerInteraction(interaction)) {
+        await interaction.reply({ content: 'Granting currency is restricted to the bot owner. You can still use /takecurrency.', ephemeral: true });
         return;
       }
 
@@ -56528,7 +56720,12 @@ function buildBotOwnerPanelHomeComponents() {
     new ButtonBuilder().setCustomId('botownerpanel_payoutbounds_edit').setLabel('Edit Payout Bounds').setEmoji('📏').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('botownerpanel_createcosmetic').setLabel('Create Cosmetic').setEmoji('🎨').setStyle(ButtonStyle.Success),
   );
-  return [row1, row2];
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('botownerpanel_createitem').setLabel('Create Item').setEmoji('📦').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('botownerpanel_edititem').setLabel('Edit Item').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('botownerpanel_removeitem').setLabel('Remove Item').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
+  );
+  return [row1, row2, row3];
 }
 
 function buildBotOwnerPanelBackRow() {
