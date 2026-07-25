@@ -224,16 +224,27 @@ async function initDatabase() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
-  // language: server-selected bot language, English ('en') is the default. Note: this
-  // stores the preference and drives the admin panel selector, but does not yet
-  // translate the bot's actual output — that's a much larger follow-up effort (every
-  // user-facing string would need to route through a translation layer). Scoped here
-  // to just the setting + infrastructure per this session's ask.
+  // language: server-selected bot language, English ('en') is the default. Resolved
+  // via getEffectiveLanguage (personal override in user_language_preferences always
+  // wins over this). Real translations live in TRANSLATIONS/t() — currently covers
+  // the Admin Panel surface (Phase 1); see the tracking doc for the ordered rollout
+  // plan covering the rest of the bot.
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en'`);
   // onboarding_enabled: gates the automatic new-member welcome DM (league/team select
   // prompt) sent on GuildMemberAdd. Does not affect the one-time new-server-owner DM
   // sent on GuildCreate, since that fires before any admin has had a chance to toggle it.
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS onboarding_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+
+  // Personal language override — deliberately NOT guild-scoped. A member's language
+  // choice is theirs across every server the bot is in, and takes priority over
+  // whatever that server's admin set. See getEffectiveLanguage.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_language_preferences (
+      user_id TEXT PRIMARY KEY,
+      language TEXT NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leagues (
@@ -5209,6 +5220,9 @@ const SUPPORTED_LANGUAGES = [
   { value: 'fr', label: 'Français', emoji: '🇫🇷' },
   { value: 'de', label: 'Deutsch', emoji: '🇩🇪' },
   { value: 'pt', label: 'Português', emoji: '🇵🇹' },
+  { value: 'ja', label: '日本語', emoji: '🇯🇵' },
+  { value: 'ko', label: '한국어', emoji: '🇰🇷' },
+  { value: 'zh-TW', label: '繁體中文', emoji: '🇹🇼' },
 ];
 
 // Server-wide language + onboarding-DM preference. Lazily creates the guilds row if
@@ -5236,6 +5250,409 @@ async function setGuildLanguage(guildId, guildName, language) {
 async function setGuildOnboardingEnabled(guildId, guildName, enabled) {
   await getGuildSettings(guildId, guildName); // ensure row exists
   await pool.query(`UPDATE guilds SET onboarding_enabled = $2 WHERE guild_id = $1`, [guildId, enabled]);
+}
+
+// Resolution priority: a member's own language choice (set via the Member Profile
+// panel) always wins, regardless of what server they're in or what that server's
+// admin set. Falls back to the server's admin-set default, falls back to English.
+// guildId is optional — DMs/contexts with no guild just use the user's own setting.
+async function getEffectiveLanguage(guildId, userId) {
+  if (userId) {
+    const userResult = await pool.query(`SELECT language FROM user_language_preferences WHERE user_id = $1`, [userId]);
+    const userLang = userResult.rows[0]?.language;
+    if (userLang && SUPPORTED_LANGUAGES.some(l => l.value === userLang)) return userLang;
+  }
+  if (guildId) {
+    const guildResult = await pool.query(`SELECT language FROM guilds WHERE guild_id = $1`, [guildId]);
+    const guildLang = guildResult.rows[0]?.language;
+    if (guildLang && SUPPORTED_LANGUAGES.some(l => l.value === guildLang)) return guildLang;
+  }
+  return 'en';
+}
+
+async function setUserLanguage(userId, language) {
+  await pool.query(
+    `INSERT INTO user_language_preferences (user_id, language, updated_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET language = $2, updated_at = NOW()`,
+    [userId, language]
+  );
+}
+
+async function clearUserLanguage(userId) {
+  await pool.query(`DELETE FROM user_language_preferences WHERE user_id = $1`, [userId]);
+}
+
+// ---- i18n: Phase 1 (Admin Panel surface) ----
+// Real, human-written translations — not machine filler — covering the Admin Panel's
+// navigation, all six category payloads, and the shared permission-denial message.
+// This is a deliberately bounded first phase, not full bot coverage — see the
+// tracking doc for the ordered rollout plan covering the rest of the bot's surfaces.
+const TRANSLATIONS = {
+  en: {
+    admin_panel_title: '🛠️ {guildName} • Admin Panel',
+    admin_panel_description: 'Server-wide controls — not tied to any one league. Pick a category below. Old slash commands still work as advanced/manual backups.',
+    admin_panel_footer: 'GG Sports • Admin Panel',
+    admin_panel_category_placeholder: 'Choose a category',
+    admin_panel_back: '⬅ Back to Overview',
+    admin_panel_no_permission: 'You do not have permission to use the admin panel.',
+    cat_leagues_label: 'League Setup', cat_leagues_desc: 'Create/delete leagues, add team roles',
+    cat_economy_label: 'Economy', cat_economy_desc: 'Give/take currency, richest, transactions',
+    cat_shop_label: 'Shop', cat_shop_desc: 'Create/remove items, view active listings',
+    cat_sportsbook_label: 'Sportsbook', cat_sportsbook_desc: 'Create/settle/refund games',
+    cat_tournament_label: 'Tournaments', cat_tournament_desc: 'Create and manage tournaments',
+    cat_settings_label: 'Server Settings', cat_settings_desc: 'Language, onboarding DM toggle',
+    league_setup_title: '🏟️ League Setup',
+    league_setup_none: 'No leagues created yet.',
+    league_setup_teamrole_placeholder: 'Choose a league to add a team role to',
+    league_setup_delete_placeholder: 'Choose a league to delete',
+    league_setup_create_button: 'Create League',
+    economy_title: '💰 Economy • {currencyName} (Global)',
+    economy_total_circulation: 'Total In Circulation (Global)',
+    economy_users_with_balance: 'Users With Balance (Global)',
+    economy_top5: '**Top 5 Richest (Global)**',
+    economy_no_balances: 'No balances found yet.',
+    economy_give_button: 'Give Currency', economy_take_button: 'Take Currency',
+    economy_transactions_button: 'Recent Transactions', economy_settings_button: 'Currency Settings',
+    economy_give_restricted: 'Granting currency is restricted to the bot owner. Server admins/commissioners can still **Take Currency** or issue refunds.',
+    shop_title: '🛍️ Server Shop',
+    shop_none: 'No active shop items yet.',
+    shop_create_button: 'Create Item', shop_remove_button: 'Remove Item',
+    sportsbook_limits_field: 'Server Bet/Payout Limits',
+    sportsbook_create_button: 'Create Game', sportsbook_settle_button: 'Settle Game',
+    sportsbook_refund_button: 'Refund Game', sportsbook_limits_button: 'Limits',
+    settings_title: '⚙️ Server Settings',
+    settings_language_field: 'Language (Beta)', settings_onboarding_field: 'New Member Onboarding DM',
+    settings_onboarding_enabled: '✅ Enabled', settings_onboarding_disabled: '🚫 Disabled',
+    settings_description: 'Language changes what every admin and member without a personal override sees across the whole bot in this server. Members can still set their own personal language in their Member Profile, which always overrides this.\n\nThe onboarding DM is the automatic welcome message (with league/team select) new members get when they join. Turning it off doesn\'t affect the one-time welcome DM sent to you when the bot was first added.',
+    settings_language_placeholder: 'Change bot language (Beta)',
+    settings_onboarding_disable_button: 'Disable Onboarding DM', settings_onboarding_enable_button: 'Enable Onboarding DM',
+    memberprofile_language_button: 'Language (Beta)',
+    memberprofile_language_placeholder: 'Choose your personal language (Beta)',
+    memberprofile_language_set: 'Your personal language is now set to **{language}** — this overrides the server default everywhere the bot talks to you.',
+    memberprofile_language_reset_button: 'Use Server Default',
+    memberprofile_language_reset_done: 'Personal language override cleared — you\'ll now see the server\'s default language.',
+  },
+  es: {
+    admin_panel_title: '🛠️ {guildName} • Panel de Administración',
+    admin_panel_description: 'Controles de todo el servidor — no vinculados a ninguna liga en particular. Elige una categoría abajo. Los comandos de barra antiguos siguen funcionando como respaldo manual/avanzado.',
+    admin_panel_footer: 'GG Sports • Panel de Administración',
+    admin_panel_category_placeholder: 'Elige una categoría',
+    admin_panel_back: '⬅ Volver al resumen',
+    admin_panel_no_permission: 'No tienes permiso para usar el panel de administración.',
+    cat_leagues_label: 'Configuración de Liga', cat_leagues_desc: 'Crear/eliminar ligas, añadir roles de equipo',
+    cat_economy_label: 'Economía', cat_economy_desc: 'Dar/quitar moneda, más ricos, transacciones',
+    cat_shop_label: 'Tienda', cat_shop_desc: 'Crear/eliminar artículos, ver listados activos',
+    cat_sportsbook_label: 'Casa de Apuestas', cat_sportsbook_desc: 'Crear/liquidar/reembolsar partidos',
+    cat_tournament_label: 'Torneos', cat_tournament_desc: 'Crear y gestionar torneos',
+    cat_settings_label: 'Configuración del Servidor', cat_settings_desc: 'Idioma, activar/desactivar DM de bienvenida',
+    league_setup_title: '🏟️ Configuración de Liga',
+    league_setup_none: 'Aún no se han creado ligas.',
+    league_setup_teamrole_placeholder: 'Elige una liga para añadir un rol de equipo',
+    league_setup_delete_placeholder: 'Elige una liga para eliminar',
+    league_setup_create_button: 'Crear Liga',
+    economy_title: '💰 Economía • {currencyName} (Global)',
+    economy_total_circulation: 'Total en Circulación (Global)',
+    economy_users_with_balance: 'Usuarios con Saldo (Global)',
+    economy_top5: '**Top 5 Más Ricos (Global)**',
+    economy_no_balances: 'Aún no se encontraron saldos.',
+    economy_give_button: 'Dar Moneda', economy_take_button: 'Quitar Moneda',
+    economy_transactions_button: 'Transacciones Recientes', economy_settings_button: 'Configuración de Moneda',
+    economy_give_restricted: 'Otorgar moneda está restringido al propietario del bot. Los administradores/comisionados del servidor aún pueden **Quitar Moneda** o emitir reembolsos.',
+    shop_title: '🛍️ Tienda del Servidor',
+    shop_none: 'Aún no hay artículos activos en la tienda.',
+    shop_create_button: 'Crear Artículo', shop_remove_button: 'Eliminar Artículo',
+    sportsbook_limits_field: 'Límites de Apuestas/Pagos del Servidor',
+    sportsbook_create_button: 'Crear Partido', sportsbook_settle_button: 'Liquidar Partido',
+    sportsbook_refund_button: 'Reembolsar Partido', sportsbook_limits_button: 'Límites',
+    settings_title: '⚙️ Configuración del Servidor',
+    settings_language_field: 'Idioma (Beta)', settings_onboarding_field: 'DM de Bienvenida para Nuevos Miembros',
+    settings_onboarding_enabled: '✅ Activado', settings_onboarding_disabled: '🚫 Desactivado',
+    settings_description: 'El idioma cambia lo que ven todos los administradores y miembros sin una preferencia personal en todo el bot en este servidor. Los miembros aún pueden establecer su propio idioma personal en su Perfil de Miembro, que siempre anula esta configuración.\n\nEl DM de bienvenida es el mensaje automático (con selección de liga/equipo) que reciben los nuevos miembros al unirse. Desactivarlo no afecta el DM de bienvenida único que recibiste cuando se añadió el bot por primera vez.',
+    settings_language_placeholder: 'Cambiar idioma del bot (Beta)',
+    settings_onboarding_disable_button: 'Desactivar DM de Bienvenida', settings_onboarding_enable_button: 'Activar DM de Bienvenida',
+    memberprofile_language_button: 'Idioma (Beta)',
+    memberprofile_language_placeholder: 'Elige tu idioma personal (Beta)',
+    memberprofile_language_set: 'Tu idioma personal ahora está configurado en **{language}** — esto anula el idioma predeterminado del servidor en todas partes donde el bot te hable.',
+    memberprofile_language_reset_button: 'Usar Idioma del Servidor',
+    memberprofile_language_reset_done: 'Preferencia de idioma personal eliminada — ahora verás el idioma predeterminado del servidor.',
+  },
+  fr: {
+    admin_panel_title: "🛠️ {guildName} • Panneau d'Administration",
+    admin_panel_description: "Contrôles à l'échelle du serveur — non liés à une ligue en particulier. Choisissez une catégorie ci-dessous. Les anciennes commandes slash fonctionnent toujours comme solution de secours avancée/manuelle.",
+    admin_panel_footer: "GG Sports • Panneau d'Administration",
+    admin_panel_category_placeholder: 'Choisissez une catégorie',
+    admin_panel_back: "⬅ Retour à l'aperçu",
+    admin_panel_no_permission: "Vous n'avez pas la permission d'utiliser le panneau d'administration.",
+    cat_leagues_label: 'Configuration de Ligue', cat_leagues_desc: "Créer/supprimer des ligues, ajouter des rôles d'équipe",
+    cat_economy_label: 'Économie', cat_economy_desc: 'Donner/retirer de la monnaie, plus riches, transactions',
+    cat_shop_label: 'Boutique', cat_shop_desc: 'Créer/supprimer des articles, voir les annonces actives',
+    cat_sportsbook_label: 'Paris Sportifs', cat_sportsbook_desc: 'Créer/régler/rembourser des matchs',
+    cat_tournament_label: 'Tournois', cat_tournament_desc: 'Créer et gérer des tournois',
+    cat_settings_label: 'Paramètres du Serveur', cat_settings_desc: "Langue, activation/désactivation du DM d'accueil",
+    league_setup_title: '🏟️ Configuration de Ligue',
+    league_setup_none: 'Aucune ligue créée pour l\'instant.',
+    league_setup_teamrole_placeholder: "Choisissez une ligue pour ajouter un rôle d'équipe",
+    league_setup_delete_placeholder: 'Choisissez une ligue à supprimer',
+    league_setup_create_button: 'Créer une Ligue',
+    economy_title: '💰 Économie • {currencyName} (Global)',
+    economy_total_circulation: 'Total en Circulation (Global)',
+    economy_users_with_balance: 'Utilisateurs avec Solde (Global)',
+    economy_top5: '**Top 5 des Plus Riches (Global)**',
+    economy_no_balances: 'Aucun solde trouvé pour l\'instant.',
+    economy_give_button: 'Donner de la Monnaie', economy_take_button: 'Retirer de la Monnaie',
+    economy_transactions_button: 'Transactions Récentes', economy_settings_button: 'Paramètres de Monnaie',
+    economy_give_restricted: 'Octroyer de la monnaie est réservé au propriétaire du bot. Les administrateurs/commissaires du serveur peuvent toujours **Retirer de la Monnaie** ou effectuer des remboursements.',
+    shop_title: '🛍️ Boutique du Serveur',
+    shop_none: 'Aucun article actif dans la boutique pour l\'instant.',
+    shop_create_button: 'Créer un Article', shop_remove_button: 'Supprimer un Article',
+    sportsbook_limits_field: 'Limites de Paris/Paiements du Serveur',
+    sportsbook_create_button: 'Créer un Match', sportsbook_settle_button: 'Régler le Match',
+    sportsbook_refund_button: 'Rembourser le Match', sportsbook_limits_button: 'Limites',
+    settings_title: '⚙️ Paramètres du Serveur',
+    settings_language_field: 'Langue (Bêta)', settings_onboarding_field: 'DM d\'Accueil pour les Nouveaux Membres',
+    settings_onboarding_enabled: '✅ Activé', settings_onboarding_disabled: '🚫 Désactivé',
+    settings_description: "La langue change ce que voient tous les administrateurs et membres sans préférence personnelle, dans tout le bot sur ce serveur. Les membres peuvent toujours définir leur propre langue personnelle dans leur Profil de Membre, qui remplace toujours ce paramètre.\n\nLe DM d'accueil est le message automatique (avec sélection de ligue/équipe) envoyé aux nouveaux membres lors de leur arrivée. Le désactiver n'affecte pas le DM d'accueil unique que vous avez reçu lors de l'ajout initial du bot.",
+    settings_language_placeholder: 'Changer la langue du bot (Bêta)',
+    settings_onboarding_disable_button: "Désactiver le DM d'Accueil", settings_onboarding_enable_button: "Activer le DM d'Accueil",
+    memberprofile_language_button: 'Langue (Bêta)',
+    memberprofile_language_placeholder: 'Choisissez votre langue personnelle (Bêta)',
+    memberprofile_language_set: 'Votre langue personnelle est maintenant définie sur **{language}** — cela remplace la langue par défaut du serveur partout où le bot vous parle.',
+    memberprofile_language_reset_button: 'Utiliser la Langue du Serveur',
+    memberprofile_language_reset_done: 'Préférence de langue personnelle supprimée — vous verrez maintenant la langue par défaut du serveur.',
+  },
+  de: {
+    admin_panel_title: '🛠️ {guildName} • Admin-Panel',
+    admin_panel_description: 'Serverweite Einstellungen — nicht an eine bestimmte Liga gebunden. Wähle unten eine Kategorie. Alte Slash-Befehle funktionieren weiterhin als erweiterte/manuelle Backups.',
+    admin_panel_footer: 'GG Sports • Admin-Panel',
+    admin_panel_category_placeholder: 'Wähle eine Kategorie',
+    admin_panel_back: '⬅ Zurück zur Übersicht',
+    admin_panel_no_permission: 'Du hast keine Berechtigung, das Admin-Panel zu verwenden.',
+    cat_leagues_label: 'Liga-Einrichtung', cat_leagues_desc: 'Ligen erstellen/löschen, Team-Rollen hinzufügen',
+    cat_economy_label: 'Wirtschaft', cat_economy_desc: 'Währung geben/entziehen, Reichste, Transaktionen',
+    cat_shop_label: 'Shop', cat_shop_desc: 'Artikel erstellen/entfernen, aktive Angebote ansehen',
+    cat_sportsbook_label: 'Wettbüro', cat_sportsbook_desc: 'Spiele erstellen/abrechnen/erstatten',
+    cat_tournament_label: 'Turniere', cat_tournament_desc: 'Turniere erstellen und verwalten',
+    cat_settings_label: 'Servereinstellungen', cat_settings_desc: 'Sprache, Onboarding-DM ein-/ausschalten',
+    league_setup_title: '🏟️ Liga-Einrichtung',
+    league_setup_none: 'Noch keine Ligen erstellt.',
+    league_setup_teamrole_placeholder: 'Wähle eine Liga, um eine Team-Rolle hinzuzufügen',
+    league_setup_delete_placeholder: 'Wähle eine zu löschende Liga',
+    league_setup_create_button: 'Liga Erstellen',
+    economy_title: '💰 Wirtschaft • {currencyName} (Global)',
+    economy_total_circulation: 'Gesamt im Umlauf (Global)',
+    economy_users_with_balance: 'Nutzer mit Guthaben (Global)',
+    economy_top5: '**Top 5 Reichste (Global)**',
+    economy_no_balances: 'Noch keine Guthaben gefunden.',
+    economy_give_button: 'Währung Geben', economy_take_button: 'Währung Entziehen',
+    economy_transactions_button: 'Letzte Transaktionen', economy_settings_button: 'Währungseinstellungen',
+    economy_give_restricted: 'Das Vergeben von Währung ist dem Bot-Besitzer vorbehalten. Server-Admins/Kommissare können weiterhin **Währung entziehen** oder Rückerstattungen vornehmen.',
+    shop_title: '🛍️ Server-Shop',
+    shop_none: 'Noch keine aktiven Shop-Artikel.',
+    shop_create_button: 'Artikel Erstellen', shop_remove_button: 'Artikel Entfernen',
+    sportsbook_limits_field: 'Server-Wett-/Auszahlungslimits',
+    sportsbook_create_button: 'Spiel Erstellen', sportsbook_settle_button: 'Spiel Abrechnen',
+    sportsbook_refund_button: 'Spiel Erstatten', sportsbook_limits_button: 'Limits',
+    settings_title: '⚙️ Servereinstellungen',
+    settings_language_field: 'Sprache (Beta)', settings_onboarding_field: 'Onboarding-DM für neue Mitglieder',
+    settings_onboarding_enabled: '✅ Aktiviert', settings_onboarding_disabled: '🚫 Deaktiviert',
+    settings_description: 'Die Sprache ändert, was alle Admins und Mitglieder ohne persönliche Einstellung im gesamten Bot auf diesem Server sehen. Mitglieder können weiterhin ihre eigene persönliche Sprache in ihrem Mitgliederprofil festlegen, die diese Einstellung immer überschreibt.\n\nDie Onboarding-DM ist die automatische Willkommensnachricht (mit Liga-/Team-Auswahl), die neue Mitglieder beim Beitritt erhalten. Das Deaktivieren betrifft nicht die einmalige Willkommens-DM, die du erhalten hast, als der Bot erstmals hinzugefügt wurde.',
+    settings_language_placeholder: 'Bot-Sprache ändern (Beta)',
+    settings_onboarding_disable_button: 'Onboarding-DM Deaktivieren', settings_onboarding_enable_button: 'Onboarding-DM Aktivieren',
+    memberprofile_language_button: 'Sprache (Beta)',
+    memberprofile_language_placeholder: 'Wähle deine persönliche Sprache (Beta)',
+    memberprofile_language_set: 'Deine persönliche Sprache ist jetzt auf **{language}** eingestellt — dies überschreibt die Server-Standardsprache überall, wo der Bot mit dir spricht.',
+    memberprofile_language_reset_button: 'Serverstandard Verwenden',
+    memberprofile_language_reset_done: 'Persönliche Spracheinstellung entfernt — du siehst jetzt die Standardsprache des Servers.',
+  },
+  pt: {
+    admin_panel_title: '🛠️ {guildName} • Painel de Administração',
+    admin_panel_description: 'Controles de todo o servidor — não vinculados a nenhuma liga específica. Escolha uma categoria abaixo. Os comandos de barra antigos ainda funcionam como backup manual/avançado.',
+    admin_panel_footer: 'GG Sports • Painel de Administração',
+    admin_panel_category_placeholder: 'Escolha uma categoria',
+    admin_panel_back: '⬅ Voltar à Visão Geral',
+    admin_panel_no_permission: 'Você não tem permissão para usar o painel de administração.',
+    cat_leagues_label: 'Configuração de Liga', cat_leagues_desc: 'Criar/excluir ligas, adicionar cargos de equipe',
+    cat_economy_label: 'Economia', cat_economy_desc: 'Dar/retirar moeda, mais ricos, transações',
+    cat_shop_label: 'Loja', cat_shop_desc: 'Criar/remover itens, ver listagens ativas',
+    cat_sportsbook_label: 'Casa de Apostas', cat_sportsbook_desc: 'Criar/liquidar/reembolsar jogos',
+    cat_tournament_label: 'Torneios', cat_tournament_desc: 'Criar e gerenciar torneios',
+    cat_settings_label: 'Configurações do Servidor', cat_settings_desc: 'Idioma, alternar DM de integração',
+    league_setup_title: '🏟️ Configuração de Liga',
+    league_setup_none: 'Nenhuma liga criada ainda.',
+    league_setup_teamrole_placeholder: 'Escolha uma liga para adicionar um cargo de equipe',
+    league_setup_delete_placeholder: 'Escolha uma liga para excluir',
+    league_setup_create_button: 'Criar Liga',
+    economy_title: '💰 Economia • {currencyName} (Global)',
+    economy_total_circulation: 'Total em Circulação (Global)',
+    economy_users_with_balance: 'Usuários com Saldo (Global)',
+    economy_top5: '**Top 5 Mais Ricos (Global)**',
+    economy_no_balances: 'Nenhum saldo encontrado ainda.',
+    economy_give_button: 'Dar Moeda', economy_take_button: 'Retirar Moeda',
+    economy_transactions_button: 'Transações Recentes', economy_settings_button: 'Configurações de Moeda',
+    economy_give_restricted: 'Conceder moeda é restrito ao proprietário do bot. Administradores/comissários do servidor ainda podem **Retirar Moeda** ou emitir reembolsos.',
+    shop_title: '🛍️ Loja do Servidor',
+    shop_none: 'Nenhum item ativo na loja ainda.',
+    shop_create_button: 'Criar Item', shop_remove_button: 'Remover Item',
+    sportsbook_limits_field: 'Limites de Apostas/Pagamentos do Servidor',
+    sportsbook_create_button: 'Criar Jogo', sportsbook_settle_button: 'Liquidar Jogo',
+    sportsbook_refund_button: 'Reembolsar Jogo', sportsbook_limits_button: 'Limites',
+    settings_title: '⚙️ Configurações do Servidor',
+    settings_language_field: 'Idioma (Beta)', settings_onboarding_field: 'DM de Integração para Novos Membros',
+    settings_onboarding_enabled: '✅ Ativado', settings_onboarding_disabled: '🚫 Desativado',
+    settings_description: 'O idioma muda o que todos os administradores e membros sem uma preferência pessoal veem em todo o bot neste servidor. Os membros ainda podem definir seu próprio idioma pessoal no Perfil de Membro, que sempre substitui esta configuração.\n\nO DM de integração é a mensagem automática de boas-vindas (com seleção de liga/equipe) que novos membros recebem ao entrar. Desativá-lo não afeta o DM de boas-vindas único que você recebeu quando o bot foi adicionado pela primeira vez.',
+    settings_language_placeholder: 'Alterar idioma do bot (Beta)',
+    settings_onboarding_disable_button: 'Desativar DM de Integração', settings_onboarding_enable_button: 'Ativar DM de Integração',
+    memberprofile_language_button: 'Idioma (Beta)',
+    memberprofile_language_placeholder: 'Escolha seu idioma pessoal (Beta)',
+    memberprofile_language_set: 'Seu idioma pessoal agora está definido como **{language}** — isso substitui o idioma padrão do servidor em todos os lugares onde o bot fala com você.',
+    memberprofile_language_reset_button: 'Usar Padrão do Servidor',
+    memberprofile_language_reset_done: 'Preferência de idioma pessoal removida — agora você verá o idioma padrão do servidor.',
+  },
+  ja: {
+    admin_panel_title: '🛠️ {guildName} • 管理パネル',
+    admin_panel_description: 'サーバー全体の設定です — 特定のリーグに限定されません。下からカテゴリーを選んでください。従来のスラッシュコマンドも、詳細操作・手動バックアップとして引き続き使用できます。',
+    admin_panel_footer: 'GG Sports • 管理パネル',
+    admin_panel_category_placeholder: 'カテゴリーを選択',
+    admin_panel_back: '⬅ 概要に戻る',
+    admin_panel_no_permission: '管理パネルを使用する権限がありません。',
+    cat_leagues_label: 'リーグ設定', cat_leagues_desc: 'リーグの作成・削除、チームロールの追加',
+    cat_economy_label: '経済', cat_economy_desc: '通貨の付与・没収、ランキング、取引履歴',
+    cat_shop_label: 'ショップ', cat_shop_desc: 'アイテムの作成・削除、出品中のアイテムを確認',
+    cat_sportsbook_label: 'スポーツブック', cat_sportsbook_desc: '試合の作成・精算・払い戻し',
+    cat_tournament_label: 'トーナメント', cat_tournament_desc: 'トーナメントの作成と管理',
+    cat_settings_label: 'サーバー設定', cat_settings_desc: '言語設定、オンボーディングDMの切り替え',
+    league_setup_title: '🏟️ リーグ設定',
+    league_setup_none: 'まだリーグが作成されていません。',
+    league_setup_teamrole_placeholder: 'チームロールを追加するリーグを選択',
+    league_setup_delete_placeholder: '削除するリーグを選択',
+    league_setup_create_button: 'リーグを作成',
+    economy_title: '💰 経済 • {currencyName}（グローバル）',
+    economy_total_circulation: '総流通量（グローバル）',
+    economy_users_with_balance: '残高保有ユーザー数（グローバル）',
+    economy_top5: '**トップ5 最も裕福なユーザー（グローバル）**',
+    economy_no_balances: 'まだ残高が見つかりません。',
+    economy_give_button: '通貨を付与', economy_take_button: '通貨を没収',
+    economy_transactions_button: '最近の取引', economy_settings_button: '通貨設定',
+    economy_give_restricted: '通貨の付与はボット所有者のみに制限されています。サーバー管理者・コミッショナーは引き続き**通貨を没収**したり、払い戻しを行うことができます。',
+    shop_title: '🛍️ サーバーショップ',
+    shop_none: 'まだ有効なショップアイテムがありません。',
+    shop_create_button: 'アイテムを作成', shop_remove_button: 'アイテムを削除',
+    sportsbook_limits_field: 'サーバーの賭け金・払戻上限',
+    sportsbook_create_button: '試合を作成', sportsbook_settle_button: '試合を精算',
+    sportsbook_refund_button: '試合を払い戻し', sportsbook_limits_button: '上限設定',
+    settings_title: '⚙️ サーバー設定',
+    settings_language_field: '言語（ベータ版）', settings_onboarding_field: '新規メンバー向けオンボーディングDM',
+    settings_onboarding_enabled: '✅ 有効', settings_onboarding_disabled: '🚫 無効',
+    settings_description: '言語設定は、個人設定を行っていないすべての管理者・メンバーがこのサーバーでボット全体に表示される言語を変更します。メンバーは自分のメンバープロフィールで個人の言語を設定することもでき、その設定は常にこの設定より優先されます。\n\nオンボーディングDMは、新規メンバーが参加した際に送信される自動ウェルカムメッセージ（リーグ・チーム選択付き）です。これを無効にしても、ボットが最初に追加されたときに送られた一度限りのウェルカムDMには影響しません。',
+    settings_language_placeholder: 'ボットの言語を変更 （ベータ版）',
+    settings_onboarding_disable_button: 'オンボーディングDMを無効化', settings_onboarding_enable_button: 'オンボーディングDMを有効化',
+    memberprofile_language_button: '言語（ベータ版）',
+    memberprofile_language_placeholder: '個人の言語を選択 （ベータ版）',
+    memberprofile_language_set: 'あなたの個人言語は **{language}** に設定されました — これにより、ボットがあなたに話しかける際は常にサーバーの既定言語より優先されます。',
+    memberprofile_language_reset_button: 'サーバーの既定設定を使用',
+    memberprofile_language_reset_done: '個人の言語設定を解除しました — 今後はサーバーの既定言語が表示されます。',
+  },
+  ko: {
+    admin_panel_title: '🛠️ {guildName} • 관리자 패널',
+    admin_panel_description: '서버 전체 설정입니다 — 특정 리그에 종속되지 않습니다. 아래에서 카테고리를 선택하세요. 기존 슬래시 명령어도 고급/수동 백업 용도로 계속 사용할 수 있습니다.',
+    admin_panel_footer: 'GG Sports • 관리자 패널',
+    admin_panel_category_placeholder: '카테고리를 선택하세요',
+    admin_panel_back: '⬅ 개요로 돌아가기',
+    admin_panel_no_permission: '관리자 패널을 사용할 권한이 없습니다.',
+    cat_leagues_label: '리그 설정', cat_leagues_desc: '리그 생성/삭제, 팀 역할 추가',
+    cat_economy_label: '경제', cat_economy_desc: '화폐 지급/회수, 최고 부자, 거래 내역',
+    cat_shop_label: '상점', cat_shop_desc: '아이템 생성/삭제, 활성 목록 보기',
+    cat_sportsbook_label: '스포츠북', cat_sportsbook_desc: '경기 생성/정산/환불',
+    cat_tournament_label: '토너먼트', cat_tournament_desc: '토너먼트 생성 및 관리',
+    cat_settings_label: '서버 설정', cat_settings_desc: '언어, 온보딩 DM 전환',
+    league_setup_title: '🏟️ 리그 설정',
+    league_setup_none: '아직 생성된 리그가 없습니다.',
+    league_setup_teamrole_placeholder: '팀 역할을 추가할 리그를 선택하세요',
+    league_setup_delete_placeholder: '삭제할 리그를 선택하세요',
+    league_setup_create_button: '리그 생성',
+    economy_title: '💰 경제 • {currencyName} (전체)',
+    economy_total_circulation: '총 유통량 (전체)',
+    economy_users_with_balance: '잔액 보유 사용자 (전체)',
+    economy_top5: '**최고 부자 TOP 5 (전체)**',
+    economy_no_balances: '아직 잔액이 없습니다.',
+    economy_give_button: '화폐 지급', economy_take_button: '화폐 회수',
+    economy_transactions_button: '최근 거래 내역', economy_settings_button: '화폐 설정',
+    economy_give_restricted: '화폐 지급은 봇 소유자만 가능합니다. 서버 관리자/커미셔너는 여전히 **화폐 회수** 또는 환불을 진행할 수 있습니다.',
+    shop_title: '🛍️ 서버 상점',
+    shop_none: '아직 활성화된 상점 아이템이 없습니다.',
+    shop_create_button: '아이템 생성', shop_remove_button: '아이템 삭제',
+    sportsbook_limits_field: '서버 베팅/지급 한도',
+    sportsbook_create_button: '경기 생성', sportsbook_settle_button: '경기 정산',
+    sportsbook_refund_button: '경기 환불', sportsbook_limits_button: '한도 설정',
+    settings_title: '⚙️ 서버 설정',
+    settings_language_field: '언어 (베타)', settings_onboarding_field: '신규 멤버 온보딩 DM',
+    settings_onboarding_enabled: '✅ 활성화됨', settings_onboarding_disabled: '🚫 비활성화됨',
+    settings_description: '언어 설정은 개인 설정을 하지 않은 모든 관리자와 멤버가 이 서버에서 봇 전체에 걸쳐 보게 되는 언어를 변경합니다. 멤버는 자신의 멤버 프로필에서 개인 언어를 설정할 수 있으며, 이는 항상 이 설정보다 우선합니다.\n\n온보딩 DM은 신규 멤버가 가입할 때 받는 자동 환영 메시지(리그/팀 선택 포함)입니다. 이를 비활성화해도 봇이 처음 추가되었을 때 보낸 일회성 환영 DM에는 영향을 주지 않습니다.',
+    settings_language_placeholder: '봇 언어 변경 (베타)',
+    settings_onboarding_disable_button: '온보딩 DM 비활성화', settings_onboarding_enable_button: '온보딩 DM 활성화',
+    memberprofile_language_button: '언어 (베타)',
+    memberprofile_language_placeholder: '개인 언어를 선택하세요 (베타)',
+    memberprofile_language_set: '개인 언어가 **{language}**(으)로 설정되었습니다 — 이제 봇이 회원님께 말할 때는 항상 서버 기본 설정보다 이 설정이 우선합니다.',
+    memberprofile_language_reset_button: '서버 기본값 사용',
+    memberprofile_language_reset_done: '개인 언어 설정이 해제되었습니다 — 이제 서버의 기본 언어가 표시됩니다.',
+  },
+  'zh-TW': {
+    admin_panel_title: '🛠️ {guildName} • 管理面板',
+    admin_panel_description: '伺服器全域設定 — 不綁定於任何特定聯盟。請在下方選擇一個類別。舊版斜線指令仍可作為進階／手動備用方式使用。',
+    admin_panel_footer: 'GG Sports • 管理面板',
+    admin_panel_category_placeholder: '選擇一個類別',
+    admin_panel_back: '⬅ 返回總覽',
+    admin_panel_no_permission: '您沒有使用管理面板的權限。',
+    cat_leagues_label: '聯盟設定', cat_leagues_desc: '建立／刪除聯盟，新增隊伍身分組',
+    cat_economy_label: '經濟', cat_economy_desc: '發放／扣除貨幣、富豪榜、交易紀錄',
+    cat_shop_label: '商店', cat_shop_desc: '建立／移除商品，檢視上架中的商品',
+    cat_sportsbook_label: '博彩', cat_sportsbook_desc: '建立／結算／退款賽事',
+    cat_tournament_label: '錦標賽', cat_tournament_desc: '建立與管理錦標賽',
+    cat_settings_label: '伺服器設定', cat_settings_desc: '語言、新手引導私訊開關',
+    league_setup_title: '🏟️ 聯盟設定',
+    league_setup_none: '尚未建立任何聯盟。',
+    league_setup_teamrole_placeholder: '選擇要新增隊伍身分組的聯盟',
+    league_setup_delete_placeholder: '選擇要刪除的聯盟',
+    league_setup_create_button: '建立聯盟',
+    economy_title: '💰 經濟 • {currencyName}（全域）',
+    economy_total_circulation: '總流通量（全域）',
+    economy_users_with_balance: '有餘額的使用者（全域）',
+    economy_top5: '**前5名首富（全域）**',
+    economy_no_balances: '尚未找到任何餘額。',
+    economy_give_button: '發放貨幣', economy_take_button: '扣除貨幣',
+    economy_transactions_button: '最近交易紀錄', economy_settings_button: '貨幣設定',
+    economy_give_restricted: '發放貨幣僅限機器人擁有者操作。伺服器管理員／委員仍可**扣除貨幣**或進行退款。',
+    shop_title: '🛍️ 伺服器商店',
+    shop_none: '目前沒有上架中的商店商品。',
+    shop_create_button: '建立商品', shop_remove_button: '移除商品',
+    sportsbook_limits_field: '伺服器下注／派彩上限',
+    sportsbook_create_button: '建立賽事', sportsbook_settle_button: '結算賽事',
+    sportsbook_refund_button: '賽事退款', sportsbook_limits_button: '上限設定',
+    settings_title: '⚙️ 伺服器設定',
+    settings_language_field: '語言（測試版）', settings_onboarding_field: '新成員新手引導私訊',
+    settings_onboarding_enabled: '✅ 已啟用', settings_onboarding_disabled: '🚫 已停用',
+    settings_description: '語言設定會變更所有未設定個人語言的管理員與成員，在此伺服器中看到的機器人介面語言。成員仍可在自己的會員檔案中設定個人語言，該設定永遠優先於此項設定。\n\n新手引導私訊是新成員加入時收到的自動歡迎訊息（含聯盟／隊伍選擇）。停用此功能不會影響機器人剛加入伺服器時發送的一次性歡迎私訊。',
+    settings_language_placeholder: '變更機器人語言（測試版）',
+    settings_onboarding_disable_button: '停用新手引導私訊', settings_onboarding_enable_button: '啟用新手引導私訊',
+    memberprofile_language_button: '語言（測試版）',
+    memberprofile_language_placeholder: '選擇您的個人語言（測試版）',
+    memberprofile_language_set: '您的個人語言已設定為 **{language}** — 這將優先於伺服器預設語言，適用於機器人與您的所有互動。',
+    memberprofile_language_reset_button: '使用伺服器預設值',
+    memberprofile_language_reset_done: '已清除個人語言設定 — 您現在將看到伺服器的預設語言。',
+  },
+};
+
+// Translation lookup: t('es', 'admin_panel_title') → looks up TRANSLATIONS.es first,
+// falls back to TRANSLATIONS.en, falls back to the key itself so a missing
+// translation degrades to a visible-but-ugly string instead of crashing. vars is an
+// optional {name: value} map for simple {name}-style interpolation within a string.
+function t(language, key, vars = {}) {
+  const dict = TRANSLATIONS[language] || TRANSLATIONS.en;
+  let str = dict[key] ?? TRANSLATIONS.en[key] ?? key;
+  for (const [varName, value] of Object.entries(vars)) {
+    str = str.replaceAll(`{${varName}}`, String(value));
+  }
+  return str;
 }
 
 // Server-wide sportsbook betting/payout bounds — distinct from a single game's
@@ -8425,7 +8842,7 @@ if (interaction.commandName === 'avatar') {
         .setCustomId('botownerpanel_edititem_select')
         .setPlaceholder('Choose a universal item to edit')
         .addOptions(items.rows.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: `Price: ${item.price}`.slice(0, 100) })));
-      await interaction.reply({ content: '**Edit Universal Shop Item** — name, price, description, and stock only. Cosmetic-specific fields (slot, rarity, art) aren\'t editable here; recreate the cosmetic if those need to change.', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: '**Edit Universal Shop Item** — for cosmetics you\'ll get a choice of which fields to edit (core / cosmetic details / slot-specific); other items go straight to core fields.', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -8435,16 +8852,155 @@ if (interaction.commandName === 'avatar') {
       const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
       if (!result.rows.length) { await interaction.reply({ content: 'Could not find that universal shop item.', flags: MessageFlags.Ephemeral }); return; }
       const item = result.rows[0];
+
+      if (!item.is_cosmetic) {
+        await interaction.showModal(buildEditItemCoreModal(item));
+        return;
+      }
+
+      // Cosmetics have more editable surface area than fits in one 5-field modal, so
+      // route through a picker instead of showing a modal directly. Slot itself is
+      // deliberately NOT offered — changing an item's fundamental equip slot after
+      // it may already be purchased/equipped risks breaking inventory/render
+      // assumptions elsewhere; recreate the cosmetic if the slot itself is wrong.
+      const slotFieldsApply = ['footwear', 'accessory', 'pet'].includes(item.avatar_slot);
+      const buttons = [
+        new ButtonBuilder().setCustomId(`botownerpanel_edititem_core:${itemId}`).setLabel('Core (name/price/desc/stock)').setEmoji('📝').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`botownerpanel_edititem_cosmetic:${itemId}`).setLabel('Cosmetic (rarity/art/colorable/etc.)').setEmoji('🎨').setStyle(ButtonStyle.Primary),
+      ];
+      if (slotFieldsApply) {
+        buttons.push(new ButtonBuilder().setCustomId(`botownerpanel_edititem_slotfields:${itemId}`).setLabel(`Slot-Specific (${item.avatar_slot})`).setEmoji('🔧').setStyle(ButtonStyle.Secondary));
+      }
+      await interaction.reply({
+        content: `**Edit ${item.item_name}** — which fields?\nSlot: \`${item.avatar_slot}\` (not editable — recreate the cosmetic if this needs to change)`,
+        components: [new ActionRowBuilder().addComponents(...buttons)],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('botownerpanel_edititem_core:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const itemId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!result.rows.length) { await interaction.reply({ content: 'Could not find that universal shop item.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.showModal(buildEditItemCoreModal(result.rows[0]));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('botownerpanel_edititem_cosmetic:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const itemId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!result.rows.length) { await interaction.reply({ content: 'Could not find that universal shop item.', flags: MessageFlags.Ephemeral }); return; }
+      const item = result.rows[0];
       const modal = new ModalBuilder()
-        .setCustomId(`botownerpanel_edititem_modal:${itemId}`)
-        .setTitle('Edit Universal Shop Item')
+        .setCustomId(`botownerpanel_edititem_cosmetic_modal:${itemId}`)
+        .setTitle('Edit Cosmetic Details')
         .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Item name').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.item_name.slice(0, 4000))),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(item.price))),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((item.description || '').slice(0, 4000))),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stock').setLabel('Stock (optional, blank = unlimited)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.stock === null || item.stock === undefined ? '' : String(item.stock))),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rarity').setLabel('Rarity (common/uncommon/rare/epic/legendary)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.rarity || 'common')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('art_key').setLabel('Art key (links to assets/avatar/layers/{slot}/)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.art_asset_key || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('colorable').setLabel('Colorable? (yes/no)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.is_colorable ? 'yes' : 'no')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_only').setLabel('Award-only? (yes/no)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.is_award_only ? 'yes' : 'no')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gift_type').setLabel('Gift type (blank/birthday/christmas)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.gift_type || '')),
         );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_edititem_cosmetic_modal:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const itemId = interaction.customId.split(':')[1];
+      const existing = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!existing.rows.length) { await interaction.editReply({ content: 'Could not find that universal shop item — it may have been removed.' }); return; }
+      const item = existing.rows[0];
+
+      const rarity = String(interaction.fields.getTextInputValue('rarity') || 'common').toLowerCase().trim();
+      if (!['common', 'uncommon', 'rare', 'epic', 'legendary'].includes(rarity)) {
+        await interaction.editReply({ content: 'Invalid rarity. Use common, uncommon, rare, epic, or legendary.' });
+        return;
+      }
+      const artKeyRaw = interaction.fields.getTextInputValue('art_key').toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      const artAssetExists = artKeyRaw ? await avatarArtExistsForSlot(item.avatar_slot, artKeyRaw) : false;
+      const finalArtKey = artAssetExists ? artKeyRaw : null;
+      const colorableRaw = interaction.fields.getTextInputValue('colorable').toLowerCase().trim();
+      const awardOnlyRaw = interaction.fields.getTextInputValue('award_only').toLowerCase().trim();
+      const isColorable = ['yes', 'true', 'y'].includes(colorableRaw);
+      const isAwardOnly = ['yes', 'true', 'y'].includes(awardOnlyRaw);
+      const giftTypeRaw = interaction.fields.getTextInputValue('gift_type').toLowerCase().trim();
+      const giftType = ['birthday', 'christmas'].includes(giftTypeRaw) ? giftTypeRaw : null;
+
+      await pool.query(
+        `UPDATE shop_items SET rarity = $1, art_asset_key = $2, is_colorable = $3, is_award_only = $4, gift_type = $5, updated_at = NOW() WHERE id = $6`,
+        [rarity, finalArtKey, isColorable, isAwardOnly, giftType, itemId]
+      );
+      await pool.query(`UPDATE avatar_catalog SET rarity = $1 WHERE item_name = $2 AND slot = $3 AND guild_id IS NULL`, [rarity, item.item_name, item.avatar_slot]).catch(() => null);
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+
+      const artNote = interaction.fields.getTextInputValue('art_key') && !artAssetExists ? ' ⚠️ No art found at that key — cleared, will render as a placeholder until fixed.' : '';
+      await interaction.editReply({ content: `Updated cosmetic details for **${item.item_name}**: rarity **${rarity}**, colorable **${isColorable ? 'yes' : 'no'}**, award-only **${isAwardOnly ? 'yes' : 'no'}**.${artNote}` });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('botownerpanel_edititem_slotfields:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const itemId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!result.rows.length) { await interaction.reply({ content: 'Could not find that universal shop item.', flags: MessageFlags.Ephemeral }); return; }
+      const item = result.rows[0];
+      const modal = new ModalBuilder().setCustomId(`botownerpanel_edititem_slotfields_modal:${itemId}`).setTitle(`Edit ${item.avatar_slot} Fields`);
+
+      if (item.avatar_slot === 'footwear') {
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('heel_lift_px').setLabel('Heel lift, px (blank = flush to ground)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.heel_lift_px ? String(item.heel_lift_px) : '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gender_lock').setLabel('Gender lock (blank/male/female)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.gender_lock || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('body_variant').setLabel('Body variant folder (blank = none)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.body_variant || '')),
+        );
+      } else if (item.avatar_slot === 'accessory') {
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('accessory_type').setLabel('Accessory type (neck/wrist/face/ears/legs/other)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.accessory_type || '')),
+        );
+      } else if (item.avatar_slot === 'pet') {
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pet_position').setLabel('Pet position (left/right/front/shoulder/float_left/float_right/float_center)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.pet_position || 'left')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pet_scale').setLabel('Pet scale (fraction of wearer height, e.g. 0.35)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.pet_scale ? String(item.pet_scale) : '')),
+        );
+      }
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_edititem_slotfields_modal:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const itemId = interaction.customId.split(':')[1];
+      const existing = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!existing.rows.length) { await interaction.editReply({ content: 'Could not find that universal shop item — it may have been removed.' }); return; }
+      const item = existing.rows[0];
+
+      if (item.avatar_slot === 'footwear') {
+        const heelLiftRaw = interaction.fields.getTextInputValue('heel_lift_px');
+        const heelLiftPx = heelLiftRaw ? Number.parseInt(heelLiftRaw, 10) : 0;
+        if (!Number.isInteger(heelLiftPx) || heelLiftPx < 0) { await interaction.editReply({ content: 'Heel lift must be a whole number 0 or greater.' }); return; }
+        const genderLockRaw = interaction.fields.getTextInputValue('gender_lock').toLowerCase().trim();
+        const genderLock = ['male', 'female'].includes(genderLockRaw) ? genderLockRaw : null;
+        const bodyVariant = interaction.fields.getTextInputValue('body_variant').trim() || null;
+        await pool.query(`UPDATE shop_items SET heel_lift_px = $1, gender_lock = $2, body_variant = $3, updated_at = NOW() WHERE id = $4`, [heelLiftPx, genderLock, bodyVariant, itemId]);
+      } else if (item.avatar_slot === 'accessory') {
+        const accessoryType = interaction.fields.getTextInputValue('accessory_type').toLowerCase().trim();
+        if (!['neck', 'wrist', 'face', 'ears', 'legs', 'other'].includes(accessoryType)) { await interaction.editReply({ content: 'accessory_type must be one of: neck, wrist, face, ears, legs, other.' }); return; }
+        await pool.query(`UPDATE shop_items SET accessory_type = $1, updated_at = NOW() WHERE id = $2`, [accessoryType, itemId]);
+      } else if (item.avatar_slot === 'pet') {
+        const petPosition = interaction.fields.getTextInputValue('pet_position').toLowerCase().trim();
+        if (!['left', 'right', 'front', 'shoulder', 'float_left', 'float_right', 'float_center'].includes(petPosition)) { await interaction.editReply({ content: 'Invalid pet_position — see the field label for valid options.' }); return; }
+        const petScaleRaw = interaction.fields.getTextInputValue('pet_scale');
+        const petScale = petScaleRaw ? Number.parseFloat(petScaleRaw) : null;
+        if (petScale !== null && (Number.isNaN(petScale) || petScale <= 0 || petScale > 2)) { await interaction.editReply({ content: 'pet_scale should be a fraction of the wearer\'s height — something like 0.1 to 1.0.' }); return; }
+        await pool.query(`UPDATE shop_items SET pet_position = $1, pet_scale = $2, updated_at = NOW() WHERE id = $3`, [petPosition, petScale, itemId]);
+      }
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+      await interaction.editReply({ content: `Updated ${item.avatar_slot}-specific fields for **${item.item_name}**.` });
       return;
     }
 
@@ -12337,6 +12893,44 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // ---- Member Profile: personal language override ----
+    // Deliberately NOT guild-scoped — a member's language choice follows them to every
+    // server the bot is in, and always wins over that server's admin-set default (see
+    // getEffectiveLanguage). Sports fans are a global audience; this and the Admin
+    // Panel language selector are the two places that preference is set.
+    if (interaction.isButton() && interaction.customId === 'memberprofile_language') {
+      const currentLang = await getEffectiveLanguage(interaction.guild?.id, interaction.user.id);
+      const personalResult = await pool.query(`SELECT language FROM user_language_preferences WHERE user_id = $1`, [interaction.user.id]);
+      const hasPersonalOverride = Boolean(personalResult.rows[0]?.language);
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('memberprofile_language_select')
+        .setPlaceholder(t(currentLang, 'memberprofile_language_placeholder'))
+        .addOptions(SUPPORTED_LANGUAGES.map(l => ({ label: l.label, value: l.value, emoji: l.emoji, default: l.value === currentLang })));
+      const components = [new ActionRowBuilder().addComponents(menu)];
+      if (hasPersonalOverride) {
+        components.push(new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('memberprofile_language_reset').setLabel(t(currentLang, 'memberprofile_language_reset_button')).setEmoji('↩️').setStyle(ButtonStyle.Secondary)
+        ));
+      }
+      await interaction.reply({ components, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'memberprofile_language_select') {
+      const language = interaction.values[0];
+      await setUserLanguage(interaction.user.id, language);
+      const langLabel = SUPPORTED_LANGUAGES.find(l => l.value === language)?.label || language;
+      await interaction.update({ content: t(language, 'memberprofile_language_set', { language: langLabel }), components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'memberprofile_language_reset') {
+      await clearUserLanguage(interaction.user.id);
+      const serverLang = await getEffectiveLanguage(interaction.guild?.id, null);
+      await interaction.update({ content: t(serverLang, 'memberprofile_language_reset_done'), components: [] });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'adminpanel_league_create') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true }); return; }
       const modal = new ModalBuilder()
@@ -12367,7 +12961,7 @@ if (interaction.commandName === 'avatar') {
       const savedLeague = await getLeagueByName(interaction.guild.id, leagueName);
       await pool.query(`INSERT INTO league_settings (league_id) VALUES ($1) ON CONFLICT (league_id) DO NOTHING`, [savedLeague.league_id]);
       await interaction.deferReply({ ephemeral: true });
-      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.editReply({ content: `League created: **${leagueName}** (${gameKey.toUpperCase()}).`, ...payload });
       return;
     }
@@ -12386,7 +12980,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'adminpanel_league_delete_abort') {
-      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: 'Delete cancelled.', ...payload });
       return;
     }
@@ -12397,7 +12991,7 @@ if (interaction.commandName === 'avatar') {
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
       await pool.query(`UPDATE leagues SET is_active = FALSE WHERE league_id = $1`, [leagueId]);
-      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: `League deactivated: **${league.league_name}**.`, ...payload });
       return;
     }
@@ -12431,25 +13025,25 @@ if (interaction.commandName === 'avatar') {
         [leagueId, role.id, role.name]
       );
       await interaction.deferReply({ ephemeral: true });
-      const payload = await buildAdminLeagueSetupPayload(interaction.guild);
+      const payload = await buildAdminLeagueSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.editReply({ content: `Added **${role.name}** as a team in **${league.league_name}**.`, ...payload });
       return;
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_category') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       await showAdminPanelCategory(interaction, interaction.values[0], { update: true });
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'adminpanel_back') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       await showAdminPanelHome(interaction, { update: true });
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('adminpanel_econ:')) {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const action = interaction.customId.split(':')[1];
 
       if (action === 'give' || action === 'take') {
@@ -12496,7 +13090,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'adminpanel_econ_settings_edit') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const currentSettings = await getCurrencySettings(interaction.guild.id);
       const modal = new ModalBuilder()
         .setCustomId('adminpanel_econ_settings_modal')
@@ -12511,7 +13105,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_econ_settings_modal') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const winPayout = Number.parseInt(interaction.fields.getTextInputValue('win_payout'), 10);
       const gamePlayedPayout = Number.parseInt(interaction.fields.getTextInputValue('game_played_payout'), 10);
       const awardPayout = Number.parseInt(interaction.fields.getTextInputValue('award_payout'), 10);
@@ -12561,7 +13155,7 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('adminpanel_econ_modal:')) {
       const [, action, targetUserId] = interaction.customId.split(':');
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       if (action === 'give' && !isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'Granting currency is restricted to the bot owner.', ephemeral: true }); return; }
       const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
       const reason = interaction.fields.getTextInputValue('reason') || (action === 'give' ? 'Staff currency adjustment' : 'Staff currency adjustment');
@@ -12585,25 +13179,25 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_settings_language_select') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const language = interaction.values[0];
       await setGuildLanguage(interaction.guild.id, interaction.guild.name, language);
-      const payload = await buildAdminSettingsPayload(interaction.guild);
+      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: null, ...payload });
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'adminpanel_settings_onboarding_toggle') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const current = await getGuildSettings(interaction.guild.id, interaction.guild.name);
       await setGuildOnboardingEnabled(interaction.guild.id, interaction.guild.name, !current.onboarding_enabled);
-      const payload = await buildAdminSettingsPayload(interaction.guild);
+      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: null, ...payload });
       return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('adminpanel_shop:')) {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const action = interaction.customId.split(':')[1];
 
       if (action === 'create') {
@@ -12637,7 +13231,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_shop_create_modal') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const name = interaction.fields.getTextInputValue('name');
       const price = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
       const description = interaction.fields.getTextInputValue('description') || null;
@@ -12657,7 +13251,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_shop_remove_select') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const itemId = interaction.values[0];
       await interaction.update({ content: 'Removing item…', components: [] });
       const item = await findShopItem(interaction.guild.id, itemId);
@@ -12675,7 +13269,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('adminpanel_sb:')) {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const action = interaction.customId.split(':')[1];
 
       if (action === 'create') {
@@ -12728,7 +13322,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_sb_create_modal') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const label = interaction.fields.getTextInputValue('label');
       const home = interaction.fields.getTextInputValue('home');
       const away = interaction.fields.getTextInputValue('away');
@@ -12761,7 +13355,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('adminpanel_sb_settle_winner:')) {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const gameId = interaction.customId.split(':')[1];
       const winner = interaction.values[0];
       await interaction.update({ content: 'Settling game…', components: [] });
@@ -12777,7 +13371,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_sb_refund_game') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const gameId = interaction.values[0];
       await interaction.update({ content: 'Refunding game…', components: [] });
       const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
@@ -16690,12 +17284,14 @@ if (interaction.commandName === 'commissioner') {
 
       if (adminSubcommand === 'panel') {
         if (!(await userCanUseLeagueSetup(interaction, null))) {
-          await interaction.reply({ content: 'You do not have permission to open the admin panel.', ephemeral: true });
+          const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
+          await interaction.reply({ content: t(lang, 'admin_panel_no_permission'), ephemeral: true });
           return;
         }
+        const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
         await interaction.reply({
-          embeds: [buildAdminPanelHomeEmbed(interaction.guild)],
-          components: buildAdminPanelHomeComponents(),
+          embeds: [buildAdminPanelHomeEmbed(interaction.guild, lang)],
+          components: buildAdminPanelHomeComponents(lang),
           ephemeral: true,
         });
         return;
@@ -23161,6 +23757,20 @@ function shortShopItemId(itemId) {
   return String(itemId || '').split('-')[0];
 }
 
+// Shared by both edit-item flows (non-cosmetics go straight here; cosmetics reach it
+// via the "Core" button since they have too many editable fields for one modal).
+function buildEditItemCoreModal(item) {
+  return new ModalBuilder()
+    .setCustomId(`botownerpanel_edititem_modal:${item.id}`)
+    .setTitle('Edit Universal Shop Item')
+    .addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Item name').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.item_name.slice(0, 4000))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(item.price))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((item.description || '').slice(0, 4000))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stock').setLabel('Stock (optional, blank = unlimited)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.stock === null || item.stock === undefined ? '' : String(item.stock))),
+    );
+}
+
 function shortInventoryItemId(itemId) {
   return String(itemId || '').split('-')[0];
 }
@@ -28078,7 +28688,7 @@ function buildMemberProfileStarterComponents() {
   )];
 }
 
-function buildMemberProfileHomeComponents() {
+function buildMemberProfileHomeComponents(lang = 'en') {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('memberprofile_category')
     .setPlaceholder('Choose a section')
@@ -28088,6 +28698,7 @@ function buildMemberProfileHomeComponents() {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('memberprofile_stream').setLabel('Connect Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('memberprofile_birthday').setLabel('Set Birthday').setEmoji('🎂').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('memberprofile_language').setLabel(t(lang, 'memberprofile_language_button')).setEmoji('🌐').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -28099,8 +28710,9 @@ function buildMemberProfileBackRow() {
 }
 
 async function showMemberProfileHome(interaction, targetUser, { update = false } = {}) {
+  const lang = await getEffectiveLanguage(interaction.guild?.id, interaction.user.id);
   const { embed, attachment } = await buildFranchiseHubPayload(interaction.guild, targetUser, null);
-  const payload = { content: null, embeds: [embed], files: [attachment], components: buildMemberProfileHomeComponents() };
+  const payload = { content: null, embeds: [embed], files: [attachment], components: buildMemberProfileHomeComponents(lang) };
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
 }
 
@@ -33872,79 +34484,82 @@ async function showMaddenGmPanelCategory(interaction, leagueId, teamName, catego
 // sportsbook. Consolidates existing staff-only slash commands into one panel,
 // same pattern as the Commissioner and GM panels.
 // ---------------------------------------------------------------------------
-const ADMIN_PANEL_CATEGORIES = [
-  { value: 'leagues', label: 'League Setup', description: 'Create/delete leagues, add team roles', emoji: '🏟️' },
-  { value: 'economy', label: 'Economy', description: 'Give/take currency, richest, transactions', emoji: '💰' },
-  { value: 'shop', label: 'Shop', description: 'Create/remove items, view active listings', emoji: '🛍️' },
-  { value: 'sportsbook', label: 'Sportsbook', description: 'Create/settle/refund games', emoji: '📊' },
-  { value: 'tournament', label: 'Tournaments', description: 'Create and manage tournaments', emoji: '🏆' },
-  { value: 'settings', label: 'Server Settings', description: 'Language, onboarding DM toggle', emoji: '⚙️' },
-];
+function getAdminPanelCategories(lang) {
+  return [
+    { value: 'leagues', label: t(lang, 'cat_leagues_label'), description: t(lang, 'cat_leagues_desc'), emoji: '🏟️' },
+    { value: 'economy', label: t(lang, 'cat_economy_label'), description: t(lang, 'cat_economy_desc'), emoji: '💰' },
+    { value: 'shop', label: t(lang, 'cat_shop_label'), description: t(lang, 'cat_shop_desc'), emoji: '🛍️' },
+    { value: 'sportsbook', label: t(lang, 'cat_sportsbook_label'), description: t(lang, 'cat_sportsbook_desc'), emoji: '📊' },
+    { value: 'tournament', label: t(lang, 'cat_tournament_label'), description: t(lang, 'cat_tournament_desc'), emoji: '🏆' },
+    { value: 'settings', label: t(lang, 'cat_settings_label'), description: t(lang, 'cat_settings_desc'), emoji: '⚙️' },
+  ];
+}
 
-function buildAdminPanelHomeEmbed(guild) {
+function buildAdminPanelHomeEmbed(guild, lang) {
   return new EmbedBuilder()
-    .setTitle(`🛠️ ${guild.name} • Admin Panel`)
+    .setTitle(t(lang, 'admin_panel_title', { guildName: guild.name }))
     .setColor(0x5865F2)
-    .setDescription('Server-wide controls — not tied to any one league. Pick a category below. Old slash commands still work as advanced/manual backups.')
-    .setFooter({ text: 'GG Sports • Admin Panel' })
+    .setDescription(t(lang, 'admin_panel_description'))
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
 }
 
-function buildAdminPanelHomeComponents() {
+function buildAdminPanelHomeComponents(lang) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('adminpanel_category')
-    .setPlaceholder('Choose a category')
-    .addOptions(ADMIN_PANEL_CATEGORIES.map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
+    .setPlaceholder(t(lang, 'admin_panel_category_placeholder'))
+    .addOptions(getAdminPanelCategories(lang).map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
   return [new ActionRowBuilder().addComponents(menu)];
 }
 
-function buildAdminPanelBackRow() {
+function buildAdminPanelBackRow(lang) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Overview').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('adminpanel_back').setLabel(t(lang, 'admin_panel_back')).setStyle(ButtonStyle.Secondary)
   );
 }
 
 async function showAdminPanelHome(interaction, { update = true } = {}) {
-  const payload = { content: null, embeds: [buildAdminPanelHomeEmbed(interaction.guild)], components: buildAdminPanelHomeComponents() };
+  const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
+  const payload = { content: null, embeds: [buildAdminPanelHomeEmbed(interaction.guild, lang)], components: buildAdminPanelHomeComponents(lang) };
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
 }
 
-async function buildAdminLeagueSetupPayload(guild) {
+async function buildAdminLeagueSetupPayload(guild, lang) {
   const result = await pool.query(
     `SELECT * FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY league_name ASC LIMIT 25`,
     [guild.id]
   );
   const embed = new EmbedBuilder()
-    .setTitle('🏟️ League Setup')
+    .setTitle(t(lang, 'league_setup_title'))
     .setColor(0x5865F2)
     .setDescription(result.rows.length
       ? result.rows.map(l => `**${l.league_name}** — ${(l.game_key || 'general').toUpperCase()}${l.season_length ? ' • ' + l.season_length + ' games' : ''}`).join('\n')
-      : 'No leagues created yet.')
-    .setFooter({ text: 'GG Sports • Admin Panel' })
+      : t(lang, 'league_setup_none'))
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
 
   const components = [];
   if (result.rows.length) {
     const menu = new StringSelectMenuBuilder()
       .setCustomId('adminpanel_league_teamrole_select')
-      .setPlaceholder('Choose a league to add a team role to')
+      .setPlaceholder(t(lang, 'league_setup_teamrole_placeholder'))
       .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
     components.push(new ActionRowBuilder().addComponents(menu));
 
     const deleteMenu = new StringSelectMenuBuilder()
       .setCustomId('adminpanel_league_delete_select')
-      .setPlaceholder('Choose a league to delete')
+      .setPlaceholder(t(lang, 'league_setup_delete_placeholder'))
       .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
     components.push(new ActionRowBuilder().addComponents(deleteMenu));
   }
   components.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_league_create').setLabel('Create League').setEmoji('➕').setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId('adminpanel_league_create').setLabel(t(lang, 'league_setup_create_button')).setEmoji('➕').setStyle(ButtonStyle.Success)
   ));
-  components.push(buildAdminPanelBackRow());
+  components.push(buildAdminPanelBackRow(lang));
   return { embeds: [embed], components };
 }
 
-async function buildAdminEconomyPayload(guild) {
+async function buildAdminEconomyPayload(guild, lang) {
   const settings = await getCurrencySettings(guild.id);
   // Balance is global now (not scoped to this guild), so this reflects total
   // circulation and richest users bot-wide — same treatment as /economy richest.
@@ -33957,50 +34572,50 @@ async function buildAdminEconomyPayload(guild) {
   );
   const totals = totalResult.rows?.[0] || { total_balance: 0, users_with_balance: 0 };
   const embed = new EmbedBuilder()
-    .setTitle(`💰 Economy • ${settings.currency_name} (Global)`)
+    .setTitle(t(lang, 'economy_title', { currencyName: settings.currency_name }))
     .setColor(0xFEE75C)
     .addFields(
-      { name: 'Total In Circulation (Global)', value: `${settings.currency_icon} ${totals.total_balance}`, inline: true },
-      { name: 'Users With Balance (Global)', value: String(totals.users_with_balance), inline: true },
+      { name: t(lang, 'economy_total_circulation'), value: `${settings.currency_icon} ${totals.total_balance}`, inline: true },
+      { name: t(lang, 'economy_users_with_balance'), value: String(totals.users_with_balance), inline: true },
     )
     .setDescription(richest.rows.length
-      ? '**Top 5 Richest (Global)**\n' + richest.rows.map((row, i) => `${i + 1}. <@${row.user_id}> — ${settings.currency_icon} ${row.balance}`).join('\n')
-      : 'No balances found yet.')
-    .setFooter({ text: 'GG Sports • Admin Panel' })
+      ? t(lang, 'economy_top5') + '\n' + richest.rows.map((row, i) => `${i + 1}. <@${row.user_id}> — ${settings.currency_icon} ${row.balance}`).join('\n')
+      : t(lang, 'economy_no_balances'))
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_econ:give').setLabel('Give Currency').setEmoji('➕').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('adminpanel_econ:take').setLabel('Take Currency').setEmoji('➖').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('adminpanel_econ:give').setLabel(t(lang, 'economy_give_button')).setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('adminpanel_econ:take').setLabel(t(lang, 'economy_take_button')).setEmoji('➖').setStyle(ButtonStyle.Danger),
   );
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_econ:transactions').setLabel('Recent Transactions').setEmoji('📜').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('adminpanel_econ:settings').setLabel('Currency Settings').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('adminpanel_econ:transactions').setLabel(t(lang, 'economy_transactions_button')).setEmoji('📜').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('adminpanel_econ:settings').setLabel(t(lang, 'economy_settings_button')).setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
   );
-  return { embeds: [embed], components: [row1, row2, buildAdminPanelBackRow()] };
+  return { embeds: [embed], components: [row1, row2, buildAdminPanelBackRow(lang)] };
 }
 
-async function buildAdminShopPayload(guild) {
+async function buildAdminShopPayload(guild, lang) {
   const settings = await getCurrencySettings(guild.id);
   const items = await pool.query(
     `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY price ASC, item_name ASC LIMIT 25`,
     [guild.id]
   );
   const embed = new EmbedBuilder()
-    .setTitle('🛍️ Server Shop')
+    .setTitle(t(lang, 'shop_title'))
     .setColor(0xFEE75C)
     .setDescription(items.rows.length
       ? items.rows.map(item => `**${shortShopItemId(item.id)} • ${item.item_name}** — ${settings.currency_icon} ${item.price}${item.stock === null ? '' : ' • Stock: ' + item.stock}`).join('\n')
-      : 'No active shop items yet.')
-    .setFooter({ text: 'GG Sports • Admin Panel' })
+      : t(lang, 'shop_none'))
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_shop:create').setLabel('Create Item').setEmoji('➕').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('adminpanel_shop:remove').setLabel('Remove Item').setEmoji('➖').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('adminpanel_shop:create').setLabel(t(lang, 'shop_create_button')).setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('adminpanel_shop:remove').setLabel(t(lang, 'shop_remove_button')).setEmoji('➖').setStyle(ButtonStyle.Danger),
   );
-  return { embeds: [embed], components: [row1, buildAdminPanelBackRow()] };
+  return { embeds: [embed], components: [row1, buildAdminPanelBackRow(lang)] };
 }
 
-async function buildAdminSportsbookPayload(guild) {
+async function buildAdminSportsbookPayload(guild, lang) {
   const settings = await getCurrencySettings(guild.id);
   const games = await pool.query(
     `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 20`,
@@ -34009,65 +34624,59 @@ async function buildAdminSportsbookPayload(guild) {
   const embed = buildSportsbookEmbed(settings, games.rows);
   const bounds = await getGuildSportsbookBounds(guild.id);
   embed.addFields({
-    name: 'Server Bet/Payout Limits',
+    name: t(lang, 'sportsbook_limits_field'),
     value: `Bet: ${bounds.min_bet ?? 'none'}–${bounds.max_bet ?? 'none'} • Payout: ${bounds.min_payout ?? 'none'}–${bounds.max_payout ?? 'none'}`,
     inline: false,
   });
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_sb:create').setLabel('Create Game').setEmoji('➕').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('adminpanel_sb:settle').setLabel('Settle Game').setEmoji('🏁').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('adminpanel_sb:refund').setLabel('Refund Game').setEmoji('↩️').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('adminpanel_sb:limits').setLabel('Limits').setEmoji('📏').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('adminpanel_sb:create').setLabel(t(lang, 'sportsbook_create_button')).setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('adminpanel_sb:settle').setLabel(t(lang, 'sportsbook_settle_button')).setEmoji('🏁').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('adminpanel_sb:refund').setLabel(t(lang, 'sportsbook_refund_button')).setEmoji('↩️').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('adminpanel_sb:limits').setLabel(t(lang, 'sportsbook_limits_button')).setEmoji('📏').setStyle(ButtonStyle.Secondary),
   );
-  return { embeds: [embed], components: [row1, buildAdminPanelBackRow()] };
+  return { embeds: [embed], components: [row1, buildAdminPanelBackRow(lang)] };
 }
 
-async function buildAdminSettingsPayload(guild) {
+async function buildAdminSettingsPayload(guild, lang) {
   const settings = await getGuildSettings(guild.id, guild.name);
   const currentLang = SUPPORTED_LANGUAGES.find(l => l.value === settings.language) || SUPPORTED_LANGUAGES[0];
   const embed = new EmbedBuilder()
-    .setTitle('⚙️ Server Settings')
+    .setTitle(t(lang, 'settings_title'))
     .setColor(0x5865F2)
     .addFields(
-      { name: 'Language', value: `${currentLang.emoji} ${currentLang.label}`, inline: true },
-      { name: 'New Member Onboarding DM', value: settings.onboarding_enabled ? '✅ Enabled' : '🚫 Disabled', inline: true },
+      { name: t(lang, 'settings_language_field'), value: `${currentLang.emoji} ${currentLang.label}`, inline: true },
+      { name: t(lang, 'settings_onboarding_field'), value: settings.onboarding_enabled ? t(lang, 'settings_onboarding_enabled') : t(lang, 'settings_onboarding_disabled'), inline: true },
     )
-    .setDescription(
-      'Language only changes the bot\'s stored preference for now — translated bot ' +
-      'output for the selected language is a larger effort still in progress. English ' +
-      'stays fully translated regardless.\n\n' +
-      'The onboarding DM is the automatic welcome message (with league/team select) new ' +
-      'members get when they join. Turning it off doesn\'t affect the one-time welcome ' +
-      'DM sent to you when the bot was first added.'
-    )
-    .setFooter({ text: 'GG Sports • Admin Panel' })
+    .setDescription(t(lang, 'settings_description'))
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
 
   const languageMenu = new StringSelectMenuBuilder()
     .setCustomId('adminpanel_settings_language_select')
-    .setPlaceholder('Change bot language')
+    .setPlaceholder(t(lang, 'settings_language_placeholder'))
     .addOptions(SUPPORTED_LANGUAGES.map(l => ({ label: l.label, value: l.value, emoji: l.emoji, default: l.value === settings.language })));
 
   const toggleRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('adminpanel_settings_onboarding_toggle')
-      .setLabel(settings.onboarding_enabled ? 'Disable Onboarding DM' : 'Enable Onboarding DM')
+      .setLabel(settings.onboarding_enabled ? t(lang, 'settings_onboarding_disable_button') : t(lang, 'settings_onboarding_enable_button'))
       .setEmoji(settings.onboarding_enabled ? '🚫' : '✅')
       .setStyle(settings.onboarding_enabled ? ButtonStyle.Danger : ButtonStyle.Success)
   );
 
-  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, buildAdminPanelBackRow()] };
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, buildAdminPanelBackRow(lang)] };
 }
 
 async function showAdminPanelCategory(interaction, category, { update = true } = {}) {
+  const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
   let payload;
-  if (category === 'leagues') payload = await buildAdminLeagueSetupPayload(interaction.guild);
-  else if (category === 'economy') payload = await buildAdminEconomyPayload(interaction.guild);
-  else if (category === 'shop') payload = await buildAdminShopPayload(interaction.guild);
-  else if (category === 'sportsbook') payload = await buildAdminSportsbookPayload(interaction.guild);
+  if (category === 'leagues') payload = await buildAdminLeagueSetupPayload(interaction.guild, lang);
+  else if (category === 'economy') payload = await buildAdminEconomyPayload(interaction.guild, lang);
+  else if (category === 'shop') payload = await buildAdminShopPayload(interaction.guild, lang);
+  else if (category === 'sportsbook') payload = await buildAdminSportsbookPayload(interaction.guild, lang);
   else if (category === 'tournament') payload = await buildTournamentManagerHomePayload(interaction.guild);
-  else if (category === 'settings') payload = await buildAdminSettingsPayload(interaction.guild);
-  else payload = { content: 'Unknown section.', embeds: [], components: [buildAdminPanelBackRow()] };
+  else if (category === 'settings') payload = await buildAdminSettingsPayload(interaction.guild, lang);
+  else payload = { content: 'Unknown section.', embeds: [], components: [buildAdminPanelBackRow(lang)] };
   const finalPayload = { content: null, ...payload };
   return update ? interaction.update(finalPayload) : interaction.editReply(finalPayload);
 }
