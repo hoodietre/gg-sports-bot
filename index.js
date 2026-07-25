@@ -224,6 +224,16 @@ async function initDatabase() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  // language: server-selected bot language, English ('en') is the default. Note: this
+  // stores the preference and drives the admin panel selector, but does not yet
+  // translate the bot's actual output — that's a much larger follow-up effort (every
+  // user-facing string would need to route through a translation layer). Scoped here
+  // to just the setting + infrastructure per this session's ask.
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en'`);
+  // onboarding_enabled: gates the automatic new-member welcome DM (league/team select
+  // prompt) sent on GuildMemberAdd. Does not affect the one-time new-server-owner DM
+  // sent on GuildCreate, since that fires before any admin has had a chance to toggle it.
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS onboarding_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leagues (
@@ -5193,6 +5203,41 @@ async function getCurrencySettings(guildId) {
   };
 }
 
+const SUPPORTED_LANGUAGES = [
+  { value: 'en', label: 'English', emoji: '🇺🇸' },
+  { value: 'es', label: 'Español', emoji: '🇪🇸' },
+  { value: 'fr', label: 'Français', emoji: '🇫🇷' },
+  { value: 'de', label: 'Deutsch', emoji: '🇩🇪' },
+  { value: 'pt', label: 'Português', emoji: '🇵🇹' },
+];
+
+// Server-wide language + onboarding-DM preference. Lazily creates the guilds row if
+// one doesn't exist yet (mirrors getCurrencySettings' upsert-then-select pattern) —
+// guilds are otherwise only inserted at league-create time, so a server that opens
+// admin settings before creating a league still needs somewhere to write to.
+async function getGuildSettings(guildId, guildName = null) {
+  await pool.query(
+    `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO NOTHING`,
+    [guildId, guildName || guildId]
+  );
+  const result = await pool.query(`SELECT language, onboarding_enabled FROM guilds WHERE guild_id = $1`, [guildId]);
+  const row = result.rows[0] || { language: 'en', onboarding_enabled: true };
+  return {
+    language: SUPPORTED_LANGUAGES.some(l => l.value === row.language) ? row.language : 'en',
+    onboarding_enabled: row.onboarding_enabled !== false,
+  };
+}
+
+async function setGuildLanguage(guildId, guildName, language) {
+  await getGuildSettings(guildId, guildName); // ensure row exists
+  await pool.query(`UPDATE guilds SET language = $2 WHERE guild_id = $1`, [guildId, language]);
+}
+
+async function setGuildOnboardingEnabled(guildId, guildName, enabled) {
+  await getGuildSettings(guildId, guildName); // ensure row exists
+  await pool.query(`UPDATE guilds SET onboarding_enabled = $2 WHERE guild_id = $1`, [guildId, enabled]);
+}
+
 // Server-wide sportsbook betting/payout bounds — distinct from a single game's
 // max_bet/max_payout (sportsbook_games, set via /sportsbook limits or the older
 // per-game admin panel flow). NULL fields mean "this server hasn't set a bound," in
@@ -7152,6 +7197,8 @@ function buildOnboardTeamSelectRows(teams, customIdPrefix) {
 async function sendNewMemberOnboardingDM(member) {
   if (member.user.bot) return;
   const guild = member.guild;
+  const guildSettings = await getGuildSettings(guild.id, guild.name).catch(() => ({ onboarding_enabled: true }));
+  if (!guildSettings.onboarding_enabled) return; // Admin turned this off in the admin panel.
   const leagues = await getActiveLeaguesForGuild(guild.id);
   if (!leagues.length) return; // Nothing configured yet — nothing useful to onboard into.
 
@@ -12534,6 +12581,24 @@ if (interaction.commandName === 'avatar') {
         }
         await interaction.reply({ content: `Removed **${settings.currency_icon} ${amount}** from <@${targetUserId}>.`, ephemeral: true });
       }
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_settings_language_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const language = interaction.values[0];
+      await setGuildLanguage(interaction.guild.id, interaction.guild.name, language);
+      const payload = await buildAdminSettingsPayload(interaction.guild);
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_settings_onboarding_toggle') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true }); return; }
+      const current = await getGuildSettings(interaction.guild.id, interaction.guild.name);
+      await setGuildOnboardingEnabled(interaction.guild.id, interaction.guild.name, !current.onboarding_enabled);
+      const payload = await buildAdminSettingsPayload(interaction.guild);
+      await interaction.update({ content: null, ...payload });
       return;
     }
 
@@ -33813,6 +33878,7 @@ const ADMIN_PANEL_CATEGORIES = [
   { value: 'shop', label: 'Shop', description: 'Create/remove items, view active listings', emoji: '🛍️' },
   { value: 'sportsbook', label: 'Sportsbook', description: 'Create/settle/refund games', emoji: '📊' },
   { value: 'tournament', label: 'Tournaments', description: 'Create and manage tournaments', emoji: '🏆' },
+  { value: 'settings', label: 'Server Settings', description: 'Language, onboarding DM toggle', emoji: '⚙️' },
 ];
 
 function buildAdminPanelHomeEmbed(guild) {
@@ -33956,6 +34022,43 @@ async function buildAdminSportsbookPayload(guild) {
   return { embeds: [embed], components: [row1, buildAdminPanelBackRow()] };
 }
 
+async function buildAdminSettingsPayload(guild) {
+  const settings = await getGuildSettings(guild.id, guild.name);
+  const currentLang = SUPPORTED_LANGUAGES.find(l => l.value === settings.language) || SUPPORTED_LANGUAGES[0];
+  const embed = new EmbedBuilder()
+    .setTitle('⚙️ Server Settings')
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Language', value: `${currentLang.emoji} ${currentLang.label}`, inline: true },
+      { name: 'New Member Onboarding DM', value: settings.onboarding_enabled ? '✅ Enabled' : '🚫 Disabled', inline: true },
+    )
+    .setDescription(
+      'Language only changes the bot\'s stored preference for now — translated bot ' +
+      'output for the selected language is a larger effort still in progress. English ' +
+      'stays fully translated regardless.\n\n' +
+      'The onboarding DM is the automatic welcome message (with league/team select) new ' +
+      'members get when they join. Turning it off doesn\'t affect the one-time welcome ' +
+      'DM sent to you when the bot was first added.'
+    )
+    .setFooter({ text: 'GG Sports • Admin Panel' })
+    .setTimestamp();
+
+  const languageMenu = new StringSelectMenuBuilder()
+    .setCustomId('adminpanel_settings_language_select')
+    .setPlaceholder('Change bot language')
+    .addOptions(SUPPORTED_LANGUAGES.map(l => ({ label: l.label, value: l.value, emoji: l.emoji, default: l.value === settings.language })));
+
+  const toggleRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('adminpanel_settings_onboarding_toggle')
+      .setLabel(settings.onboarding_enabled ? 'Disable Onboarding DM' : 'Enable Onboarding DM')
+      .setEmoji(settings.onboarding_enabled ? '🚫' : '✅')
+      .setStyle(settings.onboarding_enabled ? ButtonStyle.Danger : ButtonStyle.Success)
+  );
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, buildAdminPanelBackRow()] };
+}
+
 async function showAdminPanelCategory(interaction, category, { update = true } = {}) {
   let payload;
   if (category === 'leagues') payload = await buildAdminLeagueSetupPayload(interaction.guild);
@@ -33963,6 +34066,7 @@ async function showAdminPanelCategory(interaction, category, { update = true } =
   else if (category === 'shop') payload = await buildAdminShopPayload(interaction.guild);
   else if (category === 'sportsbook') payload = await buildAdminSportsbookPayload(interaction.guild);
   else if (category === 'tournament') payload = await buildTournamentManagerHomePayload(interaction.guild);
+  else if (category === 'settings') payload = await buildAdminSettingsPayload(interaction.guild);
   else payload = { content: 'Unknown section.', embeds: [], components: [buildAdminPanelBackRow()] };
   const finalPayload = { content: null, ...payload };
   return update ? interaction.update(finalPayload) : interaction.editReply(finalPayload);
