@@ -985,8 +985,8 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS user_avatar (
       guild_id TEXT NOT NULL,
       user_id TEXT NOT NULL,
-      equipped_top TEXT NOT NULL DEFAULT 'Basic Tee',
-      equipped_bottom TEXT NOT NULL DEFAULT 'Plain Shorts',
+      equipped_top TEXT NOT NULL DEFAULT 'none',
+      equipped_bottom TEXT NOT NULL DEFAULT 'none',
       equipped_headwear TEXT NOT NULL DEFAULT 'none',
       equipped_accessory TEXT NOT NULL DEFAULT 'Ghost Wristband',
       equipped_footwear TEXT NOT NULL DEFAULT 'Basic Sneakers',
@@ -1000,8 +1000,8 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_effect TEXT NOT NULL DEFAULT 'none'`);
   await pool.query(`ALTER TABLE user_avatar ADD COLUMN IF NOT EXISTS equipped_background TEXT NOT NULL DEFAULT 'Locker Room'`);
   // 7I-4A polish: normalize starter avatar defaults for existing profiles.
-  await pool.query(`UPDATE user_avatar SET equipped_top = 'Basic Tee' WHERE equipped_top IS NULL OR equipped_top = 'none'`);
-  await pool.query(`UPDATE user_avatar SET equipped_bottom = 'Plain Shorts' WHERE equipped_bottom IS NULL OR LOWER(equipped_bottom) = 'plain shorts'`);
+  await pool.query(`UPDATE user_avatar SET equipped_top = 'none' WHERE equipped_top IS NULL`);
+  await pool.query(`UPDATE user_avatar SET equipped_bottom = 'none' WHERE equipped_bottom IS NULL`);
   await pool.query(`UPDATE user_avatar SET equipped_footwear = 'Basic Sneakers' WHERE equipped_footwear IS NULL OR equipped_footwear = 'barefoot'`);
   await pool.query(`UPDATE user_avatar SET equipped_accessory = 'Ghost Wristband' WHERE equipped_accessory IS NULL OR equipped_accessory = 'none'`);
   await pool.query(`UPDATE user_avatar SET equipped_background = 'Locker Room' WHERE equipped_background IS NULL OR equipped_background = 'none'`);
@@ -1883,8 +1883,8 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS user_avatar (
       guild_id TEXT NOT NULL,
       user_id TEXT NOT NULL,
-      equipped_top TEXT NOT NULL DEFAULT 'Basic Tee',
-      equipped_bottom TEXT NOT NULL DEFAULT 'Plain Shorts',
+      equipped_top TEXT NOT NULL DEFAULT 'none',
+      equipped_bottom TEXT NOT NULL DEFAULT 'none',
       equipped_headwear TEXT NOT NULL DEFAULT 'none',
       equipped_accessory TEXT NOT NULL DEFAULT 'Ghost Wristband',
       equipped_footwear TEXT NOT NULL DEFAULT 'Basic Sneakers',
@@ -24681,8 +24681,8 @@ async function ensureUserAvatar(guildId, userId) {
   );
 
   return result.rows[0] || {
-    equipped_top: 'Basic Tee',
-    equipped_bottom: 'Plain Shorts',
+    equipped_top: 'none',
+    equipped_bottom: 'none',
     equipped_headwear: 'none',
     equipped_accessory: 'Ghost Wristband',
     equipped_footwear: 'Basic Sneakers',
@@ -24752,8 +24752,8 @@ async function getUserBadges(guildId, userId, recognition = null) {
 
 function formatAvatarLoadout(avatar) {
   return [
-    'Top: ' + (avatar.equipped_top || 'Basic Tee'),
-    'Bottom: ' + (avatar.equipped_bottom || 'Plain Shorts'),
+    'Top: ' + (avatar.equipped_top || 'none'),
+    'Bottom: ' + (avatar.equipped_bottom || 'none'),
     'Headwear: ' + (avatar.equipped_headwear || 'none'),
     'Accessory: ' + (avatar.equipped_accessory || 'Ghost Wristband'),
     'Footwear: ' + (avatar.equipped_footwear || 'Basic Sneakers'),
@@ -24808,8 +24808,6 @@ async function getNextSerialNumber(dbPool, itemId) {
 }
 
 const VISUAL_AVATAR_STARTERS = [
-  { item: 'Plain Shorts', slot: 'bottom', source: 'starter' },
-  { item: 'Basic Tee', slot: 'top', source: 'starter' },
   { item: 'Basic Sneakers', slot: 'footwear', source: 'starter' },
   { item: 'Ghost Wristband', slot: 'accessory', source: 'starter' },
   { item: 'Locker Room', slot: 'background', source: 'starter' },
@@ -24872,8 +24870,8 @@ async function ensureVisualAvatar(guildId, userId) {
   );
 
   return result.rows[0] || {
-    equipped_top: 'Basic Tee',
-    equipped_bottom: 'Plain Shorts',
+    equipped_top: 'none',
+    equipped_bottom: 'none',
     equipped_headwear: 'none',
     equipped_accessory: 'Ghost Wristband',
     equipped_footwear: 'Basic Sneakers',
@@ -24965,8 +24963,8 @@ async function equipVisualAvatarItem(guildId, userId, slot, itemName) {
 }
 
 function buildVisualAvatarSvg(userLabel, avatar, preview = {}) {
-  const top = preview.top || avatar.equipped_top || 'Basic Tee';
-  const bottom = preview.bottom || avatar.equipped_bottom || 'Plain Shorts';
+  const top = preview.top || avatar.equipped_top || 'none';
+  const bottom = preview.bottom || avatar.equipped_bottom || 'none';
   const headwear = preview.headwear || avatar.equipped_headwear || 'none';
   const accessory = preview.accessory || avatar.equipped_accessory || 'Ghost Wristband';
   const footwear = preview.footwear || avatar.equipped_footwear || 'Basic Sneakers';
@@ -25587,8 +25585,8 @@ function renderAvatarProfilePngPlaceholder(profile, equipped) {
   const skin = AVATAR_SKIN_TONES[profile.skin_tone] || AVATAR_SKIN_TONES.medium;
   const silhouette = AVATAR_SILHOUETTES.includes(profile.silhouette) ? profile.silhouette : 'a';
 
-  const topName = equipped.top?.item_name || 'Basic Tee';
-  const bottomName = equipped.bottom?.item_name || 'Plain Shorts';
+  const topName = equipped.top?.item_name || 'none';
+  const bottomName = equipped.bottom?.item_name || 'none';
   const headwearName = equipped.headwear?.item_name || null;
   const accessoryName = equipped.accessory?.item_name || null;
   const footwearName = equipped.footwear?.item_name || 'Basic Sneakers';
@@ -26749,8 +26747,8 @@ function buildAvatarStarterComponents() {
 function buildVisualAvatarPng(userLabel, avatar, preview = {}) {
   const width = 900;
   const height = 1200;
-  const top = preview.top || avatar.equipped_top || 'Basic Tee';
-  const bottom = preview.bottom || avatar.equipped_bottom || 'Plain Shorts';
+  const top = preview.top || avatar.equipped_top || 'none';
+  const bottom = preview.bottom || avatar.equipped_bottom || 'none';
   const headwear = preview.headwear || avatar.equipped_headwear || 'none';
   const accessory = preview.accessory || avatar.equipped_accessory || 'Ghost Wristband';
   const footwear = preview.footwear || avatar.equipped_footwear || 'Basic Sneakers';
@@ -26875,8 +26873,8 @@ function buildVisualAvatarEmbed(user, avatar, previewLabel = null) {
     .setImage('attachment://avatar.png')
     .addFields(
       { name: 'Headwear', value: avatar.equipped_headwear || 'none', inline: true },
-      { name: 'Top', value: avatar.equipped_top || 'Basic Tee', inline: true },
-      { name: 'Bottom', value: avatar.equipped_bottom || 'Plain Shorts', inline: true },
+      { name: 'Top', value: avatar.equipped_top || 'none', inline: true },
+      { name: 'Bottom', value: avatar.equipped_bottom || 'none', inline: true },
       { name: 'Accessory', value: avatar.equipped_accessory || 'Ghost Wristband', inline: true },
       { name: 'Footwear', value: avatar.equipped_footwear || 'Basic Sneakers', inline: true },
       { name: 'Background', value: avatar.equipped_background || 'Locker Room', inline: true }
@@ -27024,8 +27022,8 @@ async function findMarketplaceListing(listingInput, { activeOnly = false } = {})
 
 const VISUAL_AVATAR_SLOT_DEFAULTS = {
   headwear: 'none',
-  top: 'Basic Tee',
-  bottom: 'Plain Shorts',
+  top: 'none',
+  bottom: 'none',
   accessory: 'Ghost Wristband',
   footwear: 'Basic Sneakers',
   pet: 'none',
