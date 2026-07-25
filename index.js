@@ -21583,9 +21583,9 @@ if (shopSubcommand === 'view') {
       }
       const targetUser = interaction.options.getUser('member');
       const role = interaction.options.getRole('role');
+      await interaction.deferReply({ ephemeral: true });
       const targetMember = await interaction.guild.members.fetch(targetUser.id);
       if (interaction.commandName === 'assignrole') await targetMember.roles.add(role);
-      await interaction.deferReply({ ephemeral: true });
       else await targetMember.roles.remove(role);
       const configuredTeamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
       const isMaddenTeamRole = configuredTeamRoles.some(team => team.role_id === role.id) || isLegacyTeamRole(role.name);
