@@ -5802,7 +5802,7 @@ function shortItemId(itemId) {
 async function findShopItem(guildId, itemInput) {
   const result = await pool.query(
     `SELECT * FROM shop_items
-     WHERE guild_id = $1 AND is_active = TRUE AND is_award_only = FALSE
+     WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE
        AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3)
      ORDER BY created_at DESC
      LIMIT 1`,
@@ -6967,7 +6967,7 @@ function ggBuildShopItemButtonId(itemId) {
 async function ggBuildPermanentShopPayload(guildId) {
   const settings = await getCurrencySettings(guildId);
   const result = await pool.query(
-    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE AND is_award_only = FALSE ORDER BY price ASC, item_name ASC LIMIT 10`,
+    `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE ORDER BY price ASC, item_name ASC LIMIT 10`,
     [guildId]
   );
 
@@ -10083,7 +10083,7 @@ if (interaction.commandName === 'avatar') {
 
         const shortId = interaction.customId.split(':')[1];
         const result = await pool.query(
-          `SELECT * FROM shop_items WHERE guild_id = $1 AND id::text LIKE $2 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1`,
+          `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND id::text LIKE $2 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1`,
           [interaction.guild.id, shortId + '%']
         );
 
@@ -18140,7 +18140,7 @@ if (shopSubcommand === 'view') {
         await interaction.deferReply({ ephemeral: true });
         const result = await pool.query(
           `SELECT * FROM shop_items
-           WHERE guild_id = $1 AND is_active = TRUE
+           WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE
            ORDER BY price ASC, item_name ASC
            LIMIT 50`,
           [interaction.guild.id]
@@ -18383,7 +18383,7 @@ if (shopSubcommand === 'view') {
 
         const itemResult = await pool.query(
           `SELECT * FROM shop_items
-           WHERE guild_id = $1 AND is_award_only = TRUE
+           WHERE (guild_id = $1 OR guild_id IS NULL) AND is_award_only = TRUE
              AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3)
            ORDER BY created_at DESC
            LIMIT 1`,
@@ -18427,7 +18427,7 @@ if (shopSubcommand === 'view') {
         }
 
         const itemResult = await pool.query(
-          `SELECT * FROM shop_items WHERE guild_id = $1 AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3) ORDER BY created_at DESC LIMIT 1`,
+          `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND (LOWER(item_name) = LOWER($2) OR id::text LIKE $3) ORDER BY created_at DESC LIMIT 1`,
           [interaction.guild.id, itemInput, `${itemInput}%`]
         );
         const targetItem = itemResult.rows[0];
@@ -21495,7 +21495,7 @@ if (shopSubcommand === 'view') {
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
-        `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE AND is_award_only = FALSE ORDER BY created_at DESC LIMIT 50`,
+        `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE ORDER BY created_at DESC LIMIT 50`,
         [interaction.guild.id]
       );
       await interaction.editReply({ embeds: [buildShopEmbed(settings, result.rows)], ephemeral: true });
@@ -21567,6 +21567,19 @@ if (shopSubcommand === 'view') {
       if (!item) {
         await interaction.reply({ content: 'Could not find that active shop item.', ephemeral: true });
         return;
+      }
+      // Same anti-abuse restriction as /shop removeitem — this is a legacy/unregistered
+      // command handler (no matching SlashCommandBuilder), kept hardened defensively in
+      // case it's ever re-registered.
+      if (!isBotOwnerInteraction(interaction)) {
+        if (item.guild_id === null) {
+          await interaction.reply({ content: 'That is a universal item created by the bot owner — it can\'t be removed by server admins.', ephemeral: true });
+          return;
+        }
+        if (String(item.guild_id) !== String(interaction.guild.id) || String(item.created_by_user_id) !== String(interaction.user.id)) {
+          await interaction.reply({ content: 'You can only remove shop items you created yourself for this server.', ephemeral: true });
+          return;
+        }
       }
       await pool.query(`UPDATE shop_items SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [item.id]);
       await interaction.reply({ content: `Removed shop item **${item.item_name}**.`, ephemeral: true });
@@ -22247,7 +22260,7 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id]
       );
       const shopResult = await pool.query(
-        `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_active = TRUE`,
+        `SELECT COUNT(*)::int AS count FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE`,
         [interaction.guild.id]
       );
       await interaction.editReply({
@@ -27719,21 +27732,21 @@ async function fetchAvatarShopItems(guildId, categorySlot, page) {
   const offset = page * AVATAR_SHOP_PAGE_SIZE;
   if (categorySlot === 'exclusive') {
     const countResult = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE AND is_award_only = FALSE`,
+      `SELECT COUNT(*)::int AS count FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE AND is_award_only = FALSE`,
       [guildId]
     );
     const itemsResult = await pool.query(
-      `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE AND is_award_only = FALSE ORDER BY price ASC LIMIT $2 OFFSET $3`,
+      `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_cosmetic = TRUE AND is_active = TRUE AND is_exclusive = TRUE AND is_award_only = FALSE ORDER BY price ASC LIMIT $2 OFFSET $3`,
       [guildId, AVATAR_SHOP_PAGE_SIZE, offset]
     );
     return { items: itemsResult.rows, total: countResult.rows[0]?.count || 0 };
   }
   const countResult = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 AND is_award_only = FALSE`,
+    `SELECT COUNT(*)::int AS count FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 AND is_award_only = FALSE`,
     [guildId, categorySlot]
   );
   const itemsResult = await pool.query(
-    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 AND is_award_only = FALSE ORDER BY price ASC LIMIT $3 OFFSET $4`,
+    `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_cosmetic = TRUE AND is_active = TRUE AND avatar_slot = $2 AND is_award_only = FALSE ORDER BY price ASC LIMIT $3 OFFSET $4`,
     [guildId, categorySlot, AVATAR_SHOP_PAGE_SIZE, offset]
   );
   return { items: itemsResult.rows, total: countResult.rows[0]?.count || 0 };
@@ -28081,7 +28094,7 @@ function buildVisualWardrobeEmbed(user, items) {
 async function getShopPreviewItem(guildId, itemName) {
   const result = await pool.query(
     `SELECT * FROM shop_items
-     WHERE guild_id = $1 AND LOWER(item_name) = LOWER($2) AND is_active = TRUE
+     WHERE (guild_id = $1 OR guild_id IS NULL) AND LOWER(item_name) = LOWER($2) AND is_active = TRUE
      LIMIT 1`,
     [guildId, itemName]
   );
@@ -34884,7 +34897,7 @@ async function buildAdminEconomyPayload(guild, lang) {
 async function buildAdminShopPayload(guild, lang) {
   const settings = await getCurrencySettings(guild.id);
   const items = await pool.query(
-    `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE ORDER BY price ASC, item_name ASC LIMIT 25`,
+    `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE ORDER BY price ASC, item_name ASC LIMIT 25`,
     [guild.id]
   );
   const embed = new EmbedBuilder()
