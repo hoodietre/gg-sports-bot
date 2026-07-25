@@ -8301,13 +8301,19 @@ if (interaction.commandName === 'avatar') {
       const chosen = interaction.values[0];
 
       if (chosen === 'custom') {
-        const modal = new ModalBuilder()
-          .setCustomId(`avatarlocker_recolor_custom_modal:${slot}`)
-          .setTitle('Custom Color')
-          .addComponents(new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('hex').setLabel('Hex code (e.g. FF5733 or #FF5733)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7)
-          ));
-        await interaction.showModal(modal);
+        // In-Discord picker instead of sending people to an outside site — Browse
+        // Colors gives a real visual grid; Enter Hex Code stays available for exact
+        // brand-color matches (e.g. matching a specific real-world reference color).
+        const browseRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`avatarlocker_recolor_browse:${slot}`).setLabel('🎨 Browse Colors').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`avatarlocker_recolor_custom_open:${slot}`).setLabel('✏️ Enter Hex Code').setStyle(ButtonStyle.Secondary),
+        );
+        await interaction.update({
+          content: 'Browse a grid of colors, or enter an exact hex code if you already know one.',
+          embeds: [],
+          files: [],
+          components: [browseRow],
+        });
         return;
       }
 
@@ -8315,6 +8321,66 @@ if (interaction.commandName === 'avatar') {
       const inventoryId = equipped[slot]?.inventory_id;
       if (!inventoryId) {
         await interaction.update({ content: 'Nothing is equipped in that slot anymore.', components: buildAvatarLockerComponents() });
+        return;
+      }
+      await pool.query(`UPDATE user_inventory SET color_hex = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, [`#${chosen}`, inventoryId, interaction.user.id]);
+      const { profile, equipped: updatedEquipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      await interaction.update({
+        content: `Recolored **${updatedEquipped[slot].item_name}**.`,
+        embeds: [buildAvatarLockerEmbed(interaction.user, profile, updatedEquipped)],
+        files: [await buildAvatarProfileAttachment(profile, updatedEquipped)],
+        components: buildAvatarRecolorColorComponents(slot, `#${chosen}`),
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarlocker_recolor_custom_open:')) {
+      const slot = interaction.customId.split(':')[1];
+      const modal = new ModalBuilder()
+        .setCustomId(`avatarlocker_recolor_custom_modal:${slot}`)
+        .setTitle('Custom Color')
+        .addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('hex').setLabel('Hex code (e.g. FF5733 or #FF5733)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7)
+        ));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarlocker_recolor_browse:')) {
+      const slot = interaction.customId.split(':')[1];
+      await interaction.update({
+        content: 'Pick a hue to see a grid of shades.',
+        embeds: [], files: [],
+        components: [buildColorPickerHueRow(`avatarlocker_recolor_hue_select:${slot}`)],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_recolor_hue_select:')) {
+      const slot = interaction.customId.split(':')[1];
+      await interaction.deferUpdate();
+      const hueValue = interaction.values[0];
+      const hue = hueValue === 'gray' ? null : Number.parseInt(hueValue, 10);
+      const swatches = buildColorSwatchList(hue);
+      const png = await buildColorSwatchGridPng(swatches);
+      const payload = {
+        content: png ? null : 'Pick a swatch (hex shown per option since the image renderer is temporarily unavailable):',
+        embeds: [],
+        files: png ? [new AttachmentBuilder(png, { name: 'swatches.png' })] : [],
+        components: [buildColorPickerSwatchRow(`avatarlocker_recolor_swatch_select:${slot}`, swatches)],
+      };
+      if (png) payload.embeds = [new EmbedBuilder().setTitle('Choose a swatch').setImage('attachment://swatches.png').setColor(0x5865F2)];
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarlocker_recolor_swatch_select:')) {
+      const slot = interaction.customId.split(':')[1];
+      const chosen = interaction.values[0];
+      const { equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const inventoryId = equipped[slot]?.inventory_id;
+      if (!inventoryId) {
+        await interaction.update({ content: 'Nothing is equipped in that slot anymore.', embeds: [], files: [], components: buildAvatarLockerComponents() });
         return;
       }
       await pool.query(`UPDATE user_inventory SET color_hex = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, [`#${chosen}`, inventoryId, interaction.user.id]);
@@ -8470,7 +8536,7 @@ if (interaction.commandName === 'avatar') {
       const itemId = interaction.values[0];
       const settings = await getCurrencySettings(interaction.guild.id);
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND (guild_id = $2 OR guild_id IS NULL) LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
         await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
@@ -8486,13 +8552,19 @@ if (interaction.commandName === 'avatar') {
       const chosen = interaction.values[0];
 
       if (chosen === 'custom') {
-        const modal = new ModalBuilder()
-          .setCustomId(`avatarshop_custom_color_modal:${itemId}:${categorySlot}:${page}`)
-          .setTitle('Custom Color')
-          .addComponents(new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('hex').setLabel('Hex code (e.g. FF5733 or #FF5733)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7)
-          ));
-        await interaction.showModal(modal);
+        // In-Discord picker instead of sending people to an outside site — Browse
+        // Colors gives a real visual grid; Enter Hex Code stays available for exact
+        // brand-color matches.
+        const browseRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`avatarshop_custom_color_browse:${itemId}:${categorySlot}:${page}`).setLabel('🎨 Browse Colors').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`avatarshop_custom_color_open:${itemId}:${categorySlot}:${page}`).setLabel('✏️ Enter Hex Code').setStyle(ButtonStyle.Secondary),
+        );
+        await interaction.update({
+          content: 'Browse a grid of colors, or enter an exact hex code if you already know one.',
+          embeds: [],
+          files: [],
+          components: [browseRow],
+        });
         return;
       }
 
@@ -8500,7 +8572,64 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferUpdate();
       const settings = await getCurrencySettings(interaction.guild.id);
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND (guild_id = $2 OR guild_id IS NULL) LIMIT 1`, [itemId, interaction.guild.id]);
+      const item = itemResult.rows[0];
+      if (!item) {
+        await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
+        return;
+      }
+      await interaction.editReply(await buildAvatarShopPreviewPayload(profile, equipped, item, categorySlot, page, settings, chosen));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_custom_color_open:')) {
+      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
+      const modal = new ModalBuilder()
+        .setCustomId(`avatarshop_custom_color_modal:${itemId}:${categorySlot}:${pageStr}`)
+        .setTitle('Custom Color')
+        .addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('hex').setLabel('Hex code (e.g. FF5733 or #FF5733)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(7)
+        ));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('avatarshop_custom_color_browse:')) {
+      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
+      await interaction.update({
+        content: 'Pick a hue to see a grid of shades.',
+        embeds: [], files: [],
+        components: [buildColorPickerHueRow(`avatarshop_hue_select:${itemId}:${categorySlot}:${pageStr}`)],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_hue_select:')) {
+      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
+      await interaction.deferUpdate();
+      const hueValue = interaction.values[0];
+      const hue = hueValue === 'gray' ? null : Number.parseInt(hueValue, 10);
+      const swatches = buildColorSwatchList(hue);
+      const png = await buildColorSwatchGridPng(swatches);
+      const payload = {
+        content: png ? null : 'Pick a swatch (hex shown per option since the image renderer is temporarily unavailable):',
+        embeds: [],
+        files: png ? [new AttachmentBuilder(png, { name: 'swatches.png' })] : [],
+        components: [buildColorPickerSwatchRow(`avatarshop_swatch_select:${itemId}:${categorySlot}:${pageStr}`, swatches)],
+      };
+      if (png) payload.embeds = [new EmbedBuilder().setTitle('Choose a swatch').setImage('attachment://swatches.png').setColor(0x5865F2)];
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('avatarshop_swatch_select:')) {
+      const [, itemId, categorySlot, pageStr] = interaction.customId.split(':');
+      const page = Math.max(0, Number.parseInt(pageStr, 10) || 0);
+      const chosen = interaction.values[0];
+      await interaction.deferUpdate();
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND (guild_id = $2 OR guild_id IS NULL) LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
         await interaction.editReply({ content: 'That item is no longer available.', embeds: [], files: [], components: [] });
@@ -8525,7 +8654,7 @@ if (interaction.commandName === 'avatar') {
 
       const settings = await getCurrencySettings(interaction.guild.id);
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
-      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, interaction.guild.id]);
+      const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND (guild_id = $2 OR guild_id IS NULL) LIMIT 1`, [itemId, interaction.guild.id]);
       const item = itemResult.rows[0];
       if (!item) {
         await interaction.editReply({ content: 'That item is no longer available.' });
@@ -22425,7 +22554,7 @@ if (shopSubcommand === 'view') {
       }
       const channel = await client.channels.fetch(league?.live_channel_id || LIVE_CHANNEL_ID);
       await channel.send({ content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${fallback.rows[0].stream_url}`, allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] } });
-      await interaction.reply({ content: 'Your stream has been posted.', ephemeral: true });
+      await interaction.editReply({ content: 'Your stream has been posted.' });
       return;
     }
 
@@ -26312,7 +26441,7 @@ async function unequipAvatarAccessory(userId, accessoryType) {
 // row with award_type so it's distinguishable from a normal purchase in the Locker Room
 // / lookup-tag detail view. Does not auto-equip, matching how other grants work.
 async function grantAwardItem(guildId, userId, itemId, awardType) {
-  const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 LIMIT 1`, [itemId, guildId]);
+  const itemResult = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND (guild_id = $2 OR guild_id IS NULL) LIMIT 1`, [itemId, guildId]);
   const item = itemResult.rows[0];
   if (!item) return { ok: false, message: 'Could not find that item.' };
 
@@ -26977,6 +27106,99 @@ async function getSharp() {
   return sharpModule;
 }
 
+// ---- In-Discord hex color picker (avoids sending people to an outside site) ----
+// Two-step browse: pick a hue, then pick one of 16 saturation/lightness swatches
+// rendered as a real image grid. Discord has no native color-wheel component, so
+// this is the closest equivalent buildable from select menus + a generated image.
+const COLOR_PICKER_HUES = [
+  { value: 'gray', label: 'Grayscale', emoji: '⬛', hue: null },
+  { value: '0', label: 'Red', emoji: '🟥', hue: 0 },
+  { value: '30', label: 'Orange', emoji: '🟧', hue: 30 },
+  { value: '55', label: 'Yellow', emoji: '🟨', hue: 55 },
+  { value: '110', label: 'Green', emoji: '🟩', hue: 110 },
+  { value: '170', label: 'Teal/Cyan', emoji: '🟦', hue: 170 },
+  { value: '220', label: 'Blue', emoji: '🟦', hue: 220 },
+  { value: '265', label: 'Purple', emoji: '🟪', hue: 265 },
+  { value: '320', label: 'Pink/Magenta', emoji: '🟪', hue: 320 },
+];
+
+function hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; b = 0; }
+  else if (h < 120) { r = x; g = c; b = 0; }
+  else if (h < 180) { r = 0; g = c; b = x; }
+  else if (h < 240) { r = 0; g = x; b = c; }
+  else if (h < 300) { r = x; g = 0; b = c; }
+  else { r = c; g = 0; b = x; }
+  const toHex = v => Math.round((v + m) * 255).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+}
+
+// Returns 16 {hex, label} swatches for a hue (4 saturation x 4 lightness steps), or
+// 16 grayscale steps if hue is null.
+function buildColorSwatchList(hue) {
+  const swatches = [];
+  if (hue === null) {
+    const lightnessSteps = [8, 22, 36, 50, 64, 78, 88, 95, 5, 18, 30, 44, 58, 72, 84, 92];
+    for (let i = 0; i < 16; i++) swatches.push({ hex: hslToHex(0, 0, lightnessSteps[i]), row: Math.floor(i / 4), col: i % 4 });
+  } else {
+    const satSteps = [45, 65, 85, 100];
+    const lightSteps = [30, 42, 55, 68];
+    let i = 0;
+    for (const l of lightSteps) {
+      for (const s of satSteps) {
+        swatches.push({ hex: hslToHex(hue, s, l), row: Math.floor(i / 4), col: i % 4 });
+        i++;
+      }
+    }
+  }
+  return swatches;
+}
+
+async function buildColorSwatchGridPng(swatches) {
+  const sharp = await getSharp();
+  if (!sharp) return null; // Falls back to text-only (hex shown in select option descriptions) if sharp isn't loadable.
+  const cell = 110;
+  const gap = 6;
+  const size = cell * 4 + gap * 5;
+  const rects = swatches.map((sw, i) => {
+    const x = gap + sw.col * (cell + gap);
+    const y = gap + sw.row * (cell + gap);
+    const textColor = hslPerceivedBrightness(sw.hex) > 140 ? '#000000' : '#FFFFFF';
+    return `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" fill="${sw.hex}" rx="10"/>` +
+           `<text x="${x + cell / 2}" y="${y + cell / 2 + 8}" font-size="34" font-family="sans-serif" font-weight="bold" fill="${textColor}" text-anchor="middle">${i + 1}</text>`;
+  }).join('');
+  const svg = `<svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg"><rect width="${size}" height="${size}" fill="#2B2D31"/>${rects}</svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+function hslPerceivedBrightness(hex) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return (r * 299 + g * 587 + b * 114) / 1000;
+}
+
+function buildColorPickerHueRow(customIdPrefix) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(customIdPrefix)
+    .setPlaceholder('Choose a hue')
+    .addOptions(COLOR_PICKER_HUES.map(h => ({ label: h.label, value: h.value, emoji: h.emoji })));
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function buildColorPickerSwatchRow(customIdPrefix, swatches) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(customIdPrefix)
+    .setPlaceholder('Choose a swatch')
+    .addOptions(swatches.map((sw, i) => ({ label: `Swatch ${i + 1}`, value: sw.hex.replace('#', ''), description: sw.hex })));
+  return new ActionRowBuilder().addComponents(menu);
+}
+
 async function renderAvatarProfilePng(profile, equipped, options = {}) {
   try {
     return await renderAvatarProfilePngRealArt(profile, equipped, options);
@@ -27584,7 +27806,7 @@ async function buildAvatarShopPreviewPayload(profile, equipped, previewItem, cat
 async function performAvatarShopPurchase(interaction, itemId, colorHex = null) {
   const settings = await getCurrencySettings(interaction.guild.id);
   const itemResult = await pool.query(
-    `SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 AND is_active = TRUE LIMIT 1`,
+    `SELECT * FROM shop_items WHERE id = $1 AND (guild_id = $2 OR guild_id IS NULL) AND is_active = TRUE LIMIT 1`,
     [itemId, interaction.guild.id]
   );
   const item = itemResult.rows[0];
@@ -39214,7 +39436,19 @@ async function handleMaddenGameThreadButton(interaction) {
       await safeReply({ content: 'No saved stream link found. Save one with `/linkstream url:<your stream link>`, then press **Stream Hub** again.', ephemeral: true });
       return;
     }
-    await safeReply({ content: `📺 <@${interaction.user.id}> is streaming this matchup: ${url}`, allowedMentions: { users: [interaction.user.id], roles: [] } });
+    // Posts to the server's connected streaming channel (same destination as
+    // /livestream), not just a message in the game thread — so the announcement
+    // actually reaches whoever's watching that channel for live streams.
+    const streamChannel = await client.channels.fetch(league?.live_channel_id || LIVE_CHANNEL_ID).catch(() => null);
+    if (!streamChannel) {
+      await safeReply({ content: 'Could not find the connected streaming channel — ask a commissioner to check the streaming channel setup.', ephemeral: true });
+      return;
+    }
+    await streamChannel.send({
+      content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!** — ${game.away_team} @ ${game.home_team}\n${url}`,
+      allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] },
+    });
+    await safeReply({ content: `📺 Posted to <#${streamChannel.id}> — you're streaming this matchup!`, ephemeral: true });
     return;
   }
   if (action === 'issue') {
