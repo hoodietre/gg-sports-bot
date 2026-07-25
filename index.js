@@ -27197,6 +27197,11 @@ function avatarBackgroundColorFor(backgroundName) {
   if (bgLower.includes('court')) return { r: 120, g: 53, b: 15, alpha: 1 };
   if (bgLower.includes('tunnel')) return { r: 17, g: 24, b: 39, alpha: 1 };
   if (bgLower.includes('locker')) return { r: 24, g: 24, b: 27, alpha: 1 };
+  // Casino/mall/ski lodge — placeholder tones shown until Gemini-generated art lands
+  // at assets/avatar/layers/background/{art_key}.png (see item creation notes).
+  if (bgLower.includes('casino')) return { r: 76, g: 12, b: 20, alpha: 1 }; // deep red/felt
+  if (bgLower.includes('mall')) return { r: 226, g: 232, b: 240, alpha: 1 }; // bright mall-white
+  if (bgLower.includes('ski') || bgLower.includes('lodge')) return { r: 92, g: 64, b: 51, alpha: 1 }; // warm cabin brown
   const [r, g, b] = avatarDeterministicColor(backgroundName);
   return { r, g, b, alpha: 1 };
 }
@@ -28155,6 +28160,16 @@ async function buildAvatarShopWhatsNewPayload(guild) {
   const continueRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('avatarshop_whatsnew_continue').setLabel('Continue to Shop').setEmoji('➡️').setStyle(ButtonStyle.Primary)
   );
+
+  // Coming-soon teaser — tattoos are held until after launch, but the page is the
+  // natural spot to build hype for what's next. Update/remove this field once
+  // tattoos actually ship (see Track A).
+  embed.addFields({
+    name: '👀 Coming Soon',
+    value: '**Tattoos!** New ink is in the works — stay tuned.',
+    inline: false,
+  });
+
   return { embeds: [embed], components: [continueRow] };
 }
 
