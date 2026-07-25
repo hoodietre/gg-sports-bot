@@ -1424,6 +1424,17 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  // guild_id must be nullable — universal (bot-owner-created) items store NULL here
+  // (see /shop createcosmetic, the owner panel create/cosmetic modals). The original
+  // table was created NOT NULL before that existed; CREATE TABLE IF NOT EXISTS won't
+  // touch an already-existing table's constraints, so this ALTER is what actually
+  // makes those inserts not crash with a NOT NULL violation on a live database.
+  await pool.query(`ALTER TABLE shop_items ALTER COLUMN guild_id DROP NOT NULL`);
+  // sale_price/is_featured: scaffolding for a future sales feature — not wired to any
+  // admin UI yet, just the columns and the display logic on the new "What's New"
+  // shopping page (shows a discount tag if sale_price is set and lower than price).
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS sale_price INTEGER`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT FALSE`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_inventory (
@@ -5316,7 +5327,7 @@ const TRANSLATIONS = {
     economy_give_restricted: 'Granting currency is restricted to the bot owner. Server admins/commissioners can still **Take Currency** or issue refunds.',
     shop_title: '🛍️ Server Shop',
     shop_none: 'No active shop items yet.',
-    shop_create_button: 'Create Item', shop_remove_button: 'Remove Item',
+    shop_create_button: 'Create Item', shop_remove_button: 'Remove Item', shop_sales_button: 'Manage Sales',
     sportsbook_limits_field: 'Server Bet/Payout Limits',
     sportsbook_create_button: 'Create Game', sportsbook_settle_button: 'Settle Game',
     sportsbook_refund_button: 'Refund Game', sportsbook_limits_button: 'Limits',
@@ -5360,7 +5371,7 @@ const TRANSLATIONS = {
     economy_give_restricted: 'Otorgar moneda está restringido al propietario del bot. Los administradores/comisionados del servidor aún pueden **Quitar Moneda** o emitir reembolsos.',
     shop_title: '🛍️ Tienda del Servidor',
     shop_none: 'Aún no hay artículos activos en la tienda.',
-    shop_create_button: 'Crear Artículo', shop_remove_button: 'Eliminar Artículo',
+    shop_create_button: 'Crear Artículo', shop_remove_button: 'Eliminar Artículo', shop_sales_button: 'Gestionar Ofertas',
     sportsbook_limits_field: 'Límites de Apuestas/Pagos del Servidor',
     sportsbook_create_button: 'Crear Partido', sportsbook_settle_button: 'Liquidar Partido',
     sportsbook_refund_button: 'Reembolsar Partido', sportsbook_limits_button: 'Límites',
@@ -5404,7 +5415,7 @@ const TRANSLATIONS = {
     economy_give_restricted: 'Octroyer de la monnaie est réservé au propriétaire du bot. Les administrateurs/commissaires du serveur peuvent toujours **Retirer de la Monnaie** ou effectuer des remboursements.',
     shop_title: '🛍️ Boutique du Serveur',
     shop_none: 'Aucun article actif dans la boutique pour l\'instant.',
-    shop_create_button: 'Créer un Article', shop_remove_button: 'Supprimer un Article',
+    shop_create_button: 'Créer un Article', shop_remove_button: 'Supprimer un Article', shop_sales_button: 'Gérer les Promotions',
     sportsbook_limits_field: 'Limites de Paris/Paiements du Serveur',
     sportsbook_create_button: 'Créer un Match', sportsbook_settle_button: 'Régler le Match',
     sportsbook_refund_button: 'Rembourser le Match', sportsbook_limits_button: 'Limites',
@@ -5448,7 +5459,7 @@ const TRANSLATIONS = {
     economy_give_restricted: 'Das Vergeben von Währung ist dem Bot-Besitzer vorbehalten. Server-Admins/Kommissare können weiterhin **Währung entziehen** oder Rückerstattungen vornehmen.',
     shop_title: '🛍️ Server-Shop',
     shop_none: 'Noch keine aktiven Shop-Artikel.',
-    shop_create_button: 'Artikel Erstellen', shop_remove_button: 'Artikel Entfernen',
+    shop_create_button: 'Artikel Erstellen', shop_remove_button: 'Artikel Entfernen', shop_sales_button: 'Angebote Verwalten',
     sportsbook_limits_field: 'Server-Wett-/Auszahlungslimits',
     sportsbook_create_button: 'Spiel Erstellen', sportsbook_settle_button: 'Spiel Abrechnen',
     sportsbook_refund_button: 'Spiel Erstatten', sportsbook_limits_button: 'Limits',
@@ -5492,7 +5503,7 @@ const TRANSLATIONS = {
     economy_give_restricted: 'Conceder moeda é restrito ao proprietário do bot. Administradores/comissários do servidor ainda podem **Retirar Moeda** ou emitir reembolsos.',
     shop_title: '🛍️ Loja do Servidor',
     shop_none: 'Nenhum item ativo na loja ainda.',
-    shop_create_button: 'Criar Item', shop_remove_button: 'Remover Item',
+    shop_create_button: 'Criar Item', shop_remove_button: 'Remover Item', shop_sales_button: 'Gerenciar Promoções',
     sportsbook_limits_field: 'Limites de Apostas/Pagamentos do Servidor',
     sportsbook_create_button: 'Criar Jogo', sportsbook_settle_button: 'Liquidar Jogo',
     sportsbook_refund_button: 'Reembolsar Jogo', sportsbook_limits_button: 'Limites',
@@ -5536,7 +5547,7 @@ const TRANSLATIONS = {
     economy_give_restricted: '通貨の付与はボット所有者のみに制限されています。サーバー管理者・コミッショナーは引き続き**通貨を没収**したり、払い戻しを行うことができます。',
     shop_title: '🛍️ サーバーショップ',
     shop_none: 'まだ有効なショップアイテムがありません。',
-    shop_create_button: 'アイテムを作成', shop_remove_button: 'アイテムを削除',
+    shop_create_button: 'アイテムを作成', shop_remove_button: 'アイテムを削除', shop_sales_button: 'セール管理',
     sportsbook_limits_field: 'サーバーの賭け金・払戻上限',
     sportsbook_create_button: '試合を作成', sportsbook_settle_button: '試合を精算',
     sportsbook_refund_button: '試合を払い戻し', sportsbook_limits_button: '上限設定',
@@ -5580,7 +5591,7 @@ const TRANSLATIONS = {
     economy_give_restricted: '화폐 지급은 봇 소유자만 가능합니다. 서버 관리자/커미셔너는 여전히 **화폐 회수** 또는 환불을 진행할 수 있습니다.',
     shop_title: '🛍️ 서버 상점',
     shop_none: '아직 활성화된 상점 아이템이 없습니다.',
-    shop_create_button: '아이템 생성', shop_remove_button: '아이템 삭제',
+    shop_create_button: '아이템 생성', shop_remove_button: '아이템 삭제', shop_sales_button: '세일 관리',
     sportsbook_limits_field: '서버 베팅/지급 한도',
     sportsbook_create_button: '경기 생성', sportsbook_settle_button: '경기 정산',
     sportsbook_refund_button: '경기 환불', sportsbook_limits_button: '한도 설정',
@@ -5624,7 +5635,7 @@ const TRANSLATIONS = {
     economy_give_restricted: '發放貨幣僅限機器人擁有者操作。伺服器管理員／委員仍可**扣除貨幣**或進行退款。',
     shop_title: '🛍️ 伺服器商店',
     shop_none: '目前沒有上架中的商店商品。',
-    shop_create_button: '建立商品', shop_remove_button: '移除商品',
+    shop_create_button: '建立商品', shop_remove_button: '移除商品', shop_sales_button: '管理特賣',
     sportsbook_limits_field: '伺服器下注／派彩上限',
     sportsbook_create_button: '建立賽事', sportsbook_settle_button: '結算賽事',
     sportsbook_refund_button: '賽事退款', sportsbook_limits_button: '上限設定',
@@ -8181,11 +8192,24 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
       try {
-        await openAvatarShopPanel(interaction, { mode: 'reply' });
+        const payload = await buildAvatarShopWhatsNewPayload(interaction.guild);
+        await interaction.reply({ ...payload, ephemeral: true });
       } catch (error) {
-        console.error('[Avatar] avatarpanel_shop failed:', error);
+        console.error('[Avatar] avatarpanel_shop (What\'s New) failed:', error);
         await interaction.reply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
           console.error('[Avatar] avatarpanel_shop: fallback reply also failed:', e2);
+        });
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'avatarshop_whatsnew_continue') {
+      try {
+        await openAvatarShopPanel(interaction);
+      } catch (error) {
+        console.error('[Avatar] avatarshop_whatsnew_continue failed:', error);
+        await interaction.reply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarshop_whatsnew_continue failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
+          console.error('[Avatar] avatarshop_whatsnew_continue: fallback reply also failed:', e2);
         });
       }
       return;
@@ -9039,6 +9063,66 @@ if (interaction.commandName === 'avatar') {
       }
       await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
       await interaction.editReply({ content: `Updated ${item.avatar_slot}-specific fields for **${item.item_name}**.` });
+      return;
+    }
+
+    // ---- Owner Panel: Manage Sales (universal items) ----
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_managesales') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id IS NULL AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`);
+      if (!items.rows.length) { await interaction.reply({ content: 'No active universal shop items to put on sale.', flags: MessageFlags.Ephemeral }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('botownerpanel_managesales_select')
+        .setPlaceholder('Choose an item to manage its sale')
+        .addOptions(items.rows.map(item => ({
+          label: item.item_name.slice(0, 100),
+          value: item.id.slice(0, 100),
+          description: (item.sale_price !== null ? `On sale: ${item.sale_price} (was ${item.price})` : `Price: ${item.price}`).slice(0, 100),
+        })));
+      await interaction.reply({ content: '**Manage Sales** — choose an item', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'botownerpanel_managesales_select') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const itemId = interaction.values[0];
+      const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!result.rows.length) { await interaction.reply({ content: 'Could not find that universal shop item.', flags: MessageFlags.Ephemeral }); return; }
+      const item = result.rows[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`botownerpanel_managesales_modal:${itemId}`)
+        .setTitle('Manage Sale')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('sale_price').setLabel(`Sale price (blank = remove sale). Normal: ${item.price}`).setStyle(TextInputStyle.Short).setRequired(false).setValue(item.sale_price !== null ? String(item.sale_price) : '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('featured').setLabel('Featured on the What\'s New page? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.is_featured ? 'yes' : 'no')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_managesales_modal:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const itemId = interaction.customId.split(':')[1];
+      const existing = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!existing.rows.length) { await interaction.editReply({ content: 'Could not find that universal shop item — it may have been removed.' }); return; }
+      const item = existing.rows[0];
+
+      const salePriceRaw = interaction.fields.getTextInputValue('sale_price').trim();
+      let salePrice = null;
+      if (salePriceRaw) {
+        salePrice = Number.parseInt(salePriceRaw, 10);
+        if (!Number.isInteger(salePrice) || salePrice <= 0) { await interaction.editReply({ content: 'Sale price must be a whole number greater than 0 (or leave blank to remove the sale).' }); return; }
+        if (salePrice >= item.price) { await interaction.editReply({ content: `Sale price (${salePrice}) must be lower than the normal price (${item.price}).` }); return; }
+      }
+      const featuredRaw = interaction.fields.getTextInputValue('featured').toLowerCase().trim();
+      const isFeatured = ['yes', 'true', 'y'].includes(featuredRaw);
+
+      await pool.query(`UPDATE shop_items SET sale_price = $1, is_featured = $2, updated_at = NOW() WHERE id = $3`, [salePrice, isFeatured, itemId]);
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+
+      const saleNote = salePrice !== null ? `on sale for **${salePrice}** (was ${item.price})` : 'no longer on sale';
+      await interaction.editReply({ content: `Updated **${item.item_name}** — ${saleNote}. Featured: ${isFeatured ? 'yes' : 'no'}.` });
       return;
     }
 
@@ -13265,10 +13349,70 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: '**Remove Shop Item**', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
         return;
       }
+      if (action === 'sales') {
+        // Same scoping as remove — admins can only manage sales on items they
+        // personally created for this server, never universal (bot-owner) items or
+        // other admins' items.
+        const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id = $1 AND created_by_user_id = $2 AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`, [interaction.guild.id, interaction.user.id]);
+        if (!items.rows.length) { await interaction.reply({ content: 'No active shop items to put on sale. You can only manage sales on items you personally created for this server.', ephemeral: true }); return; }
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId('adminpanel_shop_sales_select')
+          .setPlaceholder('Choose an item to manage its sale')
+          .addOptions(items.rows.map(item => ({
+            label: item.item_name.slice(0, 100),
+            value: item.id.slice(0, 100),
+            description: (item.sale_price !== null ? `On sale: ${item.sale_price} (was ${item.price})` : `Price: ${item.price}`).slice(0, 100),
+          })));
+        await interaction.reply({ content: '**Manage Sales**', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+        return;
+      }
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_shop_create_modal') {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_shop_sales_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const itemId = interaction.values[0];
+      const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 AND created_by_user_id = $3`, [itemId, interaction.guild.id, interaction.user.id]);
+      if (!result.rows.length) { await interaction.reply({ content: 'Could not find that shop item, or it isn\'t one you created.', ephemeral: true }); return; }
+      const item = result.rows[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`adminpanel_shop_sales_modal:${itemId}`)
+        .setTitle('Manage Sale')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('sale_price').setLabel(`Sale price (blank = remove sale). Normal: ${item.price}`).setStyle(TextInputStyle.Short).setRequired(false).setValue(item.sale_price !== null ? String(item.sale_price) : '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('featured').setLabel('Featured on the What\'s New page? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.is_featured ? 'yes' : 'no')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('adminpanel_shop_sales_modal:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const itemId = interaction.customId.split(':')[1];
+      const existing = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id = $2 AND created_by_user_id = $3`, [itemId, interaction.guild.id, interaction.user.id]);
+      if (!existing.rows.length) { await interaction.editReply({ content: 'Could not find that shop item, or it isn\'t one you created — it may have been removed.' }); return; }
+      const item = existing.rows[0];
+
+      const salePriceRaw = interaction.fields.getTextInputValue('sale_price').trim();
+      let salePrice = null;
+      if (salePriceRaw) {
+        salePrice = Number.parseInt(salePriceRaw, 10);
+        if (!Number.isInteger(salePrice) || salePrice <= 0) { await interaction.editReply({ content: 'Sale price must be a whole number greater than 0 (or leave blank to remove the sale).' }); return; }
+        if (salePrice >= item.price) { await interaction.editReply({ content: `Sale price (${salePrice}) must be lower than the normal price (${item.price}).` }); return; }
+      }
+      const featuredRaw = interaction.fields.getTextInputValue('featured').toLowerCase().trim();
+      const isFeatured = ['yes', 'true', 'y'].includes(featuredRaw);
+
+      await pool.query(`UPDATE shop_items SET sale_price = $1, is_featured = $2, updated_at = NOW() WHERE id = $3`, [salePrice, isFeatured, itemId]);
+      await ggUpdatePermanentShopPanel(interaction.guild).catch(() => null);
+
+      const saleNote = salePrice !== null ? `on sale for **${salePrice}** (was ${item.price})` : 'no longer on sale';
+      await interaction.editReply({ content: `Updated **${item.item_name}** — ${saleNote}. Featured: ${isFeatured ? 'yes' : 'no'}.` });
+      return;
+    }
+
+
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const name = interaction.fields.getTextInputValue('name');
       const price = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
@@ -27137,7 +27281,11 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
     let layerResizedBuffer = await sharp(layerBuffer).resize({ height: targetHeight }).png().toBuffer();
     const colorRgb = parseAvatarHexColor(colorHex);
     if (colorRgb) layerResizedBuffer = await applyAvatarColorize(sharp, layerResizedBuffer, colorRgb);
-    const slotTop = slot === 'footwear' ? top : liftedTop;
+    let slotTop = slot === 'footwear' ? top : liftedTop;
+    // High Ponytail sits ~3px too high against the body art — small one-off nudge,
+    // not a general hairstyle offset system (every other hairstyle is correctly
+    // aligned as-is).
+    if (slot === 'hair' && artAssetKey === 'high_ponytail') slotTop += 3;
     composites.push({ input: layerResizedBuffer, left, top: slotTop });
   }
   for (const accessory of (equipped.accessories || [])) {
@@ -27896,7 +28044,53 @@ async function getShopPreviewItem(guildId, itemName) {
 }
 
 
-function rarityIcon(rarity) {
+// Ad-style "What's New" page shown when hitting the Go Shopping button, before the
+// actual shop hub — new-arrival highlights (and, once the sales feature is built out,
+// discount call-outs via sale_price) so the shop gets some spotlight/promo treatment
+// instead of dropping straight into the category browser every time.
+async function buildAvatarShopWhatsNewPayload(guild) {
+  const result = await pool.query(
+    `SELECT * FROM shop_items
+     WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE
+       AND created_at >= NOW() - INTERVAL '14 days'
+     ORDER BY is_featured DESC, created_at DESC
+     LIMIT 10`,
+    [guild.id]
+  );
+  const items = result.rows;
+  const NL = String.fromCharCode(10);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Shop' })
+    .setTimestamp();
+
+  if (!items.length) {
+    embed
+      .setTitle('🛍️ The Shop')
+      .setDescription("No new arrivals in the last couple weeks — but check back soon, new gear drops all the time!");
+  } else {
+    const lines = items.map(item => {
+      const onSale = item.sale_price !== null && item.sale_price !== undefined && Number(item.sale_price) < Number(item.price);
+      const priceText = onSale
+        ? `~~${item.price}~~ **${item.sale_price}** 🔥 ON SALE`
+        : `**${item.price}**`;
+      const featuredTag = item.is_featured ? '⭐ ' : '';
+      const rarityPrefix = item.is_cosmetic ? rarityIcon(item.rarity) + ' ' : '🆕 ';
+      return `${featuredTag}${rarityPrefix}**${item.item_name}** — ${priceText}`;
+    });
+    embed
+      .setTitle('🆕✨ NEW IN THE SHOP! ✨🆕')
+      .setDescription(`**Fresh gear just dropped!** Here's what's new:${NL}${NL}${lines.join(NL)}`);
+  }
+
+  const continueRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('avatarshop_whatsnew_continue').setLabel('Continue to Shop').setEmoji('➡️').setStyle(ButtonStyle.Primary)
+  );
+  return { embeds: [embed], components: [continueRow] };
+}
+
+
   const r = String(rarity || 'common').toLowerCase();
   if (r === 'legendary') return '👑';
   if (r === 'epic') return '💎';
@@ -34642,13 +34836,18 @@ async function buildAdminShopPayload(guild, lang) {
     .setTitle(t(lang, 'shop_title'))
     .setColor(0xFEE75C)
     .setDescription(items.rows.length
-      ? items.rows.map(item => `**${shortShopItemId(item.id)} • ${item.item_name}** — ${settings.currency_icon} ${item.price}${item.stock === null ? '' : ' • Stock: ' + item.stock}`).join('\n')
+      ? items.rows.map(item => {
+          const onSale = item.sale_price !== null && Number(item.sale_price) < Number(item.price);
+          const priceText = onSale ? `~~${item.price}~~ **${item.sale_price}** 🔥` : String(item.price);
+          return `**${shortShopItemId(item.id)} • ${item.item_name}** — ${settings.currency_icon} ${priceText}${item.stock === null ? '' : ' • Stock: ' + item.stock}`;
+        }).join('\n')
       : t(lang, 'shop_none'))
     .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('adminpanel_shop:create').setLabel(t(lang, 'shop_create_button')).setEmoji('➕').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('adminpanel_shop:remove').setLabel(t(lang, 'shop_remove_button')).setEmoji('➖').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('adminpanel_shop:sales').setLabel(t(lang, 'shop_sales_button')).setEmoji('🔥').setStyle(ButtonStyle.Success),
   );
   return { embeds: [embed], components: [row1, buildAdminPanelBackRow(lang)] };
 }
@@ -57488,7 +57687,10 @@ function buildBotOwnerPanelHomeComponents() {
     new ButtonBuilder().setCustomId('botownerpanel_edititem').setLabel('Edit Item').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('botownerpanel_removeitem').setLabel('Remove Item').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
   );
-  return [row1, row2, row3];
+  const row4 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('botownerpanel_managesales').setLabel('Manage Sales').setEmoji('🔥').setStyle(ButtonStyle.Success),
+  );
+  return [row1, row2, row3, row4];
 }
 
 function buildBotOwnerPanelBackRow() {
