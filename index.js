@@ -9126,6 +9126,60 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // ---- Owner Panel: one-time migration for items created before universal items
+    // existed as a concept (this session). Preview-then-confirm, since it's a bulk
+    // data change — never applies without an explicit confirm click.
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_migrateuniversal') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const items = await pool.query(
+        `SELECT * FROM shop_items WHERE created_by_user_id = $1 AND guild_id IS NOT NULL AND is_active = TRUE ORDER BY created_at DESC`,
+        [interaction.user.id]
+      );
+      if (!items.rows.length) {
+        await interaction.reply({ content: 'Nothing to migrate — every active item you created is already universal.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const NL = String.fromCharCode(10);
+      const preview = items.rows.slice(0, 15).map(i => `• **${i.item_name}** — ${i.price}`).join(NL);
+      const more = items.rows.length > 15 ? `${NL}…and ${items.rows.length - 15} more.` : '';
+      const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('botownerpanel_migrateuniversal_confirm').setLabel(`Yes, migrate all ${items.rows.length}`).setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('botownerpanel_migrateuniversal_abort').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.reply({
+        content: `**Found ${items.rows.length} item(s) you created that aren't universal yet** (created before this feature existed):${NL}${NL}${preview}${more}${NL}${NL}Migrate all of these to universal (available in every server)?`,
+        components: [confirmRow],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_migrateuniversal_abort') {
+      await interaction.update({ content: 'Migration cancelled — nothing was changed.', components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_migrateuniversal_confirm') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.update({ content: 'Migrating…', components: [] });
+      const migrated = await pool.query(
+        `UPDATE shop_items SET guild_id = NULL, updated_at = NOW() WHERE created_by_user_id = $1 AND guild_id IS NOT NULL AND is_active = TRUE RETURNING id, item_name, avatar_slot`,
+        [interaction.user.id]
+      );
+      // Best-effort matching avatar_catalog rows too (no created_by_user_id column
+      // there, so matched by item_name + slot instead — same items, same source).
+      for (const row of migrated.rows) {
+        if (!row.avatar_slot) continue;
+        await pool.query(
+          `UPDATE avatar_catalog SET guild_id = NULL WHERE LOWER(item_name) = LOWER($1) AND slot = $2 AND guild_id IS NOT NULL`,
+          [row.item_name, row.avatar_slot]
+        ).catch(() => null);
+      }
+      await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
+      await interaction.editReply({ content: `Migrated **${migrated.rows.length} item(s)** to universal — they're now available in every server, and will show up in Manage Sales.`, components: [] });
+      return;
+    }
+
     if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_edititem_modal:')) {
       if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -57690,6 +57744,7 @@ function buildBotOwnerPanelHomeComponents() {
   );
   const row4 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('botownerpanel_managesales').setLabel('Manage Sales').setEmoji('🔥').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('botownerpanel_migrateuniversal').setLabel('Migrate My Items to Universal').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
   );
   return [row1, row2, row3, row4];
 }
