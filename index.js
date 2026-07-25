@@ -7664,6 +7664,9 @@ if (interaction.commandName === 'avatar') {
       const avatarSubcommand = interaction.options.getSubcommand();
 
       if (avatarSubcommand === 'view') {
+        // Deferred immediately — DB fetch + real sharp compositing here risks the
+        // 3s interaction window (confirmed vulnerable, tracked from last session's sweep).
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const { profile, equipped } = await getAvatarProfileWithEquipment(targetUser.id);
         const attachment = await buildAvatarProfileAttachment(profile, equipped);
@@ -7672,7 +7675,7 @@ if (interaction.commandName === 'avatar') {
         if (avatarBadges.length) {
           embed.addFields({ name: '🏅 Avatar Badges', value: avatarBadges.slice(0, 8).map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(' • '), inline: false });
         }
-        await interaction.reply({ embeds: [embed], files: [attachment], flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ embeds: [embed], files: [attachment] });
         return;
       }
 
@@ -8375,11 +8378,12 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (subcommand === 'mylistings') {
+        await interaction.deferReply({ ephemeral: true });
         const result = await pool.query(
           `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 ORDER BY listed_at DESC LIMIT 20`,
           [interaction.user.id]
         );
-        await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
+        await interaction.editReply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
         return;
       }
 
@@ -8944,6 +8948,7 @@ if (interaction.commandName === 'avatar') {
         return;
       }
       if (interaction.customId.startsWith('ticket_review_approve:') || interaction.customId.startsWith('ticket_review_deny:')) {
+        await interaction.deferReply({ ephemeral: true });
         if (!interaction.guild) return;
 
         const isApproved = interaction.customId.startsWith('ticket_review_approve:');
@@ -8954,7 +8959,7 @@ if (interaction.commandName === 'avatar') {
         );
 
         if (!ticketResult.rows.length) {
-          await interaction.reply({ content: 'Could not find that ticket.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find that ticket.', ephemeral: true });
           return;
         }
 
@@ -9107,6 +9112,7 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.customId.startsWith('ticket_quick_claim:') || interaction.customId.startsWith('ticket_quick_reviewing:') || interaction.customId.startsWith('ticket_quick_resolved:')) {
+        await interaction.deferReply({ ephemeral: true });
         if (!interaction.guild) return;
 
         const [action, ticketId] = interaction.customId.split(':');
@@ -9116,7 +9122,7 @@ if (interaction.commandName === 'avatar') {
         );
 
         if (!ticketResult.rows.length) {
-          await interaction.reply({ content: 'Could not find that ticket.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find that ticket.', ephemeral: true });
           return;
         }
 
@@ -9159,6 +9165,7 @@ if (interaction.commandName === 'avatar') {
       
       
       if (interaction.customId.startsWith('shop_buy_button:')) {
+        await interaction.deferReply({ ephemeral: true });
         if (!interaction.guild) return;
 
         const shortId = interaction.customId.split(':')[1];
@@ -9168,7 +9175,7 @@ if (interaction.commandName === 'avatar') {
         );
 
         if (!result.rows.length) {
-          await interaction.reply({ content: 'That shop item is no longer available.', ephemeral: true });
+          await interaction.editReply({ content: 'That shop item is no longer available.', ephemeral: true });
           return;
         }
 
@@ -9207,13 +9214,14 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.customId === 'shop_cart_clear') {
+        await interaction.deferReply({ ephemeral: true });
         if (!interaction.guild) return;
 
         const activeLeague = await resolveLeague(interaction);
         const cart = await ggGetOpenShopCart(interaction.guild.id, interaction.user.id, activeLeague?.league_id || null);
         await pool.query(`DELETE FROM shop_cart_items WHERE cart_id = $1`, [cart.id]);
 
-        await interaction.reply({ content: 'Your cart has been cleared.', ephemeral: true });
+        await interaction.editReply({ content: 'Your cart has been cleared.', ephemeral: true });
         return;
       }
 
@@ -9271,10 +9279,11 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.customId.startsWith('trade_offer_accept:')) {
+        await interaction.deferReply({ ephemeral: true });
         const offerId = interaction.customId.split(':')[1];
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
         if (result.rows.length === 0) {
-          await interaction.reply({ content: 'That trade offer could not be found.', ephemeral: true });
+          await interaction.editReply({ content: 'That trade offer could not be found.', ephemeral: true });
           return;
         }
         const offer = result.rows[0];
@@ -9302,10 +9311,11 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.customId.startsWith('trade_offer_decline:')) {
+        await interaction.deferReply({ ephemeral: true });
         const offerId = interaction.customId.split(':')[1];
         const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
         if (result.rows.length === 0) {
-          await interaction.reply({ content: 'That trade offer could not be found.', ephemeral: true });
+          await interaction.editReply({ content: 'That trade offer could not be found.', ephemeral: true });
           return;
         }
         const offer = result.rows[0];
@@ -13642,6 +13652,7 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.commandName === 'league-create') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const name = interaction.options.getString('name');
         const game = interaction.options.getString('game').toLowerCase();
         const seasonLength = interaction.options.getInteger('season_length');
@@ -13649,14 +13660,15 @@ if (interaction.commandName === 'avatar') {
         await pool.query(`INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`, [interaction.guild.id, interaction.guild.name]);
         await pool.query(`INSERT INTO leagues (league_id, guild_id, league_name, game_key, season_length) VALUES ($1, $2, $3, $4, $5)`, [leagueId, interaction.guild.id, name, game, seasonLength]);
         await pool.query(`INSERT INTO league_settings (league_id) VALUES ($1) ON CONFLICT (league_id) DO NOTHING`, [leagueId]);
-        await interaction.reply({ content: `Created league **${name}** for **${game}**${seasonLength ? ` with a ${seasonLength}-game season` : ''}.`, flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ content: `Created league **${name}** for **${game}**${seasonLength ? ` with a ${seasonLength}-game season` : ''}.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (interaction.commandName === 'league-list') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const result = await pool.query(`SELECT league_name, game_key, season_length FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY league_name ASC`, [interaction.guild.id]);
         const text = result.rows.length ? result.rows.map(row => `• **${row.league_name}** (${row.game_key}${row.season_length ? ` • ${row.season_length} games` : ''})`).join('\n') : 'No leagues configured yet.';
-        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ content: text, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -13668,15 +13680,17 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.commandName === 'league-setroles') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const leagueRole = interaction.options.getRole('league_role');
         const staffRole = interaction.options.getRole('staff_role');
         const committeeRole = interaction.options.getRole('committee_role');
         await pool.query(`UPDATE league_settings SET league_role_id = $1, staff_role_id = $2, committee_role_id = $3, updated_at = NOW() WHERE league_id = $4`, [leagueRole.id, staffRole.id, committeeRole.id, league.league_id]);
-        await interaction.reply({ content: `Roles saved for **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ content: `Roles saved for **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
       if (interaction.commandName === 'league-setchannels') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const live = interaction.options.getChannel('live');
         const teamOwners = interaction.options.getChannel('team_owners');
         const tradeCount = interaction.options.getChannel('trade_count');
@@ -13689,7 +13703,7 @@ if (interaction.commandName === 'avatar') {
           `UPDATE league_settings SET live_channel_id = $1, team_owners_channel_id = $2, trade_count_channel_id = $3, trade_block_channel_id = $4, offer_a_trade_channel_id = $5, committee_channel_id = $6, approved_channel_id = $7, denied_channel_id = $8, updated_at = NOW() WHERE league_id = $9`,
           [live.id, teamOwners.id, tradeCount.id, tradeBlock.id, offerTrade.id, committee.id, approved.id, denied.id, league.league_id]
         );
-        await interaction.reply({ content: `Channels saved for **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ content: `Channels saved for **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -13733,10 +13747,11 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.commandName === 'league-addteamrole') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const role = interaction.options.getRole('role');
         await pool.query(`INSERT INTO league_team_roles (league_id, role_id, role_name) VALUES ($1, $2, $3) ON CONFLICT (league_id, role_id) DO UPDATE SET role_name = EXCLUDED.role_name`, [league.league_id, role.id, role.name]);
         await pool.query(`INSERT INTO league_trade_counts (league_id, role_id, team_name, trade_count) VALUES ($1, $2, $3, 0) ON CONFLICT (league_id, role_id) DO NOTHING`, [league.league_id, role.id, role.name]);
-        await interaction.reply({ content: `Added team role **${role.name}** to **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ content: `Added team role **${role.name}** to **${league.league_name}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -13975,6 +13990,7 @@ if (interaction.commandName === 'avatar') {
         }
 
         if (subcommand === 'add') {
+          await interaction.deferReply({ ephemeral: true });
           const position = interaction.options.getString('position');
           await pool.query(
             `INSERT INTO league_team_roster (id, guild_id, league_id, team_role_id, user_id, position, added_by_user_id)
@@ -13984,7 +14000,7 @@ if (interaction.commandName === 'avatar') {
           );
           const positionLabel = position === 'gm' ? 'GM' : position.charAt(0).toUpperCase() + position.slice(1);
           const gmNote = position === 'gm' ? ' — they can now report scores and manage trades for this team, same as the owner.' : '.';
-          await interaction.reply({ content: `✅ Added <@${targetUser.id}> to **${teamRoleName}** as **${positionLabel}**${gmNote}`, ephemeral: true });
+          await interaction.editReply({ content: `✅ Added <@${targetUser.id}> to **${teamRoleName}** as **${positionLabel}**${gmNote}`, ephemeral: true });
           return;
         }
 
@@ -14093,6 +14109,7 @@ if (interaction.commandName === 'avatar') {
       }
 
 if (gameSubcommand === 'report') {
+        await interaction.deferReply({ ephemeral: true });
         const gameInput = interaction.options.getString('game_id');
         const homeScore = interaction.options.getInteger('home_score');
         const awayScore = interaction.options.getInteger('away_score');
@@ -14107,7 +14124,7 @@ if (gameSubcommand === 'report') {
         );
 
         if (!gameResult.rows.length) {
-          await interaction.reply({ content: 'Could not find that game ID.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find that game ID.', ephemeral: true });
           return;
         }
 
@@ -14130,6 +14147,7 @@ if (gameSubcommand === 'report') {
       const profileSubcommand = interaction.options.getSubcommand();
 
       if (profileSubcommand === 'legacy') {
+        await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
@@ -14160,11 +14178,12 @@ if (gameSubcommand === 'report') {
           ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — Titles: ' + row.championships + ' • Finals: ' + row.finals_appearances + (row.last_championship ? ' • Last: ' + row.last_championship : '')).join(NL)
           : 'No franchise legacy records found yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
       if (profileSubcommand === 'awards') {
+        await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const awardFilter = interaction.options.getString('award');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
@@ -14198,11 +14217,12 @@ if (gameSubcommand === 'report') {
           ? result.rows.map(row => '**' + row.season_label + '** — ' + row.award_name + ': ' + row.winner).join(NL)
           : 'No award history found yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
       if (profileSubcommand === 'halloffame') {
+        await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
@@ -14233,7 +14253,7 @@ if (gameSubcommand === 'report') {
           ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — ' + row.championships + ' championships, ' + row.finals_appearances + ' finals').join(NL)
           : 'No Hall of Fame records found yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -14247,17 +14267,19 @@ if (gameSubcommand === 'report') {
       }
 
       if (profileSubcommand === 'activity') {
+        await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
         const result = await pool.query(
           `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
           [interaction.guild.id, targetUser.id]
         );
-        await interaction.reply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+        await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
         return;
       }
 
       if (profileSubcommand === 'earnings') {
+        await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const settings = await getCurrencySettings(interaction.guild.id);
 
@@ -14308,7 +14330,7 @@ if (gameSubcommand === 'report') {
           });
         }
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -16472,8 +16494,9 @@ if (interaction.commandName === 'badges') {
       const recognition = recognitionResult.rows[0] || {};
 
       if (badgeSubcommand === 'view') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const badges = await getExpandedUserBadges(interaction.guild.id, targetUser.id, recognition);
-        await interaction.reply({ embeds: [buildBadgesEmbed(targetUser, badges)], flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ embeds: [buildBadgesEmbed(targetUser, badges)], flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -16562,6 +16585,7 @@ if (interaction.commandName === 'trade') {
 
 
       if (tradeSubcommand === 'history') {
+        await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
@@ -16592,11 +16616,12 @@ if (interaction.commandName === 'trade') {
           ? result.rows.map(row => '**' + row.sender_team + '** ↔ **' + row.target_team + '**' + (row.screenshot_url ? NL + row.screenshot_url : '')).join(NL + NL)
           : 'No approved trades found yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
       if (tradeSubcommand === 'team') {
+        await interaction.deferReply({ ephemeral: true });
         const team = interaction.options.getRole('team');
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
@@ -16628,7 +16653,7 @@ if (interaction.commandName === 'trade') {
           ? result.rows.map(row => '**' + row.sender_team + '** ↔ **' + row.target_team + '**' + (row.screenshot_url ? NL + row.screenshot_url : '')).join(NL + NL)
           : 'No approved trades found for ' + team.name + '.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -16747,6 +16772,7 @@ if (interaction.commandName === 'trade') {
       }
 
       if (economySubcommand === 'richest') {
+        await interaction.deferReply({ ephemeral: true });
         // Balance is global now, so this is a global (cross-server) leaderboard, not
         // scoped to this guild.
         const result = await pool.query(
@@ -16766,7 +16792,7 @@ if (interaction.commandName === 'trade') {
           ? result.rows.map((row, index) => '**' + (index + 1) + '. <@' + row.user_id + '>** — ' + settings.currency_icon + ' ' + row.balance + ' • Earned: ' + row.lifetime_earned).join(NL)
           : 'No balances found yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -17048,6 +17074,7 @@ if (interaction.commandName === 'trade') {
       }
 
 if (shopSubcommand === 'view') {
+        await interaction.deferReply({ ephemeral: true });
         const result = await pool.query(
           `SELECT * FROM shop_items
            WHERE guild_id = $1 AND is_active = TRUE
@@ -17067,7 +17094,7 @@ if (shopSubcommand === 'view') {
           ? result.rows.map(item => '**' + shortShopItemId(item.id) + ' • ' + item.item_name + '** — ' + settings.currency_icon + ' ' + item.price + (item.stock === null ? '' : ' • Stock: ' + item.stock) + (item.description ? NL + item.description : '')).join(NL + NL)
           : 'No active shop items yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -17145,6 +17172,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (shopSubcommand === 'inventory') {
+        await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const result = await pool.query(
           `SELECT * FROM user_inventory
@@ -17166,7 +17194,7 @@ if (shopSubcommand === 'view') {
           ? result.rows.map(row => '**' + shortInventoryItemId(row.id) + ' • ' + row.item_name + '** — ' + row.status + ' • Paid: ' + settings.currency_icon + ' ' + row.price_paid).join(NL)
           : 'No inventory items found.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -17190,6 +17218,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (shopSubcommand === 'useitem') {
+        await interaction.deferReply({ ephemeral: true });
         const itemInput = interaction.options.getString('item');
         const note = interaction.options.getString('note') || null;
         const result = await pool.query(
@@ -17201,7 +17230,7 @@ if (shopSubcommand === 'view') {
         );
 
         if (!result.rows.length) {
-          await interaction.reply({ content: 'Could not find that inventory item.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find that inventory item.', ephemeral: true });
           return;
         }
 
@@ -17364,6 +17393,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (tournamentSubcommand === 'list') {
+        await interaction.deferReply({ ephemeral: true });
         const result = await pool.query(
           `SELECT * FROM tournaments
            WHERE guild_id = $1 AND status IN ('open', 'closed', 'active')
@@ -17383,7 +17413,7 @@ if (shopSubcommand === 'view') {
           ? result.rows.map(row => '**' + (row.tournament_name || row.name || 'Unnamed Tournament') + '** — ' + row.status + (row.format ? ' • ' + row.format : '') + (row.max_entries ? ' • ' + row.max_entries + ' slots' : '')).join(NL)
           : 'No tournaments found.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -17423,6 +17453,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (tournamentSubcommand === 'history') {
+        await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
 
@@ -17453,11 +17484,12 @@ if (shopSubcommand === 'view') {
           ? result.rows.map(row => '**' + row.tournament_name + '** — Champion: <@' + row.champion_user_id + '> • Prize: ' + row.prize_paid + (row.mvp_user_id ? ' • MVP: <@' + row.mvp_user_id + '>' : '')).join(NL)
           : 'No completed tournament history found yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
       if (tournamentSubcommand === 'rewards') {
+        await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
 
@@ -17488,7 +17520,7 @@ if (shopSubcommand === 'view') {
           ? result.rows.map(row => '**' + row.tournament_name + '** — Champion <@' + row.champion_user_id + '> paid ' + row.prize_paid + (row.mvp_user_id ? ' • MVP <@' + row.mvp_user_id + '> paid ' + row.mvp_payout : '')).join(NL)
           : 'No tournament reward records found yet.');
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -17666,6 +17698,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (ticketSubcommand === 'evidence') {
+        await interaction.deferReply({ ephemeral: true });
         const ticketInput = interaction.options.getString('ticket_id');
         let ticket = null;
 
@@ -17680,7 +17713,7 @@ if (shopSubcommand === 'view') {
         }
 
         if (!ticket) {
-          await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
           return;
         }
 
@@ -17704,6 +17737,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (ticketSubcommand === 'transcript') {
+        await interaction.deferReply({ ephemeral: true });
         const ticketInput = interaction.options.getString('ticket_id');
         const ticketResult = await pool.query(
           `SELECT * FROM support_tickets WHERE guild_id = $1 AND id::text LIKE $2 ORDER BY created_at DESC LIMIT 1`,
@@ -17711,7 +17745,7 @@ if (shopSubcommand === 'view') {
         );
 
         if (!ticketResult.rows.length) {
-          await interaction.reply({ content: 'Could not find that ticket ID.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find that ticket ID.', ephemeral: true });
           return;
         }
 
@@ -18271,6 +18305,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (leagueSubcommand === 'list') {
+        await interaction.deferReply({ ephemeral: true });
         const result = await pool.query(
           `SELECT league_name, game_key, season_length
            FROM leagues
@@ -18283,7 +18318,7 @@ if (shopSubcommand === 'view') {
           ? result.rows.map(row => '• **' + row.league_name + '** (' + row.game_key + (row.season_length ? ' • ' + row.season_length + ' games' : '') + ')').join(String.fromCharCode(10))
           : 'No leagues configured yet.';
 
-        await interaction.reply({ content: text, ephemeral: true });
+        await interaction.editReply({ content: text, ephemeral: true });
         return;
       }
 
@@ -18683,6 +18718,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'tickettranscript') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const ticketInput = interaction.options.getString('ticket_id');
       const ticketResult = await pool.query(
@@ -18691,7 +18727,7 @@ if (shopSubcommand === 'view') {
       );
 
       if (!ticketResult.rows.length) {
-        await interaction.reply({ content: 'Could not find that ticket ID.', ephemeral: true });
+        await interaction.editReply({ content: 'Could not find that ticket ID.', ephemeral: true });
         return;
       }
 
@@ -18800,6 +18836,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'ticketevidence') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const ticketInput = interaction.options.getString('ticket_id');
       let ticket = null;
@@ -18815,7 +18852,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (!ticket) {
-        await interaction.reply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
+        await interaction.editReply({ content: 'Could not find that ticket. Use this in a ticket thread or provide a ticket ID.', ephemeral: true });
         return;
       }
 
@@ -18984,6 +19021,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'bettinghistory') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const targetUser = interaction.options.getUser('user') || interaction.user;
       const settings = await getCurrencySettings(interaction.guild.id);
@@ -19011,11 +19049,12 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id, targetUser.id]
       );
 
-      await interaction.reply({ embeds: [buildBettingHistoryEmbed(settings, targetUser, summaryResult.rows[0] || {}, recentResult.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildBettingHistoryEmbed(settings, targetUser, summaryResult.rows[0] || {}, recentResult.rows)], ephemeral: true });
       return;
     }
 
     if (interaction.commandName === 'bettingleaderboard') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
@@ -19034,11 +19073,12 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id]
       );
 
-      await interaction.reply({ embeds: [buildBettingLeaderboardEmbed(settings, result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildBettingLeaderboardEmbed(settings, result.rows)], ephemeral: true });
       return;
     }
 
     if (interaction.commandName === 'activity') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const targetUser = interaction.options.getUser('user') || interaction.user;
       await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
@@ -19048,11 +19088,12 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id, targetUser.id]
       );
 
-      await interaction.reply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+      await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
       return;
     }
 
     if (interaction.commandName === 'activityleaderboard') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
 
       const result = await pool.query(
@@ -19063,11 +19104,12 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id]
       );
 
-      await interaction.reply({ embeds: [buildActivityLeaderboardEmbed(result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildActivityLeaderboardEmbed(result.rows)], ephemeral: true });
       return;
     }
 
     if (interaction.commandName === 'milestones') {
+      await interaction.deferReply();
       if (!interaction.guild) return;
       const targetUser = interaction.options.getUser('user') || interaction.user;
       await ensureRecognitionProfile(interaction.guild.id, targetUser.id);
@@ -19081,7 +19123,7 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id, targetUser.id]
       );
 
-      await interaction.reply({
+      await interaction.editReply({
         embeds: [buildMilestonesEmbed(targetUser, profileResult.rows[0]?.activity_points || 0, claimedResult.rows.map(row => row.milestone_key))],
         ephemeral: true,
       });
@@ -19147,6 +19189,7 @@ if (shopSubcommand === 'view') {
       const premiumSubcommand = interaction.options.getSubcommand();
 
       if (premiumSubcommand === 'status') {
+        await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const result = await pool.query(
           `SELECT * FROM premium_memberships
@@ -19155,7 +19198,7 @@ if (shopSubcommand === 'view') {
           [interaction.guild.id, targetUser.id]
         );
 
-        await interaction.reply({ embeds: [buildPremiumStatusEmbed(targetUser, result.rows[0] || null)], ephemeral: true });
+        await interaction.editReply({ embeds: [buildPremiumStatusEmbed(targetUser, result.rows[0] || null)], ephemeral: true });
         return;
       }
 
@@ -19166,6 +19209,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'legacy') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
 
       const result = await pool.query(
@@ -19176,7 +19220,7 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id]
       );
 
-      await interaction.reply({ embeds: [buildLegacyLeaderboardEmbed(result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildLegacyLeaderboardEmbed(result.rows)], ephemeral: true });
       return;
     }
 
@@ -19381,6 +19425,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (subcommand === 'leaderboards') {
+        await interaction.deferReply({ ephemeral: true });
         const type = interaction.options.getString('type') || 'profit';
         let rows = [];
         let title = 'Sportsbook Profit Leaders';
@@ -19434,18 +19479,19 @@ if (shopSubcommand === 'view') {
           .setFooter({ text: 'GG Sports • Sportsbook Leaderboards' })
           .setTimestamp();
 
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
 
       const settings = await getCurrencySettings(interaction.guild.id);
 
       if (subcommand === 'board') {
+        await interaction.deferReply({ ephemeral: true });
         const result = await pool.query(
           `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 20`,
           [interaction.guild.id]
         );
-        await interaction.reply({ embeds: [buildSportsbookEmbed(settings, result.rows)], ephemeral: true });
+        await interaction.editReply({ embeds: [buildSportsbookEmbed(settings, result.rows)], ephemeral: true });
         return;
       }
 
@@ -19671,6 +19717,7 @@ if (shopSubcommand === 'view') {
       }
 
       if (subcommand === 'mybets') {
+        await interaction.deferReply({ ephemeral: true });
         const result = await pool.query(
           `SELECT b.*, g.game_label, g.home_label, g.away_label
            FROM sportsbook_bets b
@@ -19680,7 +19727,7 @@ if (shopSubcommand === 'view') {
            LIMIT 15`,
           [interaction.guild.id, interaction.user.id]
         );
-        await interaction.reply({ embeds: [buildMyBetsEmbed(settings, result.rows)], ephemeral: true });
+        await interaction.editReply({ embeds: [buildMyBetsEmbed(settings, result.rows)], ephemeral: true });
         return;
       }
 
@@ -19958,6 +20005,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'mybets') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
@@ -19969,7 +20017,7 @@ if (shopSubcommand === 'view') {
          LIMIT 15`,
         [interaction.guild.id, interaction.user.id]
       );
-      await interaction.reply({ embeds: [buildMyBetsEmbed(settings, result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildMyBetsEmbed(settings, result.rows)], ephemeral: true });
       return;
     }
 
@@ -20039,6 +20087,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'reportgame') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const gameIdInput = interaction.options.getString('game_id');
       const homeScore = interaction.options.getInteger('home_score');
@@ -20055,7 +20104,7 @@ if (shopSubcommand === 'view') {
       );
 
       if (gameResult.rows.length === 0) {
-        await interaction.reply({ content: 'Could not find that game ID. Use /schedule to see game IDs.', ephemeral: true });
+        await interaction.editReply({ content: 'Could not find that game ID. Use /schedule to see game IDs.', ephemeral: true });
         return;
       }
 
@@ -20352,13 +20401,14 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'shop') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
         `SELECT * FROM shop_items WHERE guild_id = $1 AND is_active = TRUE AND is_award_only = FALSE ORDER BY created_at DESC LIMIT 50`,
         [interaction.guild.id]
       );
-      await interaction.reply({ embeds: [buildShopEmbed(settings, result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildShopEmbed(settings, result.rows)], ephemeral: true });
       return;
     }
 
@@ -20404,6 +20454,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'inventory') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const targetUser = interaction.options.getUser('user') || interaction.user;
       const settings = await getCurrencySettings(interaction.guild.id);
@@ -20411,7 +20462,7 @@ if (shopSubcommand === 'view') {
         `SELECT * FROM user_inventory WHERE user_id = $1 ORDER BY purchased_at DESC LIMIT 50`,
         [targetUser.id]
       );
-      await interaction.reply({ embeds: [buildInventoryEmbed(settings, targetUser, result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildInventoryEmbed(settings, targetUser, result.rows)], ephemeral: true });
       return;
     }
 
@@ -20580,6 +20631,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'tournaments') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
@@ -20593,7 +20645,7 @@ if (shopSubcommand === 'view') {
          LIMIT 15`,
         [interaction.guild.id]
       );
-      await interaction.reply({ embeds: [buildTournamentsEmbed(settings, result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildTournamentsEmbed(settings, result.rows)], ephemeral: true });
       return;
     }
 
@@ -21092,6 +21144,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'economy') {
+      await interaction.deferReply();
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const totalResult = await pool.query(
@@ -21107,7 +21160,7 @@ if (shopSubcommand === 'view') {
         `SELECT COUNT(*)::int AS count FROM shop_items WHERE guild_id = $1 AND is_active = TRUE`,
         [interaction.guild.id]
       );
-      await interaction.reply({
+      await interaction.editReply({
         embeds: [buildEconomyEmbed(settings, {
           totalBalance: totalResult.rows[0]?.total_balance || 0,
           usersWithBalance: totalResult.rows[0]?.users_with_balance || 0,
@@ -21120,6 +21173,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'richest') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
@@ -21129,11 +21183,12 @@ if (shopSubcommand === 'view') {
          ORDER BY balance DESC, lifetime_earned DESC
          LIMIT 10`
       );
-      await interaction.reply({ embeds: [buildRichestEmbed(settings, result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildRichestEmbed(settings, result.rows)], ephemeral: true });
       return;
     }
 
     if (interaction.commandName === 'transactions') {
+      await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
       const targetUser = interaction.options.getUser('user') || interaction.user;
       const settings = await getCurrencySettings(interaction.guild.id);
@@ -21144,7 +21199,7 @@ if (shopSubcommand === 'view') {
          LIMIT 15`,
         [interaction.guild.id, targetUser.id]
       );
-      await interaction.reply({ embeds: [buildTransactionsEmbed(settings, `${targetUser.username}'s Transactions`, result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildTransactionsEmbed(settings, `${targetUser.username}'s Transactions`, result.rows)], ephemeral: true });
       return;
     }
 
@@ -21506,12 +21561,13 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'livestream') {
+      await interaction.deferReply({ ephemeral: true });
       const result = interaction.guild
         ? await pool.query('SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2', [interaction.guild.id, interaction.user.id])
         : await pool.query('SELECT stream_url FROM stream_links WHERE user_id = $1', [interaction.user.id]);
       const fallback = result.rows.length ? result : await pool.query('SELECT stream_url FROM stream_links WHERE user_id = $1', [interaction.user.id]);
       if (fallback.rows.length === 0) {
-        await interaction.reply({ content: 'You need to set your stream first using /linkstream', ephemeral: true });
+        await interaction.editReply({ content: 'You need to set your stream first using /linkstream', ephemeral: true });
         return;
       }
       const channel = await client.channels.fetch(league?.live_channel_id || LIVE_CHANNEL_ID);
@@ -21529,6 +21585,7 @@ if (shopSubcommand === 'view') {
       const role = interaction.options.getRole('role');
       const targetMember = await interaction.guild.members.fetch(targetUser.id);
       if (interaction.commandName === 'assignrole') await targetMember.roles.add(role);
+      await interaction.deferReply({ ephemeral: true });
       else await targetMember.roles.remove(role);
       const configuredTeamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
       const isMaddenTeamRole = configuredTeamRoles.some(team => team.role_id === role.id) || isLegacyTeamRole(role.name);
@@ -21570,7 +21627,7 @@ if (shopSubcommand === 'view') {
           }
         }
       }
-      await interaction.reply({ content: `${interaction.commandName === 'assignrole' ? 'Assigned' : 'Removed'} ${role} ${interaction.commandName === 'assignrole' ? 'to' : 'from'} ${targetMember}.`, ephemeral: true });
+      await interaction.editReply({ content: `${interaction.commandName === 'assignrole' ? 'Assigned' : 'Removed'} ${role} ${interaction.commandName === 'assignrole' ? 'to' : 'from'} ${targetMember}.`, ephemeral: true });
       return;
     }
 
@@ -21599,6 +21656,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'addtrade' || interaction.commandName === 'removetrade') {
+      await interaction.deferReply({ ephemeral: true });
       const teamRole = interaction.options.getRole('team');
       const increment = interaction.commandName === 'addtrade' ? 1 : -1;
       if (league?.league_id) {
@@ -21613,7 +21671,7 @@ if (shopSubcommand === 'view') {
         await pool.query(`UPDATE trade_counts SET trade_count = GREATEST(trade_count + $1, 0) WHERE team_name = $2`, [increment, teamRole.name]);
       }
       await updateTradeCountPanel(interaction.guild, league);
-      await interaction.reply({ content: `${increment > 0 ? 'Added' : 'Removed'} 1 trade ${increment > 0 ? 'to' : 'from'} ${teamRole}.`, ephemeral: true });
+      await interaction.editReply({ content: `${increment > 0 ? 'Added' : 'Removed'} 1 trade ${increment > 0 ? 'to' : 'from'} ${teamRole}.`, ephemeral: true });
       return;
     }
 
