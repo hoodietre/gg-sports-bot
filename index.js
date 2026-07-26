@@ -7066,10 +7066,10 @@ function getMultiChannelPanelInfo(panelType) {
       label: 'Sportsbook Board',
       build: async (guild) => {
         const openResult = await pool.query(
-          `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
+          `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 75`,
           [guild.id]
         );
-        return { embeds: [await buildSportsbookPanelEmbed(guild.id)], components: buildSportsbookBetBoardButtons(openResult.rows) };
+        return { embeds: [await buildSportsbookPanelEmbed(guild.id)], components: buildSportsbookBoardComponents(openResult.rows) };
       },
     },
     bank: {
@@ -9960,9 +9960,9 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      if (interaction.customId.startsWith('sportsbook_pick_game:')) {
+      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_pick_game') {
         if (!interaction.guild) return;
-        const gameId = interaction.customId.split(':')[1];
+        const gameId = interaction.values[0];
         const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
 
         if (!sportsbookGame || sportsbookGame.status !== 'open') {
@@ -9974,6 +9974,56 @@ if (interaction.commandName === 'avatar') {
           content: 'Choose your side for **' + sportsbookGame.game_label + '**.',
           components: [buildSportsbookSideButtons(sportsbookGame)],
           ephemeral: true,
+        });
+        return;
+      }
+
+      if (interaction.isButton() && interaction.customId === 'sportsbook_quick_mybets') {
+        await interaction.deferReply({ ephemeral: true });
+        const settings = await getCurrencySettings(interaction.guild.id);
+        const result = await pool.query(
+          `SELECT b.*, g.game_label, g.home_label, g.away_label
+           FROM sportsbook_bets b
+           JOIN sportsbook_games g ON g.id = b.sportsbook_game_id
+           WHERE b.guild_id = $1 AND b.user_id = $2
+           ORDER BY b.created_at DESC
+           LIMIT 15`,
+          [interaction.guild.id, interaction.user.id]
+        );
+        await interaction.editReply({ embeds: [buildMyBetsEmbed(settings, result.rows)] });
+        return;
+      }
+
+      if (interaction.isButton() && interaction.customId === 'sportsbook_quick_leaderboards') {
+        await interaction.deferReply({ ephemeral: true });
+        const result = await pool.query(
+          `SELECT user_id, sportsbook_profit FROM user_recognition WHERE guild_id = $1 ORDER BY sportsbook_profit DESC LIMIT 10`,
+          [interaction.guild.id]
+        );
+        const NL = String.fromCharCode(10);
+        const rows = result.rows.map(row => ({ user_id: row.user_id, value: String(row.sportsbook_profit || 0) }));
+        const embed = new EmbedBuilder()
+          .setTitle('Sportsbook Profit Leaders')
+          .setColor(0xFEE75C)
+          .setDescription(rows.length ? rows.map((r, i) => `${i + 1}. <@${r.user_id}> — ${r.value}`).join(NL) : 'No leaderboard data yet.')
+          .setFooter({ text: 'GG Sports • Sportsbook — /sportsbook leaderboards for win-rate or parlay leaders' })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (interaction.isButton() && interaction.customId === 'sportsbook_quick_parlay') {
+        await interaction.deferReply({ ephemeral: true });
+        const openMoneylines = await pool.query(
+          `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' AND (bet_type IS NULL OR bet_type = 'moneyline') ORDER BY created_at DESC LIMIT 15`,
+          [interaction.guild.id]
+        );
+        const NL = String.fromCharCode(10);
+        const lines = openMoneylines.rows.length
+          ? openMoneylines.rows.map(row => `**${row.game_label}** — ${row.away_label} ${formatAmericanOdds(row.away_odds)} / ${row.home_label} ${formatAmericanOdds(row.home_odds)}`).join(NL)
+          : 'No open moneylines to parlay right now.';
+        await interaction.editReply({
+          content: `**Build a Parlay** — use \`/sportsbook parlay\` with 2-4 legs, referencing a game below by its exact name and a side (home/away):${NL}${NL}${lines}`,
         });
         return;
       }
@@ -20149,10 +20199,10 @@ if (shopSubcommand === 'view') {
       }
 
       const openSportsbookResult = await pool.query(
-        `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 5`,
+        `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 75`,
         [interaction.guild.id]
       );
-      const message = await channel.send({ embeds: [await buildSportsbookPanelEmbed(interaction.guild.id)], components: buildSportsbookBetBoardButtons(openSportsbookResult.rows) });
+      const message = await channel.send({ embeds: [await buildSportsbookPanelEmbed(interaction.guild.id)], components: buildSportsbookBoardComponents(openSportsbookResult.rows) });
       await saveSportsbookPanel(interaction.guild.id, channel.id, message.id);
       await interaction.reply({ content: 'Sportsbook board created in ' + channel.toString() + '.', ephemeral: true });
       return;
@@ -23420,20 +23470,64 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
   return { settledCount, parlayPaid, wonParlays };
 }
 
-function buildSportsbookBetBoardButtons(rows) {
-  const openRows = rows.slice(0, 5);
-  if (!openRows.length) return [];
+// Replaces the old short-ID-labeled buttons (max 5, and the code meant nothing
+// without cross-referencing the embed text — the actual "chaotic" complaint).
+// Select menus support 25 real-named options each, so the visible label is always
+// the actual matchup/prop, never a code; the game's UUID rides invisibly as the
+// option value. Same downstream sportsbook_pick_game/pick_side flow either way.
+function buildSportsbookBoardComponents(rows) {
+  const moneylines = rows.filter(r => (r.bet_type || 'moneyline') === 'moneyline').slice(0, 25);
+  const playerProps = rows.filter(r => r.bet_type === 'stat_prop').slice(0, 25);
+  const freeformProps = rows.filter(r => r.bet_type === 'freeform_prop').slice(0, 25);
 
-  const row = new ActionRowBuilder();
-  for (const game of openRows) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId('sportsbook_pick_game:' + game.id)
-        .setLabel(shortSportsbookId(game.id))
-        .setStyle(ButtonStyle.Primary)
-    );
+  const components = [];
+
+  if (moneylines.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sportsbook_pick_game')
+        .setPlaceholder('🏈 Bet a Moneyline')
+        .addOptions(moneylines.map(row => ({
+          label: `${row.away_label} @ ${row.home_label}`.slice(0, 100),
+          value: row.id,
+          description: `${formatAmericanOdds(row.away_odds)} / ${formatAmericanOdds(row.home_odds)}`.slice(0, 100),
+        })))
+    ));
   }
-  return [row];
+
+  if (playerProps.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sportsbook_pick_game')
+        .setPlaceholder('🎯 Bet a Player Prop')
+        .addOptions(playerProps.map(row => ({
+          label: `${row.subject_display_name} O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`.slice(0, 100),
+          value: row.id,
+          description: `Over ${formatAmericanOdds(row.home_odds)} / Under ${formatAmericanOdds(row.away_odds)}`.slice(0, 100),
+        })))
+    ));
+  }
+
+  if (freeformProps.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sportsbook_pick_game')
+        .setPlaceholder('🎫 Bet a Featured Prop')
+        .addOptions(freeformProps.map(row => ({
+          label: row.game_label.slice(0, 100),
+          value: row.id,
+          description: `${row.home_label} ${formatAmericanOdds(row.home_odds)} / ${row.away_label} ${formatAmericanOdds(row.away_odds)}`.slice(0, 100),
+        })))
+    ));
+  }
+
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('sportsbook_quick_mybets').setLabel('My Bets').setEmoji('📋').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('sportsbook_quick_leaderboards').setLabel('Leaderboards').setEmoji('🏅').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('sportsbook_quick_parlay').setLabel('Build a Parlay').setEmoji('🧾').setStyle(ButtonStyle.Primary),
+  ));
+
+  return components;
 }
 
 function buildSportsbookSideButtons(game) {
@@ -23479,6 +23573,15 @@ function buildSportsbookEmbed(settings, rows) {
   return embed;
 }
 
+// American odds convention requires an explicit + on positive numbers — plain
+// integers were printing "130" instead of "+130", which doesn't read as odds at
+// all to anyone used to a real sportsbook.
+function formatAmericanOdds(odds) {
+  const n = Number(odds);
+  if (!Number.isFinite(n)) return String(odds);
+  return n > 0 ? `+${n}` : `${n}`;
+}
+
 async function buildSportsbookPanelEmbed(guildId) {
   const NL = String.fromCharCode(10);
   const openResult = await pool.query(
@@ -23490,7 +23593,7 @@ async function buildSportsbookPanelEmbed(guildId) {
      WHERE g.guild_id = $1 AND g.status = 'open'
      GROUP BY g.id
      ORDER BY g.created_at DESC
-     LIMIT 10`,
+     LIMIT 75`,
     [guildId]
   );
 
@@ -23502,31 +23605,64 @@ async function buildSportsbookPanelEmbed(guildId) {
     [guildId]
   );
 
-  const openLines = openResult.rows.length
-    ? openResult.rows.map(row => {
-        const oddsSuffix = sportsbookOddsLabelSuffix(row);
-        return '**' + shortSportsbookId(row.id) + ' • ' + row.game_label + '**' + NL +
-          row.away_label + oddsSuffix + ' ' + row.away_odds + ' vs ' + row.home_label + oddsSuffix + ' ' + row.home_odds + NL +
-          'Bets: ' + row.bet_count + ' • Handle: ' + row.total_handle;
-      }).join(NL + NL)
-    : 'No open sportsbook lines.';
+  // Sectioned by bet type — no exposed short-ID codes anywhere in here. Selection
+  // now happens via select menus (real matchup/prop names as the visible option),
+  // so there's nothing for a code to need to correlate to anymore.
+  const moneylines = openResult.rows.filter(r => (r.bet_type || 'moneyline') === 'moneyline');
+  const playerProps = openResult.rows.filter(r => r.bet_type === 'stat_prop');
+  const freeformProps = openResult.rows.filter(r => r.bet_type === 'freeform_prop');
+
+  const embed = new EmbedBuilder()
+    .setTitle('🏆 GG Sports  •  Sportsbook')
+    .setColor(0x057B33)
+    .setFooter({ text: 'GG Sports • Live Sportsbook Board' })
+    .setTimestamp();
+
+  if (moneylines.length) {
+    embed.addFields({
+      name: '🏈 MONEYLINES',
+      value: moneylines.slice(0, 8).map(row =>
+        `**${row.away_label}** ${formatAmericanOdds(row.away_odds)}  @  **${row.home_label}** ${formatAmericanOdds(row.home_odds)}${NL}` +
+        `↳ ${row.bet_count} bet(s) • ${row.total_handle} handle`
+      ).join(NL).slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  if (playerProps.length) {
+    embed.addFields({
+      name: '🎯 PLAYER PROPS',
+      value: playerProps.slice(0, 8).map(row =>
+        `**${row.subject_display_name}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}${NL}` +
+        `↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`
+      ).join(NL).slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  if (freeformProps.length) {
+    embed.addFields({
+      name: '🎫 FEATURED PROPS',
+      value: freeformProps.slice(0, 8).map(row =>
+        `**${row.game_label}**${NL}↳ ${row.home_label} ${formatAmericanOdds(row.home_odds)} • ${row.away_label} ${formatAmericanOdds(row.away_odds)}`
+      ).join(NL).slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  if (!moneylines.length && !playerProps.length && !freeformProps.length) {
+    embed.addFields({ name: 'Open Lines', value: 'No open sportsbook lines right now — check back soon.', inline: false });
+  }
 
   const recentLines = recentResult.rows.length
     ? recentResult.rows.map(row => {
         const winnerLabel = row.winner_side === 'home' ? row.home_label : row.away_label;
-        return '**' + row.game_label + '** — Winner: ' + winnerLabel;
+        return `**${row.game_label}** — ✅ ${winnerLabel}`;
       }).join(NL)
     : 'No settled results yet.';
+  embed.addFields({ name: '📋 Recent Results', value: recentLines.slice(0, 1000), inline: false });
 
-  return new EmbedBuilder()
-    .setTitle('📈 Live Sportsbook Board')
-    .setColor(0x57F287)
-    .addFields(
-      { name: 'Open Lines', value: openLines.slice(0, 3000), inline: false },
-      { name: 'Recent Results', value: recentLines.slice(0, 1000), inline: false }
-    )
-    .setFooter({ text: 'GG Sports • Live Sportsbook Board' })
-    .setTimestamp();
+  return embed;
 }
 
 async function saveSportsbookPanel(guildId, channelId, messageId) {
