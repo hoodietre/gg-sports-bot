@@ -10856,20 +10856,38 @@ if (interaction.commandName === 'avatar') {
         currentRound += 1;
         await pool.query(`UPDATE league_custom_settings SET current_round = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, currentRound]);
 
-        let threadsCreated = 0;
+        // Structured-schedule matchups used to only get a bare, unlabeled Discord
+        // thread here — no league_games row, no team assignment stored, no way to
+        // report a score, no standings impact, and (since sportsbook auto-creation
+        // hangs off createLeagueGameCore) no sportsbook line either. Now each
+        // matchup gets a real league_games row — same path Game Center uses for
+        // open-schedule leagues — so scoring, standings, and sportsbook automation
+        // all work identically regardless of schedule style.
         const threadChannelId = league.game_threads_channel_id;
         const threadChannel = threadChannelId ? await interaction.guild.channels.fetch(threadChannelId).catch(() => null) : null;
-        if (threadChannel?.isTextBased?.() && roundMatchups?.length) {
-          for (const matchup of roundMatchups) {
-            const threadName = `Round ${currentRound}: ${matchup.home.role_name} vs ${matchup.away.role_name}`.slice(0, 100);
-            await threadChannel.threads.create({ name: threadName, autoArchiveDuration: 10080 }).catch(() => null);
-            threadsCreated += 1;
+        let gamesCreated = 0;
+        let threadsCreated = 0;
+        const threadFailures = [];
+
+        for (const matchup of (roundMatchups || [])) {
+          const homeTeam = { id: matchup.home.role_id, name: matchup.home.role_name };
+          const awayTeam = { id: matchup.away.role_id, name: matchup.away.role_name };
+          const createResult = await createLeagueGameCore(interaction, league, homeTeam, awayTeam, { weekLabel: `Round ${currentRound}` });
+          if (!createResult.ok || !createResult.game) continue;
+          gamesCreated += 1;
+
+          if (threadChannel?.isTextBased?.()) {
+            const threadResult = await createGameCenterThread(interaction, league, createResult.game, { channelIdOverride: threadChannelId });
+            if (threadResult.ok) threadsCreated += 1;
+            else threadFailures.push(`${matchup.away.role_name} vs ${matchup.home.role_name}: ${threadResult.message}`);
           }
         }
 
         const matchupText = (roundMatchups || []).map(m => `${m.home.role_name} vs ${m.away.role_name}`).join('\n') || 'No matchups this round (bye).';
-        const threadNote = threadChannel ? `${threadsCreated} game thread(s) created in <#${threadChannel.id}>.` : 'No Game Threads channel configured — set one to auto-create threads next time.';
-        await interaction.editReply({ content: `**Advanced to Round ${currentRound}/${schedule.length}**\n${matchupText}\n\n${threadNote}` });
+        const threadNote = threadChannel
+          ? `${threadsCreated}/${gamesCreated} matchup thread(s) created in <#${threadChannel.id}>.${threadFailures.length ? '\n⚠️ ' + threadFailures.join('\n⚠️ ') : ''}`
+          : 'No Game Threads channel configured — games were created and can still be reported with `/game report`, but set a Game Threads Channel to get auto-created matchup threads with Report Score buttons next time.';
+        await interaction.editReply({ content: `**Advanced to Round ${currentRound}/${schedule.length}**\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}` });
         return;
       }
 
@@ -24137,6 +24155,15 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
   );
   if (existing.rows.length) return existing.rows[0];
 
+  // Only recognize/post lines for user vs user games — a game involving a
+  // CPU/unclaimed team has no real stakes and shouldn't get a betting line.
+  // Mirrors isMaddenUserVsUserGame's equivalent check on the Madden side.
+  const [homeOwner, awayOwner] = await Promise.all([
+    findTeamOwnerByRoleId(interaction.guild, leagueGame.home_team_role_id),
+    findTeamOwnerByRoleId(interaction.guild, leagueGame.away_team_role_id),
+  ]);
+  if (!homeOwner || !awayOwner) return null;
+
   const odds = await generateAutoSportsbookOdds(
     interaction.guild.id,
     league.league_id,
@@ -24806,8 +24833,8 @@ function buildGameCenterThreadComponents(gameId, isFinal) {
   ];
 }
 
-async function createGameCenterThread(interaction, league, game) {
-  const channelId = league.game_center_channel_id;
+async function createGameCenterThread(interaction, league, game, { channelIdOverride = null } = {}) {
+  const channelId = channelIdOverride || league.game_center_channel_id;
   if (!channelId) return { ok: false, message: 'no Game Center channel is configured — set one in the setup dashboard to get matchup threads.' };
 
   const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
