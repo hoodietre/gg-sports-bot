@@ -9960,7 +9960,7 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_pick_game') {
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sportsbook_pick_game')) {
         if (!interaction.guild) return;
         const gameId = interaction.values[0];
         const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
@@ -23485,7 +23485,7 @@ function buildSportsbookBoardComponents(rows) {
   if (moneylines.length) {
     components.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId('sportsbook_pick_game')
+        .setCustomId('sportsbook_pick_game_moneyline')
         .setPlaceholder('🏈 Bet a Moneyline')
         .addOptions(moneylines.map(row => ({
           label: `${row.away_label} @ ${row.home_label}`.slice(0, 100),
@@ -23498,7 +23498,7 @@ function buildSportsbookBoardComponents(rows) {
   if (playerProps.length) {
     components.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId('sportsbook_pick_game')
+        .setCustomId('sportsbook_pick_game_prop')
         .setPlaceholder('🎯 Bet a Player Prop')
         .addOptions(playerProps.map(row => ({
           label: `${row.subject_display_name} O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`.slice(0, 100),
@@ -23511,7 +23511,7 @@ function buildSportsbookBoardComponents(rows) {
   if (freeformProps.length) {
     components.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId('sportsbook_pick_game')
+        .setCustomId('sportsbook_pick_game_freeform')
         .setPlaceholder('🎫 Bet a Featured Prop')
         .addOptions(freeformProps.map(row => ({
           label: row.game_label.slice(0, 100),
