@@ -480,7 +480,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_message_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS free_agents_message_id TEXT`);
-  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sportsbook_auto_lines_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sportsbook_auto_lines_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS sportsbook_game_id UUID REFERENCES sportsbook_games(id) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS is_user_vs_user BOOLEAN`);
@@ -2229,6 +2229,7 @@ async function initDatabase() {
 
   await loadCurrencyConfig();
   await migrateGuildCurrencyBalancesToGlobal();
+  await migrateMaddenSportsbookAutoLinesDefaultOn();
   await migrateSingleChannelPanelsToMultiChannel();
 
   console.log('Database ready.');
@@ -2240,6 +2241,42 @@ async function initDatabase() {
 // call made when the economy went universal (see design log, "Migration policy for
 // consolidating existing per-guild guild_currency_balances", resolved as: sum across
 // servers per user). guild_currency_balances itself is left untouched as historical data.
+// One-time enablement of Madden sportsbook auto-lines for leagues created before
+// this defaulted to on. Guarded by system_migrations so this runs exactly once —
+// critical here specifically, since without the guard, any commissioner who
+// deliberately disables this *after* the migration runs would get silently
+// re-enabled on the next bot restart. A plain unconditional UPDATE would do that;
+// this migration-key guard is what prevents it.
+async function migrateMaddenSportsbookAutoLinesDefaultOn() {
+  const MIGRATION_KEY = 'madden_sportsbook_auto_lines_default_on_v1';
+
+  const already = await pool.query(
+    `SELECT 1 FROM system_migrations WHERE migration_key = $1`,
+    [MIGRATION_KEY]
+  );
+  if (already.rows.length > 0) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE madden_league_settings SET sportsbook_auto_lines_enabled = TRUE WHERE sportsbook_auto_lines_enabled = FALSE`
+    );
+    await client.query(
+      `INSERT INTO system_migrations (migration_key) VALUES ($1)`,
+      [MIGRATION_KEY]
+    );
+    await client.query('COMMIT');
+    console.log('[Sportsbook Migration] Enabled Madden sportsbook auto-lines for existing leagues (one-time default flip).');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('[Sportsbook Migration] Failed to enable auto-lines for existing leagues:', error);
+  } finally {
+    client.release();
+  }
+}
+
+
 async function migrateGuildCurrencyBalancesToGlobal() {
   const MIGRATION_KEY = 'global_currency_balance_consolidation_v1';
 
@@ -3154,7 +3191,7 @@ function buildCommands() {
       .setName('sportsbook')
       .setDescription('Sportsbook commands')
       .addSubcommand(sc => sc.setName('board').setDescription('View open sportsbook games'))
-      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create sportsbook game').addStringOption(o => o.setName('label').setDescription('Game label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Home/team A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Away/team B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)).addStringOption(o => o.setName('bet_type').setDescription('Moneyline (default) or freeform prop').setRequired(false).addChoices({ name: 'Moneyline', value: 'moneyline' }, { name: 'Freeform Prop', value: 'freeform_prop' })))
+      .addSubcommand(sc => sc.setName('create').setDescription('Staff: create a freeform prop bet (custom outcome, not tied to game stats or a real score)').addStringOption(o => o.setName('label').setDescription('Prop label').setRequired(true)).addStringOption(o => o.setName('home').setDescription('Outcome A label').setRequired(true)).addStringOption(o => o.setName('away').setDescription('Outcome B label').setRequired(true)).addIntegerOption(o => o.setName('home_odds').setDescription('American odds').setRequired(false)).addIntegerOption(o => o.setName('away_odds').setDescription('American odds').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name (optional — tags this prop to a league)').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc
         .setName('createprop')
         .setDescription('Staff: create a stat-based player prop (auto-settles from synced box scores)')
@@ -20598,7 +20635,7 @@ if (shopSubcommand === 'view') {
 
       if (subcommand === 'create') {
         if (!(await userCanUseLeagueSetup(interaction, null))) {
-          await interaction.reply({ content: 'You do not have permission to create sportsbook games.', ephemeral: true });
+          await interaction.reply({ content: 'You do not have permission to create sportsbook props.', ephemeral: true });
           return;
         }
 
@@ -20608,7 +20645,11 @@ if (shopSubcommand === 'view') {
         const homeOdds = interaction.options.getInteger('home_odds') ?? -110;
         const awayOdds = interaction.options.getInteger('away_odds') ?? -110;
         const leagueName = interaction.options.getString('league');
-        const betType = interaction.options.getString('bet_type') || 'moneyline';
+        // Manual creation is freeform props only now — moneyline games are always
+        // auto-created (tied to a real scheduled game, non-Madden or Madden) and
+        // auto-settled off the reported score. See createAutoSportsbookForLeagueGame
+        // and autoCreateMaddenSportsbookLines.
+        const betType = 'freeform_prop';
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : null;
 
         if (leagueName && !activeLeague) {
@@ -20624,12 +20665,12 @@ if (shopSubcommand === 'view') {
         const sportsbookGameId = randomUUID();
         await pool.query(
           `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id, bet_type, subject_type)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-          [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id, betType, betType === 'freeform_prop' ? 'freeform' : null]
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'freeform')`,
+          [sportsbookGameId, interaction.guild.id, activeLeague?.league_id || null, label, home, away, homeOdds, awayOdds, interaction.user.id, betType]
         );
 
         await updateSportsbookPanel(interaction.guild).catch(() => null);
-        await interaction.reply({ content: (betType === 'freeform_prop' ? 'Prop' : 'Sportsbook game') + ' created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**.', ephemeral: true });
+        await interaction.reply({ content: 'Prop created: **' + shortSportsbookId(sportsbookGameId) + ' • ' + label + '**. Since this isn\'t tied to a real score, settle it manually with `/sportsbook settle` once the outcome is known.', ephemeral: true });
         return;
       }
 
@@ -20808,6 +20849,18 @@ if (shopSubcommand === 'view') {
         const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameInput);
         if (!sportsbookGame || sportsbookGame.status !== 'open') {
           await interaction.reply({ content: 'Could not find an open sportsbook game with that ID.', ephemeral: true });
+          return;
+        }
+
+        // Moneyline and stat_prop games settle automatically now (tied to a real
+        // reported score / synced weekly stats) — manual settlement is only for
+        // freeform props, which have no external data source to auto-settle from.
+        if (sportsbookGame.bet_type === 'moneyline') {
+          await interaction.reply({ content: 'This is a moneyline game tied to a real matchup — it settles automatically once that game\'s final score is reported. Report the actual game instead of settling it here.', ephemeral: true });
+          return;
+        }
+        if (sportsbookGame.bet_type === 'stat_prop') {
+          await interaction.reply({ content: 'This is a stat prop — it settles automatically once that week\'s stats sync in. If it\'s stuck, check `/sportsbook settleprops` for why it\'s being skipped.', ephemeral: true });
           return;
         }
 
@@ -58320,7 +58373,7 @@ async function ensureMaddenAutoDetectColumns() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_message_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS free_agents_message_id TEXT`);
   // Sportsbook auto-lines
-  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sportsbook_auto_lines_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sportsbook_auto_lines_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
   // Link madden games to sportsbook games for auto-settlement
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS sportsbook_game_id UUID REFERENCES sportsbook_games(id) ON DELETE SET NULL`);
@@ -58651,6 +58704,139 @@ async function generateMaddenMatchupOdds(guildId, league, homeTeamName, awayTeam
   };
 }
 
+
+// ---------------------------------------------------------------------------
+// Stat-prop auto-generation for Madden user vs user games.
+// Real sportsbooks set player-prop lines off a blend of season-long production and
+// recent form, then price both sides close to even (the skill is in where the
+// number sits, not lopsided odds) — this mirrors that rather than inventing a
+// black-box "confidence score." Deliberately conservative: skips a player/stat
+// entirely rather than project off less than 2 games of data, since a bad
+// projection here creates a real line people bet real currency on.
+// ---------------------------------------------------------------------------
+const MADDEN_PROP_POSITION_STATS = [
+  { positions: ['QB'], statKey: 'passing_yards', roundTo: 5 },
+  { positions: ['HB', 'RB'], statKey: 'rushing_yards', roundTo: 5 },
+  { positions: ['WR'], statKey: 'receiving_yards', roundTo: 5 },
+];
+
+async function getMaddenPlayerStatHistory(guildId, leagueId, playerRef, statType, statField, beforeWeekIndex) {
+  const result = await pool.query(
+    `SELECT week_index, raw_payload
+     FROM madden_player_weekly_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3
+       AND (roster_id = $4 OR presentation_id = $4)
+       AND week_index < $5
+     ORDER BY week_index DESC
+     LIMIT 10`,
+    [guildId, String(leagueId), statType, playerRef, beforeWeekIndex]
+  ).catch(() => ({ rows: [] }));
+
+  return result.rows
+    .map(row => Number(row.raw_payload?.[statField]))
+    .filter(value => Number.isFinite(value));
+}
+
+function projectMaddenStatLine(history, roundTo) {
+  if (history.length < 2) return null; // Not enough games to project responsibly.
+  const seasonAvg = history.reduce((sum, v) => sum + v, 0) / history.length;
+  const recent = history.slice(0, 3);
+  const recentAvg = recent.reduce((sum, v) => sum + v, 0) / recent.length;
+  const projected = history.length >= 3 ? (seasonAvg * 0.4 + recentAvg * 0.6) : seasonAvg;
+
+  // Round to the nearest step, then nudge to a half-step so the line can't land
+  // exactly on a plausible final stat (avoids most pushes without needing a
+  // separate push rule at settlement).
+  const stepped = Math.round(projected / roundTo) * roundTo;
+  return stepped + roundTo / 2;
+}
+
+// Finds the single best candidate per (team, stat) — most recent-game volume at
+// the relevant position — rather than every rostered player at that position, to
+// keep the number of props per game reasonable (3 per team, 6 per game).
+async function findMaddenPropCandidate(guildId, leagueId, teamName, positions, statType, statField, beforeWeekIndex) {
+  const result = await pool.query(
+    `SELECT roster_id, presentation_id, full_name, position,
+            SUM(COALESCE((raw_payload->>$6)::numeric, 0)) AS recent_total
+     FROM madden_player_weekly_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3
+       AND LOWER(team_name) = LOWER($4) AND position = ANY($5) AND week_index < $7
+     GROUP BY roster_id, presentation_id, full_name, position
+     ORDER BY recent_total DESC
+     LIMIT 1`,
+    [guildId, String(leagueId), statType, teamName, positions, statField, beforeWeekIndex]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
+async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
+  const settings = await ensureMaddenLeagueSettings(league);
+  if (!settings.sportsbook_auto_lines_enabled) return { created: 0 };
+
+  // week_label (games schedule) and week_index (player weekly stats) are two
+  // separate EA sync streams with no guaranteed shared numbering — rather than
+  // parse the label into a guessed index (risky: a wrong index would silently
+  // orphan these props from ever matching real stats at settlement time), derive
+  // the upcoming week's index directly from the data: one past the highest
+  // week_index already synced for this league. Stats sync in lockstep with
+  // advancing weeks, so this is a real data-driven inference, not a guess.
+  const maxWeekResult = await pool.query(
+    `SELECT COALESCE(MAX(week_index), 0) AS max_week FROM madden_player_weekly_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [{ max_week: 0 }] }));
+  const weekIndex = Number(maxWeekResult.rows[0]?.max_week || 0) + 1;
+  if (weekIndex <= 1) return { created: 0 }; // No prior-week stats synced yet — nothing to project off of.
+
+  const games = await pool.query(
+    `SELECT * FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(week_label) = LOWER($3) AND is_user_vs_user = TRUE`,
+    [guild.id, String(league.league_id), weekLabel]
+  ).catch(() => ({ rows: [] }));
+
+  let created = 0;
+  for (const game of games.rows || []) {
+    for (const team of [game.home_team, game.away_team]) {
+      for (const { positions, statKey, roundTo } of MADDEN_PROP_POSITION_STATS) {
+        const statConfig = SPORTSBOOK_PROP_STAT_TYPES[statKey];
+        const candidate = await findMaddenPropCandidate(guild.id, league.league_id, team, positions, statConfig.statType, statConfig.field, weekIndex);
+        if (!candidate) continue;
+        const playerRef = candidate.roster_id || candidate.presentation_id;
+        if (!playerRef) continue;
+
+        const existing = await pool.query(
+          `SELECT id FROM sportsbook_games
+           WHERE guild_id = $1 AND league_id = $2::uuid AND bet_type = 'stat_prop'
+             AND subject_ref = $3 AND stat_key = $4 AND prop_week_index = $5`,
+          [guild.id, league.league_id, playerRef, statKey, weekIndex]
+        ).catch(() => ({ rows: [] }));
+        if (existing.rows.length) continue;
+
+        const history = await getMaddenPlayerStatHistory(guild.id, league.league_id, playerRef, statConfig.statType, statConfig.field, weekIndex);
+        const threshold = projectMaddenStatLine(history, roundTo);
+        if (threshold === null) continue; // Not enough game history to project responsibly — skip, don't guess.
+
+        const displayName = candidate.full_name || 'Unknown Player';
+        const statLine = `${displayName} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
+        const sportsbookGameId = randomUUID();
+        await pool.query(
+          `INSERT INTO sportsbook_games
+            (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds,
+             created_by_user_id, bet_type, subject_type, subject_ref, subject_display_name,
+             stat_key, stat_threshold, stat_line, prop_week_index, source, auto_generated)
+           VALUES ($1, $2, $3::uuid, $4, $5, $6, -110, -110, 'system', 'stat_prop', 'player',
+             $7, $8, $9, $10, $4, $11, 'madden_auto_prop', TRUE)`,
+          [sportsbookGameId, guild.id, league.league_id, statLine, `Over ${threshold} ${statConfig.label}`, `Under ${threshold} ${statConfig.label}`, playerRef, displayName, statKey, threshold, weekIndex]
+        ).catch(err => {
+          console.error('[MADDEN PROP AUTO] Failed to create prop:', err?.message || err);
+          return null;
+        });
+        created += 1;
+      }
+    }
+  }
+  return { created };
+}
 
 // ---------------------------------------------------------------------------
 // User vs user detection for Madden games
@@ -59305,6 +59491,22 @@ async function autoDetectAfterSync(guild, league) {
   // 4. Sportsbook auto-lines for the new week
   await autoCreateMaddenSportsbookLines(guild, league, newWeekLabel).catch(err =>
     console.error('[AUTO DETECT] Sportsbook lines:', err?.message));
+
+  // 4a. Sportsbook player prop lines for the new week — analytical, not hand-picked.
+  // Runs after auto-lines above so is_user_vs_user is already set on this week's games.
+  await generateMaddenPlayerPropLines(guild, league, newWeekLabel).catch(err =>
+    console.error('[AUTO DETECT] Player prop lines:', err?.message));
+
+  // 4b. Stat-prop auto-settlement — previously only ran when a staff member manually
+  // typed /sportsbook autosettleprops confirm:true. Settlement shouldn't be manual
+  // any more than creation should be, so this now runs the same confirm:true pass
+  // automatically right after the week's stats have synced in. Uses a shimmed
+  // interaction-like object since this is system-triggered, not a real Discord
+  // interaction — autoSettleOpenStatProps only reads .guild/.guild.id/.user.id, it
+  // never calls .reply()/.editReply(), so this is safe. 'system' as the actor id
+  // matches the same convention autoCreateMaddenSportsbookLines already uses.
+  await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true }).catch(err =>
+    console.error('[AUTO DETECT] Stat prop settlement:', err?.message));
 
   // 5. ESPN-style news
   if (allEvents.length > 0) {
