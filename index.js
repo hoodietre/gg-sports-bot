@@ -15987,7 +15987,21 @@ if (gameSubcommand === 'report') {
         if (standCh) setCol('standings_message_id', null);
         if (rankCh) setCol('power_rankings_message_id', null);
         const resetWeek = interaction.options.getString('reset_week');
-        if (resetWeek) setCol('last_auto_detect_week_label', resetWeek.trim());
+        // Must also clear ea_reported_current_week, not just the pointer — this
+        // column (added for the EA-hub-based advance detection) gets frozen at
+        // whatever it last computed. If that value is stale or wrong and only the
+        // pointer gets reset, the very next sync compares the reset pointer
+        // against that same stale value and can jump straight back to it,
+        // ignoring the reset entirely. setCol() can't be used here — it skips
+        // null values by design (that's how it means "no value provided"), so
+        // this needs its own direct query to actually clear the column.
+        if (resetWeek) {
+          setCol('last_auto_detect_week_label', resetWeek.trim());
+          await pool.query(
+            `UPDATE madden_league_settings SET ea_reported_current_week = NULL WHERE league_id = $1`,
+            [activeLeague.league_id]
+          ).catch(() => null);
+        }
         if (updates.length) {
           updates.push('updated_at = NOW()');
           await pool.query(
@@ -56870,6 +56884,24 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       ).catch(error => console.error('[Madden Sync] Failed to persist EA reported current week:', error?.message));
     }
 
+    // Direct diagnostic — exactly what week_label values exist in the actual
+    // imported game data, and how many of each are scored vs not. Built after
+    // three rounds of trying to diagnose this from truncated log snippets;
+    // surfacing this plainly in the sync result itself removes the guesswork.
+    const weekLabelBreakdownResult = await pool.query(
+      `SELECT week_label, COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE home_score > 0 OR away_score > 0)::int AS scored
+       FROM madden_imported_games
+       WHERE guild_id = $1 AND league_id::text = $2::text AND week_label IS NOT NULL
+       GROUP BY week_label
+       ORDER BY week_label`,
+      [guild.id, String(league.league_id)]
+    ).catch(() => ({ rows: [] }));
+    const weekLabelBreakdown = weekLabelBreakdownResult.rows
+      .map(row => `${row.week_label}: ${row.scored}/${row.total} scored`)
+      .join(' | ');
+    console.log(`[WEEK LABEL BREAKDOWN 7J-6WK] League ${league.league_id}: ${weekLabelBreakdown || '(no games found)'}`);
+
     let probeResults = [];
     if (!hasRealRecordData && preseasonMode) {
       console.log('[EA STANDINGS PRESEASON-SAFE] Skipping standings probe because league is currently in ' + seasonModeLabel + '. EA standings usually reset/not available until regular season.');
@@ -57036,7 +57068,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
         : offseasonMode
         ? 'Offseason mode active: no current week/schedule data from EA (rosters/teams still synced normally); imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
         : 'Regular season mode: CareerMode_GetStandingsExport + madden compare system enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.') +
-      '\n\n' + advanceStatusLine;
+      '\n\n' + advanceStatusLine +
+      '\n\n📊 **EA reports current week:** ' + (eaHubCtx?.displayedWeek || 'unknown') +
+      '\n📋 **Week label breakdown:** ' + (weekLabelBreakdown || '(no games found)');
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
@@ -58749,13 +58783,31 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
   const eaReportedWeek = settingsResult.rows[0]?.ea_reported_current_week || null;
 
+  // Known week sequence from the schedule — shared by both paths below. Used by
+  // the EA-hub path specifically as a hard cap: never advance more than one step
+  // per sync, regardless of how far ahead eaReportedWeek claims to be. This is a
+  // deliberate circuit breaker, not just a preference — after three straight
+  // rounds of this detection logic still being wrong in production, trusting any
+  // single computed value for an unbounded jump is exactly the failure mode to
+  // stop allowing. One step at a time is always safe: a genuinely multi-week-
+  // behind league just takes multiple syncs to catch up, each one fully
+  // processed, and a wrongly-computed value can only ever cause a one-week
+  // false advance instead of a four-week one.
+  const allGamesResult = await pool.query(
+    `SELECT week_label, status, home_score, away_score FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND week_label IS NOT NULL AND TRIM(week_label) <> ''
+       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  const rows = allGamesResult.rows || [];
+  const allWeeks = Array.from(new Set(rows.map(r => r.week_label)));
+  allWeeks.sort(compareMaddenWeekLabels);
+
   // Primary path: EA's own reported current week (persisted fresh every sync in
   // runMaddenEaDirectSync) is genuine ground truth — read directly from the
   // franchise hub's nextSeasonWeek/displayWeek/weekIndex fields, not inferred
-  // from anything. This is what actually fixes the false-advance bug: game
-  // completion turned out to be an unreliable signal on its own, since CPU-vs-CPU
-  // games can auto-resolve with real final scores well before the human
-  // commissioner actually advances the week.
+  // from game completion at all.
   if (eaReportedWeek) {
     if (!lastLabel) {
       // First sync ever — anchor to whatever EA currently reports, don't process.
@@ -58764,10 +58816,20 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
       return null;
     }
     if (eaReportedWeek === lastLabel) return null; // EA still reports the same week — nothing has actually advanced.
+
     const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
     const [curG, curN] = maddenWeekLabelSortKey(eaReportedWeek);
     const movedForward = curG > lastG || (curG === lastG && curN > lastN);
-    return movedForward ? eaReportedWeek : null;
+    if (!movedForward) return null;
+
+    // Find the single next known week after lastLabel in the schedule sequence,
+    // and cap to that — never jump straight to eaReportedWeek itself.
+    const lastIdx = allWeeks.indexOf(lastLabel);
+    const nextWeek = lastIdx >= 0 && lastIdx + 1 < allWeeks.length ? allWeeks[lastIdx + 1] : eaReportedWeek;
+    if (nextWeek !== eaReportedWeek) {
+      console.log(`[AUTO DETECT] ⚠️ EA reported "${eaReportedWeek}" but last processed was "${lastLabel}" — that's more than one step. Capping advance to the next week in sequence ("${nextWeek}") instead of jumping directly, and will re-check EA's report again on the next sync.`);
+    }
+    return nextWeek;
   }
 
   // Fallback path — only reached for leagues that haven't synced since this fix
@@ -58776,19 +58838,7 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   // game-completion heuristic as before: a week only counts as fully played once
   // every game in it has a real score attached, not just a status label (which
   // the importer can set from an unreliable marker field alone).
-  const allGamesResult = await pool.query(
-    `SELECT week_label, status, home_score, away_score FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id::text = $2::text
-       AND week_label IS NOT NULL AND TRIM(week_label) <> ''
-       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'`,
-    [guildId, String(leagueId)]
-  ).catch(() => ({ rows: [] }));
-
-  const rows = allGamesResult.rows || [];
   if (!rows.length) return null;
-
-  const allWeeks = Array.from(new Set(rows.map(r => r.week_label)));
-  allWeeks.sort(compareMaddenWeekLabels);
 
   const MADDEN_COMPLETED_STATUSES = new Set(['completed', 'final', 'complete', 'completed_with_real_score', 'away_win', 'home_win', 'tie']);
   const isGameGenuinelyComplete = (row) => {
