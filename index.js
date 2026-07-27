@@ -38226,11 +38226,26 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
       else status = 'completed';
     }
 
-    const externalGameId = String([
+    // 7J-10D: root-cause fix for the 32-vs-16 duplication (Session 3, round 14).
+    // Confirmed via direct DB inspection that this path and the hub-based
+    // normalizeEaScheduleDeepFromHub path resolve the exact same real per-game
+    // EA key (scheduleId here, seasonGameKey there — same underlying field set)
+    // for the same real game, e.g. both landed on "544735456" for the same
+    // Chargers @ Browns matchup. But this path wrapped it in a synthetic
+    // compound string ("ea-schedule-export:reg:4:544735456:Chargers:Browns")
+    // while the hub path used the bare value ("544735456") — two different
+    // ON CONFLICT keys for the same real game, which is what was actually
+    // producing every duplicate row traced this session. Use the bare key
+    // directly whenever one exists, so both import paths converge on the same
+    // external_game_id and correctly update one row instead of creating two.
+    // Only fall back to the old synthetic compound format when no real
+    // scheduleId exists at all, to preserve uniqueness for rows that
+    // genuinely lack one.
+    const externalGameId = String(scheduleId || [
       'ea-schedule-export',
       stage,
       weekNumber || rawWeek || 'unknown',
-      scheduleId || index,
+      index,
       awayTeam,
       homeTeam,
     ].join(':'));
