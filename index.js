@@ -39782,13 +39782,75 @@ async function createMaddenWeeklyGameThreads(interaction, league, weekLabel, vis
 }
 
 // 7J-10BY-GT: Auto-trigger — called at end of every sync
-async function autoCreateGameThreadsAfterSync(guild, league) {
+async function autoCreateGameThreadsAfterSync(guild, league, targetWeekLabel = null) {
   const settings = await ensureMaddenLeagueSettings(league);
   if (settings.game_threads_auto === false) {
     console.log('[AUTO GAME THREADS] Disabled for league ' + league.league_id + ' — skipping.');
     return;
   }
 
+  let weekLabel;
+
+  if (targetWeekLabel) {
+    // Gated path (preferred): the caller (autoDetectAfterSync) already confirmed
+    // via getMaddenNewAdvanceWeek/ea_reported_current_week that this is a genuine
+    // new week. Use it directly instead of independently re-inferring "which week
+    // looks threadless" below — that inference was the root cause of threads
+    // getting created for a future week (e.g. Week 4) on a sync that correctly
+    // reported "no new week" for the actual current week (Week 3): future weeks'
+    // games already exist in madden_imported_games, unthreaded, from the schedule
+    // import, well before the league has actually reached them.
+    weekLabel = targetWeekLabel;
+    console.log('[AUTO GAME THREADS] Using confirmed new week from auto-detect: ' + weekLabel + ' for league ' + league.league_id);
+  } else {
+    weekLabel = await resolveAutoGameThreadsTargetWeek(guild, league);
+    if (!weekLabel) return;
+  }
+
+  console.log('[AUTO GAME THREADS] New week detected: ' + weekLabel + ' for league ' + league.league_id);
+
+  // Resolve the target channel
+  const configuredChannelId = settings.game_threads_channel_id
+    || await getMaddenGameThreadsChannelId(league.league_id).catch(() => null)
+    || await getMaddenNewsChannelId(league.league_id).catch(() => null);
+
+  if (!configuredChannelId) {
+    console.warn('[AUTO GAME THREADS] No thread channel configured for league ' + league.league_id
+      + ' — set one with /maddengames setup channel:#channel');
+    return;
+  }
+  const baseChannel = await guild.channels.fetch(configuredChannelId).catch(() => null);
+  if (!baseChannel?.isTextBased?.()) {
+    console.warn('[AUTO GAME THREADS] Configured channel not found or not text-based for league ' + league.league_id);
+    return;
+  }
+
+  // Delete prior week's threads first
+  const prevWeek = await getPreviousWeekWithThreads(guild.id, league.league_id, weekLabel).catch(() => null);
+  if (prevWeek) {
+    const del = await deleteMaddenWeekThreadsSilent(guild, league, prevWeek)
+      .catch(err => { console.error('[AUTO GAME THREADS] Prior week deletion failed:', err?.message || err); return { deleted: 0, failed: 0 }; });
+    console.log('[AUTO GAME THREADS] Deleted prior week (' + prevWeek + '): ' + del.deleted + ' removed, ' + del.failed + ' failed.');
+  }
+
+  // Create threads for the new week
+  const visibility = settings.game_threads_visibility || 'private';
+  const threadResult = await createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visibility, baseChannel)
+    .catch(err => { console.error('[AUTO GAME THREADS] Thread creation failed:', err?.message || err); return { created: [], skipped: [], failed: [] }; });
+
+  console.log('[AUTO GAME THREADS] ' + weekLabel
+    + ' — created: ' + (threadResult.created?.length || 0)
+    + ', skipped: ' + (threadResult.skipped?.length || 0)
+    + ', failed: ' + (threadResult.failed?.length || 0));
+}
+
+// Legacy/fallback path — independently infers "which week needs threads" by
+// scanning for weeks where every scheduled game is threadless. Only used when
+// autoCreateGameThreadsAfterSync is called without a confirmed targetWeekLabel
+// (e.g. a manual/administrative invocation). The gated sync path above no longer
+// relies on this for real auto-sync runs — see the handoff notes in the tracking
+// doc for why this inference alone was unsafe as the primary signal.
+async function resolveAutoGameThreadsTargetWeek(guild, league) {
   // Find weeks where ALL *scheduled* games are threadless.
   // Only look at scheduled rows — completed games from previous seasons
   // share the same week labels and must not trigger thread creation.
@@ -39861,41 +39923,7 @@ async function autoCreateGameThreadsAfterSync(guild, league) {
   }
 
   const weekLabel = candidateWeeks[0]; // earliest new week after last threaded
-  console.log('[AUTO GAME THREADS] New week detected: ' + weekLabel + ' for league ' + league.league_id);
-
-  // Resolve the target channel
-  const configuredChannelId = settings.game_threads_channel_id
-    || await getMaddenGameThreadsChannelId(league.league_id).catch(() => null)
-    || await getMaddenNewsChannelId(league.league_id).catch(() => null);
-
-  if (!configuredChannelId) {
-    console.warn('[AUTO GAME THREADS] No thread channel configured for league ' + league.league_id
-      + ' — set one with /maddengames setup channel:#channel');
-    return;
-  }
-  const baseChannel = await guild.channels.fetch(configuredChannelId).catch(() => null);
-  if (!baseChannel?.isTextBased?.()) {
-    console.warn('[AUTO GAME THREADS] Configured channel not found or not text-based for league ' + league.league_id);
-    return;
-  }
-
-  // Delete prior week's threads first
-  const prevWeek = await getPreviousWeekWithThreads(guild.id, league.league_id, weekLabel).catch(() => null);
-  if (prevWeek) {
-    const del = await deleteMaddenWeekThreadsSilent(guild, league, prevWeek)
-      .catch(err => { console.error('[AUTO GAME THREADS] Prior week deletion failed:', err?.message || err); return { deleted: 0, failed: 0 }; });
-    console.log('[AUTO GAME THREADS] Deleted prior week (' + prevWeek + '): ' + del.deleted + ' removed, ' + del.failed + ' failed.');
-  }
-
-  // Create threads for the new week
-  const visibility = settings.game_threads_visibility || 'private';
-  const threadResult = await createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visibility, baseChannel)
-    .catch(err => { console.error('[AUTO GAME THREADS] Thread creation failed:', err?.message || err); return { created: [], skipped: [], failed: [] }; });
-
-  console.log('[AUTO GAME THREADS] ' + weekLabel
-    + ' — created: ' + (threadResult.created?.length || 0)
-    + ', skipped: ' + (threadResult.skipped?.length || 0)
-    + ', failed: ' + (threadResult.failed?.length || 0));
+  return weekLabel;
 }
 
 async function getMaddenImportedGameById(gameId) {
@@ -52692,7 +52720,44 @@ function getTeamNameFromGameSide(game, side, maps) {
 }
 
 
-function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = null, parentRow = null) {
+// 7J-8LR: diagnostic wrapper — added per handoff to confirm/rule out the
+// "label instability" theory before patching repairEaFutureWeekLabelFromGameCore
+// blind again. Logs the computed label alongside the raw fields that fed it, per
+// game, on every sync. Compare the same matchup's log line across two consecutive
+// syncs: if computedLabel or rawFields differ for the same real game, that
+// confirms the label-instability theory (and explains the cascading
+// externalGameId instability that produces duplicate rows). If they're
+// identical across syncs, the instability is happening somewhere else and this
+// function is cleared. Does not change any return-value logic — pure logging.
+function repairEaFutureWeekLabelFromGame(game, fallbackIndex = 0, currentCtx = null, parentRow = null, debugId = null) {
+  const result = repairEaFutureWeekLabelFromGameCore(game, fallbackIndex, currentCtx, parentRow);
+
+  const diagSources = [game, parentRow, parentRow?.seasonGameInfo, parentRow?.gameInfo].filter(Boolean);
+  const rawFields = {};
+  for (const key of [
+    'displayedWeek', 'weekTitle', 'week_label', 'weekLabel', 'displayWeekLabel', 'seasonWeekTitle',
+    'weekType', 'seasonWeekType', 'stageIndex',
+    'week', 'weekIndex', 'seasonWeek', 'displayWeek', 'displayedWeekIndex', 'scheduleWeek', 'gameWeek',
+  ]) {
+    for (const source of diagSources) {
+      const v = getAnyValue(source, [key], null);
+      if (v !== null && v !== undefined) { rawFields[key] = v; break; }
+    }
+  }
+  console.log('[WEEK LABEL REPAIR 7J-8LR] ' + JSON.stringify({
+    matchup: debugId || null,
+    computedLabel: result,
+    ctxIsPreseason: currentCtx?.isPreseason ?? null,
+    ctxIsRegularSeason: currentCtx?.isRegularSeason ?? null,
+    ctxDisplayedWeek: currentCtx?.displayedWeek ?? null,
+    ctxSeasonWeek: currentCtx?.seasonWeek ?? null,
+    rawFields,
+  }));
+
+  return result;
+}
+
+function repairEaFutureWeekLabelFromGameCore(game, fallbackIndex = 0, currentCtx = null, parentRow = null) {
   const sources = [game, parentRow, parentRow?.seasonGameInfo, parentRow?.gameInfo].filter(Boolean);
 
   for (const source of sources) {
@@ -52851,7 +52916,7 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const seasonGameKey = getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) ||
       getAnyValue(game, ['seasonGameKey', 'id', 'gameId'], null);
 
-    const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, effectiveCtx, item);
+    const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, effectiveCtx, item, `${awayTeam} @ ${homeTeam}`);
     const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
 
@@ -57068,9 +57133,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
     await syncMaddenFranchises(guild, league).catch(() => null);
     await cleanupMaddenTradeBlockAfterRosterSync(guild.id, league.league_id).catch(() => null);
-    await autoCreateGameThreadsAfterSync(guild, league).catch(error => {
-      console.error('[Madden Sync] Auto game thread creation failed:', error?.message || error);
-    });
+    // Game thread creation now happens inside autoDetectAfterSync, gated on the
+    // confirmed newWeekLabel — see handoff notes in the tracking doc for why the
+    // old ungated call here (before week-advance was even confirmed) was wrong.
 
     const autoDetectResult = await autoDetectAfterSync(guild, league).catch(error => {
       console.error('[Madden Sync] Auto detect failed:', error?.message || error);
@@ -58068,9 +58133,8 @@ async function runDueMaddenAutosyncs(client) {
         run = { status: 'failed', source: row.sync_source || 'unknown', message: error.message || 'Autosync failed.', imported_teams: 0, imported_games: 0, imported_players: 0 };
       }
       await postMaddenSyncFeed(guild, league, run).catch(() => null);
-      await autoCreateGameThreadsAfterSync(guild, league).catch(error => {
-        console.error('[Madden Autosync] Auto game thread creation failed:', error?.message || error);
-      });
+      // Game thread creation now happens inside autoDetectAfterSync, gated on the
+      // confirmed newWeekLabel — see handoff notes in the tracking doc.
 
       await autoDetectAfterSync(guild, league).catch(error => {
         console.error('[Madden Autosync] Auto detect failed:', error?.message || error);
@@ -59995,6 +60059,13 @@ async function autoDetectAfterSync(guild, league) {
   const settings = await ensureMaddenLeagueSettings(league);
   const previousWeekLabel = settings.last_auto_detect_week_label || null;
   const allEvents = [];
+
+  // Game thread creation — gated on this confirmed newWeekLabel rather than the
+  // independent threadless-week inference the old ungated call sites used. See
+  // tracking doc handoff: that inference is what created Week 4 threads on a
+  // sync that correctly reported no new week for Week 3.
+  await autoCreateGameThreadsAfterSync(guild, league, newWeekLabel).catch(err =>
+    console.error('[AUTO DETECT] Game thread creation failed:', err?.message || err));
 
   // Check for preseason → regular season transition before anything else
   await handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel).catch(err =>
