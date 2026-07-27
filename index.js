@@ -36638,7 +36638,7 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
         guild.id,
         league.league_id,
         externalGameId,
-        weekLabel || getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null),
+        getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null) || weekLabel,
         homeTeam,
         awayTeam,
         homeRoleId,
@@ -56901,6 +56901,44 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       .map(row => `${row.week_label}: ${row.scored}/${row.total} scored`)
       .join(' | ');
     console.log(`[WEEK LABEL BREAKDOWN 7J-6WK] League ${league.league_id}: ${weekLabelBreakdown || '(no games found)'}`);
+
+    // Follow-up diagnostic — for whichever week has a suspiciously high count
+    // (more than 16, the max real games in one week for a 32-team league), check
+    // whether that's genuinely distinct matchups (pointing at two different real
+    // weeks merged under one label — e.g. preseason + regular season both
+    // labeled plain "Week N") or the same matchups duplicated (pointing at an
+    // unstable external_game_id causing re-imports instead of updates).
+    for (const row of weekLabelBreakdownResult.rows) {
+      if (row.total <= 16) continue;
+      const matchupsResult = await pool.query(
+        `SELECT external_game_id, home_team, away_team, status, home_score, away_score, raw_payload
+         FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id::text = $2::text AND week_label = $3
+         ORDER BY home_team, away_team`,
+        [guild.id, String(league.league_id), row.week_label]
+      ).catch(() => ({ rows: [] }));
+      const matchupCounts = new Map();
+      for (const g of matchupsResult.rows) {
+        const key = `${g.away_team} @ ${g.home_team}`;
+        matchupCounts.set(key, (matchupCounts.get(key) || 0) + 1);
+      }
+      const distinctMatchups = matchupCounts.size;
+      const duplicatedMatchups = Array.from(matchupCounts.entries()).filter(([, count]) => count > 1);
+      const diagnosis = duplicatedMatchups.length
+        ? `DUPLICATE ROWS — ${duplicatedMatchups.length} matchup(s) appear more than once, e.g. "${duplicatedMatchups[0][0]}" ×${duplicatedMatchups[0][1]}. Same real games got re-imported as new rows instead of updating the existing one — likely an unstable external_game_id.`
+        : `DISTINCT MATCHUPS — all ${distinctMatchups} are genuinely different games. Two different real weeks (e.g. preseason + regular season) are likely both landing on the label "${row.week_label}".`;
+      console.log(`[WEEK COUNT ANOMALY 7J-6WK2] "${row.week_label}" has ${row.total} rows but only ${distinctMatchups} distinct matchups — ${diagnosis}`);
+      // Sample a couple of the raw stageIndex/weekType fields for the first few
+      // rows, to see directly whether preseason/regular-season markers differ
+      // across rows sharing this same label — the concrete signal needed to
+      // confirm or rule out the "two real weeks merged" theory.
+      const stageSamples = matchupsResult.rows.slice(0, 6).map(g => {
+        const raw = g.raw_payload || {};
+        const stageIndex = raw.stageIndex ?? raw.seasonGameInfo?.stageIndex ?? raw.weekType ?? raw.seasonGameInfo?.weekType ?? 'n/a';
+        return `${g.away_team}@${g.home_team}:stage=${stageIndex}`;
+      }).join(', ');
+      console.log(`[WEEK COUNT ANOMALY 7J-6WK2] "${row.week_label}" stage/weekType samples: ${stageSamples}`);
+    }
 
     let probeResults = [];
     if (!hasRealRecordData && preseasonMode) {
