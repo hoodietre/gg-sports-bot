@@ -501,6 +501,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_power_rankings_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS ea_reported_current_week TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS current_season_stage TEXT NOT NULL DEFAULT 'preseason'`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_channel_id TEXT`);
@@ -56845,12 +56846,29 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     const seasonModeLabel = getEaHubSeasonModeLabel(hub, context.externalLeagueId);
     const seasonStage = getMaddenSeasonStage(hub, context.externalLeagueId); // 'preseason' | 'regular_season' | 'offseason' | 'unknown'
     const offseasonMode = seasonStage === 'offseason';
+    const eaHubCtx = extractEaStandingsRequestContextFromHub(hub, context.externalLeagueId);
     console.log('[EA SEASON MODE 7J-5AX] ' + JSON.stringify({
       preseasonMode,
       seasonModeLabel,
       seasonStage,
-      context: extractEaStandingsRequestContextFromHub(hub, context.externalLeagueId),
+      context: eaHubCtx,
     }).slice(0, 2000));
+
+    // This is genuine ground truth for "what week does the franchise think it's on
+    // right now" — read directly from EA's own hub state (nextSeasonWeek/
+    // displayWeek/weekIndex), not inferred from whether games happen to have
+    // scores. Game-completion inference turned out to be unreliable: CPU-vs-CPU
+    // games can auto-resolve with real final scores well before the human
+    // commissioner actually advances the week, which twice caused a false
+    // "advance detected" even though nothing really changed. Persisted here so
+    // getMaddenNewAdvanceWeek can compare it directly against the last-processed
+    // week without needing to guess from game data at all.
+    if (eaHubCtx?.displayedWeek) {
+      await pool.query(
+        `UPDATE madden_league_settings SET ea_reported_current_week = $2, updated_at = NOW() WHERE league_id = $1`,
+        [league.league_id, eaHubCtx.displayedWeek]
+      ).catch(error => console.error('[Madden Sync] Failed to persist EA reported current week:', error?.message));
+    }
 
     let probeResults = [];
     if (!hasRealRecordData && preseasonMode) {
@@ -58697,6 +58715,7 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
 async function ensureMaddenAutoDetectColumns() {
   // Week-advance dedup guard + detection settings
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS ea_reported_current_week TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_threshold INTEGER NOT NULL DEFAULT 30`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_review_channel_id TEXT`);
@@ -58724,15 +58743,41 @@ async function ensureMaddenAutoDetectColumns() {
 // ---------------------------------------------------------------------------
 async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   const settingsResult = await pool.query(
-    `SELECT last_auto_detect_week_label FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    `SELECT last_auto_detect_week_label, ea_reported_current_week FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
     [leagueId]
   ).catch(() => ({ rows: [] }));
   const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
+  const eaReportedWeek = settingsResult.rows[0]?.ea_reported_current_week || null;
 
-  // Pull every known week regardless of status — needed to know what week comes
-  // immediately before a candidate, for the completion gate below.
+  // Primary path: EA's own reported current week (persisted fresh every sync in
+  // runMaddenEaDirectSync) is genuine ground truth — read directly from the
+  // franchise hub's nextSeasonWeek/displayWeek/weekIndex fields, not inferred
+  // from anything. This is what actually fixes the false-advance bug: game
+  // completion turned out to be an unreliable signal on its own, since CPU-vs-CPU
+  // games can auto-resolve with real final scores well before the human
+  // commissioner actually advances the week.
+  if (eaReportedWeek) {
+    if (!lastLabel) {
+      // First sync ever — anchor to whatever EA currently reports, don't process.
+      await markMaddenAdvanceProcessed(guildId, leagueId, eaReportedWeek);
+      console.log(`[AUTO DETECT] First run — anchored to EA-reported current week: ${eaReportedWeek}. Will detect NEXT real advance.`);
+      return null;
+    }
+    if (eaReportedWeek === lastLabel) return null; // EA still reports the same week — nothing has actually advanced.
+    const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
+    const [curG, curN] = maddenWeekLabelSortKey(eaReportedWeek);
+    const movedForward = curG > lastG || (curG === lastG && curN > lastN);
+    return movedForward ? eaReportedWeek : null;
+  }
+
+  // Fallback path — only reached for leagues that haven't synced since this fix
+  // shipped (no ea_reported_current_week persisted yet) or non-EA-Direct sync
+  // sources where that hub data isn't available at all. Same hardened
+  // game-completion heuristic as before: a week only counts as fully played once
+  // every game in it has a real score attached, not just a status label (which
+  // the importer can set from an unreliable marker field alone).
   const allGamesResult = await pool.query(
-    `SELECT week_label, status FROM madden_imported_games
+    `SELECT week_label, status, home_score, away_score FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND week_label IS NOT NULL AND TRIM(week_label) <> ''
        AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'`,
@@ -58745,29 +58790,20 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   const allWeeks = Array.from(new Set(rows.map(r => r.week_label)));
   allWeeks.sort(compareMaddenWeekLabels);
 
-  // A week only counts as fully played once every game in it has a real reported
-  // result — not just because a later week's label already exists in the
-  // schedule. EA's export lists the whole season's schedule upfront, so without
-  // this gate, every future week reads as "ready to advance to" the instant a
-  // league connects, regardless of whether anyone has actually played that far.
   const MADDEN_COMPLETED_STATUSES = new Set(['completed', 'final', 'complete', 'completed_with_real_score', 'away_win', 'home_win', 'tie']);
+  const isGameGenuinelyComplete = (row) => {
+    const statusMatch = MADDEN_COMPLETED_STATUSES.has(String(row.status || '').toLowerCase());
+    const hasRealScore = Number(row.home_score || 0) > 0 || Number(row.away_score || 0) > 0;
+    return statusMatch && hasRealScore;
+  };
   const incompleteWeeks = new Set(
-    rows.filter(r => !MADDEN_COMPLETED_STATUSES.has(String(r.status || '').toLowerCase())).map(r => r.week_label)
+    rows.filter(r => !isGameGenuinelyComplete(r)).map(r => r.week_label)
   );
 
   if (!lastLabel) {
-    // First sync ever for this league — never auto-process anything on this run,
-    // no matter what the pre-loaded schedule shows. Anchor to the CURRENT week
-    // (the earliest one not yet fully completed — i.e. where the league is
-    // actually sitting right now) and wait for a real subsequent advance. This is
-    // what stops a fresh connect-and-sync (before anyone has actually advanced in
-    // Madden) from being mistaken for "the league just advanced."
-    // Deliberately NOT the latest week in the pre-loaded season schedule — anchoring
-    // there (e.g. Week 18 on a fresh Week 1 sync) would mean nothing ever counts as
-    // "after" it, permanently breaking detection for the rest of the season.
     const currentWeek = allWeeks.find(w => incompleteWeeks.has(w)) || allWeeks[allWeeks.length - 1];
     await markMaddenAdvanceProcessed(guildId, leagueId, currentWeek);
-    console.log(`[AUTO DETECT] First run — anchored to current week: ${currentWeek}. Will detect NEXT real advance.`);
+    console.log(`[AUTO DETECT] First run (fallback path, no EA hub data) — anchored to current week: ${currentWeek}. Will detect NEXT real advance.`);
     return null;
   }
 
@@ -59313,26 +59349,67 @@ async function autoCreateMaddenSportsbookLines(guild, league, weekLabel) {
 // Auto-settle Madden sportsbook bets when game results come in
 // Called when a game's status changes to final/completed.
 // ---------------------------------------------------------------------------
+// Narrow and deliberately separate from autoProcessMaddenGameResults below: this
+// ONLY settles sportsbook bets on newly-completed games, nothing else. Safe to
+// call on every single sync regardless of week-advance status, because
+// autoSettleMaddenSportsbookBet's own idempotency guard (skips anything not
+// still 'open') makes repeat calls harmless. autoProcessMaddenGameResults itself
+// can't be run this freely — its news/streak/performance detection has no such
+// guard and would duplicate-post every sync until the week actually advances.
+async function autoSettleCompletedMaddenSportsbookGames(guild, league) {
+  const completedGames = await pool.query(
+    `SELECT * FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND sportsbook_game_id IS NOT NULL
+       AND LOWER(status) IN ('final', 'completed', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
+       AND home_score IS NOT NULL AND away_score IS NOT NULL
+       AND (home_score > 0 OR away_score > 0)`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+
+  for (const game of completedGames.rows || []) {
+    await autoSettleMaddenSportsbookBet(guild, league, game).catch(err =>
+      console.error('[AUTO DETECT] Individual game sportsbook settlement failed:', err?.message));
+  }
+}
+
 async function autoSettleMaddenSportsbookBet(guild, league, maddenGame) {
   if (!maddenGame.sportsbook_game_id) return;
   const homeScore = Number(maddenGame.home_score || 0);
   const awayScore = Number(maddenGame.away_score || 0);
   if (homeScore === 0 && awayScore === 0) return; // No real score yet
 
+  const sportsbookGameResult = await pool.query(
+    `SELECT * FROM sportsbook_games WHERE id = $1 AND guild_id = $2 LIMIT 1`,
+    [maddenGame.sportsbook_game_id, guild.id]
+  ).catch(() => ({ rows: [] }));
+  const sportsbookGame = sportsbookGameResult.rows[0];
+  // Idempotency guard — critical now that this can be called on every sync
+  // (decoupled from the week-advance gate below) rather than only once. Without
+  // this, an already-settled game would get re-processed on every subsequent
+  // sync: harmless for bets themselves (performSportsbookSettlement only ever
+  // pays out 'open' bets), but it would spam a duplicate settlement feed post
+  // every single sync until the week finally advances.
+  if (!sportsbookGame || sportsbookGame.status !== 'open') return;
+
   const winnerSide = homeScore > awayScore ? 'home' : awayScore > homeScore ? 'away' : null;
-  if (!winnerSide) return; // Tie — refund (rare in Madden)
+  if (!winnerSide) {
+    // Tie — refund rather than silently leave every bet sitting open forever.
+    await refundSportsbookGameBets(guild, sportsbookGame, 'system', 'Game ended in a tie').catch(err =>
+      console.error('[MADDEN SPORTSBOOK SETTLE] Tie refund failed:', err?.message));
+    return;
+  }
 
-  await settleParlaysForSportsbookGame(
-    guild.id, maddenGame.sportsbook_game_id, winnerSide, 'system'
-  ).catch(err => console.error('[MADDEN SPORTSBOOK SETTLE]', err?.message));
-
-  await pool.query(
-    `UPDATE sportsbook_games SET status = 'settled', winner_side = $2, settled_at = NOW()
-     WHERE id = $1 AND guild_id = $3`,
-    [maddenGame.sportsbook_game_id, winnerSide, guild.id]
-  ).catch(() => null);
-
-  await updateSportsbookPanel(guild).catch(() => null);
+  // Settle through the same full settlement path /sportsbook settle uses — this
+  // is a real fix, not just a refactor: the previous version of this function
+  // only ever settled parlay legs riding on the game and then marked the game
+  // 'settled' directly, but never touched straight (non-parlay) bets on
+  // sportsbook_bets at all. Anyone with a plain moneyline bet on an
+  // auto-settled Madden game was never paid out or marked lost — their bet just
+  // sat 'open' forever, silently, with no error anywhere.
+  const settings = await getCurrencySettings(guild.id);
+  await performSportsbookSettlement(guild, sportsbookGame, winnerSide, 'system', settings).catch(err =>
+    console.error('[MADDEN SPORTSBOOK SETTLE]', err?.message));
 }
 
 
@@ -59806,10 +59883,23 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
 async function autoDetectAfterSync(guild, league) {
   await ensureMaddenAutoDetectColumns();
 
-  // Week-advance dedup guard — exit immediately if same week
+  // Runs every sync, independent of whether the week as a whole has advanced —
+  // an individual user can finish their own game well before everyone else in
+  // the week has played (confirmed: a user-controlled team beating a CPU team,
+  // not CPU-vs-CPU auto-sim as originally assumed), and that game's bets need to
+  // settle the moment it's actually done, not sit open until the whole week's
+  // advance is detected, possibly days later. Safe to call unconditionally
+  // thanks to the idempotency guard inside autoSettleMaddenSportsbookBet.
+  await autoSettleCompletedMaddenSportsbookGames(guild, league).catch(err =>
+    console.error('[AUTO DETECT] Per-game sportsbook settlement:', err?.message));
+
+  // Week-advance dedup guard — everything below this point (news/streaks/
+  // performances, new lines, new props, thread creation, season transitions) is
+  // genuinely tied to "a new week has begun," not to any individual game
+  // finishing, and isn't safe to run more than once per real advance.
   const newWeekLabel = await getMaddenNewAdvanceWeek(guild.id, league.league_id);
   if (!newWeekLabel) {
-    console.log(`[AUTO DETECT] No new advance detected for league ${league.league_id} — skipping.`);
+    console.log(`[AUTO DETECT] No new advance detected for league ${league.league_id} — skipping week-level processing.`);
     return { advanced: false, weekLabel: null };
   }
 
