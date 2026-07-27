@@ -52913,12 +52913,31 @@ function normalizeEaScheduleDeepFromHub(hubPayload) {
     const awayTeam = getTeamNameFromGameSide(game, 'away', maps);
     if (!homeTeam || !awayTeam || homeTeam === 'Home' || awayTeam === 'Away') continue;
 
-    const seasonGameKey = getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null) ||
-      getAnyValue(game, ['seasonGameKey', 'id', 'gameId'], null);
+    // 7J-9GID: diagnostic — the weekLabel is now confirmed stable across syncs
+    // (see [WEEK LABEL REPAIR 7J-8LR] comparison, Session 3 round 11), so the
+    // fallback ID built from it would be stable too. That leaves seasonGameKey
+    // itself as the only remaining thing that could make externalGameId differ
+    // between syncs for the same real game. Log exactly what it resolved to,
+    // and from which field/source, so a before/after sync diff can confirm or
+    // rule this out the same way round 11 did for the label.
+    const seasonGameKeyFromItem = getAnyValue(item, ['seasonGameKey', 'id', 'gameId'], null);
+    const seasonGameKeyFromGame = getAnyValue(game, ['seasonGameKey', 'id', 'gameId'], null);
+    const seasonGameKey = seasonGameKeyFromItem || seasonGameKeyFromGame;
 
     const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, effectiveCtx, item, `${awayTeam} @ ${homeTeam}`);
     const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
+
+    console.log('[GAME ID RESOLUTION 7J-9GID] ' + JSON.stringify({
+      matchup: `${awayTeam} @ ${homeTeam}`,
+      weekLabel,
+      sourceLabel: wrapper.sourceLabel,
+      seasonGameKeyFromItem,
+      seasonGameKeyFromGame,
+      resolvedSeasonGameKey: seasonGameKey,
+      usedFallback: !seasonGameKey,
+      externalGameId,
+    }));
 
     const scoreInfo = resolveMaddenScoresFromRawGameDeep({ raw: item });
     const homeScore = scoreInfo.homeScore;
