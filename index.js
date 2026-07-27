@@ -47,6 +47,32 @@ let lastMaddenAutosyncTickAt = null;
 let lastTradeThreadCleanupAt = null;
 let lastTradeThreadCleanupDeleted = 0;
 
+// In-memory draft store for the interactive parlay builder — short-lived by nature
+// (a single user's build-a-parlay session, done or abandoned within minutes), so
+// this doesn't need to survive a restart or be shared across instances the way an
+// actual placed bet does. Keyed by `${guildId}:${userId}`. Cleared on place/cancel
+// and swept for staleness on each access.
+const parlayDrafts = new Map();
+const PARLAY_DRAFT_TTL_MS = 15 * 60 * 1000;
+
+function getParlayDraft(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  const draft = parlayDrafts.get(key);
+  if (draft && Date.now() - draft.updatedAt > PARLAY_DRAFT_TTL_MS) {
+    parlayDrafts.delete(key);
+    return null;
+  }
+  return draft || null;
+}
+
+function setParlayDraft(guildId, userId, legs) {
+  parlayDrafts.set(`${guildId}:${userId}`, { legs, updatedAt: Date.now() });
+}
+
+function clearParlayDraft(guildId, userId) {
+  parlayDrafts.delete(`${guildId}:${userId}`);
+}
+
 const CLIENT_ID = process.env.CLIENT_ID || '1407760487151833200';
 const DEV_GUILD_ID = process.env.GUILD_ID || '1486545386649686068';
 const COMMAND_GUILD_IDS = (process.env.GUILD_IDS || process.env.GUILD_ID || DEV_GUILD_ID)
@@ -10014,17 +10040,129 @@ if (interaction.commandName === 'avatar') {
 
       if (interaction.isButton() && interaction.customId === 'sportsbook_quick_parlay') {
         await interaction.deferReply({ ephemeral: true });
-        const openMoneylines = await pool.query(
-          `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' AND (bet_type IS NULL OR bet_type = 'moneyline') ORDER BY created_at DESC LIMIT 15`,
-          [interaction.guild.id]
+        clearParlayDraft(interaction.guild.id, interaction.user.id);
+        setParlayDraft(interaction.guild.id, interaction.user.id, []);
+        const payload = await buildParlayWizardPayload(interaction.guild.id, interaction.user.id);
+        await interaction.editReply(payload);
+        return;
+      }
+
+      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_parlay_add_leg') {
+        const gameId = interaction.values[0];
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.reply({ content: 'That line is no longer open — pick another.', ephemeral: true });
+          return;
+        }
+        const sideRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:away`).setLabel(`${sportsbookGame.away_label} ${formatAmericanOdds(sportsbookGame.away_odds)}`).setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:home`).setLabel(`${sportsbookGame.home_label} ${formatAmericanOdds(sportsbookGame.home_odds)}`).setStyle(ButtonStyle.Success),
         );
+        await interaction.update({ content: `**${sportsbookGame.game_label}** — pick a side to add this leg:`, embeds: [], components: [sideRow] });
+        return;
+      }
+
+      if (interaction.isButton() && interaction.customId.startsWith('sportsbook_parlay_side:')) {
+        const [, gameId, side] = interaction.customId.split(':');
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.update({ content: 'That line closed while you were picking — start the leg over.', embeds: [], components: [] });
+          return;
+        }
+        const draft = getParlayDraft(interaction.guild.id, interaction.user.id) || { legs: [] };
+        if (draft.legs.some(leg => leg.gameId === gameId)) {
+          await interaction.update({ content: 'That game is already in your parlay.', embeds: [], components: [] });
+          return;
+        }
+        if (draft.legs.length >= 4) {
+          await interaction.update({ content: 'Parlays max out at 4 legs.', embeds: [], components: [] });
+          return;
+        }
+        const odds = side === 'home' ? Number(sportsbookGame.home_odds) : Number(sportsbookGame.away_odds);
+        const newLegs = [...draft.legs, { gameId, side, odds, label: sportsbookGame.game_label, sideLabel: side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label }];
+        setParlayDraft(interaction.guild.id, interaction.user.id, newLegs);
+        const payload = await buildParlayWizardPayload(interaction.guild.id, interaction.user.id);
+        await interaction.update(payload);
+        return;
+      }
+
+      if (interaction.isButton() && interaction.customId === 'sportsbook_parlay_cancel') {
+        clearParlayDraft(interaction.guild.id, interaction.user.id);
+        await interaction.update({ content: 'Parlay cancelled.', embeds: [], components: [] });
+        return;
+      }
+
+      if (interaction.isButton() && interaction.customId === 'sportsbook_parlay_place') {
+        const draft = getParlayDraft(interaction.guild.id, interaction.user.id);
+        if (!draft || draft.legs.length < 2) {
+          await interaction.reply({ content: 'Add at least 2 legs before placing your parlay.', ephemeral: true });
+          return;
+        }
+        const modal = new ModalBuilder()
+          .setCustomId('sportsbook_parlay_stake_modal')
+          .setTitle('Place Parlay — Stake Amount')
+          .addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('amount').setLabel('Stake amount').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Example: 100')
+          ));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.isModalSubmit() && interaction.customId === 'sportsbook_parlay_stake_modal') {
+        await interaction.deferReply({ ephemeral: true });
+        const draft = getParlayDraft(interaction.guild.id, interaction.user.id);
+        if (!draft || draft.legs.length < 2) {
+          await interaction.editReply({ content: 'Your parlay draft expired or was cleared — start over with Build a Parlay.' });
+          return;
+        }
+        const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
+        if (!Number.isInteger(amount) || amount <= 0) {
+          await interaction.editReply({ content: 'Stake must be a whole number greater than 0.' });
+          return;
+        }
+
+        // Re-verify every leg is still open right before committing currency — the
+        // draft could be stale if a line settled while the user was building.
+        const legs = [];
+        for (const draftLeg of draft.legs) {
+          const sportsbookGame = await findSportsbookGame(interaction.guild.id, draftLeg.gameId);
+          if (!sportsbookGame || sportsbookGame.status !== 'open') {
+            await interaction.editReply({ content: `**${draftLeg.label}** is no longer open — start your parlay over.` });
+            clearParlayDraft(interaction.guild.id, interaction.user.id);
+            return;
+          }
+          legs.push({ sportsbookGame, side: draftLeg.side, odds: draftLeg.odds });
+        }
+
+        const settings = await getCurrencySettings(interaction.guild.id);
+        const payoutData = calculateParlayPayout(amount, legs.map(leg => leg.odds));
+        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_parlay_bet', 'Parlay bet', interaction.user.id);
+        if (!removed) {
+          await interaction.editReply({ content: 'You do not have enough ' + settings.currency_name + ' to create that parlay.' });
+          return;
+        }
+
+        const parlayId = randomUUID();
+        await pool.query(
+          `INSERT INTO sportsbook_parlays (id, guild_id, user_id, amount, combined_decimal, potential_payout)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [parlayId, interaction.guild.id, interaction.user.id, amount, payoutData.combinedDecimal, payoutData.payout]
+        );
+        for (const leg of legs) {
+          await pool.query(
+            `INSERT INTO sportsbook_parlay_legs (id, parlay_id, sportsbook_game_id, side, odds)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [randomUUID(), parlayId, leg.sportsbookGame.id, leg.side, leg.odds]
+          );
+        }
+        clearParlayDraft(interaction.guild.id, interaction.user.id);
+
         const NL = String.fromCharCode(10);
-        const lines = openMoneylines.rows.length
-          ? openMoneylines.rows.map(row => `**${row.game_label}** — ${row.away_label} ${formatAmericanOdds(row.away_odds)} / ${row.home_label} ${formatAmericanOdds(row.home_odds)}`).join(NL)
-          : 'No open moneylines to parlay right now.';
-        await interaction.editReply({
-          content: `**Build a Parlay** — use \`/sportsbook parlay\` with 2-4 legs, referencing a game below by its exact name and a side (home/away):${NL}${NL}${lines}`,
-        });
+        const legText = legs.map((leg, index) => {
+          const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
+          return (index + 1) + '. ' + sideLabel + ' ' + formatAmericanOdds(leg.odds) + ' — ' + leg.sportsbookGame.game_label;
+        }).join(NL);
+        await interaction.editReply({ content: 'Parlay placed! 🎫' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**' });
         return;
       }
 
@@ -23581,6 +23719,60 @@ function formatAmericanOdds(odds) {
   if (!Number.isFinite(n)) return String(odds);
   return n > 0 ? `+${n}` : `${n}`;
 }
+
+async function buildParlayWizardPayload(guildId, userId) {
+  const NL = String.fromCharCode(10);
+  const draft = getParlayDraft(guildId, userId) || { legs: [] };
+  const usedGameIds = new Set(draft.legs.map(leg => leg.gameId));
+
+  const embed = new EmbedBuilder()
+    .setTitle('🧾 Build a Parlay')
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Sportsbook — 2 to 4 legs' })
+    .setTimestamp();
+
+  if (draft.legs.length) {
+    embed.setDescription(draft.legs.map((leg, i) => `${i + 1}. **${leg.sideLabel}** ${formatAmericanOdds(leg.odds)} — ${leg.label}`).join(NL));
+  } else {
+    embed.setDescription('No legs added yet — pick your first one below.');
+  }
+
+  const components = [];
+
+  if (draft.legs.length < 4) {
+    const openResult = await pool.query(
+      `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 75`,
+      [guildId]
+    );
+    const available = openResult.rows.filter(row => !usedGameIds.has(row.id)).slice(0, 25);
+    if (available.length) {
+      components.push(new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId('sportsbook_parlay_add_leg')
+          .setPlaceholder(draft.legs.length ? `Add leg ${draft.legs.length + 1}` : 'Choose your first leg')
+          .addOptions(available.map(row => {
+            const isProp = row.bet_type === 'stat_prop';
+            const isFreeform = row.bet_type === 'freeform_prop';
+            const label = isProp
+              ? `${row.subject_display_name} O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`
+              : isFreeform ? row.game_label : `${row.away_label} @ ${row.home_label}`;
+            return { label: label.slice(0, 100), value: row.id, description: `${formatAmericanOdds(row.away_odds)} / ${formatAmericanOdds(row.home_odds)}`.slice(0, 100) };
+          }))
+      ));
+    }
+  }
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('sportsbook_parlay_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  if (draft.legs.length >= 2) {
+    actionRow.addComponents(new ButtonBuilder().setCustomId('sportsbook_parlay_place').setLabel(`Place Parlay (${draft.legs.length} legs)`).setEmoji('✅').setStyle(ButtonStyle.Success));
+  }
+  components.push(actionRow);
+
+  return { content: null, embeds: [embed], components };
+}
+
 
 async function buildSportsbookPanelEmbed(guildId) {
   const NL = String.fromCharCode(10);
@@ -56792,8 +56984,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       console.error('[Madden Sync] Auto game thread creation failed:', error?.message || error);
     });
 
-    await autoDetectAfterSync(guild, league).catch(error => {
+    const autoDetectResult = await autoDetectAfterSync(guild, league).catch(error => {
       console.error('[Madden Sync] Auto detect failed:', error?.message || error);
+      return null;
     });
 
     // Auto-prune sync payloads — keep only the 10 most recent per league to prevent DB bloat
@@ -56809,6 +57002,12 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       [guild.id, league.league_id]
     ).catch(() => null); // fire-and-forget
 
+    // Clear, explicit week-advance status — this is what actually answers "did
+    // anything new happen," rather than leaving it silent either way.
+    const advanceStatusLine = autoDetectResult?.advanced
+      ? `📅 **Advanced to ${autoDetectResult.weekLabel}** — new games, sportsbook lines, and props were created for this week.`
+      : `📅 **No new week detected.** You must advance in Madden before syncing again — this sync only refreshed rosters/stats for the current week.`;
+
     const message =
       'EA Direct sync completed for ' + context.externalLeagueName +
       '. Imported teams: ' + importedTeams +
@@ -56818,7 +57017,8 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
         : offseasonMode
         ? 'Offseason mode active: no current week/schedule data from EA (rosters/teams still synced normally); imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: CareerMode_GetStandingsExport + madden compare system enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.');
+        : 'Regular season mode: CareerMode_GetStandingsExport + madden compare system enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.') +
+      '\n\n' + advanceStatusLine;
 
     await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
       console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
@@ -58250,7 +58450,7 @@ function buildMaddenSyncRunEmbed(league, run) {
       { name: 'Imported Teams', value: String(run.imported_teams || 0), inline: true },
       { name: 'Imported Games', value: String(run.imported_games || 0), inline: true },
       { name: 'Imported Players', value: String(run.imported_players || 0), inline: true },
-      { name: 'Message', value: run.message || 'Sync run completed.', inline: false }
+      { name: 'Message', value: String(run.message || 'Sync run completed.').slice(0, 1024), inline: false }
     )
     .setFooter({ text: 'GG Sports • Madden Sync Foundation' })
     .setTimestamp();
@@ -58529,53 +58729,68 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   ).catch(() => ({ rows: [] }));
   const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
 
-  // Get all distinct weeks that have at least one SCHEDULED game.
-  // Completed games from previous seasons are excluded to prevent them
-  // from appearing as "new" advance candidates.
-  const result = await pool.query(
-    `SELECT DISTINCT week_label FROM madden_imported_games
+  // Pull every known week regardless of status — needed to know what week comes
+  // immediately before a candidate, for the completion gate below.
+  const allGamesResult = await pool.query(
+    `SELECT week_label, status FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
-       AND week_label IS NOT NULL
-       AND TRIM(week_label) <> ''
-       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'
-       AND LOWER(status) = 'scheduled'`,
+       AND week_label IS NOT NULL AND TRIM(week_label) <> ''
+       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'`,
     [guildId, String(leagueId)]
   ).catch(() => ({ rows: [] }));
 
-  const allWeeks = (result.rows || []).map(r => r.week_label).filter(Boolean);
+  const rows = allGamesResult.rows || [];
+  if (!rows.length) return null;
+
+  const allWeeks = Array.from(new Set(rows.map(r => r.week_label)));
   allWeeks.sort(compareMaddenWeekLabels);
-  if (!allWeeks.length) return null;
+
+  // A week only counts as fully played once every game in it has a real reported
+  // result — not just because a later week's label already exists in the
+  // schedule. EA's export lists the whole season's schedule upfront, so without
+  // this gate, every future week reads as "ready to advance to" the instant a
+  // league connects, regardless of whether anyone has actually played that far.
+  const MADDEN_COMPLETED_STATUSES = new Set(['completed', 'final', 'complete', 'completed_with_real_score', 'away_win', 'home_win', 'tie']);
+  const incompleteWeeks = new Set(
+    rows.filter(r => !MADDEN_COMPLETED_STATUSES.has(String(r.status || '').toLowerCase())).map(r => r.week_label)
+  );
 
   if (!lastLabel) {
-    // First run — anchor off the most recent week that has threads so we don't
-    // reprocess old weeks. Mark it as processed and return null for this run;
-    // the NEXT advance will be detected cleanly.
-    const threadedResult = await pool.query(
-      `SELECT DISTINCT week_label FROM madden_imported_games
-       WHERE guild_id = $1 AND league_id::text = $2::text AND thread_id IS NOT NULL`,
-      [guildId, String(leagueId)]
-    ).catch(() => ({ rows: [] }));
-    const threadedWeeks = (threadedResult.rows || []).map(r => r.week_label).filter(Boolean);
-    threadedWeeks.sort(compareMaddenWeekLabels);
-    const latestThreaded = threadedWeeks[threadedWeeks.length - 1];
-    if (latestThreaded) {
-      // Silently mark the current week as processed so the next advance is detected
-      await markMaddenAdvanceProcessed(guildId, leagueId, latestThreaded);
-      console.log(`[AUTO DETECT] First run — anchored to current week: ${latestThreaded}. Will detect NEXT advance.`);
-      return null;
-    }
-    // No threads yet — return the earliest week as the starting point
-    return allWeeks[0];
+    // First sync ever for this league — never auto-process anything on this run,
+    // no matter what the pre-loaded schedule shows. Anchor to the CURRENT week
+    // (the earliest one not yet fully completed — i.e. where the league is
+    // actually sitting right now) and wait for a real subsequent advance. This is
+    // what stops a fresh connect-and-sync (before anyone has actually advanced in
+    // Madden) from being mistaken for "the league just advanced."
+    // Deliberately NOT the latest week in the pre-loaded season schedule — anchoring
+    // there (e.g. Week 18 on a fresh Week 1 sync) would mean nothing ever counts as
+    // "after" it, permanently breaking detection for the rest of the season.
+    const currentWeek = allWeeks.find(w => incompleteWeeks.has(w)) || allWeeks[allWeeks.length - 1];
+    await markMaddenAdvanceProcessed(guildId, leagueId, currentWeek);
+    console.log(`[AUTO DETECT] First run — anchored to current week: ${currentWeek}. Will detect NEXT real advance.`);
+    return null;
   }
 
-  // Normal run — find the first week in canonical order that comes AFTER lastLabel
   const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
   const weeksAfterLast = allWeeks.filter(w => {
     const [g, n] = maddenWeekLabelSortKey(w);
     return g > lastG || (g === lastG && n > lastN);
   });
 
-  return weeksAfterLast.length ? weeksAfterLast[0] : null;
+  for (const candidate of weeksAfterLast) {
+    const idx = allWeeks.indexOf(candidate);
+    const precedingWeek = idx > 0 ? allWeeks[idx - 1] : null;
+    if (precedingWeek && incompleteWeeks.has(precedingWeek)) {
+      // The week right before this candidate hasn't actually finished in the
+      // real league yet — the candidate isn't a legitimate advance, it's just
+      // sitting there pre-loaded in the schedule. Stop here rather than skip to
+      // it or to anything further out.
+      return null;
+    }
+    return candidate;
+  }
+
+  return null;
 }
 
 async function markMaddenAdvanceProcessed(guildId, leagueId, weekLabel) {
@@ -59595,7 +59810,7 @@ async function autoDetectAfterSync(guild, league) {
   const newWeekLabel = await getMaddenNewAdvanceWeek(guild.id, league.league_id);
   if (!newWeekLabel) {
     console.log(`[AUTO DETECT] No new advance detected for league ${league.league_id} — skipping.`);
-    return;
+    return { advanced: false, weekLabel: null };
   }
 
   console.log(`[AUTO DETECT] New week detected: ${newWeekLabel} for league ${league.league_id}`);
@@ -59657,6 +59872,7 @@ async function autoDetectAfterSync(guild, league) {
   // Mark this week as processed — must be last so a crash mid-run retries next sync
   await markMaddenAdvanceProcessed(guild.id, league.league_id, newWeekLabel);
   console.log(`[AUTO DETECT] Completed for ${newWeekLabel}, league ${league.league_id}`);
+  return { advanced: true, weekLabel: newWeekLabel, eventCount: allEvents.length };
 }
 
 
