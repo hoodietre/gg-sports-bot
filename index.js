@@ -50302,6 +50302,27 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
   const stageIndex = parseNumberOrNull(requestPayload.stageIndex) ?? 1;
   const displayWeek = weekIndex + 1;
 
+  // 7J-12POS: the weekly-stat export (this function) doesn't carry a
+  // position/pos field on its own rows at all — confirmed directly, every row
+  // in madden_player_weekly_stats had a NULL position regardless of team or
+  // stat_type, which silently zeroed out every player-prop candidate query
+  // (findMaddenPropCandidate filters on position). Position IS available from
+  // the separate roster export (madden_players, populated by
+  // upsertMaddenRosterRows), keyed by the same roster_id/presentation_id.
+  // Batch-fetch a lookup map once per sync rather than querying per row inside
+  // the loop below (this can process thousands of rows per sync).
+  const rosterPositions = await pool.query(
+    `SELECT roster_id, presentation_id, position FROM madden_players
+     WHERE guild_id = $1 AND league_id::text = $2::text AND position IS NOT NULL`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const positionByRosterId = new Map();
+  const positionByPresentationId = new Map();
+  for (const row of rosterPositions.rows || []) {
+    if (row.roster_id != null) positionByRosterId.set(String(row.roster_id), row.position);
+    if (row.presentation_id != null) positionByPresentationId.set(String(row.presentation_id), row.position);
+  }
+
   let inserted = 0;
   let updated = 0;
 
@@ -50314,7 +50335,10 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
     const teamId = getAnyValue(row, ['teamId', 'teamID'], null);
     const teamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null);
     const fullName = getAnyValue(row, ['fullName', 'name', 'playerName'], null);
-    const position = getAnyValue(row, ['position', 'pos'], null);
+    const position = getAnyValue(row, ['position', 'pos'], null)
+      || (rosterId != null && positionByRosterId.get(String(rosterId)))
+      || (presentationId != null && positionByPresentationId.get(String(presentationId)))
+      || null;
     const scheduleId = getAnyValue(row, ['scheduleId', 'scheduleID', 'externalGameId'], null);
     const statId = getAnyValue(row, ['statId', 'statID', 'id'], null);
     const id = `${guild.id}:${league.league_id}:${statType}:${stageIndex}:${weekIndex}:${playerKey}:${statId ?? 'nostat'}`;
@@ -59584,7 +59608,15 @@ async function autoCreateMaddenSportsbookLines(guild, league, weekLabel) {
     [guild.id, String(league.league_id), weekLabel]
   ).catch(() => ({ rows: [] }));
 
-  const feedChannelId = settings.madden_sportsbook_channel_id
+  // 7J-12CHN: was checking settings.madden_sportsbook_channel_id first — that's
+  // the "Madden Sportsbook Channel," where the persistent board itself posts
+  // (confirmed with Hxxdie). Betting-line announcements belong in the actual
+  // Sportsbook Feed Channel (league.sportsbook_channel_id) instead — posting
+  // alerts into the board channel clutters the channel the board is meant to
+  // live in undisturbed. Feed channel now takes priority; falls back to the
+  // board channel or news channel only if the feed channel isn't configured.
+  const feedChannelId = league.sportsbook_channel_id
+    || settings.madden_sportsbook_channel_id
     || settings.madden_news_channel_id
     || await getMaddenNewsChannelId(league.league_id).catch(() => null);
 
