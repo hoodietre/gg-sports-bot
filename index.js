@@ -10094,18 +10094,26 @@ if (interaction.commandName === 'avatar') {
 
       if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sportsbook_pick_game')) {
         if (!interaction.guild) return;
+        // 7J-15DEFER: was running the DB lookup before acknowledging the
+        // interaction at all — any latency in that single query (DB pool
+        // contention, a cold connection, a brief network hiccup) blows past
+        // Discord's 3-second ack window and produces "didn't respond in time,"
+        // confirmed as the exact error Hxxdie hit. Every other handler nearby
+        // (sportsbook_quick_mybets, sportsbook_quick_leaderboards, etc.) already
+        // defers first before doing any DB work — this one just didn't follow
+        // that pattern. Deferred replies get up to 15 minutes, not 3 seconds.
+        await interaction.deferReply({ ephemeral: true });
         const gameId = interaction.values[0];
         const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
 
         if (!sportsbookGame || sportsbookGame.status !== 'open') {
-          await interaction.reply({ content: 'That sportsbook game is no longer open.', ephemeral: true });
+          await interaction.editReply({ content: 'That sportsbook game is no longer open.' });
           return;
         }
 
-        await interaction.reply({
+        await interaction.editReply({
           content: 'Choose your side for **' + sportsbookGame.game_label + '**.',
           components: [buildSportsbookSideButtons(sportsbookGame)],
-          ephemeral: true,
         });
         return;
       }
