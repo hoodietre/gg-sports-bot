@@ -50309,18 +50309,27 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
   // (findMaddenPropCandidate filters on position). Position IS available from
   // the separate roster export (madden_players, populated by
   // upsertMaddenRosterRows), keyed by the same roster_id/presentation_id.
-  // Batch-fetch a lookup map once per sync rather than querying per row inside
-  // the loop below (this can process thousands of rows per sync).
-  const rosterPositions = await pool.query(
-    `SELECT roster_id, presentation_id, position FROM madden_players
-     WHERE guild_id = $1 AND league_id::text = $2::text AND position IS NOT NULL`,
+  // 7J-13TEAM: confirmed the exact same gap applies to team_name too — every
+  // row in madden_player_weekly_stats had a blank team_name regardless of
+  // team, which meant findMaddenPropCandidate's team_name match never had a
+  // chance to succeed even once position was fixed. Same fallback, same
+  // source table. Batch-fetch both lookup maps once per sync rather than
+  // querying per row inside the loop below (this can process thousands of
+  // rows per sync).
+  const rosterLookup = await pool.query(
+    `SELECT roster_id, presentation_id, position, team_name FROM madden_players
+     WHERE guild_id = $1 AND league_id::text = $2::text AND (position IS NOT NULL OR team_name IS NOT NULL)`,
     [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [] }));
   const positionByRosterId = new Map();
   const positionByPresentationId = new Map();
-  for (const row of rosterPositions.rows || []) {
-    if (row.roster_id != null) positionByRosterId.set(String(row.roster_id), row.position);
-    if (row.presentation_id != null) positionByPresentationId.set(String(row.presentation_id), row.position);
+  const teamNameByRosterId = new Map();
+  const teamNameByPresentationId = new Map();
+  for (const row of rosterLookup.rows || []) {
+    if (row.roster_id != null && row.position) positionByRosterId.set(String(row.roster_id), row.position);
+    if (row.presentation_id != null && row.position) positionByPresentationId.set(String(row.presentation_id), row.position);
+    if (row.roster_id != null && row.team_name) teamNameByRosterId.set(String(row.roster_id), row.team_name);
+    if (row.presentation_id != null && row.team_name) teamNameByPresentationId.set(String(row.presentation_id), row.team_name);
   }
 
   let inserted = 0;
@@ -50333,7 +50342,10 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
     const rosterId = getAnyValue(row, ['rosterId', 'rosterID', 'playerId', 'playerID'], null);
     const presentationId = getAnyValue(row, ['presentationId', 'presentationID', 'playerPresentationId'], null);
     const teamId = getAnyValue(row, ['teamId', 'teamID'], null);
-    const teamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null);
+    const teamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null)
+      || (rosterId != null && teamNameByRosterId.get(String(rosterId)))
+      || (presentationId != null && teamNameByPresentationId.get(String(presentationId)))
+      || null;
     const fullName = getAnyValue(row, ['fullName', 'name', 'playerName'], null);
     const position = getAnyValue(row, ['position', 'pos'], null)
       || (rosterId != null && positionByRosterId.get(String(rosterId)))
