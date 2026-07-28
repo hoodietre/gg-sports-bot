@@ -7870,6 +7870,25 @@ client.on(Events.GuildCreate, async (guild) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
 
+    // 7J-17TOPTRACE: unconditional, fires for every single interaction the bot
+    // receives, before any routing/matching logic runs. Added specifically to
+    // settle whether Discord is even delivering sportsbook board interactions
+    // to the bot at all — every 7J-16TRACE line inside the specific handler
+    // came back empty across multiple attempts, including a freshly-refreshed
+    // board and buttons this code never touched, which needs this broader
+    // check before assuming anything further about that handler's own logic.
+    try {
+      console.log('[INTERACTION TOP TRACE 7J-17TOPTRACE] type=' + interaction.type
+        + ' isButton=' + interaction.isButton?.()
+        + ' isStringSelectMenu=' + interaction.isStringSelectMenu?.()
+        + ' isChatInputCommand=' + interaction.isChatInputCommand?.()
+        + ' customId=' + (interaction.customId ?? 'n/a')
+        + ' commandName=' + (interaction.commandName ?? 'n/a')
+        + ' guildId=' + (interaction.guildId ?? 'n/a'));
+    } catch (traceErr) {
+      console.error('[INTERACTION TOP TRACE 7J-17TOPTRACE] Failed to log:', traceErr?.message || traceErr);
+    }
+
     if (interaction.isAutocomplete()) {
       try {
         const commandName = interaction.commandName;
