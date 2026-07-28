@@ -10666,8 +10666,8 @@ if (interaction.commandName === 'avatar') {
         return;
       }
       const sideRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:away`).setLabel(`${sportsbookGame.away_label} ${formatAmericanOdds(sportsbookGame.away_odds)}`).setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:home`).setLabel(`${sportsbookGame.home_label} ${formatAmericanOdds(sportsbookGame.home_odds)}`).setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:away`).setLabel(`${stripDiscordEmojiMarkupForLabel(sportsbookGame.away_label)} ${formatAmericanOdds(sportsbookGame.away_odds)}`).setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:home`).setLabel(`${stripDiscordEmojiMarkupForLabel(sportsbookGame.home_label)} ${formatAmericanOdds(sportsbookGame.home_odds)}`).setStyle(ButtonStyle.Success),
       );
       await interaction.update({ content: `**${sportsbookGame.game_label}** — pick a side to add this leg:`, embeds: [], components: [sideRow] });
       return;
@@ -23791,7 +23791,7 @@ function buildSportsbookBoardComponents(rows) {
         .setCustomId('sportsbook_pick_game_moneyline')
         .setPlaceholder('🏈 Bet a Moneyline')
         .addOptions(moneylines.map(row => ({
-          label: `${row.away_label} @ ${row.home_label}`.slice(0, 100),
+          label: stripDiscordEmojiMarkupForLabel(`${row.away_label} @ ${row.home_label}`).slice(0, 100),
           value: row.id,
           description: `${formatAmericanOdds(row.away_odds)} / ${formatAmericanOdds(row.home_odds)}`.slice(0, 100),
         })))
@@ -23837,13 +23837,24 @@ function buildSportsbookSideButtons(game) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('sportsbook_pick_side:' + game.id + ':away')
-      .setLabel(game.away_label + ' ML ' + game.away_odds)
+      .setLabel(stripDiscordEmojiMarkupForLabel(game.away_label) + ' ML ' + game.away_odds)
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId('sportsbook_pick_side:' + game.id + ':home')
-      .setLabel(game.home_label + ' ML ' + game.home_odds)
+      .setLabel(stripDiscordEmojiMarkupForLabel(game.home_label) + ' ML ' + game.home_odds)
       .setStyle(ButtonStyle.Success)
   );
+}
+
+// 7J-19EMOJI: select-menu option labels and button labels are plain text only —
+// unlike embed text, Discord does NOT render <:name:id> custom emoji markup
+// inside them, so team labels built for embeds (which bake the emoji markup
+// directly into the string, e.g. homeLabel = `${homeEmoji} ${team}`) show up as
+// raw junk text ("<:packers:1522016232876802088> Packers") in these contexts
+// instead of an icon. Strip it specifically here; embed text elsewhere is
+// unaffected and still renders the real emoji correctly.
+function stripDiscordEmojiMarkupForLabel(text) {
+  return String(text || '').replace(/<a?:\w+:\d+>\s*/g, '').trim();
 }
 
 // "ML -110" reads fine for moneylines but oddly for a prop line ("Under 275.5 Passing
@@ -23918,9 +23929,9 @@ async function buildParlayWizardPayload(guildId, userId) {
           .addOptions(available.map(row => {
             const isProp = row.bet_type === 'stat_prop';
             const isFreeform = row.bet_type === 'freeform_prop';
-            const label = isProp
+            const label = stripDiscordEmojiMarkupForLabel(isProp
               ? `${row.subject_display_name} O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`
-              : isFreeform ? row.game_label : `${row.away_label} @ ${row.home_label}`;
+              : isFreeform ? row.game_label : `${row.away_label} @ ${row.home_label}`);
             return { label: label.slice(0, 100), value: row.id, description: `${formatAmericanOdds(row.away_odds)} / ${formatAmericanOdds(row.home_odds)}`.slice(0, 100) };
           }))
       ));
