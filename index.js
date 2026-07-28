@@ -39333,12 +39333,20 @@ async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId =
     const c = normalizeTeamOwnerLookup(candidate);
     const cAbbr = normalizeTeamOwnerLookup(getMaddenTeamAbbrev(candidate) || '');
     if (!c) return false;
+    // 7J-12OWN: abbreviation comparisons are EXACT-only below (c === normalizedAbbr,
+    // cAbbr === normalized, cAbbr === normalizedAbbr) — deliberately no
+    // .includes()-based substring check against an abbreviation. Confirmed this
+    // was a real bug: Panthers' abbreviation "CAR" is a substring of "Cardinals"
+    // ("cardinals".includes("car") === true), which let an unrelated team with a
+    // real assigned owner get matched as if it were Panthers. Full team-name
+    // substring matching (the line below) is still fine to keep loose, since
+    // full names are long enough that this kind of accidental collision isn't a
+    // real risk the way short 2-3 letter abbreviations are.
     return c === normalized
       || c === normalizedAbbr
       || cAbbr === normalized
       || cAbbr === normalizedAbbr
-      || (!!normalized && (c.includes(normalized) || normalized.includes(c)))
-      || (!!normalizedAbbr && (c.includes(normalizedAbbr) || normalizedAbbr.includes(c)));
+      || (!!normalized && (c.includes(normalized) || normalized.includes(c)));
   };
 
   // 1. Prefer the exact role id saved on the imported game row.
@@ -39378,13 +39386,23 @@ async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId =
         const member = await guild.members.fetch(row.owner_user_id).catch(() => null);
         if (member && !member.user.bot) return member;
       }
-      // If a DB record exists for this team but owner_user_id is NULL,
-      // treat it as explicitly unassigned — do NOT fall back to role lookup.
-      // Role lookup fallback only fires if no DB record exists at all.
-      return null;
+      // 7J-12OWN: previously returned null here outright — "a record exists for
+      // this team but owner_user_id is NULL, so treat it as explicitly
+      // unassigned." That assumption doesn't hold: madden_imported_team_stats
+      // comes from the EA sync, which has no concept of Discord accounts, so
+      // owner_user_id is NULL on this table for nearly every team regardless of
+      // whether a real Discord owner is actually configured elsewhere (confirmed
+      // directly — Eagles had a real owner in madden_franchises that this early
+      // return was preventing the function from ever reaching). Break out of
+      // this loop instead and let the function continue to steps 3-5
+      // (franchises, then role-based fallback), the same way it already does
+      // when step 1's direct role lookup finds nothing.
+      break;
     }
 
-    // No DB record found for this team at all — try role lookup as last resort
+    // Retry the direct role lookup before falling through to franchises/step 4/5
+    // — covers both "no team_stats record at all" and "a record existed but had
+    // no owner_user_id" (see the break above).
     if (roleId) {
       const owner = await findTeamOwnerByRoleId(guild, roleId).catch(() => null);
       if (owner) return owner;
