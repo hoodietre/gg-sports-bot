@@ -7085,6 +7085,9 @@ client.on(Events.MessageCreate, async (message) => {
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [offerId, message.guild.id, league?.league_id || null, message.author.id, senderTeam.name, senderTeam.roleId || null, pendingData.targetTeamName, pendingData.targetTeamRoleId || null, targetOwner?.id || null, '', attachment.url, initialStatus]
     );
+    if (league?.league_id) {
+      await maybeGenerateMaddenTradeRumor(message.guild, league, senderTeam.name, pendingData.targetTeamName).catch(() => null);
+    }
 
     if (skipOwnerStep) {
       const committeeChannel = await message.guild.channels.fetch(league?.committee_channel_id || COMMITTEE_CHANNEL_ID).catch(() => null);
@@ -33629,6 +33632,12 @@ async function createMaddenTradeNegotiationHub(guildId, league, member, userId, 
     [negotiationId, guildId, league.league_id, listing.player_key || null, listing.player_name, listing.team_name, userTeam?.name || null, listing.submitted_by || null, userId]
   );
   const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+  if (userTeam?.name && listing.team_name) {
+    const rumorGuild = await client.guilds.fetch(guildId).catch(() => null);
+    if (rumorGuild) {
+      await maybeGenerateMaddenTradeRumor(rumorGuild, league, userTeam.name, listing.team_name).catch(() => null);
+    }
+  }
   return {
     ok: true,
     embed: buildMaddenTradeNegotiationHubEmbed(league, listing, negotiation, userId),
@@ -43129,6 +43138,40 @@ async function computeMaddenTeamStreak(guildId, leagueId, teamName) {
   return { type: mostRecent, count };
 }
 
+// Vague "leak" phrasing — mentions both teams, never player specifics, so it
+// feels like a real rumor rather than a formal trade announcement even though
+// offer_details/negotiation package data might have exact players available.
+const MADDEN_TRADE_RUMOR_TEMPLATES = [
+  (a, b) => `Sources close to the situation say ${a} and ${b} have been in contact about a potential deal.`,
+  (a, b) => `Word around the league is that ${a} and ${b} are exploring trade options with each other.`,
+  (a, b) => `Multiple sources indicate ${a}'s front office has reached out to ${b} about a possible trade.`,
+  (a, b) => `Whispers out of the ${a} organization suggest talks with ${b} are heating up.`,
+  (a, b) => `Insiders report ${a} and ${b} have opened a dialogue on a trade that could shake up both rosters.`,
+];
+
+// 7J-26STORY: rumors, grounded in a real trade_offers row just being created —
+// the earliest durable evidence a trade is actually being discussed, whichever
+// of the two trade flows (screenshot-based or structured negotiation) created
+// it. Dedup key is the team pair (order-independent) plus today's date, so a
+// resubmitted/retried negotiation the same day doesn't generate a second
+// rumor, but a genuinely new negotiation days later still gets its own.
+async function maybeGenerateMaddenTradeRumor(guild, league, senderTeam, targetTeam) {
+  if (!guild || !league?.league_id || !senderTeam || !targetTeam) return;
+  const pairKey = [senderTeam, targetTeam].sort().join('|');
+  const today = new Date().toISOString().slice(0, 10);
+  const canPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'trade_rumor', pairKey, today).catch(() => false);
+  if (!canPost) return;
+  const template = MADDEN_TRADE_RUMOR_TEMPLATES[Math.floor(Math.random() * MADDEN_TRADE_RUMOR_TEMPLATES.length)];
+  await recordMaddenNewsEvent(guild, league, {
+    event_type: 'trade_rumor',
+    team_name: senderTeam,
+    metadata: {
+      other_team: targetTeam,
+      summary: template(maddenTeamDisplayName(senderTeam), maddenTeamDisplayName(targetTeam)),
+    },
+  }).catch(() => null);
+}
+
 async function postMaddenWeeklyUpdatesDigest(guild, league, items, { title, emoji = '📋', color = 0x5865F2, describeLine }) {
   if (!guild || !league?.league_id || !Array.isArray(items) || !items.length) return;
   const channelId = await getMaddenWeeklyUpdatesChannelId(league.league_id).catch(() => null);
@@ -43194,6 +43237,7 @@ function maddenNewsEventTitle(eventType) {
   if (key === 'trade_block_added') return '⭐ Trade Block Update';
   if (key === 'trade_block_removed') return '🔄 Trade Block Update';
   if (key === 'trade_committee_submitted') return '🤝 Trade Sent To Committee';
+  if (key === 'trade_rumor') return '👀 Rumor Mill';
   if (key === 'trade_approved') return '✅ Trade Approved';
   if (key === 'trade_denied') return '❌ Trade Denied';
   if (key === 'injury_new') return '🏥 Injury Report';
@@ -43314,6 +43358,19 @@ async function recordMaddenNewsEvent(guild, league, event) {
   return row;
 }
 
+// 7J-26STORY: team drama, "star put on trade block" trigger. Escalates the
+// framing when the player involved is genuinely a star (high OVR) rather than
+// routine roster shuffling — reuses the existing immediate-post mechanism
+// rather than routing through the batched Claude pipeline, since trade block
+// posts fire the moment the command runs, not on a per-sync cadence.
+function maddenTradeBlockDramaSummary(playerName, teamName, overall) {
+  const team = teamName ? maddenTeamDisplayName(teamName) : 'the team';
+  const ovr = Number(overall) || 0;
+  if (ovr >= 90) return `Blockbuster news: **${playerName}** (${ovr} OVR) has been put on the trade block by ${team} — a stunning move sending shockwaves through the league.`;
+  if (ovr >= 85) return `${playerName} (${ovr} OVR) has been added to the trade block by ${team}, a genuine surprise given the caliber of player involved.`;
+  return `${playerName} was added to the trade block${teamName ? ` by ${team}` : ''}.`;
+}
+
 async function recordMaddenTradeBlockNewsEvent(guild, league, action, listing, fallback = {}) {
   if (!guild || !league?.league_id) return null;
   const eventType = action === 'removed' ? 'trade_block_removed' : 'trade_block_added';
@@ -43333,7 +43390,7 @@ async function recordMaddenTradeBlockNewsEvent(guild, league, action, listing, f
       submitted_by: fallback.submitted_by || null,
       summary: action === 'removed'
         ? `${playerName} was removed from the trade block${teamName ? ` by ${maddenTeamDisplayName(teamName)}` : ''}.`
-        : `${playerName} was added to the trade block${teamName ? ` by ${maddenTeamDisplayName(teamName)}` : ''}.`,
+        : maddenTradeBlockDramaSummary(playerName, teamName, listing?.overall || fallback.overall),
     },
   });
 }
