@@ -10200,63 +10200,6 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      if (interaction.isModalSubmit() && interaction.customId === 'sportsbook_parlay_stake_modal') {
-        await interaction.deferReply({ ephemeral: true });
-        const draft = getParlayDraft(interaction.guild.id, interaction.user.id);
-        if (!draft || draft.legs.length < 2) {
-          await interaction.editReply({ content: 'Your parlay draft expired or was cleared — start over with Build a Parlay.' });
-          return;
-        }
-        const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
-        if (!Number.isInteger(amount) || amount <= 0) {
-          await interaction.editReply({ content: 'Stake must be a whole number greater than 0.' });
-          return;
-        }
-
-        // Re-verify every leg is still open right before committing currency — the
-        // draft could be stale if a line settled while the user was building.
-        const legs = [];
-        for (const draftLeg of draft.legs) {
-          const sportsbookGame = await findSportsbookGame(interaction.guild.id, draftLeg.gameId);
-          if (!sportsbookGame || sportsbookGame.status !== 'open') {
-            await interaction.editReply({ content: `**${draftLeg.label}** is no longer open — start your parlay over.` });
-            clearParlayDraft(interaction.guild.id, interaction.user.id);
-            return;
-          }
-          legs.push({ sportsbookGame, side: draftLeg.side, odds: draftLeg.odds });
-        }
-
-        const settings = await getCurrencySettings(interaction.guild.id);
-        const payoutData = calculateParlayPayout(amount, legs.map(leg => leg.odds));
-        const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_parlay_bet', 'Parlay bet', interaction.user.id);
-        if (!removed) {
-          await interaction.editReply({ content: 'You do not have enough ' + settings.currency_name + ' to create that parlay.' });
-          return;
-        }
-
-        const parlayId = randomUUID();
-        await pool.query(
-          `INSERT INTO sportsbook_parlays (id, guild_id, user_id, amount, combined_decimal, potential_payout)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [parlayId, interaction.guild.id, interaction.user.id, amount, payoutData.combinedDecimal, payoutData.payout]
-        );
-        for (const leg of legs) {
-          await pool.query(
-            `INSERT INTO sportsbook_parlay_legs (id, parlay_id, sportsbook_game_id, side, odds)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [randomUUID(), parlayId, leg.sportsbookGame.id, leg.side, leg.odds]
-          );
-        }
-        clearParlayDraft(interaction.guild.id, interaction.user.id);
-
-        const NL = String.fromCharCode(10);
-        const legText = legs.map((leg, index) => {
-          const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
-          return (index + 1) + '. ' + sideLabel + ' ' + formatAmericanOdds(leg.odds) + ' — ' + leg.sportsbookGame.game_label;
-        }).join(NL);
-        await interaction.editReply({ content: 'Parlay placed! 🎫' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**' });
-        return;
-      }
 
       if (interaction.customId.startsWith('sportsbook_pick_side:')) {
         if (!interaction.guild) return;
@@ -10685,6 +10628,71 @@ if (interaction.commandName === 'avatar') {
         new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:home`).setLabel(`${stripDiscordEmojiMarkupForLabel(sportsbookGame.home_label)} ${formatAmericanOdds(sportsbookGame.home_odds)}`).setStyle(ButtonStyle.Success),
       );
       await interaction.update({ content: `**${sportsbookGame.game_label}** — pick a side to add this leg:`, embeds: [], components: [sideRow] });
+      return;
+    }
+
+    // 7J-22MOVED: found via a systematic re-audit for this exact bug shape
+    // (a mutually-exclusive interaction-type check nested inside the wrong
+    // bare wrapper) after the earlier sportsbook_pick_game/parlay_add_leg fix
+    // — this one was hiding in the same isButton() wrapper, checking
+    // isModalSubmit() instead. Would have made actually submitting a parlay
+    // bet (after adding legs and hitting "Place Parlay") silently fail the
+    // same way the dropdowns did. No internal logic changed, only relocated.
+    if (interaction.isModalSubmit() && interaction.customId === 'sportsbook_parlay_stake_modal') {
+      await interaction.deferReply({ ephemeral: true });
+      const draft = getParlayDraft(interaction.guild.id, interaction.user.id);
+      if (!draft || draft.legs.length < 2) {
+        await interaction.editReply({ content: 'Your parlay draft expired or was cleared — start over with Build a Parlay.' });
+        return;
+      }
+      const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.editReply({ content: 'Stake must be a whole number greater than 0.' });
+        return;
+      }
+
+      // Re-verify every leg is still open right before committing currency — the
+      // draft could be stale if a line settled while the user was building.
+      const legs = [];
+      for (const draftLeg of draft.legs) {
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, draftLeg.gameId);
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.editReply({ content: `**${draftLeg.label}** is no longer open — start your parlay over.` });
+          clearParlayDraft(interaction.guild.id, interaction.user.id);
+          return;
+        }
+        legs.push({ sportsbookGame, side: draftLeg.side, odds: draftLeg.odds });
+      }
+
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const payoutData = calculateParlayPayout(amount, legs.map(leg => leg.odds));
+      const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_parlay_bet', 'Parlay bet', interaction.user.id);
+      if (!removed) {
+        await interaction.editReply({ content: 'You do not have enough ' + settings.currency_name + ' to create that parlay.' });
+        return;
+      }
+
+      const parlayId = randomUUID();
+      await pool.query(
+        `INSERT INTO sportsbook_parlays (id, guild_id, user_id, amount, combined_decimal, potential_payout)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [parlayId, interaction.guild.id, interaction.user.id, amount, payoutData.combinedDecimal, payoutData.payout]
+      );
+      for (const leg of legs) {
+        await pool.query(
+          `INSERT INTO sportsbook_parlay_legs (id, parlay_id, sportsbook_game_id, side, odds)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [randomUUID(), parlayId, leg.sportsbookGame.id, leg.side, leg.odds]
+        );
+      }
+      clearParlayDraft(interaction.guild.id, interaction.user.id);
+
+      const NL = String.fromCharCode(10);
+      const legText = legs.map((leg, index) => {
+        const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
+        return (index + 1) + '. ' + sideLabel + ' ' + formatAmericanOdds(leg.odds) + ' — ' + leg.sportsbookGame.game_label;
+      }).join(NL);
+      await interaction.editReply({ content: 'Parlay placed! 🎫' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**' });
       return;
     }
 
