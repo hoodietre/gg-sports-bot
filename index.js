@@ -59539,18 +59539,30 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
 // Returns true if both teams have a confirmed human owner in madden_imported_team_stats.
 // ---------------------------------------------------------------------------
 async function isMaddenUserVsUserGame(guildId, leagueId, homeTeam, awayTeam) {
+  // 7J-12OWN: was checking madden_imported_team_stats.owner_user_id only — that
+  // column comes from the EA sync, which has no concept of Discord accounts, so
+  // it's NULL for nearly every team regardless of whether a real owner is
+  // configured elsewhere. Same root cause confirmed in getMaddenTeamOwnerForGameThread
+  // (game thread owner tagging) this session — madden_franchises is the actual
+  // source of truth for owner assignments made through the bot. Check both and
+  // prefer whichever has a real value for each team.
   const result = await pool.query(
-    `SELECT team_name, owner_user_id
-     FROM madden_imported_team_stats
-     WHERE guild_id = $1 AND league_id::text = $2::text
-       AND LOWER(team_name) = ANY(ARRAY[LOWER($3), LOWER($4)])`,
+    `SELECT team_name, owner_user_id FROM madden_imported_team_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND LOWER(team_name) = ANY(ARRAY[LOWER($3), LOWER($4)])
+     UNION ALL
+     SELECT team_name, owner_user_id FROM madden_franchises
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND LOWER(team_name) = ANY(ARRAY[LOWER($3), LOWER($4)])`,
     [guildId, String(leagueId), homeTeam, awayTeam]
   ).catch(() => ({ rows: [] }));
 
   const rows = result.rows || [];
-  const homeRow = rows.find(r => r.team_name?.toLowerCase() === homeTeam?.toLowerCase());
-  const awayRow = rows.find(r => r.team_name?.toLowerCase() === awayTeam?.toLowerCase());
-  return !!(homeRow?.owner_user_id && awayRow?.owner_user_id);
+  const ownerFor = (teamName) => rows.find(r =>
+    r.team_name?.toLowerCase() === teamName?.toLowerCase() && r.owner_user_id
+  )?.owner_user_id || null;
+
+  return !!(ownerFor(homeTeam) && ownerFor(awayTeam));
 }
 
 
