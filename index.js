@@ -10273,11 +10273,18 @@ if (interaction.commandName === 'avatar') {
           return;
         }
 
-        const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
+        // 7J-20MODAL: same root issue as 7J-19EMOJI — sideLabel carries the
+        // emoji markup baked in for embed use, and modal titles are plain-text
+        // with a hard 45-character limit Discord enforces at the API level
+        // (unlike select-menu/button labels, this one actually throws instead
+        // of just looking wrong). Strip the emoji and truncate defensively —
+        // this modal is also used for player-prop bets, where a long stat name
+        // could still overflow 45 chars even without the emoji issue.
+        const sideLabel = stripDiscordEmojiMarkupForLabel(side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label);
         const odds = side === 'home' ? sportsbookGame.home_odds : sportsbookGame.away_odds;
         const modal = new ModalBuilder()
           .setCustomId('sportsbook_bet_modal:' + sportsbookGame.id + ':' + side)
-          .setTitle('Bet ' + sideLabel + ' ML ' + odds);
+          .setTitle(('Bet ' + sideLabel + ' ML ' + odds).slice(0, 45));
 
         modal.addComponents(
           new ActionRowBuilder().addComponents(
