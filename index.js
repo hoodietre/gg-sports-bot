@@ -12519,7 +12519,21 @@ if (interaction.commandName === 'avatar') {
       const playerName = interaction.values[0];
       await interaction.update({ content: 'Adding to trade block…', components: [] });
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      await addMaddenTradeBlockEntry(interaction.guild.id, league, member, interaction.user.id, playerName, '', '').catch(() => null);
+      const result = await addMaddenTradeBlockEntry(interaction.guild.id, league, member, interaction.user.id, playerName, '', '').catch(() => null);
+      // 7J-27FIX: this button flow (as opposed to the /maddentrade block add
+      // slash command) never called recordMaddenTradeBlockNewsEvent at all —
+      // a genuinely pre-existing gap, confirmed via Railway logs showing this
+      // exact customId fired with no corresponding news-event log line
+      // anywhere. Not something the drama-framing change broke; it lives in
+      // a code path this button never reached in the first place.
+      if (result?.ok !== false) {
+        const listing = await findMaddenTradeBlockListing(interaction.guild.id, league.league_id, playerName).catch(() => null);
+        await recordMaddenTradeBlockNewsEvent(interaction.guild, league, 'added', listing, {
+          player_name: playerName,
+          team_name: result?.team_name || null,
+          submitted_by: interaction.user.id,
+        }).catch(error => console.warn('[7J-10BY-A1 NEWS] trade block add event failed (button flow):', error?.message || error));
+      }
       await refreshMaddenTradeBlockBoardForLeague(interaction.guild, league).catch(() => null);
       await interaction.editReply({ content: `Added **${playerName}** to the trade block. The board has been refreshed.`, components: [] });
       return;
@@ -12560,7 +12574,15 @@ if (interaction.commandName === 'avatar') {
       if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
       const playerName = interaction.values[0];
       await interaction.update({ content: 'Removing from trade block…', components: [] });
-      await removeMaddenTradeBlockEntry(interaction.guild.id, league, interaction.user.id, playerName).catch(() => null);
+      const result = await removeMaddenTradeBlockEntry(interaction.guild.id, league, interaction.user.id, playerName).catch(() => null);
+      // 7J-27FIX: same pre-existing gap as the add flow above — this button
+      // path never called recordMaddenTradeBlockNewsEvent either.
+      if (result?.ok) {
+        await recordMaddenTradeBlockNewsEvent(interaction.guild, league, 'removed', result.row || null, {
+          player_name: playerName,
+          submitted_by: interaction.user.id,
+        }).catch(error => console.warn('[7J-10BY-A1 NEWS] trade block remove event failed (button flow):', error?.message || error));
+      }
       await refreshMaddenTradeBlockBoardForLeague(interaction.guild, league).catch(() => null);
       await interaction.editReply({ content: `Removed **${playerName}** from the trade block. The board has been refreshed.`, components: [] });
       return;
