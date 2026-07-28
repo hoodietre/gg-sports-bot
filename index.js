@@ -1070,6 +1070,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS standings_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS tournament_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_news_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_weekly_updates_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_feed_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_big_bet_threshold INTEGER NOT NULL DEFAULT 1000`);
@@ -43054,6 +43055,80 @@ async function getMaddenWeeklyUpdatesChannelId(leagueId) {
 // have a `team_name`; `describeLine(item)` formats one line of the digest.
 // Silently no-ops if there's nothing to post or no channel is reachable —
 // callers should not treat this as required to succeed.
+// ---------------------------------------------------------------------------
+// 7J-26STORY: ESPN-style storyline generation (Track F item 20). Shared
+// infrastructure first — a dedup/cooldown gate so a 3-game streak doesn't get
+// reported fresh every single sync while it's still sitting at 3, and a
+// single source of truth for "how is this team trending right now" that
+// hot-streak, losing-skid, hot-seat, and drama stories all read from.
+// ---------------------------------------------------------------------------
+
+async function ensureMaddenStorylineTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_storyline_posts (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL,
+      story_type TEXT NOT NULL,
+      subject_key TEXT NOT NULL,
+      last_value TEXT,
+      posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (guild_id, league_id, story_type, subject_key)
+    )
+  `);
+}
+
+// Returns true (and records it) only if this exact story+subject+value hasn't
+// already been posted — e.g. "Cowboys hot_streak 3" only fires once; the same
+// team sitting at a 3-game streak on the next sync won't re-fire until it
+// actually becomes a 4-game streak (or whatever milestone value is passed in).
+async function shouldPostMaddenStoryline(guildId, leagueId, storyType, subjectKey, currentValue) {
+  await ensureMaddenStorylineTables();
+  const existing = await pool.query(
+    `SELECT last_value FROM madden_storyline_posts WHERE guild_id = $1 AND league_id::text = $2::text AND story_type = $3 AND subject_key = $4`,
+    [guildId, String(leagueId), storyType, subjectKey]
+  ).catch(() => ({ rows: [] }));
+  if (existing.rows.length && String(existing.rows[0].last_value) === String(currentValue)) return false;
+  await pool.query(
+    `INSERT INTO madden_storyline_posts (id, guild_id, league_id, story_type, subject_key, last_value, posted_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
+     ON CONFLICT (guild_id, league_id, story_type, subject_key) DO UPDATE SET last_value = $6, posted_at = NOW()`,
+    [randomUUID(), guildId, String(leagueId), storyType, subjectKey, String(currentValue)]
+  ).catch(() => null);
+  return true;
+}
+
+// Computes a team's current win/loss streak from completed games, most recent
+// first. status already encodes the winner directly (home_win/away_win/tie),
+// confirmed against the actual import logic — no score comparison needed.
+async function computeMaddenTeamStreak(guildId, leagueId, teamName) {
+  const result = await pool.query(
+    `SELECT week_label, home_team, away_team, status
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND status IN ('home_win', 'away_win', 'tie')
+       AND (home_team = $3 OR away_team = $3)`,
+    [guildId, String(leagueId), teamName]
+  ).catch(() => ({ rows: [] }));
+
+  const games = (result.rows || [])
+    .map(row => {
+      const isHome = row.home_team === teamName;
+      const outcome = row.status === 'tie' ? 'tie' : ((row.status === 'home_win') === isHome ? 'win' : 'loss');
+      return { weekLabel: row.week_label, sortValue: maddenWeekSortValue(row.week_label), result: outcome };
+    })
+    .sort((a, b) => b.sortValue - a.sortValue);
+
+  if (!games.length) return { type: null, count: 0 };
+  const mostRecent = games[0].result;
+  let count = 0;
+  for (const game of games) {
+    if (game.result === mostRecent) count += 1;
+    else break;
+  }
+  return { type: mostRecent, count };
+}
+
 async function postMaddenWeeklyUpdatesDigest(guild, league, items, { title, emoji = '📋', color = 0x5865F2, describeLine }) {
   if (!guild || !league?.league_id || !Array.isArray(items) || !items.length) return;
   const channelId = await getMaddenWeeklyUpdatesChannelId(league.league_id).catch(() => null);
@@ -60060,43 +60135,34 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   }
 
   // Streak detection
-  const streakTeams = await pool.query(
-    `WITH recent AS (
-       SELECT
-         CASE WHEN home_score > away_score THEN home_team ELSE away_team END AS winner,
-         CASE WHEN home_score > away_score THEN away_team ELSE home_team END AS loser,
-         week_label, updated_at
-       FROM madden_imported_games
-       WHERE guild_id = $1 AND league_id::text = $2::text
-         AND LOWER(status) IN ('final', 'completed', 'completed_with_real_score')
-         AND home_score IS NOT NULL AND away_score IS NOT NULL
-       ORDER BY updated_at DESC
-     ),
-     team_recent AS (
-       SELECT winner AS team, 'W' AS result FROM recent
-       UNION ALL
-       SELECT loser AS team, 'L' AS result FROM recent
-     ),
-     streaks AS (
-       SELECT team,
-         SUM(CASE WHEN result = 'W' THEN 1 ELSE 0 END) AS total_wins,
-         SUM(CASE WHEN result = 'L' THEN 1 ELSE 0 END) AS total_losses
-       FROM (SELECT DISTINCT ON (team) * FROM team_recent ORDER BY team) grouped
-       GROUP BY team
-     )
-     SELECT * FROM streaks WHERE total_wins >= 3 OR total_losses >= 3`,
-    [guild.id, String(league.league_id)]
+  // 7J-26STORY: the previous version of this query was broken two ways — its
+  // status filter ('final'/'completed_with_real_score') doesn't match the
+  // real values madden_imported_games actually stores (confirmed:
+  // home_win/away_win/tie/completed), and its DISTINCT ON (team) collapsed
+  // each team to one arbitrary row before summing, which structurally could
+  // never produce a real multi-game streak count. It's very likely never
+  // returned a result in practice. Replaced with computeMaddenTeamStreak
+  // (verified correct, most-recent-first per team) and a dedup gate so a
+  // streak that's already been reported doesn't get reported again on every
+  // subsequent sync while it holds — only when it crosses to a new milestone.
+  const streakTeamsResult = await pool.query(
+    `SELECT DISTINCT team_name FROM madden_franchises WHERE guild_id = $1 AND league_id = $2`,
+    [guild.id, league.league_id]
   ).catch(() => ({ rows: [] }));
-
-  for (const row of streakTeams.rows || []) {
-    const streakType = row.total_wins >= 3 ? 'win' : 'loss';
-    const streakLen = streakType === 'win' ? row.total_wins : row.total_losses;
+  for (const { team_name: teamName } of streakTeamsResult.rows || []) {
+    if (!teamName) continue;
+    const streak = await computeMaddenTeamStreak(guild.id, league.league_id, teamName);
+    if (!streak.type || streak.type === 'tie' || streak.count < 3) continue;
+    if (![3, 5, 7, 9, 11, 13, 15].includes(streak.count)) continue;
+    const storyType = streak.type === 'win' ? 'hot_streak' : 'losing_skid';
+    const canReport = await shouldPostMaddenStoryline(guild.id, league.league_id, storyType, teamName, streak.count).catch(() => false);
+    if (!canReport) continue;
     events.push({
       type: 'streak',
-      team: row.team,
-      streakType,
-      streakLen,
-      teamEmoji: getMaddenTeamEmoji(row.team),
+      team: teamName,
+      streakType: streak.type,
+      streakLen: streak.count,
+      teamEmoji: getMaddenTeamEmoji(teamName),
     });
   }
 
