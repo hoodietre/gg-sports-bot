@@ -9014,7 +9014,30 @@ if (interaction.commandName === 'avatar') {
       await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
 
       const artNote = finalArtKey ? '' : ' ⚠️ No art found at that key — item created but will render as a placeholder until art is uploaded.';
-      await interaction.reply({ content: `Cosmetic created: **${name}** (${slot}, ${rarity}) for **${price}**.${artNote} For stock limits, colorable, award-only, or gift items, use \`/shop createcosmetic\`.`, ephemeral: true });
+      // 7J-24CREATE: this create modal is capped at Discord's 5-field limit
+      // (name/slot/price/rarity/art_key) — real items, especially accessories
+      // (accessory_type is REQUIRED for them to function) and pets
+      // (pet_position/pet_scale), need fields that structurally can't fit in
+      // one modal. Rather than send the owner to a separate slash command,
+      // chain straight into the exact same Cosmetic/Slot-Specific buttons the
+      // edit flow already provides — reuses already-working modals instead of
+      // building new ones, and lets a pet/accessory be fully completed without
+      // ever leaving the panel.
+      const slotFieldsApply = ['footwear', 'accessory', 'pet'].includes(slot);
+      const followUpButtons = [
+        new ButtonBuilder().setCustomId(`botownerpanel_edititem_cosmetic:${itemId}`).setLabel('Add Details (stock/colorable/award-only/gift)').setEmoji('🎨').setStyle(ButtonStyle.Primary),
+      ];
+      if (slotFieldsApply) {
+        const isAccessory = slot === 'accessory';
+        followUpButtons.push(new ButtonBuilder().setCustomId(`botownerpanel_edititem_slotfields:${itemId}`).setLabel(isAccessory ? 'Set Accessory Type (required)' : `Slot-Specific (${slot})`).setEmoji('🔧').setStyle(isAccessory ? ButtonStyle.Danger : ButtonStyle.Secondary));
+      }
+      await interaction.reply({
+        content: `Cosmetic created: **${name}** (${slot}, ${rarity}) for **${price}**.${artNote}`
+          + (slot === 'accessory' ? '\n⚠️ **Accessories need a sub-slot set below before they\'ll work correctly — click "Set Accessory Type."**' : '')
+          + '\nUse the buttons below to finish setting it up.',
+        components: [new ActionRowBuilder().addComponents(...followUpButtons)],
+        ephemeral: true,
+      });
       return;
     }
 
