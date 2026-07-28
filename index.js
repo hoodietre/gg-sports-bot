@@ -2661,8 +2661,6 @@ function buildCommands() {
         .setDescription('Staff: configure auto-detection and auto-posting after each advance')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addBooleanOption(o => o.setName('enabled').setDescription('Enable auto-detection after sync?'))
-        .addIntegerOption(o => o.setName('threshold').setDescription('Max transactions before flagging for review (default: 30)'))
-        .addChannelOption(o => o.setName('review_channel').setDescription('Channel for anomaly alerts'))
         .addBooleanOption(o => o.setName('espn_news').setDescription('Post ESPN-style headlines after each advance?'))
         .addBooleanOption(o => o.setName('sportsbook_lines').setDescription('Auto-create betting lines for user vs user games?'))
         .addChannelOption(o => o.setName('sportsbook_channel').setDescription('Channel for Madden sportsbook lines'))
@@ -4148,7 +4146,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -11418,54 +11416,6 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isButton() && interaction.customId.startsWith('commissioner_autodetect_threshold_modal:')) {
-      const leagueId = interaction.customId.split(':')[1];
-      const league = await getLeagueById(leagueId);
-      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
-        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
-        return;
-      }
-      await ensureMaddenAutoDetectColumns();
-      const settings = await ensureMaddenLeagueSettings(league);
-      const modal = new ModalBuilder()
-        .setCustomId('commissioner_autodetect_threshold_submit:' + leagueId)
-        .setTitle('Auto-Detect Threshold')
-        .addComponents(
-          new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-              .setCustomId('threshold')
-              .setLabel('Max transactions before flagging for review')
-              .setStyle(TextInputStyle.Short)
-              .setRequired(true)
-              .setValue(String(settings.auto_detect_threshold || 30))
-          )
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_autodetect_threshold_submit:')) {
-      const leagueId = interaction.customId.split(':')[1];
-      const league = await getLeagueById(leagueId);
-      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
-        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
-        return;
-      }
-      const raw = interaction.fields.getTextInputValue('threshold');
-      const threshold = Number.parseInt(raw, 10);
-      if (!Number.isInteger(threshold) || threshold < 1) {
-        await interaction.reply({ content: 'Threshold must be a whole number of 1 or greater.', ephemeral: true });
-        return;
-      }
-      await ensureMaddenAutoDetectColumns();
-      await pool.query(
-        `UPDATE madden_league_settings SET auto_detect_threshold = $2, updated_at = NOW() WHERE league_id = $1`,
-        [leagueId, threshold]
-      );
-      await interaction.deferUpdate();
-      await showCommissionerAutoDetectSettings(interaction, leagueId);
-      return;
-    }
 
     if (interaction.isButton() && interaction.customId.startsWith('commissioner_autodetect_toggle_espn:')) {
       const leagueId = interaction.customId.split(':')[1];
@@ -11496,22 +11446,6 @@ if (interaction.commandName === 'avatar') {
       await pool.query(
         `UPDATE madden_league_settings SET sportsbook_auto_lines_enabled = $2, updated_at = NOW() WHERE league_id = $1`,
         [leagueId, !settings.sportsbook_auto_lines_enabled]
-      );
-      await showCommissionerAutoDetectSettings(interaction, leagueId);
-      return;
-    }
-
-    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('commissioner_autodetect_review:')) {
-      const leagueId = interaction.customId.split(':')[1];
-      const league = await getLeagueById(leagueId);
-      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
-        await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true });
-        return;
-      }
-      await ensureMaddenAutoDetectColumns();
-      await pool.query(
-        `UPDATE madden_league_settings SET auto_detect_review_channel_id = $2, updated_at = NOW() WHERE league_id = $1`,
-        [leagueId, interaction.values[0]]
       );
       await showCommissionerAutoDetectSettings(interaction, leagueId);
       return;
@@ -16189,8 +16123,6 @@ if (gameSubcommand === 'report') {
           if (val !== null && val !== undefined) { vals.push(val); updates.push(`${col} = $${vals.length}`); }
         };
         setCol('auto_detect_enabled',          interaction.options.getBoolean('enabled'));
-        setCol('auto_detect_threshold',         interaction.options.getInteger('threshold'));
-        setCol('auto_detect_review_channel_id', interaction.options.getChannel('review_channel')?.id);
         setCol('espn_news_enabled',             interaction.options.getBoolean('espn_news'));
         setCol('sportsbook_auto_lines_enabled', interaction.options.getBoolean('sportsbook_lines'));
         setCol('madden_sportsbook_channel_id',  interaction.options.getChannel('sportsbook_channel')?.id);
@@ -29895,6 +29827,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'active_check_channel', label: 'Active Check Channel', description: 'Where Active Check posts go by default', kind: 'channel' },
   { value: 'draft_recap_channel', label: 'Draft Recap Channel', description: 'Madden: auto-posts here when the league advances past the draft', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
+  { value: 'madden_weekly_updates_channel', label: 'Weekly Updates Channel', description: 'Batched, per-team roster/transaction/injury summaries — separate from News so routine churn doesn\'t flood it', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
   { value: 'madden_sportsbook_channel', label: 'Madden Sportsbook Channel', description: 'Channel for Madden betting lines (user vs user games)', kind: 'channel' },
@@ -30036,6 +29969,7 @@ function setupDashboardColumn(settingKey) {
     active_check_channel: 'active_check_channel_id',
     draft_recap_channel: 'draft_recap_channel_id',
     madden_news_channel: 'madden_news_channel_id',
+    madden_weekly_updates_channel: 'madden_weekly_updates_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
     madden_power_rankings_channel: 'madden_power_rankings_channel_id',
     madden_sportsbook_channel: 'madden_sportsbook_channel_id',
@@ -30094,6 +30028,7 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['active_check_channel', 'Active Check'],
     ['draft_recap_channel', 'Draft Recap'],
     ['madden_news_channel', 'Madden News'],
+    ['madden_weekly_updates_channel', 'Weekly Updates'],
     ['madden_standings_channel', 'Madden Standings Board'],
     ['madden_power_rankings_channel', 'Madden Power Rankings Board'],
     ['madden_sportsbook_channel', 'Madden Sportsbook'],
@@ -36975,6 +36910,10 @@ function extractMaddenPlayerRowsFromPayload(payload) {
 async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = null) {
   let imported = 0;
   await ensureMaddenChangeLogTables().catch(() => null);
+  // 7J-25WEEKLY: accumulates every change across the whole roster sync, then
+  // posts one batched-by-team digest at the end (see call after the loop)
+  // instead of the old per-player-per-change immediate news post.
+  const allChanges = [];
 
   for (const row of rows) {
     const playerName = String(getFirstValue(row, ['playerName', 'player_name', 'name', 'fullName'], '')).trim();
@@ -36992,14 +36931,15 @@ async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = nul
     const previousPlayer = previousResult.rows[0] || null;
 
     if (previousPlayer) {
-      await detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer, {
+      const changes = await detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer, {
         external_player_id: externalPlayerId,
         player_name: playerName,
         team_name: nextTeam,
         position: nextPosition,
         overall: nextOverall,
         raw_payload: row,
-      }, weekLabel).catch(error => console.warn('[7J-10BY-C] change detection failed:', error?.message || error));
+      }, weekLabel).catch(error => { console.warn('[7J-10BY-C] change detection failed:', error?.message || error); return []; });
+      for (const change of changes || []) { if (change) allChanges.push(change); }
     }
 
     await pool.query(
@@ -37033,6 +36973,15 @@ async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = nul
   }
 
   await refreshMaddenTeamCapFromExpandedPlayers(guild.id, league.league_id).catch(error => console.warn('[7J-10BY-DD] cap snapshot refresh failed:', error?.message || error));
+
+  if (allChanges.length) {
+    await postMaddenWeeklyUpdatesDigest(guild, league, allChanges, {
+      title: 'Weekly Roster Update',
+      emoji: '📋',
+      describeLine: change => `${maddenChangeIcon(change.change_type)} **${change.player_name || 'Unknown player'}** — ${maddenChangeTypeLabel(change.change_type)}: ${change.old_value || 'N/A'} → ${change.new_value || 'N/A'}`,
+    }).catch(error => console.warn('[7J-25WEEKLY] roster digest failed:', error?.message || error));
+  }
+
   return imported;
 }
 
@@ -40415,20 +40364,11 @@ async function recordMaddenChangeLogEvent(guild, league, change) {
     [randomUUID(), guild.id, String(league.league_id), playerId, playerName, teamName, change.change_type, oldValue, newValue, weekLabel, JSON.stringify(change.metadata || {})]
   );
   const row = result.rows[0];
-  const newsType = change.change_type === 'team_change' ? 'transaction' : change.change_type;
-  await recordMaddenNewsEvent(guild, league, {
-    event_type: newsType,
-    player_id: playerId,
-    player_name: playerName,
-    team_name: teamName,
-    old_value: oldValue,
-    new_value: newValue,
-    week_label: weekLabel,
-    metadata: {
-      ...(change.metadata || {}),
-      summary: change.summary || `${playerName || 'A player'} changed: ${oldValue || 'N/A'} → ${newValue || 'N/A'}.`,
-    },
-  }).catch(error => console.warn('[7J-10BY-C] news event failed:', error?.message || error));
+  // 7J-25WEEKLY: used to post immediately here, per player per change, to the
+  // news channel — that's exactly the flood Hxxdie asked to fix. No longer
+  // posts anything itself; the caller (importMaddenPlayersFromArray)
+  // accumulates every returned row across the whole sync and posts one
+  // batched-by-team digest to the Weekly Updates channel instead.
   return row;
 }
 
@@ -42299,6 +42239,11 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
   }
 
   if (confirm) {
+    // 7J-25WEEKLY: used to call recordMaddenNewsEvent individually per
+    // qualifying transaction here — now accumulates them and posts one
+    // batched-by-team digest after the save loop instead. Save/dedup logic
+    // below is completely unchanged.
+    const weeklyDigestRows = [];
     for (const row of rows) {
       const transactionKey = row.transaction_key || buildMaddenTransactionKey(row);
       const inserted = await pool.query(
@@ -42310,24 +42255,19 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
       ).catch(() => ({ rows: [] }));
       const savedRow = inserted.rows?.[0];
       if (guild && savedRow && ['entered_free_agency','signed','free_agency_signing','re_signed','released','team_change','drafted'].includes(String(row.event_type))) {
-        const newsRow = await recordMaddenNewsEvent(guild, league, {
-          event_type: maddenTransactionNewsEventType(row.event_type),
-          player_id: row.player_id || null,
-          player_name: row.player_name || null,
-          team_name: row.new_team_name || row.team_name || row.old_team_name || null,
-          metadata: {
-            transaction_type: row.event_type,
-            position: row.position || null,
-            overall: row.overall || null,
-            summary: buildMaddenTransactionSummary(row),
-            old_team: row.old_team_name || null,
-            new_team: row.new_team_name || row.team_name || null,
-            display_team_name: maddenTransactionDisplayTeam(row.new_team_name || row.team_name || row.old_team_name || ''),
-          },
-        }).catch(() => null);
-        if (newsRow?.id) {
-          await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = $1`, [savedRow.id]).catch(() => null);
-        }
+        weeklyDigestRows.push({ ...row, team_name: row.new_team_name || row.team_name || row.old_team_name || null, saved_id: savedRow.id });
+      }
+    }
+    if (weeklyDigestRows.length && guild) {
+      await postMaddenWeeklyUpdatesDigest(guild, league, weeklyDigestRows, {
+        title: 'Weekly Transactions',
+        emoji: '✂️',
+        color: 0xED4245,
+        describeLine: row => `${maddenTransactionPrettyLabel(row.event_type)} — ${buildMaddenTransactionSummary(row)}`,
+      }).catch(error => console.warn('[7J-25WEEKLY] transactions digest failed:', error?.message || error));
+      const savedIds = weeklyDigestRows.map(r => r.saved_id).filter(Boolean);
+      if (savedIds.length) {
+        await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = ANY($1::uuid[])`, [savedIds]).catch(() => null);
       }
     }
     await saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRows);
@@ -42495,29 +42435,21 @@ async function backfillMaddenTransactionNews(guild, league, confirm = false, lim
   ).catch(() => ({ rows: [] }));
   const rows = result.rows || [];
   if (!confirm) return rows;
-  const posted = [];
-  for (const row of rows) {
-    const newsRow = await recordMaddenNewsEvent(guild, league, {
-      event_type: 'transaction',
-      player_id: row.player_id || null,
-      player_name: row.player_name || null,
-      team_name: row.new_team_name || row.team_name || row.old_team_name || null,
-      metadata: {
-        transaction_type: row.event_type,
-        position: row.position || null,
-        overall: row.overall || null,
-        summary: buildMaddenTransactionSummary(row),
-        old_team: row.old_team_name || null,
-        new_team: row.new_team_name || row.team_name || null,
-        backfilled: true,
-      },
-    }).catch(() => null);
-    if (newsRow?.id) {
-      await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = $1`, [row.id]).catch(() => null);
-      posted.push(row);
-    }
+  // 7J-25WEEKLY: this backfills the same transaction types now routed to
+  // Weekly Updates by the regular sync flow — posting them individually to
+  // news here would reopen the exact flooding problem via a manual back door.
+  // Batch by team the same way, rather than one recordMaddenNewsEvent per row.
+  await postMaddenWeeklyUpdatesDigest(guild, league, rows.map(row => ({ ...row, team_name: row.new_team_name || row.team_name || row.old_team_name || null })), {
+    title: 'Weekly Transactions (Backfilled)',
+    emoji: '✂️',
+    color: 0xED4245,
+    describeLine: row => `${maddenTransactionPrettyLabel(row.event_type)} — ${buildMaddenTransactionSummary(row)}`,
+  }).catch(error => console.warn('[7J-25WEEKLY] backfill digest failed:', error?.message || error));
+  const ids = rows.map(row => row.id).filter(Boolean);
+  if (ids.length) {
+    await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = ANY($1::uuid[])`, [ids]).catch(() => null);
   }
-  return posted;
+  return rows;
 }
 
 async function buildMaddenTransactionsBackfillNewsEmbed(guild, league, confirm = false, limit = 25) {
@@ -42962,6 +42894,9 @@ async function scanMaddenRetirements(guild, league, confirm = false) {
   rows.sort((a, b) => Number(b.overall || 0) - Number(a.overall || 0) || Number(b.age || 0) - Number(a.age || 0) || String(a.player_name).localeCompare(String(b.player_name)));
 
   if (confirm) {
+    // 7J-25WEEKLY: same treatment as transactions/roster changes — save each
+    // row individually (unchanged), but post one batched-by-team digest
+    // instead of one recordMaddenNewsEvent call per retirement.
     for (const row of rows) {
       const retirementKey = maddenRetirementKey(row);
       await pool.query(
@@ -42970,21 +42905,14 @@ async function scanMaddenRetirements(guild, league, confirm = false) {
          ON CONFLICT (guild_id, league_id, retirement_key) WHERE retirement_key IS NOT NULL DO NOTHING`,
         [randomUUID(), guildId, leagueId, row.season_label || null, row.player_id || null, row.player_name, row.team_name || null, row.position || null, row.overall || null, row.age || null, row.years_pro || null, row.metadata || {}, retirementKey]
       ).catch(() => null);
-      if (guild?.channels) {
-        await recordMaddenNewsEvent(guild, league, {
-          event_type: 'retirement',
-          player_id: row.player_id || null,
-          player_name: row.player_name,
-          team_name: row.team_name || null,
-          metadata: {
-            position: row.position || null,
-            overall: row.overall || null,
-            summary: `${row.player_name} has retired${row.team_name ? ` after finishing with ${maddenTeamDisplayName(row.team_name)}` : ''}.`,
-            age: row.age || null,
-            years_pro: row.years_pro || null,
-          },
-        }).catch(() => null);
-      }
+    }
+    if (rows.length && guild?.channels) {
+      await postMaddenWeeklyUpdatesDigest(guild, league, rows, {
+        title: 'Weekly Retirements',
+        emoji: '👋',
+        color: 0x99AAB5,
+        describeLine: row => `👋 **${row.player_name}** has retired${row.team_name ? ` after finishing with ${maddenTeamDisplayName(row.team_name)}` : ''}${row.age ? ` (Age ${row.age})` : ''}`,
+      }).catch(error => console.warn('[7J-25WEEKLY] retirements digest failed:', error?.message || error));
     }
   }
   return rows;
@@ -43052,6 +42980,7 @@ Updated: ${baseline.updatedAt ? new Date(baseline.updatedAt).toLocaleString() : 
 
 async function ensureMaddenNewsTables() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_news_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_weekly_updates_channel_id TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_news_events (
       id UUID PRIMARY KEY,
@@ -43099,6 +43028,65 @@ async function getMaddenNewsChannelId(leagueId) {
     [String(leagueId)]
   );
   return result.rows[0]?.madden_news_channel_id || null;
+}
+
+// 7J-25WEEKLY: Weekly Updates channel — the destination for batched, per-team
+// roster-diff/transaction/retirement summaries, kept separate from the real
+// news channel so routine churn no longer floods it. Falls back to the news
+// channel if not configured, rather than silently dropping content —
+// commissioners who haven't set this up yet still get the content somewhere.
+async function getMaddenWeeklyUpdatesChannelId(leagueId) {
+  await ensureMaddenNewsTables();
+  if (!leagueId) return null;
+  const result = await pool.query(
+    `SELECT madden_weekly_updates_channel_id
+     FROM league_settings
+     WHERE league_id::text = $1::text
+     LIMIT 1`,
+    [String(leagueId)]
+  );
+  return result.rows[0]?.madden_weekly_updates_channel_id || await getMaddenNewsChannelId(leagueId);
+}
+
+// 7J-25WEEKLY: batches an array of per-player/team items into one embed per
+// team and posts them to the Weekly Updates channel, instead of the old
+// behavior of posting one message per individual change. `items` must each
+// have a `team_name`; `describeLine(item)` formats one line of the digest.
+// Silently no-ops if there's nothing to post or no channel is reachable —
+// callers should not treat this as required to succeed.
+async function postMaddenWeeklyUpdatesDigest(guild, league, items, { title, emoji = '📋', color = 0x5865F2, describeLine }) {
+  if (!guild || !league?.league_id || !Array.isArray(items) || !items.length) return;
+  const channelId = await getMaddenWeeklyUpdatesChannelId(league.league_id).catch(() => null);
+  if (!channelId) {
+    console.warn('[7J-25WEEKLY] No weekly updates (or fallback news) channel configured for league ' + String(league.league_id));
+    return;
+  }
+  const channel = await guild.channels.fetch(channelId).catch(error => {
+    console.warn('[7J-25WEEKLY] Channel fetch failed:', channelId, error?.message || error);
+    return null;
+  });
+  if (!channel?.isTextBased?.()) return;
+
+  const byTeam = new Map();
+  for (const item of items) {
+    const team = item.team_name || item.new_team_name || item.old_team_name || 'League';
+    if (!byTeam.has(team)) byTeam.set(team, []);
+    byTeam.get(team).push(item);
+  }
+
+  for (const [team, teamItems] of byTeam) {
+    const lines = teamItems.map(describeLine).filter(Boolean).join('\n').slice(0, 4000);
+    if (!lines) continue;
+    const embed = new EmbedBuilder()
+      .setTitle(`${emoji} ${title} — ${maddenTeamDisplayName(team)}`)
+      .setColor(color)
+      .setDescription(lines)
+      .setFooter({ text: `GG Sports • Weekly Updates • ${teamItems.length} update${teamItems.length === 1 ? '' : 's'}` })
+      .setTimestamp();
+    const logo = getMaddenTeamLogoUrl(team);
+    if (logo) embed.setThumbnail(logo);
+    await channel.send({ embeds: [embed] }).catch(error => console.warn('[7J-25WEEKLY] post failed for team', team, ':', error?.message || error));
+  }
 }
 
 async function postMaddenNewsEventToConfiguredChannel(guild, league, row) {
@@ -59470,44 +59458,20 @@ async function autoDetectMaddenTransactions(guild, league) {
   const settings = await ensureMaddenLeagueSettings(league);
   if (settings.auto_detect_enabled !== true) return [];
 
-  const threshold = Number(settings.auto_detect_threshold || 30);
-  const reviewChannelId = settings.auto_detect_review_channel_id
-    || await getMaddenNewsChannelId(league.league_id).catch(() => null);
-
-  // Preview scan first — count results before committing
-  const previewRows = await scanMaddenOffseasonTransactions(guild, league, false).catch(() => null);
-  const count = Array.isArray(previewRows) ? previewRows.length : 0;
+  // 7J-25WEEKLY: previously held any batch over auto_detect_threshold (default
+  // 30) for manual commissioner review via `/maddentransactions scan
+  // confirm:false` then `confirm:true` — existed specifically to protect the
+  // news channel from a bad sync flooding it with individual posts. That risk
+  // is gone now that transactions batch by team into the dedicated Weekly
+  // Updates channel instead of posting individually to news, so the guard
+  // (and the manual-review step it required commissioners to do) is removed
+  // entirely per Hxxdie's request — "one more unnecessary manual thing."
+  const rows = await scanMaddenOffseasonTransactions(guild, league, true).catch(err => {
+    console.error('[AUTO DETECT TRANSACTIONS] Scan failed:', err?.message);
+    return null;
+  });
+  const count = Array.isArray(rows) ? rows.length : 0;
   if (count === 0) return [];
-
-  if (count > threshold) {
-    // Anomalous count — hold for commissioner review
-    if (reviewChannelId) {
-      const reviewChannel = await guild.channels.fetch(reviewChannelId).catch(() => null);
-      if (reviewChannel?.isTextBased?.()) {
-        await reviewChannel.send({
-          embeds: [new EmbedBuilder()
-            .setTitle(`${GG_EMOJI} ⚠️ Auto-Detection Held — Review Required`)
-            .setColor(0xFEE75C)
-            .setDescription([
-              `**League:** ${league.league_name}`,
-              `**Transactions detected:** ${count} (threshold: ${settings.auto_detect_threshold || 30})`,
-              '',
-              'This advance generated more transactions than expected and has been **held** to avoid flooding the news channel.',
-              '',
-              'Review with `/maddentransactions scan confirm:false` then post manually with `confirm:true`.',
-              `To raise the threshold: \`/maddengames autodetect threshold:${count + 10}\``,
-            ].join('\n'))
-            .setFooter({ text: 'GG Sports • 7J-10BY-GT3 Auto Detection' })
-            .setTimestamp()],
-        }).catch(() => null);
-      }
-    }
-    return [];
-  }
-
-  // Count is within threshold — run with confirm:true to save and post news
-  await scanMaddenOffseasonTransactions(guild, league, true).catch(err =>
-    console.error('[AUTO DETECT TRANSACTIONS] Scan failed:', err?.message));
   return [{ type: 'transactions', count }];
 }
 
@@ -60626,8 +60590,6 @@ function buildMaddenAutoDetectSettingsEmbed(league, settings) {
     .setColor(settings.auto_detect_enabled ? 0x57F287 : 0xFEE75C)
     .addFields(
       { name: 'Auto-Detect Enabled', value: settings.auto_detect_enabled ? '✅ On' : '❌ Off', inline: true },
-      { name: 'Transaction Threshold', value: String(settings.auto_detect_threshold || 30), inline: true },
-      { name: 'Review Channel', value: settings.auto_detect_review_channel_id ? `<#${settings.auto_detect_review_channel_id}>` : 'News channel (default)', inline: true },
       { name: 'ESPN News', value: settings.espn_news_enabled !== false ? '✅ On' : '❌ Off', inline: true },
       { name: 'Sportsbook Auto-Lines', value: settings.sportsbook_auto_lines_enabled ? '✅ On' : '❌ Off', inline: true },
       { name: 'Sportsbook Channel', value: settings.madden_sportsbook_channel_id ? `<#${settings.madden_sportsbook_channel_id}>` : 'Not set', inline: true },
@@ -60641,20 +60603,14 @@ function buildMaddenAutoDetectSettingsEmbed(league, settings) {
 }
 
 function buildCommissionerAutoDetectSettingsComponents(leagueId, settings) {
-  const channelMenu = new ChannelSelectMenuBuilder()
-    .setCustomId('commissioner_autodetect_review:' + leagueId)
-    .setPlaceholder(settings.auto_detect_review_channel_id ? 'Change review channel' : 'Set review channel (defaults to news channel)')
-    .setChannelTypes(ChannelType.GuildText);
-  const row1 = new ActionRowBuilder().addComponents(channelMenu);
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('commissioner_autodetect_threshold_modal:' + leagueId).setLabel('Edit Threshold').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('commissioner_autodetect_toggle_espn:' + leagueId).setLabel(settings.espn_news_enabled !== false ? 'Disable ESPN News' : 'Enable ESPN News').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('commissioner_autodetect_toggle_sblines:' + leagueId).setLabel(settings.sportsbook_auto_lines_enabled ? 'Disable Sportsbook Lines' : 'Enable Sportsbook Lines').setStyle(ButtonStyle.Secondary),
   );
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('commissioner_autodetect_back:' + leagueId).setLabel('⬅ Back to Operations').setStyle(ButtonStyle.Secondary),
   );
-  return [row1, row2, row3];
+  return [row2, row3];
 }
 
 async function showCommissionerAutoDetectSettings(interaction, leagueId) {
@@ -60700,7 +60656,6 @@ function buildCommissionerHomeEmbed(league, settings = {}) {
   if (isMadden) {
     embed.addFields(
       { name: 'Auto-Detection', value: settings.auto_detect_enabled ? '✅ On' : '❌ Off', inline: true },
-      { name: 'Transaction Threshold', value: String(settings.auto_detect_threshold || 30), inline: true },
       { name: 'Last Processed Week', value: settings.last_auto_detect_week_label || 'None yet', inline: true },
     );
   }
