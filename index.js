@@ -2258,6 +2258,7 @@ async function initDatabase() {
   await migrateGuildCurrencyBalancesToGlobal();
   await migrateMaddenSportsbookAutoLinesDefaultOn();
   await migrateSingleChannelPanelsToMultiChannel();
+  await migrateStaleScheduleExportDuplicateGames();
 
   console.log('Database ready.');
 }
@@ -2302,6 +2303,110 @@ async function migrateMaddenSportsbookAutoLinesDefaultOn() {
     client.release();
   }
 }
+
+
+async function migrateStaleScheduleExportDuplicateGames() {
+  // Session 3, round 17: one-time cleanup for the round-14 fix (7J-10D). Before
+  // that fix, normalizeEaScheduleExportRows and normalizeEaScheduleDeepFromHub
+  // computed two different external_game_id formats for the same real game —
+  // "ea-schedule-export:{stage}:{week}:{key}:{away}:{home}" (the stale, no-longer-
+  // produced format) vs the bare per-game key the hub path always used and the
+  // schedule-export path now also uses. Rows already inserted under the old
+  // compound format before the fix don't self-heal — the fix only changes what
+  // NEW rows look like, so any already-duplicated week keeps sitting on both a
+  // stale compound-ID row and a correct bare-ID row indefinitely. This migration
+  // merges the two: for every stale row that has a matching bare-ID "twin" (same
+  // guild/league/week/matchup), copy over anything the twin is missing (a
+  // thread_id, or a real score if the twin is still showing 0-0) and then delete
+  // the stale row. A stale row with NO twin yet (the hub path simply hasn't
+  // reached that week yet) is left completely untouched — this migration only
+  // ever removes a row once its replacement already exists, never before.
+  // Guarded by system_migrations so this runs exactly once ever; safe to leave
+  // running indefinitely since it becomes a no-op the moment no stale rows remain
+  // (new rows are never created in the old format again, per the round-14 fix).
+  const MIGRATION_KEY = 'stale_schedule_export_duplicate_games_cleanup_v1';
+
+  const already = await pool.query(
+    `SELECT 1 FROM system_migrations WHERE migration_key = $1`,
+    [MIGRATION_KEY]
+  );
+  if (already.rows.length > 0) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Step 1: copy thread_id onto the twin if the twin doesn't have one yet.
+    const threadCopy = await client.query(
+      `UPDATE madden_imported_games AS keep
+       SET thread_id = stale.thread_id,
+           thread_created_at = COALESCE(keep.thread_created_at, stale.thread_created_at)
+       FROM madden_imported_games AS stale
+       WHERE stale.external_game_id LIKE 'ea-schedule-export:%'
+         AND keep.external_game_id NOT LIKE 'ea-schedule-export:%'
+         AND keep.guild_id = stale.guild_id
+         AND keep.league_id = stale.league_id
+         AND keep.week_label = stale.week_label
+         AND keep.home_team = stale.home_team
+         AND keep.away_team = stale.away_team
+         AND keep.thread_id IS NULL
+         AND stale.thread_id IS NOT NULL`
+    );
+
+    // Step 2: promote score/status from the stale row onto the twin, but only if
+    // the stale row actually has a real score and the twin is still 0-0/scheduled
+    // — never overwrite a twin that already has its own real result.
+    const scorePromote = await client.query(
+      `UPDATE madden_imported_games AS keep
+       SET home_score = stale.home_score,
+           away_score = stale.away_score,
+           status = stale.status
+       FROM madden_imported_games AS stale
+       WHERE stale.external_game_id LIKE 'ea-schedule-export:%'
+         AND keep.external_game_id NOT LIKE 'ea-schedule-export:%'
+         AND keep.guild_id = stale.guild_id
+         AND keep.league_id = stale.league_id
+         AND keep.week_label = stale.week_label
+         AND keep.home_team = stale.home_team
+         AND keep.away_team = stale.away_team
+         AND (COALESCE(stale.home_score, 0) > 0 OR COALESCE(stale.away_score, 0) > 0)
+         AND COALESCE(keep.home_score, 0) = 0
+         AND COALESCE(keep.away_score, 0) = 0`
+    );
+
+    // Step 3: delete the stale row, but only where a twin was actually found —
+    // any stale row with no twin yet is left alone entirely.
+    const deleted = await client.query(
+      `DELETE FROM madden_imported_games AS stale
+       WHERE stale.external_game_id LIKE 'ea-schedule-export:%'
+         AND EXISTS (
+           SELECT 1 FROM madden_imported_games AS keep
+           WHERE keep.external_game_id NOT LIKE 'ea-schedule-export:%'
+             AND keep.guild_id = stale.guild_id
+             AND keep.league_id = stale.league_id
+             AND keep.week_label = stale.week_label
+             AND keep.home_team = stale.home_team
+             AND keep.away_team = stale.away_team
+         )`
+    );
+
+    await client.query(
+      `INSERT INTO system_migrations (migration_key) VALUES ($1)`,
+      [MIGRATION_KEY]
+    );
+
+    await client.query('COMMIT');
+    console.log('[Stale Schedule Export Cleanup 7J-11CLN] threadIdsCopied: ' + (threadCopy.rowCount || 0)
+      + ', scoresPromoted: ' + (scorePromote.rowCount || 0)
+      + ', staleRowsDeleted: ' + (deleted.rowCount || 0));
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('[Stale Schedule Export Cleanup 7J-11CLN] Failed, will retry on next restart:', error?.message || error);
+  } finally {
+    client.release();
+  }
+}
+
 
 
 async function migrateGuildCurrencyBalancesToGlobal() {
