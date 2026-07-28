@@ -10111,41 +10111,6 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sportsbook_pick_game')) {
-        if (!interaction.guild) return;
-        console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] Handler entered, customId: ' + interaction.customId);
-        try {
-          // 7J-15DEFER: was running the DB lookup before acknowledging the
-          // interaction at all — any latency in that single query (DB pool
-          // contention, a cold connection, a brief network hiccup) blows past
-          // Discord's 3-second ack window and produces "didn't respond in time,"
-          // confirmed as the exact error Hxxdie hit. Every other handler nearby
-          // (sportsbook_quick_mybets, sportsbook_quick_leaderboards, etc.) already
-          // defers first before doing any DB work — this one just didn't follow
-          // that pattern. Deferred replies get up to 15 minutes, not 3 seconds.
-          await interaction.deferReply({ ephemeral: true });
-          console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] deferReply succeeded.');
-          const gameId = interaction.values[0];
-          const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
-          console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] findSportsbookGame resolved: ' + (sportsbookGame ? sportsbookGame.id + ' status=' + sportsbookGame.status : 'null'));
-
-          if (!sportsbookGame || sportsbookGame.status !== 'open') {
-            await interaction.editReply({ content: 'That sportsbook game is no longer open.' });
-            console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] editReply (not open) succeeded.');
-            return;
-          }
-
-          await interaction.editReply({
-            content: 'Choose your side for **' + sportsbookGame.game_label + '**.',
-            components: [buildSportsbookSideButtons(sportsbookGame)],
-          });
-          console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] editReply (side buttons) succeeded.');
-        } catch (err) {
-          console.error('[SPORTSBOOK PICK GAME 7J-16TRACE] Threw: ' + (err?.stack || err?.message || err));
-        }
-        return;
-      }
-
       if (interaction.isButton() && interaction.customId === 'sportsbook_quick_mybets') {
         await interaction.deferReply({ ephemeral: true });
         const settings = await getCurrencySettings(interaction.guild.id);
@@ -10186,21 +10151,6 @@ if (interaction.commandName === 'avatar') {
         setParlayDraft(interaction.guild.id, interaction.user.id, []);
         const payload = await buildParlayWizardPayload(interaction.guild.id, interaction.user.id);
         await interaction.editReply(payload);
-        return;
-      }
-
-      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_parlay_add_leg') {
-        const gameId = interaction.values[0];
-        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
-        if (!sportsbookGame || sportsbookGame.status !== 'open') {
-          await interaction.reply({ content: 'That line is no longer open — pick another.', ephemeral: true });
-          return;
-        }
-        const sideRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:away`).setLabel(`${sportsbookGame.away_label} ${formatAmericanOdds(sportsbookGame.away_odds)}`).setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:home`).setLabel(`${sportsbookGame.home_label} ${formatAmericanOdds(sportsbookGame.home_odds)}`).setStyle(ButtonStyle.Success),
-        );
-        await interaction.update({ content: `**${sportsbookGame.game_label}** — pick a side to add this leg:`, embeds: [], components: [sideRow] });
         return;
       }
 
@@ -10662,6 +10612,65 @@ if (interaction.commandName === 'avatar') {
         await interaction.update({ embeds: [buildCommitteeEmbed(offer, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId)] });
         return;
       }
+    }
+
+    // 7J-18MOVED: these two were accidentally nested inside the isButton()
+    // wrapper above (lines ~9886-10615) — since both check isStringSelectMenu(),
+    // a condition mutually exclusive with isButton(), they were permanently
+    // unreachable dead code. Confirmed directly: an unconditional top-of-handler
+    // trace fired with the exact right customId every time, but nothing inside
+    // either block ever ran, no exception, no output at all — this is why.
+    // Relocated to be reachable top-level checks instead of nested inside the
+    // wrong wrapper. No logic inside either block was changed, only their
+    // position in the file.
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sportsbook_pick_game')) {
+      if (!interaction.guild) return;
+      console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] Handler entered, customId: ' + interaction.customId);
+      try {
+        // 7J-15DEFER: was running the DB lookup before acknowledging the
+        // interaction at all — any latency in that single query (DB pool
+        // contention, a cold connection, a brief network hiccup) blows past
+        // Discord's 3-second ack window and produces "didn't respond in time,"
+        // confirmed as the exact error Hxxdie hit. Every other handler nearby
+        // (sportsbook_quick_mybets, sportsbook_quick_leaderboards, etc.) already
+        // defers first before doing any DB work — this one just didn't follow
+        // that pattern. Deferred replies get up to 15 minutes, not 3 seconds.
+        await interaction.deferReply({ ephemeral: true });
+        console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] deferReply succeeded.');
+        const gameId = interaction.values[0];
+        const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+        console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] findSportsbookGame resolved: ' + (sportsbookGame ? sportsbookGame.id + ' status=' + sportsbookGame.status : 'null'));
+
+        if (!sportsbookGame || sportsbookGame.status !== 'open') {
+          await interaction.editReply({ content: 'That sportsbook game is no longer open.' });
+          console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] editReply (not open) succeeded.');
+          return;
+        }
+
+        await interaction.editReply({
+          content: 'Choose your side for **' + sportsbookGame.game_label + '**.',
+          components: [buildSportsbookSideButtons(sportsbookGame)],
+        });
+        console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] editReply (side buttons) succeeded.');
+      } catch (err) {
+        console.error('[SPORTSBOOK PICK GAME 7J-16TRACE] Threw: ' + (err?.stack || err?.message || err));
+      }
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_parlay_add_leg') {
+      const gameId = interaction.values[0];
+      const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
+      if (!sportsbookGame || sportsbookGame.status !== 'open') {
+        await interaction.reply({ content: 'That line is no longer open — pick another.', ephemeral: true });
+        return;
+      }
+      const sideRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:away`).setLabel(`${sportsbookGame.away_label} ${formatAmericanOdds(sportsbookGame.away_odds)}`).setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`sportsbook_parlay_side:${sportsbookGame.id}:home`).setLabel(`${sportsbookGame.home_label} ${formatAmericanOdds(sportsbookGame.home_odds)}`).setStyle(ButtonStyle.Success),
+      );
+      await interaction.update({ content: `**${sportsbookGame.game_label}** — pick a side to add this leg:`, embeds: [], components: [sideRow] });
+      return;
     }
 
     if (interaction.isStringSelectMenu()) {
