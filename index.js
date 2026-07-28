@@ -59491,7 +59491,10 @@ async function findMaddenPropCandidate(guildId, leagueId, teamName, positions, s
 
 async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
   const settings = await ensureMaddenLeagueSettings(league);
-  if (!settings.sportsbook_auto_lines_enabled) return { created: 0 };
+  if (!settings.sportsbook_auto_lines_enabled) {
+    console.log('[PLAYER PROP GEN 7J-13PROP] sportsbook_auto_lines_enabled is false — skipping entirely.');
+    return { created: 0 };
+  }
 
   // week_label (games schedule) and week_index (player weekly stats) are two
   // separate EA sync streams with no guaranteed shared numbering — rather than
@@ -59505,7 +59508,11 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
     [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [{ max_week: 0 }] }));
   const weekIndex = Number(maxWeekResult.rows[0]?.max_week || 0) + 1;
-  if (weekIndex <= 1) return { created: 0 }; // No prior-week stats synced yet — nothing to project off of.
+  console.log('[PLAYER PROP GEN 7J-13PROP] weekLabel: ' + weekLabel + ', derived weekIndex: ' + weekIndex);
+  if (weekIndex <= 1) {
+    console.log('[PLAYER PROP GEN 7J-13PROP] weekIndex <= 1 — no prior-week stats synced yet, skipping entirely.');
+    return { created: 0 }; // No prior-week stats synced yet — nothing to project off of.
+  }
 
   const games = await pool.query(
     `SELECT * FROM madden_imported_games
@@ -59513,6 +59520,8 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
        AND LOWER(week_label) = LOWER($3) AND is_user_vs_user = TRUE`,
     [guild.id, String(league.league_id), weekLabel]
   ).catch(() => ({ rows: [] }));
+  console.log('[PLAYER PROP GEN 7J-13PROP] user-vs-user games found for ' + weekLabel + ': ' + (games.rows?.length || 0)
+    + (games.rows?.length ? ' (' + games.rows.map(g => `${g.away_team}@${g.home_team}`).join(', ') + ')' : ''));
 
   let created = 0;
   for (const game of games.rows || []) {
@@ -59520,9 +59529,15 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
       for (const { positions, statKey, roundTo } of MADDEN_PROP_POSITION_STATS) {
         const statConfig = SPORTSBOOK_PROP_STAT_TYPES[statKey];
         const candidate = await findMaddenPropCandidate(guild.id, league.league_id, team, positions, statConfig.statType, statConfig.field, weekIndex);
-        if (!candidate) continue;
+        if (!candidate) {
+          console.log('[PLAYER PROP GEN 7J-13PROP] ' + team + ' ' + statKey + ' (' + positions.join('/') + '): no candidate found — skipping.');
+          continue;
+        }
         const playerRef = candidate.roster_id || candidate.presentation_id;
-        if (!playerRef) continue;
+        if (!playerRef) {
+          console.log('[PLAYER PROP GEN 7J-13PROP] ' + team + ' ' + statKey + ': candidate ' + (candidate.full_name || '?') + ' has no roster_id/presentation_id — skipping.');
+          continue;
+        }
 
         const existing = await pool.query(
           `SELECT id FROM sportsbook_games
@@ -59530,11 +59545,17 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
              AND subject_ref = $3 AND stat_key = $4 AND prop_week_index = $5`,
           [guild.id, league.league_id, playerRef, statKey, weekIndex]
         ).catch(() => ({ rows: [] }));
-        if (existing.rows.length) continue;
+        if (existing.rows.length) {
+          console.log('[PLAYER PROP GEN 7J-13PROP] ' + team + ' ' + statKey + ': ' + candidate.full_name + ' already has an open line for week ' + weekIndex + ' — skipping.');
+          continue;
+        }
 
         const history = await getMaddenPlayerStatHistory(guild.id, league.league_id, playerRef, statConfig.statType, statConfig.field, weekIndex);
         const threshold = projectMaddenStatLine(history, roundTo);
-        if (threshold === null) continue; // Not enough game history to project responsibly — skip, don't guess.
+        if (threshold === null) {
+          console.log('[PLAYER PROP GEN 7J-13PROP] ' + team + ' ' + statKey + ': ' + candidate.full_name + ' has ' + (history?.length || 0) + ' game(s) of history — not enough to project, skipping.');
+          continue; // Not enough game history to project responsibly — skip, don't guess.
+        }
 
         const displayName = candidate.full_name || 'Unknown Player';
         const statLine = `${displayName} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
@@ -59555,6 +59576,7 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
       }
     }
   }
+  console.log('[PLAYER PROP GEN 7J-13PROP] Done — created: ' + created + ' for ' + weekLabel + ' (weekIndex ' + weekIndex + ')');
   return { created };
 }
 
