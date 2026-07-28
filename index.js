@@ -10659,6 +10659,14 @@ if (interaction.commandName === 'avatar') {
           components: [buildSportsbookSideButtons(sportsbookGame)],
         });
         console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] editReply (side buttons) succeeded.');
+        // 7J-21RESET: the reply above is a brand-new ephemeral message, not an
+        // update to the board's own message — so Discord's client keeps
+        // showing the just-picked option as "selected" (checkmark) on the
+        // board's dropdown indefinitely, and won't re-fire the interaction for
+        // picking the same option again until that message's component
+        // actually gets refreshed. Refresh it here so the dropdown resets and
+        // stays usable for repeat bets on the same game.
+        await updateSportsbookPanel(interaction.guild).catch(() => null);
       } catch (err) {
         console.error('[SPORTSBOOK PICK GAME 7J-16TRACE] Threw: ' + (err?.stack || err?.message || err));
       }
