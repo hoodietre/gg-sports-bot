@@ -8934,7 +8934,7 @@ if (interaction.commandName === 'avatar') {
         .setTitle('Edit Global Currency Identity')
         .addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Currency name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40).setValue(currencyConfigCache.currency_name)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('icon').setLabel('Currency icon/emoji').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(16).setValue(currencyConfigCache.currency_icon)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('icon').setLabel('Currency icon/emoji').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60).setValue(currencyConfigCache.currency_icon).setPlaceholder('e.g. 💰 or a custom emoji like <:coin:1234567890123456789>')),
         );
       await interaction.showModal(modal);
       return;
@@ -8946,7 +8946,7 @@ if (interaction.commandName === 'avatar') {
       const icon = interaction.fields.getTextInputValue('icon').trim();
 
       if (!name || name.length > 40) { await interaction.reply({ content: 'Currency name must be 1-40 characters.', flags: MessageFlags.Ephemeral }); return; }
-      if (!icon || icon.length > 16) { await interaction.reply({ content: 'Currency icon must be 1-16 characters.', flags: MessageFlags.Ephemeral }); return; }
+      if (!icon || icon.length > 60) { await interaction.reply({ content: 'Currency icon must be 1-60 characters.', flags: MessageFlags.Ephemeral }); return; }
 
       await pool.query(
         `UPDATE system_currency_config SET currency_name = $1, currency_icon = $2, updated_at = NOW(), updated_by_user_id = $3 WHERE id = 1`,
@@ -9062,13 +9062,26 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_removeitem') {
       if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id IS NULL AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`);
-      if (!items.rows.length) { await interaction.reply({ content: 'No active universal shop items to remove.', flags: MessageFlags.Ephemeral }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId('botownerpanel_removeitem_select')
-        .setPlaceholder('Choose a universal item to remove')
-        .addOptions(items.rows.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: `Price: ${item.price}`.slice(0, 100) })));
-      await interaction.reply({ content: '**Remove Universal Shop Item**', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
+      await renderPaginatedOwnerItemMenu(interaction, {
+        page: 0, isPageNav: false,
+        selectCustomId: 'botownerpanel_removeitem_select', pageCustomIdPrefix: 'botownerpanel_removeitem_page',
+        placeholder: 'Choose a universal item to remove', headerText: '**Remove Universal Shop Item**',
+        emptyText: 'No active universal shop items to remove.',
+        describeItem: item => `Price: ${item.price}`,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('botownerpanel_removeitem_page:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const page = Number.parseInt(interaction.customId.split(':')[1], 10) || 0;
+      await renderPaginatedOwnerItemMenu(interaction, {
+        page, isPageNav: true,
+        selectCustomId: 'botownerpanel_removeitem_select', pageCustomIdPrefix: 'botownerpanel_removeitem_page',
+        placeholder: 'Choose a universal item to remove', headerText: '**Remove Universal Shop Item**',
+        emptyText: 'No active universal shop items to remove.',
+        describeItem: item => `Price: ${item.price}`,
+      });
       return;
     }
 
@@ -9086,13 +9099,28 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId === 'botownerpanel_edititem') {
       if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id IS NULL AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`);
-      if (!items.rows.length) { await interaction.reply({ content: 'No active universal shop items to edit.', flags: MessageFlags.Ephemeral }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId('botownerpanel_edititem_select')
-        .setPlaceholder('Choose a universal item to edit')
-        .addOptions(items.rows.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: `Price: ${item.price}`.slice(0, 100) })));
-      await interaction.reply({ content: '**Edit Universal Shop Item** — for cosmetics you\'ll get a choice of which fields to edit (core / cosmetic details / slot-specific); other items go straight to core fields.', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
+      await renderPaginatedOwnerItemMenu(interaction, {
+        page: 0, isPageNav: false,
+        selectCustomId: 'botownerpanel_edititem_select', pageCustomIdPrefix: 'botownerpanel_edititem_page',
+        placeholder: 'Choose a universal item to edit',
+        headerText: '**Edit Universal Shop Item** — for cosmetics you\'ll get a choice of which fields to edit (core / cosmetic details / slot-specific); other items go straight to core fields.',
+        emptyText: 'No active universal shop items to edit.',
+        describeItem: item => `Price: ${item.price}`,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('botownerpanel_edititem_page:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const page = Number.parseInt(interaction.customId.split(':')[1], 10) || 0;
+      await renderPaginatedOwnerItemMenu(interaction, {
+        page, isPageNav: true,
+        selectCustomId: 'botownerpanel_edititem_select', pageCustomIdPrefix: 'botownerpanel_edititem_page',
+        placeholder: 'Choose a universal item to edit',
+        headerText: '**Edit Universal Shop Item** — for cosmetics you\'ll get a choice of which fields to edit (core / cosmetic details / slot-specific); other items go straight to core fields.',
+        emptyText: 'No active universal shop items to edit.',
+        describeItem: item => `Price: ${item.price}`,
+      });
       return;
     }
 
@@ -9257,17 +9285,26 @@ if (interaction.commandName === 'avatar') {
     // ---- Owner Panel: Manage Sales (universal items) ----
     if (interaction.isButton() && interaction.customId === 'botownerpanel_managesales') {
       if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
-      const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id IS NULL AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`);
-      if (!items.rows.length) { await interaction.reply({ content: 'No active universal shop items to put on sale.', flags: MessageFlags.Ephemeral }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId('botownerpanel_managesales_select')
-        .setPlaceholder('Choose an item to manage its sale')
-        .addOptions(items.rows.map(item => ({
-          label: item.item_name.slice(0, 100),
-          value: item.id.slice(0, 100),
-          description: (item.sale_price !== null ? `On sale: ${item.sale_price} (was ${item.price})` : `Price: ${item.price}`).slice(0, 100),
-        })));
-      await interaction.reply({ content: '**Manage Sales** — choose an item', components: [new ActionRowBuilder().addComponents(menu)], flags: MessageFlags.Ephemeral });
+      await renderPaginatedOwnerItemMenu(interaction, {
+        page: 0, isPageNav: false,
+        selectCustomId: 'botownerpanel_managesales_select', pageCustomIdPrefix: 'botownerpanel_managesales_page',
+        placeholder: 'Choose an item to manage its sale', headerText: '**Manage Sales** — choose an item',
+        emptyText: 'No active universal shop items to put on sale.',
+        describeItem: item => item.sale_price !== null ? `On sale: ${item.sale_price} (was ${item.price})` : `Price: ${item.price}`,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('botownerpanel_managesales_page:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const page = Number.parseInt(interaction.customId.split(':')[1], 10) || 0;
+      await renderPaginatedOwnerItemMenu(interaction, {
+        page, isPageNav: true,
+        selectCustomId: 'botownerpanel_managesales_select', pageCustomIdPrefix: 'botownerpanel_managesales_page',
+        placeholder: 'Choose an item to manage its sale', headerText: '**Manage Sales** — choose an item',
+        emptyText: 'No active universal shop items to put on sale.',
+        describeItem: item => item.sale_price !== null ? `On sale: ${item.sale_price} (was ${item.price})` : `Price: ${item.price}`,
+      });
       return;
     }
 
@@ -13791,7 +13828,9 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId.startsWith('adminpanel_shop:')) {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
-      const action = interaction.customId.split(':')[1];
+      const [, action, pageStr] = interaction.customId.split(':');
+      const page = Number.parseInt(pageStr, 10) || 0;
+      const isPageNav = pageStr !== undefined;
 
       if (action === 'create') {
         const modal = new ModalBuilder()
@@ -13811,30 +13850,26 @@ if (interaction.commandName === 'avatar') {
         // Scoped to items this admin personally created for this server — universal
         // (bot-owner) items and other admins' items never show up here, so there's
         // nothing to select-and-delete outside what's actually theirs to remove.
-        const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id = $1 AND created_by_user_id = $2 AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`, [interaction.guild.id, interaction.user.id]);
-        if (!items.rows.length) { await interaction.reply({ content: 'No active shop items to remove. You can only remove items you personally created for this server.', ephemeral: true }); return; }
-        const menu = new StringSelectMenuBuilder()
-          .setCustomId('adminpanel_shop_remove_select')
-          .setPlaceholder('Choose an item to remove')
-          .addOptions(items.rows.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: `Price: ${item.price}`.slice(0, 100) })));
-        await interaction.reply({ content: '**Remove Shop Item**', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+        await renderPaginatedAdminItemMenu(interaction, {
+          page, isPageNav, guildId: interaction.guild.id, userId: interaction.user.id,
+          selectCustomId: 'adminpanel_shop_remove_select', pageCustomIdPrefix: 'adminpanel_shop:remove',
+          placeholder: 'Choose an item to remove', headerText: '**Remove Shop Item**',
+          emptyText: 'No active shop items to remove. You can only remove items you personally created for this server.',
+          describeItem: item => `Price: ${item.price}`,
+        });
         return;
       }
       if (action === 'sales') {
         // Same scoping as remove — admins can only manage sales on items they
         // personally created for this server, never universal (bot-owner) items or
         // other admins' items.
-        const items = await pool.query(`SELECT * FROM shop_items WHERE guild_id = $1 AND created_by_user_id = $2 AND is_active = TRUE ORDER BY item_name ASC LIMIT 25`, [interaction.guild.id, interaction.user.id]);
-        if (!items.rows.length) { await interaction.reply({ content: 'No active shop items to put on sale. You can only manage sales on items you personally created for this server.', ephemeral: true }); return; }
-        const menu = new StringSelectMenuBuilder()
-          .setCustomId('adminpanel_shop_sales_select')
-          .setPlaceholder('Choose an item to manage its sale')
-          .addOptions(items.rows.map(item => ({
-            label: item.item_name.slice(0, 100),
-            value: item.id.slice(0, 100),
-            description: (item.sale_price !== null ? `On sale: ${item.sale_price} (was ${item.price})` : `Price: ${item.price}`).slice(0, 100),
-          })));
-        await interaction.reply({ content: '**Manage Sales**', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+        await renderPaginatedAdminItemMenu(interaction, {
+          page, isPageNav, guildId: interaction.guild.id, userId: interaction.user.id,
+          selectCustomId: 'adminpanel_shop_sales_select', pageCustomIdPrefix: 'adminpanel_shop:sales',
+          placeholder: 'Choose an item to manage its sale', headerText: '**Manage Sales**',
+          emptyText: 'No active shop items to put on sale. You can only manage sales on items you personally created for this server.',
+          describeItem: item => item.sale_price !== null ? `On sale: ${item.sale_price} (was ${item.price})` : `Price: ${item.price}`,
+        });
         return;
       }
       return;
@@ -58623,6 +58658,70 @@ function buildBotOwnerPanelBackRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('botownerpanel_back').setLabel('⬅ Back to Panel').setStyle(ButtonStyle.Secondary)
   );
+}
+
+// 7J-23PAGE: shop-item select menus (remove/edit/manage-sales) had a hard
+// LIMIT 25 with no way to reach anything past it — confirmed a real, active
+// bug (Hxxdie noticed items missing from these dropdowns once the catalog grew
+// past 25 active universal items). Fetches one extra row past the page size to
+// know whether a "Next" page actually exists, without a separate COUNT query.
+function buildShopItemPaginationRow(customIdPrefix, page, hasMore) {
+  const row = new ActionRowBuilder();
+  if (page > 0) row.addComponents(new ButtonBuilder().setCustomId(`${customIdPrefix}:${page - 1}`).setLabel('◀ Previous').setStyle(ButtonStyle.Secondary));
+  if (hasMore) row.addComponents(new ButtonBuilder().setCustomId(`${customIdPrefix}:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary));
+  return row.components.length ? row : null;
+}
+
+async function renderPaginatedOwnerItemMenu(interaction, { page, isPageNav, selectCustomId, pageCustomIdPrefix, placeholder, headerText, emptyText, describeItem }) {
+  const pageSize = 25;
+  const items = await pool.query(
+    `SELECT * FROM shop_items WHERE guild_id IS NULL AND is_active = TRUE ORDER BY item_name ASC LIMIT $1 OFFSET $2`,
+    [pageSize + 1, page * pageSize]
+  );
+  const hasMore = items.rows.length > pageSize;
+  const pageItems = items.rows.slice(0, pageSize);
+  if (!pageItems.length) {
+    const content = page === 0 ? emptyText : 'No more items on this page.';
+    if (isPageNav) await interaction.update({ content, components: [] });
+    else await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(selectCustomId)
+    .setPlaceholder(placeholder)
+    .addOptions(pageItems.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: describeItem(item).slice(0, 100) })));
+  const rows = [new ActionRowBuilder().addComponents(menu)];
+  const pagRow = buildShopItemPaginationRow(pageCustomIdPrefix, page, hasMore);
+  if (pagRow) rows.push(pagRow);
+  const content = `${headerText}${page > 0 ? ` — page ${page + 1}` : ''}`;
+  if (isPageNav) await interaction.update({ content, components: rows });
+  else await interaction.reply({ content, components: rows, flags: MessageFlags.Ephemeral });
+}
+
+async function renderPaginatedAdminItemMenu(interaction, { page, isPageNav, guildId, userId, selectCustomId, pageCustomIdPrefix, placeholder, headerText, emptyText, describeItem }) {
+  const pageSize = 25;
+  const items = await pool.query(
+    `SELECT * FROM shop_items WHERE guild_id = $1 AND created_by_user_id = $2 AND is_active = TRUE ORDER BY item_name ASC LIMIT $3 OFFSET $4`,
+    [guildId, userId, pageSize + 1, page * pageSize]
+  );
+  const hasMore = items.rows.length > pageSize;
+  const pageItems = items.rows.slice(0, pageSize);
+  if (!pageItems.length) {
+    const content = page === 0 ? emptyText : 'No more items on this page.';
+    if (isPageNav) await interaction.update({ content, components: [] });
+    else await interaction.reply({ content, ephemeral: true });
+    return;
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(selectCustomId)
+    .setPlaceholder(placeholder)
+    .addOptions(pageItems.map(item => ({ label: item.item_name.slice(0, 100), value: item.id.slice(0, 100), description: describeItem(item).slice(0, 100) })));
+  const rows = [new ActionRowBuilder().addComponents(menu)];
+  const pagRow = buildShopItemPaginationRow(pageCustomIdPrefix, page, hasMore);
+  if (pagRow) rows.push(pagRow);
+  const content = `${headerText}${page > 0 ? ` — page ${page + 1}` : ''}`;
+  if (isPageNav) await interaction.update({ content, components: rows });
+  else await interaction.reply({ content, components: rows, ephemeral: true });
 }
 
 async function showBotOwnerPanelHome(interaction, { update = true } = {}) {
