@@ -59572,7 +59572,7 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
         const displayName = candidate.full_name || 'Unknown Player';
         const statLine = `${displayName} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
         const sportsbookGameId = randomUUID();
-        await pool.query(
+        const insertResult = await pool.query(
           `INSERT INTO sportsbook_games
             (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds,
              created_by_user_id, bet_type, subject_type, subject_ref, subject_display_name,
@@ -59584,11 +59584,23 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
           console.error('[MADDEN PROP AUTO] Failed to create prop:', err?.message || err);
           return null;
         });
-        created += 1;
+        // 7J-14REF: only counts as created if the insert actually returned a
+        // row — was incrementing unconditionally before, which would have made
+        // this log lie about a real insert failure exactly like the one this
+        // round was chasing (turned out not to be the case here, but the log
+        // shouldn't have been able to mislead on that point either way).
+        if (insertResult) created += 1;
       }
     }
   }
   console.log('[PLAYER PROP GEN 7J-13PROP] Done — created: ' + created + ' for ' + weekLabel + ' (weekIndex ' + weekIndex + ')');
+  // 7J-14REF: props were inserting correctly into sportsbook_games the whole
+  // time (confirmed directly via DB query — all showed status = 'open') but the
+  // board never re-rendered to show them. autoCreateMaddenSportsbookLines (the
+  // moneyline equivalent of this function) always refreshes the panel after
+  // creating a line; this function never did. That's the entire bug — nothing
+  // wrong with candidate matching or the insert itself.
+  if (created > 0) await updateSportsbookPanel(guild).catch(() => null);
   return { created };
 }
 
