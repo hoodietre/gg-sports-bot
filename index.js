@@ -11233,14 +11233,14 @@ if (interaction.commandName === 'avatar') {
 
       if (action === 'txn_preview') {
         await interaction.deferUpdate();
-        const embed = await buildMaddenTransactionsScanEmbed(interaction.guild.id, league, false);
+        const embed = await buildMaddenTransactionsScanEmbed(interaction.guild, league, false);
         await interaction.editReply({ embeds: [embed], components: [buildCommissionerBackRow(leagueId)] });
         return;
       }
 
       if (action === 'txn_confirm') {
         await interaction.deferUpdate();
-        const embed = await buildMaddenTransactionsScanEmbed(interaction.guild.id, league, true);
+        const embed = await buildMaddenTransactionsScanEmbed(interaction.guild, league, true);
         await interaction.editReply({ embeds: [embed], components: [buildCommissionerBackRow(leagueId)] });
         return;
       }
