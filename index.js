@@ -51116,21 +51116,35 @@ async function buildMaddenRosterImportHints(context, guild, league) {
   }
 
   try {
+    // 7J-36FIX: root cause of the phantom Bills/Titans (and Jets/Saints)
+    // team-swap bug. This used to be `SELECT DISTINCT team_id, team_name` —
+    // if the same team_id was EVER associated with two different team_name
+    // strings across history (including from this exact bug corrupting a
+    // prior sync), DISTINCT returned both as separate rows, both survived
+    // into the hint list under different listIndex values, and the bot would
+    // fetch the same team's roster twice in one sync under two different
+    // names — the later one silently overwriting the correct one. Confirmed
+    // directly: teamId 775553055 hinted as "Jets" (matched stored data, zero
+    // mismatches) then, six seconds later in the same sync, hinted as
+    // "Saints" (100% mismatch against the exact same players). Fixed to
+    // return exactly one team_name per team_id: prefer
+    // madden_imported_team_stats (the authoritative teams-export table, keyed
+    // directly off EA's own external_team_id) over madden_player_weekly_stats
+    // (a more indirect, previously-known-unreliable source — see the 7J-13TEAM
+    // note elsewhere about that table's team_name gaps), and take the most
+    // recently imported row when only the latter is available.
     const result = await pool.query(
-      `SELECT DISTINCT
-         COALESCE(NULLIF(team_id, ''), NULLIF(external_team_id, '')) AS team_id,
-         COALESCE(NULLIF(team_name, ''), NULLIF(canonical_name, ''), NULLIF(display_name, '')) AS team_name
+      `SELECT DISTINCT ON (team_id) team_id, team_name
        FROM (
-         SELECT team_id, NULL::text AS external_team_id, team_name, NULL::text AS canonical_name, NULL::text AS display_name
-         FROM madden_player_weekly_stats
-         WHERE guild_id = $1 AND league_id = $2
-         UNION ALL
-         SELECT NULL::text AS team_id, external_team_id, team_name, NULL::text AS canonical_name, NULL::text AS display_name
+         SELECT external_team_id AS team_id, team_name, 1 AS priority, imported_at AS ts
          FROM madden_imported_team_stats
-         WHERE guild_id = $1 AND league_id::text = $2::text
+         WHERE guild_id = $1 AND league_id::text = $2::text AND external_team_id IS NOT NULL AND team_name IS NOT NULL
+         UNION ALL
+         SELECT team_id, team_name, 2 AS priority, imported_at AS ts
+         FROM madden_player_weekly_stats
+         WHERE guild_id = $1 AND league_id = $2 AND team_id IS NOT NULL AND team_name IS NOT NULL
        ) src
-       WHERE COALESCE(NULLIF(team_id, ''), NULLIF(external_team_id, '')) IS NOT NULL
-       ORDER BY team_name NULLS LAST, team_id`,
+       ORDER BY team_id, priority ASC, ts DESC`,
       [guild.id, league.league_id]
     );
 
@@ -51158,7 +51172,23 @@ async function buildMaddenRosterImportHints(context, guild, league) {
     add(hint.teamId, index, hint.teamName, 'generic-index-remap');
   }
 
-  return hints;
+  // 7J-36FIX: defense in depth. Even with the query fixed above, dedupe the
+  // final hint list by teamId alone (not listIndex:teamId) so the same team
+  // can never be requested twice under two different names in one sync,
+  // regardless of which source produced the conflict. Sources are added in
+  // trust order (live standings/teams data first, then the now-fixed
+  // db-team-seed, then generic-index-remap as a last resort), so keeping the
+  // first occurrence per teamId keeps the most trustworthy one.
+  const dedupedHints = [];
+  const finalSeenTeamIds = new Set();
+  for (const hint of hints) {
+    const key = String(hint.teamId);
+    if (finalSeenTeamIds.has(key)) continue;
+    finalSeenTeamIds.add(key);
+    dedupedHints.push(hint);
+  }
+
+  return dedupedHints;
 }
 
 async function probeOneMaddenTeamRosterExport(context, hint = null) {
