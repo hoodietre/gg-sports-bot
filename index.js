@@ -29853,7 +29853,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'active_check_channel', label: 'Active Check Channel', description: 'Where Active Check posts go by default', kind: 'channel' },
   { value: 'draft_recap_channel', label: 'Draft Recap Channel', description: 'Madden: auto-posts here when the league advances past the draft', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
-  { value: 'madden_weekly_updates_channel', label: 'Weekly Updates Channel', description: 'Batched, per-team roster/transaction/injury summaries — separate from News so routine churn doesn\'t flood it', kind: 'channel' },
+  { value: 'madden_weekly_updates_channel', label: 'Weekly Updates Channel', description: 'Batched roster/transaction/injury summaries, separate from News', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
   { value: 'madden_sportsbook_channel', label: 'Madden Sportsbook Channel', description: 'Channel for Madden betting lines (user vs user games)', kind: 'channel' },
