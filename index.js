@@ -40466,6 +40466,26 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
       metadata: { injury: newInjury, return_weeks: maddenRawValueFromPayload(nextRaw, ['injuryLength', 'injury_length', 'weeksOut', 'weeks_out']) || null },
       summary: `${playerName} is now injured: ${newInjury}.`,
     }));
+    // 7J-29STORY: injury escalation — a star player's injury is real news,
+    // not routine churn. Posted immediately here (same pattern as trade
+    // block drama) rather than routed through the batched Claude pipeline,
+    // since injuries get detected during roster import, a different point in
+    // the sync flow than that pipeline runs at. Still also included in the
+    // Weekly Updates digest via the normal changes accumulation above — this
+    // is an additional spotlight post, not a replacement for it.
+    if (Number(nextPlayer.overall) >= 85) {
+      await recordMaddenNewsEvent(guild, league, {
+        event_type: 'injury_report',
+        player_id: playerId,
+        player_name: playerName,
+        team_name: teamName,
+        metadata: {
+          injury: newInjury,
+          overall: nextPlayer.overall,
+          summary: `Tough break for ${maddenTeamDisplayName(teamName || '')}: **${playerName}** (${nextPlayer.overall} OVR) is now dealing with ${newInjury}.`,
+        },
+      }).catch(error => console.warn('[7J-10BY-A1 NEWS] injury report event failed:', error?.message || error));
+    }
   } else if (oldInjury && !newInjury) {
     changes.push(await recordMaddenChangeLogEvent(guild, league, {
       change_type: 'injury_recovered', player_id: playerId, player_name: playerName, team_name: teamName,
@@ -43160,6 +43180,41 @@ async function computeMaddenTeamStreak(guildId, leagueId, teamName) {
   return { type: mostRecent, count };
 }
 
+// 7J-29STORY: bounce-back / snapped streak — a team that just won after a
+// meaningful losing skid (3+), including a still-winless team picking up its
+// first win of the season. Reuses the identical game-history query as
+// computeMaddenTeamStreak (kept as its own copy rather than refactored to
+// share code, to avoid any risk of changing the already-verified original).
+async function checkMaddenStreakSnapped(guildId, leagueId, teamName) {
+  const result = await pool.query(
+    `SELECT week_label, home_team, away_team, status
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND status IN ('home_win', 'away_win', 'tie')
+       AND (home_team = $3 OR away_team = $3)`,
+    [guildId, String(leagueId), teamName]
+  ).catch(() => ({ rows: [] }));
+
+  const games = (result.rows || [])
+    .map(row => {
+      const isHome = row.home_team === teamName;
+      const outcome = row.status === 'tie' ? 'tie' : ((row.status === 'home_win') === isHome ? 'win' : 'loss');
+      return { sortValue: maddenWeekSortValue(row.week_label), result: outcome };
+    })
+    .sort((a, b) => b.sortValue - a.sortValue);
+
+  if (games.length < 2 || games[0].result !== 'win') return null;
+
+  let priorRunLength = 0;
+  for (let i = 1; i < games.length; i++) {
+    if (games[i].result === 'loss') priorRunLength += 1;
+    else break;
+  }
+  if (priorRunLength < 3) return null;
+  const isFirstWinEver = priorRunLength === games.length - 1;
+  return { priorRunLength, isFirstWinEver };
+}
+
 // Vague "leak" phrasing — mentions both teams, never player specifics, so it
 // feels like a real rumor rather than a formal trade announcement even though
 // offer_details/negotiation package data might have exact players available.
@@ -43192,6 +43247,51 @@ async function maybeGenerateMaddenTradeRumor(guild, league, senderTeam, targetTe
       summary: template(maddenTeamDisplayName(senderTeam), maddenTeamDisplayName(targetTeam)),
     },
   }).catch(() => null);
+}
+
+// 7J-26STORY: Game of the Week — picks the single best matchup from the
+// newly-created week's schedule using combined win percentage (both teams
+// playing well), with a small bump for real user-vs-user games since those
+// are more relevant to actual people in the Discord than two unowned CPU
+// teams. Dedup gated per week label so it's only ever selected once per week
+// even if the sync re-runs.
+async function selectMaddenGameOfTheWeek(guild, league, weekLabel) {
+  if (!guild || !league?.league_id || !weekLabel) return null;
+  const canPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'game_of_the_week', weekLabel, 'selected').catch(() => false);
+  if (!canPost) return null;
+
+  const games = await pool.query(
+    `SELECT g.home_team, g.away_team, g.is_user_vs_user,
+       COALESCE(hs.wins, 0) AS home_wins, COALESCE(hs.losses, 0) AS home_losses,
+       COALESCE(aws.wins, 0) AS away_wins, COALESCE(aws.losses, 0) AS away_losses
+     FROM madden_imported_games g
+     LEFT JOIN madden_imported_team_stats hs ON hs.guild_id = g.guild_id AND hs.league_id = g.league_id AND hs.team_name = g.home_team
+     LEFT JOIN madden_imported_team_stats aws ON aws.guild_id = g.guild_id AND aws.league_id = g.league_id AND aws.team_name = g.away_team
+     WHERE g.guild_id = $1 AND g.league_id::text = $2::text AND g.week_label = $3 AND g.status = 'scheduled'`,
+    [guild.id, String(league.league_id), weekLabel]
+  ).catch(() => ({ rows: [] }));
+  if (!games.rows?.length) return null;
+
+  let best = null;
+  let bestScore = -1;
+  for (const g of games.rows) {
+    const homeTotal = g.home_wins + g.home_losses;
+    const awayTotal = g.away_wins + g.away_losses;
+    const homeWinPct = homeTotal > 0 ? g.home_wins / homeTotal : 0.5;
+    const awayWinPct = awayTotal > 0 ? g.away_wins / awayTotal : 0.5;
+    const score = homeWinPct + awayWinPct + (g.is_user_vs_user ? 0.5 : 0);
+    if (score > bestScore) { bestScore = score; best = g; }
+  }
+  if (!best) return null;
+
+  return {
+    type: 'game_of_the_week',
+    homeTeam: best.home_team,
+    awayTeam: best.away_team,
+    homeRecord: `${best.home_wins}-${best.home_losses}`,
+    awayRecord: `${best.away_wins}-${best.away_losses}`,
+    isUserVsUser: !!best.is_user_vs_user,
+  };
 }
 
 async function postMaddenWeeklyUpdatesDigest(guild, league, items, { title, emoji = '📋', color = 0x5865F2, describeLine }) {
@@ -43260,6 +43360,7 @@ function maddenNewsEventTitle(eventType) {
   if (key === 'trade_block_removed') return '🔄 Trade Block Update';
   if (key === 'trade_committee_submitted') return '🤝 Trade Sent To Committee';
   if (key === 'trade_rumor') return '👀 Rumor Mill';
+  if (key === 'injury_report') return '🚑 Injury Report';
   if (key === 'trade_approved') return '✅ Trade Approved';
   if (key === 'trade_denied') return '❌ Trade Denied';
   if (key === 'injury_new') return '🏥 Injury Report';
@@ -60202,12 +60303,26 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   }
 
   // Big performance detection from weekly stats
-  const bigPerfs = await pool.query(
-    `SELECT ws.*, p.first_name, p.last_name, p.position, p.team_name
+  // 7J-28FIX: this query previously had no week_index filter at all — it
+  // matched ANY historical week's big performance, forever, meaning a
+  // player's Week 1 300-yard game would still match and re-post on every
+  // single sync through Week 15. Same class of bug as the streak-detection
+  // issue fixed two rounds ago (a feature that was never actually scoped to
+  // "recent," just never noticed). Scoped to the most recent week_index
+  // actually synced for this league, plus a dedup gate so a big game within
+  // that same week doesn't repeat across multiple syncs in the same week.
+  const latestWeekResult = await pool.query(
+    `SELECT COALESCE(MAX(week_index), 0) AS max_week FROM madden_player_weekly_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [{ max_week: 0 }] }));
+  const latestWeekIndex = Number(latestWeekResult.rows[0]?.max_week || 0);
+
+  const bigPerfs = latestWeekIndex > 0 ? await pool.query(
+    `SELECT ws.*, p.first_name, p.last_name, p.position, p.team_name, p.age
      FROM madden_player_weekly_stats ws
      LEFT JOIN madden_players p ON p.id = ws.player_key
        AND p.guild_id = ws.guild_id
-     WHERE ws.guild_id = $1 AND ws.league_id = $2
+     WHERE ws.guild_id = $1 AND ws.league_id = $2 AND ws.week_index = $3
        AND (
          (ws.stat_type = 'passing' AND (ws.raw_payload->>'passYds')::numeric > 300) OR
          (ws.stat_type = 'rushing' AND (ws.raw_payload->>'rushYds')::numeric > 125) OR
@@ -60217,19 +60332,49 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
          (ws.stat_type = 'receiving' AND (ws.raw_payload->>'recTDs')::numeric >= 2)
        )
      LIMIT 10`,
-    [guild.id, String(league.league_id)]
-  ).catch(() => ({ rows: [] }));
+    [guild.id, String(league.league_id), latestWeekIndex]
+  ).catch(() => ({ rows: [] })) : { rows: [] };
+
+  // Budding star watch — a young player (24 or under) having a big game gets
+  // flagged as its own story type, distinct from a routine veteran highlight.
+  const BUDDING_STAR_MAX_AGE = 24;
+
+  // 7J-29STORY: season-high / record-setting performance — checks whether a
+  // big performance is literally the best any player has posted in the
+  // league THIS season for that stat category, not just "a good game."
+  // Scoped to yardage stats only (passYds/rushYds/recYds) — TD-count
+  // triggers are already exciting without needing season context.
+  const YARDAGE_FIELD_BY_STAT_TYPE = { passing: 'passYds', rushing: 'rushYds', receiving: 'recYds' };
+  const seasonMaxByStatType = {};
+  for (const [statType, field] of Object.entries(YARDAGE_FIELD_BY_STAT_TYPE)) {
+    const maxResult = await pool.query(
+      `SELECT MAX((raw_payload->>$4)::numeric) AS max_val FROM madden_player_weekly_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3 AND week_index <= $5`,
+      [guild.id, String(league.league_id), statType, field, latestWeekIndex]
+    ).catch(() => ({ rows: [{ max_val: null }] }));
+    seasonMaxByStatType[statType] = Number(maxResult.rows[0]?.max_val) || 0;
+  }
 
   for (const perf of bigPerfs.rows || []) {
     const raw = perf.raw_payload || {};
     const name = [perf.first_name, perf.last_name].filter(Boolean).join(' ') || 'Unknown';
+    const dedupKey = `${name}|${perf.stat_type}|${latestWeekIndex}`;
+    const canPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'big_performance', dedupKey, 'posted').catch(() => true);
+    if (!canPost) continue;
+    const isBuddingStar = Number(perf.age) > 0 && Number(perf.age) <= BUDDING_STAR_MAX_AGE;
+    const yardageField = YARDAGE_FIELD_BY_STAT_TYPE[perf.stat_type];
+    const perfValue = yardageField ? Number(raw[yardageField]) || 0 : 0;
+    const isSeasonHigh = !!yardageField && perfValue > 0 && perfValue >= seasonMaxByStatType[perf.stat_type];
     events.push({
-      type: 'big_performance',
+      type: isSeasonHigh ? 'season_record' : (isBuddingStar ? 'budding_star' : 'big_performance'),
       playerName: name,
       team: perf.team_name,
       position: perf.position,
       statType: perf.stat_type,
       stats: raw,
+      age: perf.age || null,
+      isBuddingStar,
+      isSeasonHigh,
       teamEmoji: getMaddenTeamEmoji(perf.team_name),
     });
   }
@@ -60245,14 +60390,51 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   // (verified correct, most-recent-first per team) and a dedup gate so a
   // streak that's already been reported doesn't get reported again on every
   // subsequent sync while it holds — only when it crosses to a new milestone.
+  // 7J-26STORY: coach hot seat — composite of two signals already computed
+  // elsewhere in this function (losing skid + power ranking drop), not new
+  // detection. Queried separately here (rather than reordering the existing
+  // power_ranking_movers block below) to avoid any risk of disturbing that
+  // already-correct code's position/behavior.
+  const powerDropLookup = await pool.query(
+    `SELECT team_name, (previous_rank - rank) AS movement
+     FROM madden_power_rankings
+     WHERE league_id::text = $1::text AND previous_rank IS NOT NULL AND (previous_rank - rank) <= -3`,
+    [String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const powerDropByTeam = new Map((powerDropLookup.rows || []).map(r => [r.team_name, r.movement]));
+
   const streakTeamsResult = await pool.query(
-    `SELECT DISTINCT team_name FROM madden_franchises WHERE guild_id = $1 AND league_id = $2`,
+    `SELECT DISTINCT team_name, coach_name FROM madden_franchises WHERE guild_id = $1 AND league_id = $2`,
     [guild.id, league.league_id]
   ).catch(() => ({ rows: [] }));
-  for (const { team_name: teamName } of streakTeamsResult.rows || []) {
+  for (const { team_name: teamName, coach_name: coachName } of streakTeamsResult.rows || []) {
     if (!teamName) continue;
     const streak = await computeMaddenTeamStreak(guild.id, league.league_id, teamName);
-    if (!streak.type || streak.type === 'tie' || streak.count < 3) continue;
+    if (!streak.type || streak.type === 'tie') continue;
+
+    // 7J-29STORY: bounce-back / snapped streak needs to run when the CURRENT
+    // streak is just 1 game (a single win right after a skid) — the
+    // `streak.count < 3` check below would otherwise skip these teams
+    // entirely before this ever got a chance to run, so it has to happen
+    // before that continue, not after.
+    if (streak.type === 'win' && streak.count === 1) {
+      const snapped = await checkMaddenStreakSnapped(guild.id, league.league_id, teamName);
+      if (snapped) {
+        const snapKey = snapped.isFirstWinEver ? 'first_win' : `snapped_${snapped.priorRunLength}`;
+        const canPostSnap = await shouldPostMaddenStoryline(guild.id, league.league_id, 'bounce_back', teamName, snapKey).catch(() => false);
+        if (canPostSnap) {
+          events.push({
+            type: 'bounce_back',
+            team: teamName,
+            priorRunLength: snapped.priorRunLength,
+            isFirstWinEver: snapped.isFirstWinEver,
+            teamEmoji: getMaddenTeamEmoji(teamName),
+          });
+        }
+      }
+    }
+
+    if (streak.count < 3) continue;
     if (![3, 5, 7, 9, 11, 13, 15].includes(streak.count)) continue;
     const storyType = streak.type === 'win' ? 'hot_streak' : 'losing_skid';
     const canReport = await shouldPostMaddenStoryline(guild.id, league.league_id, storyType, teamName, streak.count).catch(() => false);
@@ -60264,6 +60446,106 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
       streakLen: streak.count,
       teamEmoji: getMaddenTeamEmoji(teamName),
     });
+
+    if (storyType === 'losing_skid' && powerDropByTeam.has(teamName)) {
+      const hotSeatCanPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'coach_hot_seat', teamName, streak.count).catch(() => false);
+      if (hotSeatCanPost) {
+        events.push({
+          type: 'coach_hot_seat',
+          team: teamName,
+          coachName: coachName || null,
+          streakLen: streak.count,
+          rankDrop: Math.abs(powerDropByTeam.get(teamName)),
+          teamEmoji: getMaddenTeamEmoji(teamName),
+        });
+      }
+    }
+  }
+
+  // 7J-29STORY: undefeated / winless watch — a "state of the league" angle,
+  // distinct from a generic streak post. Gated to week 4+ (maddenWeekSortValue)
+  // to skip trivial early-season noise where most teams are still 1-0/0-1,
+  // and dedup-gated per week so it only posts once even across repeat syncs.
+  if (maddenWeekSortValue(weekLabel) >= 4) {
+    const recordsResult = await pool.query(
+      `SELECT team_name, wins, losses FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+      [guild.id, String(league.league_id)]
+    ).catch(() => ({ rows: [] }));
+    const undefeated = (recordsResult.rows || []).filter(r => r.wins > 0 && r.losses === 0).map(r => r.team_name);
+    const winless = (recordsResult.rows || []).filter(r => r.losses > 0 && r.wins === 0).map(r => r.team_name);
+    if (undefeated.length || winless.length) {
+      const watchKey = [...undefeated, ...winless].sort().join(',');
+      const canPostWatch = await shouldPostMaddenStoryline(guild.id, league.league_id, 'undefeated_winless_watch', weekLabel, watchKey).catch(() => false);
+      if (canPostWatch) {
+        events.push({ type: 'undefeated_winless_watch', undefeated, winless });
+      }
+    }
+  }
+
+  // 7J-29STORY: division race — fires when the current division leader (best
+  // win%) changes from what was last reported. Explicitly checks whether a
+  // prior leader was ever recorded before treating it as news — otherwise the
+  // very first sync of the season would fire one post per division just for
+  // establishing the initial status quo, which isn't really a "race" story.
+  const divisionRecordsResult = await pool.query(
+    `SELECT team_name, wins, losses FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const byDivision = new Map();
+  for (const row of divisionRecordsResult.rows || []) {
+    const { division } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, row.team_name).catch(() => ({ division: null }));
+    if (!division) continue;
+    if (!byDivision.has(division)) byDivision.set(division, []);
+    byDivision.get(division).push(row);
+  }
+  for (const [division, teams] of byDivision) {
+    if (teams.length < 2) continue;
+    let leader = null;
+    let bestPct = -1;
+    for (const t of teams) {
+      const total = t.wins + t.losses;
+      const pct = total > 0 ? t.wins / total : 0;
+      if (pct > bestPct) { bestPct = pct; leader = t; }
+    }
+    if (!leader) continue;
+    const existingLeader = await pool.query(
+      `SELECT last_value FROM madden_storyline_posts WHERE guild_id = $1 AND league_id::text = $2::text AND story_type = 'division_leader' AND subject_key = $3`,
+      [guild.id, String(league.league_id), division]
+    ).catch(() => ({ rows: [] }));
+    const hadPriorLeader = existingLeader.rows.length > 0;
+    const changed = await shouldPostMaddenStoryline(guild.id, league.league_id, 'division_leader', division, leader.team_name).catch(() => false);
+    if (changed && hadPriorLeader) {
+      events.push({ type: 'division_race', division, leader: leader.team_name, record: `${leader.wins}-${leader.losses}` });
+    }
+  }
+
+  // 7J-29STORY: playoff picture update — an ongoing storyline for the back
+  // half of the season (fixed week-8 threshold rather than dynamically
+  // computed against season length, to keep this simple), distinct from the
+  // still-deferred "missed playoffs" trigger, which fires once at season
+  // end. Dedup-gated to post at most once per week.
+  if (maddenWeekSortValue(weekLabel) >= 8) {
+    const canPostPicture = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_picture', weekLabel, 'posted').catch(() => false);
+    if (canPostPicture) {
+      const allTeamsResult = await pool.query(
+        `SELECT team_name, wins, losses FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+        [guild.id, String(league.league_id)]
+      ).catch(() => ({ rows: [] }));
+      const ranked = (allTeamsResult.rows || [])
+        .map(t => ({ team: t.team_name, wins: t.wins, losses: t.losses, pct: (t.wins + t.losses) > 0 ? t.wins / (t.wins + t.losses) : 0 }))
+        .sort((a, b) => b.pct - a.pct || b.wins - a.wins);
+      const playoffCount = Number(league.playoff_team_count || 8);
+      if (ranked.length > playoffCount) {
+        const lastIn = ranked[playoffCount - 1];
+        const firstOut = ranked[playoffCount];
+        events.push({
+          type: 'playoff_picture',
+          inTeams: ranked.slice(0, playoffCount).map(r => r.team),
+          lastIn: lastIn ? { team: lastIn.team, record: `${lastIn.wins}-${lastIn.losses}` } : null,
+          firstOut: firstOut ? { team: firstOut.team, record: `${firstOut.wins}-${firstOut.losses}` } : null,
+        });
+      }
+    }
   }
 
   // Award race leaders
@@ -60340,16 +60622,27 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
   // Build structured event summary for Claude
   const gameResults = events.filter(e => e.type === 'game_result');
   const bigPerfs   = events.filter(e => e.type === 'big_performance');
+  const buddingStars = events.filter(e => e.type === 'budding_star');
+  const seasonRecords = events.filter(e => e.type === 'season_record');
   const streaks    = events.filter(e => e.type === 'streak');
+  const bounceBacks = events.filter(e => e.type === 'bounce_back');
   const movers     = events.find(e => e.type === 'power_ranking_movers');
   const awards     = events.find(e => e.type === 'award_race');
   const majorMoves = events.filter(e => e.type === 'major_movement');
+  const gotw       = events.find(e => e.type === 'game_of_the_week');
+  const hotSeats   = events.filter(e => e.type === 'coach_hot_seat');
+  const undefeatedWatch = events.find(e => e.type === 'undefeated_winless_watch');
+  const divisionRaces = events.filter(e => e.type === 'division_race');
+  const playoffPicture = events.find(e => e.type === 'playoff_picture');
 
-  if (!gameResults.length && !bigPerfs.length && !streaks.length && !movers && !awards && !majorMoves.length) return;
+  const hasAnyEvent = gameResults.length || bigPerfs.length || streaks.length || movers || awards
+    || majorMoves.length || buddingStars.length || gotw || hotSeats.length || seasonRecords.length
+    || bounceBacks.length || undefeatedWatch || divisionRaces.length || playoffPicture;
+  if (!hasAnyEvent) return;
 
   let newsItems = [];
 
-  if (useClaudeApi && (gameResults.length || bigPerfs.length || streaks.length || majorMoves.length)) {
+  if (useClaudeApi && hasAnyEvent) {
     try {
       const context = {
         leagueName: league.league_name,
@@ -60380,6 +60673,49 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
           overall: m.overall,
           position: m.position,
         })),
+        buddingStarWatch: buddingStars.slice(0, 3).map(b => ({
+          player: b.playerName,
+          team: b.team,
+          position: b.position,
+          age: b.age,
+          statType: b.statType,
+          stats: b.stats,
+        })),
+        gameOfTheWeek: gotw ? {
+          matchup: `${gotw.awayTeam} (${gotw.awayRecord}) @ ${gotw.homeTeam} (${gotw.homeRecord})`,
+          isUserVsUser: gotw.isUserVsUser,
+        } : null,
+        coachHotSeat: hotSeats.slice(0, 2).map(h => ({
+          team: h.team,
+          coach: h.coachName,
+          losingStreak: h.streakLen,
+          powerRankingDrop: h.rankDrop,
+        })),
+        seasonHighPerformances: seasonRecords.slice(0, 2).map(p => ({
+          player: p.playerName,
+          team: p.team,
+          position: p.position,
+          statType: p.statType,
+          stats: p.stats,
+        })),
+        bounceBackWins: bounceBacks.slice(0, 3).map(b => ({
+          team: b.team,
+          priorLosingStreak: b.priorRunLength,
+          isFirstWinOfSeason: b.isFirstWinEver,
+        })),
+        undefeatedWinlessWatch: undefeatedWatch ? {
+          undefeated: undefeatedWatch.undefeated,
+          winless: undefeatedWatch.winless,
+        } : null,
+        divisionRaces: divisionRaces.slice(0, 3).map(d => ({
+          division: d.division,
+          newLeader: d.leader,
+          record: d.record,
+        })),
+        playoffPicture: playoffPicture ? {
+          lastTeamIn: playoffPicture.lastIn,
+          firstTeamOut: playoffPicture.firstOut,
+        } : null,
       };
 
       const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -60395,6 +60731,14 @@ Rules:
 - Vary your angles: underdog stories, dominant performances, individual highlights, team narratives, streaks, big roster moves.
 - For team narratives on a losing streak or a team sliding in the power rankings, lean into real "team drama" framing — concern, pressure, fans losing patience — not just a neutral stat report.
 - Major roster movements (majorRosterMovements) are genuinely big news — a star player signed, released, or traded. Write these with real weight, like a real trade/signing reaction piece, not a routine transaction log entry.
+- buddingStarWatch entries are young players (24 or under) putting up big numbers — frame these as "one to watch" / breakout-potential stories, genuinely excited about a player's future, not just a stat line.
+- gameOfTheWeek, if present, should always be included as one of the items — write it as a genuine preview/hype piece for the marquee matchup of the upcoming week, not a past result.
+- coachHotSeat entries are teams struggling on multiple fronts at once (a real losing streak AND a real power-rankings slide happening together) — this is the most serious drama angle available. Write it like real "is the seat getting hot" sports-radio speculation, naming the coach if given, but don't invent anything not in the data.
+- seasonHighPerformances are the single best game any player has posted in the league THIS season for that stat, not just a good game — write these with extra weight, like a real "best performance of the year (so far)" piece.
+- bounceBackWins are teams that just snapped a real losing streak (or a still-winless team's first win) — genuine feel-good redemption stories, warm and triumphant in tone, the opposite of the drama framing used for skids.
+- undefeatedWinlessWatch is a "state of the league" angle — write about which team(s) remain perfect or still winless, especially compelling if there's only one of either.
+- divisionRaces fire when a division's first-place team changes hands — real "there's a new team atop the division" news.
+- playoffPicture, if present, should cover who's in and who's right on the bubble — real "playoff race" content, mentioning both the last team in and first team out by name.
 - Never use the same sentence structure twice. Mix tones: hype, surprise, concern, admiration.
 - Sound like a real ESPN writer, not a bot. Use sports vernacular naturally.
 - Return ONLY valid JSON: array of objects with "headline" and "blurb" keys. No markdown, no preamble.
@@ -60445,6 +60789,70 @@ Rules:
       newsItems.push({
         headline: `${teamName} ${verb} ${m.playerName}${m.overall ? ` (${m.overall} OVR)` : ''}`,
         blurb: `A significant roster move for ${teamName}${m.position ? ` at ${m.position}` : ''} — one worth keeping an eye on.`,
+      });
+    }
+    for (const b of buddingStars.slice(0, 2)) {
+      const teamName = b.team ? maddenTeamDisplayName(b.team) : 'his team';
+      newsItems.push({
+        headline: `Budding Star Watch: ${b.playerName}${b.age ? ` (${b.age})` : ''} is turning heads`,
+        blurb: `${b.playerName} put together a big game for ${teamName} — a name to keep watching this season.`,
+      });
+    }
+    if (gotw) {
+      newsItems.push({
+        headline: `Game of the Week: ${gotw.awayTeam} @ ${gotw.homeTeam}`,
+        blurb: `${gotw.awayTeam} (${gotw.awayRecord}) travel to face ${gotw.homeTeam} (${gotw.homeRecord}) in this week's marquee matchup.`,
+      });
+    }
+    for (const h of hotSeats.slice(0, 1)) {
+      const teamName = maddenTeamDisplayName(h.team);
+      newsItems.push({
+        headline: `Is ${h.coachName || teamName}'s seat getting hot?`,
+        blurb: `${teamName} have dropped ${h.streakLen} straight and slid ${h.powerRankingDrop} spots in the power rankings — the pressure is mounting.`,
+      });
+    }
+    for (const p of seasonRecords.slice(0, 1)) {
+      const teamName = p.team ? maddenTeamDisplayName(p.team) : 'his team';
+      newsItems.push({
+        headline: `${p.playerName} posts the best game of the season so far`,
+        blurb: `${p.playerName}'s outing for ${teamName} is the top single-game performance the league has seen this season.`,
+      });
+    }
+    for (const b of bounceBacks.slice(0, 1)) {
+      const teamName = maddenTeamDisplayName(b.team);
+      newsItems.push({
+        headline: b.isFirstWinEver ? `${teamName} picks up their first win of the season` : `${teamName} snap a ${b.priorRunLength}-game skid`,
+        blurb: b.isFirstWinEver
+          ? `${teamName} finally get in the win column after starting the season winless.`
+          : `${teamName} put an end to a ${b.priorRunLength}-game losing streak with a much-needed win.`,
+      });
+    }
+    if (undefeatedWatch && (undefeatedWatch.undefeated.length || undefeatedWatch.winless.length)) {
+      const undefeatedNames = undefeatedWatch.undefeated.map(maddenTeamDisplayName).join(', ');
+      const winlessNames = undefeatedWatch.winless.map(maddenTeamDisplayName).join(', ');
+      newsItems.push({
+        headline: undefeatedWatch.undefeated.length === 1 ? `${undefeatedNames} remain the league's last unbeaten team` : 'State of the League: perfect and winless teams',
+        blurb: [
+          undefeatedWatch.undefeated.length ? `Still perfect: ${undefeatedNames}.` : '',
+          undefeatedWatch.winless.length ? `Still searching for a win: ${winlessNames}.` : '',
+        ].filter(Boolean).join(' '),
+      });
+    }
+    for (const d of divisionRaces.slice(0, 1)) {
+      const teamName = maddenTeamDisplayName(d.leader);
+      newsItems.push({
+        headline: `${teamName} take over first place in the ${d.division}`,
+        blurb: `${teamName} (${d.record}) have moved to the top of the ${d.division} standings.`,
+      });
+    }
+    if (playoffPicture) {
+      const lastInName = playoffPicture.lastIn ? maddenTeamDisplayName(playoffPicture.lastIn.team) : null;
+      const firstOutName = playoffPicture.firstOut ? maddenTeamDisplayName(playoffPicture.firstOut.team) : null;
+      newsItems.push({
+        headline: 'Playoff Picture Update',
+        blurb: lastInName && firstOutName
+          ? `${lastInName} (${playoffPicture.lastIn.record}) currently hold the last playoff spot, with ${firstOutName} (${playoffPicture.firstOut.record}) right on the outside looking in.`
+          : 'The playoff race is heating up as the season enters its final stretch.',
       });
     }
   }
@@ -60666,6 +61074,11 @@ async function autoDetectAfterSync(guild, league) {
   // sync that correctly reported no new week for Week 3.
   await autoCreateGameThreadsAfterSync(guild, league, newWeekLabel).catch(err =>
     console.error('[AUTO DETECT] Game thread creation failed:', err?.message || err));
+
+  // 7J-26STORY: Game of the Week — the new week's games now exist (thread
+  // creation just ran), so standings-based selection can run against them.
+  const gameOfWeek = await selectMaddenGameOfTheWeek(guild, league, newWeekLabel).catch(() => null);
+  if (gameOfWeek) allEvents.push(gameOfWeek);
 
   // Check for preseason → regular season transition before anything else
   await handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel).catch(err =>
