@@ -43329,11 +43329,21 @@ async function postMaddenWeeklyUpdatesDigest(guild, league, items, { title, emoj
   }
 }
 
+// 7J-31RESTRUCTURE: these three event types are housekeeping data dumps, not
+// real "stories" — Hxxdie's call during the Session 3 news feed restructuring
+// decision. Routed to the Weekly Updates channel instead of the main News
+// channel. Everything else about them (DB row, dedup via recordMaddenNewsEventOnce,
+// embed content) is untouched — this only changes which channel receives the post.
+const MADDEN_WEEKLY_UPDATES_EVENT_TYPES = new Set(['top_expiring_contracts', 'cap_violation', 'year_end_finalized']);
+
 async function postMaddenNewsEventToConfiguredChannel(guild, league, row) {
   if (!guild || !league?.league_id || !row) return null;
-  const channelId = await getMaddenNewsChannelId(league.league_id);
+  const routeToWeeklyUpdates = MADDEN_WEEKLY_UPDATES_EVENT_TYPES.has(String(row.event_type || '').toLowerCase());
+  const channelId = routeToWeeklyUpdates
+    ? await getMaddenWeeklyUpdatesChannelId(league.league_id).catch(() => null)
+    : await getMaddenNewsChannelId(league.league_id);
   if (!channelId) {
-    console.warn('[7J-10BY-A1 NEWS FEED] No madden_news_channel_id configured for league ' + String(league.league_id));
+    console.warn(`[7J-10BY-A1 NEWS FEED] No ${routeToWeeklyUpdates ? 'weekly updates (or fallback news)' : 'madden_news_channel_id'} channel configured for league ` + String(league.league_id));
     return null;
   }
   const channel = await guild.channels.fetch(channelId).catch(error => {
