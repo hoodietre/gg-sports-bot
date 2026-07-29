@@ -59626,7 +59626,28 @@ async function autoDetectMaddenTransactions(guild, league) {
   });
   const count = Array.isArray(rows) ? rows.length : 0;
   if (count === 0) return [];
-  return [{ type: 'transactions', count }];
+
+  // 7J-26STORY: major roster movement — the same transaction data already
+  // gets batched into Weekly Updates as routine churn, but a genuinely big
+  // move (high OVR, a real signing/release/trade rather than a draft pick or
+  // minor re-sign) deserves the same dramatic Claude-written treatment as
+  // game results and streaks, not just a line in a per-team digest. Fed into
+  // the same events array generateMaddenESPNNews already reads from.
+  const MAJOR_MOVEMENT_TYPES = new Set(['signed', 'free_agency_signing', 'released', 'team_change']);
+  const majorEvents = rows
+    .filter(row => MAJOR_MOVEMENT_TYPES.has(String(row.event_type)) && Number(row.overall) >= 85)
+    .map(row => ({
+      type: 'major_movement',
+      playerName: row.player_name,
+      eventType: row.event_type,
+      team: row.new_team_name || row.team_name || null,
+      oldTeam: row.old_team_name || null,
+      overall: row.overall,
+      position: row.position,
+      teamEmoji: getMaddenTeamEmoji(row.new_team_name || row.team_name || ''),
+    }));
+
+  return [{ type: 'transactions', count }, ...majorEvents];
 }
 
 
@@ -60322,12 +60343,13 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
   const streaks    = events.filter(e => e.type === 'streak');
   const movers     = events.find(e => e.type === 'power_ranking_movers');
   const awards     = events.find(e => e.type === 'award_race');
+  const majorMoves = events.filter(e => e.type === 'major_movement');
 
-  if (!gameResults.length && !bigPerfs.length && !streaks.length && !movers && !awards) return;
+  if (!gameResults.length && !bigPerfs.length && !streaks.length && !movers && !awards && !majorMoves.length) return;
 
   let newsItems = [];
 
-  if (useClaudeApi && (gameResults.length || bigPerfs.length || streaks.length)) {
+  if (useClaudeApi && (gameResults.length || bigPerfs.length || streaks.length || majorMoves.length)) {
     try {
       const context = {
         leagueName: league.league_name,
@@ -60350,6 +60372,14 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
           type: s.streakType,
           length: s.streakLen,
         })),
+        majorRosterMovements: majorMoves.slice(0, 4).map(m => ({
+          player: m.playerName,
+          movementType: m.eventType,
+          team: m.team,
+          previousTeam: m.oldTeam,
+          overall: m.overall,
+          position: m.position,
+        })),
       };
 
       const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -60362,7 +60392,9 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
 Write punchy, authentic sports news headlines and one-line blurbs for this week's results. 
 Rules:
 - Each item: a headline (under 80 chars) and a blurb (1-2 sentences, under 150 chars).
-- Vary your angles: underdog stories, dominant performances, individual highlights, team narratives, streaks.
+- Vary your angles: underdog stories, dominant performances, individual highlights, team narratives, streaks, big roster moves.
+- For team narratives on a losing streak or a team sliding in the power rankings, lean into real "team drama" framing — concern, pressure, fans losing patience — not just a neutral stat report.
+- Major roster movements (majorRosterMovements) are genuinely big news — a star player signed, released, or traded. Write these with real weight, like a real trade/signing reaction piece, not a routine transaction log entry.
 - Never use the same sentence structure twice. Mix tones: hype, surprise, concern, admiration.
 - Sound like a real ESPN writer, not a bot. Use sports vernacular naturally.
 - Return ONLY valid JSON: array of objects with "headline" and "blurb" keys. No markdown, no preamble.
@@ -60399,9 +60431,20 @@ Rules:
     if (movers?.movers?.length) {
       const bigMover = movers.movers[0];
       const dir = bigMover.movement > 0 ? '▲' : '▼';
+      const isDrop = bigMover.movement < 0;
       newsItems.push({
         headline: `${bigMover.team} ${dir} ${Math.abs(bigMover.movement)} in power rankings`,
-        blurb: `${bigMover.team} moved from #${bigMover.previousRank} to #${bigMover.rank} in this week's power rankings.`,
+        blurb: isDrop
+          ? `${bigMover.team} have tumbled from #${bigMover.previousRank} to #${bigMover.rank} — the questions are starting to pile up.`
+          : `${bigMover.team} moved from #${bigMover.previousRank} to #${bigMover.rank} in this week's power rankings.`,
+      });
+    }
+    for (const m of majorMoves.slice(0, 2)) {
+      const teamName = m.team ? maddenTeamDisplayName(m.team) : 'a team';
+      const verb = m.eventType === 'released' ? 'released' : m.eventType === 'team_change' ? 'traded for' : 'signed';
+      newsItems.push({
+        headline: `${teamName} ${verb} ${m.playerName}${m.overall ? ` (${m.overall} OVR)` : ''}`,
+        blurb: `A significant roster move for ${teamName}${m.position ? ` at ${m.position}` : ''} — one worth keeping an eye on.`,
       });
     }
   }
@@ -60634,8 +60677,11 @@ async function autoDetectAfterSync(guild, league) {
     console.error('[AUTO DETECT] Offseason transition handler failed:', err?.message));
 
   // 1. Transaction auto-detect
-  await autoDetectMaddenTransactions(guild, league).catch(err =>
-    console.error('[AUTO DETECT] Transactions:', err?.message));
+  const transactionEvents = await autoDetectMaddenTransactions(guild, league).catch(err => {
+    console.error('[AUTO DETECT] Transactions:', err?.message);
+    return [];
+  });
+  allEvents.push(...(transactionEvents || []).filter(e => e.type === 'major_movement'));
 
   // 2. Retirement auto-detect
   const retirements = await autoDetectMaddenRetirements(guild, league).catch(() => []);
