@@ -42170,12 +42170,20 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     rows.push({ ...data, transaction_key: key });
   }
 
+  // 7J-34GAP: also collect every matched pair regardless of whether it produced
+  // a team-movement classification — needed below to detect injuries/attribute/
+  // overall/dev-trait changes, which have nothing to do with team movement and
+  // were previously silently skipped for EA Direct leagues entirely (see note
+  // at the confirm block below).
+  const matchedPlayerPairs = [];
+
   for (const current of currentRows) {
     let previous = null;
     for (const key of maddenTransactionLookupKeys(current)) {
       if (previousMap.has(key)) { previous = previousMap.get(key); break; }
     }
     if (!previous) continue;
+    matchedPlayerPairs.push({ previous, current });
     const eventType = classifyMaddenRosterMovement(previous, current);
     if (!eventType) continue;
     const oldTeam = normalizeMaddenTeamName(previous.team_name || previous.old_team_name || null) || previous.team_name || previous.old_team_name || null;
@@ -42322,6 +42330,35 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
         await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = ANY($1::uuid[])`, [savedIds]).catch(() => null);
       }
     }
+
+    // 7J-34GAP: injury/attribute/overall/dev-trait change detection. This never
+    // ran for EA Direct leagues before — detectAndRecordMaddenPlayerChanges is
+    // only ever invoked from importMaddenPlayersFromArray, which is only wired
+    // to the legacy external-URL sync path (madden_imported_players), and per
+    // the 7J-OFFSEASON-2 note above that table is permanently empty for EA
+    // Direct connections. Reuses the pairs already matched for the team-change
+    // scan above (previous = madden_player_team_snapshots row, current =
+    // madden_player_attributes row) — both already carry raw_payload, which is
+    // all detectAndRecordMaddenPlayerChanges needs to diff attributes/injury.
+    if (guild) {
+      const allAttrChanges = [];
+      for (const { previous, current } of matchedPlayerPairs) {
+        const previousShaped = { ...previous, external_player_id: previous.player_id, id: previous.player_id };
+        const currentShaped = { ...current, external_player_id: current.player_id, player_name: current.player_name };
+        const changes = await detectAndRecordMaddenPlayerChanges(guild, league, previousShaped, currentShaped, null)
+          .catch(error => { console.warn('[7J-34GAP] change detection failed for', current.player_name, ':', error?.message || error); return []; });
+        for (const change of changes || []) { if (change) allAttrChanges.push(change); }
+      }
+      if (allAttrChanges.length) {
+        await postMaddenWeeklyUpdatesDigest(guild, league, allAttrChanges, {
+          title: 'Weekly Roster Update',
+          emoji: '📋',
+          describeLine: change => `${maddenChangeIcon(change.change_type)} **${change.player_name || 'Unknown player'}** — ${maddenChangeTypeLabel(change.change_type)}: ${change.old_value || 'N/A'} → ${change.new_value || 'N/A'}`,
+        }).catch(error => console.warn('[7J-34GAP] roster update digest failed:', error?.message || error));
+      }
+      console.log(`[7J-34GAP] Attribute/injury scan: ${matchedPlayerPairs.length} matched pairs, ${allAttrChanges.length} changes detected.`);
+    }
+
     await saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRows);
     invalidateMaddenFreeAgentRowsCache(String(guildId), leagueId);
   }
@@ -43336,14 +43373,26 @@ async function postMaddenWeeklyUpdatesDigest(guild, league, items, { title, emoj
 // embed content) is untouched — this only changes which channel receives the post.
 const MADDEN_WEEKLY_UPDATES_EVENT_TYPES = new Set(['top_expiring_contracts', 'cap_violation', 'year_end_finalized']);
 
+// 7J-32ROUTE: game thread creation is a scheduling/logistics announcement, not
+// news or roster churn — Hxxdie's call, routes to the League Announcement
+// channel instead. Falls back to the news channel if unconfigured (same
+// never-silently-drop pattern as the Weekly Updates fallback above), since
+// league_announcement_channel_id has no dedicated getter (it's already a
+// plain column on the league row via LEAGUE_SETTINGS_JOIN_COLUMNS).
+const MADDEN_ANNOUNCEMENT_EVENT_TYPES = new Set(['game_threads_created']);
+
 async function postMaddenNewsEventToConfiguredChannel(guild, league, row) {
   if (!guild || !league?.league_id || !row) return null;
-  const routeToWeeklyUpdates = MADDEN_WEEKLY_UPDATES_EVENT_TYPES.has(String(row.event_type || '').toLowerCase());
+  const eventType = String(row.event_type || '').toLowerCase();
+  const routeToWeeklyUpdates = MADDEN_WEEKLY_UPDATES_EVENT_TYPES.has(eventType);
+  const routeToAnnouncements = MADDEN_ANNOUNCEMENT_EVENT_TYPES.has(eventType);
   const channelId = routeToWeeklyUpdates
     ? await getMaddenWeeklyUpdatesChannelId(league.league_id).catch(() => null)
-    : await getMaddenNewsChannelId(league.league_id);
+    : routeToAnnouncements
+      ? (league.league_announcement_channel_id || await getMaddenNewsChannelId(league.league_id))
+      : await getMaddenNewsChannelId(league.league_id);
   if (!channelId) {
-    console.warn(`[7J-10BY-A1 NEWS FEED] No ${routeToWeeklyUpdates ? 'weekly updates (or fallback news)' : 'madden_news_channel_id'} channel configured for league ` + String(league.league_id));
+    console.warn(`[7J-10BY-A1 NEWS FEED] No ${routeToWeeklyUpdates ? 'weekly updates (or fallback news)' : routeToAnnouncements ? 'league announcement (or fallback news)' : 'madden_news_channel_id'} channel configured for league ` + String(league.league_id));
     return null;
   }
   const channel = await guild.channels.fetch(channelId).catch(error => {
@@ -50613,6 +50662,21 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
   let inserted = 0;
   let updated = 0;
 
+  // 7J-35DIAG: diagnosing the phantom team-movement report (many players
+  // appearing to move between two teams with no real transaction behind it).
+  // Working theory: CareerMode_GetTeamRostersExport rows may not carry their
+  // own teamName field, silently falling back to requestPayload.teamName (the
+  // "hint" from buildMaddenRosterImportHints) for the entire batch — if that
+  // hint is stale or mismatched for this listIndex/teamId, every player in
+  // the batch gets tagged with the wrong team, all at once, which is exactly
+  // the "whole roster moved" shape reported. Counting native-vs-hint per
+  // batch, and cross-checking a sample against each player's previously
+  // stored team, should confirm or rule this out directly from next sync's log.
+  let nativeTeamNameCount = 0;
+  let hintFallbackCount = 0;
+  const hintMismatchSamples = [];
+  const existingTeamCache = new Map();
+
   for (const row of rows || []) {
     if (!row || typeof row !== 'object') continue;
 
@@ -50620,7 +50684,25 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
     const rosterId = getAnyValue(row, ['rosterId', 'rosterID', 'playerId', 'playerID'], null);
     const presentationId = getAnyValue(row, ['presentationId', 'presentationID', 'playerPresentationId'], null);
     const teamId = getAnyValue(row, ['teamId', 'teamID'], null) ?? getAnyValue(requestPayload, ['teamId'], null);
-    const teamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null) ?? getAnyValue(requestPayload, ['teamName', 'displayName', 'canonicalName'], null);
+    const nativeTeamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null);
+    const teamName = nativeTeamName ?? getAnyValue(requestPayload, ['teamName', 'displayName', 'canonicalName'], null);
+    if (nativeTeamName != null) nativeTeamNameCount += 1;
+    else {
+      hintFallbackCount += 1;
+      if (hintMismatchSamples.length < 20 && id) {
+        if (!existingTeamCache.has(id)) {
+          const prior = await pool.query(
+            `SELECT team_name FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text AND id = $3 LIMIT 1`,
+            [guild.id, String(league.league_id), id]
+          ).catch(() => ({ rows: [] }));
+          existingTeamCache.set(id, prior.rows?.[0]?.team_name ?? null);
+        }
+        const priorTeam = existingTeamCache.get(id);
+        if (priorTeam && teamName && String(priorTeam).toLowerCase() !== String(teamName).toLowerCase()) {
+          hintMismatchSamples.push({ player: getAnyValue(row, ['fullName', 'name', 'playerName'], null), priorTeam, hintTeam: teamName, hintTeamId: requestPayload?.teamId, hintSource: requestPayload?.hintSource });
+        }
+      }
+    }
     const firstName = getAnyValue(row, ['firstName', 'first'], null);
     const lastName = getAnyValue(row, ['lastName', 'last'], null);
     const fullName = getAnyValue(row, ['fullName', 'name', 'playerName'], null) || [firstName, lastName].filter(Boolean).join('\n').trim() || null;
@@ -50681,6 +50763,15 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
   }
 
   console.log('[MADDEN ROSTER IMPORT 7J-7ZP] ' + JSON.stringify({ label, rows: rows?.length || 0, inserted, updated }));
+  console.log('[MADDEN ROSTER TEAM NAME SOURCE 7J-35DIAG] ' + JSON.stringify({
+    label,
+    requestTeamId: requestPayload?.teamId,
+    requestTeamName: requestPayload?.teamName,
+    requestHintSource: requestPayload?.hintSource,
+    nativeTeamNameCount,
+    hintFallbackCount,
+    hintMismatchSamples,
+  }).slice(0, 4000));
   return { inserted, updated, total: inserted + updated };
 }
 
@@ -60559,7 +60650,7 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   }
 
   // Award race leaders
-  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id).catch(() => null);
+  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex || null).catch(() => null);
   if (awardLeaders) {
     events.push({ type: 'award_race', leaders: awardLeaders });
   }
@@ -60593,25 +60684,57 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   return events;
 }
 
-async function getMaddenAwardRaceLeaders(guildId, leagueId) {
-  const result = await pool.query(
-    `SELECT
-       full_name, position, team_name,
-       stat_type,
-       SUM((raw_payload->>'passYds')::numeric)  FILTER (WHERE stat_type = 'passing')   AS pass_yds,
-       SUM((raw_payload->>'passTDs')::numeric)  FILTER (WHERE stat_type = 'passing')   AS pass_tds,
-       SUM((raw_payload->>'rushYds')::numeric)  FILTER (WHERE stat_type = 'rushing')   AS rush_yds,
-       SUM((raw_payload->>'rushTDs')::numeric)  FILTER (WHERE stat_type = 'rushing')   AS rush_tds,
-       SUM((raw_payload->>'recYds')::numeric)   FILTER (WHERE stat_type = 'receiving') AS rec_yds,
-       SUM((raw_payload->>'recTDs')::numeric)   FILTER (WHERE stat_type = 'receiving') AS rec_tds
-     FROM madden_player_weekly_stats
-     WHERE guild_id = $1 AND league_id = $2
-     GROUP BY full_name, position, team_name, stat_type
-     ORDER BY pass_yds DESC NULLS LAST, rush_yds DESC NULLS LAST, rec_yds DESC NULLS LAST
-     LIMIT 20`,
-    [guildId, String(leagueId)]
-  ).catch(() => ({ rows: [] }));
-  return result.rows || [];
+// 7J-33FIX: two bugs of the same shape as the earlier big-performance/streak
+// fixes. (1) No week filter at all — this ran every sync and summed every
+// week of the season to date, despite being posted under a "Week N" title as
+// if it were that week's leaders. (2) A single query ordered by pass_yds with
+// one shared LIMIT 20 meant passing rows (one per team with a passing stat
+// line) could fill the entire limit before any rushing/receiving row was ever
+// reached — not "no rushing data happened," structurally impossible for
+// rushing rows to survive the cutoff most weeks. Split into three
+// per-stat-type queries, each with its own limit, so all three categories are
+// guaranteed a fair shot regardless of how many passing rows exist.
+async function getMaddenAwardRaceLeaders(guildId, leagueId, weekIndex = null) {
+  const weekFilter = weekIndex ? 'AND week_index = $3' : '';
+  const values = weekIndex ? [guildId, String(leagueId), weekIndex] : [guildId, String(leagueId)];
+
+  const [passing, rushing, receiving] = await Promise.all([
+    pool.query(
+      `SELECT full_name, position, team_name, 'passing' AS stat_type,
+              SUM((raw_payload->>'passYds')::numeric) AS pass_yds,
+              SUM((raw_payload->>'passTDs')::numeric) AS pass_tds
+       FROM madden_player_weekly_stats
+       WHERE guild_id = $1 AND league_id = $2 AND stat_type = 'passing' ${weekFilter}
+       GROUP BY full_name, position, team_name
+       ORDER BY pass_yds DESC NULLS LAST
+       LIMIT 10`,
+      values
+    ).catch(() => ({ rows: [] })),
+    pool.query(
+      `SELECT full_name, position, team_name, 'rushing' AS stat_type,
+              SUM((raw_payload->>'rushYds')::numeric) AS rush_yds,
+              SUM((raw_payload->>'rushTDs')::numeric) AS rush_tds
+       FROM madden_player_weekly_stats
+       WHERE guild_id = $1 AND league_id = $2 AND stat_type = 'rushing' ${weekFilter}
+       GROUP BY full_name, position, team_name
+       ORDER BY rush_yds DESC NULLS LAST
+       LIMIT 10`,
+      values
+    ).catch(() => ({ rows: [] })),
+    pool.query(
+      `SELECT full_name, position, team_name, 'receiving' AS stat_type,
+              SUM((raw_payload->>'recYds')::numeric) AS rec_yds,
+              SUM((raw_payload->>'recTDs')::numeric) AS rec_tds
+       FROM madden_player_weekly_stats
+       WHERE guild_id = $1 AND league_id = $2 AND stat_type = 'receiving' ${weekFilter}
+       GROUP BY full_name, position, team_name
+       ORDER BY rec_yds DESC NULLS LAST
+       LIMIT 10`,
+      values
+    ).catch(() => ({ rows: [] })),
+  ]);
+
+  return [...passing.rows, ...rushing.rows, ...receiving.rows];
 }
 
 
@@ -60817,7 +60940,7 @@ Rules:
     for (const h of hotSeats.slice(0, 1)) {
       const teamName = maddenTeamDisplayName(h.team);
       newsItems.push({
-        headline: `Is ${h.coachName || teamName}'s seat getting hot?`,
+        headline: h.coachName ? `Is ${h.coachName} on the hot seat?` : `${teamName} head coach on the hot seat`,
         blurb: `${teamName} have dropped ${h.streakLen} straight and slid ${h.powerRankingDrop} spots in the power rankings — the pressure is mounting.`,
       });
     }
@@ -60899,13 +61022,13 @@ Rules:
       const rbLines = rbs.map(r => `**${r.full_name}** (${r.team_name}) — ${r.rush_yds} YDS ${r.rush_tds} TD`).join('\n') || 'No data';
       await newsChannel.send({
         embeds: [new EmbedBuilder()
-          .setTitle(`${GG_EMOJI} ${weekLabel} Award Race Leaders`)
+          .setTitle(`${GG_EMOJI} ${weekLabel} Stat Leaders`)
           .setColor(0x9B59B6)
           .addFields(
             { name: '🏈 Passing', value: qbLines, inline: true },
             { name: '🏃 Rushing', value: rbLines, inline: true },
           )
-          .setFooter({ text: `GG Sports • ${league.league_name} Award Race` })
+          .setFooter({ text: `GG Sports • ${league.league_name} Weekly Stat Leaders` })
           .setTimestamp()],
       }).catch(() => null);
     }
