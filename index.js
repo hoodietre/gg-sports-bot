@@ -1071,6 +1071,13 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS tournament_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_news_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_weekly_updates_channel_id TEXT`);
+  // 7J-41SEASON: real season/year identifier, sourced from EA's own hub data
+  // (seasonYear/calendarYear) during every sync — see runMaddenEaDirectSync.
+  // Previously nothing in this system tracked a real per-season value; the
+  // year-end/award/championship history tables all used a hardcoded literal
+  // 'Current' label, which meant a genuinely new season's championship could
+  // never be told apart from the previous one. This is that missing value.
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_season_year INTEGER`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_feed_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_big_bet_threshold INTEGER NOT NULL DEFAULT 1000`);
@@ -1364,6 +1371,10 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS game_played_payout INTEGER NOT NULL DEFAULT 25`);
   await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS award_payout INTEGER NOT NULL DEFAULT 50`);
+  // 7J-40ACHIEVE: championship payout, parallel to the existing award_payout —
+  // a title is worth more than a single individual award by default, but both
+  // are commissioner-configurable via /currency.
+  await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS championship_payout INTEGER NOT NULL DEFAULT 500`);
   // Server-wide sportsbook betting/payout limits (distinct from sportsbook_games'
   // per-game max_bet/max_payout, which stays a separate, more granular override — see
   // /sportsbook limits). These are the server's defaults/ceiling, clamped on save to
@@ -1796,6 +1807,29 @@ async function initDatabase() {
       PRIMARY KEY (guild_id, user_id, milestone_key)
     )
   `);
+
+  // 7J-40ACHIEVE: Track G — Achievements. One generic dedup/reward ledger for
+  // every achievement type (season-scoped award/championship wins AND
+  // cumulative-threshold sportsbook milestones), same proven shape as
+  // activity_milestones_claimed above. achievement_key carries the season
+  // where relevant (e.g. 'champion_2026', 'award_mvp_2026') so repeat wins
+  // across different seasons each get their own row and re-pay, while
+  // cumulative thresholds (e.g. 'sportsbook_wagered_10000') use a flat key
+  // that can only ever be claimed once, exactly like activity milestones.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS achievements_claimed (
+      guild_id TEXT NOT NULL,
+      league_id TEXT,
+      user_id TEXT NOT NULL,
+      achievement_key TEXT NOT NULL,
+      achievement_type TEXT NOT NULL,
+      title TEXT,
+      reward_amount INTEGER NOT NULL DEFAULT 0,
+      claimed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id, achievement_key)
+    )
+  `);
+  await pool.query(`ALTER TABLE user_recognition ADD COLUMN IF NOT EXISTS total_wagered INTEGER NOT NULL DEFAULT 0`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS activity_settings (
@@ -3909,6 +3943,27 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
 
   if (confirm) {
     const seasonLabel = 'Current';
+    // 7J-41SEASON: achievements now key off the real EA-sourced season year
+    // (league.madden_season_year, persisted every sync — see
+    // runMaddenEaDirectSync) instead of the literal 'Current' label used
+    // everywhere else in this function. This is what actually lets a new
+    // season's MVP/champion get paid again instead of being silently
+    // blocked by the previous season's already-claimed achievement key.
+    // seasonLabel itself is left alone here deliberately — madden_award_history/
+    // madden_championship_history's ON CONFLICT keys already depend on it
+    // staying 'Current' for their own upsert-in-place behavior, and changing
+    // that is a bigger, separate migration, not part of this fix.
+    const achievementSeasonKey = league.madden_season_year != null ? String(league.madden_season_year) : seasonLabel;
+    const currencySettings = await getCurrencySettings(guild.id).catch(() => null);
+    const awardPayout = Number(currencySettings?.award_payout ?? 50);
+    const championshipPayout = Number(currencySettings?.championship_payout ?? 500);
+    // 7J-40ACHIEVE: anti-abuse guard placeholder — Hxxdie's call is a minimum
+    // 6 users in the league to qualify for achievement rewards (adjusted down
+    // from the originally-discussed 10), but NOT wired in yet, deliberately,
+    // until testing wraps. When ready: count real league members here (not
+    // just teams) and skip the grantAchievement calls below if under
+    // threshold, while still recording the award/championship history rows
+    // either way so nothing is lost.
     for (const award of awards) {
       await pool.query(
         `INSERT INTO madden_award_history (guild_id, league_id, season_label, award_key, award_name, player_key, player_name, team_name, position, value_snapshot, status, finalized_at, updated_at)
@@ -3917,6 +3972,22 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
          DO UPDATE SET player_key = EXCLUDED.player_key, player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, value_snapshot = EXCLUDED.value_snapshot, finalized_at = NOW(), updated_at = NOW()`,
         [guild.id, String(league.league_id), seasonLabel, award.award_key, award.award_name, award.player_key || null, award.player_name, award.team_name || null, award.position || null, JSON.stringify(award)]
       ).catch(() => null);
+
+      // 7J-40ACHIEVE / 7J-41SEASON: award achievements — previously these
+      // were recorded in madden_award_history but paid nothing at all.
+      // Resolves the award winner's team to its Discord owner (same
+      // function already proven for the championship below) and grants a
+      // dedup-safe currency reward, keyed by achievementSeasonKey (the real
+      // EA-sourced season year, see 7J-41SEASON above) so a genuinely new
+      // season's MVP correctly pays out again rather than being blocked by
+      // last season's already-claimed key.
+      if (award.team_name) {
+        const awardOwnerId = await findMaddenOwnerForTeamName(guild.id, league.league_id, award.team_name).catch(() => null);
+        if (awardOwnerId) {
+          const granted = await grantAchievement(guild.id, league.league_id, awardOwnerId, `award_${award.award_key}_${achievementSeasonKey}`, 'award', award.award_name, awardPayout);
+          if (granted) await addRecognitionPoints(guild.id, awardOwnerId, 5, 25).catch(() => null);
+        }
+      }
     }
     if (championName) {
       await pool.query(
@@ -3927,13 +3998,23 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
         [guild.id, String(league.league_id), seasonLabel, championName, runnerUpName || null, championOwnerId || null, JSON.stringify({ super_bowl: sb, champion: championName, runner_up: runnerUpName })]
       ).catch(() => null);
       if (championOwnerId) {
-        await pool.query(
-          `INSERT INTO user_recognition (guild_id, user_id, legacy_score, championships, activity_points)
-           VALUES ($1, $2, 1000, 1, 250)
-           ON CONFLICT (guild_id, user_id)
-           DO UPDATE SET legacy_score = user_recognition.legacy_score + 1000, championships = user_recognition.championships + 1, activity_points = user_recognition.activity_points + 250, updated_at = NOW()`,
-          [guild.id, championOwnerId]
-        ).catch(() => null);
+        // 7J-40ACHIEVE / 7J-41SEASON: this legacy/activity/championships bump
+        // previously had NO dedup at all — clicking confirm twice on the same
+        // season would have silently double-counted it every time. Now gated
+        // behind grantAchievement, keyed by achievementSeasonKey (the real
+        // EA-sourced season year), so it and the new currency payout fire
+        // once per real season — including correctly paying out again for a
+        // genuinely new season's champion.
+        const granted = await grantAchievement(guild.id, league.league_id, championOwnerId, `champion_${achievementSeasonKey}`, 'championship', 'League Champion', championshipPayout);
+        if (granted) {
+          await pool.query(
+            `INSERT INTO user_recognition (guild_id, user_id, legacy_score, championships, activity_points)
+             VALUES ($1, $2, 1000, 1, 250)
+             ON CONFLICT (guild_id, user_id)
+             DO UPDATE SET legacy_score = user_recognition.legacy_score + 1000, championships = user_recognition.championships + 1, activity_points = user_recognition.activity_points + 250, updated_at = NOW()`,
+            [guild.id, championOwnerId]
+          ).catch(() => null);
+        }
       }
     }
     await pool.query(
@@ -4147,7 +4228,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -5945,6 +6026,15 @@ async function removeCurrency(guildId, userId, amount, transactionType, reason, 
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [randomUUID(), guildId, userId, -amount, transactionType, reason || null, issuedByUserId]
   );
+
+  // 7J-40ACHIEVE: centralized total_wagered tracking — every sportsbook bet
+  // placement (single bet or parlay) funnels through this one function via
+  // removeCurrency's transactionType, so this covers all current and future
+  // bet-placement call sites without needing a separate hook at each one.
+  if (transactionType === 'sportsbook_bet' || transactionType === 'sportsbook_parlay_bet') {
+    await incrementRecognitionStat(guildId, userId, 'total_wagered', amount).catch(() => null);
+    await checkSportsbookAchievements(guildId, userId).catch(() => null);
+  }
 
   return true;
 }
@@ -15761,7 +15851,11 @@ if (gameSubcommand === 'report') {
           `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
           [interaction.guild.id, targetUser.id]
         );
-        await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+        const achievementsResult = await pool.query(
+          `SELECT achievement_key, title, claimed_at FROM achievements_claimed WHERE guild_id = $1 AND user_id = $2 ORDER BY claimed_at DESC`,
+          [interaction.guild.id, targetUser.id]
+        ).catch(() => ({ rows: [] }));
+        await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {}, achievementsResult.rows || [])], ephemeral: true });
         return;
       }
 
@@ -20617,8 +20711,12 @@ if (shopSubcommand === 'view') {
         `SELECT * FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
         [interaction.guild.id, targetUser.id]
       );
+      const achievementsResult = await pool.query(
+        `SELECT achievement_key, title, claimed_at FROM achievements_claimed WHERE guild_id = $1 AND user_id = $2 ORDER BY claimed_at DESC`,
+        [interaction.guild.id, targetUser.id]
+      ).catch(() => ({ rows: [] }));
 
-      await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {})], ephemeral: true });
+      await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {}, achievementsResult.rows || [])], ephemeral: true });
       return;
     }
 
@@ -21453,6 +21551,7 @@ if (shopSubcommand === 'view') {
           await addCurrency(interaction.guild.id, bet.user_id, payout, 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), interaction.user.id);
           await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_wins', 1);
           await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', payout - Number(bet.amount));
+          await checkSportsbookAchievements(interaction.guild.id, bet.user_id, payout).catch(() => null);
           await addRecognitionPoints(interaction.guild.id, bet.user_id, 10, 5);
           await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
           winners += 1;
@@ -23795,6 +23894,7 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
       await addCurrency(guildId, parlay.user_id, payout, 'sportsbook_parlay_win', 'Won parlay' + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), issuedByUserId);
       await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_wins', 1);
       await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_profit', payout - Number(parlay.amount));
+      await checkSportsbookAchievements(guildId, parlay.user_id, payout).catch(() => null);
       await addRecognitionPoints(guildId, parlay.user_id, 50, 25);
       await pool.query(`UPDATE sportsbook_parlays SET potential_payout = $2 WHERE id = $1`, [parlay.id, payout]);
       settledCount += 1;
@@ -24186,6 +24286,67 @@ const ACTIVITY_MILESTONES = [
   { key: 'activity_5000', points: 5000, title: 'Community Icon', reward: 1500 },
 ];
 
+// 7J-40ACHIEVE: Track G — Achievements, sportsbook tier. Cumulative
+// lifetime thresholds, same shape/claim-once semantics as
+// ACTIVITY_MILESTONES above, checked against user_recognition's live
+// counters (sportsbook_wins/sportsbook_profit already tracked on every
+// settled bet before this session; total_wagered is new, incremented at
+// bet-placement time). single_win is different in kind — checked once per
+// bet at settlement against that one bet's own payout, not a running total.
+// Thresholds/rewards here are a reasonable starting point, not final —
+// easy to retune since they're just data, not scattered through logic.
+const SPORTSBOOK_ACHIEVEMENTS = [
+  { key: 'sb_wagered_1000', type: 'wagered', threshold: 1000, title: 'High Roller', reward: 100 },
+  { key: 'sb_wagered_10000', type: 'wagered', threshold: 10000, title: 'Whale', reward: 500 },
+  { key: 'sb_wagered_50000', type: 'wagered', threshold: 50000, title: 'Casino Legend', reward: 2000 },
+  { key: 'sb_profit_2500', type: 'profit', threshold: 2500, title: 'In the Green', reward: 200 },
+  { key: 'sb_profit_10000', type: 'profit', threshold: 10000, title: 'Sharp', reward: 750 },
+  { key: 'sb_profit_50000', type: 'profit', threshold: 50000, title: 'The House Fears You', reward: 3000 },
+  { key: 'sb_bigwin_1000', type: 'single_win', threshold: 1000, title: 'Big Winner', reward: 200 },
+  { key: 'sb_bigwin_5000', type: 'single_win', threshold: 5000, title: 'Jackpot', reward: 1000 },
+];
+
+// Generic achievement grant: dedup via achievements_claimed, pays currency
+// once, returns whether it was newly granted (false if already claimed —
+// callers use this to decide whether to announce/log).
+async function grantAchievement(guildId, leagueId, userId, achievementKey, achievementType, title, rewardAmount) {
+  if (!guildId || !userId || !achievementKey) return false;
+  const claimedResult = await pool.query(
+    `INSERT INTO achievements_claimed (guild_id, league_id, user_id, achievement_key, achievement_type, title, reward_amount)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (guild_id, user_id, achievement_key) DO NOTHING
+     RETURNING achievement_key`,
+    [guildId, leagueId ? String(leagueId) : null, userId, achievementKey, achievementType, title || null, Number(rewardAmount || 0)]
+  ).catch(() => ({ rows: [] }));
+  if (!claimedResult.rows.length) return false;
+  if (Number(rewardAmount) > 0) {
+    await addCurrency(guildId, userId, Number(rewardAmount), 'achievement', title || achievementKey, null).catch(() => null);
+  }
+  return true;
+}
+
+// Checks a user's live sportsbook counters against SPORTSBOOK_ACHIEVEMENTS
+// and grants any newly-crossed thresholds. singleWinAmount is only passed
+// at bet-settlement time (checked against that one payout, not cumulative).
+async function checkSportsbookAchievements(guildId, userId, singleWinAmount = null) {
+  const profileResult = await pool.query(
+    `SELECT sportsbook_profit, total_wagered FROM user_recognition WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guildId, userId]
+  ).catch(() => ({ rows: [] }));
+  const profile = profileResult.rows[0] || {};
+  const wagered = Number(profile.total_wagered || 0);
+  const profit = Number(profile.sportsbook_profit || 0);
+
+  for (const achievement of SPORTSBOOK_ACHIEVEMENTS) {
+    let qualifies = false;
+    if (achievement.type === 'wagered') qualifies = wagered >= achievement.threshold;
+    else if (achievement.type === 'profit') qualifies = profit >= achievement.threshold;
+    else if (achievement.type === 'single_win') qualifies = singleWinAmount != null && Number(singleWinAmount) >= achievement.threshold;
+    if (!qualifies) continue;
+    await grantAchievement(guildId, null, userId, achievement.key, 'sportsbook_milestone', achievement.title, achievement.reward);
+  }
+}
+
 async function getActivitySettings(guildId) {
   await pool.query(
     `INSERT INTO activity_settings (guild_id)
@@ -24304,7 +24465,8 @@ async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
     'sportsbook_profit',
     'tickets_resolved',
     'games_played',
-    'activity_streak'
+    'activity_streak',
+    'total_wagered'
   ];
 
   if (!allowedFields.includes(field)) return;
@@ -24343,10 +24505,12 @@ function getRecognitionTier(score) {
   return getLegacyTier(score);
 }
 
-function buildActivityEmbed(user, row) {
+function buildActivityEmbed(user, row, achievements = []) {
   const profile = row || {};
   const activityPoints = Number(profile.activity_points || profile.recognition_points || 0);
   const legacyScore = Number(profile.legacy_score || 0);
+  const achievementCount = achievements.length;
+  const recentAchievements = achievements.slice(0, 5).map(a => `🏆 ${a.title || a.achievement_key}`).join('\n') || 'None yet';
 
   return new EmbedBuilder()
     .setTitle(user.username + ' • Activity & Legacy Profile')
@@ -24363,7 +24527,8 @@ function buildActivityEmbed(user, row) {
       { name: 'Sportsbook Wins', value: String(profile.sportsbook_wins || 0), inline: true },
       { name: 'Sportsbook Profit', value: String(profile.sportsbook_profit || 0), inline: true },
       { name: 'Tickets Resolved', value: String(profile.tickets_resolved || 0), inline: true },
-      { name: 'Games Played', value: String(profile.games_played || 0), inline: true }
+      { name: 'Games Played', value: String(profile.games_played || 0), inline: true },
+      { name: `Achievements (${achievementCount})`, value: recentAchievements, inline: false }
     )
     .setFooter({ text: 'GG Sports • Activity & Legacy System' })
     .setTimestamp();
@@ -25742,6 +25907,7 @@ async function performSportsbookSettlement(guild, sportsbookGame, winner, actorU
       await addCurrency(guild.id, bet.user_id, payout, 'sportsbook_win', 'Won bet: ' + sportsbookGame.game_label + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), actorUserId);
       await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_wins', 1).catch(() => null);
       await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', payout - Number(bet.amount)).catch(() => null);
+      await checkSportsbookAchievements(guild.id, bet.user_id, payout).catch(() => null);
       await addRecognitionPoints(guild.id, bet.user_id, 10, 2).catch(() => null);
       winningUserIds.add(bet.user_id);
       await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
@@ -29260,6 +29426,27 @@ const PROFILE_BADGE_DEFINITIONS = [
   { key: 'streamer', icon: '📺', label: 'Streamer', description: 'Linked a stream URL.' },
   { key: 'ticket_helper', icon: '🛠️', label: 'Ticket Helper', description: 'Resolved 10+ tickets.' },
   { key: 'league_grinder', icon: '🎮', label: 'League Grinder', description: 'Played 25+ games.' },
+  // 7J-40ACHIEVE: Track G — award/championship-achievement and top-tier
+  // sportsbook-achievement badges. Checked against achievements_claimed
+  // (below in syncExpandedProfileBadges) rather than a user_recognition
+  // counter, since these are Track G's own dedup ledger, not existing
+  // recognition fields.
+  { key: 'award_mvp', icon: '🏅', label: 'League MVP', description: 'Won a season MVP award.' },
+  { key: 'award_opoy', icon: '🏈', label: 'OPOY', description: 'Won Offensive Player of the Year.' },
+  { key: 'award_dpoy', icon: '🛡️', label: 'DPOY', description: 'Won Defensive Player of the Year.' },
+  { key: 'award_oroy', icon: '⭐', label: 'OROY', description: 'Won Offensive Rookie of the Year.' },
+  { key: 'award_droy', icon: '🌟', label: 'DROY', description: 'Won Defensive Rookie of the Year.' },
+  { key: 'sb_whale', icon: '🐳', label: 'Whale', description: 'Wagered 10,000+ lifetime on the sportsbook.' },
+  { key: 'sb_jackpot', icon: '🎉', label: 'Jackpot', description: 'Won 5,000+ on a single sportsbook bet.' },
+  // 7J-42TOURNEY: tournament championships already have a live, accurate
+  // counter on the Franchise Hub profile (the "Tournament Success" field,
+  // computed on the fly from tournament_history — not the dead, never-
+  // incremented user_recognition.tournament_titles column). This badge is
+  // purely a visual-consistency addition alongside the other achievement
+  // badges; the underlying data was already correct. No currency reward —
+  // tournament champions already win the prize pool for the tournament
+  // itself, so a second payout here would be redundant, per Hxxdie.
+  { key: 'tournament_champion', icon: '🥇', label: 'Tournament Champion', description: 'Won at least one tournament.' },
 ];
 
 function badgeDefinition(key) {
@@ -29319,6 +29506,34 @@ async function syncExpandedProfileBadges(guildId, userId, recognition = null) {
 
   const streamUrl = typeof getUserStreamUrl === 'function' ? await getUserStreamUrl(guildId, userId).catch(() => null) : null;
   if (streamUrl) await awardProfileBadge(guildId, userId, 'streamer', 'stream');
+
+  // 7J-40ACHIEVE: award/championship-achievement and top-tier sportsbook
+  // badges, driven off achievements_claimed rather than a user_recognition
+  // counter. Prefix-matches since achievement_key includes a season suffix
+  // for awards (e.g. 'award_mvp_Current') — any claimed key for that award
+  // type, ever, unlocks the badge.
+  const achievementKeysResult = await pool.query(
+    `SELECT achievement_key FROM achievements_claimed WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId]
+  ).catch(() => ({ rows: [] }));
+  const claimedKeys = (achievementKeysResult.rows || []).map(r => r.achievement_key);
+  const hasClaimedPrefix = prefix => claimedKeys.some(k => k.startsWith(prefix));
+  if (hasClaimedPrefix('award_mvp_')) await awardProfileBadge(guildId, userId, 'award_mvp', 'achievement');
+  if (hasClaimedPrefix('award_opoy_')) await awardProfileBadge(guildId, userId, 'award_opoy', 'achievement');
+  if (hasClaimedPrefix('award_dpoy_')) await awardProfileBadge(guildId, userId, 'award_dpoy', 'achievement');
+  if (hasClaimedPrefix('award_oroy_')) await awardProfileBadge(guildId, userId, 'award_oroy', 'achievement');
+  if (hasClaimedPrefix('award_droy_')) await awardProfileBadge(guildId, userId, 'award_droy', 'achievement');
+  if (claimedKeys.includes('sb_wagered_10000') || claimedKeys.includes('sb_wagered_50000')) await awardProfileBadge(guildId, userId, 'sb_whale', 'achievement');
+  if (claimedKeys.includes('sb_bigwin_5000')) await awardProfileBadge(guildId, userId, 'sb_jackpot', 'achievement');
+
+  // 7J-42TOURNEY: live-checked against tournament_history directly (the
+  // real source of truth already used by the Franchise Hub profile), not a
+  // stored counter — consistent with how that field already works.
+  const tournamentTitleCount = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM tournament_history WHERE guild_id = $1 AND champion_user_id = $2`,
+    [guildId, userId]
+  ).catch(() => ({ rows: [{ count: 0 }] }));
+  if (Number(tournamentTitleCount.rows[0]?.count || 0) >= 1) await awardProfileBadge(guildId, userId, 'tournament_champion', 'tournament');
 
   if (typeof syncProfileBadges === 'function') {
     await syncProfileBadges(guildId, userId, row).catch(() => null);
@@ -43773,8 +43988,16 @@ async function getMaddenFinalPowerRankingRows(guildId, leagueId, limit = 10) {
   return result.rows || [];
 }
 
-function maddenCurrentSeasonArchiveLabel() {
-  const year = new Date().getFullYear();
+// 7J-41SEASON: previously always used new Date().getFullYear() — the
+// real-world calendar date, which has nothing to do with the actual
+// in-franchise season. A league could be on franchise season 3 while the
+// real-world date says 2028; this label would've just always shown
+// whatever year it happens to be in real life. Now uses the real
+// EA-sourced season year (league.madden_season_year, see runMaddenEaDirectSync)
+// when available, falling back to the real-world year only for leagues that
+// haven't synced with season-year tracking yet.
+function maddenCurrentSeasonArchiveLabel(seasonYear = null) {
+  const year = seasonYear != null ? seasonYear : new Date().getFullYear();
   return `Season Archive • ${year}`;
 }
 
@@ -43799,7 +44022,7 @@ async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
     ? `**${sbMvp.player_name}** — ${maddenTeamDisplayName(sbMvp.team_name)}\n${maddenFormatPositionOverall(sbMvp.position, sbMvp.overall)}`
     : 'Not detected.';
   const embed = new EmbedBuilder()
-    .setTitle(`📰 ${league.league_name} • Offseason Season Summary`)
+    .setTitle(`📰 ${league.league_name} • Offseason Season Summary${league.madden_season_year != null ? ` (${league.madden_season_year})` : ''}`)
     .setColor(0x3498DB)
     .addFields(
       { name: '🏆 Champion', value: championName ? `**${maddenTeamDisplayName(championName)}**\nOwner: ${maddenOwnerDisplay(championOwner)}` : 'Not detected.', inline: true },
@@ -43837,7 +44060,7 @@ async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
     ? `**${sbMvp.player_name}** — ${maddenTeamDisplayName(sbMvp.team_name)}\n${maddenFormatPositionOverall(sbMvp.position, sbMvp.overall)}`
     : 'Not detected.';
   const embed = new EmbedBuilder()
-    .setTitle(`🏆 ${league.league_name} • Season Archive`)
+    .setTitle(`🏆 ${league.league_name} • Season Archive${league.madden_season_year != null ? ` (${league.madden_season_year})` : ''}`)
     .setColor(0xFEE75C)
     .addFields(
       { name: 'Champion', value: championName ? `**${maddenTeamDisplayName(championName)}**\nOwner: ${maddenOwnerDisplay(championOwner)}` : 'Not detected.', inline: true },
@@ -43845,7 +44068,7 @@ async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
       { name: 'Best Regular Season Record', value: bestRecordValue, inline: false },
       { name: 'Super Bowl MVP', value: sbMvpText, inline: false },
       { name: 'Award Winners', value: maddenSafeEmbedText(awardText, 1024), inline: false },
-      { name: 'Recorded', value: maddenCurrentSeasonArchiveLabel(), inline: false }
+      { name: 'Recorded', value: maddenCurrentSeasonArchiveLabel(league.madden_season_year), inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-10BY-DL League History Archive' })
     .setTimestamp();
@@ -57636,6 +57859,21 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       seasonStage,
       context: eaHubCtx,
     }).slice(0, 2000));
+
+    // 7J-41SEASON: persist the real season year straight from EA's own hub
+    // data (seasonYear, falling back to calendarYear) every sync. Only
+    // writes when EA actually provided a value — never overwrites a known
+    // good value with null on a sync where the hub payload happened to omit
+    // it.
+    const resolvedSeasonYear = eaHubCtx?.seasonYear ?? eaHubCtx?.calendarYear ?? null;
+    if (resolvedSeasonYear != null) {
+      await pool.query(
+        `INSERT INTO league_settings (league_id, madden_season_year)
+         VALUES ($1, $2)
+         ON CONFLICT (league_id) DO UPDATE SET madden_season_year = $2`,
+        [league.league_id, Number(resolvedSeasonYear)]
+      ).catch(error => console.warn('[7J-41SEASON] failed to persist season year:', error?.message || error));
+    }
 
     // This is genuine ground truth for "what week does the franchise think it's on
     // right now" — read directly from EA's own hub state (nextSeasonWeek/
