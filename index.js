@@ -11263,9 +11263,10 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (category === 'setup') {
+        const setupCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
         await interaction.update({
           embeds: [await buildSetupDashboardEmbed(interaction.guild, league)],
-          components: buildSetupDashboardComponents(leagueId, null, getLeagueSportKey(league) === 'madden'),
+          components: buildSetupDashboardComponents(leagueId, null, getLeagueSportKey(league) === 'madden', setupCustomSettings.schedule_style),
         });
         return;
       }
@@ -13618,13 +13619,45 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId === 'memberprofile_category') {
-      await showMemberProfileCategory(interaction, interaction.user, interaction.values[0], { update: true });
+    // 7J-45SEARCH: opens Discord's native UserSelectMenu — this doubles as
+    // the search/picker (typing filters it natively), no separate
+    // search-by-name UI needed. Ephemeral, ID embeds nothing sensitive.
+    if (interaction.isButton() && interaction.customId === 'memberprofile_search') {
+      const menu = new UserSelectMenuBuilder()
+        .setCustomId('memberprofile_search_pick')
+        .setPlaceholder('Search for a member')
+        .setMinValues(1)
+        .setMaxValues(1);
+      await interaction.reply({ content: 'Who do you want to look up?', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
       return;
     }
 
-    if (interaction.isButton() && interaction.customId === 'memberprofile_back') {
-      await showMemberProfileHome(interaction, interaction.user, { update: true });
+    if (interaction.isUserSelectMenu() && interaction.customId === 'memberprofile_search_pick') {
+      const selectedUserId = interaction.values[0];
+      if (!selectedUserId) {
+        await interaction.update({ content: 'No member selected.', components: [] });
+        return;
+      }
+      const selectedUser = await interaction.client.users.fetch(selectedUserId).catch(() => null);
+      if (!selectedUser) {
+        await interaction.update({ content: 'Could not find that member.', components: [] });
+        return;
+      }
+      await showMemberProfileHome(interaction, selectedUser, { update: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('memberprofile_category:')) {
+      const targetUserId = interaction.customId.split(':')[1];
+      const targetUser = targetUserId === 'self' ? interaction.user : await interaction.client.users.fetch(targetUserId).catch(() => interaction.user);
+      await showMemberProfileCategory(interaction, targetUser, interaction.values[0], { update: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('memberprofile_back:')) {
+      const targetUserId = interaction.customId.split(':')[1];
+      const targetUser = targetUserId === 'self' ? interaction.user : await interaction.client.users.fetch(targetUserId).catch(() => interaction.user);
+      await showMemberProfileHome(interaction, targetUser, { update: true });
       return;
     }
 
@@ -30210,35 +30243,52 @@ function buildMemberProfileStarterEmbed() {
 
 function buildMemberProfileStarterComponents() {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('memberprofile_open').setLabel('Open My Profile').setEmoji('👤').setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId('memberprofile_open').setLabel('Open My Profile').setEmoji('👤').setStyle(ButtonStyle.Primary),
+    // 7J-45SEARCH: profile search — the underlying viewer-agnostic lookup
+    // (buildFranchiseHubPayload takes any targetUser, already proven by
+    // /activity user: and the universal activity grade work) already
+    // existed; this was purely a missing UI affordance. Discord's native
+    // UserSelectMenu (wired in the memberprofile_search handler below)
+    // doubles as the search/picker, no separate search-by-name UI needed.
+    new ButtonBuilder().setCustomId('memberprofile_search').setLabel('Search Profile').setEmoji('🔍').setStyle(ButtonStyle.Secondary)
   )];
 }
 
-function buildMemberProfileHomeComponents(lang = 'en') {
+// 7J-45SEARCH: targetUserId is embedded in the category-select and
+// back-button customIds so navigating within a searched-up profile (picking
+// a category, going back) stays on that person's profile instead of
+// silently snapping back to the viewer's own — none of these customIds
+// carried a target user before this, since only self-viewing existed.
+// Self-only actions (connect stream / set birthday / set language) only
+// make sense for your own profile, so they're hidden entirely when viewing
+// someone else's.
+function buildMemberProfileHomeComponents(lang = 'en', targetUserId = null, viewerUserId = null) {
+  const isOwnProfile = !targetUserId || !viewerUserId || targetUserId === viewerUserId;
   const menu = new StringSelectMenuBuilder()
-    .setCustomId('memberprofile_category')
+    .setCustomId('memberprofile_category:' + (targetUserId || 'self'))
     .setPlaceholder('Choose a section')
     .addOptions(MEMBER_PROFILE_CATEGORIES.map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
-  return [
-    new ActionRowBuilder().addComponents(menu),
-    new ActionRowBuilder().addComponents(
+  const rows = [new ActionRowBuilder().addComponents(menu)];
+  if (isOwnProfile) {
+    rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('memberprofile_stream').setLabel('Connect Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('memberprofile_birthday').setLabel('Set Birthday').setEmoji('🎂').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('memberprofile_language').setLabel(t(lang, 'memberprofile_language_button')).setEmoji('🌐').setStyle(ButtonStyle.Secondary),
-    ),
-  ];
+    ));
+  }
+  return rows;
 }
 
-function buildMemberProfileBackRow() {
+function buildMemberProfileBackRow(targetUserId = null) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('memberprofile_back').setLabel('⬅ Back to Overview').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('memberprofile_back:' + (targetUserId || 'self')).setLabel('⬅ Back to Overview').setStyle(ButtonStyle.Secondary)
   );
 }
 
 async function showMemberProfileHome(interaction, targetUser, { update = false } = {}) {
   const lang = await getEffectiveLanguage(interaction.guild?.id, interaction.user.id);
   const { embed, attachment } = await buildFranchiseHubPayload(interaction.guild, targetUser, null);
-  const payload = { content: null, embeds: [embed], files: [attachment], components: buildMemberProfileHomeComponents(lang) };
+  const payload = { content: null, embeds: [embed], files: [attachment], components: buildMemberProfileHomeComponents(lang, targetUser.id, interaction.user.id) };
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
 }
 
@@ -30248,7 +30298,7 @@ async function showMemberProfileCategory(interaction, targetUser, category, { up
   else if (category === 'milestones') embed = await buildMemberMilestonesEmbed(interaction.guild, targetUser);
   else if (category === 'badges') embed = await buildMemberBadgesEmbed(interaction.guild, targetUser);
   else embed = new EmbedBuilder().setTitle('Unknown section').setColor(0xED4245);
-  const payload = { content: null, embeds: [embed], files: [], components: [buildMemberProfileBackRow()] };
+  const payload = { content: null, embeds: [embed], files: [], components: [buildMemberProfileBackRow(targetUser.id)] };
   return update ? interaction.update(payload) : interaction.editReply(payload);
 }
 
@@ -30405,6 +30455,24 @@ const MADDEN_ONLY_SETUP_KEYS = new Set([
   'madden_standings_channel',
   'madden_power_rankings_channel',
   'madden_sportsbook_channel',
+  // 7J-44SETUP: these two were real gaps — clearly Madden-specific per their
+  // own descriptions ("Batched roster/transaction/injury summaries" and
+  // "Madden: auto-posts here when the league advances past the draft") but
+  // were never actually added to this exclusion set, so non-Madden leagues
+  // were seeing them despite them being meaningless there.
+  'madden_weekly_updates_channel',
+  'draft_recap_channel',
+]);
+
+// 7J-44SETUP: the reverse direction — options that only make sense for
+// non-Madden leagues, hidden from Madden leagues. This didn't exist at all
+// before; MADDEN_ONLY_SETUP_KEYS only ever filtered one way. standings_channel
+// is the generic standings panel, explicitly documented elsewhere as
+// "(generic, non-Madden)" — Madden leagues use madden_standings_channel
+// instead, so seeing both is exactly the kind of setup confusion Hxxdie
+// flagged.
+const NON_MADDEN_ONLY_SETUP_KEYS = new Set([
+  'standings_channel',
 ]);
 
 const MADDEN_ONLY_PANEL_KEYS = new Set([
@@ -30423,6 +30491,10 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'league_role', label: 'League Role', description: 'Main league member role', kind: 'role' },
   { value: 'staff_role', label: 'Staff Role', description: 'Role allowed to manage league tools', kind: 'role' },
   { value: 'trade_committee_role', label: 'Trade Committee Role', description: 'Role that votes on trades', kind: 'role' },
+  // 7J-44SETUP: was previously missing entirely — /livestream and the game
+  // thread Stream Hub button both already read/write live_channel_id, but a
+  // commissioner had no way to actually set it from the setup dashboard.
+  { value: 'live_channel', label: 'Streaming Channel', description: 'Where stream announcements post (/livestream, game thread Stream Hub)', kind: 'channel' },
   { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
   { value: 'history_channel', label: 'League History Channel', description: 'Season archives and year-end history posts', kind: 'channel' },
   { value: 'madden_free_agents_channel', label: 'Madden Free Agents Channel', description: 'Live free agent board and offseason free agency panel', kind: 'channel' },
@@ -30563,6 +30635,7 @@ function setupDashboardColumn(settingKey) {
     league_role: 'league_role_id',
     staff_role: 'staff_role_id',
     trade_committee_role: 'trade_committee_role_id',
+    live_channel: 'live_channel_id',
     standings_channel: 'standings_channel_id',
     history_channel: 'history_channel_id',
     madden_free_agents_channel: 'madden_free_agents_channel_id',
@@ -30623,7 +30696,9 @@ function setupDashboardFormatValue(league, settingKey) {
 
 async function buildSetupDashboardEmbed(guild, league) {
   const isMadden = getLeagueSportKey(league) === 'madden';
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
   const channelKeyLabels = [
+    ['live_channel', 'Streaming'],
     ['standings_channel', 'Standings'],
     ['history_channel', 'League History'],
     ['madden_free_agents_channel', 'Madden Free Agents'],
@@ -30651,8 +30726,19 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['ticket_channel', 'Tickets'],
     ['support_channel', 'Support'],
   ];
+  // 7J-44SETUP: same three-filter logic as filterSetupDashboardOptions
+  // (Madden-only / non-Madden-only / schedule-style game_thread vs
+  // game_center) — this summary embed and the actual select-menu options
+  // need to stay in sync, or a commissioner could see a value listed here
+  // for an option that's no longer selectable below.
   const channelLines = channelKeyLabels
-    .filter(([key]) => isMadden || !MADDEN_ONLY_SETUP_KEYS.has(key))
+    .filter(([key]) => {
+      if (isMadden && NON_MADDEN_ONLY_SETUP_KEYS.has(key)) return false;
+      if (!isMadden && MADDEN_ONLY_SETUP_KEYS.has(key)) return false;
+      if (key === 'game_thread_channel') return isMadden || customSettings.schedule_style === 'structured';
+      if (key === 'game_center_channel') return !isMadden && customSettings.schedule_style !== 'structured';
+      return true;
+    })
     .map(([key, label]) => `${label}: ` + setupDashboardFormatValue(league, key));
 
   const tradeLines = [
@@ -30719,8 +30805,36 @@ function buildSetupPanelMenuComponents(leagueId, isMaddenLeague = true) {
   return [new ActionRowBuilder().addComponents(panelMenu), buildCommissionerBackRow(leagueId)];
 }
 
-function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMaddenLeague = true) {
-  const filteredOptions = isMaddenLeague ? SETUP_DASHBOARD_OPTIONS : SETUP_DASHBOARD_OPTIONS.filter(o => !MADDEN_ONLY_SETUP_KEYS.has(o.value));
+// 7J-44SETUP: full setup dashboard filtering, per Hxxdie — eliminates
+// new-commissioner confusion from seeing options that don't apply to their
+// league. Three independent filters stack:
+// 1. Madden-only options hidden from non-Madden leagues (existed before,
+//    now with the two real gaps above fixed).
+// 2. Non-Madden-only options hidden from Madden leagues (new — this
+//    direction never existed before at all).
+// 3. game_thread_channel / game_center_channel are mutually exclusive based
+//    on schedule style, not just Madden-vs-not: Madden leagues always use
+//    structured game threads (EA-driven schedule, no "open" concept), so
+//    always show game_thread_channel and never game_center_channel for
+//    Madden. Non-Madden leagues show whichever one matches their own
+//    schedule_style setting (open → Game Center, structured → Game
+//    Threads).
+function filterSetupDashboardOptions(isMaddenLeague, scheduleStyle) {
+  return SETUP_DASHBOARD_OPTIONS.filter(option => {
+    if (isMaddenLeague && NON_MADDEN_ONLY_SETUP_KEYS.has(option.value)) return false;
+    if (!isMaddenLeague && MADDEN_ONLY_SETUP_KEYS.has(option.value)) return false;
+    if (option.value === 'game_thread_channel') {
+      return isMaddenLeague || scheduleStyle === 'structured';
+    }
+    if (option.value === 'game_center_channel') {
+      return !isMaddenLeague && scheduleStyle !== 'structured';
+    }
+    return true;
+  });
+}
+
+function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMaddenLeague = true, scheduleStyle = 'open') {
+  const filteredOptions = filterSetupDashboardOptions(isMaddenLeague, scheduleStyle);
   const half = Math.ceil(filteredOptions.length / 2);
   const groupA = filteredOptions.slice(0, half);
   const groupB = filteredOptions.slice(half);
@@ -30788,9 +30902,10 @@ async function refreshSetupDashboardInteraction(interaction, leagueId, selectedS
   const embed = await buildSetupDashboardEmbed(interaction.guild, league);
   if (note) embed.setDescription(embed.data.description + '\n\n' + note);
 
+  const refreshCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
   await interaction.update({
     embeds: [embed],
-    components: buildSetupDashboardComponents(league.league_id, selectedSetting, getLeagueSportKey(league) === 'madden'),
+    components: buildSetupDashboardComponents(league.league_id, selectedSetting, getLeagueSportKey(league) === 'madden', refreshCustomSettings.schedule_style),
   });
 }
 
