@@ -37,6 +37,10 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    // 7J-43ACTIVITY: required for voice-activity tracking — VoiceStateUpdate
+    // events simply never fire without this. Not a privileged intent, no
+    // Developer Portal toggle needed, just this array entry.
+    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
@@ -1772,6 +1776,59 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE user_recognition ADD COLUMN IF NOT EXISTS activity_points INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`UPDATE user_recognition SET activity_points = recognition_points WHERE activity_points = 0 AND recognition_points IS NOT NULL`).catch(() => null);
+  // 7J-43ACTIVITY: passive engagement (messages/voice) earns fractional
+  // points (+0.2 each) — the column needs to actually hold fractional
+  // values or every passive tick gets silently truncated to 0 on an
+  // INTEGER column. One-time widen, safe to run every boot.
+  await pool.query(`ALTER TABLE user_recognition ALTER COLUMN activity_points TYPE NUMERIC(12,2)`).catch(() => null);
+  await pool.query(`ALTER TABLE user_recognition ALTER COLUMN activity_points SET DEFAULT 0`).catch(() => null);
+
+  // 7J-43ACTIVITY: league-scoped activity — same activity_points/legacy_score
+  // shape as user_recognition, but scoped to (guild, league, user) instead of
+  // just (guild, user), so commissioners can see who's active in *their*
+  // league specifically on a multi-league server. Fed in parallel to
+  // user_recognition by addActivityPoints whenever a league_id is available
+  // for the action (award wins, game wins, sportsbook activity tied to a
+  // league's games, championships) — actions with no clear single-league
+  // attribution (ticket resolution, passive message/voice activity) only hit
+  // the server and universal tables, not this one.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_league_activity (
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      activity_points NUMERIC(12,2) NOT NULL DEFAULT 0,
+      legacy_score INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, user_id)
+    )
+  `);
+
+  // 7J-43ACTIVITY: universal/global activity — one row per Discord user,
+  // aggregated across every server the bot is in. This is what the
+  // profile-visible "activity grade" (letter grade + tier + percentile,
+  // lookup-able by anyone) is computed from. Fed by every point-earning
+  // action everywhere, always, regardless of league/server attribution.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_global_activity (
+      user_id TEXT PRIMARY KEY,
+      activity_points NUMERIC(12,2) NOT NULL DEFAULT 0,
+      legacy_score INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // 7J-43ACTIVITY: last-counted-message timestamp per (guild, user), used to
+  // enforce the 60s cooldown on message-activity points without needing to
+  // scan message history.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_message_activity_cooldown (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      last_counted_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id)
+    )
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_awards (
@@ -3266,7 +3323,14 @@ function buildCommands() {
 
     new SlashCommandBuilder()
       .setName('activityleaderboard')
-      .setDescription('Show the top activity users in this server'),
+      .setDescription('Show the top activity users — this server, a specific league, or universal (all GG Sports servers)')
+      .addStringOption(o => o.setName('scope').setDescription('Leaderboard scope (default: this server)').setRequired(false)
+        .addChoices(
+          { name: 'This Server', value: 'server' },
+          { name: 'This League', value: 'league' },
+          { name: 'Universal (all GG Sports servers)', value: 'universal' },
+        ))
+      .addStringOption(o => o.setName('league').setDescription('League name (only used with League scope; defaults to this server\'s default league)').setRequired(false)),
 
     new SlashCommandBuilder()
       .setName('legacy')
@@ -3985,7 +4049,7 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
         const awardOwnerId = await findMaddenOwnerForTeamName(guild.id, league.league_id, award.team_name).catch(() => null);
         if (awardOwnerId) {
           const granted = await grantAchievement(guild.id, league.league_id, awardOwnerId, `award_${award.award_key}_${achievementSeasonKey}`, 'award', award.award_name, awardPayout);
-          if (granted) await addRecognitionPoints(guild.id, awardOwnerId, 5, 25).catch(() => null);
+          if (granted) await addRecognitionPoints(guild.id, awardOwnerId, 10, 25, league.league_id).catch(() => null);
         }
       }
     }
@@ -4009,10 +4073,28 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
         if (granted) {
           await pool.query(
             `INSERT INTO user_recognition (guild_id, user_id, legacy_score, championships, activity_points)
-             VALUES ($1, $2, 1000, 1, 250)
+             VALUES ($1, $2, 500, 1, 250)
              ON CONFLICT (guild_id, user_id)
-             DO UPDATE SET legacy_score = user_recognition.legacy_score + 1000, championships = user_recognition.championships + 1, activity_points = user_recognition.activity_points + 250, updated_at = NOW()`,
+             DO UPDATE SET legacy_score = user_recognition.legacy_score + 500, championships = user_recognition.championships + 1, activity_points = user_recognition.activity_points + 250, updated_at = NOW()`,
             [guild.id, championOwnerId]
+          ).catch(() => null);
+          // 7J-43ACTIVITY: this bypasses addActivityPoints (it's a direct
+          // write with the extra championships counter bump baked in), so
+          // fan out to the league/universal tables here explicitly to stay
+          // consistent with every other point-earning action.
+          await pool.query(
+            `INSERT INTO user_league_activity (guild_id, league_id, user_id, activity_points, legacy_score)
+             VALUES ($1, $2, $3, 250, 500)
+             ON CONFLICT (guild_id, league_id, user_id)
+             DO UPDATE SET activity_points = user_league_activity.activity_points + 250, legacy_score = user_league_activity.legacy_score + 500, updated_at = NOW()`,
+            [guild.id, String(league.league_id), championOwnerId]
+          ).catch(() => null);
+          await pool.query(
+            `INSERT INTO user_global_activity (user_id, activity_points, legacy_score)
+             VALUES ($1, 250, 500)
+             ON CONFLICT (user_id)
+             DO UPDATE SET activity_points = user_global_activity.activity_points + 250, legacy_score = user_global_activity.legacy_score + 500, updated_at = NOW()`,
+            [championOwnerId]
           ).catch(() => null);
         }
       }
@@ -7095,9 +7177,28 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
+// 7J-43ACTIVITY: passive voice activity tracking.
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  try {
+    await trackVoiceActivity(oldState, newState);
+  } catch (error) {
+    console.warn('[7J-43ACTIVITY] VoiceStateUpdate handler failed:', error?.message || error);
+  }
+});
+
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot || !message.guild) return;
+
+    // 7J-43ACTIVITY: passive message activity — +0.2 activity per message,
+    // only messages 25+ characters (trimmed, so whitespace-padding to hit
+    // the length doesn't count), max once per 60s per (guild, user) to block
+    // spam-farming. No league attribution (not reliably determinable from a
+    // channel in a multi-league server) — server + universal only. This runs
+    // unconditionally at the top of the listener, before any of the
+    // ticket-evidence/pending-offer logic below, so it isn't accidentally
+    // skipped by an early return elsewhere in this function.
+    await trackPassiveMessageActivity(message).catch(error => console.warn('[7J-43ACTIVITY] message tracking failed:', error?.message || error));
 
     if (message.channel?.isThread() && message.attachments.size > 0) {
       const ticket = await getOpenTicketByThread(message.guild.id, message.channel.id);
@@ -9896,7 +9997,7 @@ if (interaction.commandName === 'avatar') {
               await addCurrency(interaction.guild.id, winnerUserId, awardPayout, 'league_award', awardName + ' • ' + seasonLabel, interaction.user.id);
             }
 
-            await addRecognitionPoints(interaction.guild.id, winnerUserId, 5, 25).catch(() => null);
+            await addRecognitionPoints(interaction.guild.id, winnerUserId, 10, 25, activeLeague.league_id).catch(() => null);
           }
 
           savedAwards.push({ awardName, winnerText });
@@ -9974,7 +10075,7 @@ if (interaction.commandName === 'avatar') {
           [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
         );
 
-        await addRecognitionPoints(interaction.guild.id, interaction.user.id, 2, 0).catch(() => null);
+        await addRecognitionPoints(interaction.guild.id, interaction.user.id, 2, 0, sportsbookGame.league_id).catch(() => null);
         await updateSportsbookPanel(interaction.guild);
         const feedSettings = await getSportsbookSettings(interaction.guild.id);
         await postSportsbookFeed(
@@ -10479,7 +10580,7 @@ if (interaction.commandName === 'avatar') {
         await pool.query(`UPDATE support_tickets SET status = $1 WHERE id = $2`, [newStatus, ticket.id]);
         if (newStatus === 'resolved') {
           await incrementRecognitionStat(interaction.guild.id, interaction.user.id, 'tickets_resolved', 1);
-          await addRecognitionPoints(interaction.guild.id, interaction.user.id, 5, 2);
+          await addRecognitionPoints(interaction.guild.id, interaction.user.id, 1, 0);
         }
         await updateTicketPanel(interaction.guild);
         await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** marked **' + newStatus + '**.', ephemeral: true });
@@ -15855,7 +15956,8 @@ if (gameSubcommand === 'report') {
           `SELECT achievement_key, title, claimed_at FROM achievements_claimed WHERE guild_id = $1 AND user_id = $2 ORDER BY claimed_at DESC`,
           [interaction.guild.id, targetUser.id]
         ).catch(() => ({ rows: [] }));
-        await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {}, achievementsResult.rows || [])], ephemeral: true });
+        const universalGrade = await getUniversalActivityGrade(targetUser.id).catch(() => null);
+        await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {}, achievementsResult.rows || [], universalGrade)], ephemeral: true });
         return;
       }
 
@@ -20716,13 +20818,46 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id, targetUser.id]
       ).catch(() => ({ rows: [] }));
 
-      await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {}, achievementsResult.rows || [])], ephemeral: true });
+      const universalGrade = await getUniversalActivityGrade(targetUser.id).catch(() => null);
+      await interaction.editReply({ embeds: [buildActivityEmbed(targetUser, result.rows[0] || {}, achievementsResult.rows || [], universalGrade)], ephemeral: true });
       return;
     }
 
     if (interaction.commandName === 'activityleaderboard') {
       await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
+
+      const scope = interaction.options.getString('scope') || 'server';
+
+      if (scope === 'universal') {
+        const result = await pool.query(
+          `SELECT * FROM user_global_activity
+           ORDER BY activity_points DESC, legacy_score DESC
+           LIMIT 15`
+        );
+        await interaction.editReply({ embeds: [buildActivityLeaderboardEmbed(result.rows, '🌐 Universal Activity Leaderboard (all GG Sports servers)')], ephemeral: true });
+        return;
+      }
+
+      if (scope === 'league') {
+        const leagueName = interaction.options.getString('league');
+        const activeLeague = leagueName
+          ? await getLeagueByName(interaction.guild.id, leagueName)
+          : await getDefaultLeague(interaction.guild.id);
+        if (!activeLeague) {
+          await interaction.editReply({ content: 'No league found. Specify a league name or set a default league first.', ephemeral: true });
+          return;
+        }
+        const result = await pool.query(
+          `SELECT * FROM user_league_activity
+           WHERE guild_id = $1 AND league_id = $2
+           ORDER BY activity_points DESC, legacy_score DESC
+           LIMIT 15`,
+          [interaction.guild.id, String(activeLeague.league_id)]
+        );
+        await interaction.editReply({ embeds: [buildActivityLeaderboardEmbed(result.rows, `⚡ Activity Leaderboard • ${activeLeague.league_name}`)], ephemeral: true });
+        return;
+      }
 
       const result = await pool.query(
         `SELECT * FROM user_recognition
@@ -20732,7 +20867,7 @@ if (shopSubcommand === 'view') {
         [interaction.guild.id]
       );
 
-      await interaction.editReply({ embeds: [buildActivityLeaderboardEmbed(result.rows)], ephemeral: true });
+      await interaction.editReply({ embeds: [buildActivityLeaderboardEmbed(result.rows, `⚡ Activity Leaderboard • ${interaction.guild.name}`)], ephemeral: true });
       return;
     }
 
@@ -21308,7 +21443,7 @@ if (shopSubcommand === 'view') {
           [randomUUID(), interaction.guild.id, sportsbookGame.id, interaction.user.id, side, amount, odds, payout]
         );
 
-        await addRecognitionPoints(interaction.guild.id, interaction.user.id, 2, 0).catch(() => null);
+        await addRecognitionPoints(interaction.guild.id, interaction.user.id, 2, 0, sportsbookGame.league_id).catch(() => null);
         const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
         const activeLeague = sportsbookGame.league_id ? await getLeagueById(sportsbookGame.league_id) : await resolveLeague(interaction);
         const sportsbookSettings = await getSportsbookSettings(interaction.guild.id);
@@ -21552,7 +21687,7 @@ if (shopSubcommand === 'view') {
           await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_wins', 1);
           await incrementRecognitionStat(interaction.guild.id, bet.user_id, 'sportsbook_profit', payout - Number(bet.amount));
           await checkSportsbookAchievements(interaction.guild.id, bet.user_id, payout).catch(() => null);
-          await addRecognitionPoints(interaction.guild.id, bet.user_id, 10, 5);
+          await addRecognitionPoints(interaction.guild.id, bet.user_id, 5, 1, sportsbookGame.league_id);
           await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
           winners += 1;
           totalPaid += payout;
@@ -23895,7 +24030,20 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
       await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_wins', 1);
       await incrementRecognitionStat(guildId, parlay.user_id, 'sportsbook_profit', payout - Number(parlay.amount));
       await checkSportsbookAchievements(guildId, parlay.user_id, payout).catch(() => null);
-      await addRecognitionPoints(guildId, parlay.user_id, 50, 25);
+      // 7J-43ACTIVITY: parlays can theoretically span legs from different
+      // leagues (unusual, but not structurally prevented) — best-effort
+      // attribute to the first leg's league. If it's null, this simply
+      // doesn't hit the league-scoped table, same as any other action with
+      // no clean single-league attribution — still counts toward server +
+      // universal either way.
+      const parlayLeagueIdResult = await pool.query(
+        `SELECT sg.league_id FROM sportsbook_parlay_legs spl
+         JOIN sportsbook_games sg ON sg.id = spl.sportsbook_game_id
+         WHERE spl.parlay_id = $1 LIMIT 1`,
+        [parlay.id]
+      ).catch(() => ({ rows: [] }));
+      const parlayLeagueId = parlayLeagueIdResult.rows[0]?.league_id || null;
+      await addRecognitionPoints(guildId, parlay.user_id, 6, 2, parlayLeagueId);
       await pool.query(`UPDATE sportsbook_parlays SET potential_payout = $2 WHERE id = $1`, [parlay.id, payout]);
       settledCount += 1;
       parlayPaid += payout;
@@ -24347,6 +24495,135 @@ async function checkSportsbookAchievements(guildId, userId, singleWinAmount = nu
   }
 }
 
+// 7J-43ACTIVITY: passive message activity. 60s cooldown enforced via
+// user_message_activity_cooldown rather than an in-memory Map so it
+// survives bot restarts correctly (a restart mid-cooldown shouldn't let
+// someone immediately farm a free point).
+const PASSIVE_MESSAGE_MIN_LENGTH = 25;
+const PASSIVE_MESSAGE_COOLDOWN_MS = 60 * 1000;
+const PASSIVE_MESSAGE_POINTS = 0.2;
+
+async function trackPassiveMessageActivity(message) {
+  const content = String(message.content || '').trim();
+  if (content.length < PASSIVE_MESSAGE_MIN_LENGTH) return;
+
+  const guildId = message.guild.id;
+  const userId = message.author.id;
+
+  const cooldownResult = await pool.query(
+    `SELECT last_counted_at FROM user_message_activity_cooldown WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
+    [guildId, userId]
+  ).catch(() => ({ rows: [] }));
+  const lastCountedAt = cooldownResult.rows[0]?.last_counted_at ? new Date(cooldownResult.rows[0].last_counted_at).getTime() : 0;
+  if (Date.now() - lastCountedAt < PASSIVE_MESSAGE_COOLDOWN_MS) return;
+
+  await pool.query(
+    `INSERT INTO user_message_activity_cooldown (guild_id, user_id, last_counted_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (guild_id, user_id) DO UPDATE SET last_counted_at = NOW()`,
+    [guildId, userId]
+  ).catch(() => null);
+
+  // No leagueId — passive engagement isn't reliably attributable to one
+  // league in a multi-league server, so this only hits server + universal.
+  await addActivityPoints(guildId, userId, PASSIVE_MESSAGE_POINTS, 0).catch(() => null);
+}
+
+// 7J-43ACTIVITY: passive voice activity. In-memory session tracking
+// (guildId:userId -> session state) rather than a persisted table —
+// deliberate simplicity tradeoff: a bot restart mid-session loses whatever
+// wasn't yet awarded, which is an acceptable, low-severity edge case for a
+// passive point trickle, not worth the complexity of crash-safe session
+// persistence.
+//
+// Per Hxxdie: solo voice time shouldn't earn anything — a session only
+// accrues while 2+ non-bot members share the same channel. Each session
+// tracks accumulatedMs (finalized eligible time) plus segmentStartAt (when
+// the *current* eligible stretch began, or null if currently alone/
+// ineligible) rather than a single join-to-leave timer, since eligibility
+// can flip on and off repeatedly within one continuous voice session as
+// other people join and leave around this user.
+const activeVoiceSessions = new Map();
+
+function voiceSessionKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function getEligibleVoiceMemberCount(guild, channelId, afkChannelId) {
+  if (!channelId || channelId === afkChannelId) return 0;
+  const channel = guild.channels.cache.get(channelId);
+  if (!channel?.members) return 0;
+  let count = 0;
+  for (const member of channel.members.values()) {
+    if (!member.user.bot) count += 1;
+  }
+  return count;
+}
+
+async function finalizeVoiceSession(guildId, userId, session) {
+  let totalMs = session.accumulatedMs;
+  if (session.segmentStartAt != null) totalMs += Date.now() - session.segmentStartAt;
+  const minutes = Math.floor(totalMs / 60000);
+  if (minutes > 0) {
+    await addActivityPoints(guildId, userId, minutes * 0.2, 0).catch(error => console.warn('[7J-43ACTIVITY] voice tracking failed:', error?.message || error));
+  }
+}
+
+// Re-checks whether a channel currently has 2+ real members and starts/stops
+// the eligible-time segment for every tracked session in that channel
+// accordingly. Called for both the channel someone just left and the
+// channel they just joined, since one person's move can flip *other*
+// people's eligibility too (e.g. the second person joining an
+// otherwise-solo channel makes both of them eligible at once; the second
+// person leaving makes the remaining one solo again).
+function reevaluateVoiceChannelEligibility(guild, channelId, afkChannelId) {
+  if (!channelId || channelId === afkChannelId) return;
+  const isEligible = getEligibleVoiceMemberCount(guild, channelId, afkChannelId) >= 2;
+  for (const session of activeVoiceSessions.values()) {
+    if (session.channelId !== channelId) continue;
+    if (isEligible && session.segmentStartAt === null) {
+      session.segmentStartAt = Date.now();
+    } else if (!isEligible && session.segmentStartAt !== null) {
+      session.accumulatedMs += Date.now() - session.segmentStartAt;
+      session.segmentStartAt = null;
+    }
+  }
+}
+
+async function trackVoiceActivity(oldState, newState) {
+  const guild = newState.guild || oldState.guild;
+  const userId = newState.id || oldState.id;
+  const isBot = (newState.member || oldState.member)?.user?.bot;
+  if (!guild || !userId || isBot) return;
+  const guildId = guild.id;
+  const key = voiceSessionKey(guildId, userId);
+  const afkChannelId = guild.afkChannelId || null;
+
+  const oldChannelId = oldState.channelId;
+  const newChannelId = newState.channelId;
+  if (oldChannelId === newChannelId) return; // mute/deafen/etc — no channel change, nothing to do
+
+  const wasInRealChannel = oldChannelId && oldChannelId !== afkChannelId;
+  const isInRealChannel = newChannelId && newChannelId !== afkChannelId;
+
+  // Left a channel this user had a session in — finalize whatever eligible
+  // time accrued and award it.
+  if (wasInRealChannel && activeVoiceSessions.has(key)) {
+    const session = activeVoiceSessions.get(key);
+    activeVoiceSessions.delete(key);
+    await finalizeVoiceSession(guildId, userId, session);
+  }
+
+  // Joined a new real channel — start a fresh session, not yet eligible
+  // until the re-evaluation below confirms 2+ people are actually present.
+  if (isInRealChannel) {
+    activeVoiceSessions.set(key, { channelId: newChannelId, segmentStartAt: null, accumulatedMs: 0 });
+  }
+
+  if (wasInRealChannel) reevaluateVoiceChannelEligibility(guild, oldChannelId, afkChannelId);
+  if (isInRealChannel) reevaluateVoiceChannelEligibility(guild, newChannelId, afkChannelId);
+}
+
 async function getActivitySettings(guildId) {
   await pool.query(
     `INSERT INTO activity_settings (guild_id)
@@ -24437,7 +24714,15 @@ async function ensureRecognitionProfile(guildId, userId) {
   );
 }
 
-async function addActivityPoints(guildId, userId, points, legacyPoints = 0) {
+// 7J-43ACTIVITY: leagueId is optional and additive — the existing
+// server-scoped user_recognition update is completely unchanged, so every
+// existing call site keeps working exactly as before with no leagueId
+// passed. When a caller does have clean league context (award wins, game
+// wins, sportsbook activity, championships), passing it also updates the
+// league-scoped table. The universal/global table is always updated
+// regardless, since every point-earning action anywhere should count
+// toward a user's cross-server activity grade.
+async function addActivityPoints(guildId, userId, points, legacyPoints = 0, leagueId = null) {
   await ensureRecognitionProfile(guildId, userId);
 
   await pool.query(
@@ -24450,11 +24735,29 @@ async function addActivityPoints(guildId, userId, points, legacyPoints = 0) {
     [guildId, userId, Number(points || 0), Number(legacyPoints || 0)]
   );
 
+  if (leagueId) {
+    await pool.query(
+      `INSERT INTO user_league_activity (guild_id, league_id, user_id, activity_points, legacy_score)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (guild_id, league_id, user_id)
+       DO UPDATE SET activity_points = user_league_activity.activity_points + $4, legacy_score = user_league_activity.legacy_score + $5, updated_at = NOW()`,
+      [guildId, String(leagueId), userId, Number(points || 0), Number(legacyPoints || 0)]
+    ).catch(() => null);
+  }
+
+  await pool.query(
+    `INSERT INTO user_global_activity (user_id, activity_points, legacy_score)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id)
+     DO UPDATE SET activity_points = user_global_activity.activity_points + $2, legacy_score = user_global_activity.legacy_score + $3, updated_at = NOW()`,
+    [userId, Number(points || 0), Number(legacyPoints || 0)]
+  ).catch(() => null);
+
   await checkActivityMilestones(guildId, userId).catch(() => null);
 }
 
-async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0) {
-  return addActivityPoints(guildId, userId, points, legacyPoints);
+async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0, leagueId = null) {
+  return addActivityPoints(guildId, userId, points, legacyPoints, leagueId);
 }
 
 async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
@@ -24505,12 +24808,73 @@ function getRecognitionTier(score) {
   return getLegacyTier(score);
 }
 
-function buildActivityEmbed(user, row, achievements = []) {
+// 7J-43ACTIVITY: universal activity grade. topPercent = what percentage of
+// all GG Sports users this person's universal activity score beats or ties
+// (lower topPercent = better standing, e.g. topPercent=8 means "top 8%").
+// Grade bands are a reasonable starting curve, not final — easy to retune
+// since it's just threshold data, not scattered through logic. Tier reuses
+// the exact same getActivityTier scale as the per-server tier, just applied
+// to the universal score instead, for naming consistency across the bot.
+function computeActivityLetterGrade(topPercent) {
+  if (topPercent <= 1) return 'S';
+  if (topPercent <= 5) return 'A+';
+  if (topPercent <= 10) return 'A';
+  if (topPercent <= 20) return 'A-';
+  if (topPercent <= 30) return 'B+';
+  if (topPercent <= 40) return 'B';
+  if (topPercent <= 50) return 'B-';
+  if (topPercent <= 65) return 'C+';
+  if (topPercent <= 80) return 'C';
+  if (topPercent <= 90) return 'D';
+  return 'F';
+}
+
+async function getUniversalActivityGrade(userId) {
+  await pool.query(
+    `INSERT INTO user_global_activity (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+    [userId]
+  ).catch(() => null);
+
+  const result = await pool.query(
+    `WITH me AS (
+       SELECT activity_points FROM user_global_activity WHERE user_id = $1
+     )
+     SELECT
+       me.activity_points AS my_points,
+       (SELECT COUNT(*) FROM user_global_activity) AS total_users,
+       (SELECT COUNT(*) FROM user_global_activity, me WHERE user_global_activity.activity_points >= me.activity_points) AS better_or_equal_count
+     FROM me`,
+    [userId]
+  ).catch(() => ({ rows: [] }));
+
+  const row = result.rows[0];
+  const activityPoints = Number(row?.my_points || 0);
+  const totalUsers = Number(row?.total_users || 0);
+  const betterOrEqualCount = Number(row?.better_or_equal_count || 0);
+  // With very few users in the global pool (early on), a percentile is
+  // statistically meaningless — flag that instead of pretending precision.
+  const smallSample = totalUsers < 20;
+  const topPercent = totalUsers > 0 ? Math.max(0.1, Math.round((betterOrEqualCount / totalUsers) * 1000) / 10) : 100;
+
+  return {
+    activityPoints,
+    totalUsers,
+    topPercent,
+    smallSample,
+    grade: computeActivityLetterGrade(topPercent),
+    tier: getActivityTier(activityPoints),
+  };
+}
+
+function buildActivityEmbed(user, row, achievements = [], universalGrade = null) {
   const profile = row || {};
   const activityPoints = Number(profile.activity_points || profile.recognition_points || 0);
   const legacyScore = Number(profile.legacy_score || 0);
   const achievementCount = achievements.length;
   const recentAchievements = achievements.slice(0, 5).map(a => `🏆 ${a.title || a.achievement_key}`).join('\n') || 'None yet';
+  const universalValue = universalGrade
+    ? `**${universalGrade.grade}** • ${universalGrade.tier} • ${universalGrade.smallSample ? 'Not enough users yet for a reliable percentile' : `Top ${universalGrade.topPercent}% of GG Sports users`}`
+    : 'Not available';
 
   return new EmbedBuilder()
     .setTitle(user.username + ' • Activity & Legacy Profile')
@@ -24528,7 +24892,8 @@ function buildActivityEmbed(user, row, achievements = []) {
       { name: 'Sportsbook Profit', value: String(profile.sportsbook_profit || 0), inline: true },
       { name: 'Tickets Resolved', value: String(profile.tickets_resolved || 0), inline: true },
       { name: 'Games Played', value: String(profile.games_played || 0), inline: true },
-      { name: `Achievements (${achievementCount})`, value: recentAchievements, inline: false }
+      { name: `Achievements (${achievementCount})`, value: recentAchievements, inline: false },
+      { name: '🌐 Universal Activity Grade', value: universalValue, inline: false }
     )
     .setFooter({ text: 'GG Sports • Activity & Legacy System' })
     .setTimestamp();
@@ -24604,10 +24969,10 @@ function buildLegacyLeaderboardEmbed(rows) {
   return embed;
 }
 
-function buildActivityLeaderboardEmbed(rows) {
+function buildActivityLeaderboardEmbed(rows, title = '⚡ Activity Leaderboard') {
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
-    .setTitle('⚡ Activity Leaderboard')
+    .setTitle(title)
     .setColor(0x57F287)
     .setFooter({ text: 'GG Sports • Activity Rankings' })
     .setTimestamp();
@@ -24620,6 +24985,9 @@ function buildActivityLeaderboardEmbed(rows) {
   embed.setDescription(
     rows.map((row, index) => {
       const activityPoints = Number(row.activity_points || row.recognition_points || 0);
+      // 7J-43ACTIVITY: activity_streak only exists on the server-scoped
+      // table — league/universal rows won't have it, hence the || 0 fallback
+      // rendering it as 0 rather than throwing on the missing field.
       return '**' + (index + 1) + '. <@' + row.user_id + '>** — Activity: ' + activityPoints + ' • Streak: ' + (row.activity_streak || 0) + ' • Tier: ' + getActivityTier(activityPoints);
     }).join(NL)
   );
@@ -25114,7 +25482,7 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
       const { payout, feeAmount } = computeSportsbookNetPayout(bet.potential_payout, bet.amount);
       await addCurrency(interaction.guild.id, bet.user_id, payout, 'sportsbook_win', 'Auto-settled bet: ' + sportsbookGame.game_label + (feeAmount ? ` (booking fee ${feeAmount} burned)` : ''), interaction.user.id);
       await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
-      await addActivityPoints(interaction.guild.id, bet.user_id, 5, 2).catch(() => null);
+      await addActivityPoints(interaction.guild.id, bet.user_id, 5, 1, sportsbookGame.league_id).catch(() => null);
       winners += 1;
       totalPaid += payout;
     } else {
@@ -25297,7 +25665,7 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
           'Game played: ' + game.away_team_name + ' @ ' + game.home_team_name,
           interaction.user.id
         );
-        await addActivityPoints(interaction.guild.id, owner.id, 3, 0).catch(() => null);
+        await addActivityPoints(interaction.guild.id, owner.id, 3, 0, game.league_id).catch(() => null);
         payoutLines.push(settings.currency_icon + ' <@' + owner.id + '> earned **' + settings.game_played_payout + ' ' + settings.currency_name + '** for playing.');
       }
     }
@@ -25312,7 +25680,7 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
       'Game win: ' + winnerName,
       interaction.user.id
     );
-    await addActivityPoints(interaction.guild.id, winnerOwner.id, 5, 1).catch(() => null);
+    await addActivityPoints(interaction.guild.id, winnerOwner.id, 0, 2, game.league_id).catch(() => null);
     payoutLines.push(settings.currency_icon + ' <@' + winnerOwner.id + '> earned **' + settings.win_payout + ' ' + settings.currency_name + '** win bonus.');
   }
 
@@ -25908,7 +26276,7 @@ async function performSportsbookSettlement(guild, sportsbookGame, winner, actorU
       await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_wins', 1).catch(() => null);
       await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', payout - Number(bet.amount)).catch(() => null);
       await checkSportsbookAchievements(guild.id, bet.user_id, payout).catch(() => null);
-      await addRecognitionPoints(guild.id, bet.user_id, 10, 2).catch(() => null);
+      await addRecognitionPoints(guild.id, bet.user_id, 5, 1, sportsbookGame.league_id).catch(() => null);
       winningUserIds.add(bet.user_id);
       await pool.query(`UPDATE sportsbook_bets SET status = 'won', settled_at = NOW(), potential_payout = $2 WHERE id = $1`, [bet.id, payout]);
       winners += 1;
@@ -29660,6 +30028,10 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
   const activityIcon = getActivityTierIcon(activityTier);
   const normalizedActivityTier = normalizeActivityTierName(activityTier);
   const badgesDisplay = badges.length ? badges.map(badge => badge.badge_icon + ' **' + badge.badge_label + '**').join(String.fromCharCode(10)) : 'No badges unlocked yet.';
+  const universalGrade = await getUniversalActivityGrade(targetUser.id).catch(() => null);
+  const universalGradeDisplay = universalGrade
+    ? `**${universalGrade.grade}** • ${universalGrade.tier} • ${universalGrade.smallSample ? 'Not enough users yet for a reliable percentile' : `Top ${universalGrade.topPercent}% of GG Sports users`}`
+    : 'Not available';
 
   const embed = new EmbedBuilder()
     .setTitle('Franchise Hub • ' + targetUser.username)
@@ -29677,6 +30049,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'Parlays', value: 'Won: ' + String(parlays.won_parlays || 0) + ' • Settled: ' + String(parlays.settled_parlays || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(parlays.parlay_profit || 0), inline: false },
       { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • MVPs: ' + String(tournaments.tournament_mvps || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
       { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false },
+      { name: '🌐 Universal Activity Grade', value: universalGradeDisplay, inline: false },
       { name: 'Badges', value: badgesDisplay.slice(0, 1024), inline: false },
       { name: 'Stream', value: streamUrl || 'No stream linked. Use /linkstream to add one.', inline: false },
       { name: 'Avatar', value: 'Rendered below. Use `/avatar locker` to equip owned items, `/avatar shop` to buy more.', inline: false }
