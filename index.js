@@ -535,6 +535,23 @@ async function initDatabase() {
       PRIMARY KEY (league_id, team_name)
     )
   `);
+  // 7J-47PPG: real root cause of the PPG/PAPG discrepancy Hxxdie noticed on
+  // the game thread matchup preview. wins+losses+ties (what every PPG/PAPG
+  // computation in this codebase was dividing by) counts every game with a
+  // *resolved winner* — but a winner can be resolved from fallback flags
+  // (forceWin, homeWin/awayWin, etc.) even when a game has no real/valid
+  // score, per recalculateMaddenStandingsFromImportedGames below. Those
+  // games count toward wins+losses+ties but contribute ZERO points to
+  // points_for/points_against, since points only accumulate when
+  // hasRealScore is true. That mismatch inflates the games-played
+  // denominator relative to the points numerator, silently deflating every
+  // PPG/PAPG number below the true value whenever even one game in a season
+  // has a missing/malformed score — a real, plausible occurrence, given
+  // this same session already found evidence of score-import lag
+  // elsewhere. scored_games is the actual correct denominator: only
+  // incremented when a game had a real score that was actually added to
+  // points_for/points_against.
+  await pool.query(`ALTER TABLE madden_imported_team_stats ADD COLUMN IF NOT EXISTS scored_games INTEGER NOT NULL DEFAULT 0`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_players (
@@ -3011,6 +3028,20 @@ function buildCommands() {
         .setName('league')
         .setDescription('Show league-wide salary cap rankings')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
+
+    new SlashCommandBuilder()
+      .setName('maddenverify')
+      .setDescription('Data accuracy diagnostics — compare bot-computed values against EA source data')
+      .addSubcommand(sc => sc
+        .setName('player')
+        .setDescription('Show a player\'s raw imported season stat totals for cross-checking against EA')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc
+        .setName('standings')
+        .setDescription('Show a team\'s recomputed record plus the game-by-game breakdown that fed it')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('maddenplayer')
@@ -8149,7 +8180,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
-        if (['maddencap', 'maddenplayer', 'maddenteam', 'maddendiagnostics'].includes(commandName)) {
+        if (['maddencap', 'maddenplayer', 'maddenteam', 'maddendiagnostics', 'maddenverify'].includes(commandName)) {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
@@ -16638,6 +16669,32 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden cap command.' });
+      return;
+    }
+
+    if (interaction.commandName === 'maddenverify') {
+      if (!interaction.guild) return;
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+      const subcommand = interaction.options.getSubcommand(false);
+      const leagueName = interaction.options.getString('league');
+      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+      if (!activeLeague) {
+        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        return;
+      }
+      if (subcommand === 'player') {
+        const player = interaction.options.getString('player');
+        await interaction.editReply({ embeds: [await buildMaddenVerifyPlayerEmbed(interaction.guild.id, activeLeague, player)] });
+        return;
+      }
+      if (subcommand === 'standings') {
+        const team = interaction.options.getString('team');
+        await interaction.editReply({ embeds: [await buildMaddenVerifyStandingsEmbed(interaction.guild.id, activeLeague, team)] });
+        return;
+      }
+      await interaction.editReply({ content: 'Unknown Madden verify command.' });
       return;
     }
 
@@ -31355,7 +31412,7 @@ async function recalculateMaddenPowerRankings(guildId, leagueId) {
          ties,
          points_for,
          points_against,
-         GREATEST((wins + losses + ties), 1) AS games_played
+         GREATEST(COALESCE(NULLIF(scored_games, 0), wins + losses + ties), 1) AS games_played
        FROM madden_imported_team_stats
        WHERE guild_id = $1::text
          AND league_id::text = $2::text
@@ -31453,7 +31510,15 @@ function maddenRecordWinPct(row) {
   return games > 0 ? (wins + (ties * 0.5)) / games : 0;
 }
 
+// 7J-47PPG: was wins+losses+ties — see the schema comment on scored_games
+// above for why that's wrong specifically for PPG/PAPG math (it counts
+// games with no real score, which contribute 0 to points_for/points_against
+// but still inflated this denominator). Falls back to wins+losses+ties only
+// for rows that haven't been through a sync since this fix shipped yet
+// (scored_games would be 0/stale) — self-heals on the next sync.
 function maddenTeamGamesPlayed(row) {
+  const scoredGames = Number(row?.scored_games || 0);
+  if (scoredGames > 0) return scoredGames;
   return Math.max(1, Number(row?.wins || 0) + Number(row?.losses || 0) + Number(row?.ties || 0));
 }
 
@@ -31576,11 +31641,12 @@ function buildMaddenMatchupStoryline(homeName, awayName, home, away, homePower, 
 }
 
 function getMaddenMatchupTeamScore(team, powerRow) {
-  const wins = Number(team?.wins || 0);
-  const losses = Number(team?.losses || 0);
-  const ties = Number(team?.ties || 0);
   const pointDiff = Number(team?.points_for || 0) - Number(team?.points_against || 0);
-  const games = Math.max(1, wins + losses + ties);
+  // 7J-47PPG: was a local wins+losses+ties recomputation — same bug as
+  // maddenTeamGamesPlayed, and this feeds the actual prediction/win-
+  // probability score shown in the matchup preview, so it's not just a
+  // display issue here.
+  const games = maddenTeamGamesPlayed(team);
   const winPct = maddenRecordWinPct(team);
   const offenseRank = Number(powerRow?.offense_rank || 33);
   const defenseRank = Number(powerRow?.defense_rank || 33);
@@ -37086,7 +37152,7 @@ async function getMaddenTeamDetailedRanks(guildId, leagueId, teamName) {
          ties,
          points_for,
          points_against,
-         GREATEST((wins + losses + ties), 1) AS games_played
+         GREATEST(COALESCE(NULLIF(scored_games, 0), wins + losses + ties), 1) AS games_played
        FROM madden_imported_team_stats
        WHERE guild_id = $1::text
          AND league_id::text = $2::text
@@ -41844,6 +41910,133 @@ function maddenBydTopAttributesLine(attributes, limit = 12, position = null) {
   const entries = Object.entries(attrs).filter(([key, value]) => !['age','height','weight'].includes(key) && Number.isFinite(Number(value)) && Number(value) > 0).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, limit);
   if (!entries.length) return 'No detailed attributes found in the current import payload yet.';
   return entries.map(([key, value]) => `**${maddenBydAttributeLabel(key)}:** ${Number(value).toFixed(0)}`).join('\n');
+}
+
+// 7J-46VERIFY: Track H item 29 — data accuracy diagnostic tooling. Reuses
+// MADDEN_LEADER_CATEGORIES' own field definitions rather than a parallel
+// reimplementation, so this shows exactly the same numbers the rest of the
+// bot computes (league leaders, awards race) — the point is to compare
+// *that* against EA's own stat screen, not to introduce a second,
+// potentially-divergent calculation.
+async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
+  const statTypeFields = new Map();
+  for (const category of Object.values(MADDEN_LEADER_CATEGORIES)) {
+    if (!statTypeFields.has(category.statType)) statTypeFields.set(category.statType, new Map());
+    const fieldMap = statTypeFields.get(category.statType);
+    for (const [alias, jsonKey] of Object.entries(category.fields || {})) {
+      fieldMap.set(alias, jsonKey);
+    }
+  }
+
+  const results = [];
+  for (const [statType, fieldMap] of statTypeFields.entries()) {
+    const fields = Array.from(fieldMap.entries());
+    if (!fields.length) continue;
+    const fieldSql = fields.map(([alias, jsonKey]) => `SUM(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
+    const result = await pool.query(
+      `SELECT ${fieldSql}, COUNT(DISTINCT display_week) AS weeks_counted
+       FROM madden_player_weekly_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3 AND LOWER(full_name) = LOWER($4)`,
+      [guildId, String(leagueId), statType, playerName]
+    ).catch(() => ({ rows: [] }));
+    const row = result.rows[0];
+    if (!row) continue;
+    const hasData = Object.keys(row).some(key => key !== 'weeks_counted' && Number(row[key]) > 0);
+    if (hasData) results.push({ statType, fields, ...row });
+  }
+  return results;
+}
+
+async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
+  const resolved = await getMaddenExpandedPlayerRow(guildId, league.league_id, playerInput);
+  const canonicalName = resolved?.player_name || playerInput;
+  const statRows = await getMaddenPlayerRawStatTotals(guildId, league.league_id, canonicalName);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🔎 Data Verify • ${canonicalName}`)
+    .setColor(0x5865F2)
+    .setDescription(
+      'Raw imported season totals — summed directly from every weekly stat row the bot has stored for this player, ' +
+      'the exact same numbers used by League Leaders and the Award Race. Compare each line against this player\'s ' +
+      'season stat screen in the Madden Companion App or in-game to confirm the import is accurate.'
+    )
+    .setFooter({ text: 'GG Sports • Track H #29 Data Accuracy Verification' })
+    .setTimestamp();
+
+  if (resolved) {
+    embed.addFields({ name: 'Roster Info', value: `Team: **${maddenTeamDisplayName(resolved.team_name || 'Free Agent')}** • Position: **${resolved.position || 'N/A'}** • OVR: **${resolved.overall ?? 'N/A'}**`, inline: false });
+  }
+
+  if (!statRows.length) {
+    embed.addFields({ name: 'No stat rows found', value: `No imported weekly stats found for **${canonicalName}** yet. Run a sync after games have been played, or double-check the name spelling.`, inline: false });
+    return embed;
+  }
+
+  for (const row of statRows) {
+    const lines = row.fields.map(([alias]) => `${alias}: **${formatMaddenLeaderNumber(row[alias])}**`).join(' | ');
+    embed.addFields({ name: `${row.statType.charAt(0).toUpperCase()}${row.statType.slice(1)} (${row.weeks_counted} week${row.weeks_counted === '1' ? '' : 's'} counted)`, value: lines, inline: false });
+  }
+
+  return embed;
+}
+
+async function buildMaddenVerifyStandingsEmbed(guildId, league, teamInput) {
+  const teamName = await resolveMaddenTeamNameFromImport(guildId, league.league_id, teamInput).catch(() => teamInput);
+
+  const recordResult = await pool.query(
+    `SELECT wins, losses, ties, points_for, points_against FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(team_name) = LOWER($3)
+     ORDER BY imported_at DESC LIMIT 1`,
+    [guildId, String(league.league_id), teamName]
+  ).catch(() => ({ rows: [] }));
+  const record = recordResult.rows[0];
+
+  const gamesResult = await pool.query(
+    `SELECT week_label, home_team, away_team, home_score, away_score, status
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+       AND (LOWER(home_team) = LOWER($3) OR LOWER(away_team) = LOWER($3))
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+     ORDER BY week_label`,
+    [guildId, league.league_id, teamName]
+  ).catch(() => ({ rows: [] }));
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🔎 Data Verify • ${maddenTeamDisplayName(teamName)} Standings`)
+    .setColor(0x5865F2)
+    .setDescription(
+      'The bot **recomputes** standings from individual imported game results every sync (not a direct mirror of ' +
+      'EA\'s own team record field) — this is exactly the game-by-game breakdown that fed the record below. ' +
+      'Cross-check each result against the real schedule/results screen in Madden to confirm nothing was double-' +
+      'counted, missed, or mis-scored.'
+    )
+    .setFooter({ text: 'GG Sports • Track H #29 Data Accuracy Verification' })
+    .setTimestamp();
+
+  embed.addFields({
+    name: 'Bot-Computed Record',
+    value: record
+      ? `**${record.wins}-${record.losses}${Number(record.ties) ? `-${record.ties}` : ''}** • PF: ${record.points_for} • PA: ${record.points_against}`
+      : 'No record found for this team.',
+    inline: false,
+  });
+
+  if (!gamesResult.rows.length) {
+    embed.addFields({ name: 'No completed games found', value: 'No completed games are currently imported for this team.', inline: false });
+    return embed;
+  }
+
+  const gameLines = gamesResult.rows.map(g => {
+    const isHome = String(g.home_team).toLowerCase() === teamName.toLowerCase();
+    const opponent = isHome ? g.away_team : g.home_team;
+    const ownScore = isHome ? g.home_score : g.away_score;
+    const oppScore = isHome ? g.away_score : g.home_score;
+    const result = ownScore > oppScore ? 'W' : ownScore < oppScore ? 'L' : 'T';
+    return `${g.week_label || '?'}: **${result}** ${ownScore}-${oppScore} vs ${maddenTeamDisplayName(opponent)} ${isHome ? '(Home)' : '(Away)'}`;
+  });
+  embed.addFields({ name: `Completed Games Counted (${gameLines.length})`, value: maddenSafeEmbedText(gameLines.join('\n'), 3900), inline: false });
+
+  return embed;
 }
 
 async function buildMaddenPlayerAttributesEmbed(guildId, league, playerInput) {
@@ -49550,7 +49743,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     getMaddenTopRecordLeaders(guildId, leagueId, 'interceptions', 3),
     getMaddenTopRecordLeaders(guildId, leagueId, 'tackles', 3),
     pool.query(
-      `SELECT *, GREATEST((wins + losses + ties), 1) AS games_played
+      `SELECT *, GREATEST(COALESCE(NULLIF(scored_games, 0), wins + losses + ties), 1) AS games_played
        FROM madden_imported_team_stats
        WHERE guild_id = $1::text
          AND league_id::text = $2::text`,
@@ -58128,6 +58321,7 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
         points_for: 0,
         points_against: 0,
         games_played: 0,
+        scored_games: 0,
       });
     }
     return records.get(key);
@@ -58152,6 +58346,14 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
 
     home.games_played += 1;
     away.games_played += 1;
+    // 7J-47PPG: scored_games only increments in lockstep with the points_for/
+    // points_against accumulation directly below (both gated on
+    // hasRealScore) — this is what keeps the PPG/PAPG numerator and
+    // denominator honest with each other.
+    if (hasRealScore) {
+      home.scored_games += 1;
+      away.scored_games += 1;
+    }
 
     let winner = null;
 
@@ -58200,6 +58402,7 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
       points_for: 0,
       points_against: 0,
       games_played: 0,
+      scored_games: 0,
     };
 
     await pool.query(
@@ -58208,13 +58411,14 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
            losses = $4,
            ties = $5,
            points_for = CASE
-             WHEN $6 > 0 OR $7 > 0 THEN $6
+             WHEN $9 > 0 THEN $6
              ELSE madden_imported_team_stats.points_for
            END,
            points_against = CASE
-             WHEN $6 > 0 OR $7 > 0 THEN $7
+             WHEN $9 > 0 THEN $7
              ELSE madden_imported_team_stats.points_against
            END,
+           scored_games = $9,
            imported_at = NOW()
        WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($8)`,
       [
@@ -58226,6 +58430,7 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
         record.points_for,
         record.points_against,
         row.team_name,
+        record.scored_games,
       ]
     );
 
@@ -60625,7 +60830,7 @@ async function autoDetectMaddenRetirements(guild, league) {
 // ---------------------------------------------------------------------------
 async function getMaddenTeamStandingsForOdds(guildId, leagueId, teamName) {
   const result = await pool.query(
-    `SELECT wins, losses, ties, points_for, points_against
+    `SELECT wins, losses, ties, points_for, points_against, scored_games
      FROM madden_imported_team_stats
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND LOWER(team_name) = LOWER($3)
@@ -60703,8 +60908,14 @@ async function generateMaddenMatchupOdds(guildId, league, homeTeamName, awayTeam
   homeScore += (homeWinPct - awayWinPct) * 35;
 
   // Point differential per game (weight 0.06)
-  const homeGames = homeStandings ? Math.max(homeStandings.wins + homeStandings.losses + homeStandings.ties, 1) : 1;
-  const awayGames = awayStandings ? Math.max(awayStandings.wins + awayStandings.losses + awayStandings.ties, 1) : 1;
+  // 7J-47PPG: was Math.max(wins+losses+ties, 1) — the same games-played bug
+  // as the matchup preview PPG/PAPG fields, except here it's silently
+  // skewing the actual sportsbook spread/odds a member bets real currency
+  // against, not just a display number. Uses maddenTeamGamesPlayed's
+  // scored_games (with its own wins+losses+ties fallback for teams that
+  // haven't synced since this fix shipped).
+  const homeGames = maddenTeamGamesPlayed(homeStandings);
+  const awayGames = maddenTeamGamesPlayed(awayStandings);
   homeScore += (pointDiff(homeStandings) / homeGames - pointDiff(awayStandings) / awayGames) * 0.6;
 
   // Power rank (weight 1.5 — lower rank = better, so invert)
