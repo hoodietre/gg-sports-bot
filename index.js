@@ -497,6 +497,15 @@ async function initDatabase() {
   // thread feature (see maybePostGameThreadOwnersAvatar) — prevents re-posting on
   // every subsequent role change once it's already gone out for a given game.
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS owners_avatar_posted BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-49MADDEN: Track H item 26 extension — per Hxxdie, Madden games get
+  // the same "Game Started" mechanism as Game Center, even though Madden
+  // settles automatically via sync rather than a manual Report Score click.
+  // This is also being used as a real vs. simulated game filter: EA's sync
+  // data has no signal distinguishing a game a human actually played from
+  // one the franchise auto-simmed, so requiring this button before any
+  // reward is possible becomes that missing signal.
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS game_started_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS game_started_by_user_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
@@ -1364,6 +1373,13 @@ async function initDatabase() {
     )
   `);
   await pool.query(`ALTER TABLE league_games ADD COLUMN IF NOT EXISTS thread_id TEXT`);
+  // 7J-48LOCK: Track H item 26 — anti-late-betting exploit. Authoritative
+  // per-game record of whether "Game Started" was pressed, since a single
+  // league_game can have multiple associated sportsbook_games rows
+  // (moneyline + props) that all need to lock together off one source of
+  // truth rather than each tracking it independently.
+  await pool.query(`ALTER TABLE league_games ADD COLUMN IF NOT EXISTS game_started_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE league_games ADD COLUMN IF NOT EXISTS game_started_by_user_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS game_center_channel_id TEXT`);
 
   await pool.query(`
@@ -1733,6 +1749,16 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS prop_week_index INTEGER`);
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS prop_stage_index INTEGER`);
   await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS auto_settle_preview JSONB`);
+  // 7J-48LOCK: Track H item 26 — anti-late-betting exploit. Deliberately a
+  // separate bets_locked flag rather than a new 'status' value, so it
+  // doesn't disturb the many existing `status = 'open'` queries scattered
+  // through the sportsbook system — a locked game is still "open" in every
+  // other sense (still displayed, still awaiting settlement), just closed
+  // to new wagers.
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS game_started_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS game_started_by_user_id TEXT`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS bets_lock_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE sportsbook_games ADD COLUMN IF NOT EXISTS bets_locked BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sportsbook_games_league_game_id ON sportsbook_games(league_game_id)`);
 
 
@@ -7195,6 +7221,8 @@ client.once(Events.ClientReady, async () => {
     console.log('Madden autosync loop started.');
     startTradeThreadCleanupLoop(client);
     console.log('Trade negotiation thread cleanup loop started.');
+    startSportsbookBettingLockLoop(client);
+    console.log('Sportsbook betting-lock sweep loop started.');
     startExclusiveWindowSchedulerLoop();
     console.log('Exclusive window scheduler loop started.');
     startBirthdayChristmasGiftSchedulerLoop(client);
@@ -10093,6 +10121,10 @@ if (interaction.commandName === 'avatar') {
           await interaction.reply({ content: boundsCheck.message, ephemeral: true });
           return;
         }
+        if (sportsbookGame.bets_locked) {
+          await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
+          return;
+        }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
 
         if (!removed) {
@@ -10942,6 +10974,11 @@ if (interaction.commandName === 'avatar') {
         const sportsbookGame = await findSportsbookGame(interaction.guild.id, draftLeg.gameId);
         if (!sportsbookGame || sportsbookGame.status !== 'open') {
           await interaction.editReply({ content: `**${draftLeg.label}** is no longer open — start your parlay over.` });
+          clearParlayDraft(interaction.guild.id, interaction.user.id);
+          return;
+        }
+        if (sportsbookGame.bets_locked) {
+          await interaction.editReply({ content: `🔒 **${draftLeg.label}** — betting closed after "Game Started" was pressed. Start your parlay over without that leg.` });
           clearParlayDraft(interaction.guild.id, interaction.user.id);
           return;
         }
@@ -12062,10 +12099,78 @@ if (interaction.commandName === 'avatar') {
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, true),
+            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at)),
           }).catch(() => null);
         }
         if (league) await updateGameCenterPanel(interaction.guild, league).catch(() => null);
+      }
+      return;
+    }
+
+    // 7J-48LOCK: Track H item 26 — anti-late-betting exploit. Either team
+    // owner in the matchup OR staff can press this, per Hxxdie. Locks every
+    // sportsbook_games row tied to this league_game (moneyline + any props)
+    // to close in 15 minutes — not immediately, so people already watching
+    // the stream mid-game still get a fair warning window to get a last bet
+    // in before it locks, rather than the line vanishing without notice.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_gamestarted:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+
+      const league = await getLeagueById(game.league_id);
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const isTeamOwner = member && (member.roles.cache.has(game.home_team_role_id) || member.roles.cache.has(game.away_team_role_id));
+      const isStaff = league && await userCanUseLeagueSetup(interaction, league);
+      if (!isTeamOwner && !isStaff) {
+        await interaction.reply({ content: 'Only a team owner in this matchup or league staff can start the clock on this game.', ephemeral: true });
+        return;
+      }
+
+      if (game.game_started_at) {
+        await interaction.reply({ content: 'This game was already marked as started.', ephemeral: true });
+        return;
+      }
+      if (game.status === 'final') {
+        await interaction.reply({ content: 'This game has already been reported.', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+
+      const lockAt = new Date(Date.now() + 15 * 60 * 1000);
+      await pool.query(
+        `UPDATE league_games SET game_started_at = NOW(), game_started_by_user_id = $2, updated_at = NOW() WHERE id = $1`,
+        [game.id, interaction.user.id]
+      );
+      const lockedGamesResult = await pool.query(
+        `UPDATE sportsbook_games
+         SET game_started_at = NOW(), game_started_by_user_id = $3, bets_lock_at = $2
+         WHERE guild_id = $1 AND league_game_id = $4 AND status = 'open'
+         RETURNING id, game_label`,
+        [interaction.guild.id, lockAt, interaction.user.id, game.id]
+      );
+
+      const lockEmbed = new EmbedBuilder()
+        .setTitle('🔒 Game Started')
+        .setColor(0xFEE75C)
+        .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **15 minutes**.`)
+        .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [lockEmbed] });
+
+      if (lockedGamesResult.rows.length) {
+        await postSportsbookFeed(interaction.guild, lockEmbed).catch(() => null);
+      }
+
+      const updatedGame = await findLeagueGameById(interaction.guild.id, gameId);
+      const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+      const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+      if (interaction.channel?.isThread?.()) {
+        await interaction.channel.send({
+          embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
+          components: buildGameCenterThreadComponents(gameId, false, true),
+        }).catch(() => null);
       }
       return;
     }
@@ -12091,7 +12196,7 @@ if (interaction.commandName === 'avatar') {
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, false),
+            components: buildGameCenterThreadComponents(gameId, false, false),
           }).catch(() => null);
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -12142,7 +12247,7 @@ if (interaction.commandName === 'avatar') {
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, true),
+            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at)),
           }).catch(() => null);
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -21116,6 +21221,10 @@ if (shopSubcommand === 'view') {
           await interaction.reply({ content: 'Sportsbook game **' + sportsbookGame.game_label + '** is not open for betting.', ephemeral: true });
           return;
         }
+        if (sportsbookGame.bets_locked) {
+          await interaction.reply({ content: '🔒 Sportsbook game **' + sportsbookGame.game_label + '** — betting closed after "Game Started" was pressed.', ephemeral: true });
+          return;
+        }
         if (usedGameIds.has(sportsbookGame.id)) {
           await interaction.reply({ content: 'You cannot use the same game twice in one parlay.', ephemeral: true });
           return;
@@ -21520,6 +21629,10 @@ if (shopSubcommand === 'view') {
         if (sportsbookBounds.max_payout != null && payout > sportsbookBounds.max_payout) {
           payout = sportsbookBounds.max_payout;
         }
+        if (sportsbookGame.bets_locked) {
+          await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
+          return;
+        }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
 
         if (!removed) {
@@ -21627,6 +21740,10 @@ if (shopSubcommand === 'view') {
             await interaction.reply({ content: 'Could not find open sportsbook game **' + legInput.game + '**.', ephemeral: true });
             return;
           }
+          if (sportsbookGame.bets_locked) {
+            await interaction.reply({ content: '🔒 Sportsbook game **' + sportsbookGame.game_label + '** — betting closed after "Game Started" was pressed.', ephemeral: true });
+            return;
+          }
           if (usedGameIds.has(sportsbookGame.id)) {
             await interaction.reply({ content: 'You cannot use the same game twice in one parlay.', ephemeral: true });
             return;
@@ -21710,6 +21827,10 @@ if (shopSubcommand === 'view') {
       const sportsbookBoundsCheck = await validateSportsbookBetAmount(interaction.guild.id, amount, payout);
       if (!sportsbookBoundsCheck.ok) {
         await interaction.reply({ content: sportsbookBoundsCheck.message, ephemeral: true });
+        return;
+      }
+      if (sportsbookGame.bets_locked) {
+        await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
         return;
       }
       const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
@@ -25485,7 +25606,8 @@ async function resetSportsbookForLeagueGame(guild, leagueGame, issuedByUserId, r
 
   await pool.query(
     `UPDATE sportsbook_games
-     SET status = 'open', winner_side = NULL, settled_at = NULL, settled_by_game_report = FALSE
+     SET status = 'open', winner_side = NULL, settled_at = NULL, settled_by_game_report = FALSE,
+         game_started_at = NULL, game_started_by_user_id = NULL, bets_lock_at = NULL, bets_locked = FALSE
      WHERE id = $1`,
     [sportsbookGame.id]
   );
@@ -25774,12 +25896,49 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
     payoutLines.push(settings.currency_icon + ' <@' + winnerOwner.id + '> earned **' + settings.win_payout + ' ' + settings.currency_name + '** win bonus.');
   }
 
-  const sportsbookSettlement = isTie
-    ? null
-    : await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => {
-        console.error('Auto sportsbook settlement failed:', error);
-        return null;
-      });
+  // 7J-48LOCK: Track H item 26 — anti-late-betting exploit enforcement.
+  // Per Hxxdie's explicit call: if "Game Started" was never pressed before
+  // this report, don't settle bets normally at all — refund every open bet
+  // on this game and warn both team owners. The friction of manually
+  // pressing one button before playing is an acceptable ask, given how much
+  // of this bot is already automated for members.
+  const openSportsbookGamesForThisGame = !isTie
+    ? await pool.query(
+        `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND league_game_id = $2 AND status = 'open'`,
+        [interaction.guild.id, game.id]
+      ).catch(() => ({ rows: [] }))
+    : { rows: [] };
+
+  let sportsbookSettlement = null;
+  let lateBettingWarningNote = '';
+
+  if (!isTie && !game.game_started_at && openSportsbookGamesForThisGame.rows.length) {
+    let totalRefunded = 0;
+    let totalBets = 0;
+    for (const sbGame of openSportsbookGamesForThisGame.rows) {
+      const refundResult = await refundSportsbookGameBets(
+        interaction.guild,
+        sbGame,
+        interaction.user.id,
+        '"Game Started" was never pressed before this game was reported — refunded to protect against late-betting exploitation.'
+      ).catch(() => ({ refundedCount: 0, refundedAmount: 0 }));
+      totalRefunded += refundResult.refundedAmount;
+      totalBets += refundResult.refundedCount;
+    }
+    const ownerMentions = [homeOwner?.id, awayOwner?.id].filter(Boolean).map(id => `<@${id}>`).join(' ');
+    lateBettingWarningNote = String.fromCharCode(10)
+      + '⚠️ **' + totalBets + ' sportsbook bet(s) totaling ' + settings.currency_icon + ' ' + totalRefunded
+      + ' were refunded** — "Game Started" was never pressed before this game was reported, so betting was never protected against someone watching the stream and betting on a known outcome. '
+      + (ownerMentions ? ownerMentions + ' — ' : '')
+      + 'please press **Game Started** before playing next time.';
+  } else {
+    sportsbookSettlement = isTie
+      ? null
+      : await autoSettleSportsbookForLeagueGame(interaction, game, homeWins ? 'home' : 'away').catch(error => {
+          console.error('Auto sportsbook settlement failed:', error);
+          return null;
+        });
+  }
   const tieSportsbookNote = isTie ? String.fromCharCode(10) + 'This game was a tie, so any sportsbook bets on it were left open — settle manually if this league books ties.' : '';
 
   const sportsbookText = sportsbookSettlement
@@ -25797,7 +25956,7 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
     ok: true,
     isTie,
     winnerName,
-    message: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. ' + resultText + payoutText + sportsbookText + tieSportsbookNote + otlIgnoredNote,
+    message: 'Game reported: **' + game.home_team_name + ' ' + homeScore + ' - ' + awayScore + ' ' + game.away_team_name + '**. ' + resultText + payoutText + sportsbookText + tieSportsbookNote + otlIgnoredNote + lateBettingWarningNote,
   };
 }
 
@@ -25945,6 +26104,8 @@ async function resetLeagueGameCore(interaction, game, reason = 'Game reset') {
          away_score = NULL,
          winner_team_role_id = NULL,
          reported_by_user_id = NULL,
+         game_started_at = NULL,
+         game_started_by_user_id = NULL,
          updated_at = NOW()
      WHERE id = $1`,
     [game.id]
@@ -26040,9 +26201,10 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
   return embed;
 }
 
-function buildGameCenterThreadComponents(gameId, isFinal) {
+function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false) {
   return [
     new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gamecenter_gamestarted:' + gameId).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
       new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
       new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
     ),
@@ -40441,14 +40603,20 @@ function maddenGameHasRealScore(game) {
   return Number(away || 0) !== 0 || Number(home || 0) !== 0;
 }
 
-function buildMaddenGameThreadButtons(gameId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`maddengame_thread_game:${gameId}`).setLabel('Game Center').setEmoji('🏈').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`maddengame_thread_preview:${gameId}`).setLabel('Matchup Preview').setEmoji('🔍').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`maddengame_thread_compare:${gameId}`).setLabel('Team Comparison').setEmoji('📊').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`maddengame_thread_issue:${gameId}`).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger)
-  );
+function buildMaddenGameThreadButtons(gameId, isStarted = false, isFinal = false) {
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`maddengame_thread_gamestarted:${gameId}`).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`maddengame_thread_game:${gameId}`).setLabel('Game Center').setEmoji('🏈').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`maddengame_thread_preview:${gameId}`).setLabel('Matchup Preview').setEmoji('🔍').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`maddengame_thread_compare:${gameId}`).setLabel('Team Comparison').setEmoji('📊').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`maddengame_thread_issue:${gameId}`).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger)
+    ),
+  ];
+  return rows;
 }
 
 function buildMaddenGameThreadEmbed(league, game, owners = {}) {
@@ -40738,7 +40906,7 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
       if (!thread && baseChannel.send) {
         const starter = await baseChannel.send({
           embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
-          components: [buildMaddenGameThreadButtons(game.id)],
+          components: buildMaddenGameThreadButtons(game.id),
           allowedMentions: { users: [], roles: [] },
         });
         thread = await starter.startThread({
@@ -40760,7 +40928,7 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
           ? `${mentionIds.map(id => `<@${id}>`).join('\n')} your **${game.week_label || weekLabel}** game thread is ready: **${label}**.`
           : `Game thread created for **${label}**.`,
         embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
-        components: [buildMaddenGameThreadButtons(game.id)],
+        components: buildMaddenGameThreadButtons(game.id),
         allowedMentions: { users: mentionIds, roles: [] },
       }).catch(() => null);
       await pool.query(
@@ -41027,6 +41195,63 @@ async function handleMaddenGameThreadButton(interaction) {
   }
   if (action === 'issue') {
     await interaction.reply({ content: 'Use `/ticket game` in this thread to report a Madden game issue. Future versions will open this ticket automatically from the button.', ephemeral: true });
+    return;
+  }
+  // 7J-49MADDEN: Track H item 26 extension. Same permission model as Game
+  // Center (team owner in the matchup or staff), but this locks Madden's
+  // sportsbook line and, critically, doubles as the real-vs-simulated-game
+  // signal EA's sync data has no equivalent for — see
+  // autoSettleMaddenSportsbookBet below for the actual enforcement.
+  if (action === 'gamestarted') {
+    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+    const isTeamOwner = member && (member.roles.cache.has(game.home_team_role_id) || member.roles.cache.has(game.away_team_role_id));
+    const isStaff = await userCanUseLeagueSetup(interaction, league);
+    if (!isTeamOwner && !isStaff) {
+      await safeReply({ content: 'Only a team owner in this matchup or league staff can start the clock on this game.', ephemeral: true });
+      return;
+    }
+    if (game.game_started_at) {
+      await safeReply({ content: 'This game was already marked as started.', ephemeral: true });
+      return;
+    }
+    if (maddenGameHasRealScore(game)) {
+      await safeReply({ content: 'This game already has a reported result.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    const lockAt = new Date(Date.now() + 15 * 60 * 1000);
+    await pool.query(
+      `UPDATE madden_imported_games SET game_started_at = NOW(), game_started_by_user_id = $2 WHERE id = $1`,
+      [game.id, interaction.user.id]
+    );
+    if (game.sportsbook_game_id) {
+      await pool.query(
+        `UPDATE sportsbook_games SET game_started_at = NOW(), game_started_by_user_id = $2, bets_lock_at = $3
+         WHERE id = $1 AND status = 'open'`,
+        [game.sportsbook_game_id, interaction.user.id, lockAt]
+      ).catch(() => null);
+    }
+
+    const lockEmbed = new EmbedBuilder()
+      .setTitle('🔒 Game Started')
+      .setColor(0xFEE75C)
+      .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **15 minutes**.`)
+      .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
+      .setTimestamp();
+    await interaction.editReply({ embeds: [lockEmbed] });
+    if (game.sportsbook_game_id) {
+      await postSportsbookFeed(interaction.guild, lockEmbed).catch(() => null);
+    }
+
+    if (interaction.channel?.isThread?.()) {
+      const updatedGame = await getMaddenImportedGameById(gameId);
+      await interaction.channel.send({
+        embeds: [buildMaddenGameThreadEmbed(league, updatedGame, owners)],
+        components: buildMaddenGameThreadButtons(gameId, true, maddenGameHasRealScore(updatedGame)),
+      }).catch(() => null);
+    }
     return;
   }
   await interaction.reply({ content: 'Unknown game thread action.', ephemeral: true });
@@ -59858,6 +60083,61 @@ function startTradeThreadCleanupLoop(client) {
   setTimeout(() => cleanupInactiveTradeNegotiationThreads(client).catch(() => null), 60 * 1000);
 }
 
+// 7J-48LOCK: Track H item 26 — anti-late-betting exploit. Sweeps for any
+// sportsbook_games whose 15-minute bets_lock_at window has passed and
+// finalizes the lock. Deliberately a persisted-timestamp + periodic-sweep
+// pattern rather than a per-game in-memory setTimeout — a 15-minute
+// in-memory timer could get silently dropped by a bot restart/redeploy
+// mid-window, which is an unacceptable failure mode for something with
+// real financial-integrity stakes (unlike, say, the voice-activity
+// tracking earlier this session, where losing a partial session on
+// restart is a low-stakes, acceptable tradeoff). This self-heals
+// regardless of restarts, since it's driven off a real DB timestamp
+// checked every minute.
+let sportsbookBettingLockTimer = null;
+
+async function sweepSportsbookBettingLocks(client) {
+  const dueResult = await pool.query(
+    `SELECT id, guild_id, league_id, game_label
+     FROM sportsbook_games
+     WHERE status = 'open' AND bets_locked = FALSE AND bets_lock_at IS NOT NULL AND bets_lock_at <= NOW()`
+  ).catch(() => ({ rows: [] }));
+
+  if (!dueResult.rows.length) return;
+
+  await pool.query(
+    `UPDATE sportsbook_games SET bets_locked = TRUE
+     WHERE status = 'open' AND bets_locked = FALSE AND bets_lock_at IS NOT NULL AND bets_lock_at <= NOW()`
+  ).catch(error => console.error('[7J-48LOCK] Failed to finalize betting locks:', error?.message || error));
+
+  const byGuild = new Map();
+  for (const row of dueResult.rows) {
+    if (!byGuild.has(row.guild_id)) byGuild.set(row.guild_id, []);
+    byGuild.get(row.guild_id).push(row);
+  }
+
+  for (const [guildId, rows] of byGuild.entries()) {
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) continue;
+    const lines = rows.map(r => `🔒 ${r.game_label}`).join('\n');
+    const embed = new EmbedBuilder()
+      .setTitle('🔒 Betting Closed')
+      .setColor(0xED4245)
+      .setDescription(lines.slice(0, 3900))
+      .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
+      .setTimestamp();
+    await postSportsbookFeed(guild, embed).catch(() => null);
+  }
+}
+
+function startSportsbookBettingLockLoop(client) {
+  if (sportsbookBettingLockTimer) clearInterval(sportsbookBettingLockTimer);
+  sportsbookBettingLockTimer = setInterval(() => {
+    sweepSportsbookBettingLocks(client).catch(error => console.error('[7J-48LOCK] sweep tick failed:', error?.message || error));
+  }, 60 * 1000); // Every minute — this IS time-sensitive, unlike the 6-hour housekeeping loop above.
+  setTimeout(() => sweepSportsbookBettingLocks(client).catch(() => null), 15 * 1000);
+}
+
 // ---------------------------------------------------------------------------
 // Bot owner monitoring — /botowner, restricted to botOwnerUserId.
 // ---------------------------------------------------------------------------
@@ -61305,6 +61585,24 @@ async function autoSettleMaddenSportsbookBet(guild, league, maddenGame) {
     // Tie — refund rather than silently leave every bet sitting open forever.
     await refundSportsbookGameBets(guild, sportsbookGame, 'system', 'Game ended in a tie').catch(err =>
       console.error('[MADDEN SPORTSBOOK SETTLE] Tie refund failed:', err?.message));
+    return;
+  }
+
+  // 7J-49MADDEN: Track H item 26 extension, per Hxxdie. If "Game Started"
+  // was never pressed, refund every bet instead of settling — this is the
+  // real vs. simulated game filter: EA's sync data carries no signal
+  // distinguishing a game a human actually played from one the franchise
+  // auto-simmed, so requiring this button before any payout is possible
+  // becomes that missing signal. Members get nothing at all for a
+  // simulated game, exactly as intended — no win/loss settlement, bet
+  // amount just comes back.
+  if (!maddenGame.game_started_at) {
+    await refundSportsbookGameBets(
+      guild,
+      sportsbookGame,
+      'system',
+      '"Game Started" was never pressed before this game completed — refunded rather than settled, since this may have been a simulated game rather than one actually played.'
+    ).catch(err => console.error('[MADDEN SPORTSBOOK SETTLE] Unstarted-game refund failed:', err?.message));
     return;
   }
 
