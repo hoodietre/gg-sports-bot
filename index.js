@@ -4535,18 +4535,19 @@ async function findTeamOwnerByRoleId(guild, roleId) {
   const cachedOwner = role.members.find(member => !member.user.bot);
   if (cachedOwner) return cachedOwner;
 
-  // 7J-66OWNERFALLBACK: same root cause as the Teams & Leagues and Team
-  // Owners panel bugs fixed earlier this session — this only ever checked
-  // Discord role possession/cache, never the actual ownership record
-  // (madden_imported_team_stats.owner_user_id). Confirmed exactly this
-  // scenario in Active Check: a real owner (Cardinals) missing from the
-  // check-in list because their Discord role wasn't assigned/cached, even
-  // though the DB correctly records them as the owner. Falls back to a
-  // guild member fetch for that ID — a single targeted fetch, not a
-  // guild-wide one, so the rate-limit concern in the comment below doesn't
-  // apply here.
+  // 7J-66OWNERFALLBACK (corrected): matches the established pattern from
+  // isMaddenUserVsUserGame earlier this session — checks both
+  // madden_franchises (the real source of truth for bot-assigned
+  // ownership) and madden_imported_team_stats (near-always NULL since EA
+  // sync has no concept of Discord accounts, but checked anyway in case a
+  // team was assigned through a different flow that did populate it).
+  // Falls back to a single targeted member fetch, not a guild-wide one, so
+  // the rate-limit concern in the comment below doesn't apply here.
   const dbOwnerResult = await pool.query(
-    `SELECT owner_user_id FROM madden_imported_team_stats WHERE guild_id = $1 AND team_role_id = $2 AND owner_user_id IS NOT NULL LIMIT 1`,
+    `SELECT owner_user_id FROM madden_franchises WHERE guild_id = $1 AND team_role_id = $2 AND owner_user_id IS NOT NULL
+     UNION ALL
+     SELECT owner_user_id FROM madden_imported_team_stats WHERE guild_id = $1 AND team_role_id = $2 AND owner_user_id IS NOT NULL
+     LIMIT 1`,
     [guild.id, roleId]
   ).catch(() => ({ rows: [] }));
   const dbOwnerId = dbOwnerResult.rows[0]?.owner_user_id;
@@ -4712,18 +4713,18 @@ async function buildTeamOwnersEmbed(guild, league = null) {
   const lines = [];
   const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : null;
 
-  // 7J-65TEAMOWNERS: same root cause as the Teams & Leagues member profile
-  // bug fixed earlier this session — this previously relied entirely on
-  // Discord role possession, never the actual ownership record
-  // (madden_imported_team_stats.owner_user_id) that the game thread owner
-  // lines and GM panel already trust. A commissioner can record ownership
-  // in the DB without the matching Discord role ever being assigned, and
-  // the two drift apart — confirmed exactly this: only the one owner whose
-  // role happened to be assigned showed up, out of 6 real owners.
+  // 7J-65TEAMOWNERS (corrected): matches the established pattern from
+  // isMaddenUserVsUserGame earlier this session — checks both
+  // madden_franchises (the real source of truth) and
+  // madden_imported_team_stats (near-always NULL, but checked anyway in
+  // case a team was assigned through a different flow).
   const dbOwnersByRole = new Map();
   if (league?.league_id) {
     const ownedResult = await pool.query(
-      `SELECT team_role_id, owner_user_id FROM madden_imported_team_stats
+      `SELECT team_role_id, owner_user_id FROM madden_franchises
+       WHERE guild_id = $1 AND league_id::text = $2::text AND owner_user_id IS NOT NULL AND team_role_id IS NOT NULL
+       UNION
+       SELECT team_role_id, owner_user_id FROM madden_imported_team_stats
        WHERE guild_id = $1 AND league_id::text = $2::text AND owner_user_id IS NOT NULL AND team_role_id IS NOT NULL`,
       [guild.id, String(league.league_id)]
     ).catch(() => ({ rows: [] }));
@@ -13033,7 +13034,10 @@ if (interaction.commandName === 'avatar') {
     // 7J-63HUBTEAM: team-picker, only shown/wired when the Hub view is
     // active — per Hxxdie, the Hub previously had no way to browse teams
     // at all, always showing whichever team happened to update most recently.
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madfranchisehub:team:')) {
+    // Matches both 'madfranchisehub:team:' and 'madfranchisehub:team2:'
+    // (the second menu from the 25-option split above) — same handler
+    // works for either since leagueId sits at the same split index in both.
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madfranchisehub:team')) {
       const leagueId = interaction.customId.split(':')[2];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
@@ -30893,19 +30897,24 @@ async function getMemberLeagueMemberships(guildId, userId) {
     }
   }
 
-  // 7J-64TEAMSLEAGUES: DB-record-based — the actual ownership record
-  // (madden_imported_team_stats.owner_user_id), the same one every other
-  // owner-facing display in the bot already trusts (game thread owner
-  // lines, GM panel, etc). Needed because a commissioner can record
-  // ownership here without necessarily also assigning the matching Discord
-  // role, and the two can drift out of sync — confirmed exactly this
-  // scenario: a real owner correctly shown everywhere else, but missing
-  // entirely from this role-only check.
+  // 7J-64TEAMSLEAGUES (corrected): matches the established pattern from
+  // isMaddenUserVsUserGame earlier this session — checks both
+  // madden_franchises (the real source of truth) and
+  // madden_imported_team_stats (near-always NULL, but checked anyway in
+  // case a team was assigned through a different flow).
   const ownedResult = await pool.query(
-    `SELECT DISTINCT l.league_id, l.league_name, l.game, mts.team_role_id AS role_id, mts.team_name AS role_name
-     FROM madden_imported_team_stats mts
-     JOIN leagues l ON l.league_id::text = mts.league_id::text
-     WHERE mts.guild_id = $1 AND l.is_active = TRUE AND mts.owner_user_id = $2
+    `SELECT DISTINCT l.league_id, l.league_name, l.game, owned.role_id, owned.role_name
+     FROM (
+       SELECT league_id, team_role_id AS role_id, team_name AS role_name, owner_user_id
+       FROM madden_franchises
+       WHERE guild_id = $1 AND owner_user_id = $2
+       UNION
+       SELECT league_id, team_role_id AS role_id, team_name AS role_name, owner_user_id
+       FROM madden_imported_team_stats
+       WHERE guild_id = $1 AND owner_user_id = $2
+     ) owned
+     JOIN leagues l ON l.league_id::text = owned.league_id::text
+     WHERE l.is_active = TRUE
      ORDER BY l.league_name ASC`,
     [String(guildId), String(userId)]
   ).catch(() => ({ rows: [] }));
@@ -31465,6 +31474,7 @@ async function buildSetupDashboardEmbed(guild, league) {
   const channelKeyLabels = [
     ['live_channel', 'Streaming'],
     ['standings_channel', 'Standings'],
+    ['league_hof_channel', 'League Hall of Fame Board'],
     ['history_channel', 'League History'],
     ['madden_free_agents_channel', 'Madden Free Agents'],
     ['trade_block_channel', 'Trade Block Board'],
@@ -31485,6 +31495,7 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['madden_weekly_updates_channel', 'Weekly Updates'],
     ['madden_standings_channel', 'Madden Standings Board'],
     ['madden_power_rankings_channel', 'Madden Power Rankings Board'],
+    ['madden_franchise_hub_channel', 'Franchise Hub Board'],
     ['madden_sportsbook_channel', 'Madden Sportsbook'],
     ['sportsbook_channel', 'Sportsbook Feed'],
     ['tournament_channel', 'Tournament'],
@@ -46049,6 +46060,34 @@ function maddenHallOfFamePositionText(row) {
   return row?.resolved_position || row?.position || 'UNK';
 }
 
+// 7J-67HOFFIX: was referenced but never defined anywhere in the codebase —
+// a genuine pre-existing bug (confirmed via git-blame-equivalent: this
+// session never touched formatMaddenHallOfFameRow), which means the Hall
+// of Fame view has likely never worked, for any league, ever — the Franchise
+// Hub board just exposed it by actually being clicked for the first time.
+// Builds a career stat summary from whichever categories this player
+// actually has real career totals in (a player only shows the stat
+// categories relevant to them, not every zero'd-out field).
+function maddenHallOfFameStatLine(row) {
+  const parts = [];
+  const passYds = Number(row.career_pass_yards || 0);
+  const passTds = Number(row.career_pass_tds || 0);
+  const rushYds = Number(row.career_rush_yards || 0);
+  const rushTds = Number(row.career_rush_tds || 0);
+  const recYds = Number(row.career_rec_yards || 0);
+  const recTds = Number(row.career_rec_tds || 0);
+  const sacks = Number(row.career_sacks || 0);
+  const ints = Number(row.career_interceptions || 0);
+
+  if (passYds > 0 || passTds > 0) parts.push(`${formatMaddenLeaderNumber(passYds)} Pass YDS, ${formatMaddenLeaderNumber(passTds)} Pass TD`);
+  if (rushYds > 0 || rushTds > 0) parts.push(`${formatMaddenLeaderNumber(rushYds)} Rush YDS, ${formatMaddenLeaderNumber(rushTds)} Rush TD`);
+  if (recYds > 0 || recTds > 0) parts.push(`${formatMaddenLeaderNumber(recYds)} Rec YDS, ${formatMaddenLeaderNumber(recTds)} Rec TD`);
+  if (sacks > 0) parts.push(`${formatMaddenLeaderNumber(sacks)} Sacks`);
+  if (ints > 0) parts.push(`${formatMaddenLeaderNumber(ints)} INT`);
+
+  return parts.length ? parts.join(' • ') : 'No career stats on file yet.';
+}
+
 function formatMaddenHallOfFameRow(row, index) {
   if (!row) return 'No data yet.';
   const medal = maddenRecordMedal(index);
@@ -50679,6 +50718,29 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
 
   if (thumb) embed.setThumbnail(thumb);
   return embed;
+}
+
+// 7J-67HOFFIX: was referenced but never defined anywhere in the codebase —
+// same pre-existing bug shape as maddenHallOfFameStatLine above. Builds a
+// quick league-wide snapshot: current award race leaders, top power rank,
+// and any undefeated teams.
+function buildMaddenLeagueSnapshotLines({ mvpRace, oroyRace, droyRace, topPower, undefeatedTeams }) {
+  const lines = [];
+  const mvp = (mvpRace || [])[0];
+  const oroy = (oroyRace || [])[0];
+  const droy = (droyRace || [])[0];
+
+  lines.push(`**MVP Race Leader:** ${mvp ? `${mvp.player_name} (${maddenTeamDisplayName(mvp.team_name)})` : 'No data yet'}`);
+  lines.push(`**OROY Race Leader:** ${oroy ? `${oroy.player_name} (${maddenTeamDisplayName(oroy.team_name)})` : 'No data yet'}`);
+  lines.push(`**DROY Race Leader:** ${droy ? `${droy.player_name} (${maddenTeamDisplayName(droy.team_name)})` : 'No data yet'}`);
+  lines.push(`**Top Power Rank:** ${topPower ? `${maddenTeamDisplayName(topPower.team_name)} (#${topPower.rank})` : 'No data yet'}`);
+
+  const undefeatedText = (undefeatedTeams || []).length
+    ? undefeatedTeams.map(t => `${maddenTeamDisplayName(t.team_name)} (${t.wins}-0)`).join(', ')
+    : 'None';
+  lines.push(`**Undefeated Teams:** ${undefeatedText}`);
+
+  return lines.join('\n');
 }
 
 async function buildMaddenLeagueRecordsEmbed(guildId, league) {
@@ -61848,14 +61910,30 @@ function buildMaddenFranchiseHubBoardComponents(leagueId, currentView = 'hub', t
     })));
   const rows = [new ActionRowBuilder().addComponents(menu)];
 
-  // 7J-63HUBTEAM: only shown for the Hub view — the other 7 views are
-  // league-wide, a per-team filter doesn't apply to them.
+  // 7J-68TEAMPAGE: only shown for the Hub view — the other 7 views are
+  // league-wide, a per-team filter doesn't apply to them. Discord hard-caps
+  // a single select menu at 25 options — a 32-team league (all of the NFL)
+  // doesn't fit in one, so this splits into two menus, same 1/2, 2/2
+  // pattern already used for the setup dashboard's own long option list,
+  // rather than silently truncating to the first 25 teams.
   if (currentView === 'hub' && teamOptions.length) {
-    const teamMenu = new StringSelectMenuBuilder()
+    const half = Math.ceil(teamOptions.length / 2);
+    const groupA = teamOptions.slice(0, half);
+    const groupB = teamOptions.slice(half);
+
+    const teamMenuA = new StringSelectMenuBuilder()
       .setCustomId('madfranchisehub:team:' + leagueId)
-      .setPlaceholder('Choose a team to view')
-      .addOptions(teamOptions.slice(0, 25));
-    rows.push(new ActionRowBuilder().addComponents(teamMenu));
+      .setPlaceholder(groupB.length ? 'Choose a team (1/2)' : 'Choose a team to view')
+      .addOptions(groupA);
+    rows.push(new ActionRowBuilder().addComponents(teamMenuA));
+
+    if (groupB.length) {
+      const teamMenuB = new StringSelectMenuBuilder()
+        .setCustomId('madfranchisehub:team2:' + leagueId)
+        .setPlaceholder('Choose a team (2/2)')
+        .addOptions(groupB);
+      rows.push(new ActionRowBuilder().addComponents(teamMenuB));
+    }
   }
 
   return rows;
@@ -61863,10 +61941,12 @@ function buildMaddenFranchiseHubBoardComponents(leagueId, currentView = 'hub', t
 
 // 7J-63HUBTEAM: pulled out separately so both the board's initial
 // post/refresh and the team-select handler can build the same option list
-// without duplicating the query.
+// without duplicating the query. Capped at 50 (Discord's max across the two
+// 25-option menus above), not 25 — a real NFL-sized league (32 teams) needs
+// more than one menu's worth.
 async function getMaddenFranchiseHubTeamOptions(guildId, leagueId) {
   const result = await pool.query(
-    `SELECT team_name, team_role_id FROM madden_franchises WHERE guild_id = $1 AND league_id::text = $2::text AND team_role_id IS NOT NULL ORDER BY team_name ASC LIMIT 25`,
+    `SELECT team_name, team_role_id FROM madden_franchises WHERE guild_id = $1 AND league_id::text = $2::text AND team_role_id IS NOT NULL ORDER BY team_name ASC LIMIT 50`,
     [guildId, String(leagueId)]
   ).catch(() => ({ rows: [] }));
   return result.rows.map(row => ({ label: maddenTeamDisplayName(row.team_name).slice(0, 100), value: row.team_role_id }));
@@ -63706,9 +63786,6 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     new ButtonBuilder().setCustomId('commissioner_op:refresh:' + leagueId).setLabel('Refresh Boards').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
   );
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('commissioner_op:retire_scan:' + leagueId).setLabel('Scan Retirements').setStyle(ButtonStyle.Secondary),
-  );
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('commissioner_op:toggle_autodetect:' + leagueId).setLabel('Toggle Auto-Detection').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId('commissioner_op:announce:' + leagueId).setLabel('League Announcement').setEmoji('📣').setStyle(ButtonStyle.Primary),
@@ -63716,7 +63793,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('commissioner_op:autodetect_settings:' + leagueId).setLabel('Auto-Detect Settings').setEmoji('🎛️').setStyle(ButtonStyle.Secondary),
   );
-  const rows = [row1, row2, row3];
+  const rows = [row1, row3];
   if (isStructured) {
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_op:advance:' + leagueId).setLabel('Advance').setEmoji('⏭️').setStyle(ButtonStyle.Success),
