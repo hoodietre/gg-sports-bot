@@ -506,6 +506,12 @@ async function initDatabase() {
   // reward is possible becomes that missing signal.
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS game_started_at TIMESTAMP`);
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS game_started_by_user_id TEXT`);
+  // 7J-50MADDENREWARD: idempotency guard for the new Madden game_played/
+  // game_win currency+activity reward system — same pattern as
+  // settled_by_game_report on sportsbook_games, needed because this runs
+  // unconditionally on every sync (see autoDetectAfterSync) and must never
+  // double-pay a game it already rewarded on a prior sync.
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS rewards_paid_at TIMESTAMP`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
@@ -61534,6 +61540,86 @@ async function autoCreateMaddenSportsbookLines(guild, league, weekLabel) {
 
 
 // ---------------------------------------------------------------------------
+// 7J-50MADDENREWARD: Madden game_played/game_win currency + activity/legacy
+// rewards. Did not exist before this — verified via code search that no
+// Madden-specific reward for playing/winning a game existed anywhere;
+// game_played_payout/win_payout were only ever wired to the Game Center
+// (league_games) path. Built new, per Hxxdie's explicit "1" answer: yes,
+// build a real parallel reward system, gated on game_started_at from day
+// one so it can never pay out for a game that might have been auto-simmed
+// rather than actually played. Mirrors Game Center's existing reward
+// shape/values exactly for consistency: game_played_payout currency + 3
+// activity to both owners for playing, win_payout currency + 0 activity /
+// 2 legacy to the winner (matching the current Track H #27 values, not the
+// old pre-audit ones). Same safe-every-sync pattern as
+// autoSettleCompletedMaddenSportsbookGames below: its own idempotency
+// guard (rewards_paid_at) makes repeat calls harmless.
+// ---------------------------------------------------------------------------
+async function autoDistributeCompletedMaddenGameRewards(guild, league) {
+  const completedGames = await pool.query(
+    `SELECT * FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND game_started_at IS NOT NULL
+       AND rewards_paid_at IS NULL
+       AND LOWER(status) IN ('final', 'completed', 'completed_with_real_score')
+       AND home_score IS NOT NULL AND away_score IS NOT NULL
+       AND (home_score > 0 OR away_score > 0)`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+
+  for (const game of completedGames.rows || []) {
+    await distributeMaddenGameCompletionReward(guild, league, game).catch(err =>
+      console.error('[7J-50MADDENREWARD] Reward distribution failed for game', game.id, ':', err?.message));
+  }
+}
+
+async function distributeMaddenGameCompletionReward(guild, league, game) {
+  const homeScore = Number(game.home_score || 0);
+  const awayScore = Number(game.away_score || 0);
+
+  const settings = await getCurrencySettings(guild.id);
+  const homeOwner = await getMaddenTeamOwnerForGameThread(guild, league, game.home_team, game.home_team_role_id).catch(() => null);
+  const awayOwner = await getMaddenTeamOwnerForGameThread(guild, league, game.away_team, game.away_team_role_id).catch(() => null);
+  // Tie (homeScore === awayScore) falls through both comparisons to null —
+  // no win bonus paid, game_played still pays to both owners below.
+  const winnerOwner = homeScore > awayScore ? homeOwner : awayScore > homeScore ? awayOwner : null;
+
+  const paidOwners = new Set();
+  for (const owner of [homeOwner, awayOwner]) {
+    if (owner && !paidOwners.has(owner.id)) {
+      paidOwners.add(owner.id);
+      if (Number(settings.game_played_payout) > 0) {
+        await addCurrency(
+          guild.id,
+          owner.id,
+          Number(settings.game_played_payout),
+          'game_played',
+          `Game played: ${game.away_team} @ ${game.home_team}`,
+          'system'
+        ).catch(() => null);
+      }
+      await addActivityPoints(guild.id, owner.id, 3, 0, league.league_id).catch(() => null);
+    }
+  }
+
+  if (winnerOwner) {
+    if (Number(settings.win_payout) > 0) {
+      await addCurrency(
+        guild.id,
+        winnerOwner.id,
+        Number(settings.win_payout),
+        'game_win',
+        `Game win: ${homeScore > awayScore ? game.home_team : game.away_team}`,
+        'system'
+      ).catch(() => null);
+    }
+    await addActivityPoints(guild.id, winnerOwner.id, 0, 2, league.league_id).catch(() => null);
+  }
+
+  await pool.query(`UPDATE madden_imported_games SET rewards_paid_at = NOW() WHERE id = $1`, [game.id]);
+}
+
+// ---------------------------------------------------------------------------
 // Auto-settle Madden sportsbook bets when game results come in
 // Called when a game's status changes to final/completed.
 // ---------------------------------------------------------------------------
@@ -62450,6 +62536,12 @@ async function autoDetectAfterSync(guild, league) {
   // thanks to the idempotency guard inside autoSettleMaddenSportsbookBet.
   await autoSettleCompletedMaddenSportsbookGames(guild, league).catch(err =>
     console.error('[AUTO DETECT] Per-game sportsbook settlement:', err?.message));
+  // 7J-50MADDENREWARD: same every-sync safety pattern as the sportsbook pass
+  // above — its own idempotency guard (rewards_paid_at) makes repeat calls
+  // harmless, so this runs unconditionally too rather than waiting for a
+  // full week-advance.
+  await autoDistributeCompletedMaddenGameRewards(guild, league).catch(err =>
+    console.error('[AUTO DETECT] Per-game reward distribution:', err?.message));
 
   // Week-advance dedup guard — everything below this point (news/streaks/
   // performances, new lines, new props, thread creation, season transitions) is
