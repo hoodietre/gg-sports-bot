@@ -351,6 +351,13 @@ async function initDatabase() {
   // snapping back to the default Hub view.
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS franchise_hub_message_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS franchise_hub_current_view TEXT NOT NULL DEFAULT 'hub'`);
+  // 7J-63HUBTEAM: per Hxxdie — the Hub view previously had no way to pick a
+  // team at all; buildMaddenFranchiseEmbed's no-filter fallback is
+  // "whichever team updated most recently," which is arbitrary from a
+  // viewer's perspective. Persists which team is currently selected so a
+  // team-picker (added alongside the view-picker, only shown when the Hub
+  // view is active) can actually browse between teams.
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS franchise_hub_current_team_role_id TEXT`);
   // 7J-61LEAGUEHOF: same table reused here as the generic (non-Madden)
   // standings panel already does for standings_message_id — confirmed
   // populated for every league type, not just Madden, despite the table name.
@@ -4528,6 +4535,26 @@ async function findTeamOwnerByRoleId(guild, roleId) {
   const cachedOwner = role.members.find(member => !member.user.bot);
   if (cachedOwner) return cachedOwner;
 
+  // 7J-66OWNERFALLBACK: same root cause as the Teams & Leagues and Team
+  // Owners panel bugs fixed earlier this session — this only ever checked
+  // Discord role possession/cache, never the actual ownership record
+  // (madden_imported_team_stats.owner_user_id). Confirmed exactly this
+  // scenario in Active Check: a real owner (Cardinals) missing from the
+  // check-in list because their Discord role wasn't assigned/cached, even
+  // though the DB correctly records them as the owner. Falls back to a
+  // guild member fetch for that ID — a single targeted fetch, not a
+  // guild-wide one, so the rate-limit concern in the comment below doesn't
+  // apply here.
+  const dbOwnerResult = await pool.query(
+    `SELECT owner_user_id FROM madden_imported_team_stats WHERE guild_id = $1 AND team_role_id = $2 AND owner_user_id IS NOT NULL LIMIT 1`,
+    [guild.id, roleId]
+  ).catch(() => ({ rows: [] }));
+  const dbOwnerId = dbOwnerResult.rows[0]?.owner_user_id;
+  if (dbOwnerId) {
+    const fetchedMember = await guild.members.fetch(dbOwnerId).catch(() => null);
+    if (fetchedMember) return fetchedMember;
+  }
+
   // Avoid guild-wide member fetches here. Discord rate limits opcode 8 heavily.
   // If the owner is not cached, payouts safely skip instead of breaking /game report.
   return null;
@@ -4685,15 +4712,43 @@ async function buildTeamOwnersEmbed(guild, league = null) {
   const lines = [];
   const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : null;
 
+  // 7J-65TEAMOWNERS: same root cause as the Teams & Leagues member profile
+  // bug fixed earlier this session — this previously relied entirely on
+  // Discord role possession, never the actual ownership record
+  // (madden_imported_team_stats.owner_user_id) that the game thread owner
+  // lines and GM panel already trust. A commissioner can record ownership
+  // in the DB without the matching Discord role ever being assigned, and
+  // the two drift apart — confirmed exactly this: only the one owner whose
+  // role happened to be assigned showed up, out of 6 real owners.
+  const dbOwnersByRole = new Map();
+  if (league?.league_id) {
+    const ownedResult = await pool.query(
+      `SELECT team_role_id, owner_user_id FROM madden_imported_team_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text AND owner_user_id IS NOT NULL AND team_role_id IS NOT NULL`,
+      [guild.id, String(league.league_id)]
+    ).catch(() => ({ rows: [] }));
+    for (const row of ownedResult.rows) {
+      if (!dbOwnersByRole.has(row.team_role_id)) dbOwnersByRole.set(row.team_role_id, new Set());
+      dbOwnersByRole.get(row.team_role_id).add(row.owner_user_id);
+    }
+  }
+
+  function combinedOwnerLine(label, roleId, roleMembers) {
+    const ownerIds = new Set((roleMembers || []).filter(m => !m.user.bot).map(m => m.id));
+    for (const dbOwnerId of dbOwnersByRole.get(roleId) || []) ownerIds.add(dbOwnerId);
+    return ownerIds.size === 0
+      ? `**${label}** — Unassigned or not cached`
+      : `**${label}** — ${[...ownerIds].map(id => `<@${id}>`).join(', ')}`;
+  }
+
   if (teamRoles?.length) {
     for (const team of teamRoles) {
       const role = await guild.roles.fetch(team.role_id).catch(() => null);
-      if (!role) {
+      if (!role && !dbOwnersByRole.has(team.role_id)) {
         lines.push(`**${team.role_name}** — Role not found`);
         continue;
       }
-      const owners = role.members.filter(member => !member.user.bot);
-      lines.push(owners.size === 0 ? `**${team.role_name}** — Unassigned or not cached` : `**${team.role_name}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
+      lines.push(combinedOwnerLine(team.role_name, team.role_id, role ? [...role.members.values()] : []));
     }
   } else {
     for (const teamName of TEAM_ROLE_NAMES) {
@@ -4702,8 +4757,7 @@ async function buildTeamOwnersEmbed(guild, league = null) {
         lines.push(`**${teamName}** — Role not found`);
         continue;
       }
-      const owners = role.members.filter(member => !member.user.bot);
-      lines.push(owners.size === 0 ? `**${teamName}** — Unassigned or not cached` : `**${teamName}** — ${owners.map(member => `<@${member.id}>`).join(', ')}`);
+      lines.push(combinedOwnerLine(teamName, role.id, [...role.members.values()]));
     }
   }
 
@@ -12958,14 +13012,49 @@ if (interaction.commandName === 'avatar') {
         `UPDATE madden_league_settings SET franchise_hub_current_view = $2, updated_at = NOW() WHERE league_id = $1`,
         [leagueId, view]
       ).catch(() => null);
-      const embed = await buildMaddenFranchiseHubBoardEmbed(interaction.guild, league, view).catch(() => null);
+      const settingsRow = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+      const teamRoleId = settingsRow.franchise_hub_current_team_role_id || null;
+      const embed = await buildMaddenFranchiseHubBoardEmbed(interaction.guild, league, view, teamRoleId).catch(error => {
+        console.error(`[7J-62HUBDIAG] Franchise Hub view "${view}" failed for league ${leagueId}:`, error?.stack || error?.message || error);
+        return null;
+      });
       if (!embed) {
         await interaction.followUp({ content: 'Could not load that view — run Madden sync first if this league is new.', ephemeral: true });
         return;
       }
+      const teamOptions = view === 'hub' ? await getMaddenFranchiseHubTeamOptions(interaction.guild.id, leagueId) : [];
       await interaction.editReply({
         embeds: [embed],
-        components: buildMaddenFranchiseHubBoardComponents(leagueId, view),
+        components: buildMaddenFranchiseHubBoardComponents(leagueId, view, teamOptions),
+      });
+      return;
+    }
+
+    // 7J-63HUBTEAM: team-picker, only shown/wired when the Hub view is
+    // active — per Hxxdie, the Hub previously had no way to browse teams
+    // at all, always showing whichever team happened to update most recently.
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madfranchisehub:team:')) {
+      const leagueId = interaction.customId.split(':')[2];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      const teamRoleId = interaction.values[0];
+      await interaction.deferUpdate();
+      await pool.query(
+        `UPDATE madden_league_settings SET franchise_hub_current_team_role_id = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, teamRoleId]
+      ).catch(() => null);
+      const embed = await buildMaddenFranchiseHubBoardEmbed(interaction.guild, league, 'hub', teamRoleId).catch(error => {
+        console.error(`[7J-62HUBDIAG] Franchise Hub team select failed for league ${leagueId}:`, error?.stack || error?.message || error);
+        return null;
+      });
+      if (!embed) {
+        await interaction.followUp({ content: 'Could not load that team.', ephemeral: true });
+        return;
+      }
+      const teamOptions = await getMaddenFranchiseHubTeamOptions(interaction.guild.id, leagueId);
+      await interaction.editReply({
+        embeds: [embed],
+        components: buildMaddenFranchiseHubBoardComponents(leagueId, 'hub', teamOptions),
       });
       return;
     }
@@ -30780,19 +30869,52 @@ async function getMemberLeagueMemberships(guildId, userId) {
   const guild = client.guilds.cache.get(String(guildId));
   if (!guild) return [];
   const member = await guild.members.fetch(String(userId)).catch(() => null);
-  if (!member) return [];
-  const roleIds = [...member.roles.cache.keys()];
-  if (!roleIds.length) return [];
 
-  const result = await pool.query(
-    `SELECT DISTINCT l.league_id, l.league_name, l.game, r.role_id, r.role_name
-     FROM league_team_roles r
-     JOIN leagues l ON l.league_id = r.league_id
-     WHERE l.guild_id = $1 AND l.is_active = TRUE AND r.role_id = ANY($2::text[])
+  const results = [];
+  const seenKeys = new Set();
+
+  // Role-based: works for any league (Madden or Game Center) where team
+  // ownership is granted by assigning a Discord role.
+  if (member) {
+    const roleIds = [...member.roles.cache.keys()];
+    if (roleIds.length) {
+      const roleResult = await pool.query(
+        `SELECT DISTINCT l.league_id, l.league_name, l.game, r.role_id, r.role_name
+         FROM league_team_roles r
+         JOIN leagues l ON l.league_id = r.league_id
+         WHERE l.guild_id = $1 AND l.is_active = TRUE AND r.role_id = ANY($2::text[])
+         ORDER BY l.league_name ASC`,
+        [String(guildId), roleIds]
+      ).catch(() => ({ rows: [] }));
+      for (const row of roleResult.rows) {
+        const key = row.league_id + ':' + row.role_id;
+        if (!seenKeys.has(key)) { seenKeys.add(key); results.push(row); }
+      }
+    }
+  }
+
+  // 7J-64TEAMSLEAGUES: DB-record-based — the actual ownership record
+  // (madden_imported_team_stats.owner_user_id), the same one every other
+  // owner-facing display in the bot already trusts (game thread owner
+  // lines, GM panel, etc). Needed because a commissioner can record
+  // ownership here without necessarily also assigning the matching Discord
+  // role, and the two can drift out of sync — confirmed exactly this
+  // scenario: a real owner correctly shown everywhere else, but missing
+  // entirely from this role-only check.
+  const ownedResult = await pool.query(
+    `SELECT DISTINCT l.league_id, l.league_name, l.game, mts.team_role_id AS role_id, mts.team_name AS role_name
+     FROM madden_imported_team_stats mts
+     JOIN leagues l ON l.league_id::text = mts.league_id::text
+     WHERE mts.guild_id = $1 AND l.is_active = TRUE AND mts.owner_user_id = $2
      ORDER BY l.league_name ASC`,
-    [String(guildId), roleIds]
+    [String(guildId), String(userId)]
   ).catch(() => ({ rows: [] }));
-  return result.rows;
+  for (const row of ownedResult.rows) {
+    const key = row.league_id + ':' + (row.role_id || row.role_name);
+    if (!seenKeys.has(key)) { seenKeys.add(key); results.push(row); }
+  }
+
+  return results;
 }
 
 async function buildMemberTeamsLeaguesEmbed(guild, targetUser) {
@@ -31635,9 +31757,14 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
 
     const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
     const currentView = settings.franchise_hub_current_view || 'hub';
-    const embed = await buildMaddenFranchiseHubBoardEmbed(interaction.guild, league, currentView).catch(() => null);
+    const currentTeamRoleId = settings.franchise_hub_current_team_role_id || null;
+    const embed = await buildMaddenFranchiseHubBoardEmbed(interaction.guild, league, currentView, currentTeamRoleId).catch(error => {
+      console.error(`[7J-62HUBDIAG] Franchise Hub manual post/refresh failed for league ${league.league_id}:`, error?.stack || error?.message || error);
+      return null;
+    });
     if (!embed) return 'Could not build the Franchise Hub embed — run /madden sync first if this league is new.';
-    const message = await channel.send({ embeds: [embed], components: buildMaddenFranchiseHubBoardComponents(league.league_id, currentView) });
+    const teamOptions = currentView === 'hub' ? await getMaddenFranchiseHubTeamOptions(interaction.guild.id, league.league_id) : [];
+    const message = await channel.send({ embeds: [embed], components: buildMaddenFranchiseHubBoardComponents(league.league_id, currentView, teamOptions) });
     await pool.query(`UPDATE madden_league_settings SET franchise_hub_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
     return 'Franchise Hub Board posted/refreshed in ' + channel.toString() + '.';
   }
@@ -56008,7 +56135,7 @@ async function inspectMaddenDeepRawScoreCandidates(guild, league) {
      FROM madden_imported_games
      WHERE guild_id = $1
        AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
      ORDER BY week_label DESC, imported_at DESC
      LIMIT 12`,
     [guild.id, league.league_id]
@@ -57827,7 +57954,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
      FROM madden_imported_games
      WHERE guild_id = $1
        AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
      ORDER BY week_label ASC, imported_at ASC`,
     [guild.id, league.league_id]
   );
@@ -58718,7 +58845,7 @@ async function probeSnallapaCommandMapReconstruction(context, guild, league) {
     `SELECT *
      FROM madden_imported_games
      WHERE guild_id = $1 AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
      ORDER BY week_label DESC, imported_at DESC
      LIMIT 2`,
     [guild.id, league.league_id]
@@ -58990,7 +59117,7 @@ async function probeEaDirectScoreSources(context, guild, league) {
      FROM madden_imported_games
      WHERE guild_id = $1
        AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
      ORDER BY week_label DESC, imported_at DESC
      LIMIT 2`,
     [guild.id, league.league_id]
@@ -59155,7 +59282,7 @@ async function inspectMaddenCompletedGameRawScores(guild, league) {
      FROM madden_imported_games
      WHERE guild_id = $1
        AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
      ORDER BY week_label ASC, imported_at DESC
      LIMIT 8`,
     [guild.id, league.league_id]
@@ -59210,7 +59337,7 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
      FROM madden_imported_games
      WHERE guild_id = $1
        AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')`,
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')`,
     [guild.id, league.league_id]
   );
 
@@ -61660,7 +61787,10 @@ async function updatePersistentMaddenEmbed(guild, league, channelId, messageIdKe
   if (!channel?.isTextBased?.()) return null;
 
   const settings = await ensureMaddenLeagueSettings(league);
-  const embed = await buildEmbedFn(settings).catch(() => null);
+  const embed = await buildEmbedFn(settings).catch(error => {
+    console.error(`[7J-62HUBDIAG] Persistent embed build failed (messageIdKey=${messageIdKey}, league=${league?.league_id}):`, error?.stack || error?.message || error);
+    return null;
+  });
   if (!embed) return null;
   const components = buildComponentsFn ? await buildComponentsFn(settings).catch(() => undefined) : undefined;
   const payload = components ? { embeds: [embed], components } : { embeds: [embed] };
@@ -61691,7 +61821,7 @@ async function updatePersistentMaddenEmbed(guild, league, channelId, messageIdKe
 // only views (results_diag, endpoint_discovery, etc.) are deliberately
 // excluded — those are internal sync-debugging tools, not member-facing.
 const MADDEN_FRANCHISE_HUB_VIEWS = {
-  hub: { label: 'Franchise Hub', emoji: '🏟️', build: (guild, league) => buildMaddenFranchiseEmbed(guild, league) },
+  hub: { label: 'Franchise Hub', emoji: '🏟️', build: (guild, league, teamRoleId) => buildMaddenFranchiseEmbed(guild, league, teamRoleId) },
   news: { label: 'News Feed', emoji: '📰', build: (guild, league) => buildMaddenNewsFeedEmbed(guild.id, league) },
   records: { label: 'League Records', emoji: '🏆', build: (guild, league) => buildMaddenLeagueRecordsEmbed(guild.id, league) },
   hof: { label: 'Hall of Fame', emoji: '⭐', build: (guild, league) => buildMaddenHallOfFameEmbed(guild.id, league) },
@@ -61701,12 +61831,12 @@ const MADDEN_FRANCHISE_HUB_VIEWS = {
   season_close: { label: 'Season Close Preview', emoji: '📋', build: (guild, league) => buildMaddenSeasonClosePreviewEmbed(guild.id, league) },
 };
 
-async function buildMaddenFranchiseHubBoardEmbed(guild, league, view = 'hub') {
+async function buildMaddenFranchiseHubBoardEmbed(guild, league, view = 'hub', teamRoleId = null) {
   const viewConfig = MADDEN_FRANCHISE_HUB_VIEWS[view] || MADDEN_FRANCHISE_HUB_VIEWS.hub;
-  return viewConfig.build(guild, league);
+  return viewConfig.build(guild, league, teamRoleId);
 }
 
-function buildMaddenFranchiseHubBoardComponents(leagueId, currentView = 'hub') {
+function buildMaddenFranchiseHubBoardComponents(leagueId, currentView = 'hub', teamOptions = []) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('madfranchisehub:view:' + leagueId)
     .setPlaceholder('View: ' + (MADDEN_FRANCHISE_HUB_VIEWS[currentView]?.label || 'Franchise Hub'))
@@ -61716,7 +61846,30 @@ function buildMaddenFranchiseHubBoardComponents(leagueId, currentView = 'hub') {
       emoji: cfg.emoji,
       default: value === currentView,
     })));
-  return [new ActionRowBuilder().addComponents(menu)];
+  const rows = [new ActionRowBuilder().addComponents(menu)];
+
+  // 7J-63HUBTEAM: only shown for the Hub view — the other 7 views are
+  // league-wide, a per-team filter doesn't apply to them.
+  if (currentView === 'hub' && teamOptions.length) {
+    const teamMenu = new StringSelectMenuBuilder()
+      .setCustomId('madfranchisehub:team:' + leagueId)
+      .setPlaceholder('Choose a team to view')
+      .addOptions(teamOptions.slice(0, 25));
+    rows.push(new ActionRowBuilder().addComponents(teamMenu));
+  }
+
+  return rows;
+}
+
+// 7J-63HUBTEAM: pulled out separately so both the board's initial
+// post/refresh and the team-select handler can build the same option list
+// without duplicating the query.
+async function getMaddenFranchiseHubTeamOptions(guildId, leagueId) {
+  const result = await pool.query(
+    `SELECT team_name, team_role_id FROM madden_franchises WHERE guild_id = $1 AND league_id::text = $2::text AND team_role_id IS NOT NULL ORDER BY team_name ASC LIMIT 25`,
+    [guildId, String(leagueId)]
+  ).catch(() => ({ rows: [] }));
+  return result.rows.map(row => ({ label: maddenTeamDisplayName(row.team_name).slice(0, 100), value: row.team_role_id }));
 }
 
 function buildMaddenStandingsScopeComponents(leagueId, currentScope = 'conference') {
@@ -61760,9 +61913,14 @@ async function refreshPersistentMaddenEmbeds(guild, league) {
     updatePersistentMaddenEmbed(guild, league, league.madden_franchise_hub_channel_id, 'franchise_hub_message_id',
       async (settings) => {
         const currentView = (settings && settings.franchise_hub_current_view) || 'hub';
-        return buildMaddenFranchiseHubBoardEmbed(guild, league, currentView);
+        const currentTeamRoleId = (settings && settings.franchise_hub_current_team_role_id) || null;
+        return buildMaddenFranchiseHubBoardEmbed(guild, league, currentView, currentTeamRoleId);
       },
-      (settings) => buildMaddenFranchiseHubBoardComponents(league.league_id, (settings && settings.franchise_hub_current_view) || 'hub')),
+      async (settings) => {
+        const currentView = (settings && settings.franchise_hub_current_view) || 'hub';
+        const teamOptions = currentView === 'hub' ? await getMaddenFranchiseHubTeamOptions(guild.id, league.league_id) : [];
+        return buildMaddenFranchiseHubBoardComponents(league.league_id, currentView, teamOptions);
+      }),
     // Free agents board is intentionally NOT refreshed here. It has its own
     // separate, correct auto-refresh path (refreshMaddenFreeAgentsPanelForLeague,
     // called right after sync, backed by the madden_free_agent_panels table).
@@ -63092,9 +63250,11 @@ Rules:
   if (awards?.leaders?.length) {
     const qbs = awards.leaders.filter(r => r.position === 'QB' && r.pass_yds > 0).slice(0, 3);
     const rbs = awards.leaders.filter(r => ['HB', 'FB'].includes(r.position) && r.rush_yds > 0).slice(0, 3);
-    if (qbs.length || rbs.length) {
+    const wrs = awards.leaders.filter(r => ['WR', 'TE'].includes(r.position) && r.rec_yds > 0).slice(0, 3);
+    if (qbs.length || rbs.length || wrs.length) {
       const qbLines = qbs.map(r => `**${r.full_name}** (${r.team_name}) — ${r.pass_yds} YDS ${r.pass_tds} TD`).join('\n') || 'No data';
       const rbLines = rbs.map(r => `**${r.full_name}** (${r.team_name}) — ${r.rush_yds} YDS ${r.rush_tds} TD`).join('\n') || 'No data';
+      const wrLines = wrs.map(r => `**${r.full_name}** (${r.team_name}) — ${r.rec_yds} YDS ${r.rec_tds} TD`).join('\n') || 'No data';
       await newsChannel.send({
         embeds: [new EmbedBuilder()
           .setTitle(`${GG_EMOJI} ${weekLabel} Stat Leaders`)
@@ -63102,6 +63262,7 @@ Rules:
           .addFields(
             { name: '🏈 Passing', value: qbLines, inline: true },
             { name: '🏃 Rushing', value: rbLines, inline: true },
+            { name: '🙌 Receiving', value: wrLines, inline: true },
           )
           .setFooter({ text: `GG Sports • ${league.league_name} Weekly Stat Leaders` })
           .setTimestamp()],
@@ -63546,8 +63707,6 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
   );
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('commissioner_op:txn_preview:' + leagueId).setLabel('Preview Transactions').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('commissioner_op:txn_confirm:' + leagueId).setLabel('Confirm Transactions').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('commissioner_op:retire_scan:' + leagueId).setLabel('Scan Retirements').setStyle(ButtonStyle.Secondary),
   );
   const row3 = new ActionRowBuilder().addComponents(
