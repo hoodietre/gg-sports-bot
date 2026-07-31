@@ -7400,7 +7400,7 @@ async function ggBuildPermanentShopPayload(guildId) {
 
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
-    .setTitle('Permanent Shop')
+    .setTitle('GG Sports Shop')
     .setColor(0xFEE75C)
     .setFooter({ text: 'GG Sports • Shop' })
     .setTimestamp();
@@ -11483,6 +11483,23 @@ if (interaction.commandName === 'avatar') {
 
       if (action === 'sync') {
         await interaction.deferUpdate();
+        // 7J-53SYNCUX: immediately show a disabled "Syncing..." state before
+        // starting the actual sync — previously nothing visible changed
+        // between the click and the final result, so a slow sync (which
+        // Madden syncs often are, given everything they fetch) invited
+        // spam-clicking the still-enabled button.
+        const syncingEmbed = new EmbedBuilder()
+          .setTitle('🔄 Syncing…')
+          .setColor(0xFEE75C)
+          .setDescription('Pulling the latest data from EA. This can take a moment — please don\'t click Run Sync again while this is in progress.')
+          .setTimestamp();
+        await interaction.editReply({
+          embeds: [syncingEmbed],
+          components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('commissioner_op:sync:' + leagueId).setLabel('Syncing…').setStyle(ButtonStyle.Primary).setDisabled(true)
+          )],
+        }).catch(() => null);
+
         const run = await runMaddenExternalFetchSync(interaction.guild, league, {}).catch(err => ({ status: 'error', message: err?.message || String(err) }));
         await postMaddenSyncFeed(interaction.guild, league, run).catch(() => null);
         await refreshMaddenFreeAgentsPanelForLeague(interaction.guild, league).catch(() => null);
@@ -11724,6 +11741,14 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('commissioner_league_section:')) {
       const leagueId = interaction.customId.split(':')[1];
       const section = interaction.values[0];
+      // 7J-54LEAGUESETTINGS: server-side enforcement, not just hiding the
+      // menu option — a stale/reused interaction shouldn't be able to reach
+      // a section that doesn't apply to this league's sync model.
+      const sectionLeague = await getLeagueById(leagueId);
+      if (sectionLeague && getLeagueSportKey(sectionLeague) === 'madden' && MADDEN_HIDDEN_CUSTOMIZATION_SECTIONS.has(section)) {
+        await interaction.reply({ content: 'This section follows the Madden sync for this league and isn\'t manually configurable.', ephemeral: true });
+        return;
+      }
       await showLeagueCustomizationSection(interaction, leagueId, section, { update: true });
       return;
     }
@@ -12078,6 +12103,58 @@ if (interaction.commandName === 'avatar') {
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('away_score').setLabel(`${game.away_team_name} score (away)`.slice(0, 45)).setStyle(TextInputStyle.Short).setRequired(true)),
         );
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('maddengame_forcewin_submit:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await getMaddenImportedGameById(gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that Madden game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only league staff can force a result for this game.', ephemeral: true });
+        return;
+      }
+
+      const homeScore = Number.parseInt(interaction.fields.getTextInputValue('home_score'), 10);
+      const awayScore = Number.parseInt(interaction.fields.getTextInputValue('away_score'), 10);
+      if (!Number.isInteger(homeScore) || !Number.isInteger(awayScore) || homeScore < 0 || awayScore < 0) {
+        await interaction.reply({ content: 'Scores must be whole numbers 0 or greater.', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+      // 7J-55CONSOLIDATE: writes the corrected score and status directly,
+      // then lets the existing every-sync reward/sportsbook pipeline
+      // (autoDetectAfterSync → autoDistributeCompletedMaddenGameRewards /
+      // autoSettleCompletedMaddenSportsbookGames) pick it up on the next
+      // tick, rather than duplicating that settlement logic here. Marks
+      // game_started_at if it wasn't already set — a staff member manually
+      // confirming a result is exactly the kind of explicit authorization
+      // that gate exists to require, same principle as the existing
+      // forceLeagueGameResult staff override for Game Center.
+      await pool.query(
+        `UPDATE madden_imported_games
+         SET home_score = $2, away_score = $3, status = 'final',
+             game_started_at = COALESCE(game_started_at, NOW()),
+             game_started_by_user_id = COALESCE(game_started_by_user_id, $4)
+         WHERE id = $1`,
+        [game.id, homeScore, awayScore, interaction.user.id]
+      );
+
+      await interaction.editReply({ content: `Result forced: **${game.away_team} ${awayScore} @ ${game.home_team} ${homeScore}**. Rewards and sportsbook settlement will process automatically on the next sync.` });
+
+      if (interaction.channel?.isThread?.()) {
+        const updatedGame = await getMaddenImportedGameById(gameId);
+        const owners = {
+          away: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.away_team, game.away_team_role_id),
+          home: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id),
+        };
+        await interaction.channel.send({
+          embeds: [buildMaddenGameThreadEmbed(league, updatedGame, owners)],
+          components: buildMaddenGameThreadButtons(gameId, Boolean(updatedGame.game_started_at), true),
+        }).catch(() => null);
+      }
       return;
     }
 
@@ -14843,6 +14920,29 @@ if (interaction.commandName === 'avatar') {
       const refreshed = await getMaddenTradeNegotiationById(negotiationId) || negotiation;
       const panel = await buildMaddenNegotiationEditPanel(interaction, refreshed, league, pkg, 'offering');
       await interaction.reply({ embeds: [panel.embed], components: panel.components, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('maddentrade_neg_close:')) {
+      const negotiationId = interaction.customId.split(':')[1];
+      const negotiation = await getMaddenTradeNegotiationById(negotiationId);
+      if (!negotiation) {
+        await interaction.reply({ content: 'That negotiation could not be found.', ephemeral: true });
+        return;
+      }
+      const league = await getLeagueById(negotiation.league_id);
+      const isParty = interaction.user.id === negotiation.listing_user_id || interaction.user.id === negotiation.requesting_user_id;
+      const isStaff = league && await userCanUseLeagueSetup(interaction, league);
+      if (!isParty && !isStaff) {
+        await interaction.reply({ content: 'Only the two parties in this negotiation or league staff can close it.', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply();
+      await pool.query(`UPDATE madden_trade_negotiations SET status = 'closed', updated_at = NOW() WHERE id = $1`, [negotiationId]);
+      await interaction.editReply({ content: `🚫 <@${interaction.user.id}> closed this negotiation. This thread will be archived.` });
+      if (interaction.channel?.isThread?.()) {
+        await interaction.channel.setArchived(true, 'GG Sports: negotiation closed by ' + interaction.user.tag).catch(() => null);
+      }
       return;
     }
 
@@ -30292,7 +30392,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
     : 'Not available';
 
   const embed = new EmbedBuilder()
-    .setTitle('Franchise Hub • ' + targetUser.username)
+    .setTitle('Member Profile • ' + targetUser.username)
     .setColor(0xFEE75C)
     .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
     .setImage('attachment://avatar.png')
@@ -30312,7 +30412,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'Stream', value: streamUrl || 'No stream linked. Use /linkstream to add one.', inline: false },
       { name: 'Avatar', value: 'Rendered below. Use `/avatar locker` to equip owned items, `/avatar shop` to buy more.', inline: false }
     )
-    .setFooter({ text: 'GG Sports • Franchise Hub Foundation' })
+    .setFooter({ text: 'GG Sports • Member Profile' })
     .setTimestamp();
 
   return { embed, attachment: profileAvatarAttachment };
@@ -31196,10 +31296,10 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const { channel, error } = await requireTextChannel(league.madden_power_rankings_channel_id, interaction.channel, 'Madden power rankings channel');
     if (error) return error + ' Set **Madden Power Rankings Board** from this setup dashboard first.';
 
-    const rankRows = await pool.query(
-      `SELECT * FROM madden_power_rankings WHERE league_id::text = $1::text ORDER BY rank ASC`,
-      [String(league.league_id)]
-    ).then(r => r.rows).catch(() => []);
+    // 7J-52POWERPANEL: same fix as the persistent auto-refresh path — was
+    // reading directly from madden_power_rankings, which never stored
+    // wins/losses/points at all, so this always posted 0-0 records.
+    const rankRows = await recalculateMaddenPowerRankings(interaction.guild.id, league.league_id).catch(() => []);
     const message = await channel.send({ embeds: [buildMaddenPowerRankingsEmbed(league, rankRows)] });
     await pool.query(`UPDATE madden_league_settings SET power_rankings_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
     return 'Madden Power Rankings Board posted/refreshed in ' + channel.toString() + '.' + (rankRows.length ? '' : ' (No power rankings computed yet — run /madden sync first.)');
@@ -34464,6 +34564,13 @@ function buildMaddenTradeNegotiationThreadButtons(negotiationId) {
       new ButtonBuilder().setCustomId(`maddentrade_neg_custom:${negotiationId}`).setLabel('Create Custom Offer').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`maddentrade_neg_thread_tools:${negotiationId}:analyze`).setLabel('Analyze Selected').setEmoji('⚖️').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`maddentrade_neg_thread_tools:${negotiationId}:submit`).setLabel('Submit Selected').setEmoji('📨').setStyle(ButtonStyle.Success)
+    ),
+    // 7J-56TRADECLOSE: per Hxxdie — previously the only way a negotiation
+    // thread ever closed was the automatic multi-day inactivity sweep.
+    // Lets either party end it immediately when talks clearly aren't going
+    // anywhere, instead of leaving a dead thread sitting open.
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`maddentrade_neg_close:${negotiationId}`).setLabel('Close Negotiation').setEmoji('🚫').setStyle(ButtonStyle.Danger)
     ),
   ];
 }
@@ -40609,17 +40716,62 @@ function maddenGameHasRealScore(game) {
   return Number(away || 0) !== 0 || Number(home || 0) !== 0;
 }
 
+// 7J-55CONSOLIDATE: was three separate buttons (Game Center, Matchup
+// Preview, Team Comparison) showing heavily overlapping info, per Hxxdie.
+// Verified the actual overlap before merging rather than guessing: Team
+// Comparison turned out to be a strict subset of Game Center's own team
+// snapshots (same formatMaddenThreadTeamSnapshot function, just presented
+// side-by-side) — nothing lost by dropping it entirely. Matchup Preview was
+// the richest of the three (record/PPG/PAPG/point-diff/power-rank/top
+// players/storyline/prediction). This merges Game Center's non-overlapping
+// pieces (week/status/live score/owners) into that richer base.
+function buildMaddenGameThreadInfoEmbed(league, game, matchup, owners = {}) {
+  const hasScore = maddenGameHasRealScore(game);
+  const scoreText = hasScore
+    ? `${maddenTeamDisplayNameWithLogo(game.away_team)} **${game.away_score}** @ ${maddenTeamDisplayNameWithLogo(game.home_team)} **${game.home_score}**`
+    : 'Scheduled / Not Final';
+
+  if (!matchup?.home || !matchup?.away) {
+    return new EmbedBuilder()
+      .setTitle(`🏈 Matchup Info • ${league?.league_name || 'Madden League'}`)
+      .setColor(0x5865F2)
+      .setDescription(`**${maddenTeamDisplayNameWithLogo(game.away_team)} @ ${maddenTeamDisplayNameWithLogo(game.home_team)}**`)
+      .addFields(
+        { name: 'Week', value: game.week_label || 'Unknown week', inline: true },
+        { name: 'Status', value: formatMaddenGameStatus(game), inline: true },
+        { name: 'Score', value: scoreText, inline: false },
+        { name: 'Owners', value: `${game.away_team}: ${owners.away ? `<@${owners.away.id}>` : 'Not found'}\n${game.home_team}: ${owners.home ? `<@${owners.home.id}>` : 'Unassigned'}`, inline: false },
+        { name: 'Matchup data', value: 'No power rankings/matchup data found yet. Run Madden sync first.', inline: false }
+      )
+      .setFooter({ text: 'GG Sports • Matchup Info' })
+      .setTimestamp();
+  }
+
+  const embed = buildMaddenMatchupPreviewEmbed(league, matchup);
+  embed.setTitle(`🏈 Matchup Info • ${league?.league_name || 'Madden League'}`);
+  embed.spliceFields(0, 0,
+    { name: 'Week', value: game.week_label || 'Unknown week', inline: true },
+    { name: 'Status', value: formatMaddenGameStatus(game), inline: true },
+    { name: 'Score', value: scoreText, inline: false },
+  );
+  embed.addFields({ name: 'Owners', value: `${game.away_team}: ${owners.away ? `<@${owners.away.id}>` : 'Not found'}\n${game.home_team}: ${owners.home ? `<@${owners.home.id}>` : 'Unassigned'}`, inline: false });
+  embed.setFooter({ text: 'GG Sports • Matchup Info' });
+  return embed;
+}
+
 function buildMaddenGameThreadButtons(gameId, isStarted = false, isFinal = false) {
   const rows = [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`maddengame_thread_gamestarted:${gameId}`).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`maddengame_thread_game:${gameId}`).setLabel('Game Center').setEmoji('🏈').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`maddengame_thread_preview:${gameId}`).setLabel('Matchup Preview').setEmoji('🔍').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`maddengame_thread_compare:${gameId}`).setLabel('Team Comparison').setEmoji('📊').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`maddengame_thread_info:${gameId}`).setLabel('Matchup Info').setEmoji('🏈').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`maddengame_thread_issue:${gameId}`).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`maddengame_thread_forcewin:${gameId}`).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`maddengame_thread_resetgame:${gameId}`).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger),
     ),
   ];
   return rows;
@@ -41177,6 +41329,15 @@ async function handleMaddenGameThreadButton(interaction) {
     await safeReply({ embeds: [buildMaddenTeamComparisonEmbed(league, game, matchup)], ephemeral: true });
     return;
   }
+  // 7J-55CONSOLIDATE: the new single button replacing game/preview/compare
+  // above on threads created after this shipped — those three are kept
+  // working as-is (not removed) purely because their buttons still exist on
+  // already-posted thread messages, which Discord doesn't retroactively
+  // update.
+  if (action === 'info') {
+    await safeReply({ embeds: [buildMaddenGameThreadInfoEmbed(league, game, matchup, owners)], ephemeral: true });
+    return;
+  }
   if (action === 'stream') {
     const result = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
     const url = result.rows[0]?.stream_url;
@@ -41256,6 +41417,60 @@ async function handleMaddenGameThreadButton(interaction) {
       await interaction.channel.send({
         embeds: [buildMaddenGameThreadEmbed(league, updatedGame, owners)],
         components: buildMaddenGameThreadButtons(gameId, true, maddenGameHasRealScore(updatedGame)),
+      }).catch(() => null);
+    }
+    return;
+  }
+
+  // 7J-55CONSOLIDATE: staff tools that Madden game threads never had before
+  // — Game Center (the Game Center/open-schedule flow) already has
+  // Force Win/Reset Game; Madden threads didn't, since Madden normally
+  // settles entirely from EA sync with no manual intervention point at all.
+  if (action === 'forcewin') {
+    const isStaff = await userCanUseLeagueSetup(interaction, league);
+    if (!isStaff) {
+      await safeReply({ content: 'Only league staff can force a result for this game.', ephemeral: true });
+      return;
+    }
+    const modal = new ModalBuilder()
+      .setCustomId('maddengame_forcewin_submit:' + gameId)
+      .setTitle('Force Game Result (Staff)')
+      .addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('home_score').setLabel(`${game.home_team} score`).setStyle(TextInputStyle.Short).setRequired(true).setValue(game.home_score != null ? String(game.home_score) : '')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('away_score').setLabel(`${game.away_team} score`).setStyle(TextInputStyle.Short).setRequired(true).setValue(game.away_score != null ? String(game.away_score) : '')),
+      );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (action === 'resetgame') {
+    const isStaff = await userCanUseLeagueSetup(interaction, league);
+    if (!isStaff) {
+      await safeReply({ content: 'Only league staff can reset this game.', ephemeral: true });
+      return;
+    }
+    await interaction.deferReply();
+    await pool.query(
+      `UPDATE madden_imported_games SET home_score = NULL, away_score = NULL, status = 'scheduled', game_started_at = NULL, game_started_by_user_id = NULL, rewards_paid_at = NULL WHERE id = $1`,
+      [game.id]
+    );
+    if (game.sportsbook_game_id) {
+      await pool.query(
+        `UPDATE sportsbook_games SET status = 'open', winner_side = NULL, settled_at = NULL, settled_by_game_report = FALSE, game_started_at = NULL, game_started_by_user_id = NULL, bets_lock_at = NULL, bets_locked = FALSE WHERE id = $1`,
+        [game.sportsbook_game_id]
+      ).catch(() => null);
+    }
+    const resetEmbed = new EmbedBuilder()
+      .setTitle('🔄 Game Reset')
+      .setColor(0xED4245)
+      .setDescription(`<@${interaction.user.id}> reset this game. Score, "Game Started" state, rewards, and betting have all been cleared — this game is back to scheduled.\n\n**Note:** if this game is still active in EA's data, the next Madden sync will re-import its real score.`)
+      .setTimestamp();
+    await interaction.editReply({ embeds: [resetEmbed] });
+    if (interaction.channel?.isThread?.()) {
+      const updatedGame = await getMaddenImportedGameById(gameId);
+      await interaction.channel.send({
+        embeds: [buildMaddenGameThreadEmbed(league, updatedGame, owners)],
+        components: buildMaddenGameThreadButtons(gameId, false, false),
       }).catch(() => null);
     }
     return;
@@ -42159,29 +42374,66 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
     }
   }
 
-  const results = [];
-  for (const [statType, fieldMap] of statTypeFields.entries()) {
-    const fields = Array.from(fieldMap.entries());
-    if (!fields.length) continue;
+  // 7J-51VERIFY: confirmed via spot-check (Hxxdie, De'Von Achane) that an
+  // exact LOWER(full_name) match can miss a real player who genuinely has
+  // stats stored — madden_player_attributes (what resolves the player here)
+  // and madden_player_weekly_stats (what this queries) are populated by
+  // separate import pipelines and can carry slightly different name
+  // formatting for the same real person (apostrophe character differences
+  // being the most likely culprit, e.g. ' vs '). Falls back to a
+  // punctuation-normalized ILIKE match if the exact match finds nothing in
+  // any stat category, rather than reporting "no stats" for a player who
+  // actually has them.
+  const normalize = s => String(s || '').toLowerCase().replace(/['\u2018\u2019.\-]/g, '').replace(/\s+/g, ' ').trim();
+  const normalizedName = normalize(playerName);
+  // Matches the same character set normalize() strips above — passed as a
+  // bound parameter rather than embedded in the SQL text, since a literal
+  // apostrophe inside a Postgres string literal needs escaping and mixing
+  // that with a regex character class is exactly the kind of thing that's
+  // easy to get subtly wrong.
+  const stripPattern = "['\u2018\u2019.\\-]";
+
+  async function queryStatType(statType, fields, useNormalizedFallback) {
     const fieldSql = fields.map(([alias, jsonKey]) => `SUM(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
+    const nameCondition = useNormalizedFallback
+      ? `REGEXP_REPLACE(LOWER(full_name), $5, '', 'g') = $4`
+      : `LOWER(full_name) = LOWER($4)`;
+    const params = useNormalizedFallback
+      ? [guildId, String(leagueId), statType, normalizedName, stripPattern]
+      : [guildId, String(leagueId), statType, playerName];
     const result = await pool.query(
       `SELECT ${fieldSql}, COUNT(DISTINCT display_week) AS weeks_counted
        FROM madden_player_weekly_stats
-       WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3 AND LOWER(full_name) = LOWER($4)`,
-      [guildId, String(leagueId), statType, playerName]
+       WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3 AND ${nameCondition}`,
+      params
     ).catch(() => ({ rows: [] }));
-    const row = result.rows[0];
-    if (!row) continue;
-    const hasData = Object.keys(row).some(key => key !== 'weeks_counted' && Number(row[key]) > 0);
-    if (hasData) results.push({ statType, fields, ...row });
+    return result.rows[0] || null;
   }
-  return results;
+
+  const results = [];
+  let anyDataFound = false;
+  for (const [statType, fieldMap] of statTypeFields.entries()) {
+    const fields = Array.from(fieldMap.entries());
+    if (!fields.length) continue;
+    let row = await queryStatType(statType, fields, false);
+    let hasData = row && Object.keys(row).some(key => key !== 'weeks_counted' && Number(row[key]) > 0);
+    if (!hasData) {
+      // Exact match found nothing for this stat type — try the normalized fallback.
+      row = await queryStatType(statType, fields, true);
+      hasData = row && Object.keys(row).some(key => key !== 'weeks_counted' && Number(row[key]) > 0);
+    }
+    if (hasData) {
+      anyDataFound = true;
+      results.push({ statType, fields, ...row });
+    }
+  }
+  return { results, usedFallback: anyDataFound && results.length > 0 };
 }
 
 async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
   const resolved = await getMaddenExpandedPlayerRow(guildId, league.league_id, playerInput);
   const canonicalName = resolved?.player_name || playerInput;
-  const statRows = await getMaddenPlayerRawStatTotals(guildId, league.league_id, canonicalName);
+  const { results: statRows, usedFallback } = await getMaddenPlayerRawStatTotals(guildId, league.league_id, canonicalName);
 
   const embed = new EmbedBuilder()
     .setTitle(`🔎 Data Verify • ${canonicalName}`)
@@ -42198,8 +42450,12 @@ async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
     embed.addFields({ name: 'Roster Info', value: `Team: **${maddenTeamDisplayName(resolved.team_name || 'Free Agent')}** • Position: **${resolved.position || 'N/A'}** • OVR: **${resolved.overall ?? 'N/A'}**`, inline: false });
   }
 
+  if (usedFallback) {
+    embed.addFields({ name: '⚠️ Name-matching note', value: 'These stats were matched using a punctuation-normalized fallback — the exact name on file for this player in the weekly stats table differs slightly from the roster record (this can happen with apostrophes/hyphens between the two separate import pipelines). Numbers below are still accurate.', inline: false });
+  }
+
   if (!statRows.length) {
-    embed.addFields({ name: 'No stat rows found', value: `No imported weekly stats found for **${canonicalName}** yet. Run a sync after games have been played, or double-check the name spelling.`, inline: false });
+    embed.addFields({ name: 'No stat rows found', value: `No imported weekly stats found for **${canonicalName}** yet, even after a punctuation-normalized fallback match. Run a sync after games have been played, or double-check the name spelling.`, inline: false });
     return embed;
   }
 
@@ -42227,7 +42483,7 @@ async function buildMaddenVerifyStandingsEmbed(guildId, league, teamInput) {
      FROM madden_imported_games
      WHERE guild_id = $1 AND league_id = $2
        AND (LOWER(home_team) = LOWER($3) OR LOWER(away_team) = LOWER($3))
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score')
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
      ORDER BY week_label`,
     [guildId, league.league_id, teamName]
   ).catch(() => ({ rows: [] }));
@@ -61033,10 +61289,17 @@ async function refreshPersistentMaddenEmbeds(guild, league) {
       (settings) => buildMaddenStandingsScopeComponents(league.league_id, (settings && settings.standings_scope) || 'conference')),
     updatePersistentMaddenEmbed(guild, league, league.madden_power_rankings_channel_id, 'power_rankings_message_id',
       async () => {
-        const rows = await pool.query(
-          `SELECT * FROM madden_power_rankings WHERE league_id::text = $1::text ORDER BY rank ASC`,
-          [String(league.league_id)]
-        ).then(r => r.rows).catch(() => []);
+        // 7J-52POWERPANEL: was `SELECT * FROM madden_power_rankings` directly
+        // — but that table only ever stored rank/previous_rank/power_score
+        // (confirmed via schema), never wins/losses/points_for/points_against.
+        // Every row here always had those fields undefined, so the panel
+        // embed always rendered 0-0 records regardless of the real
+        // standings — not a staleness bug, it never had the data at all.
+        // recalculateMaddenPowerRankings (same function the /madden
+        // powerrankings slash command already uses correctly) computes
+        // fresh from live madden_imported_team_stats every call, including
+        // the actual record.
+        const rows = await recalculateMaddenPowerRankings(guild.id, league.league_id).catch(() => []);
         return buildMaddenPowerRankingsEmbed(league, rows);
       }),
     // Free agents board is intentionally NOT refreshed here. It has its own
@@ -62964,30 +63227,54 @@ const LEAGUE_CUSTOMIZATION_SECTIONS = [
   { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Turn conferences/divisions on/off, assign each team', emoji: '🗺️' },
 ];
 
+// 7J-54LEAGUESETTINGS: per Hxxdie — Madden leagues follow EA's own sync
+// data for season/schedule/playoff structure, so manually editing these is
+// misleading (the values aren't actually read by any Madden code path).
+// Confirmed via code search before filtering rather than assumed: the
+// Madden playoff bracket is built entirely from EA-synced game/schedule
+// rows (madden_imported_games with EA scheduleId) — playoff_team_count and
+// playoff_seeding_method are never referenced anywhere in a Madden-specific
+// path. Same for season_length/schedule_style. Only these two sections are
+// filtered — Standings (ties toggle still matters), Trades, Awards, and
+// Conferences/Divisions weren't confirmed inapplicable, so left alone
+// rather than guessed at.
+const MADDEN_HIDDEN_CUSTOMIZATION_SECTIONS = new Set(['season', 'playoffs']);
+
+function filterLeagueCustomizationSections(isMaddenLeague) {
+  if (!isMaddenLeague) return LEAGUE_CUSTOMIZATION_SECTIONS;
+  return LEAGUE_CUSTOMIZATION_SECTIONS.filter(s => !MADDEN_HIDDEN_CUSTOMIZATION_SECTIONS.has(s.value));
+}
+
 async function buildCommissionerLeagueEmbed(league) {
   const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
   const sportKey = getLeagueSportKey(league);
-  return new EmbedBuilder()
+  const isMadden = sportKey === 'madden';
+  const embed = new EmbedBuilder()
     .setTitle(`📋 League Customization • ${league.league_name}`)
     .setColor(0x5865F2)
-    .setDescription(`Sport: **${sportKey.toUpperCase()}**\nPick a section below to configure. These settings apply to standings, playoffs, and future schedule/trade features as they're built.`)
+    .setDescription(`Sport: **${sportKey.toUpperCase()}**\nPick a section below to configure. These settings apply to standings, playoffs, and future schedule/trade features as they're built.` + (isMadden ? '\n\n*Season/schedule and playoff structure follow this league\'s Madden sync and aren\'t manually configurable — those sections are hidden below.*' : ''))
     .addFields(
-      { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
-      { name: 'Schedule Style', value: customSettings.schedule_style === 'structured' ? 'Structured' : 'Open', inline: true },
       { name: 'Standings System', value: customSettings.standings_system === 'points' ? 'Points-based' : 'W/L Record', inline: true },
-      { name: 'Playoff Teams', value: String(league.playoff_team_count || 8), inline: true },
-      { name: 'Seeding Method', value: customSettings.playoff_seeding_method || 'overall_record', inline: true },
       { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
     )
     .setFooter({ text: 'GG Sports • Commissioner Panel' })
     .setTimestamp();
+  if (!isMadden) {
+    embed.addFields(
+      { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
+      { name: 'Schedule Style', value: customSettings.schedule_style === 'structured' ? 'Structured' : 'Open', inline: true },
+      { name: 'Playoff Teams', value: String(league.playoff_team_count || 8), inline: true },
+      { name: 'Seeding Method', value: customSettings.playoff_seeding_method || 'overall_record', inline: true },
+    );
+  }
+  return embed;
 }
 
-function buildCommissionerLeagueComponents(leagueId) {
+function buildCommissionerLeagueComponents(leagueId, isMaddenLeague = false) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('commissioner_league_section:' + leagueId)
     .setPlaceholder('Choose a section to configure')
-    .addOptions(LEAGUE_CUSTOMIZATION_SECTIONS.map(s => ({ label: s.label, value: s.value, description: s.description, emoji: s.emoji })));
+    .addOptions(filterLeagueCustomizationSections(isMaddenLeague).map(s => ({ label: s.label, value: s.value, description: s.description, emoji: s.emoji })));
   return [new ActionRowBuilder().addComponents(menu), buildCommissionerBackRow(leagueId)];
 }
 
@@ -62997,7 +63284,7 @@ async function showCommissionerLeagueSettings(interaction, leagueId) {
     await interaction.update({ content: 'League not found.', embeds: [], components: [] });
     return;
   }
-  const payload = { content: null, embeds: [await buildCommissionerLeagueEmbed(league)], components: buildCommissionerLeagueComponents(leagueId) };
+  const payload = { content: null, embeds: [await buildCommissionerLeagueEmbed(league)], components: buildCommissionerLeagueComponents(leagueId, getLeagueSportKey(league) === 'madden') };
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply(payload);
   } else {
