@@ -30923,6 +30923,19 @@ async function getMemberLeagueMemberships(guildId, userId) {
     if (!seenKeys.has(key)) { seenKeys.add(key); results.push(row); }
   }
 
+  // 7J-69TEAMSDIAG: two rounds of fixes haven't resolved this for Hxxdie
+  // despite the same underlying data source now confirmed working
+  // correctly for the Team Owners panel — logging the raw query inputs/
+  // outputs directly rather than guessing at a third fix blind.
+  console.log('[7J-69TEAMSDIAG] getMemberLeagueMemberships', JSON.stringify({
+    guildId: String(guildId),
+    userId: String(userId),
+    roleBasedRowCount: results.length - (ownedResult.rows?.length || 0),
+    dbOwnedRowCount: ownedResult.rows?.length || 0,
+    dbOwnedRows: ownedResult.rows,
+    finalResultCount: results.length,
+  }).slice(0, 3000));
+
   return results;
 }
 
@@ -50741,6 +50754,38 @@ function buildMaddenLeagueSnapshotLines({ mvpRace, oroyRace, droyRace, topPower,
   lines.push(`**Undefeated Teams:** ${undefeatedText}`);
 
   return lines.join('\n');
+}
+
+// 7J-67HOFFIX: was referenced but never defined anywhere in the codebase —
+// same pre-existing bug shape as maddenHallOfFameStatLine/
+// buildMaddenLeagueSnapshotLines above (all three broken since before this
+// session touched anything). "Record Watch" — whoever's in 2nd place
+// closing in on the current leader in each category, distinct framing from
+// the plain top-3 leaderboards already shown elsewhere in this embed.
+function buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards, sacks, interceptions }) {
+  const categories = [
+    { data: passingTDs, label: 'Passing TDs', unit: 'TD' },
+    { data: rushingYards, label: 'Rushing Yards', unit: 'YDS' },
+    { data: receivingYards, label: 'Receiving Yards', unit: 'YDS' },
+    { data: sacks, label: 'Sacks', unit: 'SACK' },
+    { data: interceptions, label: 'Interceptions', unit: 'INT' },
+  ];
+
+  const lines = [];
+  for (const cat of categories) {
+    const rows = cat.data?.rows || [];
+    const leader = rows[0];
+    const chaser = rows[1];
+    if (!leader) continue;
+    if (!chaser) {
+      lines.push(`**${cat.label}:** ${leader.player_name} leads with ${formatMaddenLeaderNumber(leader.leader_value)} ${cat.unit} — no one else on the board yet.`);
+      continue;
+    }
+    const gap = Number(leader.leader_value || 0) - Number(chaser.leader_value || 0);
+    lines.push(`**${cat.label}:** ${chaser.player_name} trails ${leader.player_name} by ${formatMaddenLeaderNumber(gap)} ${cat.unit} (${formatMaddenLeaderNumber(chaser.leader_value)} vs ${formatMaddenLeaderNumber(leader.leader_value)}).`);
+  }
+
+  return lines.length ? lines.join('\n') : 'No data yet.';
 }
 
 async function buildMaddenLeagueRecordsEmbed(guildId, league) {
