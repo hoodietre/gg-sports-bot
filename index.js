@@ -344,6 +344,18 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS autosync_interval_minutes INTEGER NOT NULL DEFAULT 60`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS next_sync_at TIMESTAMP`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sync_feed_channel_id TEXT`);
+  // 7J-60FRANCHISEHUB: message ID for the persistent board (same pattern as
+  // standings_message_id/power_rankings_message_id below), plus which of
+  // the 8 views is currently showing — needed so the every-sync auto-
+  // refresh re-renders whatever view someone last picked instead of always
+  // snapping back to the default Hub view.
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS franchise_hub_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS franchise_hub_current_view TEXT NOT NULL DEFAULT 'hub'`);
+  // 7J-61LEAGUEHOF: same table reused here as the generic (non-Madden)
+  // standings panel already does for standings_message_id — confirmed
+  // populated for every league type, not just Madden, despite the table name.
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS league_hof_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS league_hof_current_view TEXT NOT NULL DEFAULT 'legacy'`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_ea_connections (
       id UUID PRIMARY KEY,
@@ -1123,6 +1135,17 @@ async function initDatabase() {
   // 'Current' label, which meant a genuinely new season's championship could
   // never be told apart from the previous one. This is that missing value.
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_season_year INTEGER`);
+  // 7J-60FRANCHISEHUB: per Hxxdie — the 8-view Madden Franchise Hub
+  // (Hub/News/Records/HOF/Championships/Dynasty/Award History/Season Close)
+  // previously had zero button/panel access at all, only reachable by
+  // typing the exact /madden franchise command with a specific view name.
+  // Gets its own dedicated channel, same as Standings/Power Rankings/etc.
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_franchise_hub_channel_id TEXT`);
+  // 7J-61LEAGUEHOF: generic (non-Madden) equivalent of the Madden Franchise
+  // Hub channel above — Madden leagues already have superior Madden-specific
+  // Championship History/Award History/HOF views on that board, so this is
+  // scoped to non-Madden leagues only (opposite filter direction).
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_hof_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_feed_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_big_bet_threshold INTEGER NOT NULL DEFAULT 1000`);
@@ -4382,7 +4405,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -5501,6 +5524,19 @@ async function savePanel(league, panelKey, channelId, messageId) {
       [panelKey, channelId, messageId]
     );
   }
+}
+
+// 7J-61LEAGUEHOF: reuses updatePersistentMaddenEmbed, the same generic
+// helper the Madden boards use — confirmed via ensureMaddenLeagueSettings
+// that this works for any league type despite the "madden" naming.
+async function refreshLeagueHofBoard(guild, league) {
+  if (!guild || !league?.league_id) return;
+  await updatePersistentMaddenEmbed(guild, league, league.league_hof_channel_id, 'league_hof_message_id',
+    async (settings) => {
+      const currentView = (settings && settings.league_hof_current_view) || 'legacy';
+      return buildLeagueHofBoardEmbed(guild.id, league, currentView);
+    },
+    (settings) => buildLeagueHofBoardComponents(league.league_id, (settings && settings.league_hof_current_view) || 'legacy'));
 }
 
 async function updatePanel(guild, league, panelKey, embed, components = []) {
@@ -10221,6 +10257,11 @@ if (interaction.commandName === 'avatar') {
           await historyChannel.send({ embeds: [embed] }).catch(() => null);
         }
 
+        // 7J-61LEAGUEHOF: refresh once per submission batch, not per award
+        // line above — this is the manual /leagueawards flow, the other
+        // real write path into award_history besides season history posting.
+        await refreshLeagueHofBoard(interaction.guild, activeLeague).catch(() => null);
+
         await interaction.reply({ content: 'Saved **' + savedAwards.length + '** award(s) for **' + activeLeague.league_name + '**.', embeds: [embed], ephemeral: true });
         return;
       }
@@ -12904,6 +12945,50 @@ if (interaction.commandName === 'avatar') {
       const result = await startActiveCheck(interaction, league, hours, null)
         .catch(err => ({ ok: false, message: 'Failed to start active check: ' + (err?.message || 'Unknown error') }));
       await interaction.editReply({ content: result.message });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('madfranchisehub:view:')) {
+      const leagueId = interaction.customId.split(':')[2];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      const view = interaction.values[0];
+      await interaction.deferUpdate();
+      await pool.query(
+        `UPDATE madden_league_settings SET franchise_hub_current_view = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, view]
+      ).catch(() => null);
+      const embed = await buildMaddenFranchiseHubBoardEmbed(interaction.guild, league, view).catch(() => null);
+      if (!embed) {
+        await interaction.followUp({ content: 'Could not load that view — run Madden sync first if this league is new.', ephemeral: true });
+        return;
+      }
+      await interaction.editReply({
+        embeds: [embed],
+        components: buildMaddenFranchiseHubBoardComponents(leagueId, view),
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguehofboard:view:')) {
+      const leagueId = interaction.customId.split(':')[2];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      const view = interaction.values[0];
+      await interaction.deferUpdate();
+      await pool.query(
+        `UPDATE madden_league_settings SET league_hof_current_view = $2, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, view]
+      ).catch(() => null);
+      const embed = await buildLeagueHofBoardEmbed(interaction.guild.id, league, view).catch(() => null);
+      if (!embed) {
+        await interaction.followUp({ content: 'Could not load that view.', ephemeral: true });
+        return;
+      }
+      await interaction.editReply({
+        embeds: [embed],
+        components: buildLeagueHofBoardComponents(leagueId, view),
+      });
       return;
     }
 
@@ -16256,34 +16341,7 @@ if (gameSubcommand === 'report') {
         await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        const result = activeLeague
-          ? await pool.query(
-              `SELECT * FROM franchise_legacy
-               WHERE guild_id = $1 AND league_id = $2
-               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
-               LIMIT 15`,
-              [interaction.guild.id, activeLeague.league_id]
-            )
-          : await pool.query(
-              `SELECT * FROM franchise_legacy
-               WHERE guild_id = $1
-               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
-               LIMIT 15`,
-              [interaction.guild.id]
-            );
-
-        const NL = String.fromCharCode(10);
-        const embed = new EmbedBuilder()
-          .setTitle('Franchise Legacy' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
-          .setColor(0xFEE75C)
-          .setFooter({ text: 'GG Sports • Franchise Legacy' })
-          .setTimestamp();
-
-        embed.setDescription(result.rows.length
-          ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — Titles: ' + row.championships + ' • Finals: ' + row.finals_appearances + (row.last_championship ? ' • Last: ' + row.last_championship : '')).join(NL)
-          : 'No franchise legacy records found yet.');
-
+        const embed = await buildLeagueLegacyEmbed(interaction.guild.id, activeLeague);
         await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
@@ -16293,36 +16351,7 @@ if (gameSubcommand === 'report') {
         const leagueName = interaction.options.getString('league');
         const awardFilter = interaction.options.getString('award');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        let result;
-        if (activeLeague && awardFilter) {
-          result = await pool.query(
-            `SELECT * FROM award_history WHERE guild_id = $1 AND league_id = $2 AND LOWER(award_name) LIKE LOWER($3) ORDER BY created_at DESC LIMIT 20`,
-            [interaction.guild.id, activeLeague.league_id, '%' + awardFilter + '%']
-          );
-        } else if (activeLeague) {
-          result = await pool.query(
-            `SELECT * FROM award_history WHERE guild_id = $1 AND league_id = $2 ORDER BY created_at DESC LIMIT 20`,
-            [interaction.guild.id, activeLeague.league_id]
-          );
-        } else {
-          result = await pool.query(
-            `SELECT * FROM award_history WHERE guild_id = $1 ORDER BY created_at DESC LIMIT 20`,
-            [interaction.guild.id]
-          );
-        }
-
-        const NL = String.fromCharCode(10);
-        const embed = new EmbedBuilder()
-          .setTitle('Award History' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
-          .setColor(0x5865F2)
-          .setFooter({ text: 'GG Sports • Awards' })
-          .setTimestamp();
-
-        embed.setDescription(result.rows.length
-          ? result.rows.map(row => '**' + row.season_label + '** — ' + row.award_name + ': ' + row.winner).join(NL)
-          : 'No award history found yet.');
-
+        const embed = await buildLeagueAwardHistoryEmbed(interaction.guild.id, activeLeague, awardFilter);
         await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
@@ -16331,34 +16360,7 @@ if (gameSubcommand === 'report') {
         await interaction.deferReply({ ephemeral: true });
         const leagueName = interaction.options.getString('league');
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-
-        const result = activeLeague
-          ? await pool.query(
-              `SELECT * FROM franchise_legacy
-               WHERE guild_id = $1 AND league_id = $2
-               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
-               LIMIT 10`,
-              [interaction.guild.id, activeLeague.league_id]
-            )
-          : await pool.query(
-              `SELECT * FROM franchise_legacy
-               WHERE guild_id = $1
-               ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
-               LIMIT 10`,
-              [interaction.guild.id]
-            );
-
-        const NL = String.fromCharCode(10);
-        const embed = new EmbedBuilder()
-          .setTitle('🏛️ Hall of Fame' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
-          .setColor(0xFEE75C)
-          .setFooter({ text: 'GG Sports • Hall of Fame' })
-          .setTimestamp();
-
-        embed.setDescription(result.rows.length
-          ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — ' + row.championships + ' championships, ' + row.finals_appearances + ' finals').join(NL)
-          : 'No Hall of Fame records found yet.');
-
+        const embed = await buildLeagueHallOfFameEmbed(interaction.guild.id, activeLeague);
         await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
@@ -16392,55 +16394,7 @@ if (gameSubcommand === 'report') {
       if (profileSubcommand === 'earnings') {
         await interaction.deferReply({ ephemeral: true });
         const targetUser = interaction.options.getUser('user') || interaction.user;
-        const settings = await getCurrencySettings(interaction.guild.id);
-
-        const balance = await getBalance(interaction.guild.id, targetUser.id);
-
-        const sportsbookResult = await pool.query(
-          `SELECT
-             COALESCE(SUM(amount), 0) AS total_wagered,
-             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END), 0) AS total_paid,
-             COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS net_profit
-           FROM sportsbook_bets
-           WHERE guild_id = $1 AND user_id = $2`,
-          [interaction.guild.id, targetUser.id]
-        );
-        const sportsbook = sportsbookResult.rows[0] || {};
-
-        const transactionResult = await pool.query(
-          `SELECT transaction_type, COALESCE(SUM(amount), 0) AS total
-           FROM currency_transactions
-           WHERE guild_id = $1 AND user_id = $2
-           GROUP BY transaction_type
-           ORDER BY total DESC
-           LIMIT 10`,
-          [interaction.guild.id, targetUser.id]
-        );
-
-        const NL = String.fromCharCode(10);
-        const embed = new EmbedBuilder()
-          .setTitle('Earnings Profile • ' + targetUser.username)
-          .setColor(0x57F287)
-          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-          .addFields(
-            { name: 'Current Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
-            { name: 'Lifetime Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
-            { name: 'Lifetime Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
-            { name: 'Sportsbook Wagered', value: settings.currency_icon + ' ' + String(sportsbook.total_wagered || 0), inline: true },
-            { name: 'Sportsbook Paid Out', value: settings.currency_icon + ' ' + String(sportsbook.total_paid || 0), inline: true },
-            { name: 'Sportsbook Net', value: settings.currency_icon + ' ' + String(sportsbook.net_profit || 0), inline: true }
-          )
-          .setFooter({ text: 'GG Sports • Earnings Profile' })
-          .setTimestamp();
-
-        if (transactionResult.rows.length) {
-          embed.addFields({
-            name: 'Top Transaction Types',
-            value: transactionResult.rows.map(row => '**' + row.transaction_type + '** — ' + settings.currency_icon + ' ' + row.total).join(NL),
-            inline: false,
-          });
-        }
-
+        const embed = await buildMemberEarningsEmbed(interaction.guild, targetUser);
         await interaction.editReply({ embeds: [embed], ephemeral: true });
         return;
       }
@@ -30467,6 +30421,12 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
     );
   }
 
+  // 7J-61LEAGUEHOF: this is the single function where every franchise_legacy/
+  // award_history write for a season happens, so it's the right place to
+  // auto-refresh the League HOF board rather than needing a hook at each
+  // individual write site.
+  await refreshLeagueHofBoard(interaction.guild, activeLeague).catch(() => null);
+
   return { ok: true, message: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.` };
 }
 
@@ -30625,6 +30585,186 @@ async function buildMemberMilestonesEmbed(guild, targetUser) {
     .setTimestamp();
 }
 
+async function buildMemberEarningsEmbed(guild, targetUser) {
+  const settings = await getCurrencySettings(guild.id);
+  const balance = await getBalance(guild.id, targetUser.id);
+
+  const sportsbookResult = await pool.query(
+    `SELECT
+       COALESCE(SUM(amount), 0) AS total_wagered,
+       COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END), 0) AS total_paid,
+       COALESCE(SUM(CASE WHEN status = 'won' THEN potential_payout - amount WHEN status = 'lost' THEN -amount ELSE 0 END), 0) AS net_profit
+     FROM sportsbook_bets
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guild.id, targetUser.id]
+  );
+  const sportsbook = sportsbookResult.rows[0] || {};
+
+  const transactionResult = await pool.query(
+    `SELECT transaction_type, COALESCE(SUM(amount), 0) AS total
+     FROM currency_transactions
+     WHERE guild_id = $1 AND user_id = $2
+     GROUP BY transaction_type
+     ORDER BY total DESC
+     LIMIT 10`,
+    [guild.id, targetUser.id]
+  );
+
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Earnings Profile • ' + targetUser.username)
+    .setColor(0x57F287)
+    .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+    .addFields(
+      { name: 'Current Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
+      { name: 'Lifetime Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
+      { name: 'Lifetime Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
+      { name: 'Sportsbook Wagered', value: settings.currency_icon + ' ' + String(sportsbook.total_wagered || 0), inline: true },
+      { name: 'Sportsbook Paid Out', value: settings.currency_icon + ' ' + String(sportsbook.total_paid || 0), inline: true },
+      { name: 'Sportsbook Net', value: settings.currency_icon + ' ' + String(sportsbook.net_profit || 0), inline: true }
+    )
+    .setFooter({ text: 'GG Sports • Earnings Profile' })
+    .setTimestamp();
+
+  if (transactionResult.rows.length) {
+    embed.addFields({
+      name: 'Top Transaction Types',
+      value: transactionResult.rows.map(row => '**' + row.transaction_type + '** — ' + settings.currency_icon + ' ' + row.total).join(NL),
+      inline: false,
+    });
+  }
+
+  return embed;
+}
+
+// 7J-61LEAGUEHOF: extracted from the /profile legacy/awards/halloffame
+// slash command handlers (previously inline logic duplicated there) so
+// they can be reused by both the slash commands and the new League Hall
+// of Fame board below. These were never per-user profile data in the
+// first place — no user parameter, league-wide leaderboards — which is
+// why they don't belong on the per-person Member Profile panel; they're
+// the generic (non-Madden) equivalent of what the Madden Franchise Hub
+// board's Championship History/Award History/Hall of Fame views cover.
+async function buildLeagueLegacyEmbed(guildId, activeLeague) {
+  const result = activeLeague
+    ? await pool.query(
+        `SELECT * FROM franchise_legacy
+         WHERE guild_id = $1 AND league_id = $2
+         ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+         LIMIT 15`,
+        [guildId, activeLeague.league_id]
+      )
+    : await pool.query(
+        `SELECT * FROM franchise_legacy
+         WHERE guild_id = $1
+         ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+         LIMIT 15`,
+        [guildId]
+      );
+
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Franchise Legacy' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Franchise Legacy' })
+    .setTimestamp();
+
+  embed.setDescription(result.rows.length
+    ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — Titles: ' + row.championships + ' • Finals: ' + row.finals_appearances + (row.last_championship ? ' • Last: ' + row.last_championship : '')).join(NL)
+    : 'No franchise legacy records found yet.');
+  return embed;
+}
+
+async function buildLeagueAwardHistoryEmbed(guildId, activeLeague, awardFilter = null) {
+  let result;
+  if (activeLeague && awardFilter) {
+    result = await pool.query(
+      `SELECT * FROM award_history WHERE guild_id = $1 AND league_id = $2 AND LOWER(award_name) LIKE LOWER($3) ORDER BY created_at DESC LIMIT 20`,
+      [guildId, activeLeague.league_id, '%' + awardFilter + '%']
+    );
+  } else if (activeLeague) {
+    result = await pool.query(
+      `SELECT * FROM award_history WHERE guild_id = $1 AND league_id = $2 ORDER BY created_at DESC LIMIT 20`,
+      [guildId, activeLeague.league_id]
+    );
+  } else {
+    result = await pool.query(
+      `SELECT * FROM award_history WHERE guild_id = $1 ORDER BY created_at DESC LIMIT 20`,
+      [guildId]
+    );
+  }
+
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('Award History' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Awards' })
+    .setTimestamp();
+
+  embed.setDescription(result.rows.length
+    ? result.rows.map(row => '**' + row.season_label + '** — ' + row.award_name + ': ' + row.winner).join(NL)
+    : 'No award history found yet.');
+  return embed;
+}
+
+async function buildLeagueHallOfFameEmbed(guildId, activeLeague) {
+  const result = activeLeague
+    ? await pool.query(
+        `SELECT * FROM franchise_legacy
+         WHERE guild_id = $1 AND league_id = $2
+         ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+         LIMIT 10`,
+        [guildId, activeLeague.league_id]
+      )
+    : await pool.query(
+        `SELECT * FROM franchise_legacy
+         WHERE guild_id = $1
+         ORDER BY championships DESC, finals_appearances DESC, franchise_name ASC
+         LIMIT 10`,
+        [guildId]
+      );
+
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder()
+    .setTitle('🏛️ Hall of Fame' + (activeLeague ? ' • ' + activeLeague.league_name : ''))
+    .setColor(0xFEE75C)
+    .setFooter({ text: 'GG Sports • Hall of Fame' })
+    .setTimestamp();
+
+  embed.setDescription(result.rows.length
+    ? result.rows.map((row, index) => '**' + (index + 1) + '. ' + row.franchise_name + '** — ' + row.championships + ' championships, ' + row.finals_appearances + ' finals').join(NL)
+    : 'No Hall of Fame records found yet.');
+  return embed;
+}
+
+// 7J-61LEAGUEHOF: League Hall of Fame board — the generic (non-Madden)
+// equivalent of the Madden Franchise Hub board built earlier this
+// session, same navigable-select-menu pattern, three views instead of 8
+// since that's all the generic system tracks.
+const LEAGUE_HOF_BOARD_VIEWS = {
+  legacy: { label: 'Franchise Legacy', emoji: '🏆', build: (guildId, league) => buildLeagueLegacyEmbed(guildId, league) },
+  awards: { label: 'Award History', emoji: '🎖️', build: (guildId, league) => buildLeagueAwardHistoryEmbed(guildId, league) },
+  halloffame: { label: 'Hall of Fame', emoji: '🏛️', build: (guildId, league) => buildLeagueHallOfFameEmbed(guildId, league) },
+};
+
+async function buildLeagueHofBoardEmbed(guildId, league, view = 'legacy') {
+  const viewConfig = LEAGUE_HOF_BOARD_VIEWS[view] || LEAGUE_HOF_BOARD_VIEWS.legacy;
+  return viewConfig.build(guildId, league);
+}
+
+function buildLeagueHofBoardComponents(leagueId, currentView = 'legacy') {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('leaguehofboard:view:' + leagueId)
+    .setPlaceholder('View: ' + (LEAGUE_HOF_BOARD_VIEWS[currentView]?.label || 'Franchise Legacy'))
+    .addOptions(Object.entries(LEAGUE_HOF_BOARD_VIEWS).map(([value, cfg]) => ({
+      label: cfg.label,
+      value,
+      emoji: cfg.emoji,
+      default: value === currentView,
+    })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
 async function buildMemberBadgesEmbed(guild, targetUser) {
   await ensureRecognitionProfile(guild.id, targetUser.id);
   const recognitionResult = await pool.query(
@@ -30708,6 +30848,7 @@ const MEMBER_PROFILE_CATEGORIES = [
   { value: 'teams', label: 'Teams & Leagues', description: 'Teams owned, leagues joined, combined record', emoji: '🏈' },
   { value: 'milestones', label: 'Milestones', description: 'Activity and legacy milestones', emoji: '🏁' },
   { value: 'badges', label: 'Badges', description: 'Earned profile badges', emoji: '🎖️' },
+  { value: 'earnings', label: 'Earnings', description: 'Balance, lifetime earned/spent, sportsbook profit', emoji: '💰' },
 ];
 
 function buildMemberProfileStarterEmbed() {
@@ -30775,6 +30916,7 @@ async function showMemberProfileCategory(interaction, targetUser, category, { up
   if (category === 'teams') embed = await buildMemberTeamsLeaguesEmbed(interaction.guild, targetUser);
   else if (category === 'milestones') embed = await buildMemberMilestonesEmbed(interaction.guild, targetUser);
   else if (category === 'badges') embed = await buildMemberBadgesEmbed(interaction.guild, targetUser);
+  else if (category === 'earnings') embed = await buildMemberEarningsEmbed(interaction.guild, targetUser);
   else embed = new EmbedBuilder().setTitle('Unknown section').setColor(0xED4245);
   const payload = { content: null, embeds: [embed], files: [], components: [buildMemberProfileBackRow(targetUser.id)] };
   return update ? interaction.update(payload) : interaction.editReply(payload);
@@ -30940,6 +31082,7 @@ const MADDEN_ONLY_SETUP_KEYS = new Set([
   // were seeing them despite them being meaningless there.
   'madden_weekly_updates_channel',
   'draft_recap_channel',
+  'madden_franchise_hub_channel',
 ]);
 
 // 7J-44SETUP: the reverse direction — options that only make sense for
@@ -30951,6 +31094,9 @@ const MADDEN_ONLY_SETUP_KEYS = new Set([
 // flagged.
 const NON_MADDEN_ONLY_SETUP_KEYS = new Set([
   'standings_channel',
+  // 7J-61LEAGUEHOF: Madden leagues already have superior Madden-specific
+  // Championship History/Award History/HOF views on the Franchise Hub board.
+  'league_hof_channel',
 ]);
 
 const MADDEN_ONLY_PANEL_KEYS = new Set([
@@ -30963,6 +31109,19 @@ const MADDEN_ONLY_PANEL_KEYS = new Set([
   'gm_panel_starter_panel',
   'league_leaders_panel',
   'award_race_panel',
+  'madden_franchise_hub_panel',
+]);
+
+// 7J-61LEAGUEHOF: same shape of gap as the earlier SETUP_DASHBOARD_OPTIONS
+// fix this session (Track H #25) — standings_panel was already labeled
+// "(generic, non-Madden)" in its own text but MADDEN_ONLY_PANEL_KEYS only
+// ever filtered one direction, so Madden leagues could still see and pick
+// it. Found while wiring in league_hof_panel, which has the same real
+// non-Madden-only requirement (Madden leagues have the superior
+// Madden-specific equivalent on the Franchise Hub board).
+const NON_MADDEN_ONLY_PANEL_KEYS = new Set([
+  'standings_panel',
+  'league_hof_panel',
 ]);
 
 const SETUP_DASHBOARD_OPTIONS = [
@@ -30974,6 +31133,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   // commissioner had no way to actually set it from the setup dashboard.
   { value: 'live_channel', label: 'Streaming Channel', description: 'Where stream announcements post (/livestream, game thread Stream Hub)', kind: 'channel' },
   { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
+  { value: 'league_hof_channel', label: 'League Hall of Fame Board', description: 'Persistent board: Franchise Legacy, Award History, Hall of Fame', kind: 'channel' },
   { value: 'history_channel', label: 'League History Channel', description: 'Season archives and year-end history posts', kind: 'channel' },
   { value: 'madden_free_agents_channel', label: 'Madden Free Agents Channel', description: 'Live free agent board and offseason free agency panel', kind: 'channel' },
   { value: 'trade_block_channel', label: 'Trade Block Channel', description: 'Live, sortable trade block board', kind: 'channel' },
@@ -30992,6 +31152,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'draft_recap_channel', label: 'Draft Recap Channel', description: 'Madden: auto-posts here when the league advances past the draft', kind: 'channel' },
   { value: 'madden_news_channel', label: 'Madden News Channel', description: 'Where transaction, retirement, and draft news posts appear', kind: 'channel' },
   { value: 'madden_weekly_updates_channel', label: 'Weekly Updates Channel', description: 'Batched roster/transaction/injury summaries, separate from News', kind: 'channel' },
+  { value: 'madden_franchise_hub_channel', label: 'Franchise Hub Board', description: 'Persistent board: Hub, News, Records, HOF, Championships, Dynasty, Awards, Season Close', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
   { value: 'madden_sportsbook_channel', label: 'Madden Sportsbook Channel', description: 'Channel for Madden betting lines (user vs user games)', kind: 'channel' },
@@ -31026,8 +31187,10 @@ const MULTI_CHANNEL_DASHBOARD_MAP = {
 
 const SETUP_PANEL_OPTIONS = [
   { value: 'standings_panel', label: 'Create/Refresh Standings Panel (generic, non-Madden)' },
+  { value: 'league_hof_panel', label: 'Post/Refresh League Hall of Fame Board (generic, non-Madden)' },
   { value: 'madden_standings_panel', label: 'Post/Refresh Madden Standings Board' },
   { value: 'madden_power_rankings_panel', label: 'Post/Refresh Madden Power Rankings Board' },
+  { value: 'madden_franchise_hub_panel', label: 'Post/Refresh Franchise Hub Board' },
   { value: 'madden_free_agents_panel', label: 'Post/Refresh Madden Free Agents Board' },
   { value: 'trade_block_board_panel', label: 'Post/Refresh Trade Block Board' },
   { value: 'trade_negotiation_starter_panel', label: 'Post/Refresh Trade Negotiation Starter' },
@@ -31115,6 +31278,7 @@ function setupDashboardColumn(settingKey) {
     trade_committee_role: 'trade_committee_role_id',
     live_channel: 'live_channel_id',
     standings_channel: 'standings_channel_id',
+    league_hof_channel: 'league_hof_channel_id',
     history_channel: 'history_channel_id',
     madden_free_agents_channel: 'madden_free_agents_channel_id',
     trade_block_channel: 'trade_block_channel_id',
@@ -31135,6 +31299,7 @@ function setupDashboardColumn(settingKey) {
     draft_recap_channel: 'draft_recap_channel_id',
     madden_news_channel: 'madden_news_channel_id',
     madden_weekly_updates_channel: 'madden_weekly_updates_channel_id',
+    madden_franchise_hub_channel: 'madden_franchise_hub_channel_id',
     madden_standings_channel: 'madden_standings_channel_id',
     madden_power_rankings_channel: 'madden_power_rankings_channel_id',
     madden_sportsbook_channel: 'madden_sportsbook_channel_id',
@@ -31272,7 +31437,11 @@ function buildSetupPanelMenuEmbed(league) {
 }
 
 function buildSetupPanelMenuComponents(leagueId, isMaddenLeague = true) {
-  const filteredOptions = isMaddenLeague ? SETUP_PANEL_OPTIONS : SETUP_PANEL_OPTIONS.filter(o => !MADDEN_ONLY_PANEL_KEYS.has(o.value));
+  const filteredOptions = SETUP_PANEL_OPTIONS.filter(o => {
+    if (isMaddenLeague && NON_MADDEN_ONLY_PANEL_KEYS.has(o.value)) return false;
+    if (!isMaddenLeague && MADDEN_ONLY_PANEL_KEYS.has(o.value)) return false;
+    return true;
+  });
   const panelMenu = new StringSelectMenuBuilder()
     .setCustomId('setup_create_panel:' + leagueId)
     .setPlaceholder('Create/refresh a setup panel')
@@ -31456,6 +31625,36 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const message = await channel.send({ embeds: [buildMaddenPowerRankingsEmbed(league, rankRows)] });
     await pool.query(`UPDATE madden_league_settings SET power_rankings_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
     return 'Madden Power Rankings Board posted/refreshed in ' + channel.toString() + '.' + (rankRows.length ? '' : ' (No power rankings computed yet — run /madden sync first.)');
+  }
+
+  // 7J-60FRANCHISEHUB: per Hxxdie — gives the 8-view Franchise Hub the same
+  // manual post/refresh flow every other Madden board already has.
+  if (panelType === 'madden_franchise_hub_panel') {
+    const { channel, error } = await requireTextChannel(league.madden_franchise_hub_channel_id, interaction.channel, 'Madden Franchise Hub channel');
+    if (error) return error + ' Set **Franchise Hub Board** from this setup dashboard first.';
+
+    const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+    const currentView = settings.franchise_hub_current_view || 'hub';
+    const embed = await buildMaddenFranchiseHubBoardEmbed(interaction.guild, league, currentView).catch(() => null);
+    if (!embed) return 'Could not build the Franchise Hub embed — run /madden sync first if this league is new.';
+    const message = await channel.send({ embeds: [embed], components: buildMaddenFranchiseHubBoardComponents(league.league_id, currentView) });
+    await pool.query(`UPDATE madden_league_settings SET franchise_hub_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
+    return 'Franchise Hub Board posted/refreshed in ' + channel.toString() + '.';
+  }
+
+  // 7J-61LEAGUEHOF: generic (non-Madden) equivalent of the Madden Franchise
+  // Hub panel above, per Hxxdie.
+  if (panelType === 'league_hof_panel') {
+    const { channel, error } = await requireTextChannel(league.league_hof_channel_id, interaction.channel, 'League Hall of Fame channel');
+    if (error) return error + ' Set **League Hall of Fame Board** from this setup dashboard first.';
+
+    const settings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+    const currentView = settings.league_hof_current_view || 'legacy';
+    const embed = await buildLeagueHofBoardEmbed(interaction.guild.id, league, currentView).catch(() => null);
+    if (!embed) return 'Could not build the League Hall of Fame embed.';
+    const message = await channel.send({ embeds: [embed], components: buildLeagueHofBoardComponents(league.league_id, currentView) });
+    await pool.query(`UPDATE madden_league_settings SET league_hof_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
+    return 'League Hall of Fame Board posted/refreshed in ' + channel.toString() + '.';
   }
 
   if (panelType === 'madden_free_agents_panel') {
@@ -61486,6 +61685,40 @@ async function updatePersistentMaddenEmbed(guild, league, channelId, messageIdKe
   return posted;
 }
 
+// 7J-60FRANCHISEHUB: reuses the exact same 8 embed builder functions
+// /madden franchise already calls — this board is purely a navigable
+// persistent home for them, not a parallel reimplementation. Diagnostic-
+// only views (results_diag, endpoint_discovery, etc.) are deliberately
+// excluded — those are internal sync-debugging tools, not member-facing.
+const MADDEN_FRANCHISE_HUB_VIEWS = {
+  hub: { label: 'Franchise Hub', emoji: '🏟️', build: (guild, league) => buildMaddenFranchiseEmbed(guild, league) },
+  news: { label: 'News Feed', emoji: '📰', build: (guild, league) => buildMaddenNewsFeedEmbed(guild.id, league) },
+  records: { label: 'League Records', emoji: '🏆', build: (guild, league) => buildMaddenLeagueRecordsEmbed(guild.id, league) },
+  hof: { label: 'Hall of Fame', emoji: '⭐', build: (guild, league) => buildMaddenHallOfFameEmbed(guild.id, league) },
+  championships: { label: 'Championship History', emoji: '🏅', build: (guild, league) => buildMaddenChampionshipHistoryEmbed(guild.id, league) },
+  dynasty: { label: 'Dynasty Tracker', emoji: '👑', build: (guild, league) => buildMaddenDynastyTrackerEmbed(guild.id, league) },
+  award_history: { label: 'Award History', emoji: '🎖️', build: (guild, league) => buildMaddenAwardHistoryEmbed(guild.id, league) },
+  season_close: { label: 'Season Close Preview', emoji: '📋', build: (guild, league) => buildMaddenSeasonClosePreviewEmbed(guild.id, league) },
+};
+
+async function buildMaddenFranchiseHubBoardEmbed(guild, league, view = 'hub') {
+  const viewConfig = MADDEN_FRANCHISE_HUB_VIEWS[view] || MADDEN_FRANCHISE_HUB_VIEWS.hub;
+  return viewConfig.build(guild, league);
+}
+
+function buildMaddenFranchiseHubBoardComponents(leagueId, currentView = 'hub') {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('madfranchisehub:view:' + leagueId)
+    .setPlaceholder('View: ' + (MADDEN_FRANCHISE_HUB_VIEWS[currentView]?.label || 'Franchise Hub'))
+    .addOptions(Object.entries(MADDEN_FRANCHISE_HUB_VIEWS).map(([value, cfg]) => ({
+      label: cfg.label,
+      value,
+      emoji: cfg.emoji,
+      default: value === currentView,
+    })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+
 function buildMaddenStandingsScopeComponents(leagueId, currentScope = 'conference') {
   const mk = (label, value) => new ButtonBuilder()
     .setCustomId(`madstand:scope:${leagueId}:${value}`)
@@ -61521,6 +61754,15 @@ async function refreshPersistentMaddenEmbeds(guild, league) {
         const rows = await recalculateMaddenPowerRankings(guild.id, league.league_id).catch(() => []);
         return buildMaddenPowerRankingsEmbed(league, rows);
       }),
+    // 7J-60FRANCHISEHUB: re-renders whatever view was last picked
+    // (settings.franchise_hub_current_view) so an active board doesn't
+    // silently reset to the default Hub view on every sync.
+    updatePersistentMaddenEmbed(guild, league, league.madden_franchise_hub_channel_id, 'franchise_hub_message_id',
+      async (settings) => {
+        const currentView = (settings && settings.franchise_hub_current_view) || 'hub';
+        return buildMaddenFranchiseHubBoardEmbed(guild, league, currentView);
+      },
+      (settings) => buildMaddenFranchiseHubBoardComponents(league.league_id, (settings && settings.franchise_hub_current_view) || 'hub')),
     // Free agents board is intentionally NOT refreshed here. It has its own
     // separate, correct auto-refresh path (refreshMaddenFreeAgentsPanelForLeague,
     // called right after sync, backed by the madden_free_agent_panels table).
