@@ -30968,13 +30968,27 @@ async function getMemberLeagueMemberships(guildId, userId) {
     if (matchedTeams.length) {
       const leagueIds = [...new Set(matchedTeams.map(row => row.league_id))];
       const leagueInfoResult = await pool.query(
-        `SELECT league_id, league_name, game FROM leagues WHERE league_id = ANY($1::uuid[]) AND is_active = TRUE`,
+        `SELECT league_id, league_name, game, is_active FROM leagues WHERE league_id = ANY($1::uuid[])`,
         [leagueIds]
       ).catch(() => ({ rows: [] }));
+      // 7J-74TEAMSDIAG: round 5 — the round-4 diagnostic proved the match
+      // itself succeeds (role found, member has it), yet finalResultCount
+      // was still 0. This is the exact spot that was silently dropping it —
+      // logging the raw lookup here instead of assuming is_active or a
+      // league_id mismatch is the cause, and no longer requiring
+      // is_active = TRUE in the SQL itself (checked in JS below instead,
+      // where it can be logged rather than silently filtering the row out
+      // of the result set entirely).
+      console.log('[7J-74TEAMSDIAG] matchedTeams -> leagueInfo lookup:', JSON.stringify({
+        matchedTeams,
+        leagueIdsQueried: leagueIds,
+        leagueInfoFound: leagueInfoResult.rows,
+      }).slice(0, 2000));
       const leagueInfoById = new Map(leagueInfoResult.rows.map(l => [l.league_id, l]));
       for (const row of matchedTeams) {
         const leagueInfo = leagueInfoById.get(row.league_id);
         if (!leagueInfo) continue;
+        if (leagueInfo.is_active === false) continue;
         const key = row.league_id + ':' + row.role_id;
         if (!seenKeys.has(key)) {
           seenKeys.add(key);
@@ -43035,6 +43049,18 @@ async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
           [guildId, String(league.league_id), resolved.team_name]
         ).catch(() => ({ rows: [{ total: 0 }] }))
       : { rows: [{ total: 'N/A (no roster team resolved)' }] };
+    // 7J-75VERIFYDIAG: shows the team's actual full_name values on file —
+    // directly answers whether the target player appears under a
+    // different spelling/format (e.g. "J.Allen", a typo, extra
+    // whitespace) instead of requiring another round-trip to find out.
+    const sampleNamesResult = resolved?.team_name
+      ? await pool.query(
+          `SELECT DISTINCT full_name FROM madden_player_weekly_stats
+           WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(team_name) = LOWER($3) AND full_name IS NOT NULL
+           ORDER BY full_name ASC LIMIT 40`,
+          [guildId, String(league.league_id), resolved.team_name]
+        ).catch(() => ({ rows: [] }))
+      : { rows: [] };
     embed.addFields({
       name: 'No stat rows found',
       value: `No imported weekly stats found for **${canonicalName}** yet. Run a sync after games have been played, or double-check the name spelling.\n\n` +
@@ -43043,6 +43069,13 @@ async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
         (Number(teamPlayersResult.rows[0]?.total) === 0 ? 'That team specifically has zero players with imported stats — this looks like a real per-team data gap, not a name-matching issue.' : 'That team does have other players with stats, so this specific player may genuinely be missing from the import.'),
       inline: false,
     });
+    if (sampleNamesResult.rows.length) {
+      embed.addFields({
+        name: `Names On File For ${resolved.team_name}`,
+        value: maddenSafeEmbedText(sampleNamesResult.rows.map(r => r.full_name).join(', '), 1024),
+        inline: false,
+      });
+    }
     return embed;
   }
 
