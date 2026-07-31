@@ -30966,29 +30966,24 @@ async function getMemberLeagueMemberships(guildId, userId) {
       console.log('[7J-72TEAMSDIAG] No team_name containing "dolphin" found at all in madden_imported_team_stats for guild', String(guildId), '— total team rows found:', maddenTeamsResult.rows.length, JSON.stringify(maddenTeamsResult.rows.map(r => r.team_name)).slice(0, 1500));
     }
     if (matchedTeams.length) {
-      const leagueIds = [...new Set(matchedTeams.map(row => row.league_id))];
-      const leagueInfoResult = await pool.query(
-        `SELECT league_id, league_name, game, is_active FROM leagues WHERE league_id = ANY($1::uuid[])`,
-        [leagueIds]
-      ).catch(() => ({ rows: [] }));
-      // 7J-74TEAMSDIAG: round 5 — the round-4 diagnostic proved the match
-      // itself succeeds (role found, member has it), yet finalResultCount
-      // was still 0. This is the exact spot that was silently dropping it —
-      // logging the raw lookup here instead of assuming is_active or a
-      // league_id mismatch is the cause, and no longer requiring
-      // is_active = TRUE in the SQL itself (checked in JS below instead,
-      // where it can be logged rather than silently filtering the row out
-      // of the result set entirely).
-      console.log('[7J-74TEAMSDIAG] matchedTeams -> leagueInfo lookup:', JSON.stringify({
-        matchedTeams,
-        leagueIdsQueried: leagueIds,
-        leagueInfoFound: leagueInfoResult.rows,
-      }).slice(0, 2000));
-      const leagueInfoById = new Map(leagueInfoResult.rows.map(l => [l.league_id, l]));
+      // 7J-76TEAMSFIX: round 6 — the round-5 diagnostic proved the exact
+      // league_id from a successfully-matched team (confirmed correct,
+      // matches what every other part of the bot uses for this same
+      // league) still came back empty from a raw `WHERE league_id =
+      // ANY($1::uuid[])` query, which should be structurally impossible
+      // given the foreign key from madden_imported_team_stats.league_id to
+      // leagues(league_id) guarantees that row must exist. Rather than
+      // keep debugging a hand-written array-parameter query, this just
+      // reuses getLeagueById — the exact same function every other part of
+      // the bot already uses successfully for this exact league. One query
+      // per matched team instead of a batch, but there are typically only
+      // 1-2 matches per user, so the tradeoff is trivial.
       for (const row of matchedTeams) {
-        const leagueInfo = leagueInfoById.get(row.league_id);
-        if (!leagueInfo) continue;
-        if (leagueInfo.is_active === false) continue;
+        const leagueInfo = await getLeagueById(row.league_id).catch(() => null);
+        if (!leagueInfo) {
+          console.log('[7J-76TEAMSFIX] getLeagueById also returned nothing for', row.league_id, '— this points at something deeper than a query-writing issue.');
+          continue;
+        }
         const key = row.league_id + ':' + row.role_id;
         if (!seenKeys.has(key)) {
           seenKeys.add(key);
@@ -42969,8 +42964,43 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
   // correctly-deduplicated results using a normalized name match against
   // the already-cleaned player_name — sidestepping the raw full_name
   // inconsistency entirely instead of trying to out-guess its formatting.
+  //
+  // 7J-77VERIFYFIX: confirmed via the "Names On File" diagnostic added last
+  // round — the actual root cause was never formatting at all. Weekly
+  // stats store names as "J.Allen" (first-initial + period + last name);
+  // the roster table stores full first names ("Josh Allen"). These are
+  // different naming CONVENTIONS, not formatting variants of the same
+  // string — no punctuation/space stripping could ever make "joshallen"
+  // equal "jallen". Matches on last-name + first-initial instead, which
+  // correctly bridges both formats.
   const normalize = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const normalizedTarget = normalize(playerName);
+
+  const SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv', 'v']);
+  function lastNameAndInitial(fullName) {
+    const raw = String(fullName || '').trim();
+    if (!raw) return null;
+    // "J.Allen" / "J. Allen" style — initial before the first period.
+    const dotMatch = raw.match(/^([A-Za-z])\.\s*(.+)$/);
+    if (dotMatch) {
+      return { initial: dotMatch[1].toLowerCase(), lastName: normalize(dotMatch[2]) };
+    }
+    // "Josh Allen" / "Jaylen Cook III" style — first word's initial, last
+    // word as surname (stripping a trailing suffix like III/Jr first).
+    const parts = raw.split(/\s+/).filter(Boolean);
+    if (!parts.length) return null;
+    let surnameParts = [...parts];
+    while (surnameParts.length > 1 && SUFFIXES.has(normalize(surnameParts[surnameParts.length - 1]))) {
+      surnameParts = surnameParts.slice(0, -1);
+    }
+    return { initial: parts[0][0]?.toLowerCase() || '', lastName: normalize(surnameParts[surnameParts.length - 1]) };
+  }
+  const targetKey = lastNameAndInitial(playerName);
+  function namesMatch(candidateName) {
+    if (normalize(candidateName) === normalizedTarget) return true;
+    const candidateKey = lastNameAndInitial(candidateName);
+    return Boolean(targetKey && candidateKey && targetKey.initial && targetKey.initial === candidateKey.initial && targetKey.lastName && targetKey.lastName === candidateKey.lastName);
+  }
 
   async function getAllPlayersForStatType(statType, fields) {
     const fieldSql = fields.map(([alias, jsonKey]) => `SUM(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
@@ -42998,7 +43028,7 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
     const fields = Array.from(fieldMap.entries());
     if (!fields.length) continue;
     const allPlayers = await getAllPlayersForStatType(statType, fields);
-    const row = allPlayers.find(r => normalize(r.player_name) === normalizedTarget);
+    const row = allPlayers.find(r => namesMatch(r.player_name));
     if (!row) continue;
     const hasData = Object.keys(row).some(key => key !== 'weeks_counted' && key !== 'player_name' && Number(row[key]) > 0);
     if (hasData) {
