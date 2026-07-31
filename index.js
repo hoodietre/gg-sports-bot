@@ -30943,12 +30943,27 @@ async function getMemberLeagueMemberships(guildId, userId) {
       [String(guildId)]
     ).catch(() => ({ rows: [] }));
     const matchedTeams = [];
+    // 7J-72TEAMSDIAG: round 4 — the round-3 log proved "Dolphins" is
+    // literally in this member's role name list, yet this exact matching
+    // code still found nothing. Logging every intermediate value per team
+    // this time (not just the final result) so the actual break point is
+    // visible instead of needing a fifth guess.
+    const perTeamDiag = [];
     for (const row of maddenTeamsResult.rows) {
       const candidateNames = [...new Set([row.team_name, getMaddenTeamAbbrev(row.team_name), maddenTeamDisplayName(row.team_name)].filter(Boolean))];
       const matchingRole = guild.roles.cache.find(r => candidateNames.some(name => r.name === name));
-      if (matchingRole && member.roles.cache.has(matchingRole.id)) {
+      const memberHasIt = matchingRole ? member.roles.cache.has(matchingRole.id) : false;
+      if (String(row.team_name).toLowerCase().includes('dolphin')) {
+        perTeamDiag.push({ team_name: row.team_name, candidateNames, matchingRoleFound: Boolean(matchingRole), matchingRoleName: matchingRole?.name, matchingRoleId: matchingRole?.id, memberHasIt });
+      }
+      if (matchingRole && memberHasIt) {
         matchedTeams.push({ league_id: row.league_id, role_id: matchingRole.id, role_name: row.team_name });
       }
+    }
+    if (perTeamDiag.length) {
+      console.log('[7J-72TEAMSDIAG] Dolphins-matching team rows:', JSON.stringify(perTeamDiag).slice(0, 2000));
+    } else {
+      console.log('[7J-72TEAMSDIAG] No team_name containing "dolphin" found at all in madden_imported_team_stats for guild', String(guildId), '— total team rows found:', maddenTeamsResult.rows.length, JSON.stringify(maddenTeamsResult.rows.map(r => r.team_name)).slice(0, 1500));
     }
     if (matchedTeams.length) {
       const leagueIds = [...new Set(matchedTeams.map(row => row.league_id))];
@@ -43000,7 +43015,34 @@ async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
   }
 
   if (!statRows.length) {
-    embed.addFields({ name: 'No stat rows found', value: `No imported weekly stats found for **${canonicalName}** yet. Run a sync after games have been played, or double-check the name spelling.`, inline: false });
+    // 7J-72VERIFYDIAG: two different teams (Dolphins, Bills) have now both
+    // come back empty even after the getMaddenLeagueLeaders-pattern
+    // rewrite, which structurally matches the proven-correct League
+    // Leaders query. Rather than guess at a third code fix, show real
+    // evidence: how many players total have ANY stats in this league, and
+    // how many belong to this specific team — if the team count is
+    // genuinely 0 while other teams have players, that points at a real
+    // per-team import gap, not a lookup bug.
+    const totalPlayersResult = await pool.query(
+      `SELECT COUNT(DISTINCT COALESCE(NULLIF(roster_id, ''), NULLIF(player_key, ''), NULLIF(presentation_id, ''), NULLIF(full_name, ''))) AS total
+       FROM madden_player_weekly_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+      [guildId, String(league.league_id)]
+    ).catch(() => ({ rows: [{ total: 0 }] }));
+    const teamPlayersResult = resolved?.team_name
+      ? await pool.query(
+          `SELECT COUNT(DISTINCT COALESCE(NULLIF(roster_id, ''), NULLIF(player_key, ''), NULLIF(presentation_id, ''), NULLIF(full_name, ''))) AS total
+           FROM madden_player_weekly_stats WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(team_name) = LOWER($3)`,
+          [guildId, String(league.league_id), resolved.team_name]
+        ).catch(() => ({ rows: [{ total: 0 }] }))
+      : { rows: [{ total: 'N/A (no roster team resolved)' }] };
+    embed.addFields({
+      name: 'No stat rows found',
+      value: `No imported weekly stats found for **${canonicalName}** yet. Run a sync after games have been played, or double-check the name spelling.\n\n` +
+        `**Diagnostic:** ${totalPlayersResult.rows[0]?.total ?? 0} total players have stats in this league. ` +
+        `${teamPlayersResult.rows[0]?.total ?? 0} of those belong to ${resolved?.team_name || 'this player\'s team'}. ` +
+        (Number(teamPlayersResult.rows[0]?.total) === 0 ? 'That team specifically has zero players with imported stats — this looks like a real per-team data gap, not a name-matching issue.' : 'That team does have other players with stats, so this specific player may genuinely be missing from the import.'),
+      inline: false,
+    });
     return embed;
   }
 
@@ -50976,6 +51018,41 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     getMaddenSingleGameLeader('defense', 'defInts', 'Most Interceptions'),
   ])).join('\n');
 
+  // 7J-73SEASONRECORDS: per Hxxdie — player single-season records, the
+  // third tier alongside career (all-time cumulative, already shown above)
+  // and single-game (best one week, just above). Only madden_imported_games
+  // carries season_year (added earlier this session) — weekly stat rows
+  // don't have it directly, so this joins to games via week_label
+  // (deduplicated first to avoid fan-out, since a week has many games) to
+  // inherit which season each stat row belongs to.
+  async function getMaddenSingleSeasonLeader(statType, jsonField, label) {
+    const result = await pool.query(
+      `WITH season_weeks AS (
+         SELECT DISTINCT week_label, season_year FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id = $2 AND season_year IS NOT NULL
+       )
+       SELECT s.full_name, s.team_name, sw.season_year,
+              SUM(${maddenJsonNumberSql(jsonField)}) AS stat_value
+       FROM madden_player_weekly_stats s
+       JOIN season_weeks sw ON sw.week_label = s.week_label
+       WHERE s.guild_id = $1 AND s.league_id::text = $2::text AND s.stat_type = $3
+       GROUP BY s.full_name, s.team_name, sw.season_year
+       ORDER BY stat_value DESC NULLS LAST
+       LIMIT 1`,
+      [guildId, leagueId, statType]
+    ).catch(() => ({ rows: [] }));
+    const row = result.rows[0];
+    if (!row || !row.stat_value) return `**${label}:** No season-tagged data yet`;
+    return `**${label}:** ${formatMaddenLeaderNumber(row.stat_value)} — ${row.full_name} (${maddenTeamDisplayName(row.team_name)}, ${row.season_year})`;
+  }
+  const singleSeasonPlayerRecords = (await Promise.all([
+    getMaddenSingleSeasonLeader('passing', 'passYds', 'Most Passing Yards, One Season'),
+    getMaddenSingleSeasonLeader('rushing', 'rushYds', 'Most Rushing Yards, One Season'),
+    getMaddenSingleSeasonLeader('receiving', 'recYds', 'Most Receiving Yards, One Season'),
+    getMaddenSingleSeasonLeader('defense', 'defSacks', 'Most Sacks, One Season'),
+    getMaddenSingleSeasonLeader('defense', 'defInts', 'Most Interceptions, One Season'),
+  ])).join('\n');
+
   const seasonRecordsResult = await pool.query(
     `SELECT season_year, team_name,
             SUM(points_for)::int AS season_points_for,
@@ -51023,7 +51100,8 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
       { name: '🏈 League Snapshot', value: leagueSnapshot.slice(0, 1024), inline: false },
       { name: '🎮 Game Records (All-Time)', value: gameRecords.slice(0, 1024), inline: false },
       { name: '🏈 Single-Game Player Records', value: singleGamePlayerRecords.slice(0, 1024), inline: false },
-      { name: '📅 Season Records', value: seasonRecords.slice(0, 1024), inline: false },
+      { name: '📅 Single-Season Player Records', value: singleSeasonPlayerRecords.slice(0, 1024), inline: false },
+      { name: '📅 Single-Season Team Records', value: seasonRecords.slice(0, 1024), inline: false },
       { name: 'Offensive Records (Career)', value: offenseRecords.slice(0, 1024), inline: false },
       { name: 'Defensive Records (Career)', value: defensiveRecords.slice(0, 1024), inline: false },
       { name: 'Team Records (Current Season Standings)', value: teamRecords.slice(0, 1024), inline: false },
