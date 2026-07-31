@@ -30923,6 +30923,46 @@ async function getMemberLeagueMemberships(guildId, userId) {
     if (!seenKeys.has(key)) { seenKeys.add(key); results.push(row); }
   }
 
+  // 7J-69TEAMSDIAG resolution: the diagnostic log proved BOTH the role-based
+  // check above AND the owner_user_id DB check found zero rows, yet Team
+  // Owners panel correctly shows this same person as owner. The reason:
+  // league_team_roles (what the role-based check above queries) is only
+  // ever populated for Game Center leagues via /league teamrole — Madden
+  // leagues get their team-role mapping from madden_franchises/
+  // madden_imported_team_stats instead, which was never checked here at
+  // all. Team Owners panel succeeds by checking Discord role membership
+  // directly against those tables' own team_role_id values — this mirrors
+  // that exact check (inverted: this member's roles against every known
+  // team role, rather than every member of one role).
+  if (member) {
+    const knownTeamRolesResult = await pool.query(
+      `SELECT DISTINCT league_id, team_role_id, team_name FROM (
+         SELECT league_id, team_role_id, team_name FROM madden_franchises WHERE guild_id = $1 AND team_role_id IS NOT NULL
+         UNION
+         SELECT league_id, team_role_id, team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND team_role_id IS NOT NULL
+       ) t`,
+      [String(guildId)]
+    ).catch(() => ({ rows: [] }));
+    const matchedRoleTeams = knownTeamRolesResult.rows.filter(row => member.roles.cache.has(row.team_role_id));
+    if (matchedRoleTeams.length) {
+      const leagueIds = [...new Set(matchedRoleTeams.map(row => row.league_id))];
+      const leagueInfoResult = await pool.query(
+        `SELECT league_id, league_name, game FROM leagues WHERE league_id = ANY($1::uuid[]) AND is_active = TRUE`,
+        [leagueIds]
+      ).catch(() => ({ rows: [] }));
+      const leagueInfoById = new Map(leagueInfoResult.rows.map(l => [l.league_id, l]));
+      for (const row of matchedRoleTeams) {
+        const leagueInfo = leagueInfoById.get(row.league_id);
+        if (!leagueInfo) continue;
+        const key = row.league_id + ':' + row.team_role_id;
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+          results.push({ league_id: row.league_id, league_name: leagueInfo.league_name, game: leagueInfo.game, role_id: row.team_role_id, role_name: row.team_name });
+        }
+      }
+    }
+  }
+
   // 7J-69TEAMSDIAG: two rounds of fixes haven't resolved this for Hxxdie
   // despite the same underlying data source now confirmed working
   // correctly for the Team Owners panel — logging the raw query inputs/
@@ -42889,14 +42929,21 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
   // punctuation-normalized ILIKE match if the exact match finds nothing in
   // any stat category, rather than reporting "no stats" for a player who
   // actually has them.
-  const normalize = s => String(s || '').toLowerCase().replace(/['\u2018\u2019.\-]/g, '').replace(/\s+/g, ' ').trim();
+  // 7J-51VERIFY (strengthened): the original punctuation-only strip missed
+  // a real case — if one data source uses a space where the other uses an
+  // apostrophe/hyphen as a name separator (e.g. "De Von Achane" vs
+  // "De'Von Achane"), stripping just the apostrophe doesn't insert a space,
+  // so the two never matched. Now strips ALL non-alphanumeric characters
+  // including spaces on both sides, so separator-choice differences of any
+  // kind can't cause a false miss.
+  const normalize = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const normalizedName = normalize(playerName);
   // Matches the same character set normalize() strips above — passed as a
   // bound parameter rather than embedded in the SQL text, since a literal
   // apostrophe inside a Postgres string literal needs escaping and mixing
   // that with a regex character class is exactly the kind of thing that's
   // easy to get subtly wrong.
-  const stripPattern = "['\u2018\u2019.\\-]";
+  const stripPattern = '[^a-z0-9]';
 
   async function queryStatType(statType, fields, useNormalizedFallback) {
     const fieldSql = fields.map(([alias, jsonKey]) => `SUM(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
@@ -50910,6 +50957,32 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     `**Highest Combined Score**\n${gameRecordLine(highestCombinedScore, 'combined', row => row.combined)}`,
   ].join('\n\n');
 
+  // 7J-70SINGLEGAME: per Hxxdie — single-game player records, distinct
+  // from the career totals already shown elsewhere in this embed. Queries
+  // madden_player_weekly_stats directly (one row per player per week) so
+  // this is genuinely "best individual performance in one game," not a
+  // season/career sum.
+  async function getMaddenSingleGameLeader(statType, jsonField, label) {
+    const result = await pool.query(
+      `SELECT full_name, team_name, week_label, ${maddenJsonNumberSql(jsonField)} AS stat_value
+       FROM madden_player_weekly_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3
+       ORDER BY stat_value DESC NULLS LAST
+       LIMIT 1`,
+      [guildId, leagueId, statType]
+    ).catch(() => ({ rows: [] }));
+    const row = result.rows[0];
+    if (!row || !row.stat_value) return `**${label}:** No data yet`;
+    return `**${label}:** ${formatMaddenLeaderNumber(row.stat_value)} — ${row.full_name} (${maddenTeamDisplayName(row.team_name)}, ${row.week_label || 'Unknown week'})`;
+  }
+  const singleGamePlayerRecords = (await Promise.all([
+    getMaddenSingleGameLeader('passing', 'passYds', 'Most Passing Yards'),
+    getMaddenSingleGameLeader('rushing', 'rushYds', 'Most Rushing Yards'),
+    getMaddenSingleGameLeader('receiving', 'recYds', 'Most Receiving Yards'),
+    getMaddenSingleGameLeader('defense', 'defSacks', 'Most Sacks'),
+    getMaddenSingleGameLeader('defense', 'defInts', 'Most Interceptions'),
+  ])).join('\n');
+
   const seasonRecordsResult = await pool.query(
     `SELECT season_year, team_name,
             SUM(points_for)::int AS season_points_for,
@@ -50946,6 +51019,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     .addFields(
       { name: '🏈 League Snapshot', value: leagueSnapshot.slice(0, 1024), inline: false },
       { name: '🎮 Game Records (All-Time)', value: gameRecords.slice(0, 1024), inline: false },
+      { name: '🏈 Single-Game Player Records', value: singleGamePlayerRecords.slice(0, 1024), inline: false },
       { name: '📅 Season Records', value: seasonRecords.slice(0, 1024), inline: false },
       { name: 'Offensive Records (Current Season)', value: offenseRecords.slice(0, 1024), inline: false },
       { name: 'Defensive Records (Current Season)', value: defensiveRecords.slice(0, 1024), inline: false },
