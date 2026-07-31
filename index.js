@@ -512,6 +512,15 @@ async function initDatabase() {
   // unconditionally on every sync (see autoDetectAfterSync) and must never
   // double-pay a game it already rewarded on a prior sync.
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS rewards_paid_at TIMESTAMP`);
+  // 7J-59RECORDS: enables genuine season-grouped all-time league records
+  // (built this session) — nothing before this tagged which season a game
+  // belonged to, so games could never be grouped by season after the fact.
+  // Uses the same real EA-sourced season year added earlier this session
+  // (league_settings.madden_season_year). Only reliably populated for games
+  // imported/updated after this shipped — existing older games in the DB
+  // won't retroactively know their season, since nothing recorded it at the
+  // time. Self-heals going forward as new seasons accumulate.
+  await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS season_year INTEGER`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_auto BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS game_threads_visibility TEXT NOT NULL DEFAULT 'private'`);
@@ -7391,18 +7400,44 @@ function ggBuildShopItemButtonId(itemId) {
   return 'shop_buy_button:' + String(itemId).split('-')[0];
 }
 
-async function ggBuildPermanentShopPayload(guildId) {
+// 7J-57SHOPPAGE: sort options for the shop panel, per Hxxdie. Each maps to
+// a real ORDER BY — kept as a lookup table rather than inline string
+// building so the button/select values stay simple opaque keys.
+const SHOP_PANEL_SORTS = {
+  price_asc: { label: 'Price: Low to High', orderBy: 'price ASC, item_name ASC' },
+  price_desc: { label: 'Price: High to Low', orderBy: 'price DESC, item_name ASC' },
+  name_asc: { label: 'Name: A to Z', orderBy: 'item_name ASC' },
+  newest: { label: 'Newest First', orderBy: 'created_at DESC, item_name ASC' },
+};
+const SHOP_PANEL_PAGE_SIZE = 10;
+
+async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_asc') {
   const settings = await getCurrencySettings(guildId);
-  const result = await pool.query(
-    `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE ORDER BY price ASC, item_name ASC LIMIT 10`,
+  const sortConfig = SHOP_PANEL_SORTS[sort] || SHOP_PANEL_SORTS.price_asc;
+  const safeOffset = Math.max(0, Number(offset) || 0);
+
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE`,
     [guildId]
+  ).catch(() => ({ rows: [{ total: 0 }] }));
+  const totalItems = Number(countResult.rows[0]?.total || 0);
+
+  const result = await pool.query(
+    `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE
+     ORDER BY ${sortConfig.orderBy} LIMIT $2 OFFSET $3`,
+    [guildId, SHOP_PANEL_PAGE_SIZE, safeOffset]
   );
+
+  const hasNext = safeOffset + result.rows.length < totalItems;
+  const hasPrev = safeOffset > 0;
+  const pageNumber = Math.floor(safeOffset / SHOP_PANEL_PAGE_SIZE) + 1;
+  const totalPages = Math.max(1, Math.ceil(totalItems / SHOP_PANEL_PAGE_SIZE));
 
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
     .setTitle('GG Sports Shop')
     .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • Shop' })
+    .setFooter({ text: `GG Sports • Shop • Page ${pageNumber}/${totalPages} • Sorted by ${sortConfig.label}` })
     .setTimestamp();
 
   embed.setDescription(result.rows.length
@@ -7412,7 +7447,7 @@ async function ggBuildPermanentShopPayload(guildId) {
         (item.is_cosmetic ? ' • ' + rarityIcon(item.rarity) + ' ' + (item.rarity || 'common') + ' • ' + (item.avatar_slot || inferAvatarSlotFromItem(item)) : '') +
         (item.description ? NL + item.description : '')
       ).join(NL + NL)
-    : 'No active shop items yet.');
+    : (totalItems > 0 ? 'No items on this page.' : 'No active shop items yet.'));
 
   const rows = [];
   for (let i = 0; i < result.rows.length; i += 5) {
@@ -7428,6 +7463,22 @@ async function ggBuildPermanentShopPayload(guildId) {
     rows.push(row);
   }
 
+  // 7J-57SHOPPAGE: pagination row — customIds carry the target offset and
+  // current sort so the handler can re-render without needing any stored
+  // per-user session state (the panel is shared/persistent, refreshed by
+  // any viewer's click).
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`shop_panel_page:${Math.max(0, safeOffset - SHOP_PANEL_PAGE_SIZE)}:${sort}`).setLabel('◀ Back').setStyle(ButtonStyle.Secondary).setDisabled(!hasPrev),
+    new ButtonBuilder().setCustomId(`shop_panel_page:${safeOffset + SHOP_PANEL_PAGE_SIZE}:${sort}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(!hasNext),
+  ));
+
+  rows.push(new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`shop_panel_sort:${safeOffset}`)
+      .setPlaceholder('Sort: ' + sortConfig.label)
+      .addOptions(Object.entries(SHOP_PANEL_SORTS).map(([value, cfg]) => ({ label: cfg.label, value, default: value === sort })))
+  ));
+
   if (rows.length < 5) {
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('shop_view_cart').setLabel('View Cart').setStyle(ButtonStyle.Secondary),
@@ -7435,7 +7486,7 @@ async function ggBuildPermanentShopPayload(guildId) {
     ));
   }
 
-  return { embeds: [embed], components: rows };
+  return { embeds: [embed], components: rows.slice(0, 5) };
 }
 
 // ---------------------------------------------------------------------------
@@ -9825,63 +9876,143 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-58MARKETPLACE: per Hxxdie — listing/buying/canceling shouldn't
+    // require typing an item name or listing ID from memory. Item/listing
+    // *selection* is now select-menu driven throughout; the one thing that
+    // still needs typing is the asking price when listing (a single number,
+    // no sensible button/select alternative for an arbitrary price).
     if (interaction.isButton() && interaction.customId === 'marketplacepanel_list') {
+      if (!interaction.guild) return;
+      const eligibleResult = await pool.query(
+        `SELECT ui.* FROM user_inventory ui
+         WHERE ui.user_id = $1 AND ui.guild_id = $2 AND ui.is_trade_locked = FALSE
+           AND NOT EXISTS (SELECT 1 FROM marketplace_listings ml WHERE ml.inventory_id = ui.id AND ml.status = 'active')
+         ORDER BY ui.purchased_at DESC LIMIT 25`,
+        [interaction.user.id, interaction.guild.id]
+      ).catch(() => ({ rows: [] }));
+      if (!eligibleResult.rows.length) {
+        await interaction.reply({ content: 'You don\'t have any items eligible to list — either your inventory is empty, everything is trade-locked, or everything you own already has an active listing.', ephemeral: true });
+        return;
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('marketplacepanel_list_pick')
+        .setPlaceholder('Choose an item to list')
+        .addOptions(eligibleResult.rows.map(item => ({
+          label: item.item_name.slice(0, 100),
+          value: item.id,
+          description: `Paid ${item.price_paid} • Purchased ${new Date(item.purchased_at).toLocaleDateString('en-US')}`.slice(0, 100),
+        })));
+      await interaction.reply({ content: 'Which item do you want to list?', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'marketplacepanel_list_pick') {
+      const inventoryId = interaction.values[0];
       const modal = new ModalBuilder()
-        .setCustomId('marketplacepanel_list_modal')
-        .setTitle('List an Item for Sale')
+        .setCustomId('marketplacepanel_list_modal:' + inventoryId)
+        .setTitle('Set Asking Price')
         .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('item').setLabel('Item name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Asking price').setStyle(TextInputStyle.Short).setRequired(true)),
         );
       await interaction.showModal(modal);
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_list_modal') {
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('marketplacepanel_list_modal:')) {
       if (!interaction.guild) return;
+      const inventoryId = interaction.customId.split(':')[1];
       const settings = await getCurrencySettings(interaction.guild.id);
-      const itemInput = interaction.fields.getTextInputValue('item');
       const priceInput = Number.parseInt(interaction.fields.getTextInputValue('price'), 10);
       if (!Number.isInteger(priceInput)) {
         await interaction.reply({ content: 'Price must be a whole number.', ephemeral: true });
         return;
       }
-      await performMarketplaceList(interaction, settings, itemInput, priceInput);
+      await performMarketplaceList(interaction, settings, inventoryId, priceInput);
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'marketplacepanel_buy') {
-      const modal = new ModalBuilder()
-        .setCustomId('marketplacepanel_buy_modal')
-        .setTitle('Buy a Listing')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
-        );
-      await interaction.showModal(modal);
+      if (!interaction.guild) return;
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const activeResult = await pool.query(
+        `SELECT * FROM marketplace_listings WHERE status = 'active' AND seller_user_id != $1 ORDER BY listed_at DESC LIMIT 25`,
+        [interaction.user.id]
+      ).catch(() => ({ rows: [] }));
+      if (!activeResult.rows.length) {
+        await interaction.reply({ content: 'No active listings available to buy right now (or every current listing is your own).', ephemeral: true });
+        return;
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('marketplacepanel_buy_pick')
+        .setPlaceholder('Choose a listing to buy')
+        .addOptions(activeResult.rows.map(listing => ({
+          label: listing.item_name.slice(0, 100),
+          value: listing.id,
+          description: `${settings.currency_icon} ${listing.asking_price}`.slice(0, 100),
+        })));
+      await interaction.reply({ content: 'Which listing do you want to buy?', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_buy_modal') {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'marketplacepanel_buy_pick') {
       if (!interaction.guild) return;
+      const listingId = interaction.values[0];
+      const listing = await pool.query(`SELECT * FROM marketplace_listings WHERE id = $1 AND status = 'active'`, [listingId]).then(r => r.rows[0]).catch(() => null);
+      if (!listing) {
+        await interaction.update({ content: 'That listing is no longer available.', components: [] });
+        return;
+      }
       const settings = await getCurrencySettings(interaction.guild.id);
-      await performMarketplaceBuy(interaction, settings, interaction.fields.getTextInputValue('listing'));
+      await interaction.update({
+        content: `Buy **${listing.item_name}** for **${settings.currency_icon} ${listing.asking_price}**?`,
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('marketplacepanel_buy_confirm:' + listingId).setLabel('Confirm Purchase').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId('marketplacepanel_buy_abort').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+        )],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_buy_abort') {
+      await interaction.update({ content: 'Purchase cancelled.', components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('marketplacepanel_buy_confirm:')) {
+      if (!interaction.guild) return;
+      const listingId = interaction.customId.split(':')[1];
+      const settings = await getCurrencySettings(interaction.guild.id);
+      await performMarketplaceBuy(interaction, settings, listingId);
       return;
     }
 
     if (interaction.isButton() && interaction.customId === 'marketplacepanel_cancel') {
-      const modal = new ModalBuilder()
-        .setCustomId('marketplacepanel_cancel_modal')
-        .setTitle('Cancel a Listing')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('listing').setLabel('Listing name or short ID').setStyle(TextInputStyle.Short).setRequired(true)),
-        );
-      await interaction.showModal(modal);
+      if (!interaction.guild) return;
+      const ownResult = await pool.query(
+        `SELECT * FROM marketplace_listings WHERE seller_user_id = $1 AND status = 'active' ORDER BY listed_at DESC LIMIT 25`,
+        [interaction.user.id]
+      ).catch(() => ({ rows: [] }));
+      if (!ownResult.rows.length) {
+        await interaction.reply({ content: 'You don\'t have any active listings to cancel.', ephemeral: true });
+        return;
+      }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('marketplacepanel_cancel_pick')
+        .setPlaceholder('Choose a listing to cancel')
+        .addOptions(ownResult.rows.map(listing => ({
+          label: listing.item_name.slice(0, 100),
+          value: listing.id,
+          description: `${settings.currency_icon} ${listing.asking_price}`.slice(0, 100),
+        })));
+      await interaction.reply({ content: 'Which listing do you want to cancel?', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_cancel_modal') {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'marketplacepanel_cancel_pick') {
       if (!interaction.guild) return;
-      await performMarketplaceCancel(interaction, interaction.fields.getTextInputValue('listing'));
+      const listingId = interaction.values[0];
+      await performMarketplaceCancel(interaction, listingId);
       return;
     }
 
@@ -10666,6 +10797,28 @@ if (interaction.commandName === 'avatar') {
 
       
       
+      // 7J-57SHOPPAGE: updates the shared panel message in place (not an
+      // ephemeral reply) — this is shop-panel navigation, everyone viewing
+      // the channel should see the page/sort change, same as clicking a
+      // page button on any shared board elsewhere in the bot.
+      if (interaction.isButton() && interaction.customId.startsWith('shop_panel_page:')) {
+        if (!interaction.guild) return;
+        const [, offsetRaw, sort] = interaction.customId.split(':');
+        const payload = await ggBuildPermanentShopPayload(interaction.guild.id, Number(offsetRaw) || 0, sort || 'price_asc');
+        await interaction.update(payload).catch(() => null);
+        return;
+      }
+
+      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('shop_panel_sort:')) {
+        if (!interaction.guild) return;
+        const sort = interaction.values[0];
+        // Changing sort resets to page 1 — a saved offset from the
+        // previous sort order wouldn't line up with the new ordering.
+        const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, sort);
+        await interaction.update(payload).catch(() => null);
+        return;
+      }
+
       if (interaction.customId.startsWith('shop_buy_button:')) {
         await interaction.deferReply({ ephemeral: true });
         if (!interaction.guild) return;
@@ -37858,8 +38011,8 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
     }
 
     await pool.query(
-      `INSERT INTO madden_imported_games (id, guild_id, league_id, external_game_id, week_label, home_team, away_team, home_team_role_id, away_team_role_id, home_score, away_score, status, raw_payload, imported_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+      `INSERT INTO madden_imported_games (id, guild_id, league_id, external_game_id, week_label, home_team, away_team, home_team_role_id, away_team_role_id, home_score, away_score, status, raw_payload, imported_at, season_year)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14)
        ON CONFLICT (league_id, external_game_id)
        DO UPDATE SET
          week_label = $5,
@@ -37885,7 +38038,8 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
            ELSE $12
          END,
          raw_payload = $13,
-         imported_at = NOW()`,
+         imported_at = NOW(),
+         season_year = COALESCE(madden_imported_games.season_year, $14)`,
       [
         randomUUID(),
         guild.id,
@@ -37900,6 +38054,7 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
         Number.isFinite(awayScoreValue) ? awayScoreValue : 0,
         status,
         JSON.stringify(row),
+        league.madden_season_year || null,
       ]
     );
 
@@ -50288,16 +50443,80 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
   ].join('\n\n');
 
   const recordWatch = buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards, sacks, interceptions });
+
+  // 7J-59RECORDS: per Hxxdie — game and season totals, the two categories
+  // this embed didn't have before (it already covered player career stats
+  // and current-season team stats). Game records are genuinely all-time —
+  // madden_imported_games accumulates indefinitely, confirmed nothing ever
+  // wipes it. Season records are honestly scoped: only games tagged with
+  // season_year count, which only started being recorded this session, so
+  // this section will be empty until at least one full season has synced
+  // since then — flagged in the embed itself rather than silently showing
+  // incomplete/misleading data.
+  const gameRecordsResult = await pool.query(
+    `SELECT week_label, home_team, away_team, home_score, away_score,
+            GREATEST(home_score, away_score) AS top_score,
+            ABS(home_score - away_score) AS margin,
+            (home_score + away_score) AS combined
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id = $2
+       AND home_score IS NOT NULL AND away_score IS NOT NULL
+       AND (home_score > 0 OR away_score > 0)`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  const allGames = gameRecordsResult.rows || [];
+  const highestSingleGameScore = [...allGames].sort((a, b) => b.top_score - a.top_score)[0];
+  const biggestBlowout = [...allGames].sort((a, b) => b.margin - a.margin)[0];
+  const highestCombinedScore = [...allGames].sort((a, b) => b.combined - a.combined)[0];
+  const gameRecordLine = (row, valueLabel, valueFn) => row
+    ? `**${valueFn(row)} ${valueLabel}** — ${row.away_team} ${row.away_score} @ ${row.home_team} ${row.home_score} (${row.week_label || 'Unknown week'})`
+    : 'No data yet';
+  const gameRecords = [
+    `**Highest Single-Game Score**\n${gameRecordLine(highestSingleGameScore, '', row => row.top_score)}`,
+    `**Biggest Margin of Victory**\n${gameRecordLine(biggestBlowout, 'pt margin', row => row.margin)}`,
+    `**Highest Combined Score**\n${gameRecordLine(highestCombinedScore, 'combined', row => row.combined)}`,
+  ].join('\n\n');
+
+  const seasonRecordsResult = await pool.query(
+    `SELECT season_year, team_name,
+            SUM(points_for)::int AS season_points_for,
+            SUM(points_for - points_against)::int AS season_point_diff,
+            COUNT(*)::int AS games
+     FROM (
+       SELECT season_year, home_team AS team_name, home_score AS points_for, away_score AS points_against FROM madden_imported_games
+       WHERE guild_id = $1 AND league_id = $2 AND season_year IS NOT NULL AND home_score IS NOT NULL AND away_score IS NOT NULL
+       UNION ALL
+       SELECT season_year, away_team AS team_name, away_score AS points_for, home_score AS points_against FROM madden_imported_games
+       WHERE guild_id = $1 AND league_id = $2 AND season_year IS NOT NULL AND home_score IS NOT NULL AND away_score IS NOT NULL
+     ) combined
+     GROUP BY season_year, team_name`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  const seasonRows = seasonRecordsResult.rows || [];
+  let seasonRecords;
+  if (!seasonRows.length) {
+    seasonRecords = '*No season-tagged games yet — this section starts tracking from the next season synced after this feature shipped. Older games can\'t be retroactively assigned to a season.*';
+  } else {
+    const mostPointsInSeason = [...seasonRows].sort((a, b) => b.season_points_for - a.season_points_for)[0];
+    const bestDiffInSeason = [...seasonRows].sort((a, b) => b.season_point_diff - a.season_point_diff)[0];
+    seasonRecords = [
+      `**Most Points Scored, One Season**\n**${mostPointsInSeason.season_points_for}** — ${maddenTeamDisplayName(mostPointsInSeason.team_name)} (${mostPointsInSeason.season_year}, ${mostPointsInSeason.games} games)`,
+      `**Best Point Differential, One Season**\n**${bestDiffInSeason.season_point_diff >= 0 ? '+' : ''}${bestDiffInSeason.season_point_diff}** — ${maddenTeamDisplayName(bestDiffInSeason.team_name)} (${bestDiffInSeason.season_year}, ${bestDiffInSeason.games} games)`,
+    ].join('\n\n');
+  }
+
   const thumb = getMaddenTeamLogoUrl(topPower?.team_name || bestRecordRows?.[0]?.team_name);
   const embed = new EmbedBuilder()
     .setTitle('🏆 Madden League Records • ' + (league.league_name || 'Madden League'))
     .setColor(0xF1C40F)
-    .setDescription('Current-season top-three records, award favorites, power rankings, and career foundation generated from imported Madden stats.')
+    .setDescription('All-time game records, season records, current-season top-three player/team records, award favorites, and power rankings generated from imported Madden stats.')
     .addFields(
       { name: '🏈 League Snapshot', value: leagueSnapshot.slice(0, 1024), inline: false },
-      { name: 'Offensive Records', value: offenseRecords.slice(0, 1024), inline: false },
-      { name: 'Defensive Records', value: defensiveRecords.slice(0, 1024), inline: false },
-      { name: 'Team Records', value: teamRecords.slice(0, 1024), inline: false },
+      { name: '🎮 Game Records (All-Time)', value: gameRecords.slice(0, 1024), inline: false },
+      { name: '📅 Season Records', value: seasonRecords.slice(0, 1024), inline: false },
+      { name: 'Offensive Records (Current Season)', value: offenseRecords.slice(0, 1024), inline: false },
+      { name: 'Defensive Records (Current Season)', value: defensiveRecords.slice(0, 1024), inline: false },
+      { name: 'Team Records (Current Season)', value: teamRecords.slice(0, 1024), inline: false },
       { name: '📈 Record Watch', value: recordWatch.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:League Records`', inline: false }
     )
