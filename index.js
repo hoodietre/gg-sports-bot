@@ -30869,16 +30869,27 @@ async function buildMemberBadgesEmbed(guild, targetUser) {
   return buildBadgesEmbed(targetUser, badges);
 }
 
-async function getMemberLeagueMemberships(guildId, userId) {
-  const guild = client.guilds.cache.get(String(guildId));
+// 7J-78CROSSSERVER: per Hxxdie — Teams & Leagues should show every team,
+// league, and server a member is in across the whole GG Sports network,
+// not just the current server. This is the per-guild core (three checks,
+// each covering a real gap the others don't: Discord role possession via
+// the league_team_roles mapping table for Game Center leagues; the actual
+// owner_user_id ownership record for Madden leagues, checked across both
+// madden_franchises and madden_imported_team_stats since either can hold
+// it; and a name-based Discord role match as the final fallback, since
+// madden_franchises.team_role_id itself can have gaps traced back to an
+// incomplete league_team_roles mapping upstream). All three were debugged
+// and confirmed working across several rounds of real diagnostic testing.
+async function getMemberLeagueMembershipsInGuild(guild, userId) {
   if (!guild) return [];
-  const member = await guild.members.fetch(String(userId)).catch(() => null);
+  const member = guild.members.cache.get(String(userId)) || await guild.members.fetch(String(userId)).catch(() => null);
 
   const results = [];
   const seenKeys = new Set();
 
   // Role-based: works for any league (Madden or Game Center) where team
-  // ownership is granted by assigning a Discord role.
+  // ownership is granted by assigning a Discord role, via the
+  // league_team_roles mapping table.
   if (member) {
     const roleIds = [...member.roles.cache.keys()];
     if (roleIds.length) {
@@ -30888,7 +30899,7 @@ async function getMemberLeagueMemberships(guildId, userId) {
          JOIN leagues l ON l.league_id = r.league_id
          WHERE l.guild_id = $1 AND l.is_active = TRUE AND r.role_id = ANY($2::text[])
          ORDER BY l.league_name ASC`,
-        [String(guildId), roleIds]
+        [guild.id, roleIds]
       ).catch(() => ({ rows: [] }));
       for (const row of roleResult.rows) {
         const key = row.league_id + ':' + row.role_id;
@@ -30897,11 +30908,8 @@ async function getMemberLeagueMemberships(guildId, userId) {
     }
   }
 
-  // 7J-64TEAMSLEAGUES (corrected): matches the established pattern from
-  // isMaddenUserVsUserGame earlier this session — checks both
-  // madden_franchises (the real source of truth) and
-  // madden_imported_team_stats (near-always NULL, but checked anyway in
-  // case a team was assigned through a different flow).
+  // Owner-record-based: the actual ownership record for Madden leagues,
+  // checked across both tables since either can hold it.
   const ownedResult = await pool.query(
     `SELECT DISTINCT l.league_id, l.league_name, l.game, owned.role_id, owned.role_name
      FROM (
@@ -30916,101 +30924,57 @@ async function getMemberLeagueMemberships(guildId, userId) {
      JOIN leagues l ON l.league_id::text = owned.league_id::text
      WHERE l.is_active = TRUE
      ORDER BY l.league_name ASC`,
-    [String(guildId), String(userId)]
+    [guild.id, String(userId)]
   ).catch(() => ({ rows: [] }));
   for (const row of ownedResult.rows) {
     const key = row.league_id + ':' + (row.role_id || row.role_name);
     if (!seenKeys.has(key)) { seenKeys.add(key); results.push(row); }
   }
 
-  // 7J-69TEAMSDIAG resolution, round 2: the previous fix (checking Discord
-  // role membership against madden_franchises/madden_imported_team_stats'
-  // own team_role_id column) still didn't work. Root cause: that column
-  // itself only ever gets populated FROM league_team_roles, via
-  // syncMaddenFranchises — so if league_team_roles is missing an entry for
-  // this specific team (not necessarily empty entirely, just incomplete),
-  // every ID-based approach traced back to the same upstream gap and failed
-  // identically, which is exactly what kept happening across two rounds of
-  // "fixes." This instead mirrors findTeamOwnerByRoleName, the actual
-  // final-fallback step in the proven-working game thread owner resolver —
-  // matches by team NAME directly against live Discord role names, no ID
-  // lookup or intermediate table involved at all. team_name on
-  // madden_imported_team_stats is populated straight from EA sync and has
-  // no such gap.
+  // Name-based Discord role match: final fallback, mirrors
+  // findTeamOwnerByRoleName (the proven-working final step in the game
+  // thread owner resolver) — matches by team NAME directly against live
+  // Discord role names, no ID lookup or intermediate table involved.
   if (member) {
     const maddenTeamsResult = await pool.query(
       `SELECT DISTINCT league_id, team_name FROM madden_imported_team_stats WHERE guild_id = $1`,
-      [String(guildId)]
+      [guild.id]
     ).catch(() => ({ rows: [] }));
     const matchedTeams = [];
-    // 7J-72TEAMSDIAG: round 4 — the round-3 log proved "Dolphins" is
-    // literally in this member's role name list, yet this exact matching
-    // code still found nothing. Logging every intermediate value per team
-    // this time (not just the final result) so the actual break point is
-    // visible instead of needing a fifth guess.
-    const perTeamDiag = [];
     for (const row of maddenTeamsResult.rows) {
       const candidateNames = [...new Set([row.team_name, getMaddenTeamAbbrev(row.team_name), maddenTeamDisplayName(row.team_name)].filter(Boolean))];
       const matchingRole = guild.roles.cache.find(r => candidateNames.some(name => r.name === name));
-      const memberHasIt = matchingRole ? member.roles.cache.has(matchingRole.id) : false;
-      if (String(row.team_name).toLowerCase().includes('dolphin')) {
-        perTeamDiag.push({ team_name: row.team_name, candidateNames, matchingRoleFound: Boolean(matchingRole), matchingRoleName: matchingRole?.name, matchingRoleId: matchingRole?.id, memberHasIt });
-      }
-      if (matchingRole && memberHasIt) {
+      if (matchingRole && member.roles.cache.has(matchingRole.id)) {
         matchedTeams.push({ league_id: row.league_id, role_id: matchingRole.id, role_name: row.team_name });
       }
     }
-    if (perTeamDiag.length) {
-      console.log('[7J-72TEAMSDIAG] Dolphins-matching team rows:', JSON.stringify(perTeamDiag).slice(0, 2000));
-    } else {
-      console.log('[7J-72TEAMSDIAG] No team_name containing "dolphin" found at all in madden_imported_team_stats for guild', String(guildId), '— total team rows found:', maddenTeamsResult.rows.length, JSON.stringify(maddenTeamsResult.rows.map(r => r.team_name)).slice(0, 1500));
-    }
-    if (matchedTeams.length) {
-      // 7J-76TEAMSFIX: round 6 — the round-5 diagnostic proved the exact
-      // league_id from a successfully-matched team (confirmed correct,
-      // matches what every other part of the bot uses for this same
-      // league) still came back empty from a raw `WHERE league_id =
-      // ANY($1::uuid[])` query, which should be structurally impossible
-      // given the foreign key from madden_imported_team_stats.league_id to
-      // leagues(league_id) guarantees that row must exist. Rather than
-      // keep debugging a hand-written array-parameter query, this just
-      // reuses getLeagueById — the exact same function every other part of
-      // the bot already uses successfully for this exact league. One query
-      // per matched team instead of a batch, but there are typically only
-      // 1-2 matches per user, so the tradeoff is trivial.
-      for (const row of matchedTeams) {
-        const leagueInfo = await getLeagueById(row.league_id).catch(() => null);
-        if (!leagueInfo) {
-          console.log('[7J-76TEAMSFIX] getLeagueById also returned nothing for', row.league_id, '— this points at something deeper than a query-writing issue.');
-          continue;
-        }
-        const key = row.league_id + ':' + row.role_id;
-        if (!seenKeys.has(key)) {
-          seenKeys.add(key);
-          results.push({ league_id: row.league_id, league_name: leagueInfo.league_name, game: leagueInfo.game, role_id: row.role_id, role_name: row.role_name });
-        }
+    for (const row of matchedTeams) {
+      const leagueInfo = await getLeagueById(row.league_id).catch(() => null);
+      if (!leagueInfo) continue;
+      const key = row.league_id + ':' + row.role_id;
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        results.push({ league_id: row.league_id, league_name: leagueInfo.league_name, game: leagueInfo.game, role_id: row.role_id, role_name: row.role_name });
       }
     }
   }
 
-  // 7J-69TEAMSDIAG: this is round 3. Logging maximum detail this time —
-  // the member's actual role names, and the Madden team names being
-  // matched against — so if this still doesn't resolve it, the exact
-  // mismatch will be visible directly instead of needing a fourth guess.
-  console.log('[7J-69TEAMSDIAG] getMemberLeagueMemberships', JSON.stringify({
-    guildId: String(guildId),
-    userId: String(userId),
-    memberFound: Boolean(member),
-    memberRoleNames: member ? [...member.roles.cache.values()].map(r => r.name) : null,
-    dbOwnedRowCount: ownedResult.rows?.length || 0,
-    finalResultCount: results.length,
-  }).slice(0, 3000));
-
   return results;
 }
 
+async function getMemberLeagueMemberships(userId) {
+  const allResults = [];
+  for (const guild of client.guilds.cache.values()) {
+    const guildResults = await getMemberLeagueMembershipsInGuild(guild, userId).catch(() => []);
+    for (const row of guildResults) {
+      allResults.push({ ...row, guild_id: guild.id, guild_name: guild.name });
+    }
+  }
+  return allResults;
+}
+
 async function buildMemberTeamsLeaguesEmbed(guild, targetUser) {
-  const memberships = await getMemberLeagueMemberships(guild.id, targetUser.id);
+  const memberships = await getMemberLeagueMemberships(targetUser.id);
   let combinedWins = 0;
   let combinedLosses = 0;
   let combinedTies = 0;
@@ -31022,7 +30986,7 @@ async function buildMemberTeamsLeaguesEmbed(guild, targetUser) {
     if (m.game === 'madden') {
       const teamRow = await pool.query(
         `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3 LIMIT 1`,
-        [String(guild.id), String(m.league_id), m.role_id]
+        [String(m.guild_id), String(m.league_id), m.role_id]
       ).then(r => r.rows?.[0]).catch(() => null);
       if (teamRow) {
         const w = Number(teamRow.wins || 0);
@@ -31035,20 +30999,28 @@ async function buildMemberTeamsLeaguesEmbed(guild, targetUser) {
         recordText = ` — ${w}-${l}${t ? '-' + t : ''}`;
       }
     }
-    lines.push(`**${m.role_name}** (${m.league_name})${recordText}`);
+    lines.push(`**${m.role_name}** (${m.league_name})${recordText} — *${m.guild_name}*`);
   }
 
   const combinedRecordText = hasMaddenRecord ? `${combinedWins}-${combinedLosses}${combinedTies ? '-' + combinedTies : ''}` : 'No Madden teams owned yet';
+  const serverCount = new Set(memberships.map(m => m.guild_id)).size;
 
   return new EmbedBuilder()
     .setTitle(`${targetUser.username} • Teams & Leagues`)
     .setColor(0x5865F2)
+    .setDescription(lines.length ? lines.join('\n') : 'Not currently assigned a team in any league. Ask a commissioner to assign you one.')
+    // 7J-78CROSSSERVER: per Hxxdie — this should show every team, league,
+    // and SERVER a member is in across the whole GG Sports network, not
+    // just the current one. Iterates every guild the bot is in
+    // (getMemberLeagueMemberships), and each line now shows which server
+    // that team/league belongs to, plus a server count alongside the
+    // league count.
     .addFields(
       { name: 'Leagues Joined', value: String(memberships.length), inline: true },
+      { name: 'Servers', value: String(serverCount), inline: true },
       { name: 'Combined W-L Record', value: combinedRecordText, inline: true },
     )
-    .setDescription(lines.length ? lines.join('\n') : 'Not currently assigned a team in any league. Ask a commissioner to assign you one.')
-    .setFooter({ text: 'GG Sports • Member Profile' })
+    .setFooter({ text: 'GG Sports • Member Profile • Network-wide' })
     .setTimestamp();
 }
 
