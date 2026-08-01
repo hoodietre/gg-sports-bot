@@ -6860,10 +6860,18 @@ async function buildTournamentManagerHomePayload(guild) {
     `SELECT * FROM tournaments WHERE guild_id = $1 AND status IN ('open','closed','active') ORDER BY created_at DESC LIMIT 25`,
     [guild.id]
   );
+  // 7J-86CHANSETUP: default tournament channel setter relocated here from the
+  // per-league commissioner Setup Dashboard, per Hxxdie — tournaments are a
+  // guild-wide feature (the tournaments table is keyed by guild_id, not
+  // league_id), so a per-league setting was a mismatch to begin with. Writes
+  // to the same guild_tournament_settings table the existing
+  // /settournamentchannel command already uses.
+  const currentChannelId = await getGuildTournamentChannelId(guild.id);
   const embed = new EmbedBuilder()
     .setTitle('🏆 Tournament Manager')
     .setColor(0xED4245)
     .setDescription(result.rows.length ? 'Pick a tournament to manage, or create a new one.' : 'No open tournaments. Create one to get started.')
+    .addFields({ name: 'Default Tournament Channel', value: currentChannelId ? `<#${currentChannelId}>` : 'Not set', inline: false })
     .setFooter({ text: 'GG Sports • Tournament Manager' })
     .setTimestamp();
 
@@ -6879,6 +6887,14 @@ async function buildTournamentManagerHomePayload(guild) {
       })));
     components.push(new ActionRowBuilder().addComponents(menu));
   }
+  components.push(new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder()
+      .setCustomId('adminpanel_tournament_setchannel')
+      .setPlaceholder('Set default tournament channel')
+      .setChannelTypes(ChannelType.GuildText)
+      .setMinValues(1)
+      .setMaxValues(1)
+  ));
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('tourneypanel_create').setLabel('Create Tournament').setEmoji('➕').setStyle(ButtonStyle.Success)
   ));
@@ -13652,6 +13668,32 @@ if (interaction.commandName === 'avatar') {
       if (!tournament) { await interaction.update({ content: 'Could not find that tournament.', embeds: [], components: [] }); return; }
       const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
       await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    // 7J-86CHANSETUP: default tournament channel setter, relocated to the
+    // Admin Panel's Tournament category per Hxxdie. Same permission check as
+    // tourneypanel_create right below (guild-wide, no specific league), same
+    // guild_tournament_settings write the existing /settournamentchannel
+    // command already uses.
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_tournament_setchannel') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to set the server tournament channel.', ephemeral: true }); return; }
+      const channel = interaction.channels.first();
+      const botMember = await interaction.guild.members.fetchMe();
+      const permissions = channel?.permissionsFor(botMember);
+      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that tournament channel.', ephemeral: true });
+        return;
+      }
+      await pool.query(
+        `INSERT INTO guild_tournament_settings (guild_id, tournament_channel_id, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (guild_id)
+         DO UPDATE SET tournament_channel_id = $2, updated_at = NOW()`,
+        [interaction.guild.id, channel.id]
+      );
+      const payload = await buildTournamentManagerHomePayload(interaction.guild);
+      await interaction.update({ content: 'Default server tournament channel set to ' + channel + '.', ...payload });
       return;
     }
 
@@ -31453,7 +31495,6 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'approved_trades_channel', label: 'Approved Trades Channel', description: 'Approved trade announcements', kind: 'channel' },
   { value: 'denied_trades_channel', label: 'Denied Trades Channel', description: 'Denied trade announcements', kind: 'channel' },
   { value: 'trade_count_channel', label: 'Trade Count Channel', description: 'Trade count panel channel', kind: 'channel' },
-  { value: 'tournament_channel', label: 'Tournament Channel', description: 'Tournament panels/announcements', kind: 'channel' },
   { value: 'ticket_channel', label: 'Ticket Channel', description: 'Ticket panel channel', kind: 'channel' },
   { value: 'support_channel', label: 'Support Channel', description: 'Support panel channel', kind: 'channel' },
 ];
@@ -31595,7 +31636,6 @@ function setupDashboardColumn(settingKey) {
     approved_trades_channel: 'approved_trades_channel_id',
     denied_trades_channel: 'denied_trades_channel_id',
     trade_count_channel: 'trade_count_channel_id',
-    tournament_channel: 'tournament_channel_id',
     ticket_channel: 'setup_ticket_channel_id',
     support_channel: 'setup_support_channel_id',
   };
@@ -31651,9 +31691,6 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['madden_franchise_hub_channel', 'Franchise Hub Board'],
     ['madden_sportsbook_channel', 'Madden Sportsbook'],
     ['sportsbook_channel', 'Sportsbook Feed'],
-    ['tournament_channel', 'Tournament'],
-    ['ticket_channel', 'Tickets'],
-    ['support_channel', 'Support'],
   ];
   // 7J-44SETUP: same three-filter logic as filterSetupDashboardOptions
   // (Madden-only / non-Madden-only / schedule-style game_thread vs
@@ -31698,6 +31735,12 @@ async function buildSetupDashboardEmbed(guild, league) {
     const count = multiChannelCounts[i].length;
     return `${label}: ` + (count ? `posted in ${count} channel${count === 1 ? '' : 's'}` : 'Not posted anywhere yet');
   });
+  // 7J-86CHANSETUP: Tickets/Support moved here per Hxxdie — still single-
+  // channel settings under the hood (setup_pick_channel, same as any other
+  // 'channel' kind option in SETUP_DASHBOARD_OPTIONS), just grouped under
+  // this header now instead of Core Channels.
+  multiChannelLines.push('Tickets: ' + setupDashboardFormatValue(league, 'ticket_channel'));
+  multiChannelLines.push('Support: ' + setupDashboardFormatValue(league, 'support_channel'));
 
   return new EmbedBuilder()
     .setTitle(`${GG_EMOJI} GG Sports Setup Dashboard`)
@@ -38412,8 +38455,19 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
          wins = $6,
          losses = $7,
          ties = $8,
-         points_for = $9,
-         points_against = $10,
+         -- 7J-85PPGFIX: this ran dead last in the sync pipeline (via
+         -- importEaStandingsExportForLeague, the very last "post-accumulator"
+         -- step) and wrote EA's raw standings-endpoint points_for/points_against
+         -- unconditionally — no guard at all, unlike the 8 harvest functions
+         -- fixed earlier this session. EA's own standings field was already
+         -- known to be unreliable elsewhere in this codebase (the whole reason
+         -- recalculateMaddenStandingsFromImportedGames exists — the per-game
+         -- accumulator, not a mirror of EA's team record field). Being last in
+         -- the pipeline made this the most likely actual source of the
+         -- reported PPG/PAPG skew, on top of the 8 already fixed. Same guard:
+         -- only fill in when we have no game-log data of our own yet.
+         points_for = CASE WHEN COALESCE(madden_imported_team_stats.scored_games, 0) = 0 THEN $9 ELSE madden_imported_team_stats.points_for END,
+         points_against = CASE WHEN COALESCE(madden_imported_team_stats.scored_games, 0) = 0 THEN $10 ELSE madden_imported_team_stats.points_against END,
          raw_payload = $11::jsonb,
          imported_at = NOW()`,
       [
@@ -43009,7 +43063,7 @@ function maddenBydTopAttributesLine(attributes, limit = 12, position = null) {
 // bot computes (league leaders, awards race) — the point is to compare
 // *that* against EA's own stat screen, not to introduce a second,
 // potentially-divergent calculation.
-async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
+async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName, playerRosterId = null) {
   const statTypeFields = new Map();
   for (const category of Object.values(MADDEN_LEADER_CATEGORIES)) {
     if (!statTypeFields.has(category.statType)) statTypeFields.set(category.statType, new Map());
@@ -43084,6 +43138,7 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
        )
        SELECT
          COALESCE(NULLIF(MAX(full_name), ''), 'Unknown Player') AS player_name,
+         MAX(NULLIF(roster_id, '')) AS roster_id,
          COUNT(DISTINCT display_week) AS weeks_counted,
          ${fieldSql}
        FROM stat_rows
@@ -43098,9 +43153,33 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
     const fields = Array.from(fieldMap.entries());
     if (!fields.length) continue;
     const allPlayers = await getAllPlayersForStatType(statType, fields);
-    const row = allPlayers.find(r => namesMatch(r.player_name));
+
+    // 7J-84VERIFYFIX: root cause of Josh Allen (QB, BUF) showing defensive
+    // stats — namesMatch() is deliberately loose (last name + first initial),
+    // needed to bridge "J.Allen" vs "Josh Allen" naming conventions across
+    // exports, but that same looseness can't tell two different real players
+    // with the same name apart (Josh Allen QB/BUF and Josh Allen DE/JAX is a
+    // real, well-known NFL name collision). The old code took whichever
+    // same-named row happened to come back first for each stat type, so a
+    // QB with zero defense rows of his own would silently inherit the other
+    // Josh Allen's sacks/tackles. Anchoring on the resolved player's actual
+    // roster_id (passed in from getMaddenExpandedPlayerRow, the same
+    // identity Award Race/League Leaders trust) removes the ambiguity
+    // entirely — if there's no row for that roster_id in this stat type, the
+    // player genuinely has no stats there, so we correctly show nothing
+    // rather than guessing via name.
+    let row = null;
+    if (playerRosterId) {
+      row = allPlayers.find(r => r.roster_id && String(r.roster_id) === String(playerRosterId)) || null;
+    } else {
+      // No roster_id to anchor on (older data) — fall back to the loose name
+      // match, but only when it's unambiguous. More than one same-named
+      // player having rows in this stat type means we can't safely guess.
+      const nameMatches = allPlayers.filter(r => namesMatch(r.player_name));
+      row = nameMatches.length === 1 ? nameMatches[0] : null;
+    }
     if (!row) continue;
-    const hasData = Object.keys(row).some(key => key !== 'weeks_counted' && key !== 'player_name' && Number(row[key]) > 0);
+    const hasData = Object.keys(row).some(key => key !== 'weeks_counted' && key !== 'player_name' && key !== 'roster_id' && Number(row[key]) > 0);
     if (hasData) {
       results.push({ statType, fields, ...row });
     }
@@ -43111,7 +43190,7 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName) {
 async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
   const resolved = await getMaddenExpandedPlayerRow(guildId, league.league_id, playerInput);
   const canonicalName = resolved?.player_name || playerInput;
-  const statRows = await getMaddenPlayerRawStatTotals(guildId, league.league_id, canonicalName);
+  const statRows = await getMaddenPlayerRawStatTotals(guildId, league.league_id, canonicalName, resolved?.player_id || null);
 
   const embed = new EmbedBuilder()
     .setTitle(`🔎 Data Verify • ${canonicalName}`)
@@ -57728,8 +57807,8 @@ async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, l
 
       const result = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, pf, pa, team.canonicalName]
@@ -57857,8 +57936,8 @@ async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, 
 
       const result = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, pf, pa, team.canonicalName]
@@ -57937,8 +58016,8 @@ async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, la
 
       const result = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, pf, pa, team.canonicalName]
@@ -58072,8 +58151,8 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
 
       const result = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, pf, pa, team.canonicalName]
@@ -58313,8 +58392,8 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
     for (const team of pfPaTeams) {
       const queryResult = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, team.points_for, team.points_against, team.teamName]
@@ -58462,8 +58541,8 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
     for (const team of scheduleTeams) {
       const result = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, team.points_for, team.points_against, team.teamName]
@@ -58552,10 +58631,17 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       const pa = parseNumberOrNull(team.teamTotalPointsAllowed);
       if (!teamName || pf === null || pa === null) continue;
 
+      // 7J-85PPGFIX: same bug as harvestRequestInfoTeamAnalytics above, and
+      // this one runs even later in the sync pipeline — CASE WHEN $3 > 0 OR
+      // $4 > 0 is true for virtually any real game data, so this was an
+      // unconditional overwrite in practice, re-clobbering the correct
+      // per-game accumulator totals on every sync regardless of the sibling
+      // fix. Same guard applied: only fill in when we have no game-log data
+      // of our own (scored_games = 0), never override good data.
       const result = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-             points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, pf, pa, teamName]
@@ -58772,10 +58858,21 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       const pa = team.teamTotalPointsAllowed;
       if (!teamName || pf === null || pa === null) continue;
 
+      // 7J-85PPGFIX: this ran every sync, right after
+      // recalculateMaddenStandingsFromImportedGames — the per-game accumulator
+      // proven correct by the 7J-47PPG fix above — and unconditionally
+      // overwrote its points_for/points_against with EA's requestInfoList
+      // totals, with no plausibility check despite the comment above claiming
+      // otherwise. EA's requestInfoList appears to only cover a recent window
+      // of games rather than the full season, so this was silently
+      // reintroducing a PPG/PAPG deflation on every single sync — exactly why
+      // a plain re-sync alone never fixed it. Now only used as a bootstrap
+      // fallback for teams with no game-log-derived data of our own yet
+      // (scored_games = 0), never as a standing override of good data.
       const result = await pool.query(
         `UPDATE madden_imported_team_stats
-         SET points_for = $3,
-             points_against = $4,
+         SET points_for = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $3 ELSE points_for END,
+             points_against = CASE WHEN COALESCE(scored_games, 0) = 0 THEN $4 ELSE points_against END,
              imported_at = NOW()
          WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
         [guild.id, league.league_id, pf, pa, teamName]
