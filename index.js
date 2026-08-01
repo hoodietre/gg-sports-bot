@@ -30894,7 +30894,7 @@ async function getMemberLeagueMembershipsInGuild(guild, userId) {
     const roleIds = [...member.roles.cache.keys()];
     if (roleIds.length) {
       const roleResult = await pool.query(
-        `SELECT DISTINCT l.league_id, l.league_name, l.game, r.role_id, r.role_name
+        `SELECT DISTINCT l.league_id, l.league_name, l.game_key AS game, r.role_id, r.role_name
          FROM league_team_roles r
          JOIN leagues l ON l.league_id = r.league_id
          WHERE l.guild_id = $1 AND l.is_active = TRUE AND r.role_id = ANY($2::text[])
@@ -30911,7 +30911,7 @@ async function getMemberLeagueMembershipsInGuild(guild, userId) {
   // Owner-record-based: the actual ownership record for Madden leagues,
   // checked across both tables since either can hold it.
   const ownedResult = await pool.query(
-    `SELECT DISTINCT l.league_id, l.league_name, l.game, owned.role_id, owned.role_name
+    `SELECT DISTINCT l.league_id, l.league_name, l.game_key AS game, owned.role_id, owned.role_name
      FROM (
        SELECT league_id, team_role_id AS role_id, team_name AS role_name, owner_user_id
        FROM madden_franchises
@@ -30954,31 +30954,24 @@ async function getMemberLeagueMembershipsInGuild(guild, userId) {
       const key = row.league_id + ':' + row.role_id;
       if (!seenKeys.has(key)) {
         seenKeys.add(key);
-        results.push({ league_id: row.league_id, league_name: leagueInfo.league_name, game: leagueInfo.game, role_id: row.role_id, role_name: row.role_name });
+        results.push({ league_id: row.league_id, league_name: leagueInfo.league_name, game: leagueInfo.game_key, role_id: row.role_id, role_name: row.role_name });
       }
     }
   }
 
-  // 7J-80TEAMSDIAG: Hxxdie reports owning teams in 3 leagues in this
-  // server, but only 1 shows up. Rather than guess which of the three
-  // matching paths is missing the other two, log every active league in
-  // this guild alongside whether it ended up in the final results — this
-  // will show directly whether the other 2 leagues are even being
-  // considered at all, or are being considered and failing to match.
-  const allGuildLeaguesResult = await pool.query(
-    `SELECT league_id, league_name, game FROM leagues WHERE guild_id = $1 AND is_active = TRUE`,
-    [guild.id]
-  ).catch(() => ({ rows: [] }));
-  const matchedLeagueIds = new Set(results.map(r => r.league_id));
-  console.log('[7J-80TEAMSDIAG] getMemberLeagueMembershipsInGuild', JSON.stringify({
-    guildId: guild.id,
-    guildName: guild.name,
-    userId: String(userId),
-    memberFound: Boolean(member),
-    allActiveLeaguesInGuild: allGuildLeaguesResult.rows.map(l => ({ league_id: l.league_id, league_name: l.league_name, game: l.game, matched: matchedLeagueIds.has(l.league_id) })),
-    finalResultCount: results.length,
-  }).slice(0, 3000));
-
+  // 7J-81TEAMSFIX: root cause of "only 1 of 3 leagues" found and confirmed
+  // directly against the schema (not another guess) — the leagues table
+  // column is game_key, not game. Both the role-based and owner-based
+  // queries above referenced l.game, a column that doesn't exist, throwing
+  // a real SQL error that was silently swallowed by .catch(() => ({rows:
+  // []})) — meaning those two matching paths always returned nothing, and
+  // only the name-based fallback ever contributed results. That's also
+  // why the one match that DID come through had game===undefined instead
+  // of 'madden', causing buildMemberTeamsLeaguesEmbed's win/loss lookup to
+  // fall into the wrong (Game Center) branch — "No completed games yet"
+  // for a Madden team. All four occurrences fixed (both queries above, the
+  // name-based fallback's leagueInfo.game reference, and this function's
+  // return value).
   return results;
 }
 
