@@ -43184,33 +43184,49 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName, playe
     return result.rows || [];
   }
 
+  // 7J-88VERIFYFIX: cross-table anchoring (madden_players.roster_id via
+  // resolveMaddenStatsRosterId) still let Josh Allen's defense stats bleed
+  // through — the anchor likely isn't resolving cleanly across two
+  // separately-imported EA exports whose field formatting can't be verified
+  // without live DB access. Switched to a self-contained approach that never
+  // leaves madden_player_weekly_stats at all: scan every stat type for one
+  // where the loose name match is already unambiguous (exactly one
+  // candidate — for a QB, that's passing, which has never been wrong here),
+  // and borrow THAT candidate's own roster_id as the anchor for every other
+  // stat type, including the ambiguous one (defense). A same-name collision
+  // affecting one stat type is exceedingly unlikely to also affect every
+  // other stat type for the same real player, so this is safe. The
+  // explicit playerRosterId param (if the caller has one) is still tried
+  // first since it costs nothing extra when it happens to line up.
   const results = [];
+  const statTypeResults = [];
   for (const [statType, fieldMap] of statTypeFields.entries()) {
     const fields = Array.from(fieldMap.entries());
     if (!fields.length) continue;
     const allPlayers = await getAllPlayersForStatType(statType, fields);
+    statTypeResults.push({ statType, fields, allPlayers });
+  }
 
-    // 7J-84VERIFYFIX: root cause of Josh Allen (QB, BUF) showing defensive
-    // stats — namesMatch() is deliberately loose (last name + first initial),
-    // needed to bridge "J.Allen" vs "Josh Allen" naming conventions across
-    // exports, but that same looseness can't tell two different real players
-    // with the same name apart (Josh Allen QB/BUF and Josh Allen DE/JAX is a
-    // real, well-known NFL name collision). The old code took whichever
-    // same-named row happened to come back first for each stat type, so a
-    // QB with zero defense rows of his own would silently inherit the other
-    // Josh Allen's sacks/tackles. Anchoring on the resolved player's actual
-    // roster_id (passed in from getMaddenExpandedPlayerRow, the same
-    // identity Award Race/League Leaders trust) removes the ambiguity
-    // entirely — if there's no row for that roster_id in this stat type, the
-    // player genuinely has no stats there, so we correctly show nothing
-    // rather than guessing via name.
+  let anchorRosterId = playerRosterId || null;
+  if (!anchorRosterId) {
+    for (const { allPlayers } of statTypeResults) {
+      const nameMatches = allPlayers.filter(r => namesMatch(r.player_name));
+      if (nameMatches.length === 1 && nameMatches[0].roster_id) {
+        anchorRosterId = nameMatches[0].roster_id;
+        break;
+      }
+    }
+  }
+
+  for (const { statType, fields, allPlayers } of statTypeResults) {
     let row = null;
-    if (playerRosterId) {
-      row = allPlayers.find(r => r.roster_id && String(r.roster_id) === String(playerRosterId)) || null;
+    if (anchorRosterId) {
+      row = allPlayers.find(r => r.roster_id && String(r.roster_id) === String(anchorRosterId)) || null;
     } else {
-      // No roster_id to anchor on (older data) — fall back to the loose name
-      // match, but only when it's unambiguous. More than one same-named
-      // player having rows in this stat type means we can't safely guess.
+      // No anchor available anywhere (every stat type this player appears in
+      // is itself ambiguous, or they have no roster_id on any row) — fall
+      // back to the loose name match, but only when unambiguous for this
+      // specific stat type.
       const nameMatches = allPlayers.filter(r => namesMatch(r.player_name));
       row = nameMatches.length === 1 ? nameMatches[0] : null;
     }
