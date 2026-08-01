@@ -30959,6 +30959,26 @@ async function getMemberLeagueMembershipsInGuild(guild, userId) {
     }
   }
 
+  // 7J-80TEAMSDIAG: Hxxdie reports owning teams in 3 leagues in this
+  // server, but only 1 shows up. Rather than guess which of the three
+  // matching paths is missing the other two, log every active league in
+  // this guild alongside whether it ended up in the final results — this
+  // will show directly whether the other 2 leagues are even being
+  // considered at all, or are being considered and failing to match.
+  const allGuildLeaguesResult = await pool.query(
+    `SELECT league_id, league_name, game FROM leagues WHERE guild_id = $1 AND is_active = TRUE`,
+    [guild.id]
+  ).catch(() => ({ rows: [] }));
+  const matchedLeagueIds = new Set(results.map(r => r.league_id));
+  console.log('[7J-80TEAMSDIAG] getMemberLeagueMembershipsInGuild', JSON.stringify({
+    guildId: guild.id,
+    guildName: guild.name,
+    userId: String(userId),
+    memberFound: Boolean(member),
+    allActiveLeaguesInGuild: allGuildLeaguesResult.rows.map(l => ({ league_id: l.league_id, league_name: l.league_name, game: l.game, matched: matchedLeagueIds.has(l.league_id) })),
+    finalResultCount: results.length,
+  }).slice(0, 3000));
+
   return results;
 }
 
@@ -30978,31 +30998,58 @@ async function buildMemberTeamsLeaguesEmbed(guild, targetUser) {
   let combinedWins = 0;
   let combinedLosses = 0;
   let combinedTies = 0;
-  let hasMaddenRecord = false;
+  let hasAnyRecord = false;
   const lines = [];
 
   for (const m of memberships) {
     let recordText = '';
+    let teamRow = null;
     if (m.game === 'madden') {
-      const teamRow = await pool.query(
-        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND team_role_id = $3 LIMIT 1`,
+      // 7J-79RECORDFIX: was matching by team_role_id — but the name-based
+      // fallback path in getMemberLeagueMembershipsInGuild finds teams via
+      // Discord role NAME matching precisely because team_role_id can be
+      // unreliable/unpopulated on this table for some rows. A team found
+      // that way could never be looked back up by that same unreliable ID
+      // — exactly the contradiction Hxxdie caught (Dolphins shown as owned,
+      // but "No Madden teams owned yet" in the same embed). role_name is
+      // reliably the real team name across all three matching paths, so
+      // it's a much safer join key here.
+      teamRow = await pool.query(
+        `SELECT * FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3) LIMIT 1`,
+        [String(m.guild_id), String(m.league_id), m.role_name]
+      ).then(r => r.rows?.[0]).catch(() => null);
+    } else {
+      // 7J-79RECORDFIX: non-Madden (Game Center) leagues never contributed
+      // to the combined record at all before — this was silently excluding
+      // them entirely, not just failing to show a number. Game Center
+      // leagues don't have a pre-aggregated team_stats table; wins/losses
+      // are derived directly from individual completed games.
+      teamRow = await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'final' AND winner_team_role_id = $3) AS wins,
+           COUNT(*) FILTER (WHERE status = 'final' AND winner_team_role_id IS NOT NULL AND winner_team_role_id != $3 AND (home_team_role_id = $3 OR away_team_role_id = $3)) AS losses,
+           COUNT(*) FILTER (WHERE status = 'final' AND winner_team_role_id IS NULL AND (home_team_role_id = $3 OR away_team_role_id = $3)) AS ties
+         FROM league_games
+         WHERE guild_id = $1 AND league_id = $2 AND (home_team_role_id = $3 OR away_team_role_id = $3)`,
         [String(m.guild_id), String(m.league_id), m.role_id]
       ).then(r => r.rows?.[0]).catch(() => null);
-      if (teamRow) {
-        const w = Number(teamRow.wins || 0);
-        const l = Number(teamRow.losses || 0);
-        const t = Number(teamRow.ties || 0);
+    }
+    if (teamRow) {
+      const w = Number(teamRow.wins || 0);
+      const l = Number(teamRow.losses || 0);
+      const t = Number(teamRow.ties || 0);
+      if (w || l || t) {
         combinedWins += w;
         combinedLosses += l;
         combinedTies += t;
-        hasMaddenRecord = true;
+        hasAnyRecord = true;
         recordText = ` — ${w}-${l}${t ? '-' + t : ''}`;
       }
     }
     lines.push(`**${m.role_name}** (${m.league_name})${recordText} — *${m.guild_name}*`);
   }
 
-  const combinedRecordText = hasMaddenRecord ? `${combinedWins}-${combinedLosses}${combinedTies ? '-' + combinedTies : ''}` : 'No Madden teams owned yet';
+  const combinedRecordText = hasAnyRecord ? `${combinedWins}-${combinedLosses}${combinedTies ? '-' + combinedTies : ''}` : (memberships.length ? 'No completed games yet' : 'No teams owned yet');
   const serverCount = new Set(memberships.map(m => m.guild_id)).size;
 
   return new EmbedBuilder()
