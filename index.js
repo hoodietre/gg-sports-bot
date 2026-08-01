@@ -10905,16 +10905,6 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      if (interaction.isStringSelectMenu() && interaction.customId.startsWith('shop_panel_sort:')) {
-        if (!interaction.guild) return;
-        const sort = interaction.values[0];
-        // Changing sort resets to page 1 — a saved offset from the
-        // previous sort order wouldn't line up with the new ordering.
-        const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, sort);
-        await interaction.update(payload).catch(() => null);
-        return;
-      }
-
       if (interaction.customId.startsWith('shop_buy_button:')) {
         await interaction.deferReply({ ephemeral: true });
         if (!interaction.guild) return;
@@ -11133,6 +11123,21 @@ if (interaction.commandName === 'avatar') {
         await interaction.update({ embeds: [buildCommitteeEmbed(offer, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId)] });
         return;
       }
+    }
+
+    // 7J-58SORTMOVED: same bug shape as 7J-18MOVED right below — shop_panel_sort
+    // checks isStringSelectMenu() but was written inside the isButton() wrapper
+    // above (added after the original sweep, so it wasn't caught then), making it
+    // permanently unreachable — Discord's "didn't respond in time" was the visible
+    // symptom of the handler simply never firing. Relocated here, logic unchanged.
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('shop_panel_sort:')) {
+      if (!interaction.guild) return;
+      const sort = interaction.values[0];
+      // Changing sort resets to page 1 — a saved offset from the
+      // previous sort order wouldn't line up with the new ordering.
+      const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, sort);
+      await interaction.update(payload).catch(() => null);
+      return;
     }
 
     // 7J-18MOVED: these two were accidentally nested inside the isButton()
