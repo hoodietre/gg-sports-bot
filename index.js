@@ -10923,7 +10923,7 @@ if (interaction.commandName === 'avatar') {
         const item = result.rows[0];
 
         if (item.stock !== null && Number(item.stock) <= 0) {
-          await interaction.reply({ content: 'That item is out of stock.', ephemeral: true });
+          await interaction.editReply({ content: 'That item is out of stock.' });
           return;
         }
 
@@ -10931,11 +10931,14 @@ if (interaction.commandName === 'avatar') {
         await ggAddItemToShopCart(interaction.guild.id, interaction.user.id, item, activeLeague?.league_id || null);
         const cartPayload = await ggBuildShopCartEmbed(interaction.guild.id, interaction.user, activeLeague?.league_id || null);
 
-        await interaction.reply({
+        // 7J-59REPLYFIX: this handler deferReply()'s at the top, so every
+        // reply after that point must be editReply() — .reply() on an
+        // already-deferred interaction throws InteractionAlreadyReplied,
+        // exactly the crash seen when clicking a numbered shop buy button.
+        await interaction.editReply({
           content: 'Added **' + item.item_name + '** to your cart.',
           embeds: [cartPayload.embed],
           components: [ggBuildShopCartButtons(false)],
-          ephemeral: true,
         });
         return;
       }
