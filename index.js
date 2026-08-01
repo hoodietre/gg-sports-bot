@@ -2295,6 +2295,19 @@ async function initDatabase() {
   // separately, see Avatar Item Build Roadmap wiring status).
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_award_only BOOLEAN NOT NULL DEFAULT FALSE`);
 
+  // 7J-60ITEMREWARD: Casino Background and Money Rain Effect, per Hxxdie, are being
+  // repurposed from normal purchasable items into exclusive sportsbook-milestone
+  // rewards (Whale/10k wagered and Jackpot/5k single-win respectively — see
+  // SPORTSBOOK_ACHIEVEMENTS below). Flipping is_award_only=TRUE here is sufficient to
+  // pull them from every browse/purchase surface (shop listing, What's New, Manage
+  // Sales, etc.) since those already filter is_award_only=FALSE — no other code
+  // changes needed. Matched by name pattern rather than a hardcoded id since these
+  // were created directly in the DB by Hxxdie, not through this codebase. Idempotent
+  // (safe to re-run every boot); scoped to guild_id IS NULL since Track A's background
+  // items were created as universal items via the owner panel.
+  await pool.query(`UPDATE shop_items SET is_award_only = TRUE, updated_at = NOW() WHERE guild_id IS NULL AND is_award_only = FALSE AND avatar_slot = 'background' AND item_name ILIKE '%casino%'`);
+  await pool.query(`UPDATE shop_items SET is_award_only = TRUE, updated_at = NOW() WHERE guild_id IS NULL AND is_award_only = FALSE AND item_name ILIKE '%money rain%'`);
+
   // Birthday/Christmas gift items — a distinct item per year (2026's birthday item
   // differs from 2027's, same idea as year-specific holiday exclusives) so recipients
   // can tell which year's gift they got. Auto-granted, never purchasable — createcosmetic
@@ -10910,8 +10923,12 @@ if (interaction.commandName === 'avatar') {
         if (!interaction.guild) return;
 
         const shortId = interaction.customId.split(':')[1];
+        // 7J-60ITEMREWARD: is_award_only excluded here too, not just from the shop
+        // listing query — otherwise a panel message posted before an item became
+        // award-only (e.g. Casino Background/Money Rain Effect converting to
+        // achievement-exclusive) would still have a live, clickable buy button.
         const result = await pool.query(
-          `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND id::text LIKE $2 AND is_active = TRUE ORDER BY created_at DESC LIMIT 1`,
+          `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND id::text LIKE $2 AND is_active = TRUE AND is_award_only = FALSE ORDER BY created_at DESC LIMIT 1`,
           [interaction.guild.id, shortId + '%']
         );
 
@@ -24970,19 +24987,28 @@ const ACTIVITY_MILESTONES = [
 // easy to retune since they're just data, not scattered through logic.
 const SPORTSBOOK_ACHIEVEMENTS = [
   { key: 'sb_wagered_1000', type: 'wagered', threshold: 1000, title: 'High Roller', reward: 100 },
-  { key: 'sb_wagered_10000', type: 'wagered', threshold: 10000, title: 'Whale', reward: 500 },
+  // 7J-60ITEMREWARD: per Hxxdie, Whale also unlocks the exclusive Casino Background
+  // (matched by name — see the is_award_only migration above). itemNamePattern is
+  // optional on every entry here; only these two currently carry one.
+  { key: 'sb_wagered_10000', type: 'wagered', threshold: 10000, title: 'Whale', reward: 500, itemNamePattern: 'casino' },
   { key: 'sb_wagered_50000', type: 'wagered', threshold: 50000, title: 'Casino Legend', reward: 2000 },
   { key: 'sb_profit_2500', type: 'profit', threshold: 2500, title: 'In the Green', reward: 200 },
   { key: 'sb_profit_10000', type: 'profit', threshold: 10000, title: 'Sharp', reward: 750 },
   { key: 'sb_profit_50000', type: 'profit', threshold: 50000, title: 'The House Fears You', reward: 3000 },
   { key: 'sb_bigwin_1000', type: 'single_win', threshold: 1000, title: 'Big Winner', reward: 200 },
-  { key: 'sb_bigwin_5000', type: 'single_win', threshold: 5000, title: 'Jackpot', reward: 1000 },
+  // Jackpot also unlocks the exclusive Money Rain Effect, per Hxxdie.
+  { key: 'sb_bigwin_5000', type: 'single_win', threshold: 5000, title: 'Jackpot', reward: 1000, itemNamePattern: 'money rain' },
 ];
 
 // Generic achievement grant: dedup via achievements_claimed, pays currency
 // once, returns whether it was newly granted (false if already claimed —
-// callers use this to decide whether to announce/log).
-async function grantAchievement(guildId, leagueId, userId, achievementKey, achievementType, title, rewardAmount) {
+// callers use this to decide whether to announce/log). itemNamePattern is
+// optional — when present, also grants a matching is_award_only shop item
+// (e.g. Casino Background for the Whale milestone) via grantAwardItem,
+// bypassing the shop/currency entirely, same as any other award item. A
+// missing/renamed item is best-effort: it won't roll back the already-
+// committed currency payout or dedup row, just silently skips the item.
+async function grantAchievement(guildId, leagueId, userId, achievementKey, achievementType, title, rewardAmount, itemNamePattern = null) {
   if (!guildId || !userId || !achievementKey) return false;
   const claimedResult = await pool.query(
     `INSERT INTO achievements_claimed (guild_id, league_id, user_id, achievement_key, achievement_type, title, reward_amount)
@@ -24994,6 +25020,12 @@ async function grantAchievement(guildId, leagueId, userId, achievementKey, achie
   if (!claimedResult.rows.length) return false;
   if (Number(rewardAmount) > 0) {
     await addCurrency(guildId, userId, Number(rewardAmount), 'achievement', title || achievementKey, null).catch(() => null);
+  }
+  if (itemNamePattern) {
+    const item = await findAwardOnlyShopItemByNamePattern(guildId, itemNamePattern).catch(() => null);
+    if (item) {
+      await grantAwardItem(guildId, userId, item.id, title || achievementKey).catch(() => null);
+    }
   }
   return true;
 }
@@ -25016,7 +25048,7 @@ async function checkSportsbookAchievements(guildId, userId, singleWinAmount = nu
     else if (achievement.type === 'profit') qualifies = profit >= achievement.threshold;
     else if (achievement.type === 'single_win') qualifies = singleWinAmount != null && Number(singleWinAmount) >= achievement.threshold;
     if (!qualifies) continue;
-    await grantAchievement(guildId, null, userId, achievement.key, 'sportsbook_milestone', achievement.title, achievement.reward);
+    await grantAchievement(guildId, null, userId, achievement.key, 'sportsbook_milestone', achievement.title, achievement.reward, achievement.itemNamePattern || null);
   }
 }
 
@@ -28276,6 +28308,24 @@ async function equipAvatarAccessory(userId, inventoryId) {
 async function unequipAvatarAccessory(userId, accessoryType) {
   await pool.query(`DELETE FROM avatar_equipped_accessories WHERE user_id = $1 AND accessory_type = $2`, [userId, accessoryType]);
   return { ok: true, message: `Unequipped ${accessoryType}.` };
+}
+
+// Looks up an exclusive (is_award_only) item by a loose case-insensitive name match,
+// scoped to this guild's own items plus universal (guild_id IS NULL) ones. findShopItem
+// can't be reused here since it deliberately filters is_award_only = FALSE (so award
+// items can't be found/bought through normal shop browsing) — this is the mirror-image
+// lookup for the handful of places, like achievement rewards, that need to grant one
+// of those items on purpose.
+async function findAwardOnlyShopItemByNamePattern(guildId, namePattern) {
+  const result = await pool.query(
+    `SELECT * FROM shop_items
+     WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = TRUE
+       AND item_name ILIKE $2
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [guildId, `%${namePattern}%`]
+  );
+  return result.rows[0] || null;
 }
 
 // Grants an award item (MVP, Champion, Rookie of the Year, etc.) directly into a
