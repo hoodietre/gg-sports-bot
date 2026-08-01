@@ -43057,6 +43057,42 @@ function maddenBydTopAttributesLine(attributes, limit = 12, position = null) {
   return entries.map(([key, value]) => `**${maddenBydAttributeLabel(key)}:** ${Number(value).toFixed(0)}`).join('\n');
 }
 
+// 7J-87VERIFYFIX: getMaddenPlayerRawStatTotals used to anchor on
+// madden_player_attributes.player_id (via getMaddenExpandedPlayerRow) to fix
+// the Josh Allen QB/defender collision — but that table is populated from a
+// completely different EA export (the BYD/attributes endpoint) than
+// madden_player_weekly_stats.roster_id (the weekly-stat export), and their
+// player_id/roster_id values are not the same ID space. That anchor never
+// matched anything, which regressed a working player from "wrong defense
+// stats" to "no stats found at all" across every stat type. madden_players
+// (the roster export table) is the one already proven to share weekly
+// stats' roster_id space — see the position/team_name backfill join in
+// upsertMaddenWeeklyStatRows above. Resolves the correct roster_id from
+// there instead, using position to break ties when the name alone isn't
+// unique (exactly the Josh Allen QB/BUF vs Josh Allen DE/JAX case).
+async function resolveMaddenStatsRosterId(guildId, leagueId, canonicalName, position) {
+  const exact = await pool.query(
+    `SELECT roster_id FROM madden_players
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(full_name) = LOWER($3) AND roster_id IS NOT NULL
+     LIMIT 5`,
+    [String(guildId), String(leagueId), canonicalName]
+  ).catch(() => ({ rows: [] }));
+  const rows = exact.rows || [];
+  if (rows.length === 1) return rows[0].roster_id;
+  if (rows.length > 1 && position) {
+    const byPosition = await pool.query(
+      `SELECT roster_id FROM madden_players
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND LOWER(full_name) = LOWER($3) AND LOWER(position) = LOWER($4) AND roster_id IS NOT NULL
+       LIMIT 2`,
+      [String(guildId), String(leagueId), canonicalName, position]
+    ).catch(() => ({ rows: [] }));
+    if (byPosition.rows.length === 1) return byPosition.rows[0].roster_id;
+  }
+  return null;
+}
+
 // 7J-46VERIFY: Track H item 29 — data accuracy diagnostic tooling. Reuses
 // MADDEN_LEADER_CATEGORIES' own field definitions rather than a parallel
 // reimplementation, so this shows exactly the same numbers the rest of the
@@ -43190,7 +43226,8 @@ async function getMaddenPlayerRawStatTotals(guildId, leagueId, playerName, playe
 async function buildMaddenVerifyPlayerEmbed(guildId, league, playerInput) {
   const resolved = await getMaddenExpandedPlayerRow(guildId, league.league_id, playerInput);
   const canonicalName = resolved?.player_name || playerInput;
-  const statRows = await getMaddenPlayerRawStatTotals(guildId, league.league_id, canonicalName, resolved?.player_id || null);
+  const statsRosterId = await resolveMaddenStatsRosterId(guildId, league.league_id, canonicalName, resolved?.position || null);
+  const statRows = await getMaddenPlayerRawStatTotals(guildId, league.league_id, canonicalName, statsRosterId);
 
   const embed = new EmbedBuilder()
     .setTitle(`🔎 Data Verify • ${canonicalName}`)
