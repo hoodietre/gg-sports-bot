@@ -3413,6 +3413,7 @@ function buildCommands() {
         { name: 'Results Diagnostics', value: 'results_diag' },
         { name: 'EA Endpoint Discovery', value: 'endpoint_discovery' },
         { name: 'Raw Payload Deep Scan', value: 'raw_payload_scan' },
+        { name: 'Injury/Ability Field Scan', value: 'injury_ability_scan' },
         { name: 'Schedule Payload Inspector', value: 'schedule_payload_inspector' },
         { name: 'Schedule Status Decoder', value: 'schedule_status_decoder' },
         { name: 'EA Direct Sync Source Audit', value: 'sync_source_audit' },
@@ -18006,6 +18007,7 @@ if (gameSubcommand === 'report') {
         results_diag: buildMaddenHistoricalResultsDiagnosticsEmbed,
         endpoint_discovery: buildMaddenEaEndpointDiscoveryEmbed,
         raw_payload_scan: buildMaddenRawPayloadDeepScanEmbed,
+        injury_ability_scan: buildMaddenInjuryAbilityScanEmbed,
         schedule_payload_inspector: buildMaddenSchedulePayloadInspectorEmbed,
         schedule_status_decoder: buildMaddenScheduleStatusDecoderEmbed,
         sync_source_audit: buildMaddenEaDirectSyncSourceAuditEmbed,
@@ -19800,6 +19802,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
           results_diag: buildMaddenHistoricalResultsDiagnosticsEmbed,
           endpoint_discovery: buildMaddenEaEndpointDiscoveryEmbed,
           raw_payload_scan: buildMaddenRawPayloadDeepScanEmbed,
+          injury_ability_scan: buildMaddenInjuryAbilityScanEmbed,
           schedule_payload_inspector: buildMaddenSchedulePayloadInspectorEmbed,
           schedule_status_decoder: buildMaddenScheduleStatusDecoderEmbed,
           sync_source_audit: buildMaddenEaDirectSyncSourceAuditEmbed,
@@ -33612,6 +33615,7 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['madden_franchise_hub_channel', 'Franchise Hub Board'],
     ['madden_sportsbook_channel', 'Madden Sportsbook'],
     ['sportsbook_channel', 'Sportsbook Feed'],
+    ['suspensions_channel', 'Suspensions Board'],
   ];
   // 7J-44SETUP: same three-filter logic as filterSetupDashboardOptions
   // (Madden-only / non-Madden-only / schedule-style game_thread vs
@@ -40708,7 +40712,7 @@ async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = nul
     await postMaddenWeeklyUpdatesDigest(guild, league, allChanges, {
       title: 'Weekly Roster Update',
       emoji: '📋',
-      describeLine: change => `${maddenChangeIcon(change.change_type)} **${change.player_name || 'Unknown player'}** — ${maddenChangeTypeLabel(change.change_type)}: ${change.old_value || 'N/A'} → ${change.new_value || 'N/A'}`,
+      describeLine: describeMaddenChangeLine,
     }).catch(error => console.warn('[7J-25WEEKLY] roster digest failed:', error?.message || error));
   }
 
@@ -44255,6 +44259,20 @@ function normalizeMaddenInjuryValue(value) {
   return raw;
 }
 
+// 7J-104INJURY: was silently displaying whatever raw value the sync found
+// as if it were a real injury name — confirmed happening live ("New
+// Injuries: 59 → 97" in production) when EA's export returns a numeric
+// injury-type code instead of text. The underlying event (a player really
+// did get hurt) is still worth reporting even when we can't name it, so
+// this doesn't suppress the event — it just keeps the *displayed* text
+// honest instead of showing a bare confusing number.
+function formatMaddenInjuryDisplay(value) {
+  const normalized = normalizeMaddenInjuryValue(value);
+  if (!normalized) return null;
+  if (/^-?\d+(\.\d+)?$/.test(normalized)) return 'Injury reported (details unavailable)';
+  return normalized;
+}
+
 function getMaddenChangeAttributeMap(rawPayload) {
   const raw = typeof rawPayload === 'string' ? (() => { try { return JSON.parse(rawPayload); } catch { return {}; } })() : (rawPayload || {});
   const keys = [
@@ -44311,6 +44329,25 @@ function maddenChangeIcon(type) {
   if (key === 'team_change') return '🔁';
   if (key === 'transaction') return '✂️';
   return '📰';
+}
+
+// 7J-104INJURY: shared by both roster-change digest call sites (legacy
+// external-URL sync and EA Direct sync — Hxxdie's league uses EA Direct,
+// which is the "7J-34GAP" path, the one actually feeding the production
+// screenshots). Injury events get a dedicated "Player - Injury, out N
+// weeks" format instead of the generic old→new arrow template, since an
+// arrow never made sense for "here's a fresh injury" in the first place —
+// everything else keeps the existing arrow format unchanged.
+function describeMaddenChangeLine(change) {
+  const playerName = change.player_name || 'Unknown player';
+  if (change.change_type === 'injury_new') {
+    const weeks = Number(change.metadata?.return_weeks) || null;
+    return `🏥 **${playerName}** — ${change.new_value || 'Injured'}${weeks ? `, out ${weeks} week${weeks === 1 ? '' : 's'}` : ''}`;
+  }
+  if (change.change_type === 'injury_recovered') {
+    return `🟢 **${playerName}** — Recovered from ${change.old_value || 'injury'}`;
+  }
+  return `${maddenChangeIcon(change.change_type)} **${playerName}** — ${maddenChangeTypeLabel(change.change_type)}: ${change.old_value || 'N/A'} → ${change.new_value || 'N/A'}`;
 }
 
 async function recordMaddenChangeLogEvent(guild, league, change) {
@@ -44400,14 +44437,19 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
     }));
   }
 
-  const oldInjury = normalizeMaddenInjuryValue(maddenRawValueFromPayload(prevRaw, ['injury', 'injuryType', 'injury_type', 'injuryStatus', 'injury_status']));
-  const newInjury = normalizeMaddenInjuryValue(maddenRawValueFromPayload(nextRaw, ['injury', 'injuryType', 'injury_type', 'injuryStatus', 'injury_status']));
+  const oldInjuryRaw = maddenRawValueFromPayload(prevRaw, ['injury', 'injuryType', 'injury_type', 'injuryStatus', 'injury_status', 'injuryDescription', 'injury_description', 'injuryName', 'injury_name', 'bodyPart', 'body_part']);
+  const newInjuryRaw = maddenRawValueFromPayload(nextRaw, ['injury', 'injuryType', 'injury_type', 'injuryStatus', 'injury_status', 'injuryDescription', 'injury_description', 'injuryName', 'injury_name', 'bodyPart', 'body_part']);
+  const oldInjury = normalizeMaddenInjuryValue(oldInjuryRaw);
+  const newInjury = normalizeMaddenInjuryValue(newInjuryRaw);
   if (!oldInjury && newInjury) {
+    const newInjuryDisplay = formatMaddenInjuryDisplay(newInjuryRaw);
+    const returnWeeksRaw = maddenRawValueFromPayload(nextRaw, ['injuryLength', 'injury_length', 'weeksOut', 'weeks_out', 'injuryWeeks', 'injury_weeks']);
+    const returnWeeks = Number.isFinite(Number(returnWeeksRaw)) && Number(returnWeeksRaw) > 0 ? Number(returnWeeksRaw) : null;
     changes.push(await recordMaddenChangeLogEvent(guild, league, {
       change_type: 'injury_new', player_id: playerId, player_name: playerName, team_name: teamName,
-      old_value: 'Healthy', new_value: newInjury, week_label: weekLabel,
-      metadata: { injury: newInjury, return_weeks: maddenRawValueFromPayload(nextRaw, ['injuryLength', 'injury_length', 'weeksOut', 'weeks_out']) || null },
-      summary: `${playerName} is now injured: ${newInjury}.`,
+      old_value: 'Healthy', new_value: newInjuryDisplay, week_label: weekLabel,
+      metadata: { injury: newInjuryDisplay, return_weeks: returnWeeks },
+      summary: `${playerName} is now injured: ${newInjuryDisplay}${returnWeeks ? `, out ${returnWeeks} week${returnWeeks === 1 ? '' : 's'}` : ''}.`,
     }));
     // 7J-29STORY: injury escalation — a star player's injury is real news,
     // not routine churn. Posted immediately here (same pattern as trade
@@ -44423,25 +44465,28 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
         player_name: playerName,
         team_name: teamName,
         metadata: {
-          injury: newInjury,
+          injury: newInjuryDisplay,
           overall: nextPlayer.overall,
-          summary: `Tough break for ${maddenTeamDisplayName(teamName || '')}: **${playerName}** (${nextPlayer.overall} OVR) is now dealing with ${newInjury}.`,
+          summary: `Tough break for ${maddenTeamDisplayName(teamName || '')}: **${playerName}** (${nextPlayer.overall} OVR) is now dealing with ${newInjuryDisplay}${returnWeeks ? `, out ${returnWeeks} week${returnWeeks === 1 ? '' : 's'}` : ''}.`,
         },
       }).catch(error => console.warn('[7J-10BY-A1 NEWS] injury report event failed:', error?.message || error));
     }
   } else if (oldInjury && !newInjury) {
+    const oldInjuryDisplay = formatMaddenInjuryDisplay(oldInjuryRaw);
     changes.push(await recordMaddenChangeLogEvent(guild, league, {
       change_type: 'injury_recovered', player_id: playerId, player_name: playerName, team_name: teamName,
-      old_value: oldInjury, new_value: 'Healthy', week_label: weekLabel,
-      metadata: { recovered_from: oldInjury },
-      summary: `${playerName} has recovered from ${oldInjury}.`,
+      old_value: oldInjuryDisplay, new_value: 'Healthy', week_label: weekLabel,
+      metadata: { recovered_from: oldInjuryDisplay },
+      summary: `${playerName} has recovered from ${oldInjuryDisplay}.`,
     }));
   } else if (oldInjury && newInjury && oldInjury !== newInjury) {
+    const oldInjuryDisplay = formatMaddenInjuryDisplay(oldInjuryRaw);
+    const newInjuryDisplay = formatMaddenInjuryDisplay(newInjuryRaw);
     changes.push(await recordMaddenChangeLogEvent(guild, league, {
       change_type: 'injury_new', player_id: playerId, player_name: playerName, team_name: teamName,
-      old_value: oldInjury, new_value: newInjury, week_label: weekLabel,
-      metadata: { injury: newInjury },
-      summary: `${playerName} injury status changed from ${oldInjury} to ${newInjury}.`,
+      old_value: oldInjuryDisplay, new_value: newInjuryDisplay, week_label: weekLabel,
+      metadata: { injury: newInjuryDisplay },
+      summary: `${playerName} injury status changed from ${oldInjuryDisplay} to ${newInjuryDisplay}.`,
     }));
   }
 
@@ -46617,7 +46662,7 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
         await postMaddenWeeklyUpdatesDigest(guild, league, allAttrChanges, {
           title: 'Weekly Roster Update',
           emoji: '📋',
-          describeLine: change => `${maddenChangeIcon(change.change_type)} **${change.player_name || 'Unknown player'}** — ${maddenChangeTypeLabel(change.change_type)}: ${change.old_value || 'N/A'} → ${change.new_value || 'N/A'}`,
+          describeLine: describeMaddenChangeLine,
         }).catch(error => console.warn('[7J-34GAP] roster update digest failed:', error?.message || error));
       }
       console.log(`[7J-34GAP] Attribute/injury scan: ${matchedPlayerPairs.length} matched pairs, ${allAttrChanges.length} changes detected.`);
@@ -49367,6 +49412,138 @@ async function buildMaddenEaEndpointDiscoveryEmbed(guildId, league) {
   return embed;
 }
 
+
+// 7J-104INJURY: same pattern as maddenDeepScanCollectSignals below, kept as
+// a separate function rather than parameterizing that one, so the
+// game/score diagnostic tool it powers can't be affected by this at all.
+function maddenInjuryAbilityScanCollectSignals(payload, endpointLabel, limit = 12) {
+  const signals = [];
+  const seen = new Set();
+  const keywords = /(injury|injured|hurt|bodyPart|body_part|weeksOut|weeks_out|injuryLength|injury_length|ability|abilities|signature|xfactor|x-factor|superstar|devTrait|dev_trait)/i;
+
+  function preview(value) {
+    if (value == null) return '';
+    if (typeof value === 'object') {
+      try { return JSON.stringify(value).slice(0, 180); } catch { return '[object]'; }
+    }
+    return String(value).slice(0, 180);
+  }
+
+  function add(path, value) {
+    const key = `${endpointLabel}:${path}:${preview(value)}`.toLowerCase();
+    if (seen.has(key) || signals.length >= limit) return;
+    seen.add(key);
+    signals.push({ endpoint: endpointLabel, path, sample: preview(value) });
+  }
+
+  function walk(node, path = '', depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 6 || signals.length >= limit) return;
+    if (Array.isArray(node)) {
+      if (keywords.test(path)) add(`${path} [array:${node.length}]`, node[0]);
+      for (let i = 0; i < Math.min(node.length, 8); i++) walk(node[i], `${path}[${i}]`, depth + 1);
+      return;
+    }
+    for (const [key, value] of Object.entries(node).slice(0, 80)) {
+      const nextPath = path ? `${path}.${key}` : key;
+      if (keywords.test(key) || keywords.test(nextPath)) add(nextPath, value);
+      if (value && typeof value === 'object') walk(value, nextPath, depth + 1);
+      if (signals.length >= limit) return;
+    }
+  }
+
+  walk(payload);
+  return signals;
+}
+
+// 7J-104INJURY: finds the real field names EA's export uses for injury
+// type/duration and player abilities, by scanning payloads already stored
+// in madden_sync_payloads from past syncs — no need to manually dig up a
+// payload sample, this reads from data the bot already captured on its own.
+async function buildMaddenInjuryAbilityScanEmbed(guildId, league) {
+  const leagueId = league.league_id;
+  const NL = String.fromCharCode(10);
+  const keywordSql = '(injury|injured|hurt|bodypart|body_part|weeksout|weeks_out|injurylength|injury_length|ability|abilities|signature|xfactor|x-factor|superstar|devtrait|dev_trait)';
+
+  const coverageRows = await pool.query(
+    `SELECT
+       COUNT(*)::int AS payloads,
+       COUNT(DISTINCT endpoint)::int AS endpoints,
+       SUM(CASE WHEN raw_payload::text ~* $3 THEN 1 ELSE 0 END)::int AS matching_payloads
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text AND league_id::text = $2::text`,
+    [guildId, String(leagueId), keywordSql]
+  ).catch(error => {
+    console.warn('Madden injury/ability scan coverage query failed:', error.message);
+    return { rows: [{}] };
+  });
+
+  const endpointRows = await pool.query(
+    `SELECT endpoint, payload_type, COUNT(*)::int AS payload_count
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text AND league_id::text = $2::text AND raw_payload::text ~* $3
+     GROUP BY endpoint, payload_type
+     ORDER BY COUNT(*) DESC, endpoint ASC
+     LIMIT 10`,
+    [guildId, String(leagueId), keywordSql]
+  ).catch(error => {
+    console.warn('Madden injury/ability scan endpoint query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const sampleRows = await pool.query(
+    `SELECT endpoint, payload_type, raw_payload, created_at
+     FROM madden_sync_payloads
+     WHERE guild_id = $1::text AND league_id::text = $2::text AND raw_payload::text ~* $3
+     ORDER BY created_at DESC
+     LIMIT 12`,
+    [guildId, String(leagueId), keywordSql]
+  ).catch(error => {
+    console.warn('Madden injury/ability scan sample query failed:', error.message);
+    return { rows: [] };
+  });
+
+  const c = coverageRows.rows?.[0] || {};
+  const coverageText = [
+    `Stored payloads scanned: **${Number(c.payloads || 0)}**`,
+    `Distinct endpoints: **${Number(c.endpoints || 0)}**`,
+    `Payloads with injury/ability keywords: **${Number(c.matching_payloads || 0)}**`,
+  ].join(NL);
+
+  const endpointText = (endpointRows.rows || []).map(row => {
+    const endpoint = String(row.endpoint || 'unknown endpoint').replace(/^ea_direct:/, '');
+    const type = row.payload_type ? ` • ${row.payload_type}` : '';
+    return `**${endpoint.slice(0, 80)}**${type} • ${Number(row.payload_count || 0)} match(es)`;
+  }).join(NL) || 'No stored payloads matched the injury/ability keyword scan.';
+
+  const discovered = [];
+  const seen = new Set();
+  for (const row of sampleRows.rows || []) {
+    const endpoint = String(row.endpoint || 'unknown endpoint').replace(/^ea_direct:/, '').slice(0, 80);
+    const signals = maddenInjuryAbilityScanCollectSignals(row.raw_payload || {}, endpoint, 8);
+    for (const signal of signals) {
+      const key = `${signal.endpoint}:${signal.path}:${signal.sample}`.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      discovered.push(`**${signal.endpoint}**${NL}\`${String(signal.path).slice(0, 90)}\`${NL}${String(signal.sample).replace(/`/g, '').slice(0, 220)}`);
+      if (discovered.length >= 10) break;
+    }
+    if (discovered.length >= 10) break;
+  }
+  const signalText = discovered.join(NL + NL) || 'No injury/ability-looking fields found in stored payload samples yet — run a sync first if this league hasn\'t synced recently, since this only scans payloads already captured.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('🩺 Madden Injury/Ability Field Scan • ' + (league.league_name || 'Madden League'))
+    .setColor(0x1ABC9C)
+    .setDescription('Scans EA payloads already stored from past syncs for injury type/duration and player ability field names — read-only, changes nothing. Use the field paths/samples below to confirm what the real injury and ability fields are actually called.')
+    .addFields(
+      { name: 'Coverage', value: coverageText.slice(0, 1024), inline: false },
+      { name: 'Matching Endpoints', value: endpointText.slice(0, 1024), inline: false },
+      { name: 'Discovered Fields', value: signalText.slice(0, 1024), inline: false },
+    )
+    .setFooter({ text: 'GG Sports • Injury/Ability Field Scan • 7J-104INJURY' })
+    .setTimestamp();
+  return embed;
+}
 
 function maddenDeepScanCollectSignals(payload, endpointLabel, limit = 12) {
   const signals = [];
