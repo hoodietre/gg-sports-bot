@@ -20,6 +20,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   MessageFlags,
+  InteractionContextType,
 } from 'discord.js';
 import pkg from 'pg';
 import { randomUUID, randomBytes, createHash, constants as cryptoConstants } from 'crypto';
@@ -1169,6 +1170,38 @@ async function initDatabase() {
   `);
   await pool.query(`ALTER TABLE league_team_roles ADD COLUMN IF NOT EXISTS conference TEXT`);
   await pool.query(`ALTER TABLE league_team_roles ADD COLUMN IF NOT EXISTS division TEXT`);
+
+  // 7J-89RECRUIT: recruitment feature — v1 is auto-detected-vacancy-only
+  // (open team = a league_team_roles entry whose Discord role currently has
+  // zero non-bot members, checked live rather than stored/cached), with
+  // commissioner approval required before a team role gets assigned.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_recruitment_applications (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      team_role_id TEXT NOT NULL,
+      team_name TEXT,
+      applicant_user_id TEXT NOT NULL,
+      pitch TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      decided_by_user_id TEXT,
+      decision_note TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      decided_at TIMESTAMP
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recruitment_apps_league_status ON league_recruitment_applications (league_id, status)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_recruitment_apps_applicant ON league_recruitment_applications (applicant_user_id)`);
+  // 7J-90DISCOVERY: NULL means the role hasn't been granted yet — either
+  // never approved, or approved while the applicant wasn't a server member
+  // (cross-server discovery case), waiting on them to join.
+  await pool.query(`ALTER TABLE league_recruitment_applications ADD COLUMN IF NOT EXISTS role_granted_at TIMESTAMP`);
+  // 7J-91DISCOVERABLE: opt-in, not opt-out — a league only shows up on the
+  // cross-server Discover Leagues board once a commissioner explicitly
+  // turns it on. Same-guild Browse Open Teams is unaffected (posting the
+  // Recruitment panel at all is already that opt-in for in-server use).
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS recruitment_discoverable BOOLEAN NOT NULL DEFAULT FALSE`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_panels (
@@ -3388,6 +3421,14 @@ function buildCommands() {
       .addStringOption(o => o.setName('url').setDescription('Your stream link').setRequired(true)),
 
     new SlashCommandBuilder().setName('livestream').setDescription('Post your saved stream link'),
+    // 7J-90DISCOVERY: explicitly usable in DMs (setContexts includes BotDM),
+    // unlike the rest of this bot's commands which are guild-only — the
+    // whole point of Discover Leagues is finding a league you're not in
+    // yet, so it needs to work from outside any particular server.
+    new SlashCommandBuilder()
+      .setName('discoverleagues')
+      .setDescription('Browse open team slots across every GG Sports league, from any server or DM')
+      .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel),
 
     new SlashCommandBuilder()
       .setName('assignrole')
@@ -4426,7 +4467,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -7739,6 +7780,10 @@ function getMultiChannelPanelInfo(panelType) {
       label: 'Avatar',
       build: async () => ({ embeds: [buildAvatarStarterEmbed()], components: buildAvatarStarterComponents() }),
     },
+    recruitment: {
+      label: 'Recruitment',
+      build: async () => ({ embeds: [buildRecruitmentStarterEmbed()], components: buildRecruitmentStarterComponents() }),
+    },
   };
   return registry[panelType] || null;
 }
@@ -8338,7 +8383,14 @@ async function sendNewMemberOnboardingDM(member) {
   } else {
     soleLeague = await getLeagueById(leagues[0].league_id).catch(() => null);
     const teams = soleLeague ? await getLeagueTeamRoles(soleLeague.league_id) : [];
-    if (teams.length) {
+    // 7J-90DISCOVERY: if the member already holds one of this league's team
+    // roles — most commonly because grantPendingRecruitmentRolesOnJoin just
+    // assigned one a moment ago, but also true for any other reason — don't
+    // show the "pick your team" prompt. It'd be a confusing duplicate at
+    // best, and at worst they click through it anyway and end up holding a
+    // second team role they didn't mean to take.
+    const alreadyHasTeam = teams.some(t => member.roles.cache.has(t.role_id));
+    if (teams.length && !alreadyHasTeam) {
       components = buildOnboardTeamSelectRows(teams, `onboard_team_select:${guild.id}:${soleLeague.league_id}`);
     }
   }
@@ -8380,6 +8432,13 @@ async function sendNewServerOwnerOnboardingDM(guild) {
 }
 
 client.on(Events.GuildMemberAdd, async (member) => {
+  // 7J-90DISCOVERY: run recruitment role grants BEFORE the onboarding DM,
+  // not after — sendNewMemberOnboardingDM checks the member's current
+  // roles to decide whether to prompt for a team, so the grant has to have
+  // already happened by the time that check runs, or someone approved via
+  // recruitment would still get asked to pick a team (and could end up
+  // self-assigning a second one).
+  await grantPendingRecruitmentRolesOnJoin(member).catch(err => console.error('[Recruitment] Pending role grant on join failed:', err?.message));
   await sendNewMemberOnboardingDM(member).catch(err => console.error('New member onboarding DM failed:', err?.message));
 });
 
@@ -10279,6 +10338,322 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // ---- Recruitment feature (7J-89RECRUIT) ----
+    if (interaction.isButton() && interaction.customId === 'recruitmentpanel_browse') {
+      await interaction.deferReply({ ephemeral: true });
+      const league = await resolveLeague(interaction);
+      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
+      const vacant = await getVacantLeagueTeams(interaction.guild, league);
+      if (!vacant.length) { await interaction.editReply({ content: `No open teams in **${league.league_name}** right now — every team role has at least one member.` }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`recruitmentpanel_apply_team_select:${league.league_id}`)
+        .setPlaceholder('Pick a team to apply for')
+        .addOptions(vacant.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
+      await interaction.editReply({
+        content: `**${vacant.length}** open team${vacant.length === 1 ? '' : 's'} in **${league.league_name}**. Pick one to apply:`,
+        components: [new ActionRowBuilder().addComponents(menu)],
+      });
+      return;
+    }
+
+    // 7J-90DISCOVERY: cross-server "Looking for League" board. Paginated by
+    // league (small page size — each league needs live Discord role-
+    // membership checks to compute its open-team count, so this is capped
+    // to keep API calls bounded per click). Works from any server or DM,
+    // since it's not scoped to the current guild's own league at all.
+    // 7J-90DISCOVERY: shared between the Recruitment panel's Discover
+    // Leagues button and the /discoverleagues slash command (which is
+    // DM-reachable) — one implementation, two entry points.
+    if (interaction.isButton() && (interaction.customId === 'recruitmentpanel_discover' || interaction.customId.startsWith('recruitmentpanel_discover_page:'))) {
+      const isDM = !interaction.guild;
+      if (isDM) await interaction.deferUpdate().catch(() => interaction.deferReply());
+      else await interaction.deferReply({ ephemeral: true });
+      const page = interaction.customId.startsWith('recruitmentpanel_discover_page:') ? Number.parseInt(interaction.customId.split(':')[1], 10) || 0 : 0;
+      const payload = await buildDiscoverLeaguesPayload(page);
+      await interaction.editReply({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'recruitmentpanel_discover_select') {
+      await interaction.deferUpdate();
+      const leagueId = interaction.values[0];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.editReply({ content: 'That league no longer exists.', embeds: [], components: [] }); return; }
+      const guild = client.guilds.cache.get(league.guild_id);
+      if (!guild) { await interaction.editReply({ content: "I'm no longer in that league's server.", embeds: [], components: [] }); return; }
+      const vacant = await getVacantLeagueTeams(guild, league);
+      if (!vacant.length) { await interaction.editReply({ content: `**${league.league_name}** doesn't have any open teams anymore — someone beat you to it.`, embeds: [], components: [] }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`recruitmentpanel_apply_team_select:${league.league_id}`)
+        .setPlaceholder('Pick a team to apply for')
+        .addOptions(vacant.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
+      await interaction.editReply({
+        content: `**${vacant.length}** open team${vacant.length === 1 ? '' : 's'} in **${league.league_name}** (${guild.name}). Pick one to apply:`,
+        embeds: [],
+        components: [new ActionRowBuilder().addComponents(menu)],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('recruitmentpanel_apply_team_select:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const teamRoleId = interaction.values[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`recruitmentpanel_apply_modal:${leagueId}:${teamRoleId}`)
+        .setTitle('Apply for this team')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('pitch').setLabel('Why this team? Experience/availability?').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)
+          ),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('recruitmentpanel_apply_modal:')) {
+      await interaction.deferReply({ ephemeral: true });
+      const [, leagueId, teamRoleId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.editReply({ content: 'That league no longer exists.' }); return; }
+
+      // 7J-90DISCOVERY: resolve the league's own home guild rather than
+      // assuming interaction.guild — this handler now serves both the
+      // same-guild Browse Open Teams flow and the cross-server Discover
+      // Leagues flow, where the applicant may be applying from a different
+      // server (or a DM) than the one the team role actually lives in.
+      const targetGuild = client.guilds.cache.get(league.guild_id);
+      if (!targetGuild) { await interaction.editReply({ content: "I'm no longer in that league's server." }); return; }
+
+      // Re-verify the team is still vacant at submit time (someone else may
+      // have been approved for it, or gotten the role manually, in the time
+      // it took to fill out the modal).
+      const role = targetGuild.roles.cache.get(teamRoleId) || await targetGuild.roles.fetch(teamRoleId).catch(() => null);
+      if (!role) { await interaction.editReply({ content: 'That team role no longer exists.' }); return; }
+      if (role.members.filter(m => !m.user.bot).size > 0) {
+        await interaction.editReply({ content: `**${role.name}** already has an owner — someone beat you to it. Check \`Browse Open Teams\` again for what's still open.` });
+        return;
+      }
+      const targetMember = await targetGuild.members.fetch(interaction.user.id).catch(() => null);
+      if (targetMember?.roles.cache.has(teamRoleId)) {
+        await interaction.editReply({ content: `You already have the **${role.name}** role.` });
+        return;
+      }
+
+      // One pending application per user per team — resubmitting doesn't
+      // spam the review queue with duplicates.
+      const existing = await pool.query(
+        `SELECT id FROM league_recruitment_applications WHERE league_id = $1 AND team_role_id = $2 AND applicant_user_id = $3 AND status = 'pending' LIMIT 1`,
+        [league.league_id, teamRoleId, interaction.user.id]
+      );
+      if (existing.rows.length) { await interaction.editReply({ content: `You already have a pending application for **${role.name}**. Check \`My Applications\` for status.` }); return; }
+
+      await pool.query(
+        `INSERT INTO league_recruitment_applications (id, guild_id, league_id, team_role_id, team_name, applicant_user_id, pitch)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [randomUUID(), targetGuild.id, league.league_id, teamRoleId, role.name, interaction.user.id, interaction.fields.getTextInputValue('pitch').trim()]
+      );
+      const notInServerNote = targetMember ? '' : ` You're not currently a member of **${targetGuild.name}** — if approved, I'll send you an invite.`;
+      await interaction.editReply({ content: `Application submitted for **${role.name}** in **${league.league_name}**. A commissioner will review it — check \`My Applications\` for status.${notInServerNote}` });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'recruitmentpanel_myapplications') {
+      await interaction.deferReply({ ephemeral: true });
+      const result = await pool.query(
+        `SELECT * FROM league_recruitment_applications WHERE guild_id = $1 AND applicant_user_id = $2 ORDER BY created_at DESC LIMIT 20`,
+        [interaction.guild.id, interaction.user.id]
+      );
+      if (!result.rows.length) { await interaction.editReply({ content: "You haven't applied for any teams yet." }); return; }
+      const NL = String.fromCharCode(10);
+      const embed = new EmbedBuilder()
+        .setTitle('📄 My Recruitment Applications')
+        .setColor(0x57F287)
+        .setDescription(result.rows.map(r =>
+          `${recruitmentStatusEmoji(r.status)} **${r.team_name}** — ${r.status}${r.decision_note ? ` (${r.decision_note})` : ''}${NL}Applied ${new Date(r.created_at).toLocaleDateString('en-US')}`
+        ).join(NL + NL))
+        .setFooter({ text: 'GG Sports • Recruitment' })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'recruitmentpanel_review') {
+      await interaction.deferReply({ ephemeral: true });
+      const league = await resolveLeague(interaction);
+      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
+      if (!(await memberHasStaff(interaction.member, league))) { await interaction.editReply({ content: 'You need staff permissions to review applications.' }); return; }
+      const result = await pool.query(
+        `SELECT * FROM league_recruitment_applications WHERE league_id = $1 AND status = 'pending' ORDER BY created_at ASC LIMIT 25`,
+        [league.league_id]
+      );
+      if (!result.rows.length) { await interaction.editReply({ content: `No pending applications for **${league.league_name}**.` }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('recruitmentpanel_review_select')
+        .setPlaceholder('Pick an application to review')
+        .addOptions(await Promise.all(result.rows.map(async r => {
+          const applicantMember = await interaction.guild.members.fetch(r.applicant_user_id).catch(() => null);
+          const applicantName = applicantMember?.user?.username || `User ${r.applicant_user_id}`;
+          return {
+            label: `${r.team_name} — ${applicantName}`.slice(0, 100),
+            description: `Applied ${new Date(r.created_at).toLocaleDateString('en-US')}`,
+            value: r.id,
+          };
+        })));
+      await interaction.editReply({ content: `**${result.rows.length}** pending application${result.rows.length === 1 ? '' : 's'} for **${league.league_name}**:`, components: [new ActionRowBuilder().addComponents(menu)] });
+      return;
+    }
+
+    // 7J-91DISCOVERABLE: per-league opt-in toggle for the cross-server
+    // Discover Leagues board. Staff-only, doesn't affect same-guild Browse
+    // Open Teams at all — only whether this league shows up on the global
+    // board other servers' members browse.
+    if (interaction.isButton() && interaction.customId === 'recruitmentpanel_discoverable_settings') {
+      await interaction.deferReply({ ephemeral: true });
+      const league = await resolveLeague(interaction);
+      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
+      if (!(await memberHasStaff(interaction.member, league))) { await interaction.editReply({ content: 'You need staff permissions to change this setting.' }); return; }
+      const isOn = Boolean(league.recruitment_discoverable);
+      await interaction.editReply({
+        content: `**${league.league_name}** is currently **${isOn ? 'discoverable' : 'not discoverable'}** on the cross-server Discover Leagues board.` +
+          `${isOn ? '' : ' Same-guild Browse Open Teams still works either way — this only controls whether other servers can find your open teams.'}`,
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`recruitmentpanel_discoverable_set:${league.league_id}:true`).setLabel('Turn On').setStyle(ButtonStyle.Success).setDisabled(isOn),
+          new ButtonBuilder().setCustomId(`recruitmentpanel_discoverable_set:${league.league_id}:false`).setLabel('Turn Off').setStyle(ButtonStyle.Danger).setDisabled(!isOn),
+        )],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('recruitmentpanel_discoverable_set:')) {
+      await interaction.deferUpdate();
+      const [, leagueId, valueStr] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.editReply({ content: 'That league no longer exists.', components: [] }); return; }
+      if (!(await memberHasStaff(interaction.member, league))) { await interaction.followUp({ content: 'You need staff permissions to change this setting.', ephemeral: true }); return; }
+      const enabled = valueStr === 'true';
+      await pool.query(
+        `INSERT INTO league_settings (league_id, recruitment_discoverable, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (league_id) DO UPDATE SET recruitment_discoverable = $2, updated_at = NOW()`,
+        [league.league_id, enabled]
+      );
+      await interaction.editReply({
+        content: `**${league.league_name}** is now **${enabled ? 'discoverable' : 'not discoverable'}** on the cross-server Discover Leagues board.`,
+        components: [],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'recruitmentpanel_review_select') {
+      const appId = interaction.values[0];
+      const result = await pool.query(`SELECT * FROM league_recruitment_applications WHERE id = $1 LIMIT 1`, [appId]);
+      const app = result.rows[0];
+      if (!app || app.status !== 'pending') { await interaction.update({ content: 'That application is no longer pending.', components: [] }); return; }
+      const embed = new EmbedBuilder()
+        .setTitle(`Application • ${app.team_name}`)
+        .setColor(0x57F287)
+        .addFields(
+          { name: 'Applicant', value: `<@${app.applicant_user_id}>`, inline: true },
+          { name: 'Applied', value: new Date(app.created_at).toLocaleDateString('en-US'), inline: true },
+          { name: 'Pitch', value: app.pitch || 'No pitch provided.', inline: false },
+        )
+        .setFooter({ text: 'GG Sports • Recruitment Review' })
+        .setTimestamp();
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`recruitmentpanel_approve:${app.id}`).setLabel('Approve').setEmoji('✅').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`recruitmentpanel_decline:${app.id}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
+      );
+      await interaction.update({ content: null, embeds: [embed], components: [buttons] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('recruitmentpanel_approve:')) {
+      await interaction.deferUpdate();
+      const appId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM league_recruitment_applications WHERE id = $1 LIMIT 1`, [appId]);
+      const app = result.rows[0];
+      if (!app || app.status !== 'pending') { await interaction.editReply({ content: 'That application is no longer pending.', embeds: [], components: [] }); return; }
+      const league = await getLeagueById(app.league_id);
+      if (!(await memberHasStaff(interaction.member, league))) { await interaction.followUp({ content: 'You need staff permissions to approve applications.', ephemeral: true }); return; }
+
+      // Re-check vacancy one more time — the whole point of v1's
+      // auto-detected-vacancy model is that it can't drift, but two staff
+      // members approving different applicants for the same team in the
+      // same few minutes is exactly the race this guards against.
+      const role = interaction.guild.roles.cache.get(app.team_role_id) || await interaction.guild.roles.fetch(app.team_role_id).catch(() => null);
+      if (!role) { await interaction.editReply({ content: 'That team role no longer exists.', embeds: [], components: [] }); return; }
+      if (role.members.filter(m => !m.user.bot).size > 0) {
+        await pool.query(`UPDATE league_recruitment_applications SET status = 'declined', decided_by_user_id = $1, decision_note = 'Team was filled before approval', decided_at = NOW() WHERE id = $2`, [interaction.user.id, appId]);
+        await interaction.editReply({ content: `**${role.name}** already has an owner — this application was auto-declined.`, embeds: [], components: [] });
+        return;
+      }
+
+      const applicantMember = await interaction.guild.members.fetch(app.applicant_user_id).catch(() => null);
+      await pool.query(`UPDATE league_recruitment_applications SET status = 'approved', decided_by_user_id = $1, decided_at = NOW() WHERE id = $2`, [interaction.user.id, appId]);
+
+      if (!applicantMember) {
+        // 7J-90DISCOVERY: applicant applied from Discover Leagues and isn't
+        // in this server yet. Approve now, send an invite, and let
+        // grantPendingRecruitmentRolesOnJoin assign the role once they
+        // actually join — role_granted_at stays NULL until then.
+        const botMember = await interaction.guild.members.fetchMe();
+        const inviteChannel = interaction.guild.channels.cache.find(c => c.isTextBased() && c.permissionsFor(botMember)?.has(PermissionFlagsBits.CreateInstantInvite));
+        const invite = inviteChannel ? await inviteChannel.createInvite({ maxAge: 604800, maxUses: 1, unique: true, reason: `Recruitment approval for ${role.name}` }).catch(() => null) : null;
+        await interaction.editReply({ content: `Approved <@${app.applicant_user_id}> for **${role.name}**, but they're not in this server yet — sent them an invite. Role will be assigned automatically once they join.`, embeds: [], components: [] });
+        const applicantUser = await client.users.fetch(app.applicant_user_id).catch(() => null);
+        await applicantUser?.send({
+          content: `🎉 Your application for **${role.name}** in **${league?.league_name || 'the league'}** was approved!` +
+            (invite ? ` Join the server here to get your role: ${invite.url}` : ` Ask the commissioner for an invite to join and get your role assigned.`),
+        }).catch(() => null);
+        return;
+      }
+
+      await applicantMember.roles.add(role).catch(async (error) => {
+        console.error('[Recruitment] Failed to assign team role on approval:', error?.message || error);
+        await interaction.followUp({ content: `Could not assign the **${role.name}** role — check my role position and permissions.`, ephemeral: true });
+      });
+      // 7J-90DISCOVERY: a new team owner needs the general league role too,
+      // not just the team-specific one — same pairing the existing
+      // onboarding flow assigns (see sendNewMemberOnboardingDM).
+      if (league?.league_role_id) {
+        await applicantMember.roles.add(league.league_role_id).catch(err => console.error('[Recruitment] Failed to assign league role on approval:', err?.message || err));
+      }
+      await pool.query(`UPDATE league_recruitment_applications SET role_granted_at = NOW() WHERE id = $1`, [appId]);
+      await interaction.editReply({ content: `Approved. <@${app.applicant_user_id}> is now **${role.name}**.`, embeds: [], components: [] });
+      await applicantMember.send({ content: `🎉 Your application for **${role.name}** in **${league?.league_name || 'the league'}** was approved! You've been assigned the team role.` }).catch(() => null);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('recruitmentpanel_decline:')) {
+      const appId = interaction.customId.split(':')[1];
+      const modal = new ModalBuilder()
+        .setCustomId(`recruitmentpanel_decline_modal:${appId}`)
+        .setTitle('Decline application')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional, shown to applicant)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200)
+          ),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('recruitmentpanel_decline_modal:')) {
+      await interaction.deferUpdate();
+      const appId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM league_recruitment_applications WHERE id = $1 LIMIT 1`, [appId]);
+      const app = result.rows[0];
+      if (!app || app.status !== 'pending') { await interaction.editReply({ content: 'That application is no longer pending.', embeds: [], components: [] }); return; }
+      const league = await getLeagueById(app.league_id);
+      if (!(await memberHasStaff(interaction.member, league))) { await interaction.followUp({ content: 'You need staff permissions to decline applications.', ephemeral: true }); return; }
+
+      const reason = interaction.fields.getTextInputValue('reason').trim() || null;
+      await pool.query(`UPDATE league_recruitment_applications SET status = 'declined', decided_by_user_id = $1, decision_note = $2, decided_at = NOW() WHERE id = $3`, [interaction.user.id, reason, appId]);
+      await interaction.editReply({ content: `Declined <@${app.applicant_user_id}>'s application for **${app.team_name}**.`, embeds: [], components: [] });
+      const applicantMember = await interaction.guild.members.fetch(app.applicant_user_id).catch(() => null);
+      await applicantMember?.send({ content: `Your application for **${app.team_name}** in **${league?.league_name || 'the league'}** was declined.${reason ? ` Reason: ${reason}` : ''}` }).catch(() => null);
+      return;
+    }
+
 
 
 
@@ -10312,6 +10687,17 @@ if (interaction.commandName === 'avatar') {
         return;
       }
       const existingOwner = role.members.find(m => !m.user.bot && m.id !== member.id);
+      // 7J-90DISCOVERY: defensive duplicate-team check — the sole-league
+      // onboarding DM now skips this prompt entirely when the member
+      // already has a team (see sendNewMemberOnboardingDM), but this covers
+      // the multi-league path too, and anyone who still had this select
+      // menu open from before a recruitment approval landed.
+      const league_teams = league ? await getLeagueTeamRoles(league.league_id) : [];
+      const alreadyHasOtherTeam = league_teams.find(t => t.role_id !== roleId && member.roles.cache.has(t.role_id));
+      if (alreadyHasOtherTeam) {
+        await interaction.update({ content: `You already have **${alreadyHasOtherTeam.role_name}** in ${league?.league_name || 'this league'} — ask a commissioner if you need to switch teams.`, embeds: [], components: [] });
+        return;
+      }
       await member.roles.add(role.id).catch(() => null);
       const note = existingOwner ? ` Heads up — <@${existingOwner.id}> already has this role too; a commissioner can sort out ownership if that's not intended.` : '';
       await interaction.update({
@@ -16123,6 +16509,13 @@ if (interaction.commandName === 'avatar') {
 
 
     if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === 'discoverleagues') {
+      await interaction.deferReply({ ephemeral: true });
+      const payload = await buildDiscoverLeaguesPayload(0);
+      await interaction.editReply(payload);
+      return;
+    }
 
     if (interaction.commandName.startsWith('league-')) {
       if (!interaction.guild) {
@@ -31421,6 +31814,126 @@ function buildBankBackRow() {
   );
 }
 
+// 7J-89RECRUIT: v1 vacancy detection — a team is "open" if its Discord role
+// currently has zero non-bot members. No stored/manual "recruiting" flag;
+// this is computed live every time so it can never drift from reality (an
+// owner leaving the server, or a commissioner removing the role, shows up
+// immediately without anyone having to remember to flag it).
+async function getVacantLeagueTeams(guild, league) {
+  const teams = await getLeagueTeamRoles(league.league_id);
+  const vacant = [];
+  for (const team of teams) {
+    const role = guild.roles.cache.get(team.role_id) || await guild.roles.fetch(team.role_id).catch(() => null);
+    if (!role) continue; // role deleted from the server — not a valid team to recruit for
+    const memberCount = role.members.filter(m => !m.user.bot).size;
+    if (memberCount === 0) vacant.push(team);
+  }
+  return vacant;
+}
+
+function buildRecruitmentStarterEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🎯 Recruitment')
+    .setColor(0x57F287)
+    .setDescription('Browse open team slots and apply — no need to ask around in chat. Applications go to the commissioner for approval before a team role is assigned.')
+    .setFooter({ text: 'GG Sports • Recruitment' })
+    .setTimestamp();
+}
+
+function buildRecruitmentStarterComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('recruitmentpanel_browse').setLabel('Browse Open Teams').setEmoji('🔍').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('recruitmentpanel_discover').setLabel('Discover Leagues').setEmoji('🌐').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('recruitmentpanel_myapplications').setLabel('My Applications').setEmoji('📄').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('recruitmentpanel_review').setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('recruitmentpanel_discoverable_settings').setLabel('Discoverable Setting').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
+  )];
+}
+
+function recruitmentStatusEmoji(status) {
+  if (status === 'approved') return '✅';
+  if (status === 'declined') return '❌';
+  return '⏳';
+}
+
+// 7J-90DISCOVERY: shared between the Recruitment panel's Discover Leagues
+// button and the /discoverleagues slash command (which is DM-reachable) —
+// one implementation, two entry points.
+async function buildDiscoverLeaguesPayload(page) {
+  const pageSize = 5;
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM leagues l JOIN league_settings s ON s.league_id = l.league_id WHERE l.is_active = TRUE AND s.recruitment_discoverable = TRUE`
+  );
+  const totalLeagues = countResult.rows[0]?.count || 0;
+  const leaguesResult = await pool.query(
+    `SELECT l.league_id, l.guild_id, l.league_name FROM leagues l JOIN league_settings s ON s.league_id = l.league_id
+     WHERE l.is_active = TRUE AND s.recruitment_discoverable = TRUE ORDER BY l.league_name ASC LIMIT $1 OFFSET $2`,
+    [pageSize, page * pageSize]
+  );
+
+  const NL = String.fromCharCode(10);
+  const lines = [];
+  const openLeagues = [];
+  for (const league of leaguesResult.rows) {
+    const guild = client.guilds.cache.get(league.guild_id);
+    if (!guild) continue; // bot no longer in that server — skip silently
+    const vacant = await getVacantLeagueTeams(guild, league);
+    lines.push(`**${league.league_name}** — ${guild.name} — ${vacant.length} open team${vacant.length === 1 ? '' : 's'}`);
+    if (vacant.length) openLeagues.push({ league_id: league.league_id, league_name: league.league_name, guildName: guild.name });
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🌐 Discover Leagues')
+    .setColor(0x57F287)
+    .setDescription(lines.length ? lines.join(NL) : 'No leagues to show on this page.')
+    .setFooter({ text: `GG Sports • Recruitment • Page ${page + 1} of ${Math.max(1, Math.ceil(totalLeagues / pageSize))}` })
+    .setTimestamp();
+
+  const rows = [];
+  if (openLeagues.length) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('recruitmentpanel_discover_select')
+        .setPlaceholder('Pick a league to see open teams')
+        .addOptions(openLeagues.map(l => ({ label: l.league_name.slice(0, 100), description: l.guildName.slice(0, 100), value: l.league_id })))
+    ));
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`recruitmentpanel_discover_page:${Math.max(0, page - 1)}`).setLabel('◀ Back').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+    new ButtonBuilder().setCustomId(`recruitmentpanel_discover_page:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled((page + 1) * pageSize >= totalLeagues),
+  ));
+
+  return { embeds: [embed], components: rows };
+}
+
+// 7J-90DISCOVERY: called from GuildMemberAdd. Grants any role(s) this
+// member has an approved-but-not-yet-granted recruitment application for in
+// the server they just joined.
+async function grantPendingRecruitmentRolesOnJoin(member) {
+  const result = await pool.query(
+    `SELECT * FROM league_recruitment_applications WHERE guild_id = $1 AND applicant_user_id = $2 AND status = 'approved' AND role_granted_at IS NULL`,
+    [member.guild.id, member.id]
+  );
+  for (const app of result.rows) {
+    const role = member.guild.roles.cache.get(app.team_role_id) || await member.guild.roles.fetch(app.team_role_id).catch(() => null);
+    if (!role) continue;
+    if (role.members.filter(m => !m.user.bot).size > 0) {
+      // Team got filled by someone else while this applicant was still
+      // outside the server — nothing to grant now, just close it out.
+      await pool.query(`UPDATE league_recruitment_applications SET decision_note = COALESCE(decision_note, '') || ' (team filled before they joined)' WHERE id = $1`, [app.id]);
+      continue;
+    }
+    await member.roles.add(role).catch(err => console.error('[Recruitment] grantPendingRecruitmentRolesOnJoin role add failed:', err?.message));
+    // League role too, same pairing as the immediate-approval path.
+    const league = await getLeagueById(app.league_id).catch(() => null);
+    if (league?.league_role_id) {
+      await member.roles.add(league.league_role_id).catch(err => console.error('[Recruitment] grantPendingRecruitmentRolesOnJoin league role add failed:', err?.message));
+    }
+    await pool.query(`UPDATE league_recruitment_applications SET role_granted_at = NOW() WHERE id = $1`, [app.id]);
+    await member.send({ content: `🎉 Welcome! Your **${role.name}** team role from your approved recruitment application has been assigned.` }).catch(() => null);
+  }
+}
+
 async function buildBankHomeEmbed(guild, targetUser) {
   const settings = await getCurrencySettings(guild.id);
   const balance = await getBalance(guild.id, targetUser.id);
@@ -31636,6 +32149,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'avatar_panel_channels', label: 'Avatar Panel', description: 'Manage which channel(s) the avatar panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'bank_panel_channels', label: 'Bank Starter', description: 'Manage which channel(s) the bank starter panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'profile_panel_channels', label: 'Member Profile Starter', description: 'Manage which channel(s) the member profile starter panel is posted in — can be more than one', kind: 'multichannel' },
+  { value: 'recruitment_panel_channels', label: 'Recruitment Panel', description: 'Manage which channel(s) the recruitment panel is posted in — can be more than one', kind: 'multichannel' },
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
   { value: 'trade_offer_channel', label: 'Trade Offer Channel', description: 'Trade offer panel channel', kind: 'channel' },
   { value: 'trade_committee_channel', label: 'Trade Committee Channel', description: 'Trade voting channel', kind: 'channel' },
@@ -31655,6 +32169,7 @@ const MULTI_CHANNEL_DASHBOARD_MAP = {
   avatar_panel_channels: 'avatar',
   bank_panel_channels: 'bank',
   profile_panel_channels: 'profile',
+  recruitment_panel_channels: 'recruitment',
 };
 
 const SETUP_PANEL_OPTIONS = [
@@ -31876,6 +32391,7 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['bank', 'Bank Starter'],
     ['profile', 'Member Profile Starter'],
     ['avatar', 'Avatar'],
+    ['recruitment', 'Recruitment'],
   ];
   const multiChannelCounts = await Promise.all(multiChannelPanelTypes.map(([panelType]) => listMultiChannelPanelPostings(guild.id, panelType)));
   const multiChannelLines = multiChannelPanelTypes.map(([, label], i) => {
