@@ -191,6 +191,28 @@ async function loadCurrencyConfig() {
   return currencyConfigCache;
 }
 
+// 7J-101REVIEW: same tiny singleton-row cache pattern as currencyConfigCache.
+let botSettingsCache = { review_link: null, review_prompt_enabled: true };
+
+async function loadBotSettings() {
+  await pool.query(`INSERT INTO system_bot_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
+  const result = await pool.query(`SELECT * FROM system_bot_settings WHERE id = 1`);
+  if (result.rows[0]) botSettingsCache = result.rows[0];
+  return botSettingsCache;
+}
+
+// 7J-101REVIEW: redesigned per Hxxdie — DM-based (not intrusive on
+// leagues/servers), sent to every person in any league across every
+// server, first prompt after 10 days (deliberately before typical trial
+// periods end, so the review reflects genuine opinion rather than
+// trial-expiration frustration), then every 30 days after that until they
+// confirm they've left a review. See runReviewPromptSchedulerTick below —
+// this table is populated/consulted by that periodic tick, not by any
+// single interaction handler.
+const REVIEW_PROMPT_FIRST_DELAY_DAYS = 10;
+const REVIEW_PROMPT_REPEAT_DAYS = 30;
+
+// Fires as a follow-up after the Commissioner Panel opens, at most once per
 function clampPayoutRate(type, value) {
   const min = Number(currencyConfigCache[`${type}_min`]);
   const max = Number(currencyConfigCache[`${type}_max`]);
@@ -278,6 +300,52 @@ async function initDatabase() {
   // prompt) sent on GuildMemberAdd. Does not affect the one-time new-server-owner DM
   // sent on GuildCreate, since that fires before any admin has had a chance to toggle it.
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS onboarding_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+  // 7J-96WELCOMER: public welcome/leave channel announcements — distinct
+  // from the private onboarding DM (onboarding_enabled above). Defaults
+  // OFF, unlike onboarding, since it's new and posts publicly rather than
+  // just DMing the new member.
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS welcome_leave_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS welcome_channel_id TEXT`);
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS leave_channel_id TEXT`);
+  // 7J-101REVIEW: SUPERSEDED — original design was a one-time guild-level
+  // prompt shown in the Commissioner Panel. Redesigned per Hxxdie to a
+  // per-user DM instead (see user_review_prompts / runReviewPromptSchedulerTick
+  // below), so these two columns are no longer read or written anywhere.
+  // Left in place rather than dropped, matching this codebase's convention
+  // of never removing columns once added.
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS review_prompted_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS review_dismissed BOOLEAN NOT NULL DEFAULT FALSE`);
+
+  // 7J-101REVIEW: bot-owner-global, one row — same id=1 singleton pattern as
+  // system_currency_config. No review_link set means the prompt never
+  // fires anywhere, so this is safe to leave unconfigured.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS system_bot_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      review_link TEXT,
+      review_prompt_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      CONSTRAINT system_bot_settings_single_row CHECK (id = 1)
+    )
+  `);
+
+  // 7J-101REVIEW: one row per Discord user, global — not guild-scoped, since
+  // this is "every person in any league across every server," not a per-
+  // server thing. first_seen_at only ever gets set once (ON CONFLICT DO
+  // NOTHING at insert — see runReviewPromptSchedulerTick's discovery pass),
+  // so it reflects the very first time this user was ever detected holding
+  // a team role anywhere. review_confirmed is self-reported (a button in
+  // the DM) — there's no way to verify an actual external review from here.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_review_prompts (
+      user_id TEXT PRIMARY KEY,
+      first_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      last_prompted_at TIMESTAMP,
+      review_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
 
   // Personal language override — deliberately NOT guild-scoped. A member's language
   // choice is theirs across every server the bot is in, and takes priority over
@@ -1167,6 +1235,7 @@ async function initDatabase() {
   // Championship History/Award History/HOF views on that board, so this is
   // scoped to non-Madden leagues only (opposite filter direction).
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_hof_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS suspensions_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_feed_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS sportsbook_big_bet_threshold INTEGER NOT NULL DEFAULT 1000`);
@@ -1215,6 +1284,49 @@ async function initDatabase() {
   // turns it on. Same-guild Browse Open Teams is unaffected (posting the
   // Recruitment panel at all is already that opt-in for in-server use).
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS recruitment_discoverable BOOLEAN NOT NULL DEFAULT FALSE`);
+
+  // 7J-97SUSPEND: purely informational tracking, per Hxxdie — no enforcement,
+  // just an embed/list a commissioner can add to and consult. games_remaining
+  // auto-decrements when that team_name plays a game (hooked into the same
+  // game-played payout call sites everything else uses), and the suspension
+  // is treated as inactive once it hits 0 rather than being deleted, so the
+  // history stays visible.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_player_suspensions (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      player_name TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      games_total INTEGER NOT NULL,
+      games_remaining INTEGER NOT NULL,
+      reason TEXT,
+      added_by_user_id TEXT NOT NULL,
+      lifted_by_user_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      lifted_at TIMESTAMP
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_suspensions_league ON league_player_suspensions (league_id, guild_id)`);
+
+  // 7J-98WAITLIST: ties into Recruitment. team_names is a comma-separated
+  // list of specific teams the user is waiting on, NULL means "any team in
+  // this league." Notified (DM) when a team they're watching becomes
+  // vacant — see notifyWaitlistForVacantTeam, hooked into the kick flow
+  // and GuildMemberRemove, the two clear "a team just opened up" moments
+  // this codebase actually has.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_waitlist (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
+      team_names TEXT,
+      note TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_waitlist_league ON league_waitlist (league_id, guild_id)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_panels (
@@ -1398,6 +1510,36 @@ async function initDatabase() {
   // per-league toggle, not sport-gated, same as ties_allowed.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS otl_allowed BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS otl_points INTEGER NOT NULL DEFAULT 1`);
+  // 7J-99WAGER: opt-in, defaults off — a straight 1v1 bet between the two
+  // owners in a game thread, entirely separate from the sportsbook/
+  // moneylines. See game_wagers table below.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS wagers_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+
+  // 7J-99WAGER: escrowed at acceptance (both amounts deducted immediately,
+  // not just at settlement) — prevents a wager being un-payable because
+  // the loser spent the currency in the shop between accepting and the
+  // game finishing. Settled when the underlying game gets a final score,
+  // hooked into the same report/auto-settle paths as everything else.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_wagers (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      game_id UUID NOT NULL,
+      proposer_user_id TEXT NOT NULL,
+      proposer_team TEXT,
+      opponent_user_id TEXT NOT NULL,
+      opponent_team TEXT,
+      amount INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      winner_user_id TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      responded_at TIMESTAMP,
+      settled_at TIMESTAMP
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_game_wagers_game ON game_wagers (game_id, status)`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_team_roster (
       id UUID PRIMARY KEY,
@@ -2530,6 +2672,7 @@ async function initDatabase() {
   }
 
   await loadCurrencyConfig();
+  await loadBotSettings();
   await migrateGuildCurrencyBalancesToGlobal();
   await migrateMaddenSportsbookAutoLinesDefaultOn();
   await migrateSingleChannelPanelsToMultiChannel();
@@ -3478,6 +3621,15 @@ function buildCommands() {
       .setName('discoverleagues')
       .setDescription('Browse open team slots across every GG Sports league, from any server or DM')
       .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel),
+
+    // 7J-97SUSPEND: informational-only per Hxxdie — no enforcement, just a
+    // trackable list a commissioner can add to.
+    new SlashCommandBuilder()
+      .setName('suspensions')
+      .setDescription('Track player suspensions (informational — no in-game enforcement)')
+      .addSubcommand(sc => sc.setName('list').setDescription('Show active player suspensions').addStringOption(o => o.setName('league').setDescription('League name (optional)').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('add').setDescription('Staff: add a player suspension').addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true)).addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true)).addIntegerOption(o => o.setName('games').setDescription('Number of games suspended').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason (optional)').setRequired(false)).addStringOption(o => o.setName('league').setDescription('League name (optional)').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('remove').setDescription('Staff: lift a suspension early').addStringOption(o => o.setName('suspension').setDescription('Suspension short ID (see /suspensions list)').setRequired(true))),
 
     new SlashCommandBuilder()
       .setName('assignrole')
@@ -4507,7 +4659,7 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable, s.suspensions_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -5166,6 +5318,48 @@ const LEAGUE_DEFAULT_AWARDS = {
   cfb: ['Heisman Trophy', 'Coach of the Year'],
   fc: ['Golden Boot', 'Golden Glove', 'Player of the Season', "Young Player of the Season"],
   other: ['MVP'],
+};
+
+// 7J-100AUTOSETUP: real team names for the auto-create-team-roles feature.
+// Per Hxxdie: real names for madden(NFL)/nba/nhl/mlb, placeholder names for
+// fc (soccer — too many real teams to enumerate) and everything else
+// (cfb, club, pro-am). Verified current as of this session (Utah Mammoth,
+// not Utah Hockey Club; Athletics with no city name, not Oakland/Sacramento
+// Athletics — both are recent renames worth double-checking again if this
+// ever looks stale).
+const REAL_TEAM_NAMES = {
+  madden: [
+    'Buffalo Bills', 'Miami Dolphins', 'New England Patriots', 'New York Jets',
+    'Baltimore Ravens', 'Cincinnati Bengals', 'Cleveland Browns', 'Pittsburgh Steelers',
+    'Houston Texans', 'Indianapolis Colts', 'Jacksonville Jaguars', 'Tennessee Titans',
+    'Denver Broncos', 'Kansas City Chiefs', 'Las Vegas Raiders', 'Los Angeles Chargers',
+    'Dallas Cowboys', 'New York Giants', 'Philadelphia Eagles', 'Washington Commanders',
+    'Chicago Bears', 'Detroit Lions', 'Green Bay Packers', 'Minnesota Vikings',
+    'Atlanta Falcons', 'Carolina Panthers', 'New Orleans Saints', 'Tampa Bay Buccaneers',
+    'Arizona Cardinals', 'Los Angeles Rams', 'San Francisco 49ers', 'Seattle Seahawks',
+  ],
+  nba: [
+    'Boston Celtics', 'Brooklyn Nets', 'New York Knicks', 'Philadelphia 76ers', 'Toronto Raptors',
+    'Chicago Bulls', 'Cleveland Cavaliers', 'Detroit Pistons', 'Indiana Pacers', 'Milwaukee Bucks',
+    'Atlanta Hawks', 'Charlotte Hornets', 'Miami Heat', 'Orlando Magic', 'Washington Wizards',
+    'Denver Nuggets', 'Minnesota Timberwolves', 'Oklahoma City Thunder', 'Portland Trail Blazers', 'Utah Jazz',
+    'Golden State Warriors', 'LA Clippers', 'Los Angeles Lakers', 'Phoenix Suns', 'Sacramento Kings',
+    'Dallas Mavericks', 'Houston Rockets', 'Memphis Grizzlies', 'New Orleans Pelicans', 'San Antonio Spurs',
+  ],
+  nhl: [
+    'Boston Bruins', 'Buffalo Sabres', 'Detroit Red Wings', 'Florida Panthers', 'Montreal Canadiens', 'Ottawa Senators', 'Tampa Bay Lightning', 'Toronto Maple Leafs',
+    'Carolina Hurricanes', 'Columbus Blue Jackets', 'New Jersey Devils', 'New York Islanders', 'New York Rangers', 'Philadelphia Flyers', 'Pittsburgh Penguins', 'Washington Capitals',
+    'Chicago Blackhawks', 'Colorado Avalanche', 'Dallas Stars', 'Minnesota Wild', 'Nashville Predators', 'St. Louis Blues', 'Utah Mammoth', 'Winnipeg Jets',
+    'Anaheim Ducks', 'Calgary Flames', 'Edmonton Oilers', 'Los Angeles Kings', 'San Jose Sharks', 'Seattle Kraken', 'Vancouver Canucks', 'Vegas Golden Knights',
+  ],
+  mlb: [
+    'Baltimore Orioles', 'Boston Red Sox', 'New York Yankees', 'Tampa Bay Rays', 'Toronto Blue Jays',
+    'Chicago White Sox', 'Cleveland Guardians', 'Detroit Tigers', 'Kansas City Royals', 'Minnesota Twins',
+    'Houston Astros', 'Los Angeles Angels', 'Athletics', 'Seattle Mariners', 'Texas Rangers',
+    'Atlanta Braves', 'Miami Marlins', 'New York Mets', 'Philadelphia Phillies', 'Washington Nationals',
+    'Chicago Cubs', 'Cincinnati Reds', 'Milwaukee Brewers', 'Pittsburgh Pirates', 'St. Louis Cardinals',
+    'Arizona Diamondbacks', 'Colorado Rockies', 'Los Angeles Dodgers', 'San Diego Padres', 'San Francisco Giants',
+  ],
 };
 
 const LEAGUE_SPORT_DEFAULT_SETTINGS = {
@@ -5834,11 +6028,14 @@ async function getGuildSettings(guildId, guildName = null) {
     `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO NOTHING`,
     [guildId, guildName || guildId]
   );
-  const result = await pool.query(`SELECT language, onboarding_enabled FROM guilds WHERE guild_id = $1`, [guildId]);
-  const row = result.rows[0] || { language: 'en', onboarding_enabled: true };
+  const result = await pool.query(`SELECT language, onboarding_enabled, welcome_leave_enabled, welcome_channel_id, leave_channel_id FROM guilds WHERE guild_id = $1`, [guildId]);
+  const row = result.rows[0] || { language: 'en', onboarding_enabled: true, welcome_leave_enabled: false, welcome_channel_id: null, leave_channel_id: null };
   return {
     language: SUPPORTED_LANGUAGES.some(l => l.value === row.language) ? row.language : 'en',
     onboarding_enabled: row.onboarding_enabled !== false,
+    welcome_leave_enabled: row.welcome_leave_enabled === true,
+    welcome_channel_id: row.welcome_channel_id || null,
+    leave_channel_id: row.leave_channel_id || null,
   };
 }
 
@@ -5850,6 +6047,22 @@ async function setGuildLanguage(guildId, guildName, language) {
 async function setGuildOnboardingEnabled(guildId, guildName, enabled) {
   await getGuildSettings(guildId, guildName); // ensure row exists
   await pool.query(`UPDATE guilds SET onboarding_enabled = $2 WHERE guild_id = $1`, [guildId, enabled]);
+}
+
+// 7J-96WELCOMER
+async function setGuildWelcomeLeaveEnabled(guildId, guildName, enabled) {
+  await getGuildSettings(guildId, guildName);
+  await pool.query(`UPDATE guilds SET welcome_leave_enabled = $2 WHERE guild_id = $1`, [guildId, enabled]);
+}
+
+async function setGuildWelcomeChannel(guildId, guildName, channelId) {
+  await getGuildSettings(guildId, guildName);
+  await pool.query(`UPDATE guilds SET welcome_channel_id = $2 WHERE guild_id = $1`, [guildId, channelId]);
+}
+
+async function setGuildLeaveChannel(guildId, guildName, channelId) {
+  await getGuildSettings(guildId, guildName);
+  await pool.query(`UPDATE guilds SET leave_channel_id = $2 WHERE guild_id = $1`, [guildId, channelId]);
 }
 
 // Resolution priority: a member's own language choice (set via the Member Profile
@@ -7532,6 +7745,7 @@ client.once(Events.ClientReady, async () => {
     startExclusiveWindowSchedulerLoop();
     console.log('Exclusive window scheduler loop started.');
     startBirthdayChristmasGiftSchedulerLoop(client);
+    startReviewPromptSchedulerLoop(client);
     console.log('Birthday/Christmas gift scheduler loop started.');
 
     const application = await client.application?.fetch().catch(() => null);
@@ -8354,6 +8568,49 @@ async function getActiveLeaguesForGuild(guildId) {
   return result.rows;
 }
 
+// 7J-96WELCOMER: public channel announcements, distinct from the private
+// onboarding DM above — this posts visibly in a configured channel rather
+// than DMing the member. Both independently toggleable/configurable; a
+// server can run either, both, or neither.
+function buildMemberWelcomeAnnouncementEmbed(member) {
+  return new EmbedBuilder()
+    .setTitle('👋 Welcome!')
+    .setColor(0x57F287)
+    .setDescription(`${member} just joined **${member.guild.name}** — say hi!`)
+    .setThumbnail(member.user.displayAvatarURL())
+    .setFooter({ text: `Member #${member.guild.memberCount}` })
+    .setTimestamp();
+}
+
+function buildMemberLeaveAnnouncementEmbed(member) {
+  const tag = member.user?.tag || member.displayName || 'A member';
+  const avatarUrl = member.user?.displayAvatarURL?.() || null;
+  const embed = new EmbedBuilder()
+    .setTitle('👋 Goodbye')
+    .setColor(0xED4245)
+    .setDescription(`**${tag}** has left **${member.guild.name}**.`)
+    .setFooter({ text: `Member count: ${member.guild.memberCount}` })
+    .setTimestamp();
+  if (avatarUrl) embed.setThumbnail(avatarUrl);
+  return embed;
+}
+
+async function postMemberWelcomeAnnouncement(member) {
+  const settings = await getGuildSettings(member.guild.id, member.guild.name).catch(() => null);
+  if (!settings?.welcome_leave_enabled || !settings.welcome_channel_id) return;
+  const channel = await member.guild.channels.fetch(settings.welcome_channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) return;
+  await channel.send({ embeds: [buildMemberWelcomeAnnouncementEmbed(member)] }).catch(() => null);
+}
+
+async function postMemberLeaveAnnouncement(member) {
+  const settings = await getGuildSettings(member.guild.id, member.guild.name).catch(() => null);
+  if (!settings?.welcome_leave_enabled || !settings.leave_channel_id) return;
+  const channel = await member.guild.channels.fetch(settings.leave_channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) return;
+  await channel.send({ embeds: [buildMemberLeaveAnnouncementEmbed(member)] }).catch(() => null);
+}
+
 function buildNewMemberWelcomeEmbed(guild, leagues, league) {
   const NL = String.fromCharCode(10);
   const leagueNote = leagues.length > 1
@@ -8480,6 +8737,14 @@ client.on(Events.GuildMemberAdd, async (member) => {
   // self-assigning a second one).
   await grantPendingRecruitmentRolesOnJoin(member).catch(err => console.error('[Recruitment] Pending role grant on join failed:', err?.message));
   await sendNewMemberOnboardingDM(member).catch(err => console.error('New member onboarding DM failed:', err?.message));
+  // 7J-96WELCOMER: independent of the DM above — public channel post, only
+  // fires if the server has both enabled it and configured a channel.
+  await postMemberWelcomeAnnouncement(member).catch(err => console.error('[Welcomer] Welcome announcement failed:', err?.message));
+});
+
+client.on(Events.GuildMemberRemove, async (member) => {
+  await postMemberLeaveAnnouncement(member).catch(err => console.error('[Welcomer] Leave announcement failed:', err?.message));
+  await notifyWaitlistForMemberLeaveIfTeamHolder(member).catch(err => console.error('[Waitlist] Leave notification check failed:', err?.message));
 });
 
 client.on(Events.GuildCreate, async (guild) => {
@@ -8511,6 +8776,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       try {
         const commandName = interaction.commandName;
         if (commandName === 'commissioner') {
+          const focused = interaction.options.getFocused(true);
+          if (focused?.name === 'league') {
+            const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value);
+            await interaction.respond((choices || []).slice(0, 25));
+            return;
+          }
+        }
+
+        if (commandName === 'suspensions') {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value);
@@ -9592,6 +9866,52 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-101REVIEW
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_reviewlink_edit') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('botownerpanel_reviewlink_modal')
+        .setTitle('Edit Review Prompt Link')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('link').setLabel('Review link (e.g. top.gg listing URL)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(300).setValue(botSettingsCache.review_link || '').setPlaceholder('Leave blank to disable the prompt entirely')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'botownerpanel_reviewlink_modal') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const link = interaction.fields.getTextInputValue('link').trim() || null;
+      if (link && !/^https?:\/\//i.test(link)) {
+        await interaction.reply({ content: 'Review link must start with http:// or https://, or be left blank to disable.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await pool.query(
+        `UPDATE system_bot_settings SET review_link = $1, updated_at = NOW() WHERE id = 1`,
+        [link]
+      );
+      await loadBotSettings();
+      await interaction.reply({
+        content: link ? `Review prompt link set to ${link}. Every player across every league will start getting DMed on the 10/30-day schedule from the next scheduler tick.` : 'Review link cleared — the DM prompt is now disabled everywhere until a link is set again.',
+        components: [buildBotOwnerPanelBackRow()],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    // 7J-101REVIEW: self-reported confirmation from the DM prompt — no way
+    // to verify an actual external review, this is the honor system. Fires
+    // from a DM, so no interaction.guild here.
+    if (interaction.isButton() && interaction.customId === 'reviewprompt_confirm') {
+      await pool.query(
+        `INSERT INTO user_review_prompts (user_id, review_confirmed) VALUES ($1, TRUE)
+         ON CONFLICT (user_id) DO UPDATE SET review_confirmed = TRUE, updated_at = NOW()`,
+        [interaction.user.id]
+      ).catch(() => null);
+      await interaction.update({ content: '🙏 Thank you! You won\'t be asked again.', embeds: [], components: [] });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'botownerpanel_pricingguide') {
       if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
       await interaction.reply({ embeds: [buildShopPricingGuideEmbed()], components: [buildBotOwnerPanelBackRow()], flags: MessageFlags.Ephemeral });
@@ -10523,6 +10843,199 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-98WAITLIST
+    if (interaction.isButton() && interaction.customId === 'recruitmentpanel_waitlist_join') {
+      await interaction.deferReply({ ephemeral: true });
+      const league = await resolveLeague(interaction);
+      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
+      const teams = await getLeagueTeamRoles(league.league_id);
+      if (!teams.length) { await interaction.editReply({ content: `**${league.league_name}** doesn't have any team roles set up yet.` }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`recruitmentpanel_waitlist_select:${league.league_id}`)
+        .setPlaceholder('Pick specific team(s), or leave it as "Any Team"')
+        .setMinValues(1)
+        .setMaxValues(Math.min(teams.length + 1, 25))
+        .addOptions([
+          { label: 'Any Team', description: "Notify me when any team opens up", value: '__any__' },
+          ...teams.slice(0, 24).map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })),
+        ]);
+      await interaction.editReply({
+        content: `Join the waitlist for **${league.league_name}**. Pick "Any Team" or one/more specific teams — you'll get a DM when a match opens up.`,
+        components: [new ActionRowBuilder().addComponents(menu)],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('recruitmentpanel_waitlist_select:')) {
+      await interaction.deferUpdate();
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.editReply({ content: 'That league no longer exists.', components: [] }); return; }
+      const pickedAny = interaction.values.includes('__any__');
+      let teamNames = null;
+      if (!pickedAny) {
+        const teams = await getLeagueTeamRoles(league.league_id);
+        teamNames = interaction.values.map(roleId => teams.find(t => t.role_id === roleId)?.role_name).filter(Boolean).join(', ') || null;
+      }
+      // One waitlist entry per user per league — replace rather than stack,
+      // so re-joining with a new team selection updates instead of
+      // duplicating.
+      await pool.query(`DELETE FROM league_waitlist WHERE guild_id = $1 AND league_id = $2 AND user_id = $3`, [interaction.guild.id, league.league_id, interaction.user.id]);
+      await pool.query(
+        `INSERT INTO league_waitlist (id, guild_id, league_id, user_id, team_names) VALUES ($1, $2, $3, $4, $5)`,
+        [randomUUID(), interaction.guild.id, league.league_id, interaction.user.id, teamNames]
+      );
+      await interaction.editReply({
+        content: `You're on the waitlist for **${league.league_name}** — watching ${teamNames ? `**${teamNames}**` : '**any team**'}. You'll get a DM if a match opens up.`,
+        components: [],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'recruitmentpanel_waitlist_mine') {
+      await interaction.deferReply({ ephemeral: true });
+      const result = await pool.query(
+        `SELECT lw.*, l.league_name FROM league_waitlist lw JOIN leagues l ON l.league_id = lw.league_id
+         WHERE lw.guild_id = $1 AND lw.user_id = $2 ORDER BY lw.created_at DESC`,
+        [interaction.guild.id, interaction.user.id]
+      );
+      if (!result.rows.length) { await interaction.editReply({ content: "You're not on any waitlists in this server." }); return; }
+      const NL = String.fromCharCode(10);
+      const embed = new EmbedBuilder()
+        .setTitle('📋 My Waitlists')
+        .setColor(0x57F287)
+        .setDescription(result.rows.map(r => `**${r.league_name}** — watching ${r.team_names ? `**${r.team_names}**` : '**any team**'}`).join(NL))
+        .setFooter({ text: 'GG Sports • Recruitment' })
+        .setTimestamp();
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('recruitmentpanel_waitlist_leave_select')
+        .setPlaceholder('Leave a waitlist')
+        .addOptions(result.rows.map(r => ({ label: r.league_name.slice(0, 100), description: r.team_names ? r.team_names.slice(0, 100) : 'Any team', value: r.id })));
+      await interaction.editReply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'recruitmentpanel_waitlist_leave_select') {
+      await interaction.deferUpdate();
+      const waitlistId = interaction.values[0];
+      await pool.query(`DELETE FROM league_waitlist WHERE id = $1 AND user_id = $2`, [waitlistId, interaction.user.id]);
+      await interaction.editReply({ content: 'Removed from that waitlist.', embeds: [], components: [] });
+      return;
+    }
+
+    // 7J-99WAGER
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('gamewager_propose_modal:')) {
+      await interaction.deferReply();
+      const gameId = interaction.customId.split(':')[1];
+      const game = await getMaddenImportedGameById(gameId);
+      const league = game?.league_id ? await getLeagueById(game.league_id) : null;
+      if (!game || !league) { await interaction.editReply({ content: 'That game could not be found anymore.' }); return; }
+      const owners = {
+        away: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.away_team, game.away_team_role_id),
+        home: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id),
+      };
+      const userId = interaction.user.id;
+      const isAway = owners.away?.id === userId;
+      const proposer = isAway ? owners.away : owners.home;
+      const opponent = isAway ? owners.home : owners.away;
+      if (!proposer || !opponent) { await interaction.editReply({ content: 'Could not resolve both owners for this game anymore.' }); return; }
+
+      const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.editReply({ content: 'Wager amount must be a positive whole number.' });
+        return;
+      }
+      const proposerBalance = await getBalance(interaction.guild.id, userId);
+      // 7J-99WAGER: the 50% cap Hxxdie asked for — checked against the
+      // proposer's balance now, and checked again against the opponent's
+      // balance at accept time (below), since the stakes are symmetric.
+      const maxAllowed = Math.floor(Number(proposerBalance.balance || 0) / 2);
+      if (amount > maxAllowed) {
+        await interaction.editReply({ content: `You can't wager more than 50% of your balance (max **${maxAllowed}** — you have **${proposerBalance.balance}**).` });
+        return;
+      }
+
+      const wagerId = randomUUID();
+      await pool.query(
+        `INSERT INTO game_wagers (id, guild_id, league_id, game_id, proposer_user_id, proposer_team, opponent_user_id, opponent_team, amount)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [wagerId, interaction.guild.id, league.league_id, gameId, userId, isAway ? game.away_team : game.home_team, opponent.id, isAway ? game.home_team : game.away_team, amount]
+      );
+
+      const settings = await getCurrencySettings(interaction.guild.id).catch(() => ({ currency_icon: '🪙' }));
+      const embed = new EmbedBuilder()
+        .setTitle('💰 Wager Proposed')
+        .setColor(0xFEE75C)
+        .setDescription(`<@${userId}> is proposing a wager against <@${opponent.id}>.`)
+        .addFields(
+          { name: 'Amount (each)', value: `${settings.currency_icon} ${amount}`, inline: true },
+          { name: 'Winner Takes', value: `${settings.currency_icon} ${amount * 2}`, inline: true },
+        )
+        .setFooter({ text: 'GG Sports • Nothing to do with the sportsbook — just between these two owners' })
+        .setTimestamp();
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`gamewager_accept:${wagerId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`gamewager_decline:${wagerId}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
+      );
+      await interaction.editReply({ content: `<@${opponent.id}>`, embeds: [embed], components: [buttons] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamewager_accept:')) {
+      await interaction.deferUpdate();
+      const wagerId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM game_wagers WHERE id = $1 LIMIT 1`, [wagerId]);
+      const wager = result.rows[0];
+      if (!wager || wager.status !== 'pending') { await interaction.editReply({ content: 'This wager is no longer pending.', embeds: [], components: [] }); return; }
+      if (interaction.user.id !== wager.opponent_user_id) { await interaction.followUp({ content: 'Only the other owner in this wager can accept it.', ephemeral: true }); return; }
+
+      const opponentBalance = await getBalance(interaction.guild.id, interaction.user.id);
+      const maxAllowed = Math.floor(Number(opponentBalance.balance || 0) / 2);
+      if (wager.amount > maxAllowed) {
+        await pool.query(`UPDATE game_wagers SET status = 'declined', responded_at = NOW() WHERE id = $1`, [wagerId]);
+        await interaction.editReply({ content: `You can't cover this wager — it's more than 50% of your balance (max **${maxAllowed}**, wager is **${wager.amount}**). Auto-declined.`, embeds: [], components: [] });
+        return;
+      }
+
+      // 7J-99WAGER: escrow both amounts now, at acceptance — settlement
+      // just pays the pot to the winner, no risk of either side having
+      // since spent the currency elsewhere.
+      const proposerDeducted = await removeCurrency(wager.guild_id, wager.proposer_user_id, wager.amount, 'wager_escrow', `Wager vs <@${wager.opponent_user_id}>`, null);
+      if (!proposerDeducted) {
+        await pool.query(`UPDATE game_wagers SET status = 'declined', responded_at = NOW() WHERE id = $1`, [wagerId]);
+        await interaction.editReply({ content: 'The proposer no longer has enough balance to cover this wager. Auto-declined.', embeds: [], components: [] });
+        return;
+      }
+      const opponentDeducted = await removeCurrency(wager.guild_id, interaction.user.id, wager.amount, 'wager_escrow', `Wager vs <@${wager.proposer_user_id}>`, null);
+      if (!opponentDeducted) {
+        await addCurrency(wager.guild_id, wager.proposer_user_id, wager.amount, 'wager_refund', 'Wager acceptance failed — refunded', null);
+        await pool.query(`UPDATE game_wagers SET status = 'declined', responded_at = NOW() WHERE id = $1`, [wagerId]);
+        await interaction.editReply({ content: 'Could not cover your side of the wager. Auto-declined, proposer refunded.', embeds: [], components: [] });
+        return;
+      }
+
+      await pool.query(`UPDATE game_wagers SET status = 'accepted', responded_at = NOW() WHERE id = $1`, [wagerId]);
+      const settings = await getCurrencySettings(interaction.guild.id).catch(() => ({ currency_icon: '🪙' }));
+      await interaction.editReply({
+        content: `✅ Wager accepted between <@${wager.proposer_user_id}> and <@${wager.opponent_user_id}> — ${settings.currency_icon} ${wager.amount} each, escrowed. Winner takes ${settings.currency_icon} ${wager.amount * 2} when the game finishes.`,
+        embeds: [],
+        components: [],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamewager_decline:')) {
+      await interaction.deferUpdate();
+      const wagerId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM game_wagers WHERE id = $1 LIMIT 1`, [wagerId]);
+      const wager = result.rows[0];
+      if (!wager || wager.status !== 'pending') { await interaction.editReply({ content: 'This wager is no longer pending.', embeds: [], components: [] }); return; }
+      if (interaction.user.id !== wager.opponent_user_id) { await interaction.followUp({ content: 'Only the other owner in this wager can decline it.', ephemeral: true }); return; }
+      await pool.query(`UPDATE game_wagers SET status = 'declined', responded_at = NOW() WHERE id = $1`, [wagerId]);
+      await interaction.editReply({ content: `❌ <@${wager.opponent_user_id}> declined the wager.`, embeds: [], components: [] });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'recruitmentpanel_review') {
       await interaction.deferReply({ ephemeral: true });
       const league = await resolveLeague(interaction);
@@ -11052,6 +11565,18 @@ if (interaction.commandName === 'avatar') {
         }
         if (pending.removeLeagueRole && kickTargetLeague?.league_role_id) {
           await targetMember.roles.remove(kickTargetLeague.league_role_id).catch(() => null);
+        }
+
+        // 7J-98WAITLIST: a kick is one of the two clear "team just became
+        // vacant" moments — notify anyone waiting on it.
+        if (kickTargetLeague && pending.teamRoleIds.length) {
+          const teamRolesResult = await pool.query(
+            `SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 AND role_id = ANY($2)`,
+            [kickTargetLeague.league_id, pending.teamRoleIds]
+          ).catch(() => ({ rows: [] }));
+          for (const team of teamRolesResult.rows) {
+            await notifyWaitlistForVacantTeam(interaction.guild, kickTargetLeague, team.role_name).catch(() => null);
+          }
         }
 
         await interaction.update({
@@ -12335,6 +12860,35 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      if (action === 'suspensions') {
+        await interaction.deferUpdate();
+        const result = await pool.query(
+          `SELECT * FROM league_player_suspensions WHERE league_id = $1 AND games_remaining > 0 ORDER BY team_name ASC, player_name ASC`,
+          [league.league_id]
+        );
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle(`🚫 Player Suspensions • ${league.league_name}`)
+          .setColor(0xED4245)
+          .setDescription(result.rows.length
+            ? result.rows.map(r => `**${r.player_name}** (${r.team_name}) — ${r.games_remaining}/${r.games_total} games left${r.reason ? NL + `Reason: ${r.reason}` : ''}${NL}ID: \`${r.id.slice(0, 8)}\``).join(NL + NL)
+            : 'No active suspensions.')
+          .setFooter({ text: 'GG Sports • Informational only — no in-game enforcement' })
+          .setTimestamp();
+        const buttons = [
+          new ButtonBuilder().setCustomId('commissioner_suspend_add:' + leagueId).setLabel('Add Suspension').setEmoji('➕').setStyle(ButtonStyle.Danger),
+        ];
+        if (result.rows.length) {
+          buttons.push(new ButtonBuilder().setCustomId('commissioner_suspend_lift:' + leagueId).setLabel('Lift a Suspension').setEmoji('✅').setStyle(ButtonStyle.Success));
+        }
+        await interaction.editReply({
+          content: null,
+          embeds: [embed],
+          components: [new ActionRowBuilder().addComponents(buttons), buildCommissionerBackRow(leagueId)],
+        });
+        return;
+      }
+
       if (action === 'sync') {
         await interaction.deferUpdate();
         // 7J-53SYNCUX: immediately show a disabled "Syncing..." state before
@@ -12543,6 +13097,146 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_suspend_add:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to add suspensions.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('commissioner_suspend_add_modal:' + leagueId)
+        .setTitle('Add Player Suspension')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('player').setLabel('Player name').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('team').setLabel('Team name').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('games').setLabel('Games suspended (number)').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Reason (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_suspend_add_modal:')) {
+      await interaction.deferUpdate();
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.editReply({ content: 'League not found.', embeds: [], components: [] }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.followUp({ content: 'You do not have permission to add suspensions.', ephemeral: true }); return; }
+      const player = interaction.fields.getTextInputValue('player').trim();
+      const team = interaction.fields.getTextInputValue('team').trim();
+      const games = Number.parseInt(interaction.fields.getTextInputValue('games'), 10);
+      const reason = interaction.fields.getTextInputValue('reason').trim() || null;
+      if (!Number.isInteger(games) || games < 1) {
+        await interaction.followUp({ content: 'Games must be a whole number of at least 1.', ephemeral: true });
+        return;
+      }
+      await pool.query(
+        `INSERT INTO league_player_suspensions (id, guild_id, league_id, player_name, team_name, games_total, games_remaining, reason, added_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8)`,
+        [randomUUID(), interaction.guild.id, league.league_id, player, team, games, reason, interaction.user.id]
+      );
+      await refreshSuspensionsBoard(interaction.guild, league).catch(() => null);
+      await interaction.editReply({
+        content: `Added: **${player}** (${team}) suspended for **${games}** game${games === 1 ? '' : 's'}${reason ? ` — ${reason}` : ''}.`,
+        embeds: [],
+        components: [buildCommissionerBackRow(leagueId)],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_suspend_lift:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to lift suspensions.', ephemeral: true }); return; }
+      const result = await pool.query(
+        `SELECT id, player_name, team_name, games_remaining, games_total FROM league_player_suspensions
+         WHERE league_id = $1 AND games_remaining > 0 ORDER BY team_name ASC, player_name ASC LIMIT 25`,
+        [league.league_id]
+      );
+      if (!result.rows.length) { await interaction.reply({ content: 'No active suspensions to lift.', ephemeral: true }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('commissioner_suspend_lift_select:' + leagueId)
+        .setPlaceholder('Pick a suspension to lift')
+        .addOptions(result.rows.map(r => ({
+          label: `${r.player_name} (${r.team_name})`.slice(0, 100),
+          description: `${r.games_remaining}/${r.games_total} games left`,
+          value: r.id,
+        })));
+      await interaction.reply({ content: 'Which suspension should be lifted?', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('commissioner_suspend_lift_select:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to lift suspensions.', ephemeral: true }); return; }
+      const suspensionId = interaction.values[0];
+      const result = await pool.query(
+        `UPDATE league_player_suspensions SET games_remaining = 0, lifted_at = NOW(), lifted_by_user_id = $1
+         WHERE id = $2 AND league_id = $3 RETURNING player_name, team_name`,
+        [interaction.user.id, suspensionId, league.league_id]
+      );
+      if (!result.rows.length) { await interaction.update({ content: 'Could not find that suspension anymore.', components: [] }); return; }
+      await refreshSuspensionsBoard(interaction.guild, league).catch(() => null);
+      await interaction.update({ content: `Lifted suspension for **${result.rows[0].player_name}** (${result.rows[0].team_name}).`, components: [] });
+      return;
+    }
+
+    // 7J-100AUTOSETUP
+    if (interaction.isButton() && interaction.customId.startsWith('setup_autocreate_channels:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const isMadden = getLeagueSportKey(league) === 'madden';
+      const { category, channels } = await autoCreateLeagueChannels(interaction.guild, league, isMadden);
+      await interaction.editReply({
+        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} — settings and panels are already wired up. Anything else can still be adjusted individually from Channels & Roles.`,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('setup_autocreate_roles:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const sportKey = getLeagueSportKey(league);
+      if (REAL_TEAM_NAMES[sportKey]) {
+        await interaction.deferReply({ ephemeral: true });
+        const roles = await autoCreateLeagueTeamRoles(interaction.guild, league);
+        await interaction.editReply({ content: `Created **${roles.length}** real ${sportKey.toUpperCase()} team roles and registered them to **${league.league_name}**.` });
+        return;
+      }
+      // fc/cfb/other — no real team list, ask how many placeholder teams.
+      const modal = new ModalBuilder()
+        .setCustomId('setup_autocreate_roles_modal:' + leagueId)
+        .setTitle('How Many Teams?')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('count').setLabel('Number of teams (placeholder names)').setStyle(TextInputStyle.Short).setRequired(true).setValue('20'))
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('setup_autocreate_roles_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const count = Number.parseInt(interaction.fields.getTextInputValue('count'), 10);
+      if (!Number.isInteger(count) || count < 2 || count > 64) {
+        await interaction.reply({ content: 'Team count must be a whole number between 2 and 64.', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const roles = await autoCreateLeagueTeamRoles(interaction.guild, league, count);
+      await interaction.editReply({ content: `Created **${roles.length}** placeholder team roles ("Team 1".."Team ${roles.length}") and registered them to **${league.league_name}**. Rename them in Discord whenever you like — they'll keep working as long as the role itself isn't deleted.` });
       return;
     }
 
@@ -12850,6 +13544,18 @@ if (interaction.commandName === 'avatar') {
       const next = !customSettings.use_team_roster;
       await pool.query(`UPDATE league_custom_settings SET use_team_roster = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, next]);
       await showLeagueCustomizationSection(interaction, leagueId, 'trades', { update: true });
+      return;
+    }
+
+    // 7J-99WAGER
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_wagers:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const next = !customSettings.wagers_enabled;
+      await pool.query(`UPDATE league_custom_settings SET wagers_enabled = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, next]);
+      await showLeagueCustomizationSection(interaction, leagueId, 'wagers', { update: true });
       return;
     }
 
@@ -15214,6 +15920,32 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-96WELCOMER
+    if (interaction.isButton() && interaction.customId === 'adminpanel_settings_welcomeleave_toggle') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const current = await getGuildSettings(interaction.guild.id, interaction.guild.name);
+      await setGuildWelcomeLeaveEnabled(interaction.guild.id, interaction.guild.name, !current.welcome_leave_enabled);
+      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_settings_welcome_channel') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      await setGuildWelcomeChannel(interaction.guild.id, interaction.guild.name, interaction.values[0]);
+      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: 'Welcome channel set to ' + `<#${interaction.values[0]}>` + '.', ...payload });
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_settings_leave_channel') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      await setGuildLeaveChannel(interaction.guild.id, interaction.guild.name, interaction.values[0]);
+      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: 'Leave channel set to ' + `<#${interaction.values[0]}>` + '.', ...payload });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('adminpanel_shop:')) {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const [, action, pageStr] = interaction.customId.split(':');
@@ -16560,6 +17292,68 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply({ ephemeral: true });
       const payload = await buildDiscoverLeaguesPayload(0);
       await interaction.editReply(payload);
+      return;
+    }
+
+    if (interaction.commandName === 'suspensions') {
+      if (!interaction.guild) { await interaction.reply({ content: 'Use this from inside a server.', ephemeral: true }); return; }
+      const subcommand = interaction.options.getSubcommand();
+      const leagueName = interaction.options.getString('league');
+      const league = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await resolveLeague(interaction);
+      if (!league) { await interaction.reply({ content: 'No active league found.', ephemeral: true }); return; }
+
+      if (subcommand === 'list') {
+        await interaction.deferReply();
+        const result = await pool.query(
+          `SELECT * FROM league_player_suspensions WHERE league_id = $1 AND games_remaining > 0 ORDER BY team_name ASC, player_name ASC`,
+          [league.league_id]
+        );
+        const NL = String.fromCharCode(10);
+        const embed = new EmbedBuilder()
+          .setTitle(`🚫 Player Suspensions • ${league.league_name}`)
+          .setColor(0xED4245)
+          .setDescription(result.rows.length
+            ? result.rows.map(r => `**${r.player_name}** (${r.team_name}) — ${r.games_remaining}/${r.games_total} games left${r.reason ? NL + `Reason: ${r.reason}` : ''}${NL}ID: \`${r.id.slice(0, 8)}\``).join(NL + NL)
+            : 'No active suspensions.')
+          .setFooter({ text: 'GG Sports • Informational only — no in-game enforcement' })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (subcommand === 'add') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You need staff permissions to add suspensions.', ephemeral: true }); return; }
+        await interaction.deferReply();
+        const player = interaction.options.getString('player').trim();
+        const team = interaction.options.getString('team').trim();
+        const games = interaction.options.getInteger('games');
+        const reason = interaction.options.getString('reason');
+        if (games < 1) { await interaction.editReply({ content: 'Games must be at least 1.' }); return; }
+        await pool.query(
+          `INSERT INTO league_player_suspensions (id, guild_id, league_id, player_name, team_name, games_total, games_remaining, reason, added_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8)`,
+          [randomUUID(), interaction.guild.id, league.league_id, player, team, games, reason || null, interaction.user.id]
+        );
+        await refreshSuspensionsBoard(interaction.guild, league).catch(() => null);
+        await interaction.editReply({ content: `Added: **${player}** (${team}) suspended for **${games}** game${games === 1 ? '' : 's'}${reason ? ` — ${reason}` : ''}.` });
+        return;
+      }
+
+      if (subcommand === 'remove') {
+        if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You need staff permissions to lift suspensions.', ephemeral: true }); return; }
+        await interaction.deferReply();
+        const shortId = interaction.options.getString('suspension').trim();
+        const result = await pool.query(
+          `UPDATE league_player_suspensions SET games_remaining = 0, lifted_at = NOW(), lifted_by_user_id = $1
+           WHERE league_id = $2 AND id::text LIKE $3 AND games_remaining > 0
+           RETURNING player_name, team_name`,
+          [interaction.user.id, league.league_id, shortId + '%']
+        );
+        if (!result.rows.length) { await interaction.editReply({ content: 'Could not find an active suspension with that ID.' }); return; }
+        await refreshSuspensionsBoard(interaction.guild, league).catch(() => null);
+        await interaction.editReply({ content: `Lifted suspension for **${result.rows[0].player_name}** (${result.rows[0].team_name}).` });
+        return;
+      }
       return;
     }
 
@@ -26956,6 +27750,13 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
       }
     }
   }
+  // 7J-97SUSPEND: decrement any active suspensions for either team now that
+  // they've played a game — independent of the payout loop above (fires
+  // even if game_played_payout is 0 or an owner wasn't found).
+  await decrementActiveSuspensionsForTeam(interaction.guild.id, game.league_id, game.home_team_name).catch(() => null);
+  await decrementActiveSuspensionsForTeam(interaction.guild.id, game.league_id, game.away_team_name).catch(() => null);
+  const suspensionsLeague = await getLeagueById(game.league_id).catch(() => null);
+  if (suspensionsLeague) await refreshSuspensionsBoard(interaction.guild, suspensionsLeague).catch(() => null);
 
   if (winnerOwner && Number(settings.win_payout) > 0) {
     await addCurrency(
@@ -29196,6 +29997,81 @@ function startBirthdayChristmasGiftSchedulerLoop(client) {
   setTimeout(() => runBirthdayChristmasGiftSchedulerTick(client).catch(() => null), 30 * 1000);
 }
 
+// 7J-101REVIEW: two passes. Discovery finds every user currently holding a
+// team role in any active league on any server the bot is in, and records
+// the first time each one is ever seen (ON CONFLICT DO NOTHING — never
+// overwrites an existing first_seen_at, so re-running this doesn't reset
+// anyone's clock). Prompting DMs whoever has crossed the first-prompt or
+// repeat-prompt threshold and hasn't confirmed a review yet. Both best-
+// effort throughout — DMs closed, a user who left every mutual server, etc.
+// all just silently skip rather than blocking the rest of the run.
+async function runReviewPromptSchedulerTick(client) {
+  if (!botSettingsCache.review_link || !botSettingsCache.review_prompt_enabled) return;
+
+  // Discovery pass.
+  for (const guild of client.guilds.cache.values()) {
+    const leagues = await getActiveLeaguesForGuild(guild.id).catch(() => []);
+    for (const league of leagues) {
+      const teams = await getLeagueTeamRoles(league.league_id).catch(() => []);
+      for (const team of teams) {
+        const role = guild.roles.cache.get(team.role_id);
+        if (!role) continue;
+        for (const member of role.members.values()) {
+          if (member.user.bot) continue;
+          await pool.query(
+            `INSERT INTO user_review_prompts (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
+            [member.id]
+          ).catch(() => null);
+        }
+      }
+    }
+  }
+
+  // Prompting pass.
+  const eligible = await pool.query(
+    `SELECT user_id FROM user_review_prompts
+     WHERE review_confirmed = FALSE
+       AND first_seen_at <= NOW() - ($1::text || ' days')::interval
+       AND (last_prompted_at IS NULL OR last_prompted_at <= NOW() - ($2::text || ' days')::interval)`,
+    [REVIEW_PROMPT_FIRST_DELAY_DAYS, REVIEW_PROMPT_REPEAT_DAYS]
+  ).catch(() => ({ rows: [] }));
+
+  for (const row of eligible.rows) {
+    const user = await client.users.fetch(row.user_id).catch(() => null);
+    if (!user) continue;
+    const embed = new EmbedBuilder()
+      .setTitle('⭐ Enjoying GG Sports?')
+      .setColor(0xFEE75C)
+      .setDescription("You've been playing in a GG Sports league for a bit now — if it's been a good experience, a quick rating helps a lot.")
+      .setFooter({ text: 'GG Sports' })
+      .setTimestamp();
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel('Leave a Review').setEmoji('⭐').setStyle(ButtonStyle.Link).setURL(botSettingsCache.review_link),
+      new ButtonBuilder().setCustomId('reviewprompt_confirm').setLabel('I Left My 5 Star Review').setStyle(ButtonStyle.Success),
+    );
+    const sent = await user.send({ embeds: [embed], components: [buttons] }).catch(() => null);
+    // Only bump last_prompted_at on an actual successful send — if their
+    // DMs are closed, leave it alone so this keeps retrying every tick
+    // instead of silently going quiet on them for 30 days.
+    if (sent) {
+      await pool.query(`UPDATE user_review_prompts SET last_prompted_at = NOW(), updated_at = NOW() WHERE user_id = $1`, [row.user_id]).catch(() => null);
+    }
+  }
+}
+
+let reviewPromptSchedulerTimer = null;
+function startReviewPromptSchedulerLoop(client) {
+  if (reviewPromptSchedulerTimer) clearInterval(reviewPromptSchedulerTimer);
+  // Daily tick — day-granularity thresholds (10/30 days), no need for
+  // anything finer, and the discovery pass touches every guild/league/team
+  // role on every tick, so keeping it infrequent matters more here than
+  // for the hourly birthday-gift tick above.
+  reviewPromptSchedulerTimer = setInterval(() => {
+    runReviewPromptSchedulerTick(client).catch(error => console.error('Review prompt scheduler tick failed:', error));
+  }, 24 * 60 * 60 * 1000);
+  setTimeout(() => runReviewPromptSchedulerTick(client).catch(() => null), 60 * 1000);
+}
+
 // ---------------------------------------------------------------------------
 // Holiday & championship exclusive auto-scheduling — periodically flips is_active on
 // any shop_items row with an exclusive_window_start/end set, based on whether NOW()
@@ -31392,6 +32268,11 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
   const universalGradeDisplay = universalGrade
     ? `**${universalGrade.grade}** • ${universalGrade.tier} • ${universalGrade.smallSample ? 'Not enough users yet for a reliable percentile' : `Top ${universalGrade.topPercent}% of GG Sports users`}`
     : 'Not available';
+  // 7J-102MEMBERSINCE: Discord server join date, not "first seen by the
+  // bot" — the more common meaning of "member since" on a profile card.
+  // Falls back gracefully if the member has left or can't be fetched.
+  const memberSinceDate = await guild.members.fetch(targetUser.id).then(m => m.joinedAt).catch(() => null);
+  const memberSinceDisplay = memberSinceDate ? `<t:${Math.floor(memberSinceDate.getTime() / 1000)}:D>` : 'Unknown';
 
   const embed = new EmbedBuilder()
     .setTitle('Member Profile • ' + targetUser.username)
@@ -31399,6 +32280,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
     .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
     .setImage('attachment://avatar.png')
     .addFields(
+      { name: 'Member Since', value: memberSinceDisplay, inline: true },
       { name: 'League Scope', value: activeLeague ? activeLeague.league_name : 'All Leagues', inline: true },
       { name: '⚡ Activity', value: activityIcon + ' ' + normalizedActivityTier + ' • ' + String(recognition.activity_points || 0) + ' pts', inline: true },
       { name: '🏆 Legacy', value: legacyIcon + ' ' + legacyTier.name + ' • ' + String(recognition.legacy_score || 0) + ' pts', inline: true },
@@ -31975,6 +32857,218 @@ function buildBankBackRow() {
 // this is computed live every time so it can never drift from reality (an
 // owner leaving the server, or a commissioner removing the role, shows up
 // immediately without anyone having to remember to flag it).
+// 7J-97SUSPEND: called once per team per reported game. Case-insensitive
+// team name match since Madden team names get formatted/displayed several
+// different ways across this codebase (with logos, abbreviations, etc.) —
+// matches on the raw stored team_name.
+// 7J-97SUSPEND: shared by the slash command, the Commissioner Panel button,
+// and the posted board refresh — one implementation.
+function buildSuspensionsListEmbed(league, rows) {
+  const NL = String.fromCharCode(10);
+  return new EmbedBuilder()
+    .setTitle(`🚫 Player Suspensions • ${league.league_name}`)
+    .setColor(0xED4245)
+    .setDescription(rows.length
+      ? rows.map(r => `**${r.player_name}** (${r.team_name}) — ${r.games_remaining}/${r.games_total} games left${r.reason ? NL + `Reason: ${r.reason}` : ''}${NL}ID: \`${r.id.slice(0, 8)}\``).join(NL + NL)
+      : 'No active suspensions.')
+    .setFooter({ text: 'GG Sports • Informational only — no in-game enforcement' })
+    .setTimestamp();
+}
+
+// Posts a fresh copy to the configured channel if none exists yet there, or
+// edits the existing message in place — same single-channel-per-league
+// pattern as Standings/Tournament (league_settings.*_channel_id +
+// league_panels), not the multi-channel mechanism Shop/Marketplace use.
+async function refreshSuspensionsBoard(guild, league) {
+  if (!league.suspensions_channel_id) return;
+  const channel = await guild.channels.fetch(league.suspensions_channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) return;
+  const result = await pool.query(
+    `SELECT * FROM league_player_suspensions WHERE league_id = $1 AND games_remaining > 0 ORDER BY team_name ASC, player_name ASC`,
+    [league.league_id]
+  );
+  const embed = buildSuspensionsListEmbed(league, result.rows);
+  const existing = await pool.query(
+    `SELECT channel_id, message_id FROM league_panels WHERE league_id = $1 AND panel_key = 'suspensions' LIMIT 1`,
+    [league.league_id]
+  );
+  if (existing.rows.length && existing.rows[0].channel_id === league.suspensions_channel_id) {
+    const message = await channel.messages.fetch(existing.rows[0].message_id).catch(() => null);
+    if (message) { await message.edit({ embeds: [embed] }).catch(() => null); return; }
+  }
+  const newMessage = await channel.send({ embeds: [embed] }).catch(() => null);
+  if (newMessage) {
+    await pool.query(
+      `INSERT INTO league_panels (league_id, panel_key, channel_id, message_id)
+       VALUES ($1, 'suspensions', $2, $3)
+       ON CONFLICT (league_id, panel_key) DO UPDATE SET channel_id = $2, message_id = $3`,
+      [league.league_id, channel.id, newMessage.id]
+    ).catch(() => null);
+  }
+}
+
+async function decrementActiveSuspensionsForTeam(guildId, leagueId, teamName) {
+  if (!teamName) return;
+  await pool.query(
+    `UPDATE league_player_suspensions
+     SET games_remaining = GREATEST(0, games_remaining - 1)
+     WHERE guild_id = $1 AND league_id = $2 AND games_remaining > 0 AND LOWER(team_name) = LOWER($3)`,
+    [guildId, leagueId, teamName]
+  );
+}
+
+// 7J-98WAITLIST: DMs every waitlist entry watching this team (or watching
+// "any team" — team_names IS NULL) for this league. Best-effort, DMs
+// closed is a silent skip like everywhere else in this bot. Does NOT
+// remove the waitlist entry after notifying — someone might want to hear
+// about the next opening too if this one doesn't work out for them.
+// 7J-98WAITLIST: the other clear "team just became vacant" moment — a
+// member with a team role leaving the server. member.roles.cache still
+// reflects their roles as of the moment they left.
+async function notifyWaitlistForMemberLeaveIfTeamHolder(member) {
+  if (member.user?.bot) return;
+  const leagues = await getActiveLeaguesForGuild(member.guild.id).catch(() => []);
+  for (const league of leagues) {
+    const teams = await getLeagueTeamRoles(league.league_id).catch(() => []);
+    for (const team of teams) {
+      if (member.roles.cache.has(team.role_id)) {
+        await notifyWaitlistForVacantTeam(member.guild, league, team.role_name).catch(() => null);
+      }
+    }
+  }
+}
+
+// 7J-99WAGER: settles any accepted wager tied to this game once it has a
+// real final score. Winner determined by comparing the wager's recorded
+// team names to which side actually won — a tie refunds both sides rather
+// than guessing. Both amounts were already escrowed at acceptance, so this
+// only ever pays out/refunds, never deducts again.
+async function settleGameWager(guild, game) {
+  const result = await pool.query(
+    `SELECT * FROM game_wagers WHERE game_id = $1 AND status = 'accepted' LIMIT 1`,
+    [game.id]
+  ).catch(() => ({ rows: [] }));
+  const wager = result.rows[0];
+  if (!wager) return;
+
+  const homeScore = Number(game.home_score);
+  const awayScore = Number(game.away_score);
+  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return;
+
+  const pot = wager.amount * 2;
+  if (homeScore === awayScore) {
+    await addCurrency(wager.guild_id, wager.proposer_user_id, wager.amount, 'wager_refund', 'Wager push (tie) — refunded', null);
+    await addCurrency(wager.guild_id, wager.opponent_user_id, wager.amount, 'wager_refund', 'Wager push (tie) — refunded', null);
+    await pool.query(`UPDATE game_wagers SET status = 'pushed', settled_at = NOW() WHERE id = $1`, [wager.id]);
+    return;
+  }
+
+  const winningTeam = homeScore > awayScore ? game.home_team : game.away_team;
+  const winnerUserId = String(wager.proposer_team).toLowerCase() === String(winningTeam).toLowerCase()
+    ? wager.proposer_user_id
+    : String(wager.opponent_team).toLowerCase() === String(winningTeam).toLowerCase()
+      ? wager.opponent_user_id
+      : null;
+  if (!winnerUserId) return; // team names didn't match either side — leave it for staff to sort out manually rather than guess
+
+  await addCurrency(wager.guild_id, winnerUserId, pot, 'wager_win', `Wager won: ${game.away_team} @ ${game.home_team}`, null);
+  await pool.query(`UPDATE game_wagers SET status = 'settled', winner_user_id = $1, settled_at = NOW() WHERE id = $2`, [winnerUserId, wager.id]);
+  const winnerUser = await client.users.fetch(winnerUserId).catch(() => null);
+  const settings = await getCurrencySettings(guild.id).catch(() => ({ currency_icon: '🪙' }));
+  await winnerUser?.send({ content: `🎉 You won your wager on **${game.away_team} @ ${game.home_team}**! ${settings.currency_icon} ${pot} has been added to your balance.` }).catch(() => null);
+}
+
+async function notifyWaitlistForVacantTeam(guild, league, teamName) {
+  if (!teamName) return;
+  const result = await pool.query(
+    `SELECT * FROM league_waitlist WHERE guild_id = $1 AND league_id = $2
+       AND (team_names IS NULL OR team_names ILIKE $3)`,
+    [guild.id, league.league_id, `%${teamName}%`]
+  ).catch(() => ({ rows: [] }));
+  for (const entry of result.rows) {
+    const user = await client.users.fetch(entry.user_id).catch(() => null);
+    await user?.send({
+      content: `🎉 **${teamName}** just opened up in **${league.league_name}** (${guild.name}) — you're on the waitlist! Head to the Recruitment panel and use \`Browse Open Teams\` to apply before someone else does.`,
+    }).catch(() => null);
+  }
+}
+
+// 7J-100AUTOSETUP: creates a category + a curated set of channels for a
+// league, wires each single-channel setting into league_settings
+// immediately, and for the multi-channel-panel types (Shop/Marketplace/
+// Avatar/Recruitment/Bank/Member Profile) posts the actual live panel into
+// the new channel right away — so the league is functional out of the box,
+// not just "channels exist but nothing's configured." Curated rather than
+// exhaustive: this bot has 40+ possible channel settings, most of them
+// niche/optional — this covers what a new league actually needs to get
+// going, and anything else is still one click away in the Setup Dashboard.
+async function autoCreateLeagueChannels(guild, league, isMadden) {
+  const category = await guild.channels.create({ name: `🏈 ${league.league_name}`.slice(0, 100), type: ChannelType.GuildCategory });
+  const created = [];
+
+  const singleChannelSpecs = [
+    ['league_announcement_channel_id', 'announcements'],
+    ['league_rules_channel_id', 'rules'],
+    ['standings_channel_id', 'standings'],
+    ['trade_block_channel_id', 'trade-block'],
+    ['sportsbook_channel_id', 'sportsbook'],
+    ['setup_ticket_channel_id', 'tickets'],
+    ['suspensions_channel_id', 'suspensions'],
+  ];
+  if (isMadden) {
+    singleChannelSpecs.push(
+      ['game_threads_channel_id', 'game-threads'],
+      ['madden_news_channel_id', 'madden-news'],
+      ['madden_free_agents_channel_id', 'free-agents'],
+    );
+  }
+  for (const [column, channelName] of singleChannelSpecs) {
+    const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (!channel) continue;
+    await pool.query(`UPDATE league_settings SET ${column} = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, channel.id]).catch(() => null);
+    created.push(channel);
+  }
+
+  const multiChannelSpecs = [
+    ['bank', 'bank'],
+    ['profile', 'member-profile'],
+    ['shop', 'shop'],
+    ['marketplace', 'marketplace'],
+    ['avatar', 'avatar'],
+    ['recruitment', 'recruitment'],
+  ];
+  for (const [panelType, channelName] of multiChannelSpecs) {
+    const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (!channel) continue;
+    await postOrRefreshMultiChannelPanel(guild, panelType, channel).catch(() => null);
+    created.push(channel);
+  }
+
+  return { category, channels: created };
+}
+
+// 7J-100AUTOSETUP: real team names for madden(NFL)/nba/nhl/mlb (REAL_TEAM_NAMES),
+// placeholder "Team 1".."Team N" for everything else (fc/cfb/other — per
+// Hxxdie, fc has too many real teams to enumerate, and club/pro-am leagues
+// don't have real team names to begin with). teamCount only matters for the
+// placeholder path — the real lists are always used in full.
+async function autoCreateLeagueTeamRoles(guild, league, teamCount = 32) {
+  const sportKey = getLeagueSportKey(league);
+  const names = REAL_TEAM_NAMES[sportKey] || Array.from({ length: teamCount }, (_, i) => `Team ${i + 1}`);
+  const createdRoles = [];
+  for (const name of names) {
+    const role = await guild.roles.create({ name, mentionable: true, reason: `Auto-created team role for ${league.league_name}` }).catch(() => null);
+    if (!role) continue;
+    await pool.query(
+      `INSERT INTO league_team_roles (league_id, role_id, role_name) VALUES ($1, $2, $3)
+       ON CONFLICT (league_id, role_id) DO UPDATE SET role_name = $3`,
+      [league.league_id, role.id, name]
+    ).catch(() => null);
+    createdRoles.push(role);
+  }
+  return createdRoles;
+}
+
 async function getVacantLeagueTeams(guild, league) {
   const teams = await getLeagueTeamRoles(league.league_id);
   const vacant = [];
@@ -31997,13 +33091,20 @@ function buildRecruitmentStarterEmbed() {
 }
 
 function buildRecruitmentStarterComponents() {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('recruitmentpanel_browse').setLabel('Browse Open Teams').setEmoji('🔍').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('recruitmentpanel_discover').setLabel('Discover Leagues').setEmoji('🌐').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('recruitmentpanel_myapplications').setLabel('My Applications').setEmoji('📄').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('recruitmentpanel_review').setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('recruitmentpanel_discoverable_settings').setLabel('Discoverable Setting').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
-  )];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('recruitmentpanel_browse').setLabel('Browse Open Teams').setEmoji('🔍').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('recruitmentpanel_discover').setLabel('Discover Leagues').setEmoji('🌐').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('recruitmentpanel_myapplications').setLabel('My Applications').setEmoji('📄').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('recruitmentpanel_review').setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('recruitmentpanel_discoverable_settings').setLabel('Discoverable Setting').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
+    ),
+    // 7J-98WAITLIST
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('recruitmentpanel_waitlist_join').setLabel('Join Waitlist').setEmoji('📋').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('recruitmentpanel_waitlist_mine').setLabel('My Waitlist').setEmoji('📄').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
 }
 
 function recruitmentStatusEmoji(status) {
@@ -32314,6 +33415,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'trade_count_channel', label: 'Trade Count Channel', description: 'Trade count panel channel', kind: 'channel' },
   { value: 'ticket_channel', label: 'Ticket Channel', description: 'Ticket panel channel', kind: 'channel' },
   { value: 'support_channel', label: 'Support Channel', description: 'Support panel channel', kind: 'channel' },
+  { value: 'suspensions_channel', label: 'Suspensions Board', description: 'Posted list of active player suspensions', kind: 'channel' },
 ];
 
 // Dashboard keys that open the multi-channel panel manager instead of a plain
@@ -32456,6 +33558,7 @@ function setupDashboardColumn(settingKey) {
     trade_count_channel: 'trade_count_channel_id',
     ticket_channel: 'setup_ticket_channel_id',
     support_channel: 'setup_support_channel_id',
+    suspensions_channel: 'suspensions_channel_id',
   };
   return map[settingKey] || null;
 }
@@ -32681,6 +33784,13 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMadde
     }
     // kind === 'multichannel' is handled by swapping to buildMultiChannelPanelManagerPayload
     // entirely (see the setup_select_setting handler) rather than an inline picker here.
+  } else {
+    // 7J-100AUTOSETUP: only shown on the main view, not while a setting
+    // picker is open, to stay under Discord's 5-row cap.
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('setup_autocreate_channels:' + leagueId).setLabel('Auto-Setup Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('setup_autocreate_roles:' + leagueId).setLabel('Auto-Create Team Roles').setEmoji('🏗️').setStyle(ButtonStyle.Success),
+    ));
   }
 
   rows.push(buildCommissionerBackRow(leagueId));
@@ -38147,6 +39257,9 @@ async function buildAdminSettingsPayload(guild, lang) {
     .addFields(
       { name: t(lang, 'settings_language_field'), value: `${currentLang.emoji} ${currentLang.label}`, inline: true },
       { name: t(lang, 'settings_onboarding_field'), value: settings.onboarding_enabled ? t(lang, 'settings_onboarding_enabled') : t(lang, 'settings_onboarding_disabled'), inline: true },
+      { name: 'Welcome/Leave Announcements', value: settings.welcome_leave_enabled ? '✅ Enabled' : '🚫 Disabled', inline: true },
+      { name: 'Welcome Channel', value: settings.welcome_channel_id ? `<#${settings.welcome_channel_id}>` : 'Not set', inline: true },
+      { name: 'Leave Channel', value: settings.leave_channel_id ? `<#${settings.leave_channel_id}>` : 'Not set', inline: true },
     )
     .setDescription(t(lang, 'settings_description'))
     .setFooter({ text: t(lang, 'admin_panel_footer') })
@@ -38162,10 +39275,33 @@ async function buildAdminSettingsPayload(guild, lang) {
       .setCustomId('adminpanel_settings_onboarding_toggle')
       .setLabel(settings.onboarding_enabled ? t(lang, 'settings_onboarding_disable_button') : t(lang, 'settings_onboarding_enable_button'))
       .setEmoji(settings.onboarding_enabled ? '🚫' : '✅')
-      .setStyle(settings.onboarding_enabled ? ButtonStyle.Danger : ButtonStyle.Success)
+      .setStyle(settings.onboarding_enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+    // 7J-96WELCOMER
+    new ButtonBuilder()
+      .setCustomId('adminpanel_settings_welcomeleave_toggle')
+      .setLabel(settings.welcome_leave_enabled ? 'Disable Welcome/Leave' : 'Enable Welcome/Leave')
+      .setEmoji(settings.welcome_leave_enabled ? '🚫' : '✅')
+      .setStyle(settings.welcome_leave_enabled ? ButtonStyle.Danger : ButtonStyle.Success)
   );
 
-  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, buildAdminPanelBackRow(lang)] };
+  const welcomeChannelRow = new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder()
+      .setCustomId('adminpanel_settings_welcome_channel')
+      .setPlaceholder('Set welcome channel')
+      .setChannelTypes(ChannelType.GuildText)
+      .setMinValues(1)
+      .setMaxValues(1)
+  );
+  const leaveChannelRow = new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder()
+      .setCustomId('adminpanel_settings_leave_channel')
+      .setPlaceholder('Set leave channel')
+      .setChannelTypes(ChannelType.GuildText)
+      .setMinValues(1)
+      .setMaxValues(1)
+  );
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, welcomeChannelRow, leaveChannelRow, buildAdminPanelBackRow(lang)] };
 }
 
 async function showAdminPanelCategory(interaction, category, { update = true } = {}) {
@@ -42292,6 +43428,15 @@ function buildMaddenGameThreadButtons(gameId, isStarted = false, isFinal = false
       new ButtonBuilder().setCustomId(`maddengame_thread_resetgame:${gameId}`).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger),
     ),
   ];
+  // 7J-99WAGER: always present — gated by league.wagers_enabled at click
+  // time instead, rather than threading a new param through every one of
+  // this function's 6 call sites. Disabled once the game is final (no
+  // point wagering on a game that's already decided).
+  if (!isFinal) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`maddengame_thread_wager:${gameId}`).setLabel('Wager').setEmoji('💰').setStyle(ButtonStyle.Success),
+    ));
+  }
   return rows;
 }
 
@@ -42882,6 +44027,43 @@ async function handleMaddenGameThreadButton(interaction) {
   // update.
   if (action === 'info') {
     await safeReply({ embeds: [buildMaddenGameThreadInfoEmbed(league, game, matchup, owners)], ephemeral: true });
+    return;
+  }
+  // 7J-99WAGER: straight 1v1 bet between the two game owners, nothing to
+  // do with the sportsbook/moneylines. Opt-in per league.
+  if (action === 'wager') {
+    const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+    if (!customSettings.wagers_enabled) {
+      await safeReply({ content: 'Wagers are not enabled for this league — a commissioner can turn them on under League Settings → Wagers.', ephemeral: true });
+      return;
+    }
+    const userId = interaction.user.id;
+    const isAway = owners.away?.id === userId;
+    const isHome = owners.home?.id === userId;
+    if (!isAway && !isHome) {
+      await safeReply({ content: 'Only the two owners in this game can propose a wager.', ephemeral: true });
+      return;
+    }
+    const opponent = isAway ? owners.home : owners.away;
+    if (!opponent) {
+      await safeReply({ content: 'The other team doesn\'t have an assigned owner yet — a wager needs both sides.', ephemeral: true });
+      return;
+    }
+    const existing = await pool.query(
+      `SELECT id FROM game_wagers WHERE game_id = $1 AND status IN ('pending','accepted') LIMIT 1`,
+      [gameId]
+    );
+    if (existing.rows.length) {
+      await safeReply({ content: 'There\'s already a pending or accepted wager for this game.', ephemeral: true });
+      return;
+    }
+    const modal = new ModalBuilder()
+      .setCustomId(`gamewager_propose_modal:${gameId}`)
+      .setTitle('Propose a Wager')
+      .addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Wager amount').setStyle(TextInputStyle.Short).setRequired(true))
+      );
+    await interaction.showModal(modal);
     return;
   }
   if (action === 'stream') {
@@ -62478,6 +63660,7 @@ function buildBotOwnerPanelHomeComponents() {
   );
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('botownerpanel_currencyidentity_edit').setLabel('Edit Currency Identity').setEmoji('✏️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('botownerpanel_reviewlink_edit').setLabel('Edit Review Link').setEmoji('⭐').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('botownerpanel_payoutbounds_edit').setLabel('Edit Payout Bounds').setEmoji('📏').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('botownerpanel_createcosmetic').setLabel('Create Cosmetic').setEmoji('🎨').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('botownerpanel_pricingguide').setLabel('Pricing Guide').setEmoji('💰').setStyle(ButtonStyle.Secondary),
@@ -63975,6 +65158,13 @@ async function distributeMaddenGameCompletionReward(guild, league, game) {
       await addParticipationScore(guild.id, owner.id, 1, league.league_id).catch(() => null);
     }
   }
+  // 7J-97SUSPEND: same decrement as the other game-played path.
+  await decrementActiveSuspensionsForTeam(guild.id, league.league_id, game.home_team).catch(() => null);
+  await decrementActiveSuspensionsForTeam(guild.id, league.league_id, game.away_team).catch(() => null);
+  await refreshSuspensionsBoard(guild, league).catch(() => null);
+  // 7J-99WAGER: settle any accepted wager tied to this game now that it has
+  // a real final score.
+  await settleGameWager(guild, game).catch(err => console.error('[Wager] Settlement failed:', err?.message));
 
   if (winnerOwner) {
     if (Number(settings.win_payout) > 0) {
@@ -65189,6 +66379,10 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
         new ButtonBuilder().setCustomId('commissioner_op:advance:' + leagueId).setLabel('Advance').setEmoji('⏭️').setStyle(ButtonStyle.Success),
       ));
     }
+    // 7J-97SUSPEND
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('commissioner_op:suspensions:' + leagueId).setLabel('Suspensions').setEmoji('🚫').setStyle(ButtonStyle.Danger),
+    ));
     rows.push(buildCommissionerBackRow(leagueId));
     return rows;
   }
@@ -65197,6 +66391,8 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     new ButtonBuilder().setCustomId('commissioner_op:sync:' + leagueId).setLabel('Run Sync').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('commissioner_op:refresh:' + leagueId).setLabel('Refresh Boards').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
+    // 7J-97SUSPEND
+    new ButtonBuilder().setCustomId('commissioner_op:suspensions:' + leagueId).setLabel('Suspensions').setEmoji('🚫').setStyle(ButtonStyle.Danger),
   );
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('commissioner_op:toggle_autodetect:' + leagueId).setLabel('Toggle Auto-Detection').setStyle(ButtonStyle.Danger),
@@ -65334,6 +66530,7 @@ const LEAGUE_CUSTOMIZATION_SECTIONS = [
   { value: 'trades', label: 'Trades', description: 'CPU trades, trade limit per season', emoji: '🔀' },
   { value: 'awards', label: 'Awards', description: 'Which awards this league tracks', emoji: '🎖️' },
   { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Turn conferences/divisions on/off, assign each team', emoji: '🗺️' },
+  { value: 'wagers', label: 'Wagers', description: '1v1 game-thread wagers between owners, separate from the sportsbook', emoji: '💰' },
 ];
 
 // 7J-54LEAGUESETTINGS: per Hxxdie — Madden leagues follow EA's own sync
@@ -65513,6 +66710,22 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
         new ButtonBuilder().setCustomId('leaguecustom_toggle_cpu:' + leagueId).setLabel(customSettings.cpu_trades_allowed === false ? 'Allow CPU Trades' : 'Disallow CPU Trades').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('leaguecustom_tradelimit_modal:' + leagueId).setLabel('Edit Trade Limit').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('leaguecustom_toggle_roster:' + leagueId).setLabel(customSettings.use_team_roster ? 'Disable Team Rosters' : 'Enable Team Rosters').setStyle(ButtonStyle.Secondary),
+      ),
+      buildLeagueCustomizationBackRow(leagueId),
+    ];
+  } else if (section === 'wagers') {
+    embed = new EmbedBuilder()
+      .setTitle(`💰 Wagers • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .setDescription('A straight 1v1 bet between the two owners in a game thread — propose an amount, the other owner accepts or declines, winner takes both. Nothing to do with the sportsbook or moneylines.')
+      .addFields(
+        { name: 'Wagers', value: customSettings.wagers_enabled ? 'Enabled' : 'Disabled', inline: true },
+      )
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_wagers:' + leagueId).setLabel(customSettings.wagers_enabled ? 'Disable Wagers' : 'Enable Wagers').setStyle(ButtonStyle.Secondary),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
