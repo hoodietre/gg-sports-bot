@@ -13005,7 +13005,7 @@ if (interaction.commandName === 'avatar') {
           home: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id),
         };
         await interaction.channel.send({
-          embeds: [buildMaddenGameThreadEmbed(league, updatedGame, owners)],
+          embeds: [await buildMaddenGameThreadEmbed(league, updatedGame, owners)],
           components: buildMaddenGameThreadButtons(gameId, Boolean(updatedGame.game_started_at), true),
         }).catch(() => null);
       }
@@ -42295,7 +42295,8 @@ function buildMaddenGameThreadButtons(gameId, isStarted = false, isFinal = false
   return rows;
 }
 
-function buildMaddenGameThreadEmbed(league, game, owners = {}) {
+async function buildMaddenGameThreadEmbed(league, game, owners = {}) {
+  const NL = String.fromCharCode(10);
   const awayLogo = getMaddenTeamLogoUrl(game.away_team);
   const homeLogo = getMaddenTeamLogoUrl(game.home_team);
   const hasScore = maddenGameHasRealScore(game);
@@ -42310,8 +42311,35 @@ function buildMaddenGameThreadEmbed(league, game, owners = {}) {
       { name: 'Away Team', value: `${maddenTeamDisplayNameWithLogo(game.away_team || 'Away')}${owners.away ? `\nOwner: <@${owners.away.id}>` : '\nOwner: Unassigned'}`, inline: true },
       { name: 'Home Team', value: `${maddenTeamDisplayNameWithLogo(game.home_team || 'Home')}${owners.home ? `\nOwner: <@${owners.home.id}>` : '\nOwner: Unassigned'}`, inline: true },
       { name: 'Game Status', value: scoreLine, inline: false },
-      { name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for matchup tools.', inline: false }
-    )
+    );
+
+  // 7J-95MONEYLINE: display-only — no bet placement from this embed, just
+  // lets the involved owners see who's favored at a glance. Looked up by
+  // game_label match against the same auto-generated moneyline line the
+  // Sportsbook board uses (generateMaddenMatchupOdds), since sportsbook_games
+  // rows aren't directly FK'd to madden_imported_games. Only exists for
+  // user-vs-user games (CPU games never get a line) — omitted entirely when
+  // there isn't one, rather than showing a misleading placeholder.
+  if (!hasScore) {
+    const gameLabel = `${game.away_team} @ ${game.home_team}`;
+    const lineResult = await pool.query(
+      `SELECT home_odds, away_odds FROM sportsbook_games
+       WHERE guild_id = $1 AND league_id = $2::uuid AND game_label = $3
+         AND bet_type = 'moneyline' AND status = 'open'
+       ORDER BY created_at DESC LIMIT 1`,
+      [league?.guild_id || league?.guildId, league?.league_id, gameLabel]
+    ).catch(() => ({ rows: [] }));
+    if (lineResult.rows.length) {
+      const line = lineResult.rows[0];
+      embed.addFields({
+        name: 'Moneyline',
+        value: `${maddenTeamDisplayNameWithLogo(game.away_team)}: **${formatAmericanOdds(line.away_odds)}**${NL}${maddenTeamDisplayNameWithLogo(game.home_team)}: **${formatAmericanOdds(line.home_odds)}**`,
+        inline: false,
+      });
+    }
+  }
+
+  embed.addFields({ name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for matchup tools.', inline: false })
     .setFooter({ text: 'GG Sports • 7J-10BY-BA1 Auto Game Threads' })
     .setTimestamp();
   if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(game.away_team) || game.away_team} at ${getMaddenTeamAbbrev(game.home_team) || game.home_team}`, iconURL: awayLogo });
@@ -42581,7 +42609,7 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
       }
       if (!thread && baseChannel.send) {
         const starter = await baseChannel.send({
-          embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
+          embeds: [await buildMaddenGameThreadEmbed(league, game, owners)],
           components: buildMaddenGameThreadButtons(game.id),
           allowedMentions: { users: [], roles: [] },
         });
@@ -42603,7 +42631,7 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
         content: mentionIds.length
           ? `${mentionIds.map(id => `<@${id}>`).join('\n')} your **${game.week_label || weekLabel}** game thread is ready: **${label}**.`
           : `Game thread created for **${label}**.`,
-        embeds: [buildMaddenGameThreadEmbed(league, game, owners)],
+        embeds: [await buildMaddenGameThreadEmbed(league, game, owners)],
         components: buildMaddenGameThreadButtons(game.id),
         allowedMentions: { users: mentionIds, roles: [] },
       }).catch(() => null);
@@ -42933,7 +42961,7 @@ async function handleMaddenGameThreadButton(interaction) {
     if (interaction.channel?.isThread?.()) {
       const updatedGame = await getMaddenImportedGameById(gameId);
       await interaction.channel.send({
-        embeds: [buildMaddenGameThreadEmbed(league, updatedGame, owners)],
+        embeds: [await buildMaddenGameThreadEmbed(league, updatedGame, owners)],
         components: buildMaddenGameThreadButtons(gameId, true, maddenGameHasRealScore(updatedGame)),
       }).catch(() => null);
     }
@@ -42987,7 +43015,7 @@ async function handleMaddenGameThreadButton(interaction) {
     if (interaction.channel?.isThread?.()) {
       const updatedGame = await getMaddenImportedGameById(gameId);
       await interaction.channel.send({
-        embeds: [buildMaddenGameThreadEmbed(league, updatedGame, owners)],
+        embeds: [await buildMaddenGameThreadEmbed(league, updatedGame, owners)],
         components: buildMaddenGameThreadButtons(gameId, false, false),
       }).catch(() => null);
     }
