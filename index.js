@@ -127,7 +127,7 @@ const pool = new Pool({
 // rates are clamped to a global range — both are bot-owner adjustable at runtime via
 // /botowner currencyidentity and /botowner payoutbounds, backed by system_currency_config.
 // These are just the seed defaults for that table's first row.
-const CURRENCY_PAYOUT_TYPES = ['win_payout', 'game_played_payout', 'award_payout'];
+const CURRENCY_PAYOUT_TYPES = ['win_payout', 'game_played_payout', 'award_payout', 'championship_payout'];
 // Sportsbook bounds reuse the exact same bot-owner-global / per-server-clamped
 // pattern as currency payouts above — same system_currency_config table,
 // clampPayoutRate(), and Bot Owner Panel "Edit Payout Bounds" flow, just two more
@@ -140,12 +140,23 @@ const ALL_PAYOUT_BOUND_TYPES = [...CURRENCY_PAYOUT_TYPES, ...SPORTSBOOK_BOUND_TY
 const CURRENCY_CONFIG_DEFAULTS = {
   currency_name: 'GG Coins',
   currency_icon: '🪙',
-  win_payout_min: 10,
-  win_payout_max: 500,
+  win_payout_min: 5,
+  win_payout_max: 10,
   game_played_payout_min: 5,
-  game_played_payout_max: 100,
-  award_payout_min: 10,
-  award_payout_max: 300,
+  game_played_payout_max: 10,
+  award_payout_min: 50,
+  award_payout_max: 250,
+  // 7J-93ECONBALANCE: added per Hxxdie — was completely unbounded before
+  // (any commissioner could set championship_payout to anything, no clamp
+  // at all), which mattered a lot once win/game payouts came down to the
+  // 5-10 range: at the old 500 default it would have been roughly 2x an
+  // entire strong season's game earnings on its own, the same "one thing
+  // dwarfs everything" problem Legacy Score had before this session's
+  // rework. 100-250 keeps it a genuinely exciting lump sum (comparable to,
+  // not double, a full season's game earnings at the high end) without
+  // dominating the economy.
+  championship_payout_min: 100,
+  championship_payout_max: 250,
   sportsbook_bet_min: 5,
   sportsbook_bet_max: 5000,
   sportsbook_payout_min: 5,
@@ -158,8 +169,8 @@ let currencyConfigCache = { ...CURRENCY_CONFIG_DEFAULTS };
 
 async function loadCurrencyConfig() {
   await pool.query(
-    `INSERT INTO system_currency_config (id, currency_name, currency_icon, win_payout_min, win_payout_max, game_played_payout_min, game_played_payout_max, award_payout_min, award_payout_max)
-     VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO system_currency_config (id, currency_name, currency_icon, win_payout_min, win_payout_max, game_played_payout_min, game_played_payout_max, award_payout_min, award_payout_max, championship_payout_min, championship_payout_max)
+     VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (id) DO NOTHING`,
     [
       CURRENCY_CONFIG_DEFAULTS.currency_name,
@@ -170,6 +181,8 @@ async function loadCurrencyConfig() {
       CURRENCY_CONFIG_DEFAULTS.game_played_payout_max,
       CURRENCY_CONFIG_DEFAULTS.award_payout_min,
       CURRENCY_CONFIG_DEFAULTS.award_payout_max,
+      CURRENCY_CONFIG_DEFAULTS.championship_payout_min,
+      CURRENCY_CONFIG_DEFAULTS.championship_payout_max,
     ]
   );
 
@@ -1563,6 +1576,13 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS sportsbook_bet_max INTEGER NOT NULL DEFAULT 5000`);
   await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS sportsbook_payout_min INTEGER NOT NULL DEFAULT 5`);
   await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS sportsbook_payout_max INTEGER NOT NULL DEFAULT 25000`);
+  // 7J-93ECONBALANCE: championship_payout was completely unbounded before —
+  // no clamp at all, unlike win/game/award payout. Backfilled via the
+  // column DEFAULT so Hxxdie's already-configured row picks this up
+  // immediately without needing a fresh INSERT (the seed INSERT below is
+  // ON CONFLICT DO NOTHING, so it never touches an existing row).
+  await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS championship_payout_min INTEGER NOT NULL DEFAULT 100`);
+  await pool.query(`ALTER TABLE system_currency_config ADD COLUMN IF NOT EXISTS championship_payout_max INTEGER NOT NULL DEFAULT 250`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shop_items (
@@ -1904,6 +1924,29 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE user_recognition ALTER COLUMN activity_points TYPE NUMERIC(12,2)`).catch(() => null);
   await pool.query(`ALTER TABLE user_recognition ALTER COLUMN activity_points SET DEFAULT 0`).catch(() => null);
 
+  // 7J-92LEGACYFLOOR: Legacy Score rework. Old model let a single event
+  // (championship, flat +500) dwarf everything else — two championships
+  // alone hit the old max tier (1000), while a multi-year non-champion
+  // veteran couldn't get anywhere close. New model splits legacy into two
+  // tracked halves:
+  //   participation_score — accrues ONLY from things skill can't skip:
+  //     completed seasons (see the sync-time season-rollover hook) and
+  //     games played. This is the floor nobody can buy or win their way
+  //     past.
+  //   achievement_score_raw — accrues from skill-driven events (wins,
+  //     championships). Uncapped in storage, but legacy_score only ever
+  //     credits achievement up to LEGACY_ACHIEVEMENT_CAP_MULTIPLIER times
+  //     current participation_score — so a dominant rookie's achievement
+  //     total gets "banked" and unlocks gradually as their participation
+  //     catches up, rather than being lost.
+  // legacy_score itself stays a stored, directly-queryable column (every
+  // leaderboard/profile display already reads it directly) — it's just
+  // maintained by this capped formula now instead of being incremented
+  // directly at each event.
+  await pool.query(`ALTER TABLE user_recognition ADD COLUMN IF NOT EXISTS participation_score INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE user_recognition ADD COLUMN IF NOT EXISTS achievement_score_raw INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE user_recognition ADD COLUMN IF NOT EXISTS seasons_completed INTEGER NOT NULL DEFAULT 0`);
+
   // 7J-43ACTIVITY: league-scoped activity — same activity_points/legacy_score
   // shape as user_recognition, but scoped to (guild, league, user) instead of
   // just (guild, user), so commissioners can see who's active in *their*
@@ -1924,6 +1967,9 @@ async function initDatabase() {
       PRIMARY KEY (guild_id, league_id, user_id)
     )
   `);
+  await pool.query(`ALTER TABLE user_league_activity ADD COLUMN IF NOT EXISTS participation_score INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE user_league_activity ADD COLUMN IF NOT EXISTS achievement_score_raw INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE user_league_activity ADD COLUMN IF NOT EXISTS seasons_completed INTEGER NOT NULL DEFAULT 0`);
 
   // 7J-43ACTIVITY: universal/global activity — one row per Discord user,
   // aggregated across every server the bot is in. This is what the
@@ -1938,6 +1984,9 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE user_global_activity ADD COLUMN IF NOT EXISTS participation_score INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE user_global_activity ADD COLUMN IF NOT EXISTS achievement_score_raw INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE user_global_activity ADD COLUMN IF NOT EXISTS seasons_completed INTEGER NOT NULL DEFAULT 0`);
 
   // 7J-43ACTIVITY: last-counted-message timestamp per (guild, user), used to
   // enforce the 60s cooldown on message-activity points without needing to
@@ -3527,7 +3576,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('iteminfo').setDescription('Look up an owned item by its tag, or search by name/serial').addStringOption(o => o.setName('search').setDescription('Item tag (e.g. GG-AB12CD), or item name, or "item name #serial"').setRequired(true)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('accessory_type').setDescription('Accessory only: which sub-slot this occupies (required for accessory items).').setRequired(false).addChoices({ name: 'neck', value: 'neck' }, { name: 'wrist', value: 'wrist' }, { name: 'face', value: 'face' }, { name: 'ears', value: 'ears' }, { name: 'legs', value: 'legs' }, { name: 'other', value: 'other' })).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common(60-120) uncommon(150-300) rare(400-700) epic(900-1400) legendary(1800-2500)').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('accessory_type').setDescription('Accessory only: which sub-slot this occupies (required for accessory items).').setRequired(false).addChoices({ name: 'neck', value: 'neck' }, { name: 'wrist', value: 'wrist' }, { name: 'face', value: 'face' }, { name: 'ears', value: 'ears' }, { name: 'legs', value: 'legs' }, { name: 'other', value: 'other' })).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false)))
@@ -4177,7 +4226,7 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
     const achievementSeasonKey = league.madden_season_year != null ? String(league.madden_season_year) : seasonLabel;
     const currencySettings = await getCurrencySettings(guild.id).catch(() => null);
     const awardPayout = Number(currencySettings?.award_payout ?? 50);
-    const championshipPayout = Number(currencySettings?.championship_payout ?? 500);
+    const championshipPayout = clampPayoutRate('championship_payout', Number(currencySettings?.championship_payout ?? 150));
     // 7J-40ACHIEVE: anti-abuse guard placeholder — Hxxdie's call is a minimum
     // 6 users in the league to qualify for achievement rewards (adjusted down
     // from the originally-discussed 10), but NOT wired in yet, deliberately,
@@ -4228,31 +4277,22 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
         // genuinely new season's champion.
         const granted = await grantAchievement(guild.id, league.league_id, championOwnerId, `champion_${achievementSeasonKey}`, 'championship', 'League Champion', championshipPayout);
         if (granted) {
+          // 7J-92LEGACYFLOOR: was a flat +500 direct legacy_score add — a
+          // single championship used to be worth as much as roughly 250
+          // regular-season wins. Now routed through addActivityPoints as
+          // 60 raw achievement, subject to the same participation-relative
+          // cap as everything else (see LEGACY_ACHIEVEMENT_CAP_NUMERATOR/
+          // DENOMINATOR) — still the single biggest achievement event by
+          // far, just no longer able to single-handedly max out the whole
+          // tier system in two clicks.
           await pool.query(
-            `INSERT INTO user_recognition (guild_id, user_id, legacy_score, championships, activity_points)
-             VALUES ($1, $2, 500, 1, 250)
+            `INSERT INTO user_recognition (guild_id, user_id, championships)
+             VALUES ($1, $2, 1)
              ON CONFLICT (guild_id, user_id)
-             DO UPDATE SET legacy_score = user_recognition.legacy_score + 500, championships = user_recognition.championships + 1, activity_points = user_recognition.activity_points + 250, updated_at = NOW()`,
+             DO UPDATE SET championships = user_recognition.championships + 1, updated_at = NOW()`,
             [guild.id, championOwnerId]
           ).catch(() => null);
-          // 7J-43ACTIVITY: this bypasses addActivityPoints (it's a direct
-          // write with the extra championships counter bump baked in), so
-          // fan out to the league/universal tables here explicitly to stay
-          // consistent with every other point-earning action.
-          await pool.query(
-            `INSERT INTO user_league_activity (guild_id, league_id, user_id, activity_points, legacy_score)
-             VALUES ($1, $2, $3, 250, 500)
-             ON CONFLICT (guild_id, league_id, user_id)
-             DO UPDATE SET activity_points = user_league_activity.activity_points + 250, legacy_score = user_league_activity.legacy_score + 500, updated_at = NOW()`,
-            [guild.id, String(league.league_id), championOwnerId]
-          ).catch(() => null);
-          await pool.query(
-            `INSERT INTO user_global_activity (user_id, activity_points, legacy_score)
-             VALUES ($1, 250, 500)
-             ON CONFLICT (user_id)
-             DO UPDATE SET activity_points = user_global_activity.activity_points + 250, legacy_score = user_global_activity.legacy_score + 500, updated_at = NOW()`,
-            [championOwnerId]
-          ).catch(() => null);
+          await addActivityPoints(guild.id, championOwnerId, 250, 60, league.league_id).catch(() => null);
         }
       }
     }
@@ -9549,6 +9589,12 @@ if (interaction.commandName === 'avatar') {
         components: [buildBotOwnerPanelBackRow()],
         flags: MessageFlags.Ephemeral,
       });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'botownerpanel_pricingguide') {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.reply({ embeds: [buildShopPricingGuideEmbed()], components: [buildBotOwnerPanelBackRow()], flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -25838,14 +25884,32 @@ async function checkActivityMilestones(guildId, userId) {
   }
 }
 
-async function ensureRecognitionProfile(guildId, userId) {
-  await pool.query(
-    `INSERT INTO user_recognition (guild_id, user_id)
-     VALUES ($1, $2)
-     ON CONFLICT (guild_id, user_id) DO NOTHING`,
-    [guildId, userId]
-  );
-}
+// 7J-92LEGACYFLOOR: a dominant player's achievement total can never count
+// for more than this multiple of their participation_score toward
+// legacy_score — the mechanism that makes skill accelerate progress
+// without letting it skip the time-served floor. Tuned (see the session's
+// design discussion) so a consistently-active non-champion reaches the top
+// legacy tier in ~4-4.5 years, and a repeat-champion elite player
+// compresses that to ~2-2.5 years — never less, since participation itself
+// can't be rushed. Expressed as thirds/halves to stay in integer math
+// (Postgres integer division truncates, which is fine here).
+// 7J-94CADENCEFIX: recalibrated per Hxxdie's real-world correction — most
+// leagues run a 48-hour advance schedule (~50 days for a 17-game season
+// incl. playoffs/offseason), landing around 6 completed seasons/year per
+// league, not the original ~3/year assumption this constant and
+// SEASON_PARTICIPATION_POINTS below were tuned against. Cap raised from
+// 1.5x to 2.5x participation to compensate — at 6 seasons/year, a
+// consistent non-champion now reaches GOAT in ~4.0 years and a repeat-
+// champion elite player in ~2.3 years, matching the original target.
+const LEGACY_ACHIEVEMENT_CAP_NUMERATOR = 5;
+const LEGACY_ACHIEVEMENT_CAP_DENOMINATOR = 2; // 5/2 = 2.5x
+// 7J-94CADENCEFIX: was 50, assuming ~3 seasons/year. At the corrected ~6
+// seasons/year, per-game participation (1/game × ~17 games/season × 6
+// seasons/year ≈ 102/year) is now the dominant participation source on its
+// own — this constant is more of a "completed a season" bonus on top of
+// that than the primary driver it originally was, which is fine; the cap
+// mechanism doesn't care which component participation comes from.
+const SEASON_PARTICIPATION_POINTS = 8;
 
 // 7J-43ACTIVITY: leagueId is optional and additive — the existing
 // server-scoped user_recognition update is completely unchanged, so every
@@ -25855,13 +25919,22 @@ async function ensureRecognitionProfile(guildId, userId) {
 // league-scoped table. The universal/global table is always updated
 // regardless, since every point-earning action anywhere should count
 // toward a user's cross-server activity grade.
+//
+// 7J-92LEGACYFLOOR: legacyPoints here now means "raw achievement points" —
+// it accrues into achievement_score_raw uncapped, but legacy_score (the
+// number every leaderboard/profile actually displays) only ever credits up
+// to LEGACY_ACHIEVEMENT_CAP_NUMERATOR/DENOMINATOR times current
+// participation_score. Nothing is lost — a big achievement earned before
+// enough participation exists just "banks" and unlocks gradually as
+// participation (see addParticipationScore) catches up.
 async function addActivityPoints(guildId, userId, points, legacyPoints = 0, leagueId = null) {
   await ensureRecognitionProfile(guildId, userId);
 
   await pool.query(
     `UPDATE user_recognition
      SET activity_points = activity_points + $3,
-         legacy_score = legacy_score + $4,
+         achievement_score_raw = achievement_score_raw + $4,
+         legacy_score = participation_score + LEAST(achievement_score_raw + $4, (participation_score * ${LEGACY_ACHIEVEMENT_CAP_NUMERATOR}) / ${LEGACY_ACHIEVEMENT_CAP_DENOMINATOR}),
          updated_at = NOW(),
          last_activity_at = NOW()
      WHERE guild_id = $1 AND user_id = $2`,
@@ -25870,23 +25943,87 @@ async function addActivityPoints(guildId, userId, points, legacyPoints = 0, leag
 
   if (leagueId) {
     await pool.query(
-      `INSERT INTO user_league_activity (guild_id, league_id, user_id, activity_points, legacy_score)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO user_league_activity (guild_id, league_id, user_id, activity_points, achievement_score_raw, legacy_score)
+       VALUES ($1, $2, $3, $4, $5, LEAST($5, 0))
        ON CONFLICT (guild_id, league_id, user_id)
-       DO UPDATE SET activity_points = user_league_activity.activity_points + $4, legacy_score = user_league_activity.legacy_score + $5, updated_at = NOW()`,
+       DO UPDATE SET
+         activity_points = user_league_activity.activity_points + $4,
+         achievement_score_raw = user_league_activity.achievement_score_raw + $5,
+         legacy_score = user_league_activity.participation_score + LEAST(user_league_activity.achievement_score_raw + $5, (user_league_activity.participation_score * ${LEGACY_ACHIEVEMENT_CAP_NUMERATOR}) / ${LEGACY_ACHIEVEMENT_CAP_DENOMINATOR}),
+         updated_at = NOW()`,
       [guildId, String(leagueId), userId, Number(points || 0), Number(legacyPoints || 0)]
     ).catch(() => null);
   }
 
   await pool.query(
-    `INSERT INTO user_global_activity (user_id, activity_points, legacy_score)
-     VALUES ($1, $2, $3)
+    `INSERT INTO user_global_activity (user_id, activity_points, achievement_score_raw, legacy_score)
+     VALUES ($1, $2, $3, LEAST($3, 0))
      ON CONFLICT (user_id)
-     DO UPDATE SET activity_points = user_global_activity.activity_points + $2, legacy_score = user_global_activity.legacy_score + $3, updated_at = NOW()`,
+     DO UPDATE SET
+       activity_points = user_global_activity.activity_points + $2,
+       achievement_score_raw = user_global_activity.achievement_score_raw + $3,
+       legacy_score = user_global_activity.participation_score + LEAST(user_global_activity.achievement_score_raw + $3, (user_global_activity.participation_score * ${LEGACY_ACHIEVEMENT_CAP_NUMERATOR}) / ${LEGACY_ACHIEVEMENT_CAP_DENOMINATOR}),
+       updated_at = NOW()`,
     [userId, Number(points || 0), Number(legacyPoints || 0)]
   ).catch(() => null);
 
   await checkActivityMilestones(guildId, userId).catch(() => null);
+}
+
+// 7J-92LEGACYFLOOR: the participation half of Legacy Score — the floor
+// achievement can accelerate past but never skip. Fed by games played (a
+// small trickle) and completed seasons (the dominant contributor — see the
+// season-rollover hook in the EA sync pipeline). Recomputes legacy_score
+// the same capped way as addActivityPoints, since raising participation
+// can also retroactively unlock previously-banked achievement.
+async function addParticipationScore(guildId, userId, points, leagueId = null, seasonsCompleted = 0) {
+  await ensureRecognitionProfile(guildId, userId);
+
+  await pool.query(
+    `UPDATE user_recognition
+     SET participation_score = participation_score + $3,
+         seasons_completed = seasons_completed + $4,
+         legacy_score = (participation_score + $3) + LEAST(achievement_score_raw, ((participation_score + $3) * ${LEGACY_ACHIEVEMENT_CAP_NUMERATOR}) / ${LEGACY_ACHIEVEMENT_CAP_DENOMINATOR}),
+         updated_at = NOW(),
+         last_activity_at = NOW()
+     WHERE guild_id = $1 AND user_id = $2`,
+    [guildId, userId, Number(points || 0), Number(seasonsCompleted || 0)]
+  );
+
+  if (leagueId) {
+    await pool.query(
+      `INSERT INTO user_league_activity (guild_id, league_id, user_id, participation_score, seasons_completed, legacy_score)
+       VALUES ($1, $2, $3, $4, $5, $4)
+       ON CONFLICT (guild_id, league_id, user_id)
+       DO UPDATE SET
+         participation_score = user_league_activity.participation_score + $4,
+         seasons_completed = user_league_activity.seasons_completed + $5,
+         legacy_score = (user_league_activity.participation_score + $4) + LEAST(user_league_activity.achievement_score_raw, ((user_league_activity.participation_score + $4) * ${LEGACY_ACHIEVEMENT_CAP_NUMERATOR}) / ${LEGACY_ACHIEVEMENT_CAP_DENOMINATOR}),
+         updated_at = NOW()`,
+      [guildId, String(leagueId), userId, Number(points || 0), Number(seasonsCompleted || 0)]
+    ).catch(() => null);
+  }
+
+  await pool.query(
+    `INSERT INTO user_global_activity (user_id, participation_score, seasons_completed, legacy_score)
+     VALUES ($1, $2, $3, $2)
+     ON CONFLICT (user_id)
+     DO UPDATE SET
+       participation_score = user_global_activity.participation_score + $2,
+       seasons_completed = user_global_activity.seasons_completed + $3,
+       legacy_score = (user_global_activity.participation_score + $2) + LEAST(user_global_activity.achievement_score_raw, ((user_global_activity.participation_score + $2) * ${LEGACY_ACHIEVEMENT_CAP_NUMERATOR}) / ${LEGACY_ACHIEVEMENT_CAP_DENOMINATOR}),
+       updated_at = NOW()`,
+    [userId, Number(points || 0), Number(seasonsCompleted || 0)]
+  ).catch(() => null);
+}
+
+async function ensureRecognitionProfile(guildId, userId) {
+  await pool.query(
+    `INSERT INTO user_recognition (guild_id, user_id)
+     VALUES ($1, $2)
+     ON CONFLICT (guild_id, user_id) DO NOTHING`,
+    [guildId, userId]
+  );
 }
 
 async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0, leagueId = null) {
@@ -25918,12 +26055,22 @@ async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
   );
 }
 
+// 7J-92LEGACYFLOOR / 7J-94CADENCEFIX: recalibrated for the corrected ~6
+// seasons/year cadence (48-hour advance leagues) and the participation-
+// floor formula. A consistent player with zero championships reaches GOAT
+// around 3.4-4 years depending on sportsbook engagement (betting wins
+// contribute a modest, outcome-gated amount — not exploitable by placing
+// lots of bets, since it only fires on wins); a repeat-champion elite
+// player compresses that to roughly 2.3-2.5 years — never less, since
+// participation itself can't be rushed. Thresholds unchanged from the
+// first pass (200/450/750/1200) — the cap/season-points retune absorbed
+// the cadence correction without needing to move these too.
 function getLegacyTier(score) {
   const legacyScore = Number(score || 0);
-  if (legacyScore >= 1000) return 'GOAT';
-  if (legacyScore >= 500) return 'Legend';
-  if (legacyScore >= 250) return 'Elite';
-  if (legacyScore >= 100) return 'Veteran';
+  if (legacyScore >= 1200) return 'GOAT';
+  if (legacyScore >= 750) return 'Legend';
+  if (legacyScore >= 450) return 'Elite';
+  if (legacyScore >= 200) return 'Veteran';
   return 'Rising Star';
 }
 
@@ -26800,6 +26947,11 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
           interaction.user.id
         );
         await addActivityPoints(interaction.guild.id, owner.id, 3, 0, game.league_id).catch(() => null);
+        // 7J-92LEGACYFLOOR: participation credit for playing, regardless of
+        // outcome — the small, unskippable trickle. Season-completion (see
+        // the sync-time hook) is the dominant participation source; this is
+        // the supplementary per-game piece.
+        await addParticipationScore(interaction.guild.id, owner.id, 1, game.league_id).catch(() => null);
         payoutLines.push(settings.currency_icon + ' <@' + owner.id + '> earned **' + settings.game_played_payout + ' ' + settings.currency_name + '** for playing.');
       }
     }
@@ -26814,7 +26966,11 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
       'Game win: ' + winnerName,
       interaction.user.id
     );
-    await addActivityPoints(interaction.guild.id, winnerOwner.id, 0, 2, game.league_id).catch(() => null);
+    // 7J-92LEGACYFLOOR: was 2 raw legacy, now 3 — subject to the
+    // participation-relative cap now, so this number means something
+    // different than it used to (it's a raw achievement contribution, not
+    // a guaranteed legacy_score add).
+    await addActivityPoints(interaction.guild.id, winnerOwner.id, 0, 3, game.league_id).catch(() => null);
     payoutLines.push(settings.currency_icon + ' <@' + winnerOwner.id + '> earned **' + settings.win_payout + ' ' + settings.currency_name + '** win bonus.');
   }
 
@@ -60800,12 +60956,44 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     // it.
     const resolvedSeasonYear = eaHubCtx?.seasonYear ?? eaHubCtx?.calendarYear ?? null;
     if (resolvedSeasonYear != null) {
+      // 7J-92LEGACYFLOOR: read the previously-known season year BEFORE
+      // overwriting it, so a change can be detected — this is the season-
+      // rollover signal that drives Legacy Score's participation floor.
+      // Deliberately reusing the same season-year source this codebase
+      // already trusts for achievement dedup (achievementSeasonKey above)
+      // rather than inventing a second notion of "season boundary."
+      const previousSeasonYearResult = await pool.query(
+        `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
+        [league.league_id]
+      ).catch(() => ({ rows: [] }));
+      const previousSeasonYear = previousSeasonYearResult.rows[0]?.madden_season_year ?? null;
+
       await pool.query(
         `INSERT INTO league_settings (league_id, madden_season_year)
          VALUES ($1, $2)
          ON CONFLICT (league_id) DO UPDATE SET madden_season_year = $2`,
         [league.league_id, Number(resolvedSeasonYear)]
       ).catch(error => console.warn('[7J-41SEASON] failed to persist season year:', error?.message || error));
+
+      if (previousSeasonYear != null && Number(previousSeasonYear) !== Number(resolvedSeasonYear)) {
+        // A season just completed. Award every current team-role holder
+        // participation credit — this is the dominant, unskippable
+        // contributor to Legacy Score's floor (see LEGACY_ACHIEVEMENT_CAP_*
+        // and addParticipationScore). Simplification worth flagging: this
+        // credits whoever currently holds each team role at the moment the
+        // rollover is detected, not a snapshot of who held it all season —
+        // there's no ownership-history tracking to do better than that
+        // without much larger scope.
+        const teams = await getLeagueTeamRoles(league.league_id).catch(() => []);
+        for (const team of teams) {
+          const role = guild.roles.cache.get(team.role_id) || await guild.roles.fetch(team.role_id).catch(() => null);
+          if (!role) continue;
+          for (const member of role.members.values()) {
+            if (member.user.bot) continue;
+            await addParticipationScore(guild.id, member.id, SEASON_PARTICIPATION_POINTS, league.league_id, 1).catch(() => null);
+          }
+        }
+      }
     }
 
     // This is genuine ground truth for "what week does the franchise think it's on
@@ -62264,6 +62452,7 @@ function buildBotOwnerPanelHomeComponents() {
     new ButtonBuilder().setCustomId('botownerpanel_currencyidentity_edit').setLabel('Edit Currency Identity').setEmoji('✏️').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('botownerpanel_payoutbounds_edit').setLabel('Edit Payout Bounds').setEmoji('📏').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('botownerpanel_createcosmetic').setLabel('Create Cosmetic').setEmoji('🎨').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('botownerpanel_pricingguide').setLabel('Pricing Guide').setEmoji('💰').setStyle(ButtonStyle.Secondary),
   );
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('botownerpanel_createitem').setLabel('Create Item').setEmoji('📦').setStyle(ButtonStyle.Success),
@@ -62352,6 +62541,52 @@ async function showBotOwnerPanelHome(interaction, { update = true } = {}) {
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
 }
 
+// 7J-93ECONBALANCE / 7J-94CADENCEFIX: shop item pricing guide, derived
+// from the actual currency velocity these payout bounds produce. Corrected
+// from an earlier draft that assumed ~3 seasons/year — real cadence is
+// closer to 6/year (48-hour advance leagues, ~50 days for a 17-game season
+// incl. playoffs/offseason), which alone pushes games-only income to
+// ~1,150/year (191/season × 6). Sportsbook activity (achievement-tier
+// currency payouts, modest net profit for a competent bettor) adds a
+// realistic ~500/year on top, plus occasional staff awards (~150/year) —
+// ~1,800/year total for a single-league, moderately engaged player.
+// Deliberately calibrated toward the upper end of realistic single-league
+// velocity rather than a bare-minimum average, since currency balances are
+// per-guild — a user active across multiple leagues *within the same
+// server* pools all of that income into one shared balance, and pricing
+// needs to hold up against that faster accumulation, not just the median
+// single-league player. Multi-league players will naturally clear these
+// bands faster than the "time to afford" column suggests below; that's
+// expected, same as a more skilled player earning Legacy Score faster —
+// not something pricing alone should try to fully neutralize.
+const SHOP_PRICING_GUIDE_BANDS = [
+  { rarity: 'Common', range: '60–120', time: '2–3 weeks' },
+  { rarity: 'Uncommon', range: '150–300', time: '~a month' },
+  { rarity: 'Rare', range: '400–700', time: '~a season (~50 days)' },
+  { rarity: 'Epic', range: '900–1,400', time: '4–6 months' },
+  { rarity: 'Legendary', range: '1,800–2,500', time: 'close to a year (single-league pace)' },
+];
+
+function buildShopPricingGuideEmbed() {
+  const NL = String.fromCharCode(10);
+  return new EmbedBuilder()
+    .setTitle('💰 Shop Pricing Guide')
+    .setColor(0xFEE75C)
+    .setDescription(
+      `Reference bands for pricing new items, based on the current global payout bounds ` +
+      `(Game ${currencyConfigCache.game_played_payout_min}-${currencyConfigCache.game_played_payout_max}, ` +
+      `Win ${currencyConfigCache.win_payout_min}-${currencyConfigCache.win_payout_max}, ` +
+      `Championship ${currencyConfigCache.championship_payout_min}-${currencyConfigCache.championship_payout_max}) — ` +
+      `~1,150/year from games alone at 6 seasons/year, ~1,800/year realistic total for a single-league player including sportsbook activity and occasional awards.` +
+      NL + NL +
+      SHOP_PRICING_GUIDE_BANDS.map(b => `**${b.rarity}**: ${b.range} — ${b.time}`).join(NL) +
+      NL + NL +
+      `Multi-league players (same server, multiple leagues pooling into one balance) will clear these faster — expected, not a flaw to fix with pricing alone. These are guidance, not an enforced limit. If the payout bounds change meaningfully, revisit this table by hand.`
+    )
+    .setFooter({ text: 'GG Sports • Bot Owner • Pricing Guide' })
+    .setTimestamp();
+}
+
 function buildBotOwnerCurrencyConfigEmbed() {
   return new EmbedBuilder()
     .setTitle('Global Currency Configuration')
@@ -62361,6 +62596,7 @@ function buildBotOwnerCurrencyConfigEmbed() {
       { name: 'Win Payout Range', value: `${currencyConfigCache.win_payout_min}–${currencyConfigCache.win_payout_max}`, inline: true },
       { name: 'Game Played Payout Range', value: `${currencyConfigCache.game_played_payout_min}–${currencyConfigCache.game_played_payout_max}`, inline: true },
       { name: 'Award Payout Range', value: `${currencyConfigCache.award_payout_min}–${currencyConfigCache.award_payout_max}`, inline: true },
+      { name: 'Championship Payout Range', value: `${currencyConfigCache.championship_payout_min}–${currencyConfigCache.championship_payout_max}`, inline: true },
     )
     .setFooter({ text: 'GG Sports • Bot Owner • Applies to every server' })
     .setTimestamp();
@@ -62370,6 +62606,7 @@ const CURRENCY_PAYOUT_TYPE_LABELS = {
   win_payout: 'Win Payout',
   game_played_payout: 'Game Played Payout',
   award_payout: 'Award Payout',
+  championship_payout: 'Championship Payout',
   sportsbook_bet: 'Sportsbook Bet',
   sportsbook_payout: 'Sportsbook Payout',
 };
@@ -63707,6 +63944,7 @@ async function distributeMaddenGameCompletionReward(guild, league, game) {
         ).catch(() => null);
       }
       await addActivityPoints(guild.id, owner.id, 3, 0, league.league_id).catch(() => null);
+      await addParticipationScore(guild.id, owner.id, 1, league.league_id).catch(() => null);
     }
   }
 
@@ -63721,7 +63959,7 @@ async function distributeMaddenGameCompletionReward(guild, league, game) {
         'system'
       ).catch(() => null);
     }
-    await addActivityPoints(guild.id, winnerOwner.id, 0, 2, league.league_id).catch(() => null);
+    await addActivityPoints(guild.id, winnerOwner.id, 0, 3, league.league_id).catch(() => null);
   }
 
   await pool.query(`UPDATE madden_imported_games SET rewards_paid_at = NOW() WHERE id = $1`, [game.id]);
