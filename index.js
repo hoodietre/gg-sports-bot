@@ -3728,7 +3728,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
       .addSubcommand(sc => sc.setName('iteminfo').setDescription('Look up an owned item by its tag, or search by name/serial').addStringOption(o => o.setName('search').setDescription('Item tag (e.g. GG-AB12CD), or item name, or "item name #serial"').setRequired(true)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
-            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common(60-120) uncommon(150-300) rare(400-700) epic(900-1400) legendary(1800-2500)').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('accessory_type').setDescription('Accessory only: which sub-slot this occupies (required for accessory items).').setRequired(false).addChoices({ name: 'neck', value: 'neck' }, { name: 'wrist', value: 'wrist' }, { name: 'face', value: 'face' }, { name: 'ears', value: 'ears' }, { name: 'legs', value: 'legs' }, { name: 'other', value: 'other' })).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
+            .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common(60-120) uncommon(150-300) rare(700-1000) epic(2000-3000) legendary(6000-9000)').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('accessory_type').setDescription('Accessory only: which sub-slot this occupies (required for accessory items).').setRequired(false).addChoices({ name: 'neck', value: 'neck' }, { name: 'wrist', value: 'wrist' }, { name: 'face', value: 'face' }, { name: 'ears', value: 'ears' }, { name: 'legs', value: 'legs' }, { name: 'other', value: 'other' })).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('useitem').setDescription('Request item use').addStringOption(o => o.setName('item').setDescription('Inventory item').setRequired(true)).addStringOption(o => o.setName('note').setDescription('Optional note').setRequired(false)))
       .addSubcommand(sc => sc.setName('redeemitem').setDescription('Staff: redeem inventory item').addUserOption(o => o.setName('user').setDescription('Item owner').setRequired(true)).addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)).addStringOption(o => o.setName('status').setDescription('redeemed, used, owned, requested').setRequired(false)).addStringOption(o => o.setName('note').setDescription('Fulfillment note').setRequired(false)))
@@ -63752,30 +63752,30 @@ async function showBotOwnerPanelHome(interaction, { update = true } = {}) {
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
 }
 
-// 7J-93ECONBALANCE / 7J-94CADENCEFIX: shop item pricing guide, derived
-// from the actual currency velocity these payout bounds produce. Corrected
-// from an earlier draft that assumed ~3 seasons/year — real cadence is
-// closer to 6/year (48-hour advance leagues, ~50 days for a 17-game season
-// incl. playoffs/offseason), which alone pushes games-only income to
-// ~1,150/year (191/season × 6). Sportsbook activity (achievement-tier
-// currency payouts, modest net profit for a competent bettor) adds a
-// realistic ~500/year on top, plus occasional staff awards (~150/year) —
-// ~1,800/year total for a single-league, moderately engaged player.
-// Deliberately calibrated toward the upper end of realistic single-league
-// velocity rather than a bare-minimum average, since currency balances are
-// per-guild — a user active across multiple leagues *within the same
-// server* pools all of that income into one shared balance, and pricing
-// needs to hold up against that faster accumulation, not just the median
-// single-league player. Multi-league players will naturally clear these
-// bands faster than the "time to afford" column suggests below; that's
-// expected, same as a more skilled player earning Legacy Score faster —
-// not something pricing alone should try to fully neutralize.
+// 7J-93ECONBALANCE / 7J-94CADENCEFIX / 7J-103MULTILEAGUE: shop item
+// pricing guide, derived from actual currency velocity. ~1,800/year is the
+// single-league estimate (191/season games income x 6 seasons/year, plus
+// ~500/year sportsbook activity, plus ~150/year occasional staff awards).
+// Since balance is fully global (one user_currency_balances row per user,
+// not per-guild — see the 7J-99WAGER-era comment on that table), and per
+// Hxxdie an average active user plays in ~6 leagues at once (with real
+// spread from 1 to well over 6 given how many sports this bot supports and
+// how easy it is to run multiple leagues in one server), the realistic
+// average annual income is closer to ~10,800/year (1,800 x 6), not
+// ~1,800/year. Rather than scale every tier up 6x — which would price
+// Common/Uncommon out of reach for genuinely single-league/casual players —
+// only Rare and up were stretched toward the multi-league reality, since
+// that's specifically where "buys the whole catalog too fast" happens: it's
+// the multi-league power users who have the currency to blow through a
+// shallow catalog, not the casual single-league player. Common/Uncommon
+// deliberately unchanged from the single-league estimate, so the shop stays
+// accessible regardless of how many leagues someone's in.
 const SHOP_PRICING_GUIDE_BANDS = [
-  { rarity: 'Common', range: '60–120', time: '2–3 weeks' },
-  { rarity: 'Uncommon', range: '150–300', time: '~a month' },
-  { rarity: 'Rare', range: '400–700', time: '~a season (~50 days)' },
-  { rarity: 'Epic', range: '900–1,400', time: '4–6 months' },
-  { rarity: 'Legendary', range: '1,800–2,500', time: 'close to a year (single-league pace)' },
+  { rarity: 'Common', range: '60–120', time: '2–3 weeks (single-league pace)' },
+  { rarity: 'Uncommon', range: '150–300', time: '~a month (single-league pace)' },
+  { rarity: 'Rare', range: '700–1,000', time: '~3–4 weeks even at 6-league pace' },
+  { rarity: 'Epic', range: '2,000–3,000', time: '~2–3 months even at 6-league pace' },
+  { rarity: 'Legendary', range: '6,000–9,000', time: 'most of a year even for the average 6-league power user' },
 ];
 
 function buildShopPricingGuideEmbed() {
@@ -63788,11 +63788,11 @@ function buildShopPricingGuideEmbed() {
       `(Game ${currencyConfigCache.game_played_payout_min}-${currencyConfigCache.game_played_payout_max}, ` +
       `Win ${currencyConfigCache.win_payout_min}-${currencyConfigCache.win_payout_max}, ` +
       `Championship ${currencyConfigCache.championship_payout_min}-${currencyConfigCache.championship_payout_max}) — ` +
-      `~1,150/year from games alone at 6 seasons/year, ~1,800/year realistic total for a single-league player including sportsbook activity and occasional awards.` +
+      `~1,800/year per league at 6 seasons/year including sportsbook + awards, ~10,800/year realistic average since currency is global and an average active user plays ~6 leagues at once.` +
       NL + NL +
       SHOP_PRICING_GUIDE_BANDS.map(b => `**${b.rarity}**: ${b.range} — ${b.time}`).join(NL) +
       NL + NL +
-      `Multi-league players (same server, multiple leagues pooling into one balance) will clear these faster — expected, not a flaw to fix with pricing alone. These are guidance, not an enforced limit. If the payout bounds change meaningfully, revisit this table by hand.`
+      `Common/Uncommon deliberately stayed at single-league pricing so the shop stays accessible regardless of league count — only Rare and up were stretched toward the multi-league reality, since that's where "buys the whole catalog too fast" actually happens. These are guidance, not an enforced limit. If the payout bounds or the average-leagues-per-user assumption change meaningfully, revisit this table by hand.`
     )
     .setFooter({ text: 'GG Sports • Bot Owner • Pricing Guide' })
     .setTimestamp();
