@@ -3484,6 +3484,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('preview').setDescription('Preview a shop/cosmetic item on your avatar').addStringOption(o => o.setName('item').setDescription('Item name').setRequired(true)))
       .addSubcommand(sc => sc.setName('buy').setDescription('Buy an item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
       .addSubcommand(sc => sc.setName('inventory').setDescription('View inventory').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
+      .addSubcommand(sc => sc.setName('iteminfo').setDescription('Look up an owned item by its tag, or search by name/serial').addStringOption(o => o.setName('search').setDescription('Item tag (e.g. GG-AB12CD), or item name, or "item name #serial"').setRequired(true)))
       .addSubcommand(sc => sc.setName('createitem').setDescription('Staff: create shop item').addStringOption(o => o.setName('name').setDescription('Item name').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Limited stock').setRequired(false)))
             .addSubcommand(sc => sc.setName('createcosmetic').setDescription('Bot owner: create a visual avatar cosmetic for the shop').addStringOption(o => o.setName('name').setDescription('Cosmetic name').setRequired(true)).addStringOption(o => o.setName('slot').setDescription('headwear, top, bottom, accessory, footwear, pet, effect, background').setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Price').setRequired(true)).addStringOption(o => o.setName('rarity').setDescription('common, uncommon, rare, epic, legendary').setRequired(false)).addIntegerOption(o => o.setName('stock').setDescription('Optional stock limit').setRequired(false)).addStringOption(o => o.setName('description').setDescription('Description').setRequired(false)).addStringOption(o => o.setName('art_key').setDescription('Links to assets/avatar/layers/{slot}/{art_key}/ — defaults to the name, slugified').setRequired(false)).addBooleanOption(o => o.setName('colorable').setDescription('Let buyers pick any color? Art must be neutral gray, not a fixed color.').setRequired(false)).addBooleanOption(o => o.setName('award_only').setDescription('Award item (MVP, Champion, etc.)? Hidden from shop browsing, only obtainable via /shop grantaward.').setRequired(false)).addStringOption(o => o.setName('gift_type').setDescription('Auto-granted gift item? Hidden from shop, granted by the daily gift scheduler, not /shop grantaward.').setRequired(false).addChoices({ name: 'birthday', value: 'birthday' }, { name: 'christmas', value: 'christmas' })).addIntegerOption(o => o.setName('gift_year').setDescription('Which year this gift item is for (defaults to current year). Make a new item each year.').setRequired(false)).addIntegerOption(o => o.setName('heel_lift_px').setDescription('Footwear only: pixels this elevates the wearer (heels/skates). Blank = flush to ground.').setRequired(false)).addStringOption(o => o.setName('gender_lock').setDescription('Footwear only: restrict this item to one gender (e.g. High Heel Pumps).').setRequired(false).addChoices({ name: 'male', value: 'male' }, { name: 'female', value: 'female' })).addStringOption(o => o.setName('body_variant').setDescription('Footwear only: alternate body pose folder name under bodies_variant/ (e.g. heel_pose).').setRequired(false)).addStringOption(o => o.setName('accessory_type').setDescription('Accessory only: which sub-slot this occupies (required for accessory items).').setRequired(false).addChoices({ name: 'neck', value: 'neck' }, { name: 'wrist', value: 'wrist' }, { name: 'face', value: 'face' }, { name: 'ears', value: 'ears' }, { name: 'legs', value: 'legs' }, { name: 'other', value: 'other' })).addStringOption(o => o.setName('pet_position').setDescription('Pet only: where it renders relative to the wearer. Defaults to left.').setRequired(false).addChoices({ name: 'left', value: 'left' }, { name: 'right', value: 'right' }, { name: 'front', value: 'front' }, { name: 'shoulder', value: 'shoulder' }, { name: 'float_left', value: 'float_left' }, { name: 'float_right', value: 'float_right' }, { name: 'float_center', value: 'float_center' })).addNumberOption(o => o.setName('pet_scale').setDescription('Pet only: height as a fraction of the wearer\'s height, e.g. 0.35. Blank uses a generic default.').setRequired(false)))
 .addSubcommand(sc => sc.setName('removeitem').setDescription('Staff: remove shop item').addStringOption(o => o.setName('item').setDescription('Item name or short ID').setRequired(true)))
@@ -6350,6 +6351,93 @@ function buildShopEmbed(settings, rows) {
   return embed;
 }
 
+// Item Info page — a single owned item's full detail, looked up by its
+// unique lookup_tag (shown in /shop inventory), or by "item name #serial"
+// for collectors who remember the item but not the tag. Joins shop_items
+// for cosmetic detail (rarity/slot/description) when the source item still
+// exists — award-only/gift items always exist since they're staff-created,
+// but a removed item still shows the ownership record itself.
+function buildItemInfoEmbed(settings, row) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🔎 ${row.item_name}${row.serial_number ? ' #' + row.serial_number : ''}`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Item Info' })
+    .setTimestamp();
+
+  const fields = [
+    { name: 'Owner', value: `<@${row.user_id}>`, inline: true },
+    { name: 'Status', value: row.status || 'owned', inline: true },
+  ];
+  if (row.serial_number) fields.push({ name: 'Serial Number', value: `#${row.serial_number}`, inline: true });
+  if (row.rarity) fields.push({ name: 'Rarity', value: row.rarity.charAt(0).toUpperCase() + row.rarity.slice(1), inline: true });
+  if (row.avatar_slot) fields.push({ name: 'Slot', value: row.avatar_slot, inline: true });
+  fields.push({ name: 'Price Paid', value: `${settings.currency_icon} ${row.price_paid}`, inline: true });
+  if (row.award_type) fields.push({ name: 'Award', value: row.award_type, inline: true });
+  fields.push({ name: 'Acquired', value: row.purchased_at ? new Date(row.purchased_at).toLocaleDateString('en-US') : 'Unknown', inline: true });
+  if (row.lookup_tag) fields.push({ name: 'Tag', value: `\`${row.lookup_tag}\``, inline: true });
+  if (row.item_description) fields.push({ name: 'Description', value: row.item_description, inline: false });
+
+  embed.addFields(fields);
+  return embed;
+}
+
+// Shared search logic behind /shop iteminfo and the Marketplace panel's Item
+// Info button — see buildItemInfoEmbed above for what gets displayed.
+// Returns { row, multipleMatches, content } where content is a ready-to-send
+// error/disambiguation message when row is null.
+async function resolveItemInfoSearch(guildId, search) {
+  const NL = String.fromCharCode(10);
+  const joinedSelect = `ui.*, si.rarity, si.avatar_slot, si.description AS item_description`;
+
+  // 1. Exact tag match — lookup_tag is globally unique, so this alone is
+  // enough to find the item regardless of which guild it's in.
+  let row = null;
+  const tagResult = await pool.query(
+    `SELECT ${joinedSelect} FROM user_inventory ui LEFT JOIN shop_items si ON si.id = ui.item_id
+     WHERE LOWER(ui.lookup_tag) = LOWER($1) LIMIT 1`,
+    [search]
+  ).catch(() => ({ rows: [] }));
+  if (tagResult.rows.length) row = tagResult.rows[0];
+
+  // 2. "Item Name #serial" pattern — scoped to this guild.
+  if (!row && guildId) {
+    const serialMatch = search.match(/^(.+?)\s*#\s*(\d+)$/);
+    if (serialMatch) {
+      const byNameSerial = await pool.query(
+        `SELECT ${joinedSelect} FROM user_inventory ui LEFT JOIN shop_items si ON si.id = ui.item_id
+         WHERE ui.guild_id = $1 AND LOWER(ui.item_name) = LOWER($2) AND ui.serial_number = $3 LIMIT 1`,
+        [guildId, serialMatch[1].trim(), Number.parseInt(serialMatch[2], 10)]
+      ).catch(() => ({ rows: [] }));
+      if (byNameSerial.rows.length) row = byNameSerial.rows[0];
+    }
+  }
+
+  // 3. Fallback: free-text name search, scoped to this guild — shows a pick
+  // list if it's ambiguous rather than guessing which owner's copy.
+  let multipleMatches = [];
+  if (!row && guildId) {
+    const nameResult = await pool.query(
+      `SELECT ${joinedSelect} FROM user_inventory ui LEFT JOIN shop_items si ON si.id = ui.item_id
+       WHERE ui.guild_id = $1 AND ui.item_name ILIKE $2
+       ORDER BY ui.serial_number ASC NULLS LAST, ui.purchased_at DESC
+       LIMIT 11`,
+      [guildId, `%${search}%`]
+    ).catch(() => ({ rows: [] }));
+    if (nameResult.rows.length === 1) row = nameResult.rows[0];
+    else if (nameResult.rows.length > 1) multipleMatches = nameResult.rows;
+  }
+
+  if (!row && !multipleMatches.length) {
+    return { row: null, multipleMatches: [], content: `No item found matching **${search}**. Try the exact tag (shown in \`/shop inventory\`), or "Item Name #serial".` };
+  }
+  if (!row) {
+    const lines = multipleMatches.slice(0, 10).map(r => `• **${r.item_name}${r.serial_number ? ' #' + r.serial_number : ''}** — <@${r.user_id}> — tag \`${r.lookup_tag || 'n/a'}\``);
+    const more = multipleMatches.length > 10 ? `${NL}...and more. Narrow your search with a serial number or exact tag.` : '';
+    return { row: null, multipleMatches, content: `Multiple items match **${search}**:${NL}${lines.join(NL)}${more}` };
+  }
+  return { row, multipleMatches: [], content: null };
+}
+
 function buildInventoryEmbed(settings, user, rows) {
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
@@ -6367,7 +6455,9 @@ function buildInventoryEmbed(settings, user, rows) {
   const lines = rows.map(row => {
     const date = row.purchased_at ? new Date(row.purchased_at).toLocaleDateString('en-US') : 'Unknown date';
     const note = row.request_note ? `${NL}Note: ${row.request_note}` : '';
-    return `**${shortItemId(row.id)} • ${row.item_name}** — ${settings.currency_icon} ${row.price_paid} • ${date}${NL}Status: **${row.status}**${note}`;
+    const serialText = row.serial_number ? ` #${row.serial_number}` : '';
+    const tagLine = row.lookup_tag ? `${NL}Tag: \`${row.lookup_tag}\`` : '';
+    return `**${shortItemId(row.id)} • ${row.item_name}${serialText}** — ${settings.currency_icon} ${row.price_paid} • ${date}${NL}Status: **${row.status}**${tagLine}${note}`;
   });
 
   embed.setDescription(lines.join(`${NL}${NL}`));
@@ -9035,6 +9125,17 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId === 'avatarlocker_myinventory') {
+      if (!interaction.guild) { await interaction.reply({ content: 'Use this from inside a server.', flags: MessageFlags.Ephemeral }); return; }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const result = await pool.query(
+        `SELECT * FROM user_inventory WHERE guild_id = $1 AND user_id = $2 ORDER BY purchased_at DESC LIMIT 50`,
+        [interaction.guild.id, interaction.user.id]
+      );
+      await interaction.reply({ embeds: [buildInventoryEmbed(settings, interaction.user, result.rows)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId === 'avatarlocker_customize_body') {
       await updateAvatarBodyCustomization(interaction.user.id, { bodyKey: interaction.values[0] });
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
@@ -9632,7 +9733,7 @@ if (interaction.commandName === 'avatar') {
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('art_key').setLabel('Art key (links to assets/avatar/layers/{slot}/)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.art_asset_key || '')),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('colorable').setLabel('Colorable? (yes/no)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.is_colorable ? 'yes' : 'no')),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_only').setLabel('Award-only? (yes/no)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.is_award_only ? 'yes' : 'no')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gift_type').setLabel('Gift type (blank/birthday/christmas)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.gift_type || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gift_type').setLabel('Gift type + year (blank/birthday/christmas 2027)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.gift_type ? (item.gift_type + (item.gift_year ? ' ' + item.gift_year : '')) : '')),
         );
       await interaction.showModal(modal);
       return;
@@ -9658,18 +9759,25 @@ if (interaction.commandName === 'avatar') {
       const awardOnlyRaw = interaction.fields.getTextInputValue('award_only').toLowerCase().trim();
       const isColorable = ['yes', 'true', 'y'].includes(colorableRaw);
       const isAwardOnly = ['yes', 'true', 'y'].includes(awardOnlyRaw);
-      const giftTypeRaw = interaction.fields.getTextInputValue('gift_type').toLowerCase().trim();
-      const giftType = ['birthday', 'christmas'].includes(giftTypeRaw) ? giftTypeRaw : null;
+      const giftRaw = interaction.fields.getTextInputValue('gift_type').toLowerCase().trim();
+      const giftMatch = giftRaw.match(/^(birthday|christmas)(?:\s+(\d{4}))?$/);
+      const giftType = giftMatch ? giftMatch[1] : null;
+      const giftYear = giftType ? (giftMatch[2] ? Number.parseInt(giftMatch[2], 10) : new Date().getFullYear()) : null;
+      if (giftRaw && !giftMatch) {
+        await interaction.editReply({ content: 'Invalid gift type. Use blank, "birthday", "christmas", or add a year like "christmas 2027".' });
+        return;
+      }
 
       await pool.query(
-        `UPDATE shop_items SET rarity = $1, art_asset_key = $2, is_colorable = $3, is_award_only = $4, gift_type = $5, updated_at = NOW() WHERE id = $6`,
-        [rarity, finalArtKey, isColorable, isAwardOnly, giftType, itemId]
+        `UPDATE shop_items SET rarity = $1, art_asset_key = $2, is_colorable = $3, is_award_only = $4, gift_type = $5, gift_year = $6, updated_at = NOW() WHERE id = $7`,
+        [rarity, finalArtKey, isColorable, isAwardOnly, giftType, giftYear, itemId]
       );
       await pool.query(`UPDATE avatar_catalog SET rarity = $1 WHERE item_name = $2 AND slot = $3 AND guild_id IS NULL`, [rarity, item.item_name, item.avatar_slot]).catch(() => null);
       await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
 
       const artNote = interaction.fields.getTextInputValue('art_key') && !artAssetExists ? ' ⚠️ No art found at that key — cleared, will render as a placeholder until fixed.' : '';
-      await interaction.editReply({ content: `Updated cosmetic details for **${item.item_name}**: rarity **${rarity}**, colorable **${isColorable ? 'yes' : 'no'}**, award-only **${isAwardOnly ? 'yes' : 'no'}**.${artNote}` });
+      const giftNote = giftType ? `, gift **${giftType} ${giftYear}**` : '';
+      await interaction.editReply({ content: `Updated cosmetic details for **${item.item_name}**: rarity **${rarity}**, colorable **${isColorable ? 'yes' : 'no'}**, award-only **${isAwardOnly ? 'yes' : 'no'}**${giftNote}.${artNote}` });
       return;
     }
 
@@ -10144,6 +10252,30 @@ if (interaction.commandName === 'avatar') {
         [interaction.user.id]
       );
       await interaction.reply({ embeds: [buildMyMarketplaceListingsEmbed(settings, interaction.user, result.rows)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'marketplacepanel_iteminfo') {
+      const modal = new ModalBuilder()
+        .setCustomId('marketplacepanel_iteminfo_modal')
+        .setTitle('Item Info')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('search').setLabel('Item tag, or "Item Name #serial", or name').setStyle(TextInputStyle.Short).setRequired(true)
+          ),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'marketplacepanel_iteminfo_modal') {
+      await interaction.deferReply({ ephemeral: true });
+      if (!interaction.guild) { await interaction.editReply({ content: 'Use this from inside a server.' }); return; }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const search = interaction.fields.getTextInputValue('search').trim();
+      const { row, content } = await resolveItemInfoSearch(interaction.guild.id, search);
+      if (!row) { await interaction.editReply({ content }); return; }
+      await interaction.editReply({ embeds: [buildItemInfoEmbed(settings, row)] });
       return;
     }
 
@@ -19465,10 +19597,19 @@ if (shopSubcommand === 'view') {
           .setTimestamp();
 
         embed.setDescription(result.rows.length
-          ? result.rows.map(row => '**' + shortInventoryItemId(row.id) + ' • ' + row.item_name + '** — ' + row.status + ' • Paid: ' + settings.currency_icon + ' ' + row.price_paid).join(NL)
+          ? result.rows.map(row => '**' + shortInventoryItemId(row.id) + ' • ' + row.item_name + (row.serial_number ? ' #' + row.serial_number : '') + '** — ' + row.status + ' • Paid: ' + settings.currency_icon + ' ' + row.price_paid + (row.lookup_tag ? NL + 'Tag: `' + row.lookup_tag + '`' : '')).join(NL + NL)
           : 'No inventory items found.');
 
         await interaction.editReply({ embeds: [embed], ephemeral: true });
+        return;
+      }
+
+      if (shopSubcommand === 'iteminfo') {
+        await interaction.deferReply({ ephemeral: true });
+        const search = interaction.options.getString('search').trim();
+        const { row, content } = await resolveItemInfoSearch(interaction.guild?.id || null, search);
+        if (!row) { await interaction.editReply({ content }); return; }
+        await interaction.editReply({ embeds: [buildItemInfoEmbed(settings, row)] });
         return;
       }
 
@@ -29340,7 +29481,8 @@ function buildAvatarLockerComponents() {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('avatarlocker_customize').setLabel('Customize Body').setEmoji('🧍').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('avatarlocker_recolor').setLabel('Recolor').setEmoji('🎨').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('avatarlocker_flex').setLabel('Flex').setEmoji('📸').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId('avatarlocker_flex').setLabel('Flex').setEmoji('📸').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('avatarlocker_myinventory').setLabel('My Inventory').setEmoji('🎒').setStyle(ButtonStyle.Secondary)
     ),
   ];
 }
@@ -30369,13 +30511,18 @@ function buildMarketplaceStarterEmbed() {
 }
 
 function buildMarketplaceStarterComponents() {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('marketplacepanel_browse').setLabel('Browse').setEmoji('🔍').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('marketplacepanel_list').setLabel('List an Item').setEmoji('🏷️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('marketplacepanel_buy').setLabel('Buy a Listing').setEmoji('💳').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('marketplacepanel_cancel').setLabel('Cancel a Listing').setEmoji('🗑️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('marketplacepanel_mylistings').setLabel('My Listings').setEmoji('📄').setStyle(ButtonStyle.Secondary),
-  )];
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('marketplacepanel_browse').setLabel('Browse').setEmoji('🔍').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('marketplacepanel_list').setLabel('List an Item').setEmoji('🏷️').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('marketplacepanel_buy').setLabel('Buy a Listing').setEmoji('💳').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('marketplacepanel_cancel').setLabel('Cancel a Listing').setEmoji('🗑️').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('marketplacepanel_mylistings').setLabel('My Listings').setEmoji('📄').setStyle(ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('marketplacepanel_iteminfo').setLabel('Item Info').setEmoji('🔎').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
 }
 
 
