@@ -44256,6 +44256,17 @@ function normalizeMaddenInjuryValue(value) {
   if (!raw) return null;
   const lower = raw.toLowerCase();
   if (['none', 'healthy', 'false', '0', 'no', 'null', 'n/a'].includes(lower)) return null;
+  // 7J-104INJURY: confirmed live via the Injury/Ability Field Scan against
+  // real synced data — injuryType: 97 showed up repeatedly across multiple
+  // different players' roster entries, which is exactly the signature of a
+  // "not injured" baseline/sentinel value, not a real injury code. This is
+  // almost certainly the actual root cause of the original bug report
+  // ("New Injuries: 59 → 97") — that wasn't an injury changing type, it was
+  // a player recovering (59 = some real injury → 97 = back to healthy),
+  // just not recognized as a recovery since nothing here expected the
+  // healthy baseline to be a non-obvious two-digit code instead of a
+  // literal "none"/"healthy"/"0".
+  if (lower === '97') return null;
   return raw;
 }
 
