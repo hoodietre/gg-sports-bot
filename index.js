@@ -10706,20 +10706,34 @@ if (interaction.commandName === 'avatar') {
     }
 
     // ---- Recruitment feature (7J-89RECRUIT) ----
+    // 7J-106LEAGUEPICK: was silently defaulting to whichever league is
+    // oldest in the guild (resolveLeague's fallback, getDefaultLeague —
+    // there's no actual "default" marker, just "created first") whenever a
+    // multi-league guild's Recruitment panel wasn't posted in a channel
+    // bound to one specific league. Confirmed live: Hxxdie's Recruitment
+    // panel locked onto his MLB league even though he has others. Now asks
+    // which league first whenever there's more than one active league —
+    // single-league guilds are completely unaffected, same instant
+    // behavior as before.
+    // 7J-106LEAGUEPICK: handles the picker shown by resolveOrPickRecruitmentLeague
+    // for any of the 4 league-specific Recruitment actions — dispatches to
+    // the matching extracted body function once a league is actually chosen.
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('recruitmentpanel_leaguepick:')) {
+      await interaction.deferUpdate();
+      const actionKey = interaction.customId.split(':')[1];
+      const league = await getLeagueById(interaction.values[0]);
+      if (!league) { await interaction.editReply({ content: 'That league no longer exists.', components: [] }); return; }
+      if (actionKey === 'browse') await runRecruitmentBrowse(interaction, league);
+      else if (actionKey === 'waitlist_join') await runRecruitmentWaitlistJoin(interaction, league);
+      else if (actionKey === 'review') await runRecruitmentReview(interaction, league);
+      else if (actionKey === 'discoverable') await runRecruitmentDiscoverableSettings(interaction, league);
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'recruitmentpanel_browse') {
       await interaction.deferReply({ ephemeral: true });
-      const league = await resolveLeague(interaction);
-      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
-      const vacant = await getVacantLeagueTeams(interaction.guild, league);
-      if (!vacant.length) { await interaction.editReply({ content: `No open teams in **${league.league_name}** right now — every team role has at least one member.` }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`recruitmentpanel_apply_team_select:${league.league_id}`)
-        .setPlaceholder('Pick a team to apply for')
-        .addOptions(vacant.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
-      await interaction.editReply({
-        content: `**${vacant.length}** open team${vacant.length === 1 ? '' : 's'} in **${league.league_name}**. Pick one to apply:`,
-        components: [new ActionRowBuilder().addComponents(menu)],
-      });
+      const league = await resolveOrPickRecruitmentLeague(interaction, 'browse');
+      if (league) await runRecruitmentBrowse(interaction, league);
       return;
     }
 
@@ -10847,23 +10861,8 @@ if (interaction.commandName === 'avatar') {
     // 7J-98WAITLIST
     if (interaction.isButton() && interaction.customId === 'recruitmentpanel_waitlist_join') {
       await interaction.deferReply({ ephemeral: true });
-      const league = await resolveLeague(interaction);
-      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
-      const teams = await getLeagueTeamRoles(league.league_id);
-      if (!teams.length) { await interaction.editReply({ content: `**${league.league_name}** doesn't have any team roles set up yet.` }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`recruitmentpanel_waitlist_select:${league.league_id}`)
-        .setPlaceholder('Pick specific team(s), or leave it as "Any Team"')
-        .setMinValues(1)
-        .setMaxValues(Math.min(teams.length + 1, 25))
-        .addOptions([
-          { label: 'Any Team', description: "Notify me when any team opens up", value: '__any__' },
-          ...teams.slice(0, 24).map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })),
-        ]);
-      await interaction.editReply({
-        content: `Join the waitlist for **${league.league_name}**. Pick "Any Team" or one/more specific teams — you'll get a DM when a match opens up.`,
-        components: [new ActionRowBuilder().addComponents(menu)],
-      });
+      const league = await resolveOrPickRecruitmentLeague(interaction, 'waitlist_join');
+      if (league) await runRecruitmentWaitlistJoin(interaction, league);
       return;
     }
 
@@ -11039,27 +11038,8 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId === 'recruitmentpanel_review') {
       await interaction.deferReply({ ephemeral: true });
-      const league = await resolveLeague(interaction);
-      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
-      if (!(await memberHasStaff(interaction.member, league))) { await interaction.editReply({ content: 'You need staff permissions to review applications.' }); return; }
-      const result = await pool.query(
-        `SELECT * FROM league_recruitment_applications WHERE league_id = $1 AND status = 'pending' ORDER BY created_at ASC LIMIT 25`,
-        [league.league_id]
-      );
-      if (!result.rows.length) { await interaction.editReply({ content: `No pending applications for **${league.league_name}**.` }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId('recruitmentpanel_review_select')
-        .setPlaceholder('Pick an application to review')
-        .addOptions(await Promise.all(result.rows.map(async r => {
-          const applicantMember = await interaction.guild.members.fetch(r.applicant_user_id).catch(() => null);
-          const applicantName = applicantMember?.user?.username || `User ${r.applicant_user_id}`;
-          return {
-            label: `${r.team_name} — ${applicantName}`.slice(0, 100),
-            description: `Applied ${new Date(r.created_at).toLocaleDateString('en-US')}`,
-            value: r.id,
-          };
-        })));
-      await interaction.editReply({ content: `**${result.rows.length}** pending application${result.rows.length === 1 ? '' : 's'} for **${league.league_name}**:`, components: [new ActionRowBuilder().addComponents(menu)] });
+      const league = await resolveOrPickRecruitmentLeague(interaction, 'review');
+      if (league) await runRecruitmentReview(interaction, league);
       return;
     }
 
@@ -11069,18 +11049,8 @@ if (interaction.commandName === 'avatar') {
     // board other servers' members browse.
     if (interaction.isButton() && interaction.customId === 'recruitmentpanel_discoverable_settings') {
       await interaction.deferReply({ ephemeral: true });
-      const league = await resolveLeague(interaction);
-      if (!league) { await interaction.editReply({ content: 'No active league found for this server/channel.' }); return; }
-      if (!(await memberHasStaff(interaction.member, league))) { await interaction.editReply({ content: 'You need staff permissions to change this setting.' }); return; }
-      const isOn = Boolean(league.recruitment_discoverable);
-      await interaction.editReply({
-        content: `**${league.league_name}** is currently **${isOn ? 'discoverable' : 'not discoverable'}** on the cross-server Discover Leagues board.` +
-          `${isOn ? '' : ' Same-guild Browse Open Teams still works either way — this only controls whether other servers can find your open teams.'}`,
-        components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`recruitmentpanel_discoverable_set:${league.league_id}:true`).setLabel('Turn On').setStyle(ButtonStyle.Success).setDisabled(isOn),
-          new ButtonBuilder().setCustomId(`recruitmentpanel_discoverable_set:${league.league_id}:false`).setLabel('Turn Off').setStyle(ButtonStyle.Danger).setDisabled(!isOn),
-        )],
-      });
+      const league = await resolveOrPickRecruitmentLeague(interaction, 'discoverable');
+      if (league) await runRecruitmentDiscoverableSettings(interaction, league);
       return;
     }
 
@@ -33110,6 +33080,98 @@ function buildRecruitmentStarterComponents() {
   ];
 }
 
+// 7J-106LEAGUEPICK: resolveLeague's fallback (getDefaultLeague — oldest
+// active league, no real "default" concept) worked fine for single-league
+// guilds but silently picked the wrong league for multi-league guilds
+// whenever Recruitment wasn't posted in a channel bound to one specific
+// league (it's a guild-wide multi-channel panel, so it usually isn't).
+// Confirmed live: locked onto MLB in a guild that also runs other leagues.
+// Returns the league directly when there's only one (identical behavior/
+// speed to before), otherwise shows a picker and returns null so the
+// caller knows to stop — the picker's own select handler re-invokes the
+// same action body function once a league is chosen.
+async function resolveOrPickRecruitmentLeague(interaction, actionKey) {
+  const leagues = await getActiveLeaguesForGuild(interaction.guild.id).catch(() => []);
+  if (!leagues.length) {
+    await interaction.editReply({ content: 'No active league found for this server.' });
+    return null;
+  }
+  if (leagues.length === 1) return leagues[0];
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`recruitmentpanel_leaguepick:${actionKey}`)
+    .setPlaceholder('Which league?')
+    .addOptions(leagues.slice(0, 25).map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id })));
+  await interaction.editReply({ content: 'This server runs more than one league — which one?', components: [new ActionRowBuilder().addComponents(menu)] });
+  return null;
+}
+
+async function runRecruitmentBrowse(interaction, league) {
+  const vacant = await getVacantLeagueTeams(interaction.guild, league);
+  if (!vacant.length) { await interaction.editReply({ content: `No open teams in **${league.league_name}** right now — every team role has at least one member.` }); return; }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`recruitmentpanel_apply_team_select:${league.league_id}`)
+    .setPlaceholder('Pick a team to apply for')
+    .addOptions(vacant.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
+  await interaction.editReply({
+    content: `**${vacant.length}** open team${vacant.length === 1 ? '' : 's'} in **${league.league_name}**. Pick one to apply:`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function runRecruitmentWaitlistJoin(interaction, league) {
+  const teams = await getLeagueTeamRoles(league.league_id);
+  if (!teams.length) { await interaction.editReply({ content: `**${league.league_name}** doesn't have any team roles set up yet.` }); return; }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`recruitmentpanel_waitlist_select:${league.league_id}`)
+    .setPlaceholder('Pick specific team(s), or leave it as "Any Team"')
+    .setMinValues(1)
+    .setMaxValues(Math.min(teams.length + 1, 25))
+    .addOptions([
+      { label: 'Any Team', description: "Notify me when any team opens up", value: '__any__' },
+      ...teams.slice(0, 24).map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })),
+    ]);
+  await interaction.editReply({
+    content: `Join the waitlist for **${league.league_name}**. Pick "Any Team" or one/more specific teams — you'll get a DM when a match opens up.`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function runRecruitmentReview(interaction, league) {
+  if (!(await memberHasStaff(interaction.member, league))) { await interaction.editReply({ content: 'You need staff permissions to review applications.' }); return; }
+  const result = await pool.query(
+    `SELECT * FROM league_recruitment_applications WHERE league_id = $1 AND status = 'pending' ORDER BY created_at ASC LIMIT 25`,
+    [league.league_id]
+  );
+  if (!result.rows.length) { await interaction.editReply({ content: `No pending applications for **${league.league_name}**.` }); return; }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('recruitmentpanel_review_select')
+    .setPlaceholder('Pick an application to review')
+    .addOptions(await Promise.all(result.rows.map(async r => {
+      const applicantMember = await interaction.guild.members.fetch(r.applicant_user_id).catch(() => null);
+      const applicantName = applicantMember?.user?.username || `User ${r.applicant_user_id}`;
+      return {
+        label: `${r.team_name} — ${applicantName}`.slice(0, 100),
+        description: `Applied ${new Date(r.created_at).toLocaleDateString('en-US')}`,
+        value: r.id,
+      };
+    })));
+  await interaction.editReply({ content: `**${result.rows.length}** pending application${result.rows.length === 1 ? '' : 's'} for **${league.league_name}**:`, components: [new ActionRowBuilder().addComponents(menu)] });
+}
+
+async function runRecruitmentDiscoverableSettings(interaction, league) {
+  if (!(await memberHasStaff(interaction.member, league))) { await interaction.editReply({ content: 'You need staff permissions to change this setting.' }); return; }
+  const isOn = Boolean(league.recruitment_discoverable);
+  await interaction.editReply({
+    content: `**${league.league_name}** is currently **${isOn ? 'discoverable' : 'not discoverable'}** on the cross-server Discover Leagues board.` +
+      `${isOn ? '' : ' Same-guild Browse Open Teams still works either way — this only controls whether other servers can find your open teams.'}`,
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`recruitmentpanel_discoverable_set:${league.league_id}:true`).setLabel('Turn On').setStyle(ButtonStyle.Success).setDisabled(isOn),
+      new ButtonBuilder().setCustomId(`recruitmentpanel_discoverable_set:${league.league_id}:false`).setLabel('Turn Off').setStyle(ButtonStyle.Danger).setDisabled(!isOn),
+    )],
+  });
+}
+
 function recruitmentStatusEmoji(status) {
   if (status === 'approved') return '✅';
   if (status === 'declined') return '❌';
@@ -43418,29 +43480,35 @@ function buildMaddenGameThreadInfoEmbed(league, game, matchup, owners = {}) {
 }
 
 function buildMaddenGameThreadButtons(gameId, isStarted = false, isFinal = false) {
+  // 7J-105BUTTONORDER: reordered per Hxxdie for a more natural progression
+  // through the buttons — info first, then the two "do something" actions
+  // (Wager, Stream Hub), then Game Started/Report Issue, staff-only
+  // buttons last. Wager stays gated by league.wagers_enabled at click time
+  // (not threaded through this function's 6 call sites) and disappears
+  // once the game is final, same as before — just moved up to row 1.
   const rows = [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`maddengame_thread_gamestarted:${gameId}`).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
-    ),
-    new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`maddengame_thread_info:${gameId}`).setLabel('Matchup Info').setEmoji('🏈').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`maddengame_thread_issue:${gameId}`).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger)
+    ),
+  ];
+  if (!isFinal) {
+    rows[0].addComponents(
+      new ButtonBuilder().setCustomId(`maddengame_thread_wager:${gameId}`).setLabel('Wager').setEmoji('💰').setStyle(ButtonStyle.Success),
+    );
+  }
+  rows[0].addComponents(
+    new ButtonBuilder().setCustomId(`maddengame_thread_stream:${gameId}`).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+  );
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`maddengame_thread_gamestarted:${gameId}`).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
+      new ButtonBuilder().setCustomId(`maddengame_thread_issue:${gameId}`).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger),
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`maddengame_thread_forcewin:${gameId}`).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`maddengame_thread_resetgame:${gameId}`).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger),
     ),
-  ];
-  // 7J-99WAGER: always present — gated by league.wagers_enabled at click
-  // time instead, rather than threading a new param through every one of
-  // this function's 6 call sites. Disabled once the game is final (no
-  // point wagering on a game that's already decided).
-  if (!isFinal) {
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`maddengame_thread_wager:${gameId}`).setLabel('Wager').setEmoji('💰').setStyle(ButtonStyle.Success),
-    ));
-  }
+  );
   return rows;
 }
 
