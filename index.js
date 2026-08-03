@@ -6802,6 +6802,26 @@ function buildItemInfoEmbed(settings, row) {
 // lookup answers both "what is this item" and "is anyone selling one."
 // Returns { row, multipleMatches, content } where content is a ready-to-send
 // error/disambiguation message when row is null.
+// 7J-113ITEMINFOPATH: direct lookup by inventory row id — backs the select-menu
+// click-through path (inventory list, Item Info disambiguation) which already
+// knows exactly which row was picked, so it skips resolveItemInfoSearch's
+// text-matching entirely rather than reconstructing a search string.
+async function getItemInfoRowById(rowId) {
+  const result = await pool.query(
+    `SELECT ui.*, si.rarity, si.avatar_slot, si.description AS item_description,
+       si.max_stock, si.is_exclusive, si.is_award_only, si.is_active, si.stock AS current_stock,
+       si.gift_type, si.gift_year, si.release_package,
+       ml.id AS listing_id, ml.asking_price AS listing_price
+     FROM user_inventory ui
+     LEFT JOIN shop_items si ON si.id = ui.item_id
+     LEFT JOIN marketplace_listings ml ON ml.inventory_id = ui.id AND ml.status = 'active'
+     WHERE ui.id = $1
+     LIMIT 1`,
+    [rowId]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
 async function resolveItemInfoSearch(guildId, search) {
   const NL = String.fromCharCode(10);
   const joinedSelect = `ui.*, si.rarity, si.avatar_slot, si.description AS item_description,
@@ -6875,12 +6895,39 @@ async function resolveItemInfoSearch(guildId, search) {
   return { row, multipleMatches: [], content: null };
 }
 
+// 7J-113ITEMINFOPATH: shared by every Item Info search entry point — when the
+// search is ambiguous, this turns resolveItemInfoSearch's multipleMatches
+// into a clickable select menu (capped at Discord's 25-option limit) instead
+// of leaving the person to retype a more specific search. Empty array if
+// there's nothing to disambiguate (exact match, or no matches at all).
+function buildItemInfoDisambiguationComponents(multipleMatches) {
+  if (!multipleMatches || !multipleMatches.length) return [];
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId('inventory_iteminfo_select')
+    .setPlaceholder('Which one?')
+    .addOptions(multipleMatches.slice(0, 25).map(r => {
+      const numberText = r.production_number ? ` #${r.production_number}` : '';
+      return {
+        label: `${r.item_name}${numberText}`.slice(0, 100),
+        value: r.id,
+        description: `owner tag ${r.lookup_tag || 'n/a'}${r.listing_id ? ' • for sale' : ''}`.slice(0, 100),
+      };
+    }));
+  return [new ActionRowBuilder().addComponents(selectMenu)];
+}
+
 // 7J-109PRODNUM: redesigned per Hxxdie's feedback — the old version led with the
 // raw inventory row id ("170b424c"), which read as a jumbled, meaningless code.
 // Now leads with the item name and its real Production Number, with the lookup
 // tag shown separately underneath for anyone who wants full detail via Item Info
 // (the button/command that calls buildItemInfoEmbed above) — this list stays
 // intentionally compact rather than trying to show every field inline.
+// 7J-113ITEMINFOPATH: returns { embed, components } instead of a bare embed —
+// per Hxxdie, "Item Info and My Inventory are still not giving any path to
+// seeing more detailed info on items." The text hint alone (type the tag or
+// "Item Name #number") wasn't a real path, just instructions to retype
+// something. Now attaches a select menu (capped at Discord's 25-option limit)
+// so tapping an item opens its Item Info directly — no retyping anything.
 function buildInventoryEmbed(settings, user, rows) {
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
@@ -6892,7 +6939,7 @@ function buildInventoryEmbed(settings, user, rows) {
 
   if (!rows.length) {
     embed.setDescription('No inventory items yet.');
-    return embed;
+    return { embed, components: [] };
   }
 
   const lines = rows.map(row => {
@@ -6903,9 +6950,24 @@ function buildInventoryEmbed(settings, user, rows) {
     return `**${row.item_name}${numberText}** — ${settings.currency_icon} ${row.price_paid} • ${date}${NL}Status: **${row.status}**${tagLine}${note}`;
   });
 
-  const intro = 'Use **Item Info** (tag or "Item Name #number") for full detail on any item below.';
+  const intro = rows.length > 25
+    ? `Showing the first 25 of ${rows.length} — pick one below for full detail, or use **Item Info** directly (tag or "Item Name #number") for anything further down.`
+    : 'Pick an item below for full detail.';
   embed.setDescription(intro + NL + NL + lines.join(`${NL}${NL}`));
-  return embed;
+
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId('inventory_iteminfo_select')
+    .setPlaceholder('View full detail on an item')
+    .addOptions(rows.slice(0, 25).map(row => {
+      const numberText = row.production_number ? ` #${row.production_number}` : (row.serial_number ? ` #${row.serial_number}` : '');
+      return {
+        label: `${row.item_name}${numberText}`.slice(0, 100),
+        value: row.id,
+        description: `${settings.currency_icon} ${row.price_paid} • ${row.status}`.slice(0, 100),
+      };
+    }));
+
+  return { embed, components: [new ActionRowBuilder().addComponents(selectMenu)] };
 }
 
 function buildEconomyEmbed(settings, stats) {
@@ -9655,7 +9717,8 @@ if (interaction.commandName === 'avatar') {
         `SELECT * FROM user_inventory WHERE guild_id = $1 AND user_id = $2 ORDER BY purchased_at DESC LIMIT 50`,
         [interaction.guild.id, interaction.user.id]
       );
-      await interaction.reply({ embeds: [buildInventoryEmbed(settings, interaction.user, result.rows)], flags: MessageFlags.Ephemeral });
+      const inventoryPayload = buildInventoryEmbed(settings, interaction.user, result.rows);
+      await interaction.reply({ embeds: [inventoryPayload.embed], components: inventoryPayload.components, flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -10854,8 +10917,21 @@ if (interaction.commandName === 'avatar') {
       if (!interaction.guild) { await interaction.editReply({ content: 'Use this from inside a server.' }); return; }
       const settings = await getCurrencySettings(interaction.guild.id);
       const search = interaction.fields.getTextInputValue('search').trim();
-      const { row, content } = await resolveItemInfoSearch(interaction.guild.id, search);
-      if (!row) { await interaction.editReply({ content }); return; }
+      const { row, multipleMatches, content } = await resolveItemInfoSearch(interaction.guild.id, search);
+      if (!row) { await interaction.editReply({ content, components: buildItemInfoDisambiguationComponents(multipleMatches) }); return; }
+      await interaction.editReply({ embeds: [buildItemInfoEmbed(settings, row)] });
+      return;
+    }
+
+    // 7J-113ITEMINFOPATH: shared by My Inventory's item picker and every Item
+    // Info disambiguation list — the select's value is the inventory row's own
+    // id, so this is a direct lookup, not a re-run of the text search.
+    if (interaction.isStringSelectMenu() && interaction.customId === 'inventory_iteminfo_select') {
+      await interaction.deferReply({ ephemeral: true });
+      if (!interaction.guild) { await interaction.editReply({ content: 'Use this from inside a server.' }); return; }
+      const settings = await getCurrencySettings(interaction.guild.id);
+      const row = await getItemInfoRowById(interaction.values[0]);
+      if (!row) { await interaction.editReply({ content: 'That item could not be found — it may have been removed.' }); return; }
       await interaction.editReply({ embeds: [buildItemInfoEmbed(settings, row)] });
       return;
     }
@@ -11079,6 +11155,53 @@ if (interaction.commandName === 'avatar') {
     }
 
     // 7J-99WAGER
+    // 7J-114REPORTISSUE: final step — actually opens the ticket. Discord
+    // doesn't support threads-within-threads, so if this modal was submitted
+    // from inside the game thread (the normal case — that's where the Report
+    // Issue button lives), the ticket has to post in the thread's PARENT
+    // channel instead, with a link back to the game thread for staff context.
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('maddengame_issue_modal:')) {
+      const [, requestAction, gameId] = interaction.customId.split(':');
+      const game = await getMaddenImportedGameById(gameId);
+      const league = game?.league_id ? await getLeagueById(game.league_id) : null;
+      if (!game || !league) { await interaction.reply({ content: 'That game could not be found anymore.', ephemeral: true }); return; }
+
+      const details = interaction.fields.getTextInputValue('details');
+      const requestLabel = requestAction === 'lagout' ? 'Lag Out' : requestAction === 'quit' ? 'Opponent Quit' : 'Reset Request';
+      const NL = String.fromCharCode(10);
+      const subject = requestLabel + ' — ' + game.away_team + ' @ ' + game.home_team;
+      let description = '**League:** ' + league.league_name;
+      description += NL + '**Game:** ' + game.away_team + ' @ ' + game.home_team;
+      description += NL + '**Request Type:** ' + requestLabel;
+      description += NL + '**Details:** ' + details;
+      description += NL + NL + 'Please upload proof/screenshots in this ticket thread. Attachments will be saved automatically as evidence.';
+
+      const sourceThread = interaction.channel?.isThread() ? interaction.channel : null;
+      const baseChannel = sourceThread ? sourceThread.parent : interaction.channel;
+      if (!baseChannel) {
+        await interaction.reply({ content: 'Could not find a channel to open this ticket in — the game thread\'s parent channel may have been deleted.', ephemeral: true });
+        return;
+      }
+
+      interaction.ggSportsReviewButtons = true;
+      interaction.ggSportsGameIssueMeta = {
+        gameId,
+        requestAction,
+        requestedTeamRoleId: null,
+        opponentUserId: null,
+      };
+      await openSupportTicket(interaction, 'gamerequest', {
+        subject,
+        description,
+        leagueName: league.league_name,
+        baseChannel,
+        sourceThread,
+      });
+      delete interaction.ggSportsReviewButtons;
+      delete interaction.ggSportsGameIssueMeta;
+      return;
+    }
+
     if (interaction.isModalSubmit() && interaction.customId.startsWith('gamewager_propose_modal:')) {
       await interaction.deferReply();
       const gameId = interaction.customId.split(':')[1];
@@ -11792,6 +11915,22 @@ if (interaction.commandName === 'avatar') {
 
       if (interaction.customId.startsWith('maddengame_thread_')) {
         await handleMaddenGameThreadButton(interaction);
+        return;
+      }
+
+      // 7J-114REPORTISSUE: second step of Report Issue — pick a type, now
+      // collect the details via modal before actually opening the ticket.
+      if (interaction.customId.startsWith('maddengame_issue_type:')) {
+        const [, requestAction, gameId] = interaction.customId.split(':');
+        const modal = new ModalBuilder()
+          .setCustomId(`maddengame_issue_modal:${requestAction}:${gameId}`)
+          .setTitle('Report ' + (requestAction === 'lagout' ? 'Lag Out' : requestAction === 'quit' ? 'Opponent Quit' : 'Reset Request'))
+          .addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder().setCustomId('details').setLabel('What happened?').setStyle(TextInputStyle.Paragraph).setRequired(true)
+            )
+          );
+        await interaction.showModal(modal);
         return;
       }
 
@@ -12755,8 +12894,13 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('multipanel_post:')) {
       const [, leagueId, panelType, origin] = interaction.customId.split(':');
-      const league = await getLeagueById(leagueId);
-      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+      // 7J-112SERVERSETUP: guild-wide entry (from Admin Panel > Server Setup)
+      // has no real league to look up — leagueId is the ADMIN_SERVERSETUP_MARKER
+      // sentinel instead, and permission is checked guild-wide.
+      const isAdminOrigin = leagueId === ADMIN_SERVERSETUP_MARKER;
+      const league = isAdminOrigin ? null : await getLeagueById(leagueId);
+      const hasPermission = isAdminOrigin ? await userCanUseLeagueSetup(interaction, null) : (league && await userCanUseLeagueSetup(interaction, league));
+      if (!hasPermission) {
         await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
         return;
       }
@@ -12791,8 +12935,10 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId.startsWith('multipanel_refreshall:')) {
       const [, leagueId, panelType, origin] = interaction.customId.split(':');
-      const league = await getLeagueById(leagueId);
-      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+      const isAdminOrigin = leagueId === ADMIN_SERVERSETUP_MARKER;
+      const league = isAdminOrigin ? null : await getLeagueById(leagueId);
+      const hasPermission = isAdminOrigin ? await userCanUseLeagueSetup(interaction, null) : (league && await userCanUseLeagueSetup(interaction, league));
+      if (!hasPermission) {
         await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
         return;
       }
@@ -12807,8 +12953,10 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('multipanel_remove:')) {
       const [, leagueId, panelType, origin] = interaction.customId.split(':');
-      const league = await getLeagueById(leagueId);
-      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+      const isAdminOrigin = leagueId === ADMIN_SERVERSETUP_MARKER;
+      const league = isAdminOrigin ? null : await getLeagueById(leagueId);
+      const hasPermission = isAdminOrigin ? await userCanUseLeagueSetup(interaction, null) : (league && await userCanUseLeagueSetup(interaction, league));
+      if (!hasPermission) {
         await interaction.reply({ content: 'You do not have permission to manage panels.', ephemeral: true });
         return;
       }
@@ -12824,6 +12972,17 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.isButton() && interaction.customId.startsWith('multipanel_back:')) {
       const [, leagueId, origin] = interaction.customId.split(':');
+      // 7J-112SERVERSETUP: guild-wide origin goes back to Server Setup, not a
+      // league's Commissioner Panel — no league lookup needed at all here.
+      if (leagueId === ADMIN_SERVERSETUP_MARKER) {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
+          await interaction.reply({ content: 'You do not have permission to use the admin panel.', ephemeral: true });
+          return;
+        }
+        const payload = await buildAdminServerSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+        await interaction.update({ content: null, ...payload });
+        return;
+      }
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
@@ -15894,17 +16053,20 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    // 7J-110RELOCATE: guild-wide — creates a "GG Sports" category plus the 7
+    // 7J-112SERVERSETUP: guild-wide — creates a "GG Sports" category plus the 7
     // Multi-Channel Panel channels (Shop/Sportsbook/Marketplace/Avatar/Bank/
-    // Member Profile/Recruitment) and posts each board immediately. None of
-    // these are tied to a specific league, so unlike Auto Create League Roles
-    // below, this doesn't need a league picker — it acts on the guild directly.
-    if (interaction.isButton() && interaction.customId === 'adminpanel_autosetup_channels') {
+    // Member Profile/Recruitment), posts each board immediately, and (if
+    // Welcome/Leave is enabled but not yet pointed at a channel) also creates
+    // those two channels. Renamed from "Auto Setup Channels" and moved here
+    // from League Setup per Hxxdie — none of this was ever league-specific.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_serversetup_autosetup') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
       await interaction.deferReply({ ephemeral: true });
       const { category, channels } = await autoCreateGuildMultiChannelPanels(interaction.guild);
+      const payload = await buildAdminServerSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.editReply({
-        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment panels. Continue league-specific setup (core channels, roles, trade setup) from that league's Commissioner Panel.`,
+        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment panels${channels.length > 7 ? ' (Welcome/Leave channels included)' : ''}. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
+        ...payload,
       });
       return;
     }
@@ -16119,12 +16281,13 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    // 7J-96WELCOMER
+    // 7J-112SERVERSETUP: welcome/leave toggle + channel selects moved to their
+    // own sub-page (buildAdminWelcomeLeavePayload), reached from Server Setup.
     if (interaction.isButton() && interaction.customId === 'adminpanel_settings_welcomeleave_toggle') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const current = await getGuildSettings(interaction.guild.id, interaction.guild.name);
       await setGuildWelcomeLeaveEnabled(interaction.guild.id, interaction.guild.name, !current.welcome_leave_enabled);
-      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      const payload = await buildAdminWelcomeLeavePayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: null, ...payload });
       return;
     }
@@ -16132,7 +16295,7 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_settings_welcome_channel') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       await setGuildWelcomeChannel(interaction.guild.id, interaction.guild.name, interaction.values[0]);
-      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      const payload = await buildAdminWelcomeLeavePayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: 'Welcome channel set to ' + `<#${interaction.values[0]}>` + '.', ...payload });
       return;
     }
@@ -16140,23 +16303,39 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_settings_leave_channel') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       await setGuildLeaveChannel(interaction.guild.id, interaction.guild.name, interaction.values[0]);
-      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      const payload = await buildAdminWelcomeLeavePayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: 'Leave channel set to ' + `<#${interaction.values[0]}>` + '.', ...payload });
       return;
     }
 
-    // 7J-111TICKETSCOPE: Ticket Settings sub-page.
-    if (interaction.isButton() && interaction.customId === 'adminpanel_settings_tickets') {
+    // 7J-112SERVERSETUP: Server Setup category and its sub-pages.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_serversetup_welcomeleave') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const payload = await buildAdminWelcomeLeavePayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_serversetup_tickets') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const payload = await buildAdminTicketSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: null, ...payload });
       return;
     }
 
-    if (interaction.isButton() && interaction.customId === 'adminpanel_settings_from_tickets') {
+    // Shared back button for both Server Setup sub-pages above.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_serversetup_from_sub') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
-      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      const payload = await buildAdminServerSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_serversetup_multichannel_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const panelType = interaction.values[0];
+      const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, ADMIN_SERVERSETUP_MARKER, panelType, 'adminserversetup');
+      await interaction.update(payload);
       return;
     }
 
@@ -21068,15 +21247,16 @@ if (shopSubcommand === 'view') {
         // it — this copy still showed the raw row-id prefix after the redesign
         // below fixed it there). Now reuses the shared builder so both surfaces
         // can't drift apart again.
-        await interaction.editReply({ embeds: [buildInventoryEmbed(settings, targetUser, result.rows)], ephemeral: true });
+        const shopInventoryPayload = buildInventoryEmbed(settings, targetUser, result.rows);
+        await interaction.editReply({ embeds: [shopInventoryPayload.embed], components: shopInventoryPayload.components, ephemeral: true });
         return;
       }
 
       if (shopSubcommand === 'iteminfo') {
         await interaction.deferReply({ ephemeral: true });
         const search = interaction.options.getString('search').trim();
-        const { row, content } = await resolveItemInfoSearch(interaction.guild?.id || null, search);
-        if (!row) { await interaction.editReply({ content }); return; }
+        const { row, multipleMatches, content } = await resolveItemInfoSearch(interaction.guild?.id || null, search);
+        if (!row) { await interaction.editReply({ content, components: buildItemInfoDisambiguationComponents(multipleMatches) }); return; }
         await interaction.editReply({ embeds: [buildItemInfoEmbed(settings, row)] });
         return;
       }
@@ -24472,7 +24652,8 @@ if (shopSubcommand === 'view') {
         `SELECT * FROM user_inventory WHERE user_id = $1 ORDER BY purchased_at DESC LIMIT 50`,
         [targetUser.id]
       );
-      await interaction.editReply({ embeds: [buildInventoryEmbed(settings, targetUser, result.rows)], ephemeral: true });
+      const standaloneInventoryPayload = buildInventoryEmbed(settings, targetUser, result.rows);
+      await interaction.editReply({ embeds: [standaloneInventoryPayload.embed], components: standaloneInventoryPayload.components, ephemeral: true });
       return;
     }
 
@@ -28973,14 +29154,6 @@ async function openGameIssueTicket(interaction, ticketType) {
   description += NL + '**Details:** ' + (details || 'No details provided yet.');
   description += NL + NL + 'Please upload proof/screenshots in this ticket thread. Attachments will be saved automatically as evidence.';
 
-  const originalGetString = interaction.options.getString.bind(interaction.options);
-  interaction.options.getString = function(name) {
-    if (name === 'subject') return subject;
-    if (name === 'description') return description;
-    if (name === 'league') return activeLeague.league_name;
-    return originalGetString(name);
-  };
-
   const requestedTeamRoleId = team?.id || null;
   const opponentUserId = opponent?.id || null;
 
@@ -28992,20 +29165,31 @@ async function openGameIssueTicket(interaction, ticketType) {
     opponentUserId,
   };
 
-  await openSupportTicket(interaction, 'gamerequest');
+  // 7J-114REPORTISSUE: used to monkey-patch interaction.options.getString to
+  // feed openSupportTicket its subject/description/league — worked for slash
+  // commands (which have a real .options), but broke the moment anything
+  // else (button/modal) needed the same code path, since those interactions
+  // don't have .options at all. openSupportTicket now takes these as an
+  // explicit overrides object instead, so both paths can share one function.
+  await openSupportTicket(interaction, 'gamerequest', { subject, description, leagueName: activeLeague.league_name });
   delete interaction.ggSportsReviewButtons;
   delete interaction.ggSportsGameIssueMeta;
 }
 
-async function openSupportTicket(interaction, ticketType) {
+// 7J-114REPORTISSUE: overrides lets non-slash-command callers (the game
+// thread's Report Issue button + modal) supply subject/description/league
+// and the channel to post the ticket starter message in, without needing a
+// real interaction.options to read from. Slash-command callers (/ticket
+// open|dispute|game) pass no overrides and behave exactly as before.
+async function openSupportTicket(interaction, ticketType, overrides = {}) {
   if (!interaction.guild) return;
 
   const shouldAddReviewButtons = interaction.ggSportsReviewButtons === true;
   const gameIssueMeta = interaction.ggSportsGameIssueMeta || null;
 
-  const subject = interaction.options.getString('subject');
-  const description = interaction.options.getString('description');
-  const leagueName = interaction.options.getString('league');
+  const subject = overrides.subject !== undefined ? overrides.subject : interaction.options.getString('subject');
+  const description = overrides.description !== undefined ? overrides.description : interaction.options.getString('description');
+  const leagueName = overrides.leagueName !== undefined ? overrides.leagueName : interaction.options.getString('league');
   // 7J-111TICKETSCOPE: explicit league name wins; otherwise infer ONLY from a
   // real signal — the channel the ticket was opened in being one of that
   // league's own configured channels (getLeagueByChannel). Deliberately does
@@ -29023,7 +29207,16 @@ async function openSupportTicket(interaction, ticketType) {
     return;
   }
 
-  const baseChannel = interaction.channel;
+  // 7J-114REPORTISSUE: Discord doesn't support threads-within-threads — a
+  // message posted inside a thread can't itself start a new thread. Report
+  // Issue is meant to be pressed from inside a game thread (that's the whole
+  // point — the button lives on the game thread's own message), so this
+  // can't just use interaction.channel the way the slash commands do: it has
+  // to climb to the thread's parent channel and post the ticket there
+  // instead, or ticket creation would silently fail every single time.
+  // overrides.baseChannel lets the game-thread flow supply that explicitly;
+  // everything else keeps using interaction.channel unchanged.
+  const baseChannel = overrides.baseChannel || interaction.channel;
   if (!baseChannel || !baseChannel.isTextBased()) {
     await interaction.reply({ content: 'Tickets can only be opened from a text channel.', ephemeral: true });
     return;
@@ -29051,7 +29244,10 @@ async function openSupportTicket(interaction, ticketType) {
   const mentionText = mentionRoleIds.length ? mentionRoleIds.map(id => '<@&' + id + '>').join(' ') : '';
 
   const starterPayload = {
-    content: '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (mentionText ? ' ' + mentionText : ''),
+    // If this ticket was opened from a game thread (overrides.sourceThread),
+    // link back to it — the ticket thread itself lives in a different parent
+    // channel now, so that link is the only way staff get back to the game.
+    content: '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (overrides.sourceThread ? ' From: ' + overrides.sourceThread.toString() + '.' : '') + (mentionText ? ' ' + mentionText : ''),
     embeds: [buildTicketEmbed({ type: ticketType, subject, description, creator: interaction.user })],
     allowedMentions: {
       users: [interaction.user.id],
@@ -33349,13 +33545,18 @@ async function notifyWaitlistForVacantTeam(guild, league, teamName) {
   }
 }
 
-// 7J-110RELOCATE: guild-wide counterpart to autoCreateLeagueChannels below —
+// 7J-112SERVERSETUP: guild-wide counterpart to autoCreateLeagueChannels below —
 // creates one "GG Sports" category (not named after any one league, since
-// none of these 7 panel types are league-specific — they're guild-wide via
-// multi_channel_panels, keyed by guild_id/panel_type/channel_id only) and
-// posts each board immediately via the existing postOrRefreshMultiChannelPanel.
-// Lives in the Admin Panel's League Setup page per Hxxdie, since that's a
-// guild-wide page and fits the "just created a league" flow naturally.
+// none of these panel types are league-specific — the 7 real multi-channel
+// panels are guild-wide via multi_channel_panels, keyed by guild_id/panel_type/
+// channel_id only) and posts each board immediately via the existing
+// postOrRefreshMultiChannelPanel. Lives in the Admin Panel's Server Setup
+// category per Hxxdie (moved here from League Setup — this function was never
+// actually league-specific, so Server Setup is the more honest home).
+// Also creates Welcome/Leave channels here when that feature is enabled but
+// channels aren't set yet, per Hxxdie's ask to fold that into this flow too —
+// skipped entirely (not just left unset) if welcome_leave_enabled is off, so
+// this doesn't create channels for a feature the server hasn't turned on.
 async function autoCreateGuildMultiChannelPanels(guild) {
   const category = await guild.channels.create({ name: 'GG Sports', type: ChannelType.GuildCategory });
   const created = [];
@@ -33374,6 +33575,25 @@ async function autoCreateGuildMultiChannelPanels(guild) {
     await postOrRefreshMultiChannelPanel(guild, panelType, channel).catch(() => null);
     created.push(channel);
   }
+
+  const guildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
+  if (guildSettings?.welcome_leave_enabled) {
+    if (!guildSettings.welcome_channel_id) {
+      const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+      if (welcomeChannel) {
+        await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
+        created.push(welcomeChannel);
+      }
+    }
+    if (!guildSettings.leave_channel_id) {
+      const leaveChannel = await guild.channels.create({ name: 'leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+      if (leaveChannel) {
+        await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
+        created.push(leaveChannel);
+      }
+    }
+  }
+
   return { category, channels: created };
 }
 
@@ -33929,13 +34149,12 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
   { value: 'madden_sportsbook_channel', label: 'Madden Sportsbook Channel', description: 'Channel for Madden betting lines (user vs user games)', kind: 'channel' },
   { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed only — not where the board itself posts, see "Sportsbook Board" below', kind: 'channel' },
-  { value: 'shop_panel_channels', label: 'Shop Panel', description: 'Manage which channel(s) the shop panel is posted in — can be more than one', kind: 'multichannel' },
-  { value: 'sportsbook_panel_channels', label: 'Sportsbook Board', description: 'Manage which channel(s) the live sportsbook board is posted in — can be more than one', kind: 'multichannel' },
-  { value: 'marketplace_panel_channels', label: 'Marketplace Panel', description: 'Manage which channel(s) the marketplace panel is posted in — can be more than one', kind: 'multichannel' },
-  { value: 'avatar_panel_channels', label: 'Avatar Panel', description: 'Manage which channel(s) the avatar panel is posted in — can be more than one', kind: 'multichannel' },
-  { value: 'bank_panel_channels', label: 'Bank Starter', description: 'Manage which channel(s) the bank starter panel is posted in — can be more than one', kind: 'multichannel' },
-  { value: 'profile_panel_channels', label: 'Member Profile Starter', description: 'Manage which channel(s) the member profile starter panel is posted in — can be more than one', kind: 'multichannel' },
-  { value: 'recruitment_panel_channels', label: 'Recruitment Panel', description: 'Manage which channel(s) the recruitment panel is posted in — can be more than one', kind: 'multichannel' },
+  // 7J-112SERVERSETUP: the 7 multichannel entries that used to live here
+  // (Shop/Sportsbook/Marketplace/Avatar/Bank/Profile/Recruitment) moved to
+  // Admin Panel > Server Setup — none of them were ever league-specific
+  // (multi_channel_panels is keyed by guild_id only), so a per-league page
+  // was never the right home. See buildAdminServerSetupPayload and
+  // MULTI_CHANNEL_DASHBOARD_MAP below.
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
   { value: 'trade_offer_channel', label: 'Trade Offer Channel', description: 'Trade offer panel channel', kind: 'channel' },
   { value: 'trade_committee_channel', label: 'Trade Committee Channel', description: 'Trade voting channel', kind: 'channel' },
@@ -33960,6 +34179,13 @@ const MULTI_CHANNEL_DASHBOARD_MAP = {
   recruitment_panel_channels: 'recruitment',
 };
 
+// 7J-112SERVERSETUP: sentinel passed as "leagueId" to buildMultiChannelPanelManagerPayload
+// and the multipanel_* handlers when reached from Admin Panel > Server Setup
+// instead of a real league's Commissioner Panel. Every multipanel_* handler
+// checks for this literal string before calling getLeagueById, since 'guild'
+// is never a real UUID and would otherwise just silently fail the lookup.
+const ADMIN_SERVERSETUP_MARKER = 'guild';
+
 const SETUP_PANEL_OPTIONS = [
   { value: 'standings_panel', label: 'Create/Refresh Standings Panel (generic, non-Madden)' },
   { value: 'league_hof_panel', label: 'Post/Refresh League Hall of Fame Board (generic, non-Madden)' },
@@ -33973,29 +34199,25 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'gm_panel_starter_panel', label: 'Post/Refresh GM Panel Starter' },
   { value: 'league_leaders_panel', label: 'Post/Refresh League Leaders Board' },
   { value: 'award_race_panel', label: 'Post/Refresh Award Race Board' },
-  { value: 'member_profile_starter_panel', label: 'Manage Member Profile Starter (multi-channel)' },
-  { value: 'bank_starter_panel', label: 'Manage Bank Starter (multi-channel)' },
+  // 7J-112SERVERSETUP: member_profile_starter_panel/bank_starter_panel/
+  // shop_panel/sportsbook_panel/marketplace_panel/avatar_panel removed —
+  // all 7 Multi-Channel Panels (Recruitment was never listed here to begin
+  // with) moved to Admin Panel > Server Setup, guild-wide, not per-league.
   { value: 'league_rules_panel', label: 'Post/Refresh League Rules Panel' },
   { value: 'game_center_panel', label: 'Post/Refresh Game Center Panel' },
-  { value: 'shop_panel', label: 'Manage Shop Panel (multi-channel)' },
-  { value: 'sportsbook_panel', label: 'Manage Sportsbook Board (multi-channel)' },
-  { value: 'marketplace_panel', label: 'Manage Marketplace Panel (multi-channel)' },
-  { value: 'avatar_panel', label: 'Manage Avatar Panel (multi-channel)' },
   { value: 'team_owners_panel', label: 'Create/Refresh Team Owners Panel' },
   { value: 'trade_offer_panel', label: 'Create/Refresh Trade Offer Panel' },
   { value: 'trade_count_panel', label: 'Create/Refresh Trade Count Panel' },
   { value: 'ticket_panel', label: 'Create/Refresh Ticket Panel' },
 ];
 
-// Setup-menu keys that route to the multi-channel manager instead of
-// createConfiguredPanelFromSetup's single-configured-channel flow.
+// 7J-112SERVERSETUP: emptied out — used to route Shop/Sportsbook/Bank/Member
+// Profile/Marketplace/Avatar to the multi-channel manager from the per-league
+// Panels menu; all 6 removed from SETUP_PANEL_OPTIONS above, so this map is
+// never populated by any real lookup anymore. Left in place (not deleted) since
+// the setup_create_panel handler still references it — an always-empty lookup
+// is harmless and simpler than also stripping that handler's dead branch.
 const MULTI_CHANNEL_SETUP_PANEL_MAP = {
-  shop_panel: 'shop',
-  sportsbook_panel: 'sportsbook',
-  bank_starter_panel: 'bank',
-  member_profile_starter_panel: 'profile',
-  marketplace_panel: 'marketplace',
-  avatar_panel: 'avatar',
 };
 
 async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType, origin = 'panels') {
@@ -34040,7 +34262,7 @@ async function buildMultiChannelPanelManagerPayload(guild, leagueId, panelType, 
   }
 
   rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`multipanel_back:${leagueId}:${origin}`).setLabel(origin === 'dashboard' ? '⬅ Back to Channels & Roles' : '⬅ Back to Panels').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`multipanel_back:${leagueId}:${origin}`).setLabel(origin === 'dashboard' ? '⬅ Back to Channels & Roles' : origin === 'adminserversetup' ? '⬅ Back to Server Setup' : '⬅ Back to Panels').setStyle(ButtonStyle.Secondary)
   ));
 
   return { content: null, embeds: [embed], components: rows };
@@ -39629,6 +39851,12 @@ function getAdminPanelCategories(lang) {
     { value: 'shop', label: t(lang, 'cat_shop_label'), description: t(lang, 'cat_shop_desc'), emoji: '🛍️' },
     { value: 'sportsbook', label: t(lang, 'cat_sportsbook_label'), description: t(lang, 'cat_sportsbook_desc'), emoji: '📊' },
     { value: 'tournament', label: t(lang, 'cat_tournament_label'), description: t(lang, 'cat_tournament_desc'), emoji: '🏆' },
+    // 7J-112SERVERSETUP: new category, English-only (not run through t()) like
+    // several other strings added this session — this bot's i18n coverage is
+    // still Phase 1 (Admin Panel core only, per the tracking doc's rollout
+    // plan), so plain English here is consistent with precedent rather than a
+    // regression. Revisit when i18n Phase 2+ actually happens.
+    { value: 'serversetup', label: 'Server Setup', description: 'Auto Setup Server Channels, Ticket Settings, Welcome/Leave, Multi-Channel Panels', emoji: '🏗️' },
     { value: 'settings', label: t(lang, 'cat_settings_label'), description: t(lang, 'cat_settings_desc'), emoji: '⚙️' },
   ];
 }
@@ -39690,18 +39918,14 @@ async function buildAdminLeagueSetupPayload(guild, lang) {
       .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
     components.push(new ActionRowBuilder().addComponents(deleteMenu));
   }
-  // 7J-110RELOCATE: Auto Setup Channels / Auto Create League Roles, relocated here
-  // per Hxxdie — this page is guild-wide league management, and Auto Setup Channels
-  // specifically only ever touches guild-wide infrastructure (the Multi-Channel
-  // Panels — Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment —
-  // none of which are tied to any one specific league), so it fits the league
-  // creation flow better here than buried in one league's Commissioner Panel.
-  // Auto Create League Roles DOES need a specific league (roles are per-league
-  // settings) — clicking it opens a league picker rather than acting on all of
-  // them at once. Only shown once at least one league exists.
+  // 7J-112SERVERSETUP: Auto Setup Channels moved OUT of here to the new Server
+  // Setup category, per Hxxdie — it was never actually league-specific (it only
+  // ever touched guild-wide infrastructure), so Server Setup is the more honest
+  // home for it. Auto Create League Roles stays here since roles genuinely ARE
+  // per-league settings — clicking it opens a league picker rather than acting
+  // on all of them at once. Only shown once at least one league exists.
   if (result.rows.length) {
     components.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('adminpanel_autosetup_channels').setLabel('Auto Setup Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('adminpanel_autosetup_roles').setLabel('Auto Create League Roles').setEmoji('🏗️').setStyle(ButtonStyle.Success),
     ));
   }
@@ -39795,6 +40019,10 @@ async function buildAdminSportsbookPayload(guild, lang) {
   return { embeds: [embed], components: [row1, buildAdminPanelBackRow(lang)] };
 }
 
+// 7J-112SERVERSETUP: Welcome/Leave and Ticket Settings moved OUT of here to
+// the new Server Setup category per Hxxdie, leaving just Language +
+// Onboarding — freed up enough row budget that this no longer needs to be
+// split at all.
 async function buildAdminSettingsPayload(guild, lang) {
   const settings = await getGuildSettings(guild.id, guild.name);
   const currentLang = SUPPORTED_LANGUAGES.find(l => l.value === settings.language) || SUPPORTED_LANGUAGES[0];
@@ -39804,11 +40032,8 @@ async function buildAdminSettingsPayload(guild, lang) {
     .addFields(
       { name: t(lang, 'settings_language_field'), value: `${currentLang.emoji} ${currentLang.label}`, inline: true },
       { name: t(lang, 'settings_onboarding_field'), value: settings.onboarding_enabled ? t(lang, 'settings_onboarding_enabled') : t(lang, 'settings_onboarding_disabled'), inline: true },
-      { name: 'Welcome/Leave Announcements', value: settings.welcome_leave_enabled ? '✅ Enabled' : '🚫 Disabled', inline: true },
-      { name: 'Welcome Channel', value: settings.welcome_channel_id ? `<#${settings.welcome_channel_id}>` : 'Not set', inline: true },
-      { name: 'Leave Channel', value: settings.leave_channel_id ? `<#${settings.leave_channel_id}>` : 'Not set', inline: true },
     )
-    .setDescription(t(lang, 'settings_description'))
+    .setDescription(t(lang, 'settings_description') + '\n\nWelcome/Leave and Ticket Settings moved to **Server Setup**.')
     .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
 
@@ -39823,41 +40048,83 @@ async function buildAdminSettingsPayload(guild, lang) {
       .setLabel(settings.onboarding_enabled ? t(lang, 'settings_onboarding_disable_button') : t(lang, 'settings_onboarding_enable_button'))
       .setEmoji(settings.onboarding_enabled ? '🚫' : '✅')
       .setStyle(settings.onboarding_enabled ? ButtonStyle.Danger : ButtonStyle.Success),
-    // 7J-96WELCOMER
+  );
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, buildAdminPanelBackRow(lang)] };
+}
+
+// 7J-112SERVERSETUP: entry point for everything guild-wide-infrastructure —
+// Auto Setup Server Channels (renamed from Auto Setup Channels, moved from
+// League Setup — it was never league-specific), Ticket Settings and
+// Welcome/Leave (both moved from Server Settings), and the Multi-Channel
+// Panels manager (moved from Commissioner Panel's Setup Dashboard/Panels —
+// per Hxxdie these 7 panel types were never league-specific either, so they
+// don't belong on a per-league page). Kept to 3 rows so there's headroom.
+async function buildAdminServerSetupPayload(guild, lang) {
+  const settings = await getGuildSettings(guild.id, guild.name);
+  const embed = new EmbedBuilder()
+    .setTitle('🏗️ Server Setup')
+    .setColor(0x5865F2)
+    .setDescription('Guild-wide infrastructure — none of this is tied to a specific league.')
+    .addFields(
+      { name: 'Welcome/Leave Announcements', value: settings.welcome_leave_enabled ? '✅ Enabled' : '🚫 Disabled', inline: true },
+      { name: 'Ticket Channel', value: settings.ticket_channel_id ? `<#${settings.ticket_channel_id}>` : 'Not set', inline: true },
+      { name: 'Support Channel', value: settings.support_channel_id ? `<#${settings.support_channel_id}>` : 'Not set', inline: true },
+    )
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
+    .setTimestamp();
+
+  const actionRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_serversetup_autosetup').setLabel('Auto Setup Server Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('adminpanel_serversetup_tickets').setLabel('Ticket Settings').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('adminpanel_serversetup_welcomeleave').setLabel('Welcome/Leave Setup').setEmoji('👋').setStyle(ButtonStyle.Secondary),
+  );
+
+  const multiChannelMenu = new StringSelectMenuBuilder()
+    .setCustomId('adminpanel_serversetup_multichannel_select')
+    .setPlaceholder('Manage a Multi-Channel Panel')
+    .addOptions(Object.entries(MULTI_CHANNEL_DASHBOARD_MAP).map(([, panelType]) => {
+      const info = getMultiChannelPanelInfo(panelType);
+      return { label: info?.label || panelType, value: panelType, description: `Manage which channel(s) the ${info?.label || panelType} panel is posted in`.slice(0, 100) };
+    }));
+
+  return { embeds: [embed], components: [actionRow, new ActionRowBuilder().addComponents(multiChannelMenu), buildAdminPanelBackRow(lang)] };
+}
+
+// 7J-112SERVERSETUP: Welcome/Leave configuration, moved here from Server
+// Settings (see buildAdminSettingsPayload above).
+async function buildAdminWelcomeLeavePayload(guild, lang) {
+  const settings = await getGuildSettings(guild.id, guild.name);
+  const embed = new EmbedBuilder()
+    .setTitle('👋 Welcome/Leave Setup')
+    .setColor(0x5865F2)
+    .setDescription('Public welcome/leave channel announcements — distinct from the private onboarding DM (Server Settings). If enabled with no channel set yet, **Auto Setup Server Channels** will create one for you.')
+    .addFields(
+      { name: 'Welcome/Leave Announcements', value: settings.welcome_leave_enabled ? '✅ Enabled' : '🚫 Disabled', inline: true },
+      { name: 'Welcome Channel', value: settings.welcome_channel_id ? `<#${settings.welcome_channel_id}>` : 'Not set', inline: true },
+      { name: 'Leave Channel', value: settings.leave_channel_id ? `<#${settings.leave_channel_id}>` : 'Not set', inline: true },
+    )
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
+    .setTimestamp();
+
+  const toggleRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('adminpanel_settings_welcomeleave_toggle')
       .setLabel(settings.welcome_leave_enabled ? 'Disable Welcome/Leave' : 'Enable Welcome/Leave')
       .setEmoji(settings.welcome_leave_enabled ? '🚫' : '✅')
       .setStyle(settings.welcome_leave_enabled ? ButtonStyle.Danger : ButtonStyle.Success),
-    // 7J-111TICKETSCOPE: opens its own sub-page rather than adding channel/role
-    // selects directly here — this page is already at Discord's 5-action-row
-    // cap (language select, this button row, welcome channel, leave channel,
-    // back), and Ticket Settings needs 3 more selects of its own.
-    new ButtonBuilder()
-      .setCustomId('adminpanel_settings_tickets')
-      .setLabel('Ticket Settings')
-      .setEmoji('🎫')
-      .setStyle(ButtonStyle.Secondary)
   );
-
   const welcomeChannelRow = new ActionRowBuilder().addComponents(
-    new ChannelSelectMenuBuilder()
-      .setCustomId('adminpanel_settings_welcome_channel')
-      .setPlaceholder('Set welcome channel')
-      .setChannelTypes(ChannelType.GuildText)
-      .setMinValues(1)
-      .setMaxValues(1)
+    new ChannelSelectMenuBuilder().setCustomId('adminpanel_settings_welcome_channel').setPlaceholder('Set welcome channel').setChannelTypes(ChannelType.GuildText).setMinValues(1).setMaxValues(1)
   );
   const leaveChannelRow = new ActionRowBuilder().addComponents(
-    new ChannelSelectMenuBuilder()
-      .setCustomId('adminpanel_settings_leave_channel')
-      .setPlaceholder('Set leave channel')
-      .setChannelTypes(ChannelType.GuildText)
-      .setMinValues(1)
-      .setMaxValues(1)
+    new ChannelSelectMenuBuilder().setCustomId('adminpanel_settings_leave_channel').setPlaceholder('Set leave channel').setChannelTypes(ChannelType.GuildText).setMinValues(1).setMaxValues(1)
+  );
+  const backRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_serversetup_from_sub').setLabel('Back to Server Setup').setEmoji('⬅️').setStyle(ButtonStyle.Secondary)
   );
 
-  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, welcomeChannelRow, leaveChannelRow, buildAdminPanelBackRow(lang)] };
+  return { embeds: [embed], components: [toggleRow, welcomeChannelRow, leaveChannelRow, backRow] };
 }
 
 // 7J-111TICKETSCOPE: guild-wide Ticket/Support channel + admin-notify-role
@@ -39893,7 +40160,7 @@ async function buildAdminTicketSettingsPayload(guild, lang) {
     new RoleSelectMenuBuilder().setCustomId('adminpanel_ticketsettings_role').setPlaceholder('Set Admin Notify Role (for guild-wide tickets)').setMinValues(1).setMaxValues(1)
   );
   const backRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_settings_from_tickets').setLabel('Back to Server Settings').setEmoji('⬅️').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('adminpanel_serversetup_from_sub').setLabel('Back to Server Setup').setEmoji('⬅️').setStyle(ButtonStyle.Secondary)
   );
 
   return { embeds: [embed], components: [ticketChannelRow, supportChannelRow, adminRoleRow, backRow] };
@@ -39907,6 +40174,7 @@ async function showAdminPanelCategory(interaction, category, { update = true } =
   else if (category === 'shop') payload = await buildAdminShopPayload(interaction.guild, lang);
   else if (category === 'sportsbook') payload = await buildAdminSportsbookPayload(interaction.guild, lang);
   else if (category === 'tournament') payload = await buildTournamentManagerHomePayload(interaction.guild);
+  else if (category === 'serversetup') payload = await buildAdminServerSetupPayload(interaction.guild, lang);
   else if (category === 'settings') payload = await buildAdminSettingsPayload(interaction.guild, lang);
   else payload = { content: 'Unknown section.', embeds: [], components: [buildAdminPanelBackRow(lang)] };
   const finalPayload = { content: null, ...payload };
@@ -44689,8 +44957,16 @@ async function handleMaddenGameThreadButton(interaction) {
     await safeReply({ content: `📺 Posted to <#${streamChannel.id}> — you're streaming this matchup!`, ephemeral: true });
     return;
   }
+  // 7J-114REPORTISSUE: used to be a stub telling the person to type `/ticket
+  // game` instead. Now actually opens a ticket from the button: pick which
+  // kind of issue, describe it in a modal, done — no slash command needed.
   if (action === 'issue') {
-    await interaction.reply({ content: 'Use `/ticket game` in this thread to report a Madden game issue. Future versions will open this ticket automatically from the button.', ephemeral: true });
+    const issueTypeRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`maddengame_issue_type:lagout:${gameId}`).setLabel('Lag Out').setEmoji('📡').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`maddengame_issue_type:quit:${gameId}`).setLabel('Opponent Quit').setEmoji('🚪').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`maddengame_issue_type:reset:${gameId}`).setLabel('Reset Request').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+    );
+    await safeReply({ content: 'What kind of issue are you reporting for **' + game.away_team + ' @ ' + game.home_team + '**?', components: [issueTypeRow], ephemeral: true });
     return;
   }
   // 7J-49MADDEN: Track H item 26 extension. Same permission model as Game
