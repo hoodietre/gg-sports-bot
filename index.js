@@ -11177,18 +11177,35 @@ if (interaction.commandName === 'avatar') {
       description += NL + NL + 'Please upload proof/screenshots in this ticket thread. Attachments will be saved automatically as evidence.';
 
       const sourceThread = interaction.channel?.isThread() ? interaction.channel : null;
-      const baseChannel = sourceThread ? sourceThread.parent : interaction.channel;
+
+      // 7J-117TICKETPRIVACY: per Hxxdie, this was opening in whatever channel
+      // the game thread happened to live under — the ticket needs to go to
+      // the actual guild-wide Ticket Channel instead (falls back to Support,
+      // then to the game thread's parent as a last resort if neither is set,
+      // so this never just fails outright for an unconfigured server).
+      const guildTicketSettings = await getGuildSettings(interaction.guild.id, interaction.guild.name).catch(() => null);
+      const ticketChannelId = guildTicketSettings?.ticket_channel_id || guildTicketSettings?.support_channel_id;
+      const baseChannel = (ticketChannelId ? await interaction.guild.channels.fetch(ticketChannelId).catch(() => null) : null) || sourceThread?.parent || interaction.channel;
       if (!baseChannel) {
-        await interaction.reply({ content: 'Could not find a channel to open this ticket in — the game thread\'s parent channel may have been deleted.', ephemeral: true });
+        await interaction.reply({ content: 'Could not find a channel to open this ticket in — set a Ticket Channel from Admin Panel > Server Setup > Ticket Settings.', ephemeral: true });
         return;
       }
+
+      // 7J-117TICKETPRIVACY: "the users involved" — the reporter plus whoever
+      // owns the other team in this game, so both sides of the dispute can
+      // see the ticket even though it's private.
+      const owners = {
+        away: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.away_team, game.away_team_role_id).catch(() => null),
+        home: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id).catch(() => null),
+      };
+      const involvedUserIds = [owners.away?.id, owners.home?.id].filter(id => id && id !== interaction.user.id);
 
       interaction.ggSportsReviewButtons = true;
       interaction.ggSportsGameIssueMeta = {
         gameId,
         requestAction,
         requestedTeamRoleId: null,
-        opponentUserId: null,
+        opponentUserId: involvedUserIds[0] || null,
       };
       await openSupportTicket(interaction, 'gamerequest', {
         subject,
@@ -11196,6 +11213,8 @@ if (interaction.commandName === 'avatar') {
         leagueName: league.league_name,
         baseChannel,
         sourceThread,
+        isPrivate: true,
+        involvedUserIds,
       });
       delete interaction.ggSportsReviewButtons;
       delete interaction.ggSportsGameIssueMeta;
@@ -15998,7 +16017,7 @@ if (interaction.commandName === 'avatar') {
         new ButtonBuilder().setCustomId(`adminpanel_league_delete_confirm:${leagueId}`).setLabel('Yes, Delete').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId('adminpanel_league_delete_abort').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
       );
-      await interaction.update({ content: `Delete **${league.league_name}**? This deactivates the league (soft delete) — its data is kept but it will no longer appear as active.`, embeds: [], components: [confirmRow] });
+      await interaction.update({ content: `Delete **${league.league_name}**? This deactivates the league (its data is kept, is_active = false) but permanently deletes its Discord roles (league/staff/trade committee/team roles) and channels, plus its category if it ends up empty. This part can't be undone.`, embeds: [], components: [confirmRow] });
       return;
     }
 
@@ -16013,9 +16032,16 @@ if (interaction.commandName === 'avatar') {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      await interaction.update({ content: `Deleting **${league.league_name}** and its roles/channels…`, embeds: [], components: [] });
+      // 7J-116LEAGUEDELETE: real Discord cleanup (roles/channels/category),
+      // not just the DB soft-delete below — see deleteLeagueDiscordInfrastructure.
+      const cleanup = await deleteLeagueDiscordInfrastructure(interaction.guild, league).catch(() => ({ deletedRoles: 0, deletedChannels: 0, deletedCategory: false }));
       await pool.query(`UPDATE leagues SET is_active = FALSE WHERE league_id = $1`, [leagueId]);
       const payload = await buildAdminLeagueSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
-      await interaction.update({ content: `League deactivated: **${league.league_name}**.`, ...payload });
+      await interaction.editReply({
+        content: `League deactivated: **${league.league_name}**. Cleaned up ${cleanup.deletedRoles} role${cleanup.deletedRoles === 1 ? '' : 's'}, ${cleanup.deletedChannels} channel${cleanup.deletedChannels === 1 ? '' : 's'}${cleanup.deletedCategory ? ', and its category' : ''}.`,
+        ...payload,
+      });
       return;
     }
 
@@ -29212,10 +29238,11 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
   // Issue is meant to be pressed from inside a game thread (that's the whole
   // point — the button lives on the game thread's own message), so this
   // can't just use interaction.channel the way the slash commands do: it has
-  // to climb to the thread's parent channel and post the ticket there
-  // instead, or ticket creation would silently fail every single time.
-  // overrides.baseChannel lets the game-thread flow supply that explicitly;
-  // everything else keeps using interaction.channel unchanged.
+  // to use a real channel to post/create the ticket in — either the guild's
+  // configured Ticket Channel (7J-117TICKETPRIVACY, when overrides.baseChannel
+  // is supplied) or, failing that, climb to the thread's parent. Either way,
+  // ticket creation would otherwise silently fail every single time it was
+  // opened from inside a thread.
   const baseChannel = overrides.baseChannel || interaction.channel;
   if (!baseChannel || !baseChannel.isTextBased()) {
     await interaction.reply({ content: 'Tickets can only be opened from a text channel.', ephemeral: true });
@@ -29224,8 +29251,11 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
 
   const botMember = await interaction.guild.members.fetchMe();
   const permissions = baseChannel.permissionsFor(botMember);
-  if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.CreatePublicThreads)) {
-    await interaction.reply({ content: 'I need View Channel, Send Messages, and Create Public Threads permissions here to open tickets.', ephemeral: true });
+  // 7J-117TICKETPRIVACY: private tickets need CreatePrivateThreads instead of
+  // CreatePublicThreads — everything else about the permission check is the same.
+  const requiredThreadPerm = overrides.isPrivate ? PermissionFlagsBits.CreatePrivateThreads : PermissionFlagsBits.CreatePublicThreads;
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(requiredThreadPerm)) {
+    await interaction.reply({ content: `I need View Channel, Send Messages, and Create ${overrides.isPrivate ? 'Private' : 'Public'} Threads permissions here to open tickets.`, ephemeral: true });
     return;
   }
 
@@ -29243,28 +29273,52 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
   const mentionLabel = activeLeague ? 'Staff' : 'Admins';
   const mentionText = mentionRoleIds.length ? mentionRoleIds.map(id => '<@&' + id + '>').join(' ') : '';
 
-  const starterPayload = {
-    // If this ticket was opened from a game thread (overrides.sourceThread),
-    // link back to it — the ticket thread itself lives in a different parent
-    // channel now, so that link is the only way staff get back to the game.
-    content: '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (overrides.sourceThread ? ' From: ' + overrides.sourceThread.toString() + '.' : '') + (mentionText ? ' ' + mentionText : ''),
-    embeds: [buildTicketEmbed({ type: ticketType, subject, description, creator: interaction.user })],
-    allowedMentions: {
-      users: [interaction.user.id],
-      roles: mentionRoleIds,
-    },
-  };
+  const starterContent = '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (overrides.sourceThread ? ' From: ' + overrides.sourceThread.toString() + '.' : '') + (mentionText ? ' ' + mentionText : '');
+  const starterEmbed = buildTicketEmbed({ type: ticketType, subject, description, creator: interaction.user });
 
-  const starter = await baseChannel.send(starterPayload);
-
-  const thread = await starter.startThread({
-    name: threadName,
-    autoArchiveDuration: 1440,
-    reason: 'GG Sports ' + ticketType + ' ticket',
-  }).catch(() => null);
+  let thread;
+  if (overrides.isPrivate) {
+    // 7J-117TICKETPRIVACY: private threads can't be created from an existing
+    // message (channel.send().startThread() only makes PUBLIC threads) — they
+    // have to be created directly on the channel, then the starter message
+    // sent as the first message inside. Visibility on a private thread is
+    // membership-based, not permission-based, so anyone who needs to see it
+    // (the reporter, anyone in overrides.involvedUserIds, and every member
+    // currently holding a pinged staff/admin role) has to be added explicitly
+    // below — being an Administrator does bypass this via Manage Threads, but
+    // a plain Staff role does not, so this can't be skipped for either case.
+    thread = await baseChannel.threads.create({
+      name: threadName,
+      type: ChannelType.PrivateThread,
+      autoArchiveDuration: 1440,
+      reason: 'GG Sports ' + ticketType + ' ticket (private)',
+    }).catch(() => null);
+    if (thread) {
+      await thread.send({ content: starterContent, embeds: [starterEmbed], allowedMentions: { users: [interaction.user.id], roles: mentionRoleIds } }).catch(() => null);
+      const memberIdsToAdd = new Set([interaction.user.id, ...(overrides.involvedUserIds || [])]);
+      for (const roleId of mentionRoleIds) {
+        const role = await interaction.guild.roles.fetch(roleId).catch(() => null);
+        role?.members?.forEach(m => memberIdsToAdd.add(m.id));
+      }
+      for (const userId of memberIdsToAdd) {
+        await thread.members.add(userId).catch(() => null);
+      }
+    }
+  } else {
+    const starter = await baseChannel.send({
+      content: starterContent,
+      embeds: [starterEmbed],
+      allowedMentions: { users: [interaction.user.id], roles: mentionRoleIds },
+    });
+    thread = await starter.startThread({
+      name: threadName,
+      autoArchiveDuration: 1440,
+      reason: 'GG Sports ' + ticketType + ' ticket',
+    }).catch(() => null);
+  }
 
   if (!thread) {
-    await interaction.reply({ content: 'I could not create the ticket thread. Make sure I have Create Public Threads permission.', ephemeral: true });
+    await interaction.reply({ content: 'I could not create the ticket thread. Make sure I have the right thread-creation permission.', ephemeral: true });
     return;
   }
 
@@ -33704,6 +33758,87 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   return { category, channels: created };
 }
 
+// 7J-116LEAGUEDELETE: full cleanup when a league is deleted, per Hxxdie — the
+// old behavior was purely a soft delete (is_active = FALSE), leaving every
+// role/channel/category the league ever had sitting around in Discord
+// forever, orphaned. This deletes the real Discord objects (best-effort —
+// one missing/already-deleted role or channel doesn't abort the rest) and
+// nulls out the league_settings columns that pointed to them, since league
+// creation re-activates an existing row by (guild_id, league_name) on a name
+// collision — without nulling these out, recreating a league with the same
+// name would silently resurrect references to deleted channels/roles.
+// Deliberately does NOT touch guilds.ticket_channel_id/support_channel_id —
+// those are guild-wide (7J-111TICKETSCOPE), not this league's to delete.
+const LEAGUE_OWNED_CHANNEL_COLUMNS = [
+  'league_announcement_channel_id', 'league_rules_channel_id', 'standings_channel_id',
+  'trade_block_channel_id', 'sportsbook_channel_id', 'suspensions_channel_id',
+  'team_owners_channel_id', 'trade_offer_channel_id', 'trade_committee_channel_id',
+  'approved_trades_channel_id', 'denied_trades_channel_id', 'trade_count_channel_id',
+  'live_channel_id', 'history_channel_id', 'tournament_channel_id', 'league_hof_channel_id',
+  'madden_free_agents_channel_id', 'trade_negotiation_channel_id', 'player_search_channel_id',
+  'gm_panel_channel_id', 'staff_channel_id', 'league_leaders_channel_id', 'award_race_channel_id',
+  'member_profile_channel_id', 'bank_channel_id', 'playoff_bracket_channel_id',
+  'game_threads_channel_id', 'madden_news_channel_id', 'madden_weekly_updates_channel_id',
+  'madden_standings_channel_id', 'madden_power_rankings_channel_id', 'madden_sportsbook_channel_id',
+  'game_center_channel_id', 'active_check_channel_id', 'draft_recap_channel_id',
+  'madden_franchise_hub_channel_id',
+];
+const LEAGUE_OWNED_ROLE_COLUMNS = ['league_role_id', 'staff_role_id', 'trade_committee_role_id', 'committee_role_id'];
+
+async function deleteLeagueDiscordInfrastructure(guild, league) {
+  const deletedChannelIds = [];
+  let deletedRoles = 0;
+  let deletedChannels = 0;
+
+  // Roles: the three league-level roles plus every registered team role.
+  const roleIds = new Set(LEAGUE_OWNED_ROLE_COLUMNS.map(col => league[col]).filter(Boolean));
+  const teamRoles = await getLeagueTeamRoles(league.league_id).catch(() => []);
+  for (const tr of teamRoles) roleIds.add(tr.role_id);
+
+  for (const roleId of roleIds) {
+    const role = await guild.roles.fetch(roleId).catch(() => null);
+    if (role) {
+      await role.delete('League deleted').catch(() => null);
+      deletedRoles++;
+    }
+  }
+
+  // Channels: every league-owned channel column that's actually set.
+  const channelIds = new Set(LEAGUE_OWNED_CHANNEL_COLUMNS.map(col => league[col]).filter(Boolean));
+  for (const channelId of channelIds) {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (channel) {
+      deletedChannelIds.push(channel.parentId);
+      await channel.delete('League deleted').catch(() => null);
+      deletedChannels++;
+    }
+  }
+
+  // Category: best-effort — only delete it if it's now actually empty, since
+  // a category the league shares with something else (manually reorganized,
+  // or a channel we didn't know about) shouldn't get deleted out from under it.
+  let deletedCategory = false;
+  const uniqueParentIds = [...new Set(deletedChannelIds.filter(Boolean))];
+  for (const parentId of uniqueParentIds) {
+    const category = await guild.channels.fetch(parentId).catch(() => null);
+    if (!category) continue;
+    const remainingChildren = guild.channels.cache.filter(c => c.parentId === parentId);
+    if (remainingChildren.size === 0) {
+      await category.delete('League deleted — category emptied out').catch(() => null);
+      deletedCategory = true;
+    }
+  }
+
+  // DB cleanup: drop the team role records (the roles themselves are gone)
+  // and null out every channel/role column so a same-named league recreated
+  // later doesn't inherit references to things that no longer exist.
+  await pool.query(`DELETE FROM league_team_roles WHERE league_id = $1`, [league.league_id]).catch(() => null);
+  const nullColumns = [...LEAGUE_OWNED_CHANNEL_COLUMNS, ...LEAGUE_OWNED_ROLE_COLUMNS].map(col => `${col} = NULL`).join(', ');
+  await pool.query(`UPDATE league_settings SET ${nullColumns}, updated_at = NOW() WHERE league_id = $1`, [league.league_id]).catch(() => null);
+
+  return { deletedRoles, deletedChannels, deletedCategory };
+}
+
 // 7J-100AUTOSETUP: real team names for madden(NFL)/nba/nhl/mlb (REAL_TEAM_NAMES),
 // placeholder "Team 1".."Team N" for everything else (fc/cfb/other — per
 // Hxxdie, fc has too many real teams to enumerate, and club/pro-am leagues
@@ -34394,26 +34529,11 @@ async function buildSetupDashboardEmbed(guild, league) {
     'Trade Committee: ' + setupDashboardFormatValue(league, 'trade_committee_role'),
   ];
 
-  const multiChannelPanelTypes = [
-    ['shop', 'Shop'],
-    ['sportsbook', 'Sportsbook Board'],
-    ['marketplace', 'Marketplace'],
-    ['bank', 'Bank Starter'],
-    ['profile', 'Member Profile Starter'],
-    ['avatar', 'Avatar'],
-    ['recruitment', 'Recruitment'],
-  ];
-  const multiChannelCounts = await Promise.all(multiChannelPanelTypes.map(([panelType]) => listMultiChannelPanelPostings(guild.id, panelType)));
-  const multiChannelLines = multiChannelPanelTypes.map(([, label], i) => {
-    const count = multiChannelCounts[i].length;
-    return `${label}: ` + (count ? `posted in ${count} channel${count === 1 ? '' : 's'}` : 'Not posted anywhere yet');
-  });
-  // 7J-111TICKETSCOPE: Tickets/Support removed from here — both are guild-wide
-  // now (Admin Panel > Server Settings > Ticket Settings), not per-league, so
-  // they no longer belong on a per-league dashboard. This whole field is
-  // otherwise read-only guild-wide status now (7J-110RELOCATE moved the actual
-  // editing to the Admin Panel's League Setup page) — kept here for visibility
-  // since a commissioner mid-setup may still look here first.
+  // 7J-115MULTICHANNELGONE: Multi-Channel Panels field fully removed from
+  // here per Hxxdie — last session only pulled the picker/editing out of the
+  // Commissioner Panel and left this status field behind "for visibility,"
+  // but that's still the section the ask was to remove. It lives in Admin
+  // Panel > Server Setup now, full stop; see buildAdminServerSetupPayload.
 
   return new EmbedBuilder()
     .setTitle(`${GG_EMOJI} GG Sports Setup Dashboard`)
@@ -34422,7 +34542,6 @@ async function buildSetupDashboardEmbed(guild, league) {
     .addFields(
       { name: 'Roles', value: roleLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Core Channels', value: channelLines.join(String.fromCharCode(10)), inline: false },
-      { name: 'Multi-Channel Panels', value: multiChannelLines.join(String.fromCharCode(10)), inline: false },
       { name: 'Trade Setup', value: tradeLines.join(String.fromCharCode(10)), inline: false }
     )
     .setFooter({ text: 'GG Sports • Interactive Setup' })
@@ -39846,17 +39965,18 @@ async function showMaddenGmPanelCategory(interaction, leagueId, teamName, catego
 // ---------------------------------------------------------------------------
 function getAdminPanelCategories(lang) {
   return [
+    // 7J-115REORDER: Server Setup moved to the top per Hxxdie.
+    // English-only (not run through t()) like several other strings added
+    // this session — this bot's i18n coverage is still Phase 1 (Admin Panel
+    // core only, per the tracking doc's rollout plan), so plain English here
+    // is consistent with precedent rather than a regression. Revisit when
+    // i18n Phase 2+ actually happens.
+    { value: 'serversetup', label: 'Server Setup', description: 'Auto Setup Server Channels, Ticket Settings, Welcome/Leave, Multi-Channel Panels', emoji: '🏗️' },
     { value: 'leagues', label: t(lang, 'cat_leagues_label'), description: t(lang, 'cat_leagues_desc'), emoji: '🏟️' },
     { value: 'economy', label: t(lang, 'cat_economy_label'), description: t(lang, 'cat_economy_desc'), emoji: '💰' },
     { value: 'shop', label: t(lang, 'cat_shop_label'), description: t(lang, 'cat_shop_desc'), emoji: '🛍️' },
     { value: 'sportsbook', label: t(lang, 'cat_sportsbook_label'), description: t(lang, 'cat_sportsbook_desc'), emoji: '📊' },
     { value: 'tournament', label: t(lang, 'cat_tournament_label'), description: t(lang, 'cat_tournament_desc'), emoji: '🏆' },
-    // 7J-112SERVERSETUP: new category, English-only (not run through t()) like
-    // several other strings added this session — this bot's i18n coverage is
-    // still Phase 1 (Admin Panel core only, per the tracking doc's rollout
-    // plan), so plain English here is consistent with precedent rather than a
-    // regression. Revisit when i18n Phase 2+ actually happens.
-    { value: 'serversetup', label: 'Server Setup', description: 'Auto Setup Server Channels, Ticket Settings, Welcome/Leave, Multi-Channel Panels', emoji: '🏗️' },
     { value: 'settings', label: t(lang, 'cat_settings_label'), description: t(lang, 'cat_settings_desc'), emoji: '⚙️' },
   ];
 }
