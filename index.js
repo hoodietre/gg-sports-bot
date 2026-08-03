@@ -4958,10 +4958,16 @@ function buildOfferTradePanelButton(leagueId = 'legacy') {
   );
 }
 
+// 7J-123SETUPORDER: same bug class as buildTeamOwnersEmbed above — used to
+// fall back to TEAM_ROLE_NAMES (hardcoded NBA teams) as fake select-menu
+// options whenever team roles hadn't been created yet, for every sport.
+// Worse here than in the embed: the fallback used the team NAME itself as
+// the select option's value rather than a role id, so even clicking one
+// wouldn't have pointed at anything real. Returns an empty array now —
+// caller is responsible for telling the person to set teams up first.
 function buildTeamSelectMenus(teamRoles, leagueId = 'legacy') {
-  const source = teamRoles?.length
-    ? teamRoles.map(team => ({ label: team.role_name, value: team.role_id }))
-    : TEAM_ROLE_NAMES.map(name => ({ label: name, value: name }));
+  if (!teamRoles?.length) return [];
+  const source = teamRoles.map(team => ({ label: team.role_name, value: team.role_id }));
 
   const firstHalf = source.slice(0, 25);
   const secondHalf = source.slice(25);
@@ -5042,14 +5048,17 @@ async function buildTeamOwnersEmbed(guild, league = null) {
       lines.push(combinedOwnerLine(team.role_name, team.role_id, role ? [...role.members.values()] : []));
     }
   } else {
-    for (const teamName of TEAM_ROLE_NAMES) {
-      const role = guild.roles.cache.find(r => r.name === teamName);
-      if (!role) {
-        lines.push(`**${teamName}** — Role not found`);
-        continue;
-      }
-      lines.push(combinedOwnerLine(teamName, role.id, [...role.members.values()]));
-    }
+    // 7J-123SETUPORDER: root cause of Hxxdie's "auto setup channels before
+    // auto create team roles put NBA teams on an NHL league's Team Owners
+    // board" report. TEAM_ROLE_NAMES is a hardcoded relic from before this
+    // bot supported multiple sports — an NBA team-name list, always. This
+    // fallback used to search the guild for roles literally NAMED "76ers",
+    // "Bucks", etc. whenever league_team_roles was empty (i.e. team roles
+    // just hadn't been created yet), which is wrong for every sport except
+    // NBA and actively misleading rather than just unhelpful — it silently
+    // populated the board with a plausible-looking but completely wrong
+    // team list instead of saying "not set up yet." Now says exactly that.
+    lines.push('No team roles configured yet for this league — use **Auto-Create Team Roles** in the Commissioner Panel, or `/league teamrole` to register them one at a time.');
   }
 
   return new EmbedBuilder()
@@ -12004,6 +12013,16 @@ if (interaction.commandName === 'avatar') {
         await interaction.followUp({ content: result.message, ephemeral: true });
         return;
       }
+      // 7J-118TICKETBUTTONS: these buttons approve/deny a game-issue request
+      // (lag out / opponent quit / reset) opened via Report Issue or /ticket
+      // game — approve applies the request's effect (see applyApprovedGameIssue:
+      // e.g. reverses a reported score for a reset request), deny just records
+      // the decision with no game-state change. Both were completely broken:
+      // every path here called interaction.reply()/interaction.update() AFTER
+      // interaction.deferReply() above, which Discord's API rejects outright
+      // (you must use editReply() once deferred) — so every click threw an
+      // unhandled error and the button just hung on "thinking..." forever,
+      // exactly as reported. Fixed by switching every path to editReply().
       if (interaction.customId.startsWith('ticket_review_approve:') || interaction.customId.startsWith('ticket_review_deny:')) {
         await interaction.deferReply({ ephemeral: true });
         if (!interaction.guild) return;
@@ -12016,7 +12035,7 @@ if (interaction.commandName === 'avatar') {
         );
 
         if (!ticketResult.rows.length) {
-          await interaction.editReply({ content: 'Could not find that ticket.', ephemeral: true });
+          await interaction.editReply({ content: 'Could not find that ticket.' });
           return;
         }
 
@@ -12026,12 +12045,12 @@ if (interaction.commandName === 'avatar') {
         const isStaff = reviewer ? await memberHasStaff(reviewer, activeLeague) : false;
 
         if (!isStaff) {
-          await interaction.reply({ content: 'Only staff/admins can approve or deny game issue requests.', ephemeral: true });
+          await interaction.editReply({ content: 'Only staff/admins can approve or deny game issue requests.' });
           return;
         }
 
         if (ticket.review_decision) {
-          await interaction.reply({ content: 'This request already has a decision: **' + ticket.review_decision + '**.', ephemeral: true });
+          await interaction.editReply({ content: 'This request already has a decision: **' + ticket.review_decision + '**.' });
           return;
         }
 
@@ -12053,17 +12072,44 @@ if (interaction.commandName === 'avatar') {
 
         await updateTicketPanel(interaction.guild);
 
-        await interaction.update({
+        // This button's own message can't be .update()'d anymore once
+        // deferReply() has been called on it — editReply() targets the
+        // deferred reply (a NEW ephemeral message), so the original
+        // "Approve Request/Deny Request" message is edited separately here
+        // via its message reference instead of the old .update() call.
+        await interaction.message?.edit({ components: [buildTicketReviewButtons(ticket.id, true)] }).catch(() => null);
+        await interaction.editReply({
           content: 'Request **' + decision + '** by <@' + interaction.user.id + '>.' + (applyMessage ? ' ' + applyMessage : ''),
-          components: [buildTicketReviewButtons(ticket.id, true)],
         });
 
         if (interaction.channel?.isTextBased()) {
           await interaction.channel.send({
-            content: 'Decision recorded: **' + decision + '** by <@' + interaction.user.id + '>.' + (applyMessage ? String.fromCharCode(10) + applyMessage : '') + String.fromCharCode(10) + 'Use `/closeticket` when the review is fully complete.',
+            content: 'Decision recorded: **' + decision + '** by <@' + interaction.user.id + '>.' + (applyMessage ? String.fromCharCode(10) + applyMessage : '') + String.fromCharCode(10) + 'Use the **Close Ticket** button (or `/closeticket`) when the review is fully complete.',
             allowedMentions: { users: [interaction.user.id], roles: [] },
           }).catch(() => null);
         }
+        return;
+      }
+
+      // 7J-118TICKETBUTTONS: Close Ticket button, posted in every ticket
+      // thread — shares the exact same close logic as /closeticket.
+      if (interaction.customId.startsWith('ticket_close:')) {
+        if (!interaction.guild) return;
+        if (!interaction.channel?.isThread()) {
+          await interaction.reply({ content: 'This button only works inside a ticket thread.', ephemeral: true });
+          return;
+        }
+        const ticketId = interaction.customId.split(':')[1];
+        const ticketResult = await pool.query(
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id = $2 AND status = 'open' LIMIT 1`,
+          [interaction.guild.id, ticketId]
+        );
+        if (!ticketResult.rows.length) {
+          await interaction.reply({ content: 'This ticket is already closed, or could not be found.', ephemeral: true });
+          return;
+        }
+        await closeTicketFlow(interaction, ticketResult.rows[0]);
+        await interaction.message?.edit({ components: [] }).catch(() => null);
         return;
       }
 
@@ -12294,6 +12340,10 @@ if (interaction.commandName === 'avatar') {
         const [, leagueId] = interaction.customId.split(':');
         const league = leagueId && leagueId !== 'legacy' ? await getLeagueById(leagueId) : await resolveLeague(interaction);
         const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
+        if (!teamRoles.length) {
+          await interaction.reply({ content: 'No team roles are configured for this league yet — a commissioner needs to run **Auto-Create Team Roles** (or `/league teamrole`) before trades can be offered.', ephemeral: true });
+          return;
+        }
         await interaction.reply({ content: 'Choose the team you are sending the offer to.', components: buildTeamSelectMenus(teamRoles, league?.league_id || 'legacy'), ephemeral: true });
         return;
       }
@@ -14782,7 +14832,7 @@ if (interaction.commandName === 'avatar') {
       const page = Math.min(Math.max(Number(pageStr || 0), 0), totalPages - 1);
       await interaction.editReply({
         embeds: [buildMaddenTradeBlockBoardEmbedFromRows(league, rows, { page, pageSize, sort, position })],
-        components: buildMaddenTradeBlockBoardComponents(leagueId, page, totalPages, sort, position, rows.slice(page * pageSize, page * pageSize + pageSize)),
+        components: buildMaddenTradeBlockBoardComponents(leagueId, page, totalPages, sort, position, rows.slice(page * pageSize, page * pageSize + pageSize), getLeagueSportKey(league) === 'madden'),
       });
       await pool.query(
         `UPDATE madden_trade_block_panels SET page = $3, updated_at = NOW() WHERE guild_id = $1 AND league_id = $2`,
@@ -14803,7 +14853,7 @@ if (interaction.commandName === 'avatar') {
       const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
       await interaction.editReply({
         embeds: [buildMaddenTradeBlockBoardEmbedFromRows(league, rows, { page: 0, pageSize, sort, position })],
-        components: buildMaddenTradeBlockBoardComponents(leagueId, 0, totalPages, sort, position, rows.slice(0, pageSize)),
+        components: buildMaddenTradeBlockBoardComponents(leagueId, 0, totalPages, sort, position, rows.slice(0, pageSize), getLeagueSportKey(league) === 'madden'),
       });
       await pool.query(
         `UPDATE madden_trade_block_panels SET sort = $3, page = 0, updated_at = NOW() WHERE guild_id = $1 AND league_id = $2`,
@@ -14824,7 +14874,7 @@ if (interaction.commandName === 'avatar') {
       const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
       await interaction.editReply({
         embeds: [buildMaddenTradeBlockBoardEmbedFromRows(league, rows, { page: 0, pageSize, sort, position })],
-        components: buildMaddenTradeBlockBoardComponents(leagueId, 0, totalPages, sort, position, rows.slice(0, pageSize)),
+        components: buildMaddenTradeBlockBoardComponents(leagueId, 0, totalPages, sort, position, rows.slice(0, pageSize), getLeagueSportKey(league) === 'madden'),
       });
       await pool.query(
         `UPDATE madden_trade_block_panels SET position = $3, page = 0, updated_at = NOW() WHERE guild_id = $1 AND league_id = $2`,
@@ -16137,7 +16187,11 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
         return;
       }
-      await showCommissionerOperations(interaction, leagueId);
+      // 7J-119COMMISHHOME: was showCommissionerOperations — Operations is one
+      // specific category inside the Commissioner Panel, not its main page,
+      // so "Continue in Commissioner Panel" was dropping people one level
+      // deeper than intended.
+      await showCommissionerHome(interaction, leagueId);
       return;
     }
 
@@ -16360,6 +16414,15 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_serversetup_multichannel_select') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       const panelType = interaction.values[0];
+      // 7J-124TICKETMERGE: Tickets/Support picked from this same select now,
+      // but they're single-channel settings under the hood, not true
+      // multi-channel panels — route to Ticket Settings instead of the
+      // multi-channel manager.
+      if (panelType === 'ticket' || panelType === 'support') {
+        const payload = await buildAdminTicketSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+        await interaction.update(payload);
+        return;
+      }
       const payload = await buildMultiChannelPanelManagerPayload(interaction.guild, ADMIN_SERVERSETUP_MARKER, panelType, 'adminserversetup');
       await interaction.update(payload);
       return;
@@ -22029,26 +22092,7 @@ if (shopSubcommand === 'view') {
         return;
       }
 
-      const ticket = ticketResult.rows[0];
-      const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
-      const closer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      const isTicketOwner = ticket.user_id === interaction.user.id;
-      const isStaff = closer ? await memberHasStaff(closer, activeLeague) : false;
-
-      if (!isTicketOwner && !isStaff) {
-        await interaction.reply({ content: 'Only the ticket owner or staff can close this ticket.', ephemeral: true });
-        return;
-      }
-
-      const closeReason = interaction.options.getString('reason');
-      await saveTicketTranscript(interaction.channel, ticket);
-      await closeTicketRecord(interaction.channel.id, interaction.user.id);
-      if (closeReason) {
-        await pool.query(`UPDATE support_tickets SET close_reason = $1 WHERE id = $2`, [closeReason, ticket.id]);
-      }
-      await updateTicketPanel(interaction.guild);
-      await interaction.reply({ content: 'Ticket closed. Transcript saved. This thread will be archived.' + (closeReason ? ' Reason: ' + closeReason : ''), ephemeral: false });
-      await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
+      await closeTicketFlow(interaction, ticketResult.rows[0], interaction.options.getString('reason'));
       return;
     }
 
@@ -25991,6 +26035,41 @@ async function closeTicketRecord(threadId, closedByUserId) {
   );
 }
 
+// 7J-118TICKETBUTTONS: shared by /closeticket and the new Close Ticket button
+// (see buildTicketCloseRow) so both close a ticket exactly the same way —
+// permission check, transcript, DB update, archive. Caller is responsible for
+// having already confirmed interaction.channel is a thread and passing the
+// matching open ticket row.
+async function closeTicketFlow(interaction, ticket, closeReason = null) {
+  const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+  const closer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  const isTicketOwner = ticket.user_id === interaction.user.id;
+  const isStaff = closer ? await memberHasStaff(closer, activeLeague) : false;
+
+  if (!isTicketOwner && !isStaff) {
+    await interaction.reply({ content: 'Only the ticket owner or staff can close this ticket.', ephemeral: true });
+    return;
+  }
+
+  await saveTicketTranscript(interaction.channel, ticket);
+  await closeTicketRecord(interaction.channel.id, interaction.user.id);
+  if (closeReason) {
+    await pool.query(`UPDATE support_tickets SET close_reason = $1 WHERE id = $2`, [closeReason, ticket.id]);
+  }
+  await updateTicketPanel(interaction.guild);
+  await interaction.reply({ content: 'Ticket closed. Transcript saved. This thread will be archived.' + (closeReason ? ' Reason: ' + closeReason : ''), ephemeral: false });
+  await interaction.channel.setArchived(true, 'Ticket closed').catch(() => null);
+}
+
+// 7J-118TICKETBUTTONS: per Hxxdie, tickets need a real Close Ticket button —
+// posted in every ticket thread right after it opens (see openSupportTicket),
+// not just the game-issue review ones that already had Approve/Deny.
+function buildTicketCloseRow(ticketId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ticket_close:' + ticketId).setLabel('Close Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary)
+  );
+}
+
 function buildTicketEmbed({ type, subject, description, creator }) {
   return new EmbedBuilder()
     .setColor(0xffcc00)
@@ -29210,6 +29289,21 @@ async function openGameIssueTicket(interaction, ticketType) {
 async function openSupportTicket(interaction, ticketType, overrides = {}) {
   if (!interaction.guild) return;
 
+  // 7J-122TICKETDEFER: root cause of the "Unknown interaction" (DiscordAPIError
+  // 10062) errors seen in Railway logs — this function creates a channel
+  // message, sometimes a private thread, sends a starter message, and (for
+  // private tickets) loops through role members adding each one individually,
+  // all BEFORE ever acknowledging the interaction. Discord invalidates an
+  // interaction that isn't acknowledged within 3 seconds, and a private
+  // ticket with a decent-sized staff role easily blows past that. Deferring
+  // immediately here — before any of that work — acknowledges the
+  // interaction right away (deferred replies stay valid up to 15 minutes),
+  // and every reply below now uses editReply to match. None of this
+  // function's callers defer or reply before calling it, so this is safe
+  // everywhere it's used (/ticket open|dispute|game, the support panel
+  // buttons, and the Report Issue modal flow).
+  await interaction.deferReply({ ephemeral: true });
+
   const shouldAddReviewButtons = interaction.ggSportsReviewButtons === true;
   const gameIssueMeta = interaction.ggSportsGameIssueMeta || null;
 
@@ -29229,7 +29323,7 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
     : await getLeagueByChannel(interaction.guild.id, interaction.channelId);
 
   if (leagueName && !activeLeague) {
-    await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
+    await interaction.editReply({ content: 'Could not find league **' + leagueName + '**.' });
     return;
   }
 
@@ -29245,7 +29339,7 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
   // opened from inside a thread.
   const baseChannel = overrides.baseChannel || interaction.channel;
   if (!baseChannel || !baseChannel.isTextBased()) {
-    await interaction.reply({ content: 'Tickets can only be opened from a text channel.', ephemeral: true });
+    await interaction.editReply({ content: 'Tickets can only be opened from a text channel.' });
     return;
   }
 
@@ -29255,7 +29349,7 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
   // CreatePublicThreads — everything else about the permission check is the same.
   const requiredThreadPerm = overrides.isPrivate ? PermissionFlagsBits.CreatePrivateThreads : PermissionFlagsBits.CreatePublicThreads;
   if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(requiredThreadPerm)) {
-    await interaction.reply({ content: `I need View Channel, Send Messages, and Create ${overrides.isPrivate ? 'Private' : 'Public'} Threads permissions here to open tickets.`, ephemeral: true });
+    await interaction.editReply({ content: `I need View Channel, Send Messages, and Create ${overrides.isPrivate ? 'Private' : 'Public'} Threads permissions here to open tickets.` });
     return;
   }
 
@@ -29318,19 +29412,11 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
   }
 
   if (!thread) {
-    await interaction.reply({ content: 'I could not create the ticket thread. Make sure I have the right thread-creation permission.', ephemeral: true });
+    await interaction.editReply({ content: 'I could not create the ticket thread. Make sure I have the right thread-creation permission.' });
     return;
   }
 
   const NL = String.fromCharCode(10);
-  await thread.send({
-    content: '<@' + interaction.user.id + '> your ticket is open here.' + (mentionText ? ' ' + mentionLabel + ': ' + mentionText : '') + NL + NL + 'Use **/closeticket** in this thread when it is resolved.',
-    allowedMentions: {
-      users: [interaction.user.id],
-      roles: mentionRoleIds,
-    },
-  }).catch(() => null);
-
   const ticketId = await createTicketRecord({
     guildId: interaction.guild.id,
     leagueId: activeLeague?.league_id || null,
@@ -29341,6 +29427,18 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
     channelId: baseChannel.id,
     threadId: thread.id,
   });
+
+  // 7J-118TICKETBUTTONS: Close Ticket button now included right here, so
+  // every ticket has a real close path regardless of type — not just the
+  // game-issue ones that already had Approve/Deny.
+  await thread.send({
+    content: '<@' + interaction.user.id + '> your ticket is open here.' + (mentionText ? ' ' + mentionLabel + ': ' + mentionText : ''),
+    allowedMentions: {
+      users: [interaction.user.id],
+      roles: mentionRoleIds,
+    },
+    components: [buildTicketCloseRow(ticketId)],
+  }).catch(() => null);
 
   if (gameIssueMeta) {
     await pool.query(
@@ -29362,7 +29460,7 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
   }
 
   await updateTicketPanel(interaction.guild);
-  await interaction.reply({ content: 'Ticket opened: ' + thread.toString() + '. Ticket ID: **' + ticketId.split('-')[0] + '**', ephemeral: true });
+  await interaction.editReply({ content: 'Ticket opened: ' + thread.toString() + '. Ticket ID: **' + ticketId.split('-')[0] + '**' });
 }
 async function ggGetOpenShopCart(guildId, userId, leagueId = null) {
   const existing = await pool.query(
@@ -33706,7 +33804,7 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     ['league_rules_channel_id', 'rules'],
     ['standings_channel_id', 'standings'],
     ['trade_block_channel_id', 'trade-block'],
-    ['sportsbook_channel_id', 'sportsbook'],
+    ['sportsbook_channel_id', 'sportsbook-feed'],
     ['suspensions_channel_id', 'suspensions'],
     // 7J-110RELOCATE: trade setup channels, previously never auto-created at
     // all (a commissioner had to set each one by hand from the Setup
@@ -33718,12 +33816,35 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     ['approved_trades_channel_id', 'approved-trades'],
     ['denied_trades_channel_id', 'denied-trades'],
     ['trade_count_channel_id', 'trade-count'],
+    // 7J-125FULLCOVERAGE: per Hxxdie's screenshot, this used to stop short —
+    // Streaming, Staff, History, Playoff Bracket, and Active Check were never
+    // created at all, so a commissioner had to hunt these down and set each
+    // one by hand. These 5 apply to every league regardless of sport.
+    ['live_channel_id', 'streaming'],
+    ['staff_channel_id', 'staff'],
+    ['history_channel_id', 'history'],
+    ['playoff_bracket_channel_id', 'playoff-bracket'],
+    ['active_check_channel_id', 'active-check'],
   ];
+  // 7J-125FULLCOVERAGE: "keep these custom to the league settings upon
+  // creation" — Game Center vs. Game Threads is exactly this. Madden leagues
+  // get a real structured schedule (games/weeks come from EA sync), so they
+  // use Game Threads (auto-created matchup threads per synced game).
+  // Non-Madden leagues have no such sync, so they use Game Center instead
+  // (the manual "Add Game" flow) — creating both would just leave one of them
+  // permanently empty and confusing. League HOF is explicitly the "generic,
+  // non-Madden" board (see SETUP_PANEL_OPTIONS' own label for it), so it's
+  // conditional the same way.
   if (isMadden) {
     singleChannelSpecs.push(
       ['game_threads_channel_id', 'game-threads'],
       ['madden_news_channel_id', 'madden-news'],
       ['madden_free_agents_channel_id', 'free-agents'],
+    );
+  } else {
+    singleChannelSpecs.push(
+      ['game_center_channel_id', 'game-center'],
+      ['league_hof_channel_id', 'league-hof'],
     );
   }
   for (const [column, channelName] of singleChannelSpecs) {
@@ -33733,11 +33854,15 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     created.push(channel);
   }
 
-  // 7J-110RELOCATE: post league boards/panels in the appropriate channels
-  // right away, same "functional out of the box" goal this function always
-  // had — the Multi-Channel Panels (guild-wide) already do this themselves;
-  // this is the equivalent for the per-league channels just created above.
-  // Uses a minimal interaction-shaped object since createConfiguredPanelFromSetup
+  // 7J-110RELOCATE / 7J-125FULLCOVERAGE: post league boards/panels in the
+  // appropriate channels right away, same "functional out of the box" goal
+  // this function always had — the Multi-Channel Panels (guild-wide) already
+  // do this themselves; this is the equivalent for the per-league channels
+  // just created above. Streaming/Staff/History/Playoff Bracket/Active Check
+  // don't have a static panel to post (they're destinations for
+  // live/manual/periodic content, not persistent boards), so only the
+  // channels that actually have a corresponding panel type get one. Uses a
+  // minimal interaction-shaped object since createConfiguredPanelFromSetup
   // only reads .guild (and .channel as a fallback we don't need, since every
   // channel id it looks up was just set on freshLeague below). ticket_panel is
   // deliberately NOT posted here (7J-111TICKETSCOPE) — Tickets/Support are
@@ -33747,8 +33872,8 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   if (freshLeague) {
     const fakeInteraction = { guild, channel: null };
     const panelTypesToPost = isMadden
-      ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel']
-      : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel'];
+      ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'madden_free_agents_panel']
+      : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel'];
     for (const panelType of panelTypesToPost) {
       await createConfiguredPanelFromSetup(fakeInteraction, freshLeague, panelType).catch(() => null);
     }
@@ -34899,20 +35024,16 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const { channel, error } = await requireTextChannel(league.trade_offer_channel_id, interaction.channel, 'trade offer channel');
     if (error) return error;
 
-    if (typeof buildTradeOfferPanel === 'function') {
-      await channel.send(buildTradeOfferPanel(league));
-      return 'Trade Offer panel posted in ' + channel.toString() + '.';
-    }
-
-    const embed = new EmbedBuilder()
-      .setTitle('Offer a Trade')
-      .setDescription('Use this channel to start and manage trade offers.')
-      .setColor(0x57F287)
-      .setFooter({ text: 'GG Sports • Trade Offers' })
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-    return 'Basic Trade Offer panel posted in ' + channel.toString() + '.';
+    // 7J-121TRADEOFFERPANEL: this always fell through to a bare "Basic Trade
+    // Offer panel" with no button — buildTradeOfferPanel (checked above via
+    // typeof) was never actually defined anywhere in the file, so that check
+    // was permanently false. The real panel (title/description matching the
+    // non-Madden version, plus the actual Offer Trade button) already
+    // existed — buildOfferTradePanelEmbed/buildOfferTradePanelButton, same
+    // ones /league offerpanel and the initial league-creation flow use — this
+    // branch just wasn't calling them.
+    await channel.send({ embeds: [buildOfferTradePanelEmbed(league.league_name)], components: [buildOfferTradePanelButton(league.league_id)] });
+    return 'Trade Offer panel posted in ' + channel.toString() + '.';
   }
 
   if (panelType === 'ticket_panel') {
@@ -39426,7 +39547,7 @@ function buildMaddenTradeBlockBoardEmbedFromRows(league, rows, { page = 0, pageS
   return embed;
 }
 
-function buildMaddenTradeBlockBoardComponents(leagueId, page, totalPages, sort = 'value', position = null, pageRows = []) {
+function buildMaddenTradeBlockBoardComponents(leagueId, page, totalPages, sort = 'value', position = null, pageRows = [], isMadden = true) {
   const currentPage = Number(page || 0);
   const lastPage = Math.max(1, Number(totalPages || 1)) - 1;
   const prevPage = Math.max(0, currentPage - 1);
@@ -39447,30 +39568,41 @@ function buildMaddenTradeBlockBoardComponents(leagueId, page, totalPages, sort =
       .setDisabled(currentPage >= lastPage)
   );
 
+  // 7J-120TRADEBLOCKSPORT: Trade Value and Overall sorts read value_score/
+  // overall, both populated only by Madden's EA sync — a non-Madden league
+  // has no data source for either (no export pulls exist for those games
+  // yet, per Hxxdie), so those two sort options are dropped entirely rather
+  // than offered and silently doing nothing useful.
+  const availableSorts = isMadden ? MADDEN_TRADE_BLOCK_SORTS : MADDEN_TRADE_BLOCK_SORTS.filter(s => s.value !== 'value' && s.value !== 'overall');
+  const effectiveSort = availableSorts.some(s => s.value === sort) ? sort : availableSorts[0].value;
   const sortMenu = new StringSelectMenuBuilder()
     .setCustomId(`madtb:sort:${leagueId}:${posValue}`)
     .setPlaceholder('Sort by...')
-    .addOptions(MADDEN_TRADE_BLOCK_SORTS.map(s => ({
+    .addOptions(availableSorts.map(s => ({
       label: s.label,
       value: s.value,
       description: s.description,
-      default: s.value === sort,
+      default: s.value === effectiveSort,
     })));
 
-  const posMenu = new StringSelectMenuBuilder()
-    .setCustomId(`madtb:pos:${leagueId}:${sort}`)
-    .setPlaceholder('Filter position...')
-    .addOptions(['ALL', 'QB', 'HB', 'WR', 'TE', 'OL', 'DL', 'LB', 'DB'].map(p => ({
-      label: p === 'ALL' ? 'All Positions' : p,
-      value: p,
-      default: posValue === p,
-    })));
+  const rows = [navRow, new ActionRowBuilder().addComponents(sortMenu)];
 
-  const rows = [
-    navRow,
-    new ActionRowBuilder().addComponents(sortMenu),
-    new ActionRowBuilder().addComponents(posMenu),
-  ];
+  // 7J-120TRADEBLOCKSPORT: the position filter's option list (QB/HB/WR/TE/
+  // OL/DL/LB/DB) is football-specific and matched via Madden-only helpers
+  // (normalizeMaddenFreeAgentFilter/maddenFreeAgentPositionMatches) — wrong
+  // for every other sport, so it's dropped for non-Madden leagues rather
+  // than offering positions that don't exist in that sport.
+  if (isMadden) {
+    const posMenu = new StringSelectMenuBuilder()
+      .setCustomId(`madtb:pos:${leagueId}:${sort}`)
+      .setPlaceholder('Filter position...')
+      .addOptions(['ALL', 'QB', 'HB', 'WR', 'TE', 'OL', 'DL', 'LB', 'DB'].map(p => ({
+        label: p === 'ALL' ? 'All Positions' : p,
+        value: p,
+        default: posValue === p,
+      })));
+    rows.push(new ActionRowBuilder().addComponents(posMenu));
+  }
 
   if (pageRows.length) {
     const playerMenu = new StringSelectMenuBuilder()
@@ -39516,7 +39648,13 @@ async function postOrRefreshMaddenTradeBlockBoard(guild, league, options = {}) {
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased?.()) return { ok: false, message: 'Configured trade block channel was not found or is not text-based.' };
 
-  const sort = options.sort || 'value';
+  const isMadden = getLeagueSportKey(league) === 'madden';
+  // 7J-120TRADEBLOCKSPORT: default sort must match what the sort menu will
+  // actually offer — 'value' isn't an option for non-Madden leagues (see
+  // buildMaddenTradeBlockBoardComponents), so defaulting to it here would
+  // show "Sorted by Trade Value" in the footer while the menu itself defaults
+  // to Name, a visible mismatch.
+  const sort = options.sort || (isMadden ? 'value' : 'name');
   const position = options.position || null;
   const rows = await getMaddenTradeBlockBoardRows(guild.id, league.league_id, { position, sort });
   const pageSize = MADDEN_TRADE_BLOCK_PAGE_SIZE;
@@ -39525,7 +39663,7 @@ async function postOrRefreshMaddenTradeBlockBoard(guild, league, options = {}) {
 
   const payload = {
     embeds: [buildMaddenTradeBlockBoardEmbedFromRows(league, rows, { page, pageSize, sort, position })],
-    components: buildMaddenTradeBlockBoardComponents(league.league_id, page, totalPages, sort, position, rows.slice(page * pageSize, page * pageSize + pageSize)),
+    components: buildMaddenTradeBlockBoardComponents(league.league_id, page, totalPages, sort, position, rows.slice(page * pageSize, page * pageSize + pageSize), isMadden),
   };
 
   const existing = await pool.query(`SELECT * FROM madden_trade_block_panels WHERE guild_id = $1 AND league_id = $2 LIMIT 1`, [String(guild.id), String(league.league_id)]).catch(() => ({ rows: [] }));
@@ -40194,19 +40332,30 @@ async function buildAdminServerSetupPayload(guild, lang) {
     .setFooter({ text: t(lang, 'admin_panel_footer') })
     .setTimestamp();
 
+  // 7J-124TICKETMERGE: Ticket Settings' standalone button folded into this
+  // same select, per Hxxdie — one consistent entry point for every guild-
+  // wide channel setting instead of a separate button living outside it.
+  // Tickets/Support aren't true multi-channel panels underneath (each is
+  // still a single configured channel, not "post in as many channels as you
+  // want" like the other 7) — selecting either one here routes to
+  // buildAdminTicketSettingsPayload instead of buildMultiChannelPanelManagerPayload,
+  // see the adminpanel_serversetup_multichannel_select handler.
   const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('adminpanel_serversetup_autosetup').setLabel('Auto Setup Server Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('adminpanel_serversetup_tickets').setLabel('Ticket Settings').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('adminpanel_serversetup_welcomeleave').setLabel('Welcome/Leave Setup').setEmoji('👋').setStyle(ButtonStyle.Secondary),
   );
 
   const multiChannelMenu = new StringSelectMenuBuilder()
     .setCustomId('adminpanel_serversetup_multichannel_select')
     .setPlaceholder('Manage a Multi-Channel Panel')
-    .addOptions(Object.entries(MULTI_CHANNEL_DASHBOARD_MAP).map(([, panelType]) => {
-      const info = getMultiChannelPanelInfo(panelType);
-      return { label: info?.label || panelType, value: panelType, description: `Manage which channel(s) the ${info?.label || panelType} panel is posted in`.slice(0, 100) };
-    }));
+    .addOptions([
+      ...Object.entries(MULTI_CHANNEL_DASHBOARD_MAP).map(([, panelType]) => {
+        const info = getMultiChannelPanelInfo(panelType);
+        return { label: info?.label || panelType, value: panelType, description: `Manage which channel(s) the ${info?.label || panelType} panel is posted in`.slice(0, 100) };
+      }),
+      { label: 'Tickets', value: 'ticket', description: 'Ticket Channel, Support Channel, and Admin Notify Role' },
+      { label: 'Support', value: 'support', description: 'Ticket Channel, Support Channel, and Admin Notify Role' },
+    ]);
 
   return { embeds: [embed], components: [actionRow, new ActionRowBuilder().addComponents(multiChannelMenu), buildAdminPanelBackRow(lang)] };
 }
