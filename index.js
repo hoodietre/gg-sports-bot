@@ -316,6 +316,22 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS review_prompted_at TIMESTAMP`);
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS review_dismissed BOOLEAN NOT NULL DEFAULT FALSE`);
 
+  // 7J-111TICKETSCOPE: Tickets/Support moved from per-league (league_settings.
+  // setup_ticket_channel_id/setup_support_channel_id) to guild-wide, per Hxxdie —
+  // neither is actually tied to one specific league's business, so a multi-league
+  // server should only need to set these up once, not per league. Old league-
+  // level columns are left in place (never dropped, this codebase's convention)
+  // but are no longer read or written by the ticket system.
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS ticket_channel_id TEXT`);
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS support_channel_id TEXT`);
+  // Pinged on tickets that AREN'T tied to a specific league (guild-wide feature
+  // issues) — league-specific tickets keep pinging that league's staff role, same
+  // as before. Optional: if unset, ticket creation falls back to pinging whichever
+  // guild role(s) actually carry Discord's Administrator permission (see
+  // resolveGuildTicketAdminMentionRoleIds), so a ping still goes out even before
+  // an admin has configured this explicitly.
+  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS ticket_admin_role_id TEXT`);
+
   // 7J-101REVIEW: bot-owner-global, one row — same id=1 singleton pattern as
   // system_currency_config. No review_link set means the prompt never
   // fires anywhere, so this is safe to leave unconfigured.
@@ -1751,6 +1767,10 @@ async function initDatabase() {
   // shopping page (shows a discount tag if sale_price is set and lower than price).
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS sale_price INTEGER`);
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS is_featured BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-109PRODNUM: optional named grouping for items released together as a themed
+  // drop/set (e.g. "Summer 2026 Collection"). Purely descriptive — shown on Item Info
+  // when set, no other code currently filters or groups by it.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS release_package TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_inventory (
@@ -2478,6 +2498,22 @@ async function initDatabase() {
   // purchases — these bypass the shop entirely (price_paid = 0, no stock decrement).
   // NULL for anything bought normally.
   await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS award_type TEXT`);
+
+  // 7J-109PRODNUM: Production Number — a real collector's number, distinct from
+  // serial_number above. serial_number is scoped to one specific shop_items row and
+  // bounded by that run's max_stock (the "#7/50" limited-edition sequence). Production
+  // Number is global to the item's NAME, spans every guild/instance of that item, is
+  // assigned to every unit ever granted (purchased, awarded, or gifted — not just
+  // limited-stock items), and never resets. Per Hxxdie: "as hoodies are sold they get
+  // numbered starting at 1 and continuing forever, each item should have its own set of
+  // production numbers." See getNextProductionNumber() and item_production_counters below.
+  await pool.query(`ALTER TABLE user_inventory ADD COLUMN IF NOT EXISTS production_number INTEGER`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS item_production_counters (
+      item_name_key TEXT PRIMARY KEY,
+      next_number INTEGER NOT NULL DEFAULT 1
+    )
+  `);
 
   // Powers auto-scheduling for both holiday exclusives and championship-window
   // exclusives: a scheduled check compares NOW() against this window and flips
@@ -4657,10 +4693,16 @@ async function registerCommands() {
 // getting added to only one or two of the four (see 7/3 trade_negotiation/player_search
 // bug, and the later game_threads/madden_* columns that were only ever added to
 // getLeagueById). Any new league_settings column must be added here ONCE.
+// setup_ticket_channel_id/setup_support_channel_id at the tail are dead weight
+// as of 7J-111TICKETSCOPE — Tickets/Support moved to guild-wide columns on
+// `guilds` (see getGuildSettings) and nothing reads these two off a league
+// object anymore. Left in the SELECT rather than pulled back out — harmless,
+// and touching this shared list is exactly the kind of edit that caused the
+// bug this comment describes, so it's not worth the risk for a no-op cleanup.
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable, s.suspensions_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable, s.suspensions_channel_id, s.setup_ticket_channel_id, s.setup_support_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -6029,15 +6071,50 @@ async function getGuildSettings(guildId, guildName = null) {
     `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO NOTHING`,
     [guildId, guildName || guildId]
   );
-  const result = await pool.query(`SELECT language, onboarding_enabled, welcome_leave_enabled, welcome_channel_id, leave_channel_id FROM guilds WHERE guild_id = $1`, [guildId]);
-  const row = result.rows[0] || { language: 'en', onboarding_enabled: true, welcome_leave_enabled: false, welcome_channel_id: null, leave_channel_id: null };
+  const result = await pool.query(`SELECT language, onboarding_enabled, welcome_leave_enabled, welcome_channel_id, leave_channel_id, ticket_channel_id, support_channel_id, ticket_admin_role_id FROM guilds WHERE guild_id = $1`, [guildId]);
+  const row = result.rows[0] || { language: 'en', onboarding_enabled: true, welcome_leave_enabled: false, welcome_channel_id: null, leave_channel_id: null, ticket_channel_id: null, support_channel_id: null, ticket_admin_role_id: null };
   return {
     language: SUPPORTED_LANGUAGES.some(l => l.value === row.language) ? row.language : 'en',
     onboarding_enabled: row.onboarding_enabled !== false,
     welcome_leave_enabled: row.welcome_leave_enabled === true,
     welcome_channel_id: row.welcome_channel_id || null,
     leave_channel_id: row.leave_channel_id || null,
+    // 7J-111TICKETSCOPE: guild-wide Tickets/Support channels + the optional
+    // admin-notify role for tickets that aren't tied to a specific league.
+    ticket_channel_id: row.ticket_channel_id || null,
+    support_channel_id: row.support_channel_id || null,
+    ticket_admin_role_id: row.ticket_admin_role_id || null,
   };
+}
+
+async function setGuildTicketSettings(guildId, guildName, { ticketChannelId, supportChannelId, ticketAdminRoleId } = {}) {
+  await getGuildSettings(guildId, guildName); // ensure row exists
+  const updates = [];
+  const params = [guildId];
+  if (ticketChannelId !== undefined) { params.push(ticketChannelId); updates.push(`ticket_channel_id = $${params.length}`); }
+  if (supportChannelId !== undefined) { params.push(supportChannelId); updates.push(`support_channel_id = $${params.length}`); }
+  if (ticketAdminRoleId !== undefined) { params.push(ticketAdminRoleId); updates.push(`ticket_admin_role_id = $${params.length}`); }
+  if (!updates.length) return;
+  await pool.query(`UPDATE guilds SET ${updates.join(', ')} WHERE guild_id = $1`, params);
+}
+
+// 7J-111TICKETSCOPE: who to ping on a ticket that ISN'T tied to a specific
+// league (a guild-wide feature issue) — the configured ticket_admin_role_id if
+// set, otherwise falls back to whichever of the guild's own roles actually
+// carry Discord's Administrator permission (excluding managed/bot-integration
+// roles, which can't be meaningfully "pinged for help"), so a real ping still
+// goes out even before an admin has explicitly configured this. Best-effort:
+// if genuinely nothing qualifies (e.g. only @everyone has admin, extremely
+// unusual), returns an empty array and the ticket still opens, just unpinged.
+async function resolveGuildTicketAdminMentionRoleIds(guild) {
+  const settings = await getGuildSettings(guild.id, guild.name).catch(() => null);
+  if (settings?.ticket_admin_role_id) return [settings.ticket_admin_role_id];
+  const adminRoles = guild.roles.cache.filter(role => !role.managed && role.id !== guild.id && role.permissions.has(PermissionFlagsBits.Administrator));
+  if (!adminRoles.size) return [];
+  // Highest-position real admin role only, to avoid mass-pinging every admin
+  // role in a server that has several (owner role, a legacy admin role, etc.).
+  const topRole = [...adminRoles.values()].sort((a, b) => b.position - a.position)[0];
+  return topRole ? [topRole.id] : [];
 }
 
 async function setGuildLanguage(guildId, guildName, language) {
@@ -6646,15 +6723,21 @@ function buildShopEmbed(settings, rows) {
   return embed;
 }
 
-// Item Info page — a single owned item's full detail, looked up by its
-// unique lookup_tag (shown in /shop inventory), or by "item name #serial"
-// for collectors who remember the item but not the tag. Joins shop_items
-// for cosmetic detail (rarity/slot/description) when the source item still
-// exists — award-only/gift items always exist since they're staff-created,
-// but a removed item still shows the ownership record itself.
+// Item Info page — a single owned item's full detail, looked up by its unique
+// lookup_tag (shown in /shop inventory), "item name #production number" for a
+// specific unit, or free text. Joins shop_items for cosmetic/catalog detail
+// when the source item still exists (a removed item still shows the ownership
+// record itself, just without catalog fields), and marketplace_listings so
+// collectors can tell at a glance if a matched item is currently for sale.
+// 7J-109PRODNUM: redesigned per Hxxdie's feedback that the old version was
+// confusing and didn't surface real collector info — now leads with the
+// meaningful numbers (Production #, Limited Edition X/Y) instead of the raw
+// inventory row id, and surfaces exclusive/purchasable/holiday/reward/release
+// package/for-sale status explicitly rather than leaving them undiscoverable.
 function buildItemInfoEmbed(settings, row) {
+  const titleSuffix = row.production_number ? ` — Production #${row.production_number}` : '';
   const embed = new EmbedBuilder()
-    .setTitle(`🔎 ${row.item_name}${row.serial_number ? ' #' + row.serial_number : ''}`)
+    .setTitle(`🔎 ${row.item_name}${titleSuffix}`)
     .setColor(0x5865F2)
     .setFooter({ text: 'GG Sports • Item Info' })
     .setTimestamp();
@@ -6663,13 +6746,50 @@ function buildItemInfoEmbed(settings, row) {
     { name: 'Owner', value: `<@${row.user_id}>`, inline: true },
     { name: 'Status', value: row.status || 'owned', inline: true },
   ];
-  if (row.serial_number) fields.push({ name: 'Serial Number', value: `#${row.serial_number}`, inline: true });
+
+  if (row.production_number) {
+    fields.push({ name: 'Production Number', value: `#${row.production_number}`, inline: true });
+  }
+  if (row.serial_number) {
+    const runTotal = row.max_stock !== null && row.max_stock !== undefined ? `/${row.max_stock}` : '';
+    fields.push({ name: 'Limited Edition', value: `#${row.serial_number}${runTotal}`, inline: true });
+  }
   if (row.rarity) fields.push({ name: 'Rarity', value: row.rarity.charAt(0).toUpperCase() + row.rarity.slice(1), inline: true });
   if (row.avatar_slot) fields.push({ name: 'Slot', value: row.avatar_slot, inline: true });
   fields.push({ name: 'Price Paid', value: `${settings.currency_icon} ${row.price_paid}`, inline: true });
-  if (row.award_type) fields.push({ name: 'Award', value: row.award_type, inline: true });
   fields.push({ name: 'Acquired', value: row.purchased_at ? new Date(row.purchased_at).toLocaleDateString('en-US') : 'Unknown', inline: true });
-  if (row.lookup_tag) fields.push({ name: 'Tag', value: `\`${row.lookup_tag}\``, inline: true });
+
+  // "Reward?" — award_type distinguishes a specific staff-granted reward
+  // (MVP, Champion, birthday/Christmas gift, etc.) from an ordinary purchase.
+  fields.push({ name: 'Reward?', value: row.award_type ? `Yes — ${row.award_type}` : 'No', inline: true });
+  fields.push({ name: 'Exclusive?', value: row.is_exclusive ? 'Yes' : 'No', inline: true });
+  if (row.gift_type) {
+    fields.push({ name: 'Holiday?', value: `${row.gift_type.charAt(0).toUpperCase()}${row.gift_type.slice(1)}${row.gift_year ? ' ' + row.gift_year : ''}`, inline: true });
+  }
+
+  // "Purchasable?" reflects the item's CURRENT shop status, not whether this
+  // particular owned copy could be bought again — a removed/deactivated/
+  // sold-out/award-only source item still shows correctly here.
+  let purchasableText = 'No';
+  if (!row.item_id) purchasableText = 'No — item removed';
+  else if (row.is_award_only) purchasableText = 'No — reward only';
+  else if (row.is_active === false) purchasableText = 'No — deactivated';
+  else if (row.current_stock !== null && row.current_stock !== undefined && Number(row.current_stock) <= 0) purchasableText = 'No — sold out';
+  else if (row.is_active === true) purchasableText = 'Yes';
+  fields.push({ name: 'Purchasable?', value: purchasableText, inline: true });
+
+  if (row.release_package) fields.push({ name: 'Release Package', value: row.release_package, inline: true });
+  if (row.lookup_tag) fields.push({ name: 'Lookup Tag', value: `\`${row.lookup_tag}\``, inline: true });
+
+  // For Sale? — surfaces whether this exact owned copy is currently listed on
+  // the (global, cross-server) Marketplace, per Hxxdie's ask that Item Info
+  // cover "any owned items and any items posted for sale on the marketplace."
+  fields.push({
+    name: 'For Sale?',
+    value: row.listing_id ? `Yes — ${settings.currency_icon} ${row.listing_price} (Marketplace)` : 'No',
+    inline: true,
+  });
+
   if (row.item_description) fields.push({ name: 'Description', value: row.item_description, inline: false });
 
   embed.addFields(fields);
@@ -6677,33 +6797,51 @@ function buildItemInfoEmbed(settings, row) {
 }
 
 // Shared search logic behind /shop iteminfo and the Marketplace panel's Item
-// Info button — see buildItemInfoEmbed above for what gets displayed.
+// Info button — see buildItemInfoEmbed above for what gets displayed. Searches
+// owned items (any status) and flags active Marketplace listings, so a single
+// lookup answers both "what is this item" and "is anyone selling one."
 // Returns { row, multipleMatches, content } where content is a ready-to-send
 // error/disambiguation message when row is null.
 async function resolveItemInfoSearch(guildId, search) {
   const NL = String.fromCharCode(10);
-  const joinedSelect = `ui.*, si.rarity, si.avatar_slot, si.description AS item_description`;
+  const joinedSelect = `ui.*, si.rarity, si.avatar_slot, si.description AS item_description,
+    si.max_stock, si.is_exclusive, si.is_award_only, si.is_active, si.stock AS current_stock,
+    si.gift_type, si.gift_year, si.release_package,
+    ml.id AS listing_id, ml.asking_price AS listing_price`;
+  const joinedFrom = `user_inventory ui
+    LEFT JOIN shop_items si ON si.id = ui.item_id
+    LEFT JOIN marketplace_listings ml ON ml.inventory_id = ui.id AND ml.status = 'active'`;
 
   // 1. Exact tag match — lookup_tag is globally unique, so this alone is
   // enough to find the item regardless of which guild it's in.
   let row = null;
   const tagResult = await pool.query(
-    `SELECT ${joinedSelect} FROM user_inventory ui LEFT JOIN shop_items si ON si.id = ui.item_id
+    `SELECT ${joinedSelect} FROM ${joinedFrom}
      WHERE LOWER(ui.lookup_tag) = LOWER($1) LIMIT 1`,
     [search]
   ).catch(() => ({ rows: [] }));
   if (tagResult.rows.length) row = tagResult.rows[0];
 
-  // 2. "Item Name #serial" pattern — scoped to this guild.
+  // 2. "Item Name #serial" pattern (limited-edition run number) — scoped to
+  // this guild. Also tries the item's production number, which is global.
   if (!row && guildId) {
     const serialMatch = search.match(/^(.+?)\s*#\s*(\d+)$/);
     if (serialMatch) {
       const byNameSerial = await pool.query(
-        `SELECT ${joinedSelect} FROM user_inventory ui LEFT JOIN shop_items si ON si.id = ui.item_id
+        `SELECT ${joinedSelect} FROM ${joinedFrom}
          WHERE ui.guild_id = $1 AND LOWER(ui.item_name) = LOWER($2) AND ui.serial_number = $3 LIMIT 1`,
         [guildId, serialMatch[1].trim(), Number.parseInt(serialMatch[2], 10)]
       ).catch(() => ({ rows: [] }));
       if (byNameSerial.rows.length) row = byNameSerial.rows[0];
+
+      if (!row) {
+        const byNameProduction = await pool.query(
+          `SELECT ${joinedSelect} FROM ${joinedFrom}
+           WHERE LOWER(ui.item_name) = LOWER($1) AND ui.production_number = $2 LIMIT 1`,
+          [serialMatch[1].trim(), Number.parseInt(serialMatch[2], 10)]
+        ).catch(() => ({ rows: [] }));
+        if (byNameProduction.rows.length) row = byNameProduction.rows[0];
+      }
     }
   }
 
@@ -6712,9 +6850,9 @@ async function resolveItemInfoSearch(guildId, search) {
   let multipleMatches = [];
   if (!row && guildId) {
     const nameResult = await pool.query(
-      `SELECT ${joinedSelect} FROM user_inventory ui LEFT JOIN shop_items si ON si.id = ui.item_id
+      `SELECT ${joinedSelect} FROM ${joinedFrom}
        WHERE ui.guild_id = $1 AND ui.item_name ILIKE $2
-       ORDER BY ui.serial_number ASC NULLS LAST, ui.purchased_at DESC
+       ORDER BY ui.production_number ASC NULLS LAST, ui.purchased_at DESC
        LIMIT 11`,
       [guildId, `%${search}%`]
     ).catch(() => ({ rows: [] }));
@@ -6723,16 +6861,26 @@ async function resolveItemInfoSearch(guildId, search) {
   }
 
   if (!row && !multipleMatches.length) {
-    return { row: null, multipleMatches: [], content: `No item found matching **${search}**. Try the exact tag (shown in \`/shop inventory\`), or "Item Name #serial".` };
+    return { row: null, multipleMatches: [], content: `No item found matching **${search}**. Try the exact tag (shown in \`/shop inventory\`), or "Item Name #production number".` };
   }
   if (!row) {
-    const lines = multipleMatches.slice(0, 10).map(r => `• **${r.item_name}${r.serial_number ? ' #' + r.serial_number : ''}** — <@${r.user_id}> — tag \`${r.lookup_tag || 'n/a'}\``);
-    const more = multipleMatches.length > 10 ? `${NL}...and more. Narrow your search with a serial number or exact tag.` : '';
+    const lines = multipleMatches.slice(0, 10).map(r => {
+      const numberText = r.production_number ? ' #' + r.production_number : '';
+      const saleText = r.listing_id ? ` — 🏷️ for sale` : '';
+      return `• **${r.item_name}${numberText}** — <@${r.user_id}> — tag \`${r.lookup_tag || 'n/a'}\`${saleText}`;
+    });
+    const more = multipleMatches.length > 10 ? `${NL}...and more. Narrow your search with a production number or exact tag.` : '';
     return { row: null, multipleMatches, content: `Multiple items match **${search}**:${NL}${lines.join(NL)}${more}` };
   }
   return { row, multipleMatches: [], content: null };
 }
 
+// 7J-109PRODNUM: redesigned per Hxxdie's feedback — the old version led with the
+// raw inventory row id ("170b424c"), which read as a jumbled, meaningless code.
+// Now leads with the item name and its real Production Number, with the lookup
+// tag shown separately underneath for anyone who wants full detail via Item Info
+// (the button/command that calls buildItemInfoEmbed above) — this list stays
+// intentionally compact rather than trying to show every field inline.
 function buildInventoryEmbed(settings, user, rows) {
   const NL = String.fromCharCode(10);
   const embed = new EmbedBuilder()
@@ -6750,12 +6898,13 @@ function buildInventoryEmbed(settings, user, rows) {
   const lines = rows.map(row => {
     const date = row.purchased_at ? new Date(row.purchased_at).toLocaleDateString('en-US') : 'Unknown date';
     const note = row.request_note ? `${NL}Note: ${row.request_note}` : '';
-    const serialText = row.serial_number ? ` #${row.serial_number}` : '';
+    const numberText = row.production_number ? ` #${row.production_number}` : (row.serial_number ? ` #${row.serial_number}` : '');
     const tagLine = row.lookup_tag ? `${NL}Tag: \`${row.lookup_tag}\`` : '';
-    return `**${shortItemId(row.id)} • ${row.item_name}${serialText}** — ${settings.currency_icon} ${row.price_paid} • ${date}${NL}Status: **${row.status}**${tagLine}${note}`;
+    return `**${row.item_name}${numberText}** — ${settings.currency_icon} ${row.price_paid} • ${date}${NL}Status: **${row.status}**${tagLine}${note}`;
   });
 
-  embed.setDescription(lines.join(`${NL}${NL}`));
+  const intro = 'Use **Item Info** (tag or "Item Name #number") for full detail on any item below.';
+  embed.setDescription(intro + NL + NL + lines.join(`${NL}${NL}`));
   return embed;
 }
 
@@ -9702,10 +9851,13 @@ if (interaction.commandName === 'avatar') {
 
       const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
       const serialNote = outcome.serialNumber !== null && outcome.serialNumber !== undefined
-        ? ` You got **#${outcome.serialNumber}${outcome.item.max_stock !== null && outcome.item.max_stock !== undefined ? '/' + outcome.item.max_stock : ''}**!`
+        ? ` Limited Edition **#${outcome.serialNumber}${outcome.item.max_stock !== null && outcome.item.max_stock !== undefined ? '/' + outcome.item.max_stock : ''}**!`
+        : '';
+      const productionNote = outcome.productionNumber !== null && outcome.productionNumber !== undefined
+        ? ` You're **Production #${outcome.productionNumber}**!`
         : '';
       await interaction.update({
-        content: `Bought and equipped **${outcome.item.item_name}**!${serialNote}`,
+        content: `Bought and equipped **${outcome.item.item_name}**!${serialNote}${productionNote}`,
         embeds: [buildAvatarLockerEmbed(interaction.user, profile, equipped).setTitle(`✅ ${interaction.user.username} • Purchase Complete`)],
         files: [await buildAvatarProfileAttachment(profile, equipped)],
         components: [new ActionRowBuilder().addComponents(
@@ -10013,6 +10165,7 @@ if (interaction.commandName === 'avatar') {
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stock').setLabel('Stock (optional, blank = unlimited)').setStyle(TextInputStyle.Short).setRequired(false)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('release_package').setLabel('Release Package (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
         );
       await interaction.showModal(modal);
       return;
@@ -10026,13 +10179,14 @@ if (interaction.commandName === 'avatar') {
       const description = interaction.fields.getTextInputValue('description') || null;
       const stockRaw = interaction.fields.getTextInputValue('stock');
       const stock = stockRaw ? Number.parseInt(stockRaw, 10) : null;
+      const releasePackage = interaction.fields.getTextInputValue('release_package') || null;
       if (!Number.isInteger(price) || price <= 0) { await interaction.editReply({ content: 'Price must be a whole number greater than 0.' }); return; }
       if (stock !== null && (!Number.isInteger(stock) || stock < 0)) { await interaction.editReply({ content: 'Stock must be a whole number 0 or greater.' }); return; }
       const itemId = randomUUID();
       await pool.query(
-        `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, created_by_user_id)
-         VALUES ($1, NULL, $2, $3, $4, $5, $6)`,
-        [itemId, name, description, price, stock, interaction.user.id]
+        `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, created_by_user_id, release_package)
+         VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)`,
+        [itemId, name, description, price, stock, interaction.user.id, releasePackage]
       );
       await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
       await interaction.editReply({ content: `Universal shop item created: **${shortShopItemId(itemId)} • ${name}** for **${price}**. Available in every server.` });
@@ -10402,11 +10556,12 @@ if (interaction.commandName === 'avatar') {
       const description = interaction.fields.getTextInputValue('description') || null;
       const stockRaw = interaction.fields.getTextInputValue('stock');
       const stock = stockRaw ? Number.parseInt(stockRaw, 10) : null;
+      const releasePackage = interaction.fields.getTextInputValue('release_package') || null;
       if (!Number.isInteger(price) || price <= 0) { await interaction.editReply({ content: 'Price must be a whole number greater than 0.' }); return; }
       if (stock !== null && (!Number.isInteger(stock) || stock < 0)) { await interaction.editReply({ content: 'Stock must be a whole number 0 or greater.' }); return; }
       await pool.query(
-        `UPDATE shop_items SET item_name = $1, price = $2, description = $3, stock = $4, updated_at = NOW() WHERE id = $5`,
-        [name, price, description, stock, itemId]
+        `UPDATE shop_items SET item_name = $1, price = $2, description = $3, stock = $4, release_package = $5, updated_at = NOW() WHERE id = $6`,
+        [name, price, description, stock, releasePackage, itemId]
       );
       await ggUpdatePermanentShopPanelAllGuilds().catch(() => null);
       await interaction.editReply({ content: `Updated universal shop item: **${name}** — **${price}**.` });
@@ -12094,14 +12249,17 @@ if (interaction.commandName === 'avatar') {
         for (const item of cartPayload.items) {
           // Compute the starting serial number once per item (not per unit) so buying
           // multiple of the same limited item in one cart checkout assigns consecutive
-          // numbers (e.g. #7, #8, #9) instead of repeating one lookup.
+          // numbers (e.g. #7, #8, #9) instead of repeating one lookup. Same idea for the
+          // global production number (7J-109PRODNUM), reserved as one contiguous block.
           const startingSerial = await getNextSerialNumber(pool, item.id);
+          const startingProduction = await getNextProductionNumber(pool, item.item_name, Number(item.quantity));
           for (let i = 0; i < Number(item.quantity); i++) {
             const serialNumber = startingSerial === null ? null : startingSerial + i;
+            const productionNumber = startingProduction === null ? null : startingProduction + i;
             await pool.query(
-              `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, lookup_tag)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-              [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, serialNumber, generateInventoryLookupTag()]
+              `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, production_number, lookup_tag)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+              [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, serialNumber, productionNumber, generateInventoryLookupTag()]
             );
           }
 
@@ -15736,6 +15894,65 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-110RELOCATE: guild-wide — creates a "GG Sports" category plus the 7
+    // Multi-Channel Panel channels (Shop/Sportsbook/Marketplace/Avatar/Bank/
+    // Member Profile/Recruitment) and posts each board immediately. None of
+    // these are tied to a specific league, so unlike Auto Create League Roles
+    // below, this doesn't need a league picker — it acts on the guild directly.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_autosetup_channels') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const { category, channels } = await autoCreateGuildMultiChannelPanels(interaction.guild);
+      await interaction.editReply({
+        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment panels. Continue league-specific setup (core channels, roles, trade setup) from that league's Commissioner Panel.`,
+      });
+      return;
+    }
+
+    // Roles ARE per-league (league_role_id/staff_role_id/trade_committee_role_id
+    // live on league_settings), so this needs to know which league — a picker
+    // when more than one exists, straight to creation when there's only one.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_autosetup_roles') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const result = await pool.query(`SELECT * FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY league_name ASC LIMIT 25`, [interaction.guild.id]);
+      if (!result.rows.length) {
+        await interaction.reply({ content: 'Create a league first, then come back to auto-create its roles.', ephemeral: true });
+        return;
+      }
+      if (result.rows.length === 1) {
+        await interaction.deferReply({ ephemeral: true });
+        await runAdminPanelAutoCreateLeagueRoles(interaction, result.rows[0]);
+        return;
+      }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('adminpanel_autosetup_roles_select')
+        .setPlaceholder('Choose a league to auto-create roles for')
+        .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
+      await interaction.reply({ content: '**Auto Create League Roles** — which league?', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_autosetup_roles_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const leagueId = interaction.values[0];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      await interaction.update({ content: `Creating roles for **${league.league_name}**…`, components: [] });
+      await runAdminPanelAutoCreateLeagueRoles(interaction, league);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_open_commissioner:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'You do not have permission to use the commissioner panel.', ephemeral: true });
+        return;
+      }
+      await showCommissionerOperations(interaction, leagueId);
+      return;
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId === 'adminpanel_category') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       await showAdminPanelCategory(interaction, interaction.values[0], { update: true });
@@ -15925,6 +16142,45 @@ if (interaction.commandName === 'avatar') {
       await setGuildLeaveChannel(interaction.guild.id, interaction.guild.name, interaction.values[0]);
       const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.update({ content: 'Leave channel set to ' + `<#${interaction.values[0]}>` + '.', ...payload });
+      return;
+    }
+
+    // 7J-111TICKETSCOPE: Ticket Settings sub-page.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_settings_tickets') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const payload = await buildAdminTicketSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_settings_from_tickets') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const payload = await buildAdminSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_ticketsettings_channel') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      await setGuildTicketSettings(interaction.guild.id, interaction.guild.name, { ticketChannelId: interaction.values[0] });
+      const payload = await buildAdminTicketSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: 'Ticket channel set to ' + `<#${interaction.values[0]}>` + '.', ...payload });
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_ticketsettings_support') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      await setGuildTicketSettings(interaction.guild.id, interaction.guild.name, { supportChannelId: interaction.values[0] });
+      const payload = await buildAdminTicketSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: 'Support channel set to ' + `<#${interaction.values[0]}>` + '.', ...payload });
+      return;
+    }
+
+    if (interaction.isRoleSelectMenu() && interaction.customId === 'adminpanel_ticketsettings_role') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      await setGuildTicketSettings(interaction.guild.id, interaction.guild.name, { ticketAdminRoleId: interaction.values[0] });
+      const payload = await buildAdminTicketSettingsPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      await interaction.update({ content: 'Admin Notify Role set to ' + `<@&${interaction.values[0]}>` + '.', ...payload });
       return;
     }
 
@@ -20776,10 +21032,11 @@ if (shopSubcommand === 'view') {
 
         const inventoryId = randomUUID();
         const serialNumber = await getNextSerialNumber(pool, item.id);
+        const productionNumber = await getNextProductionNumber(pool, item.item_name);
         await pool.query(
-          `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, lookup_tag)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, serialNumber, generateInventoryLookupTag()]
+          `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, production_number, lookup_tag)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, serialNumber, productionNumber, generateInventoryLookupTag()]
         );
 
         if (item.stock !== null) {
@@ -20789,8 +21046,9 @@ if (shopSubcommand === 'view') {
         const avatarSlot = inferAvatarSlotFromItem(item);
         await grantVisualAvatarItem(interaction.guild.id, interaction.user.id, item.item_name, avatarSlot, 'shop_purchase').catch(() => null);
 
-        const serialSuffix = serialNumber !== null ? ` — you got **#${serialNumber}${item.max_stock !== null && item.max_stock !== undefined ? '/' + item.max_stock : ''}**!` : '';
-        await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.' + serialSuffix, ephemeral: true });
+        const serialSuffix = serialNumber !== null ? ` (Limited Edition **#${serialNumber}${item.max_stock !== null && item.max_stock !== undefined ? '/' + item.max_stock : ''}**)` : '';
+        const productionSuffix = productionNumber !== null ? ` — you're **Production #${productionNumber}**!` : '';
+        await interaction.reply({ content: 'Purchased **' + item.item_name + '** for **' + settings.currency_icon + ' ' + item.price + '**.' + serialSuffix + productionSuffix, ephemeral: true });
         return;
       }
 
@@ -20805,19 +21063,12 @@ if (shopSubcommand === 'view') {
           [targetUser.id]
         );
 
-        const NL = String.fromCharCode(10);
-        const embed = new EmbedBuilder()
-          .setTitle(targetUser.username + ' • Inventory')
-          .setColor(0x5865F2)
-          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-          .setFooter({ text: 'GG Sports • Inventory' })
-          .setTimestamp();
-
-        embed.setDescription(result.rows.length
-          ? result.rows.map(row => '**' + shortInventoryItemId(row.id) + ' • ' + row.item_name + (row.serial_number ? ' #' + row.serial_number : '') + '** — ' + row.status + ' • Paid: ' + settings.currency_icon + ' ' + row.price_paid + (row.lookup_tag ? NL + 'Tag: `' + row.lookup_tag + '`' : '')).join(NL + NL)
-          : 'No inventory items found.');
-
-        await interaction.editReply({ embeds: [embed], ephemeral: true });
+        // 7J-109PRODNUM: this used to be its own separate inline embed builder,
+        // duplicating buildInventoryEmbed's logic (and drifting out of sync with
+        // it — this copy still showed the raw row-id prefix after the redesign
+        // below fixed it there). Now reuses the shared builder so both surfaces
+        // can't drift apart again.
+        await interaction.editReply({ embeds: [buildInventoryEmbed(settings, targetUser, result.rows)], ephemeral: true });
         return;
       }
 
@@ -24192,10 +24443,11 @@ if (shopSubcommand === 'view') {
       }
 
       const purchaseSerialNumber = await getNextSerialNumber(pool, item.id);
+      const purchaseProductionNumber = await getNextProductionNumber(pool, item.item_name);
       await pool.query(
-        `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, lookup_tag)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, purchaseSerialNumber, generateInventoryLookupTag()]
+        `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, serial_number, production_number, lookup_tag)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [randomUUID(), interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, purchaseSerialNumber, purchaseProductionNumber, generateInventoryLookupTag()]
       );
 
       if (item.stock !== null) {
@@ -24205,8 +24457,9 @@ if (shopSubcommand === 'view') {
         );
       }
 
-      const purchaseSerialSuffix = purchaseSerialNumber !== null ? ` — you got **#${purchaseSerialNumber}${item.max_stock !== null && item.max_stock !== undefined ? '/' + item.max_stock : ''}**!` : '';
-      await interaction.reply({ content: `Purchased **${item.item_name}** for **${settings.currency_icon} ${item.price} ${settings.currency_name}**.${purchaseSerialSuffix}`, ephemeral: true });
+      const purchaseSerialSuffix = purchaseSerialNumber !== null ? ` (Limited Edition **#${purchaseSerialNumber}${item.max_stock !== null && item.max_stock !== undefined ? '/' + item.max_stock : ''}**)` : '';
+      const purchaseProductionSuffix = purchaseProductionNumber !== null ? ` — you're **Production #${purchaseProductionNumber}**!` : '';
+      await interaction.reply({ content: `Purchased **${item.item_name}** for **${settings.currency_icon} ${item.price} ${settings.currency_name}**.${purchaseSerialSuffix}${purchaseProductionSuffix}`, ephemeral: true });
       return;
     }
 
@@ -27251,6 +27504,7 @@ function buildEditItemCoreModal(item) {
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('price').setLabel('Price').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(item.price))),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('description').setLabel('Description (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue((item.description || '').slice(0, 4000))),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stock').setLabel('Stock (optional, blank = unlimited)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.stock === null || item.stock === undefined ? '' : String(item.stock))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('release_package').setLabel('Release Package (optional)').setStyle(TextInputStyle.Short).setRequired(false).setValue((item.release_package || '').slice(0, 4000))),
     );
 }
 
@@ -28752,7 +29006,17 @@ async function openSupportTicket(interaction, ticketType) {
   const subject = interaction.options.getString('subject');
   const description = interaction.options.getString('description');
   const leagueName = interaction.options.getString('league');
-  const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await resolveLeague(interaction);
+  // 7J-111TICKETSCOPE: explicit league name wins; otherwise infer ONLY from a
+  // real signal — the channel the ticket was opened in being one of that
+  // league's own configured channels (getLeagueByChannel). Deliberately does
+  // NOT fall back to resolveLeague's "guess the oldest active league" default
+  // (getDefaultLeague) the way this used to — that fallback exists for
+  // channel-bound commands where guessing wrong is low-stakes, but here it
+  // would silently mislabel a guild-wide feature ticket as belonging to some
+  // unrelated league and ping the wrong staff. No match = genuinely guild-wide.
+  const activeLeague = leagueName
+    ? await getLeagueByName(interaction.guild.id, leagueName)
+    : await getLeagueByChannel(interaction.guild.id, interaction.channelId);
 
   if (leagueName && !activeLeague) {
     await interaction.reply({ content: 'Could not find league **' + leagueName + '**.', ephemeral: true });
@@ -28774,14 +29038,24 @@ async function openSupportTicket(interaction, ticketType) {
 
   const safeSubject = subject.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 40) || ticketType;
   const threadName = (ticketType + '-' + interaction.user.username + '-' + safeSubject).slice(0, 90);
-  const staffRoleId = activeLeague?.staff_role_id || null;
+
+  // 7J-111TICKETSCOPE: league-specific ticket -> ping that league's staff role
+  // (unchanged). Guild-wide ticket (no league resolved) -> ping the guild's
+  // configured admin-notify role, falling back to whichever role(s) actually
+  // carry Administrator, so a guild-wide issue never goes out unpinged the
+  // way it silently did before.
+  const mentionRoleIds = activeLeague?.staff_role_id
+    ? [activeLeague.staff_role_id]
+    : await resolveGuildTicketAdminMentionRoleIds(interaction.guild);
+  const mentionLabel = activeLeague ? 'Staff' : 'Admins';
+  const mentionText = mentionRoleIds.length ? mentionRoleIds.map(id => '<@&' + id + '>').join(' ') : '';
 
   const starterPayload = {
-    content: '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (staffRoleId ? ' <@&' + staffRoleId + '>' : ''),
+    content: '<@' + interaction.user.id + '> opened a **' + ticketType + '** ticket.' + (mentionText ? ' ' + mentionText : ''),
     embeds: [buildTicketEmbed({ type: ticketType, subject, description, creator: interaction.user })],
     allowedMentions: {
       users: [interaction.user.id],
-      roles: staffRoleId ? [staffRoleId] : [],
+      roles: mentionRoleIds,
     },
   };
 
@@ -28800,10 +29074,10 @@ async function openSupportTicket(interaction, ticketType) {
 
   const NL = String.fromCharCode(10);
   await thread.send({
-    content: '<@' + interaction.user.id + '> your ticket is open here.' + (staffRoleId ? ' Staff: <@&' + staffRoleId + '>' : '') + NL + NL + 'Use **/closeticket** in this thread when it is resolved.',
+    content: '<@' + interaction.user.id + '> your ticket is open here.' + (mentionText ? ' ' + mentionLabel + ': ' + mentionText : '') + NL + NL + 'Use **/closeticket** in this thread when it is resolved.',
     allowedMentions: {
       users: [interaction.user.id],
-      roles: staffRoleId ? [staffRoleId] : [],
+      roles: mentionRoleIds,
     },
   }).catch(() => null);
 
@@ -29323,6 +29597,30 @@ async function getNextSerialNumber(dbPool, itemId) {
     [itemId]
   );
   return Number(soldResult.rows[0].count) + 1;
+}
+
+// 7J-109PRODNUM: assigns the next global "production number" for an item, keyed by
+// item NAME (case-insensitive, trimmed) — NOT scoped to guild, item_id, or stock
+// limits. Every unit of e.g. "Hoodie" ever purchased/awarded/gifted, anywhere this
+// bot runs, shares one forever-incrementing sequence — distinct from
+// getNextSerialNumber above, which is scoped to a single shop_items row and only
+// fires for limited-stock runs (that one powers the "#7/50" limited-edition display).
+// quantity > 1 atomically reserves a contiguous block (e.g. buying 3 in one cart
+// checkout gets #41, #42, #43) in a single round trip rather than one query per unit.
+async function getNextProductionNumber(dbPool, itemName, quantity = 1) {
+  const key = String(itemName || '').trim().toLowerCase();
+  if (!key || !Number.isInteger(quantity) || quantity < 1) return null;
+  await dbPool.query(
+    `INSERT INTO item_production_counters (item_name_key, next_number) VALUES ($1, 1)
+     ON CONFLICT (item_name_key) DO NOTHING`,
+    [key]
+  );
+  const result = await dbPool.query(
+    `UPDATE item_production_counters SET next_number = next_number + $2
+     WHERE item_name_key = $1 RETURNING next_number - $2 AS assigned`,
+    [key, quantity]
+  );
+  return Number(result.rows[0].assigned);
 }
 
 const VISUAL_AVATAR_STARTERS = [
@@ -29928,10 +30226,11 @@ async function grantAwardItem(guildId, userId, itemId, awardType) {
   if (!item) return { ok: false, message: 'Could not find that item.' };
 
   const inventoryId = randomUUID();
+  const productionNumber = await getNextProductionNumber(pool, item.item_name);
   await pool.query(
-    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, award_type, lookup_tag)
-     VALUES ($1, $2, $3, $4, $5, 0, 'owned', $6, $7)`,
-    [inventoryId, guildId, userId, item.id, item.item_name, awardType, generateInventoryLookupTag()]
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, award_type, production_number, lookup_tag)
+     VALUES ($1, $2, $3, $4, $5, 0, 'owned', $6, $7, $8)`,
+    [inventoryId, guildId, userId, item.id, item.item_name, awardType, productionNumber, generateInventoryLookupTag()]
   );
   return { ok: true, item, inventoryId };
 }
@@ -29945,10 +30244,11 @@ async function grantGiftItemOnce(guildId, userId, item, giftType) {
   const existing = await pool.query(`SELECT id FROM user_inventory WHERE user_id = $1 AND item_id = $2 LIMIT 1`, [userId, item.id]);
   if (existing.rows.length) return false;
   const inventoryId = randomUUID();
+  const productionNumber = await getNextProductionNumber(pool, item.item_name);
   await pool.query(
-    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, award_type, lookup_tag)
-     VALUES ($1, $2, $3, $4, $5, 0, 'owned', $6, $7)`,
-    [inventoryId, guildId, userId, item.id, item.item_name, giftType, generateInventoryLookupTag()]
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, award_type, production_number, lookup_tag)
+     VALUES ($1, $2, $3, $4, $5, 0, 'owned', $6, $7, $8)`,
+    [inventoryId, guildId, userId, item.id, item.item_name, giftType, productionNumber, generateInventoryLookupTag()]
   );
   return true;
 }
@@ -31306,10 +31606,11 @@ async function performAvatarShopPurchase(interaction, itemId, colorHex = null) {
 
   const inventoryId = randomUUID();
   const dressingRoomSerialNumber = await getNextSerialNumber(pool, item.id);
+  const dressingRoomProductionNumber = await getNextProductionNumber(pool, item.item_name);
   await pool.query(
-    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, color_hex, serial_number, lookup_tag)
-     VALUES ($1, $2, $3, $4, $5, $6, 'owned', $7, $8, $9)`,
-    [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, finalColorHex, dressingRoomSerialNumber, generateInventoryLookupTag()]
+    `INSERT INTO user_inventory (id, guild_id, user_id, item_id, item_name, price_paid, status, color_hex, serial_number, production_number, lookup_tag)
+     VALUES ($1, $2, $3, $4, $5, $6, 'owned', $7, $8, $9, $10)`,
+    [inventoryId, interaction.guild.id, interaction.user.id, item.id, item.item_name, item.price, finalColorHex, dressingRoomSerialNumber, dressingRoomProductionNumber, generateInventoryLookupTag()]
   );
 
   if (item.stock !== null) {
@@ -31319,7 +31620,7 @@ async function performAvatarShopPurchase(interaction, itemId, colorHex = null) {
   const slot = item.avatar_slot || inferAvatarSlotFromItem(item);
   await equipAvatarItem(interaction.user.id, slot, inventoryId);
 
-  return { ok: true, item, inventoryId, serialNumber: dressingRoomSerialNumber };
+  return { ok: true, item, inventoryId, serialNumber: dressingRoomSerialNumber, productionNumber: dressingRoomProductionNumber };
 }
 
 // Shared by /avatar locker, /avatar shop, and the Avatar Panel's "Locker Room"/"Go
@@ -33048,15 +33349,80 @@ async function notifyWaitlistForVacantTeam(guild, league, teamName) {
   }
 }
 
+// 7J-110RELOCATE: guild-wide counterpart to autoCreateLeagueChannels below —
+// creates one "GG Sports" category (not named after any one league, since
+// none of these 7 panel types are league-specific — they're guild-wide via
+// multi_channel_panels, keyed by guild_id/panel_type/channel_id only) and
+// posts each board immediately via the existing postOrRefreshMultiChannelPanel.
+// Lives in the Admin Panel's League Setup page per Hxxdie, since that's a
+// guild-wide page and fits the "just created a league" flow naturally.
+async function autoCreateGuildMultiChannelPanels(guild) {
+  const category = await guild.channels.create({ name: 'GG Sports', type: ChannelType.GuildCategory });
+  const created = [];
+  const panelSpecs = [
+    ['shop', 'shop'],
+    ['sportsbook', 'sportsbook-board'],
+    ['marketplace', 'marketplace'],
+    ['avatar', 'avatar'],
+    ['bank', 'bank'],
+    ['profile', 'member-profile'],
+    ['recruitment', 'recruitment'],
+  ];
+  for (const [panelType, channelName] of panelSpecs) {
+    const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (!channel) continue;
+    await postOrRefreshMultiChannelPanel(guild, panelType, channel).catch(() => null);
+    created.push(channel);
+  }
+  return { category, channels: created };
+}
+
+// 7J-110RELOCATE: creates the three per-league roles (league/staff/trade
+// committee) and saves them via the canonical Setup Dashboard columns, then
+// offers a button straight into that league's Commissioner Panel so the
+// admin can keep going without hunting for it. Called either right after a
+// deferReply (single-league case) or after an interaction.update (multi-
+// league picker case) — editReply works in both since either acknowledgment
+// leaves the interaction in an editable state.
+async function runAdminPanelAutoCreateLeagueRoles(interaction, league) {
+  const leagueRole = await interaction.guild.roles.create({ name: `${league.league_name} League`, mentionable: true, reason: `Auto-created league role for ${league.league_name}` }).catch(() => null);
+  const staffRole = await interaction.guild.roles.create({ name: `${league.league_name} Staff`, mentionable: true, reason: `Auto-created staff role for ${league.league_name}` }).catch(() => null);
+  const committeeRole = await interaction.guild.roles.create({ name: `${league.league_name} Trade Committee`, mentionable: true, reason: `Auto-created trade committee role for ${league.league_name}` }).catch(() => null);
+
+  await pool.query(
+    `INSERT INTO league_settings (league_id, league_role_id, staff_role_id, trade_committee_role_id, updated_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (league_id) DO UPDATE SET
+       league_role_id = COALESCE($2, league_settings.league_role_id),
+       staff_role_id = COALESCE($3, league_settings.staff_role_id),
+       trade_committee_role_id = COALESCE($4, league_settings.trade_committee_role_id),
+       updated_at = NOW()`,
+    [league.league_id, leagueRole?.id || null, staffRole?.id || null, committeeRole?.id || null]
+  );
+
+  const created = [leagueRole, staffRole, committeeRole].filter(Boolean);
+  const continueRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`adminpanel_open_commissioner:${league.league_id}`).setLabel('Continue in Commissioner Panel').setEmoji('➡️').setStyle(ButtonStyle.Primary)
+  );
+  await interaction.editReply({
+    content: `Created **${created.length}** role${created.length === 1 ? '' : 's'} for **${league.league_name}**: ${created.map(r => r.toString()).join(', ') || 'none — role creation failed'}. Continue league-specific setup (core channels, trade setup channels, team roles) in the Commissioner Panel.`,
+    components: [continueRow],
+  });
+}
+
 // 7J-100AUTOSETUP: creates a category + a curated set of channels for a
-// league, wires each single-channel setting into league_settings
-// immediately, and for the multi-channel-panel types (Shop/Marketplace/
-// Avatar/Recruitment/Bank/Member Profile) posts the actual live panel into
-// the new channel right away — so the league is functional out of the box,
-// not just "channels exist but nothing's configured." Curated rather than
-// exhaustive: this bot has 40+ possible channel settings, most of them
-// niche/optional — this covers what a new league actually needs to get
-// going, and anything else is still one click away in the Setup Dashboard.
+// league and wires each single-channel setting into league_settings
+// immediately, plus (7J-110RELOCATE) the trade-setup channels and their
+// panels, so a league is functional out of the box right after creation.
+// The 7 Multi-Channel Panel channels (Shop/Marketplace/Avatar/Recruitment/
+// Bank/Member Profile/Sportsbook Board) moved OUT of this function per
+// Hxxdie — they're guild-wide, not league-specific, so they now live in the
+// Admin Panel's League Setup page instead (see autoCreateGuildMultiChannelPanels
+// above). This function is what's left: core channels + trade setup, both of
+// which genuinely are per-league. Curated rather than exhaustive: this bot
+// has 40+ possible channel settings, most of them niche/optional — this
+// covers what a new league actually needs to get going, and anything else
+// is still one click away in the Setup Dashboard.
 async function autoCreateLeagueChannels(guild, league, isMadden) {
   const category = await guild.channels.create({ name: `🏈 ${league.league_name}`.slice(0, 100), type: ChannelType.GuildCategory });
   const created = [];
@@ -33067,8 +33433,17 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     ['standings_channel_id', 'standings'],
     ['trade_block_channel_id', 'trade-block'],
     ['sportsbook_channel_id', 'sportsbook'],
-    ['setup_ticket_channel_id', 'tickets'],
     ['suspensions_channel_id', 'suspensions'],
+    // 7J-110RELOCATE: trade setup channels, previously never auto-created at
+    // all (a commissioner had to set each one by hand from the Setup
+    // Dashboard) — per Hxxdie, this button should now cover "core channels
+    // and trade setup channels."
+    ['team_owners_channel_id', 'team-owners'],
+    ['trade_offer_channel_id', 'trade-offer'],
+    ['trade_committee_channel_id', 'trade-committee'],
+    ['approved_trades_channel_id', 'approved-trades'],
+    ['denied_trades_channel_id', 'denied-trades'],
+    ['trade_count_channel_id', 'trade-count'],
   ];
   if (isMadden) {
     singleChannelSpecs.push(
@@ -33084,19 +33459,26 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     created.push(channel);
   }
 
-  const multiChannelSpecs = [
-    ['bank', 'bank'],
-    ['profile', 'member-profile'],
-    ['shop', 'shop'],
-    ['marketplace', 'marketplace'],
-    ['avatar', 'avatar'],
-    ['recruitment', 'recruitment'],
-  ];
-  for (const [panelType, channelName] of multiChannelSpecs) {
-    const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-    if (!channel) continue;
-    await postOrRefreshMultiChannelPanel(guild, panelType, channel).catch(() => null);
-    created.push(channel);
+  // 7J-110RELOCATE: post league boards/panels in the appropriate channels
+  // right away, same "functional out of the box" goal this function always
+  // had — the Multi-Channel Panels (guild-wide) already do this themselves;
+  // this is the equivalent for the per-league channels just created above.
+  // Uses a minimal interaction-shaped object since createConfiguredPanelFromSetup
+  // only reads .guild (and .channel as a fallback we don't need, since every
+  // channel id it looks up was just set on freshLeague below). ticket_panel is
+  // deliberately NOT posted here (7J-111TICKETSCOPE) — Tickets/Support are
+  // guild-wide now, not per-league, so posting that panel belongs to the
+  // guild-wide Admin Panel ticket setup instead of running once per league.
+  const freshLeague = await getLeagueById(league.league_id).catch(() => null);
+  if (freshLeague) {
+    const fakeInteraction = { guild, channel: null };
+    const panelTypesToPost = isMadden
+      ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel']
+      : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel'];
+    for (const panelType of panelTypesToPost) {
+      await createConfiguredPanelFromSetup(fakeInteraction, freshLeague, panelType).catch(() => null);
+    }
+    await refreshSuspensionsBoard(guild, freshLeague).catch(() => null);
   }
 
   return { category, channels: created };
@@ -33560,8 +33942,9 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'approved_trades_channel', label: 'Approved Trades Channel', description: 'Approved trade announcements', kind: 'channel' },
   { value: 'denied_trades_channel', label: 'Denied Trades Channel', description: 'Denied trade announcements', kind: 'channel' },
   { value: 'trade_count_channel', label: 'Trade Count Channel', description: 'Trade count panel channel', kind: 'channel' },
-  { value: 'ticket_channel', label: 'Ticket Channel', description: 'Ticket panel channel', kind: 'channel' },
-  { value: 'support_channel', label: 'Support Channel', description: 'Support panel channel', kind: 'channel' },
+  // ticket_channel/support_channel removed 7J-111TICKETSCOPE — Tickets/Support
+  // are guild-wide now (Admin Panel > Server Settings), not per-league. See
+  // guilds.ticket_channel_id/support_channel_id and buildAdminTicketSettingsPayload.
   { value: 'suspensions_channel', label: 'Suspensions Board', description: 'Posted list of active player suspensions', kind: 'channel' },
 ];
 
@@ -33703,8 +34086,6 @@ function setupDashboardColumn(settingKey) {
     approved_trades_channel: 'approved_trades_channel_id',
     denied_trades_channel: 'denied_trades_channel_id',
     trade_count_channel: 'trade_count_channel_id',
-    ticket_channel: 'setup_ticket_channel_id',
-    support_channel: 'setup_support_channel_id',
     suspensions_channel: 'suspensions_channel_id',
   };
   return map[settingKey] || null;
@@ -33805,12 +34186,12 @@ async function buildSetupDashboardEmbed(guild, league) {
     const count = multiChannelCounts[i].length;
     return `${label}: ` + (count ? `posted in ${count} channel${count === 1 ? '' : 's'}` : 'Not posted anywhere yet');
   });
-  // 7J-86CHANSETUP: Tickets/Support moved here per Hxxdie — still single-
-  // channel settings under the hood (setup_pick_channel, same as any other
-  // 'channel' kind option in SETUP_DASHBOARD_OPTIONS), just grouped under
-  // this header now instead of Core Channels.
-  multiChannelLines.push('Tickets: ' + setupDashboardFormatValue(league, 'ticket_channel'));
-  multiChannelLines.push('Support: ' + setupDashboardFormatValue(league, 'support_channel'));
+  // 7J-111TICKETSCOPE: Tickets/Support removed from here — both are guild-wide
+  // now (Admin Panel > Server Settings > Ticket Settings), not per-league, so
+  // they no longer belong on a per-league dashboard. This whole field is
+  // otherwise read-only guild-wide status now (7J-110RELOCATE moved the actual
+  // editing to the Admin Panel's League Setup page) — kept here for visibility
+  // since a commissioner mid-setup may still look here first.
 
   return new EmbedBuilder()
     .setTitle(`${GG_EMOJI} GG Sports Setup Dashboard`)
@@ -34194,9 +34575,12 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
   }
 
   if (panelType === 'ticket_panel') {
-    const channelId = league.setup_ticket_channel_id || league.setup_support_channel_id;
+    // 7J-111TICKETSCOPE: guild-wide now — reads guilds.ticket_channel_id/
+    // support_channel_id instead of the old per-league columns.
+    const guildTicketSettings = await getGuildSettings(interaction.guild.id, interaction.guild.name).catch(() => null);
+    const channelId = guildTicketSettings?.ticket_channel_id || guildTicketSettings?.support_channel_id;
     const { channel, error } = await requireTextChannel(channelId, interaction.channel, 'ticket/support channel');
-    if (error) return error;
+    if (error) return error + ' Set the Ticket/Support channel from Admin Panel > Server Settings > Ticket Settings first.';
 
     const embed = new EmbedBuilder()
       .setTitle('Support Tickets')
@@ -39306,6 +39690,21 @@ async function buildAdminLeagueSetupPayload(guild, lang) {
       .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
     components.push(new ActionRowBuilder().addComponents(deleteMenu));
   }
+  // 7J-110RELOCATE: Auto Setup Channels / Auto Create League Roles, relocated here
+  // per Hxxdie — this page is guild-wide league management, and Auto Setup Channels
+  // specifically only ever touches guild-wide infrastructure (the Multi-Channel
+  // Panels — Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment —
+  // none of which are tied to any one specific league), so it fits the league
+  // creation flow better here than buried in one league's Commissioner Panel.
+  // Auto Create League Roles DOES need a specific league (roles are per-league
+  // settings) — clicking it opens a league picker rather than acting on all of
+  // them at once. Only shown once at least one league exists.
+  if (result.rows.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_autosetup_channels').setLabel('Auto Setup Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('adminpanel_autosetup_roles').setLabel('Auto Create League Roles').setEmoji('🏗️').setStyle(ButtonStyle.Success),
+    ));
+  }
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('adminpanel_league_create').setLabel(t(lang, 'league_setup_create_button')).setEmoji('➕').setStyle(ButtonStyle.Success)
   ));
@@ -39429,7 +39828,16 @@ async function buildAdminSettingsPayload(guild, lang) {
       .setCustomId('adminpanel_settings_welcomeleave_toggle')
       .setLabel(settings.welcome_leave_enabled ? 'Disable Welcome/Leave' : 'Enable Welcome/Leave')
       .setEmoji(settings.welcome_leave_enabled ? '🚫' : '✅')
-      .setStyle(settings.welcome_leave_enabled ? ButtonStyle.Danger : ButtonStyle.Success)
+      .setStyle(settings.welcome_leave_enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+    // 7J-111TICKETSCOPE: opens its own sub-page rather than adding channel/role
+    // selects directly here — this page is already at Discord's 5-action-row
+    // cap (language select, this button row, welcome channel, leave channel,
+    // back), and Ticket Settings needs 3 more selects of its own.
+    new ButtonBuilder()
+      .setCustomId('adminpanel_settings_tickets')
+      .setLabel('Ticket Settings')
+      .setEmoji('🎫')
+      .setStyle(ButtonStyle.Secondary)
   );
 
   const welcomeChannelRow = new ActionRowBuilder().addComponents(
@@ -39450,6 +39858,45 @@ async function buildAdminSettingsPayload(guild, lang) {
   );
 
   return { embeds: [embed], components: [new ActionRowBuilder().addComponents(languageMenu), toggleRow, welcomeChannelRow, leaveChannelRow, buildAdminPanelBackRow(lang)] };
+}
+
+// 7J-111TICKETSCOPE: guild-wide Ticket/Support channel + admin-notify-role
+// settings — split into its own sub-page since Server Settings above is
+// already at Discord's 5-action-row cap. See getGuildSettings /
+// setGuildTicketSettings / resolveGuildTicketAdminMentionRoleIds.
+async function buildAdminTicketSettingsPayload(guild, lang) {
+  const settings = await getGuildSettings(guild.id, guild.name);
+  const embed = new EmbedBuilder()
+    .setTitle('🎫 Ticket Settings')
+    .setColor(0x5865F2)
+    .setDescription(
+      'Tickets and Support are guild-wide (not tied to any one league). ' +
+      'A ticket opened about a specific league still pings that league\'s Staff role, same as before. ' +
+      'A ticket opened about a guild-wide feature (no league detected) pings the Admin Notify Role below instead — ' +
+      'if that\'s not set, it falls back to whichever server role actually has Administrator permission.'
+    )
+    .addFields(
+      { name: 'Ticket Channel', value: settings.ticket_channel_id ? `<#${settings.ticket_channel_id}>` : 'Not set', inline: true },
+      { name: 'Support Channel', value: settings.support_channel_id ? `<#${settings.support_channel_id}>` : 'Not set', inline: true },
+      { name: 'Admin Notify Role', value: settings.ticket_admin_role_id ? `<@&${settings.ticket_admin_role_id}>` : 'Not set (falls back to Administrator roles)', inline: true },
+    )
+    .setFooter({ text: t(lang, 'admin_panel_footer') })
+    .setTimestamp();
+
+  const ticketChannelRow = new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder().setCustomId('adminpanel_ticketsettings_channel').setPlaceholder('Set Ticket Channel').setChannelTypes(ChannelType.GuildText).setMinValues(1).setMaxValues(1)
+  );
+  const supportChannelRow = new ActionRowBuilder().addComponents(
+    new ChannelSelectMenuBuilder().setCustomId('adminpanel_ticketsettings_support').setPlaceholder('Set Support Channel').setChannelTypes(ChannelType.GuildText).setMinValues(1).setMaxValues(1)
+  );
+  const adminRoleRow = new ActionRowBuilder().addComponents(
+    new RoleSelectMenuBuilder().setCustomId('adminpanel_ticketsettings_role').setPlaceholder('Set Admin Notify Role (for guild-wide tickets)').setMinValues(1).setMaxValues(1)
+  );
+  const backRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('adminpanel_settings_from_tickets').setLabel('Back to Server Settings').setEmoji('⬅️').setStyle(ButtonStyle.Secondary)
+  );
+
+  return { embeds: [embed], components: [ticketChannelRow, supportChannelRow, adminRoleRow, backRow] };
 }
 
 async function showAdminPanelCategory(interaction, category, { update = true } = {}) {
