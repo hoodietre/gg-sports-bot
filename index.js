@@ -11435,6 +11435,11 @@ if (interaction.commandName === 'avatar') {
           await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
           return;
         }
+        const selfBetConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
+        if (selfBetConflict) {
+          await interaction.reply({ content: '🚫 ' + selfBetConflict, ephemeral: true });
+          return;
+        }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
 
         if (!removed) {
@@ -12335,6 +12340,12 @@ if (interaction.commandName === 'avatar') {
         }
         if (sportsbookGame.bets_locked) {
           await interaction.editReply({ content: `🔒 **${draftLeg.label}** — betting closed after "Game Started" was pressed. Start your parlay over without that leg.` });
+          clearParlayDraft(interaction.guild.id, interaction.user.id);
+          return;
+        }
+        const legConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
+        if (legConflict) {
+          await interaction.editReply({ content: `🚫 **${draftLeg.label}** — ${legConflict} Start your parlay over without that leg.` });
           clearParlayDraft(interaction.guild.id, interaction.user.id);
           return;
         }
@@ -22945,6 +22956,11 @@ if (shopSubcommand === 'view') {
           await interaction.reply({ content: '🔒 Sportsbook game **' + sportsbookGame.game_label + '** — betting closed after "Game Started" was pressed.', ephemeral: true });
           return;
         }
+        const legConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
+        if (legConflict) {
+          await interaction.reply({ content: `🚫 **${sportsbookGame.game_label}** — ${legConflict}`, ephemeral: true });
+          return;
+        }
         if (usedGameIds.has(sportsbookGame.id)) {
           await interaction.reply({ content: 'You cannot use the same game twice in one parlay.', ephemeral: true });
           return;
@@ -23261,7 +23277,15 @@ if (shopSubcommand === 'view') {
         }
 
         const subjectDisplayName = maddenPlayerDisplayName(player);
-        const statLine = `${subjectDisplayName} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
+        // 7J-108PROPTEAM: per Hxxdie — with lots of user-vs-user games
+        // happening in a full league, same/similar player names across
+        // different teams are a real mix-up risk. Baked into
+        // subject_display_name itself (not just this one label) so every
+        // downstream display — the board, bet confirmations, settlement
+        // results, the self-bet conflict message — gets it for free.
+        const subjectTeamAbbrev = player.team_name ? getMaddenTeamAbbrev(player.team_name) : null;
+        const subjectDisplayNameWithTeam = subjectTeamAbbrev ? `${subjectDisplayName} (${subjectTeamAbbrev})` : subjectDisplayName;
+        const statLine = `${subjectDisplayNameWithTeam} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
         const homeLabel = `Over ${threshold} ${statConfig.label}`;
         const awayLabel = `Under ${threshold} ${statConfig.label}`;
         const sportsbookGameId = randomUUID();
@@ -23269,7 +23293,7 @@ if (shopSubcommand === 'view') {
         await pool.query(
           `INSERT INTO sportsbook_games (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds, created_by_user_id, bet_type, subject_type, subject_ref, subject_display_name, stat_key, stat_threshold, stat_line, prop_week_index)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'stat_prop', 'player', $10, $11, $12, $13, $14, $15)`,
-          [sportsbookGameId, interaction.guild.id, activeLeague.league_id, statLine, homeLabel, awayLabel, homeOdds, awayOdds, interaction.user.id, subjectRef, subjectDisplayName, statKey, threshold, statLine, weekIndex]
+          [sportsbookGameId, interaction.guild.id, activeLeague.league_id, statLine, homeLabel, awayLabel, homeOdds, awayOdds, interaction.user.id, subjectRef, subjectDisplayNameWithTeam, statKey, threshold, statLine, weekIndex]
         );
 
         await updateSportsbookPanel(interaction.guild).catch(() => null);
@@ -23351,6 +23375,11 @@ if (shopSubcommand === 'view') {
         }
         if (sportsbookGame.bets_locked) {
           await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
+          return;
+        }
+        const selfBetConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
+        if (selfBetConflict) {
+          await interaction.reply({ content: '🚫 ' + selfBetConflict, ephemeral: true });
           return;
         }
         const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
@@ -23464,6 +23493,11 @@ if (shopSubcommand === 'view') {
             await interaction.reply({ content: '🔒 Sportsbook game **' + sportsbookGame.game_label + '** — betting closed after "Game Started" was pressed.', ephemeral: true });
             return;
           }
+          const legConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
+          if (legConflict) {
+            await interaction.reply({ content: `🚫 **${sportsbookGame.game_label}** — ${legConflict}`, ephemeral: true });
+            return;
+          }
           if (usedGameIds.has(sportsbookGame.id)) {
             await interaction.reply({ content: 'You cannot use the same game twice in one parlay.', ephemeral: true });
             return;
@@ -23551,6 +23585,11 @@ if (shopSubcommand === 'view') {
       }
       if (sportsbookGame.bets_locked) {
         await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
+        return;
+      }
+      const selfBetConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
+      if (selfBetConflict) {
+        await interaction.reply({ content: '🚫 ' + selfBetConflict, ephemeral: true });
         return;
       }
       const removed = await removeCurrency(interaction.guild.id, interaction.user.id, amount, 'sportsbook_bet', 'Bet on ' + sportsbookGame.game_label, interaction.user.id);
@@ -28519,6 +28558,49 @@ function buildPropAutoSettlePreviewEmbed(result, confirm) {
   }
 
   return embed;
+}
+
+// 7J-107SELFBET: no user should be able to bet on a game they're actually
+// involved in as a team owner — real integrity issue, confirmed missing
+// live (Hxxdie, as the Dolphins owner, was able to bet on his own game).
+// Only blocks when the sportsbook line is actually tied to a league and
+// resolves to a real team — a manually-created custom prop bet not tied
+// to real teams just passes through untouched, same as before, rather
+// than risk a false block on something unrelated.
+async function checkSportsbookSelfBetConflict(guild, sportsbookGame, userId) {
+  if (!sportsbookGame.league_id) return null;
+  const league = await getLeagueById(sportsbookGame.league_id).catch(() => null);
+  if (!league) return null;
+  const teams = await getLeagueTeamRoles(league.league_id).catch(() => []);
+  if (!teams.length) return null;
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return null;
+
+  // 7J-107SELFBET: stat props reuse this same table, but home_label/
+  // away_label mean "Over"/"Under" for a prop, not team names — the
+  // team-label check below would never match, silently letting an owner
+  // bet on their own player's prop. Resolve the actual team via
+  // subject_ref (the player's roster_id/presentation_id) instead.
+  if (sportsbookGame.bet_type === 'stat_prop' && sportsbookGame.subject_type === 'player' && sportsbookGame.subject_ref) {
+    const playerRow = await pool.query(
+      `SELECT team_name FROM madden_players WHERE league_id = $1 AND (roster_id = $2 OR presentation_id = $2) LIMIT 1`,
+      [league.league_id, sportsbookGame.subject_ref]
+    ).catch(() => ({ rows: [] }));
+    const teamName = playerRow.rows[0]?.team_name;
+    if (!teamName) return null; // can't resolve the player's team — allow rather than false-block
+    const team = teams.find(t => t.role_name.toLowerCase() === teamName.toLowerCase());
+    if (team && member.roles.cache.has(team.role_id)) {
+      return `**${sportsbookGame.subject_display_name || 'This player'}** plays for your team (**${teamName}**) — owners can't bet on their own players' props.`;
+    }
+    return null;
+  }
+
+  const homeTeam = teams.find(t => t.role_name.toLowerCase() === String(sportsbookGame.home_label || '').toLowerCase());
+  const awayTeam = teams.find(t => t.role_name.toLowerCase() === String(sportsbookGame.away_label || '').toLowerCase());
+
+  if (homeTeam && member.roles.cache.has(homeTeam.role_id)) return `You own the **${sportsbookGame.home_label}** — owners can't bet on their own games.`;
+  if (awayTeam && member.roles.cache.has(awayTeam.role_id)) return `You own the **${sportsbookGame.away_label}** — owners can't bet on their own games.`;
+  return null;
 }
 
 async function findSportsbookGame(guildId, input) {
@@ -65176,7 +65258,11 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
           continue; // Not enough game history to project responsibly — skip, don't guess.
         }
 
-        const displayName = candidate.full_name || 'Unknown Player';
+        // 7J-108PROPTEAM: same reasoning as the manual creation path — the
+        // outer loop already knows which team this candidate belongs to
+        // (that's literally how findMaddenPropCandidate found them).
+        const teamAbbrev = getMaddenTeamAbbrev(team);
+        const displayName = (candidate.full_name || 'Unknown Player') + (teamAbbrev ? ` (${teamAbbrev})` : '');
         const statLine = `${displayName} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
         const sportsbookGameId = randomUUID();
         const insertResult = await pool.query(
