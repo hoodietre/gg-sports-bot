@@ -21441,27 +21441,35 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
 if (interaction.commandName === 'commissioner') {
       if (!interaction.guild) return;
       const commissionerSubcommand = interaction.options.getSubcommand();
+      console.log('[7J-142DIAG] commissioner command entered, subcommand=' + commissionerSubcommand);
 
       if (commissionerSubcommand === 'panel') {
         const leagueName = interaction.options.getString('league');
+        console.log('[7J-142DIAG] commissioner panel: resolving league, leagueName=' + leagueName);
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
+        console.log('[7J-142DIAG] commissioner panel: league resolved, found=' + Boolean(activeLeague));
 
         if (!activeLeague) {
           await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
           return;
         }
 
+        console.log('[7J-142DIAG] commissioner panel: checking permission');
         if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          console.log('[7J-142DIAG] commissioner panel: permission denied');
           await interaction.reply({ content: 'You do not have permission to open the commissioner panel.', ephemeral: true });
           return;
         }
+        console.log('[7J-142DIAG] commissioner panel: permission granted, fetching madden settings');
 
-        const settings = await ensureMaddenLeagueSettings(activeLeague).catch(() => ({}));
+        const settings = await ensureMaddenLeagueSettings(activeLeague).catch((err) => { console.log('[7J-142DIAG] commissioner panel: ensureMaddenLeagueSettings threw: ' + (err?.message || err)); return {}; });
+        console.log('[7J-142DIAG] commissioner panel: settings fetched, about to reply');
         await interaction.reply({
           embeds: [buildCommissionerHomeEmbed(activeLeague, settings)],
           components: buildCommissionerHomeComponents(activeLeague.league_id),
           ephemeral: true,
         });
+        console.log('[7J-142DIAG] commissioner panel: reply sent successfully');
         return;
       }
     }
@@ -21498,19 +21506,25 @@ if (interaction.commandName === 'commissioner') {
     if (interaction.commandName === 'admin') {
       if (!interaction.guild) return;
       const adminSubcommand = interaction.options.getSubcommand();
+      console.log('[7J-142DIAG] admin command entered, subcommand=' + adminSubcommand);
 
       if (adminSubcommand === 'panel') {
+        console.log('[7J-142DIAG] admin panel: checking permission');
         if (!(await userCanUseLeagueSetup(interaction, null))) {
+          console.log('[7J-142DIAG] admin panel: permission denied, fetching language');
           const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
           await interaction.reply({ content: t(lang, 'admin_panel_no_permission'), ephemeral: true });
           return;
         }
+        console.log('[7J-142DIAG] admin panel: permission granted, fetching language');
         const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
+        console.log('[7J-142DIAG] admin panel: language=' + lang + ', about to reply');
         await interaction.reply({
           embeds: [buildAdminPanelHomeEmbed(interaction.guild, lang)],
           components: buildAdminPanelHomeComponents(lang),
           ephemeral: true,
         });
+        console.log('[7J-142DIAG] admin panel: reply sent successfully');
         return;
       }
     }
