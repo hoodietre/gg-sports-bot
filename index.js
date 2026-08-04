@@ -14976,7 +14976,7 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.customId.startsWith('gamecenter_issue_type:')) {
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_issue_type:')) {
       const [, requestAction, gameId] = interaction.customId.split(':');
       const modal = new ModalBuilder()
         .setCustomId(`gamecenter_issue_modal:${requestAction}:${gameId}`)
@@ -21441,35 +21441,27 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
 if (interaction.commandName === 'commissioner') {
       if (!interaction.guild) return;
       const commissionerSubcommand = interaction.options.getSubcommand();
-      console.log('[7J-142DIAG] commissioner command entered, subcommand=' + commissionerSubcommand);
 
       if (commissionerSubcommand === 'panel') {
         const leagueName = interaction.options.getString('league');
-        console.log('[7J-142DIAG] commissioner panel: resolving league, leagueName=' + leagueName);
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-        console.log('[7J-142DIAG] commissioner panel: league resolved, found=' + Boolean(activeLeague));
 
         if (!activeLeague) {
           await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
           return;
         }
 
-        console.log('[7J-142DIAG] commissioner panel: checking permission');
         if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
-          console.log('[7J-142DIAG] commissioner panel: permission denied');
           await interaction.reply({ content: 'You do not have permission to open the commissioner panel.', ephemeral: true });
           return;
         }
-        console.log('[7J-142DIAG] commissioner panel: permission granted, fetching madden settings');
 
-        const settings = await ensureMaddenLeagueSettings(activeLeague).catch((err) => { console.log('[7J-142DIAG] commissioner panel: ensureMaddenLeagueSettings threw: ' + (err?.message || err)); return {}; });
-        console.log('[7J-142DIAG] commissioner panel: settings fetched, about to reply');
+        const settings = await ensureMaddenLeagueSettings(activeLeague).catch(() => ({}));
         await interaction.reply({
           embeds: [buildCommissionerHomeEmbed(activeLeague, settings)],
           components: buildCommissionerHomeComponents(activeLeague.league_id),
           ephemeral: true,
         });
-        console.log('[7J-142DIAG] commissioner panel: reply sent successfully');
         return;
       }
     }
@@ -21506,25 +21498,19 @@ if (interaction.commandName === 'commissioner') {
     if (interaction.commandName === 'admin') {
       if (!interaction.guild) return;
       const adminSubcommand = interaction.options.getSubcommand();
-      console.log('[7J-142DIAG] admin command entered, subcommand=' + adminSubcommand);
 
       if (adminSubcommand === 'panel') {
-        console.log('[7J-142DIAG] admin panel: checking permission');
         if (!(await userCanUseLeagueSetup(interaction, null))) {
-          console.log('[7J-142DIAG] admin panel: permission denied, fetching language');
           const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
           await interaction.reply({ content: t(lang, 'admin_panel_no_permission'), ephemeral: true });
           return;
         }
-        console.log('[7J-142DIAG] admin panel: permission granted, fetching language');
         const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
-        console.log('[7J-142DIAG] admin panel: language=' + lang + ', about to reply');
         await interaction.reply({
           embeds: [buildAdminPanelHomeEmbed(interaction.guild, lang)],
           components: buildAdminPanelHomeComponents(lang),
           ephemeral: true,
         });
-        console.log('[7J-142DIAG] admin panel: reply sent successfully');
         return;
       }
     }
@@ -26892,25 +26878,6 @@ if (shopSubcommand === 'view') {
 });
 
 client.on('error', console.error);
-
-// 7J-143RAWDIAG: temporary — sits BELOW all of discord.js's own parsing,
-// at the raw gateway packet level. If an INTERACTION_CREATE packet doesn't
-// even show up here when a command is run, Discord isn't delivering it to
-// this process at all (a gateway/Discord-side issue, not app code). If it
-// DOES show up here but Events.InteractionCreate still never fires, that
-// points at discord.js's own dispatch layer instead. Remove once the real
-// cause is found — this logs the raw type of every single gateway event,
-// which is noisy by design for this one diagnostic pass.
-client.on('raw', (packet) => {
-  if (packet?.t === 'INTERACTION_CREATE') {
-    console.log('[7J-143RAWDIAG] raw INTERACTION_CREATE packet received, id=' + packet?.d?.id + ' type=' + packet?.d?.type + ' commandName=' + (packet?.d?.data?.name ?? 'n/a'));
-  }
-});
-client.on('shardDisconnect', (event, shardId) => console.log('[7J-143RAWDIAG] shardDisconnect shard=' + shardId + ' code=' + event?.code));
-client.on('shardReconnecting', (shardId) => console.log('[7J-143RAWDIAG] shardReconnecting shard=' + shardId));
-client.on('shardResume', (shardId) => console.log('[7J-143RAWDIAG] shardResume shard=' + shardId));
-client.on('shardError', (error, shardId) => console.log('[7J-143RAWDIAG] shardError shard=' + shardId + ' error=' + (error?.message || error)));
-
 process.on('unhandledRejection', console.error);
 process.on('uncaughtException', console.error);
 
