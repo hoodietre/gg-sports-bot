@@ -14805,11 +14805,122 @@ if (interaction.commandName === 'avatar') {
       const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
       const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
       if (interaction.channel?.isThread?.()) {
+        const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
         await interaction.channel.send({
           embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-          components: buildGameCenterThreadComponents(gameId, false, true),
+          components: buildGameCenterThreadComponents(gameId, false, true, wagersEnabled),
         }).catch(() => null);
       }
+      return;
+    }
+
+    // 7J-141GAMETHREADBUTTONS: Matchup Info — same embed the thread starter
+    // message already shows, just re-postable on demand.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_info:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+      const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+      await interaction.reply({ embeds: [buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id)], ephemeral: true });
+      return;
+    }
+
+    // 7J-141GAMETHREADBUTTONS: Wager — same straight 1v1 bet as Madden's
+    // version, reusing the exact same game_wagers table and the generic
+    // gamewager_accept:/gamewager_decline: buttons (neither of those two
+    // handlers care which game table the game_id came from). Only the
+    // propose step needs its own modal/submit handler, since that part
+    // does look the game up by id in a specific table.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_wager:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
+      if (!customSettings.wagers_enabled) {
+        await interaction.reply({ content: 'Wagers are not enabled for this league — a commissioner can turn them on under League Settings → Wagers.', ephemeral: true });
+        return;
+      }
+      const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+      const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+      const userId = interaction.user.id;
+      const isHome = homeOwner?.id === userId;
+      const isAway = awayOwner?.id === userId;
+      if (!isHome && !isAway) {
+        await interaction.reply({ content: 'Only the two owners in this game can propose a wager.', ephemeral: true });
+        return;
+      }
+      const opponent = isHome ? awayOwner : homeOwner;
+      if (!opponent) {
+        await interaction.reply({ content: 'The other team doesn\'t have an assigned owner yet — a wager needs both sides.', ephemeral: true });
+        return;
+      }
+      const existing = await pool.query(`SELECT id FROM game_wagers WHERE game_id = $1 AND status IN ('pending','accepted') LIMIT 1`, [gameId]);
+      if (existing.rows.length) {
+        await interaction.reply({ content: 'There\'s already a pending or accepted wager for this game.', ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`gamecenter_wager_modal:${gameId}`)
+        .setTitle('Propose a Wager')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Wager amount').setStyle(TextInputStyle.Short).setRequired(true))
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('gamecenter_wager_modal:')) {
+      await interaction.deferReply();
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      const league = game ? await getLeagueById(game.league_id) : null;
+      if (!game || !league) { await interaction.editReply({ content: 'That game could not be found anymore.' }); return; }
+      const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+      const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+      const userId = interaction.user.id;
+      const isHome = homeOwner?.id === userId;
+      const proposer = isHome ? homeOwner : awayOwner;
+      const opponent = isHome ? awayOwner : homeOwner;
+      if (!proposer || !opponent) { await interaction.editReply({ content: 'Could not resolve both owners for this game anymore.' }); return; }
+
+      const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.editReply({ content: 'Wager amount must be a positive whole number.' });
+        return;
+      }
+      const proposerBalance = await getBalance(interaction.guild.id, userId);
+      const maxAllowed = Math.floor(Number(proposerBalance.balance || 0) / 2);
+      if (amount > maxAllowed) {
+        await interaction.editReply({ content: `You can't wager more than 50% of your balance (max **${maxAllowed}** — you have **${proposerBalance.balance}**).` });
+        return;
+      }
+
+      const wagerId = randomUUID();
+      await pool.query(
+        `INSERT INTO game_wagers (id, guild_id, league_id, game_id, proposer_user_id, proposer_team, opponent_user_id, opponent_team, amount)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [wagerId, interaction.guild.id, league.league_id, gameId, userId, isHome ? game.home_team_name : game.away_team_name, opponent.id, isHome ? game.away_team_name : game.home_team_name, amount]
+      );
+
+      const settings = await getCurrencySettings(interaction.guild.id).catch(() => ({ currency_icon: '🪙' }));
+      const embed = new EmbedBuilder()
+        .setTitle('💰 Wager Proposed')
+        .setColor(0xFEE75C)
+        .setDescription(`<@${userId}> is proposing a wager against <@${opponent.id}>.`)
+        .addFields(
+          { name: 'Amount (each)', value: `${settings.currency_icon} ${amount}`, inline: true },
+          { name: 'Winner Takes', value: `${settings.currency_icon} ${amount * 2}`, inline: true },
+        )
+        .setFooter({ text: 'GG Sports • Nothing to do with the sportsbook — just between these two owners' })
+        .setTimestamp();
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`gamewager_accept:${wagerId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`gamewager_decline:${wagerId}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
+      );
+      await interaction.editReply({ content: `<@${opponent.id}>`, embeds: [embed], components: [buttons] });
       return;
     }
 
@@ -14845,6 +14956,92 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-141GAMETHREADBUTTONS: Report Issue for Game Center — same
+    // pattern as maddengame_thread_issue/maddengame_issue_type/
+    // maddengame_issue_modal, resolved against league_games instead of
+    // madden_imported_games. Picks a type, then a modal for details, then
+    // opens a real ticket via the shared openSupportTicket (private, in the
+    // guild's configured Ticket Channel, staff/admins + both owners added
+    // — see 7J-111TICKETSCOPE/7J-117TICKETPRIVACY).
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_issue:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const issueTypeRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`gamecenter_issue_type:lagout:${gameId}`).setLabel('Lag Out').setEmoji('📡').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`gamecenter_issue_type:quit:${gameId}`).setLabel('Opponent Quit').setEmoji('🚪').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`gamecenter_issue_type:reset:${gameId}`).setLabel('Reset Request').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.reply({ content: `What kind of issue are you reporting for **${game.away_team_name} @ ${game.home_team_name}**?`, components: [issueTypeRow], ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith('gamecenter_issue_type:')) {
+      const [, requestAction, gameId] = interaction.customId.split(':');
+      const modal = new ModalBuilder()
+        .setCustomId(`gamecenter_issue_modal:${requestAction}:${gameId}`)
+        .setTitle('Report ' + (requestAction === 'lagout' ? 'Lag Out' : requestAction === 'quit' ? 'Opponent Quit' : 'Reset Request'))
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('details').setLabel('What happened?').setStyle(TextInputStyle.Paragraph).setRequired(true)
+          )
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('gamecenter_issue_modal:')) {
+      const [, requestAction, gameId] = interaction.customId.split(':');
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      const league = game ? await getLeagueById(game.league_id) : null;
+      if (!game || !league) { await interaction.reply({ content: 'That game could not be found anymore.', ephemeral: true }); return; }
+
+      const details = interaction.fields.getTextInputValue('details');
+      const requestLabel = requestAction === 'lagout' ? 'Lag Out' : requestAction === 'quit' ? 'Opponent Quit' : 'Reset Request';
+      const NL = String.fromCharCode(10);
+      const subject = requestLabel + ' — ' + game.away_team_name + ' @ ' + game.home_team_name;
+      let description = '**League:** ' + league.league_name;
+      description += NL + '**Game:** ' + game.away_team_name + ' @ ' + game.home_team_name;
+      description += NL + '**Request Type:** ' + requestLabel;
+      description += NL + '**Details:** ' + details;
+      description += NL + NL + 'Please upload proof/screenshots in this ticket thread. Attachments will be saved automatically as evidence.';
+
+      const sourceThread = interaction.channel?.isThread() ? interaction.channel : null;
+      const guildTicketSettings = await getGuildSettings(interaction.guild.id, interaction.guild.name).catch(() => null);
+      const ticketChannelId = guildTicketSettings?.ticket_channel_id || guildTicketSettings?.support_channel_id;
+      const baseChannel = (ticketChannelId ? await interaction.guild.channels.fetch(ticketChannelId).catch(() => null) : null) || sourceThread?.parent || interaction.channel;
+      if (!baseChannel) {
+        await interaction.reply({ content: 'Could not find a channel to open this ticket in — set a Ticket Channel from Admin Panel > Server Setup > Ticket Settings.', ephemeral: true });
+        return;
+      }
+
+      const owners = {
+        home: await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id).catch(() => null),
+        away: await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id).catch(() => null),
+      };
+      const involvedUserIds = [owners.home?.id, owners.away?.id].filter(id => id && id !== interaction.user.id);
+
+      interaction.ggSportsReviewButtons = true;
+      interaction.ggSportsGameIssueMeta = {
+        gameId,
+        requestAction,
+        requestedTeamRoleId: null,
+        opponentUserId: involvedUserIds[0] || null,
+      };
+      await openSupportTicket(interaction, 'gamerequest', {
+        subject,
+        description,
+        leagueName: league.league_name,
+        baseChannel,
+        sourceThread,
+        isPrivate: true,
+        involvedUserIds,
+      });
+      delete interaction.ggSportsReviewButtons;
+      delete interaction.ggSportsGameIssueMeta;
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('gamecenter_reset:')) {
       const gameId = interaction.customId.split(':')[1];
       const game = await findLeagueGameById(interaction.guild.id, gameId);
@@ -14864,9 +15061,10 @@ if (interaction.commandName === 'avatar') {
         if (interaction.channel?.isThread?.()) {
           const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+          const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, false, false),
+            components: buildGameCenterThreadComponents(gameId, false, false, wagersEnabled),
           }).catch(() => null);
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -28971,6 +29169,16 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
     await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
   }
 
+  // 7J-141GAMETHREADBUTTONS: settles any accepted wager on this game now
+  // that it has a real final score — settleGameWager expects .home_team/
+  // .away_team (matching Madden's imported-game shape), so this shim
+  // normalizes the field names rather than editing that shared function.
+  // Previously only ever called from Madden's own sync-finalize path
+  // (reportLeagueGameCore, which is what THIS function is, is never used by
+  // Madden at all) — so a wager on a non-Madden game would have been
+  // accepted but never actually settled/paid out.
+  await settleGameWager(interaction.guild, { id: game.id, home_score: homeScore, away_score: awayScore, home_team: game.home_team_name, away_team: game.away_team_name }).catch(err => console.error('[Wager] Settlement failed:', err?.message));
+
   // 7J-135/136 GENERICNEWS: this is the one shared path every non-Madden
   // game result flows through (Game Center and structured-schedule leagues
   // alike) — hooking Power Rankings + News here means neither needs its own
@@ -29389,20 +29597,39 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
   return embed;
 }
 
-function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false) {
+// 7J-141GAMETHREADBUTTONS: brought up to parity with Madden's game thread
+// buttons per Hxxdie — Matchup Info, Wager (only shown when the league has
+// wagers enabled — explicit ask, unlike Madden's which always shows and
+// gates at click time instead), and Report Issue added. Kept the same
+// 3-row shape as Madden's version (info/economy row, action row, staff
+// row) rather than a literal 1:1 button match — Game Center has no EA sync,
+// so it still needs its own manual Report Score button, which Madden's
+// screenshot doesn't have at all (Madden's score comes from sync). Report
+// Score sits alongside the new Report Issue in row 2 rather than displacing
+// it, since dropping manual score entry would break the core feature.
+function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wagersEnabled = false) {
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gamecenter_info:' + gameId).setLabel('Matchup Info').setEmoji('🏒').setStyle(ButtonStyle.Primary),
+  );
+  if (wagersEnabled && !isFinal) {
+    row1.addComponents(
+      new ButtonBuilder().setCustomId('gamecenter_wager:' + gameId).setLabel('Wager').setEmoji('💰').setStyle(ButtonStyle.Success),
+    );
+  }
+  row1.addComponents(
+    new ButtonBuilder().setCustomId('gamecenter_stream:' + gameId).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+  );
+
   return [
+    row1,
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gamecenter_gamestarted:' + gameId).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
       new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
-      new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
-      // 7J-132STREAMHUB: per Hxxdie, Game Center matchup threads need the same
-      // Stream Hub button Madden game threads already have (maddengame_thread_stream)
-      // — announces to the league's configured Streaming Channel (live_channel_id,
-      // added for every league in 7J-125FULLCOVERAGE) using a saved /linkstream link.
-      new ButtonBuilder().setCustomId('gamecenter_stream:' + gameId).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('gamecenter_issue:' + gameId).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger),
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
+      new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
     ),
   ];
 }
@@ -29477,10 +29704,11 @@ async function createGameCenterThread(interaction, league, game, { channelIdOver
   await pool.query(`UPDATE league_games SET thread_id = $1, updated_at = NOW() WHERE id = $2`, [thread.id, game.id]);
 
   const mentionText = [homeOwner ? `<@${homeOwner.id}>` : null, awayOwner ? `<@${awayOwner.id}>` : null].filter(Boolean).join(' ');
+  const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
   await thread.send({
     content: (mentionText ? mentionText + ' ' : '') + 'Matchup thread opened. Report the score here once the game is finished.',
     embeds: [buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id)],
-    components: buildGameCenterThreadComponents(game.id, false),
+    components: buildGameCenterThreadComponents(game.id, false, false, wagersEnabled),
     allowedMentions: { users: [homeOwner?.id, awayOwner?.id].filter(Boolean), roles: [] },
   }).catch(() => null);
 
