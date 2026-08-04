@@ -26892,6 +26892,25 @@ if (shopSubcommand === 'view') {
 });
 
 client.on('error', console.error);
+
+// 7J-143RAWDIAG: temporary — sits BELOW all of discord.js's own parsing,
+// at the raw gateway packet level. If an INTERACTION_CREATE packet doesn't
+// even show up here when a command is run, Discord isn't delivering it to
+// this process at all (a gateway/Discord-side issue, not app code). If it
+// DOES show up here but Events.InteractionCreate still never fires, that
+// points at discord.js's own dispatch layer instead. Remove once the real
+// cause is found — this logs the raw type of every single gateway event,
+// which is noisy by design for this one diagnostic pass.
+client.on('raw', (packet) => {
+  if (packet?.t === 'INTERACTION_CREATE') {
+    console.log('[7J-143RAWDIAG] raw INTERACTION_CREATE packet received, id=' + packet?.d?.id + ' type=' + packet?.d?.type + ' commandName=' + (packet?.d?.data?.name ?? 'n/a'));
+  }
+});
+client.on('shardDisconnect', (event, shardId) => console.log('[7J-143RAWDIAG] shardDisconnect shard=' + shardId + ' code=' + event?.code));
+client.on('shardReconnecting', (shardId) => console.log('[7J-143RAWDIAG] shardReconnecting shard=' + shardId));
+client.on('shardResume', (shardId) => console.log('[7J-143RAWDIAG] shardResume shard=' + shardId));
+client.on('shardError', (error, shardId) => console.log('[7J-143RAWDIAG] shardError shard=' + shardId + ' error=' + (error?.message || error)));
+
 process.on('unhandledRejection', console.error);
 process.on('uncaughtException', console.error);
 
