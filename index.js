@@ -1520,6 +1520,17 @@ async function initDatabase() {
     )
   `);
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS use_team_roster BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-126SCHEDULEFIX: root cause of the "column schedule of relation
+  // league_custom_settings does not exist" errors in the Railway logs —
+  // schedule/current_round were added straight into the CREATE TABLE literal
+  // above at some point, but CREATE TABLE IF NOT EXISTS is a no-op once the
+  // table already exists, so any database that had this table BEFORE those
+  // two columns were added to the literal never actually got them. Same
+  // class of bug as the setup_ticket_channel_id/setup_support_channel_id fix
+  // earlier this project — a column added to a literal but never backfilled
+  // for existing rows/tables.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS schedule JSONB NOT NULL DEFAULT '[]'`);
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS current_round INTEGER NOT NULL DEFAULT 0`);
   // OTL toggle — 4th standings record type (W-L-T-OTL) alongside ties_allowed above,
   // same "customizable point value" pattern as win_points/loss_points/tie_points.
   // Off by default; NHL-style leagues are the expected use case but it's a manual
@@ -1530,6 +1541,65 @@ async function initDatabase() {
   // owners in a game thread, entirely separate from the sportsbook/
   // moneylines. See game_wagers table below.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS wagers_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+
+  // 7J-135GENERICNEWS: per Hxxdie — Madden leagues have ESPN-style news
+  // (generateMaddenESPNNews) and Power Rankings, both entirely EA-sync-
+  // driven; non-Madden leagues had neither. Generic versions built off what
+  // non-Madden leagues actually have: league_standings (win/loss/points
+  // record) for Power Rankings, and individual game results for News —
+  // see computeAndPostLeaguePowerRankings / generateAndPostLeagueGameNews,
+  // hooked into reportLeagueGameCore/forceLeagueGameResult (the one shared
+  // path every non-Madden game result already flows through).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_power_rankings (
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      team_role_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      rank INTEGER NOT NULL,
+      previous_rank INTEGER,
+      power_score NUMERIC NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, team_role_id)
+    )
+  `);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_power_rankings_channel_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_power_rankings_message_id TEXT`);
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_news_channel_id TEXT`);
+  // No UI toggle wired up for this yet (unlike Madden's espn_news_enabled,
+  // which has a real settings button) — defaults on, but flipping it off
+  // currently needs a direct DB update. Flagged as a real gap, not hidden.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS league_news_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+
+  // 7J-138NEGOTIATION: generic (non-Madden) trade negotiation threads, per
+  // Hxxdie — brings the plain Offer Trade flow closer to how Madden's
+  // negotiation system works: a private thread between the two owners
+  // instead of "upload a screenshot in the public channel and hope." No
+  // auto-generated player packages here (there's no roster data to build
+  // one from) — this only tracks the thread itself and the final screenshot
+  // both owners have to confirm before it goes to committee.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS league_trade_negotiations (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID REFERENCES leagues(league_id) ON DELETE CASCADE,
+      sender_user_id TEXT NOT NULL,
+      sender_team_name TEXT NOT NULL,
+      sender_team_role_id TEXT,
+      target_user_id TEXT NOT NULL,
+      target_team_name TEXT NOT NULL,
+      target_team_role_id TEXT,
+      thread_id TEXT,
+      status TEXT NOT NULL DEFAULT 'negotiating',
+      pending_screenshot_url TEXT,
+      pending_submitted_by TEXT,
+      sender_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+      target_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+      offer_id UUID,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
 
   // 7J-99WAGER: escrowed at acceptance (both amounts deducted immediately,
   // not just at settlement) — prevents a wager being un-payable because
@@ -4996,13 +5066,85 @@ function buildTeamSelectMenus(teamRoles, leagueId = 'legacy') {
   return rows;
 }
 
+// 7J-138NEGOTIATION: description updated — the flow no longer ends with
+// "upload a screenshot in this channel." Picking a team now opens a private
+// negotiation thread with that team's owner (when one exists); the
+// screenshot goes in the thread once both sides are ready.
 function buildOfferTradePanelEmbed(leagueName = 'League') {
   return new EmbedBuilder()
     .setTitle(`${leagueName} • Offer a Trade`)
-    .setDescription('Press the button below to start a trade offer.\n\nAfter you choose the team, upload a screenshot of the in-game trade proposal in this channel.')
+    .setDescription('Press the button below to start a trade offer.\n\nAfter you choose the team, a private negotiation thread opens between you and that team\'s owner. Once you both agree on a deal, submit a screenshot there — both owners have to confirm it before it goes to the trade committee.')
     .setColor(0xED4245)
     .setFooter({ text: 'GG Sports • Offer a Trade' })
     .setTimestamp();
+}
+
+// 7J-138NEGOTIATION: generic trade negotiation thread — the non-Madden
+// equivalent of createMaddenTradeNegotiationThread, minus everything that
+// depends on synced roster data (auto-generated packages, player-by-player
+// editing). This just opens a private thread between the two owners and
+// hands it over to them; the bot's only remaining job is the final
+// screenshot + dual-confirmation step before it reaches committee.
+function buildNegotiationSubmitRow(negotiationId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('negotiation_ready_submit:' + negotiationId).setLabel('Ready to Submit').setEmoji('📸').setStyle(ButtonStyle.Primary).setDisabled(disabled)
+  );
+}
+
+function buildNegotiationConfirmRow(negotiationId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('negotiation_confirm:' + negotiationId).setLabel('Confirm & Send to Committee').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(disabled),
+    new ButtonBuilder().setCustomId('negotiation_cancel:' + negotiationId).setLabel('Cancel This Screenshot').setEmoji('❌').setStyle(ButtonStyle.Danger).setDisabled(disabled),
+  );
+}
+
+async function createGenericTradeNegotiationThread(guild, league, { senderUserId, senderTeamName, senderTeamRoleId, targetUserId, targetTeamName, targetTeamRoleId }) {
+  const candidateChannelIds = [league?.trade_negotiation_channel_id, league?.offer_a_trade_channel_id, league?.trade_offer_channel_id].filter(Boolean);
+  let channel = null;
+  for (const channelId of candidateChannelIds) {
+    const possible = await guild.channels.fetch(channelId).catch(() => null);
+    if (possible?.isTextBased?.()) { channel = possible; break; }
+  }
+  if (!channel) return { ok: false, message: 'Could not find a channel to open the negotiation thread in — set an Offer a Trade channel first.' };
+
+  const safeName = `${senderTeamName}-${targetTeamName}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'trade';
+  const thread = await channel.threads.create({
+    name: `trade-${safeName}`.slice(0, 90),
+    type: ChannelType.PrivateThread,
+    invitable: false,
+    autoArchiveDuration: 1440,
+    reason: 'GG Sports trade negotiation',
+  }).catch(() => null);
+  if (!thread) return { ok: false, message: 'Could not create a negotiation thread. Check bot permissions: View Channel, Send Messages, Create Private Threads, and Send Messages in Threads.' };
+
+  await thread.members.add(senderUserId).catch(() => null);
+  await thread.members.add(targetUserId).catch(() => null);
+
+  const negotiationId = randomUUID();
+  await pool.query(
+    `INSERT INTO league_trade_negotiations (id, guild_id, league_id, sender_user_id, sender_team_name, sender_team_role_id, target_user_id, target_team_name, target_team_role_id, thread_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'negotiating')`,
+    [negotiationId, guild.id, league.league_id, senderUserId, senderTeamName, senderTeamRoleId || null, targetUserId, targetTeamName, targetTeamRoleId || null, thread.id]
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Trade Negotiation — ${senderTeamName} ↔ ${targetTeamName}`)
+    .setColor(0x5865F2)
+    .setDescription('Discuss the trade here. When you\'ve agreed on a deal, press **Ready to Submit** and post a screenshot of the final in-game proposal as your next message — both owners have to confirm it before it goes to the trade committee.')
+    .setFooter({ text: 'GG Sports • Trade Negotiation' })
+    .setTimestamp();
+  await thread.send({
+    content: `<@${senderUserId}> <@${targetUserId}> private trade negotiation opened.`,
+    embeds: [embed],
+    components: [buildNegotiationSubmitRow(negotiationId)],
+    allowedMentions: { users: [senderUserId, targetUserId], roles: [] },
+  }).catch(() => null);
+
+  // 7J-139NEGOTIATIONRUMOR: two teams starting to talk is real news — fires
+  // once, right here, not on every message exchanged in the thread.
+  await generateAndPostLeagueNewsEvent(guild, league, 'trade_rumor', { teamA: senderTeamName, teamB: targetTeamName }).catch(() => null);
+
+  return { ok: true, thread, negotiationId };
 }
 
 async function buildTeamOwnersEmbed(guild, league = null) {
@@ -6030,6 +6172,231 @@ async function updateStandingsPanel(guild, league) {
   if (!guild || !league?.league_id) return;
   const rows = await getStandingsRows(guild.id, league.league_id);
   await updatePanel(guild, league, 'standings', await buildStandingsEmbed(league, rows));
+}
+
+// 7J-135GENERICNEWS: Power Rankings for non-Madden leagues — Madden's
+// version (madden_power_rankings) is entirely EA-sync-driven (roster
+// ratings, team stats from imported data); non-Madden leagues have none of
+// that. This computes a power score purely from what a non-Madden league
+// DOES have — league_standings — weighted heavily toward actual record
+// (standings_points, which already accounts for whatever win/loss/tie/OTL
+// point system this league uses) with point differential as a tiebreaker/
+// secondary factor, so it reads as a real ranking rather than just a copy
+// of the standings order. Movement arrows (▲▼NEW) mirror the Madden
+// version's UX, computed against each team's own previous rank.
+function buildLeaguePowerRankingsEmbed(league, rows) {
+  const NL = String.fromCharCode(10);
+  const lines = rows.map((r, i) => {
+    const rank = i + 1;
+    let movement = '🆕 NEW';
+    if (r.previous_rank !== null && r.previous_rank !== undefined) {
+      if (r.previous_rank > rank) movement = `▲ ${r.previous_rank - rank}`;
+      else if (r.previous_rank < rank) movement = `▼ ${rank - r.previous_rank}`;
+      else movement = '—';
+    }
+    return `**${rank}. ${r.team_name}** ${movement}`;
+  });
+  return new EmbedBuilder()
+    .setTitle(`📊 ${league.league_name} • Power Rankings`)
+    .setColor(0x5865F2)
+    .setDescription(lines.join(NL) || 'No games played yet this season.')
+    .setFooter({ text: 'GG Sports • Power Rankings • Based on record and point differential' })
+    .setTimestamp();
+}
+
+// 7J-135GENERICNEWS: shared by computeAndPostLeaguePowerRankings (refresh —
+// called after every reported game) and the league_power_rankings_panel
+// branch below (initial post, which needs a brand-new message rather than
+// editing one that doesn't exist yet) — this half just does the DB
+// compute/upsert and hands back the ranked rows; each caller decides how to
+// actually get them on screen.
+// 7J-136NEWSEVENTS: win-streak/losing-skid detection — league_standings is
+// a rolled-up aggregate (total wins/losses), not sequential, so streaks
+// have to be computed from actual game history instead. Pulls each team's
+// last 10 FINAL league_games (most recent first) and counts a run of
+// identical outcomes from the front; stops at the first game that breaks
+// the run (or a tie, which breaks both win and loss streaks). Ties in the
+// game itself aren't a "streak" of anything, so the very first game in the
+// window being a tie returns length 0.
+async function getTeamResultStreak(guildId, leagueId, teamRoleId) {
+  const result = await pool.query(
+    `SELECT home_team_role_id, away_team_role_id, winner_team_role_id, home_score, away_score
+     FROM league_games
+     WHERE guild_id = $1 AND league_id = $2 AND status = 'final'
+       AND (home_team_role_id = $3 OR away_team_role_id = $3)
+     ORDER BY updated_at DESC
+     LIMIT 10`,
+    [guildId, leagueId, teamRoleId]
+  ).catch(() => ({ rows: [] }));
+
+  if (!result.rows.length) return { type: null, length: 0 };
+
+  const isTieRow = row => row.winner_team_role_id === null && row.home_score !== null && row.away_score !== null && row.home_score === row.away_score;
+  const firstType = isTieRow(result.rows[0]) ? null : (result.rows[0].winner_team_role_id === teamRoleId ? 'win' : 'loss');
+  if (!firstType) return { type: null, length: 0 };
+
+  let length = 0;
+  for (const row of result.rows) {
+    if (isTieRow(row)) break;
+    const rowType = row.winner_team_role_id === teamRoleId ? 'win' : 'loss';
+    if (rowType !== firstType) break;
+    length++;
+  }
+  return { type: firstType, length };
+}
+
+async function computeLeaguePowerRankingRows(guild, league) {
+  const standingsResult = await pool.query(
+    `SELECT * FROM league_standings WHERE guild_id = $1 AND league_id = $2`,
+    [guild.id, league.league_id]
+  ).catch(() => ({ rows: [] }));
+  if (!standingsResult.rows.length) return [];
+
+  const previousResult = await pool.query(
+    `SELECT team_role_id, rank FROM league_power_rankings WHERE guild_id = $1 AND league_id = $2`,
+    [guild.id, league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const previousRankByRole = new Map(previousResult.rows.map(r => [r.team_role_id, r.rank]));
+
+  const ranked = standingsResult.rows
+    .map(r => ({
+      team_role_id: r.team_role_id,
+      team_name: r.team_name,
+      power_score: Number(r.standings_points || 0) * 100 + (Number(r.points_for || 0) - Number(r.points_against || 0)),
+      previous_rank: previousRankByRole.has(r.team_role_id) ? previousRankByRole.get(r.team_role_id) : null,
+    }))
+    .sort((a, b) => b.power_score - a.power_score);
+
+  for (let i = 0; i < ranked.length; i++) {
+    const row = ranked[i];
+    await pool.query(
+      `INSERT INTO league_power_rankings (guild_id, league_id, team_role_id, team_name, rank, previous_rank, power_score, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (guild_id, league_id, team_role_id) DO UPDATE SET
+         team_name = $4, previous_rank = league_power_rankings.rank, rank = $5, power_score = $7, updated_at = NOW()`,
+      [guild.id, league.league_id, row.team_role_id, row.team_name, i + 1, row.previous_rank, row.power_score]
+    ).catch(() => null);
+  }
+  return ranked;
+}
+
+async function computeAndPostLeaguePowerRankings(guild, league) {
+  if (!guild || !league?.league_id) return;
+  const ranked = await computeLeaguePowerRankingRows(guild, league);
+  if (!ranked.length) return;
+  await updatePanel(guild, league, 'league_power_rankings', buildLeaguePowerRankingsEmbed(league, ranked));
+}
+
+// 7J-136NEWSEVENTS: per Hxxdie — "feed the news system with all the same
+// information Madden gets, minus sync data, using generic events off the
+// same kinds of triggers: trade rumors, power ranking movement, win
+// streaks/losing skids, official trade reporting, award winners, league
+// champions." Generalized generateAndPostLeagueGameNews (was game-result-
+// only) into one function covering all of these — each eventType gets its
+// own system prompt (so the tone fits the news, not a generic reskin) and
+// its own plain-text fallback template if the Claude API call fails or
+// league_news_enabled is off. Every trigger below is best-effort
+// (.catch(() => null) at the call site) and silently no-ops if the league
+// hasn't configured a News channel — same pattern as every other optional
+// board in this bot.
+async function generateAndPostLeagueNewsEvent(guild, league, eventType, context) {
+  if (!league?.league_news_channel_id) return;
+  const newsChannel = await guild.channels.fetch(league.league_news_channel_id).catch(() => null);
+  if (!newsChannel?.isTextBased?.()) return;
+
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  const useClaudeApi = customSettings.league_news_enabled !== false;
+
+  const EVENT_PROMPTS = {
+    game_result: `Write one punchy headline (under 80 chars) and one blurb (1-2 sentences, under 150 chars) recapping this single game result. Vary tone based on the margin — a blowout reads differently than a nail-biter or a tie.`,
+    win_streak: `Write a headline and blurb about a team riding a real winning streak. Frame it with real momentum/confidence energy — this team is rolling.`,
+    losing_skid: `Write a headline and blurb about a team on a real losing streak. Frame it with genuine concern/pressure — fans losing patience, questions being asked — without inventing specifics not given.`,
+    power_ranking_movers: `Write a headline and blurb about a team making a big jump (or a big fall) in this week's Power Rankings. Frame climbers with hype/momentum energy, and fallers with concern/"what's going wrong" energy.`,
+    // 7J-139NEGOTIATIONRUMOR: trade_rumor now fires when two teams actually
+    // START negotiating (a real thread, real interest between two real
+    // owners) — trade_block_listing below covers just being put on the
+    // block, a separate and less significant event.
+    trade_rumor: `Write a headline and blurb about two teams entering trade talks. Frame it as breaking trade-rumor news — "discussions are underway," "the two sides are talking" — genuine rumor-mill energy, not a finalized trade.`,
+    trade_block_listing: `Write a headline and blurb about a player just being put on the trade block. Frame it as "on the block," "gauging interest" — lower-key than an actual rumor of talks between two teams.`,
+    trade_official: `Write a headline and blurb reporting a trade that has just been OFFICIALLY approved between two teams. This is a real, finalized trade — write it with the weight of a real trade-reaction piece, not a rumor.`,
+    award_winner: `Write a headline and blurb celebrating a player who just won a league award. Genuine, celebratory tone — this is a real accomplishment.`,
+    league_champion: `Write a headline and blurb crowning this season's league champion. This is the biggest story of the season — write it with real weight and celebration.`,
+  };
+  const promptInstruction = EVENT_PROMPTS[eventType];
+  if (!promptInstruction) return;
+
+  let headline = null;
+  let blurb = null;
+
+  if (useClaudeApi) {
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 300,
+          system: `You are a sports journalist covering a fan-run online league called "${league.league_name}". ${promptInstruction} Sound like a real beat writer, not a bot. Never invent facts not present in the data given. Return ONLY valid JSON: {"headline": "...", "blurb": "..."}. No markdown, no preamble.`,
+          messages: [{ role: 'user', content: JSON.stringify({ leagueName: league.league_name, ...context }) }],
+        }),
+      }).then(r => r.json()).catch(() => null);
+      const text = response?.content?.map(c => c.text || '').join('') || '';
+      const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+      if (parsed?.headline) { headline = parsed.headline; blurb = parsed.blurb || ''; }
+    } catch (err) {
+      console.warn(`[LEAGUE NEWS] Claude API failed for ${eventType}, falling back to template:`, err?.message);
+    }
+  }
+
+  if (!headline) {
+    const fallback = buildLeagueNewsFallbackTemplate(eventType, context);
+    if (!fallback) return;
+    headline = fallback.headline;
+    blurb = fallback.blurb;
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📰 ${headline}`)
+    .setColor(0x5865F2)
+    .setDescription(blurb || '')
+    .setFooter({ text: 'GG Sports • League News' })
+    .setTimestamp();
+  await newsChannel.send({ embeds: [embed] }).catch(() => null);
+}
+
+// 7J-136NEWSEVENTS: plain-text fallback for every event type above — used
+// whenever the Claude API call fails or is disabled, so News never just
+// silently produces nothing.
+function buildLeagueNewsFallbackTemplate(eventType, context) {
+  switch (eventType) {
+    case 'game_result': {
+      const { homeTeam, awayTeam, homeScore, awayScore, isTie, winner, loser, margin } = context;
+      return isTie
+        ? { headline: `${awayTeam} and ${homeTeam} play to a draw`, blurb: 'Neither side could find the separator.' }
+        : { headline: `${winner} defeats ${loser} ${Math.max(homeScore, awayScore)}-${Math.min(homeScore, awayScore)}`, blurb: margin >= 3 ? `${winner} pulled away for the win.` : `${winner} held on in a close one.` };
+    }
+    case 'win_streak':
+      return { headline: `${context.team} riding a ${context.streakLength}-game winning streak`, blurb: `${context.team} has won ${context.streakLength} straight.` };
+    case 'losing_skid':
+      return { headline: `${context.team} has dropped ${context.streakLength} in a row`, blurb: `${context.team} is looking for answers after a ${context.streakLength}-game slide.` };
+    case 'power_ranking_movers':
+      return { headline: context.direction === 'up'
+        ? `${context.team} climbs to #${context.newRank} in Power Rankings`
+        : `${context.team} slides to #${context.newRank} in Power Rankings`,
+        blurb: `Moved from #${context.oldRank} to #${context.newRank} this week.` };
+    case 'trade_rumor':
+      return { headline: `${context.teamA} and ${context.teamB} talking trade`, blurb: `The two sides have opened trade discussions.` };
+    case 'trade_block_listing':
+      return { headline: `${context.playerName} hits the trade block`, blurb: `${context.teamName || 'A team'} is gauging interest in ${context.playerName}.` };
+    case 'trade_official':
+      return { headline: `Trade official: ${context.teamA} ↔ ${context.teamB}`, blurb: 'The deal has been approved by the trade committee.' };
+    case 'award_winner':
+      return { headline: `${context.playerName} wins ${context.awardName}`, blurb: `${context.playerName} takes home the ${context.awardName} for ${context.leagueName}.` };
+    case 'league_champion':
+      return { headline: `${context.championTeam} are your league champions!`, blurb: `${context.championTeam} closed out the season on top.` };
+    default:
+      return null;
+  }
 }
 
 // guildId is kept as a parameter purely so per-server payout rates (win/game-played/
@@ -7863,6 +8230,17 @@ async function finalizeApprovedTrade(guild, offerId) {
     metadata: { summary: `${offer.sender_team || 'Offering Team'} ↔ ${offer.target_team || 'Receiving Team'} was approved by committee.`, offer_id: offer.id },
   }).catch(error => console.warn('[7J-10BY-A NEWS] trade approved event failed:', error?.message || error));
 
+  // 7J-136NEWSEVENTS: recordMaddenNewsEvent above only ever feeds Madden's
+  // weekly digest pipeline — non-Madden leagues have no such pipeline, so
+  // this trade would otherwise go completely unreported for them. Posts
+  // immediately instead of batching (there's no weekly cycle to batch into
+  // for non-Madden leagues in the first place).
+  if (league?.league_id && getLeagueSportKey(league) !== 'madden') {
+    await generateAndPostLeagueNewsEvent(guild, league, 'trade_official', {
+      teamA: offer.sender_team || 'Team A', teamB: offer.target_team || 'Team B',
+    }).catch(() => null);
+  }
+
   await updateTradeCountPanel(guild, league);
 }
 
@@ -8015,6 +8393,41 @@ client.on(Events.MessageCreate, async (message) => {
           });
         }
         await message.react('📎').catch(() => null);
+      }
+    }
+
+    // 7J-138NEGOTIATION: watches for an attachment posted by either owner
+    // inside an active negotiation thread — this is the "submit the final
+    // screenshot" step. Scoped to message.channel.isThread() so this never
+    // fires on a normal channel message.
+    if (message.channel.isThread?.() && message.attachments.first()) {
+      const negotiationResult = await pool.query(
+        `SELECT * FROM league_trade_negotiations WHERE thread_id = $1 AND status = 'negotiating' LIMIT 1`,
+        [message.channel.id]
+      ).catch(() => ({ rows: [] }));
+      const negotiation = negotiationResult.rows[0];
+      if (negotiation && [negotiation.sender_user_id, negotiation.target_user_id].includes(message.author.id)) {
+        const attachment = message.attachments.first();
+        await pool.query(
+          `UPDATE league_trade_negotiations
+           SET pending_screenshot_url = $1, pending_submitted_by = $2, sender_confirmed = FALSE, target_confirmed = FALSE, updated_at = NOW()
+           WHERE id = $3`,
+          [attachment.url, message.author.id, negotiation.id]
+        );
+        const otherOwner = message.author.id === negotiation.sender_user_id ? negotiation.target_user_id : negotiation.sender_user_id;
+        const embed = new EmbedBuilder()
+          .setTitle('Final Trade Screenshot')
+          .setColor(0xFEE75C)
+          .setDescription(`Posted by <@${message.author.id}>. **Both owners must confirm** before this goes to the trade committee.`)
+          .setImage(attachment.url)
+          .setFooter({ text: 'GG Sports • Trade Negotiation' })
+          .setTimestamp();
+        await message.channel.send({
+          content: `<@${otherOwner}> please confirm or cancel this screenshot.`,
+          embeds: [embed],
+          components: [buildNegotiationConfirmRow(negotiation.id)],
+          allowedMentions: { users: [otherOwner], roles: [] },
+        }).catch(() => null);
       }
     }
 
@@ -8966,6 +9379,19 @@ client.on(Events.GuildMemberAdd, async (member) => {
 client.on(Events.GuildMemberRemove, async (member) => {
   await postMemberLeaveAnnouncement(member).catch(err => console.error('[Welcomer] Leave announcement failed:', err?.message));
   await notifyWaitlistForMemberLeaveIfTeamHolder(member).catch(err => console.error('[Waitlist] Leave notification check failed:', err?.message));
+});
+
+// 7J-133TEAMTHREADJOIN: per Hxxdie — if a new user joins a league (gets a
+// team role assigned) after Advance has already been run for that team,
+// they need to be added to their team's existing game thread(s), or they'd
+// have no way to see/participate in a game that's already in progress.
+// Watches role changes directly (not any one specific "assign a team role"
+// code path) so this catches every way a team role can end up on someone —
+// recruitment approval, /league teamrole, or a commissioner just adding the
+// role by hand in Discord's own UI — rather than only the paths this bot
+// itself controls.
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  await addMemberToOpenTeamGameThreads(oldMember, newMember).catch(err => console.error('[TeamThreadJoin] Failed to add member to open game threads:', err?.message));
 });
 
 client.on(Events.GuildCreate, async (guild) => {
@@ -12348,7 +12774,93 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      
+      // 7J-138NEGOTIATION: "Ready to Submit" — either owner in the thread can
+      // press this. Doesn't take the screenshot itself (buttons can't accept
+      // attachments); just tells them their next message with an attachment
+      // in this thread will be treated as the final proposal.
+      if (interaction.customId.startsWith('negotiation_ready_submit:')) {
+        const negotiationId = interaction.customId.split(':')[1];
+        const negResult = await pool.query(`SELECT * FROM league_trade_negotiations WHERE id = $1`, [negotiationId]);
+        const negotiation = negResult.rows[0];
+        if (!negotiation) { await interaction.reply({ content: 'This negotiation could not be found.', ephemeral: true }); return; }
+        if (![negotiation.sender_user_id, negotiation.target_user_id].includes(interaction.user.id)) {
+          await interaction.reply({ content: 'Only the two owners in this negotiation can do that.', ephemeral: true });
+          return;
+        }
+        await interaction.reply({ content: 'Post the final trade screenshot as your next message in this thread.', ephemeral: true });
+        return;
+      }
+
+      // 7J-138NEGOTIATION: dual confirmation — records whichever owner
+      // clicked, then checks if BOTH have now confirmed before actually
+      // sending anything to committee. Per Hxxdie: "make sure both users
+      // agree to the final screenshot being sent to the committee."
+      if (interaction.customId.startsWith('negotiation_confirm:') || interaction.customId.startsWith('negotiation_cancel:')) {
+        const isConfirm = interaction.customId.startsWith('negotiation_confirm:');
+        const negotiationId = interaction.customId.split(':')[1];
+        const negResult = await pool.query(`SELECT * FROM league_trade_negotiations WHERE id = $1`, [negotiationId]);
+        const negotiation = negResult.rows[0];
+        if (!negotiation) { await interaction.reply({ content: 'This negotiation could not be found.', ephemeral: true }); return; }
+        if (![negotiation.sender_user_id, negotiation.target_user_id].includes(interaction.user.id)) {
+          await interaction.reply({ content: 'Only the two owners in this negotiation can do that.', ephemeral: true });
+          return;
+        }
+        if (!negotiation.pending_screenshot_url) {
+          await interaction.reply({ content: 'There is no pending screenshot to confirm.', ephemeral: true });
+          return;
+        }
+
+        if (!isConfirm) {
+          await pool.query(
+            `UPDATE league_trade_negotiations SET pending_screenshot_url = NULL, pending_submitted_by = NULL, sender_confirmed = FALSE, target_confirmed = FALSE, updated_at = NOW() WHERE id = $1`,
+            [negotiationId]
+          );
+          await interaction.update({ content: `<@${interaction.user.id}> cancelled this screenshot. Post a new one whenever you're ready.`, embeds: [], components: [] });
+          return;
+        }
+
+        const isSender = interaction.user.id === negotiation.sender_user_id;
+        const column = isSender ? 'sender_confirmed' : 'target_confirmed';
+        await pool.query(`UPDATE league_trade_negotiations SET ${column} = TRUE, updated_at = NOW() WHERE id = $1`, [negotiationId]);
+        const refreshed = (await pool.query(`SELECT * FROM league_trade_negotiations WHERE id = $1`, [negotiationId])).rows[0];
+
+        if (!refreshed.sender_confirmed || !refreshed.target_confirmed) {
+          const waitingOn = !refreshed.sender_confirmed ? refreshed.sender_user_id : refreshed.target_user_id;
+          await interaction.update({ content: `<@${interaction.user.id}> confirmed. Waiting on <@${waitingOn}> to confirm too.`, components: [buildNegotiationConfirmRow(negotiationId)] });
+          return;
+        }
+
+        // Both confirmed — send to committee, same path the old direct-
+        // upload flow used (trade_offers row, status owner_accepted since
+        // both owners already agreed, straight to committee vote).
+        const league = await getLeagueById(refreshed.league_id);
+        const offerId = randomUUID();
+        await pool.query(
+          `INSERT INTO trade_offers (
+             id, guild_id, league_id, sender_user_id, sender_team, sender_team_role_id,
+             target_team, target_team_role_id, target_owner_user_id, offer_details, screenshot_url, status
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'owner_accepted')`,
+          [offerId, interaction.guild.id, refreshed.league_id, refreshed.sender_user_id, refreshed.sender_team_name, refreshed.sender_team_role_id, refreshed.target_team_name, refreshed.target_team_role_id, refreshed.target_user_id, '', refreshed.pending_screenshot_url]
+        );
+        await pool.query(`UPDATE league_trade_negotiations SET status = 'submitted', offer_id = $1, updated_at = NOW() WHERE id = $2`, [offerId, negotiationId]);
+
+        const committeeChannel = await interaction.guild.channels.fetch(league?.committee_channel_id || COMMITTEE_CHANNEL_ID).catch(() => null);
+        if (!committeeChannel?.isTextBased?.()) {
+          await interaction.update({ content: 'Both owners confirmed, but no committee channel is configured to send this to. Ask a commissioner to set one.', components: [] });
+          return;
+        }
+        const offerForEmbed = { id: offerId, sender_team: refreshed.sender_team_name, target_team: refreshed.target_team_name, offer_details: '', screenshot_url: refreshed.pending_screenshot_url, status: 'owner_accepted' };
+        const committeeMessage = await committeeChannel.send({
+          content: `<@&${league?.committee_role_id || COMMITTEE_ROLE_ID}>`,
+          embeds: [buildCommitteeEmbed(offerForEmbed, 0, 0)],
+          components: [buildCommitteeVoteButtons(offerId)],
+          allowedMentions: { roles: [league?.committee_role_id || COMMITTEE_ROLE_ID], users: [] },
+        });
+        await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
+        await interaction.update({ content: `Both owners confirmed — sent to the trade committee: ${committeeChannel.toString()}`, components: [] });
+        return;
+      }
+
       
       // 7J-57SHOPPAGE: updates the shared panel message in place (not an
       // ephemeral reply) — this is shop-panel navigation, everyone viewing
@@ -12751,6 +13263,16 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isStringSelectMenu()) {
+      // 7J-138NEGOTIATION: was "store intent, tell them to upload a screenshot
+      // in the public channel." Now resolves the target owner and this
+      // league's CPU-trade setting immediately (previously that check only
+      // happened AFTER a screenshot was uploaded, which meant someone could
+      // go through the whole flow before finding out the trade wasn't even
+      // allowed) — then either opens a private negotiation thread between
+      // the two real owners, or, if the target team has no owner and CPU
+      // trades are allowed here, keeps the old direct-to-committee shortcut
+      // (a negotiation thread needs two real people; skipping it entirely
+      // when there's only one is correct, not a shortcut around the feature).
       if (interaction.customId.startsWith('offer_trade_select_')) {
         const [, leagueId = 'legacy'] = interaction.customId.split(':');
         let targetTeamName = interaction.values[0];
@@ -12765,8 +13287,48 @@ if (interaction.commandName === 'avatar') {
             targetTeamRoleId = selected.role_id;
           }
         }
-        pendingOfferTargets.set(interaction.user.id, { targetTeamName, targetTeamRoleId, leagueId: league?.league_id || null, leagueName: league?.league_name || null, createdAt: Date.now() });
-        await interaction.reply({ content: `You selected **${targetTeamName}**. Now upload your trade proposal screenshot as your next message in <#${league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID}>.`, ephemeral: true });
+
+        await interaction.deferReply({ ephemeral: true });
+
+        const senderMember = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const senderTeam = league && senderMember ? await getMemberTeamForLeague(senderMember, league) : null;
+        if (!senderTeam) {
+          await interaction.editReply({ content: 'I could not determine your team role for this league.' });
+          return;
+        }
+
+        const targetOwner = targetTeamRoleId
+          ? await findTeamOwnerByRoleId(interaction.guild, targetTeamRoleId)
+          : await findTeamOwnerByRoleName(interaction.guild, targetTeamName);
+
+        const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
+        const cpuTradesAllowed = customSettings.cpu_trades_allowed !== false;
+
+        if (!targetOwner) {
+          if (!cpuTradesAllowed) {
+            await interaction.editReply({ content: `**${targetTeamName}** does not currently have an owner assigned, and this league does not allow trades with CPU-controlled teams (League Customization → Trades).` });
+            return;
+          }
+          // No real owner to negotiate with — keep the original shortcut:
+          // upload a screenshot directly, straight to committee.
+          pendingOfferTargets.set(interaction.user.id, { targetTeamName, targetTeamRoleId, leagueId: league?.league_id || null, leagueName: league?.league_name || null, createdAt: Date.now() });
+          await interaction.editReply({ content: `**${targetTeamName}** has no owner, and this league allows CPU trades. Upload your trade proposal screenshot as your next message in <#${league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID}> and it'll go straight to committee.` });
+          return;
+        }
+
+        const negotiationResult = await createGenericTradeNegotiationThread(interaction.guild, league, {
+          senderUserId: interaction.user.id,
+          senderTeamName: senderTeam.name,
+          senderTeamRoleId: senderTeam.roleId,
+          targetUserId: targetOwner.id,
+          targetTeamName,
+          targetTeamRoleId,
+        });
+        if (!negotiationResult.ok) {
+          await interaction.editReply({ content: negotiationResult.message });
+          return;
+        }
+        await interaction.editReply({ content: `Negotiation thread opened: ${negotiationResult.thread.toString()}` });
         return;
       }
     }
@@ -13228,6 +13790,23 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      // 7J-131RECRUITMOVE: Review Applications / Discoverable Setting, moved
+      // here from the guild-wide Recruitment panel — league is already known
+      // in this context (we're inside that league's Commissioner Panel), so
+      // this skips resolveOrPickRecruitmentLeague's picker entirely and goes
+      // straight to the same underlying functions the old panel buttons used.
+      if (action === 'recruitreview') {
+        await interaction.deferReply({ ephemeral: true });
+        await runRecruitmentReview(interaction, league);
+        return;
+      }
+
+      if (action === 'recruitdiscoverable') {
+        await interaction.deferReply({ ephemeral: true });
+        await runRecruitmentDiscoverableSettings(interaction, league);
+        return;
+      }
+
       if (action === 'suspensions') {
         await interaction.deferUpdate();
         const result = await pool.query(
@@ -13355,6 +13934,7 @@ if (interaction.commandName === 'avatar') {
 
         let schedule = Array.isArray(customSettings.schedule) ? customSettings.schedule : [];
         let currentRound = Number(customSettings.current_round || 0);
+        const isFirstStart = !schedule.length;
 
         if (!schedule.length) {
           const teamsResult = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC`, [leagueId]);
@@ -13407,7 +13987,15 @@ if (interaction.commandName === 'avatar') {
         const threadNote = threadChannel
           ? `${threadsCreated}/${gamesCreated} matchup thread(s) created in <#${threadChannel.id}>.${threadFailures.length ? '\n⚠️ ' + threadFailures.join('\n⚠️ ') : ''}`
           : 'No Game Threads channel configured — games were created and can still be reported with `/game report`, but set a Game Threads Channel to get auto-created matchup threads with Report Score buttons next time.';
-        await interaction.editReply({ content: `**Advanced to Round ${currentRound}/${schedule.length}**\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}` });
+        // 7J-130STARTLEAGUE: first press generated the schedule AND round 1 in
+        // one go (the !schedule.length branch above) — message it as the
+        // season actually starting, not just "advanced," and note the button
+        // is now labeled Advance for every press after this one.
+        const headline = isFirstStart
+          ? `**League started! Round 1/${schedule.length}**`
+          : `**Advanced to Round ${currentRound}/${schedule.length}**`;
+        const startedNote = isFirstStart ? '\n\nThe Operations button is now labeled **Advance** for future rounds.' : '';
+        await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}` });
         return;
       }
 
@@ -14186,6 +14774,38 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-132STREAMHUB: same behavior as Madden's maddengame_thread_stream —
+    // posts to the league's Streaming Channel using a link saved via
+    // /linkstream, so viewers watching that channel see the announcement
+    // regardless of which specific matchup thread it came from.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_stream:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+
+      const linkResult = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
+      const url = linkResult.rows[0]?.stream_url;
+      if (!url) {
+        await interaction.reply({ content: 'No saved stream link found. Save one with `/linkstream url:<your stream link>`, then press **Stream Hub** again.', ephemeral: true });
+        return;
+      }
+
+      const streamChannelId = league?.live_channel_id;
+      const streamChannel = streamChannelId ? await interaction.guild.channels.fetch(streamChannelId).catch(() => null) : null;
+      if (!streamChannel) {
+        await interaction.reply({ content: 'Could not find the connected Streaming Channel — ask a commissioner to set one from the Commissioner Panel.', ephemeral: true });
+        return;
+      }
+
+      await streamChannel.send({
+        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `**${interaction.user.username} is LIVE!** — ${game.away_team_name} @ ${game.home_team_name}\n${url}`,
+        allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
+      });
+      await interaction.reply({ content: `📺 Posted to <#${streamChannel.id}> — you're streaming this matchup!`, ephemeral: true });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('gamecenter_reset:')) {
       const gameId = interaction.customId.split(':')[1];
       const game = await findLeagueGameById(interaction.guild.id, gameId);
@@ -14914,8 +15534,47 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: "You don't own a team in this league, so there's nothing for you to add to the trade block. Ask your commissioner to assign you one.", ephemeral: true });
         return;
       }
+      // 7J-137GENERICTRADEBLOCK: the roster-picker path requires synced
+      // Madden player data that non-Madden leagues never have — a modal
+      // asking for the player name directly is the real functional
+      // equivalent for them, not a lesser fallback.
+      if (getLeagueSportKey(league) !== 'madden') {
+        const modal = new ModalBuilder()
+          .setCustomId(`madtb_add_modal:${leagueId}`)
+          .setTitle('Add to Trade Block')
+          .addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('player_name').setLabel('Player name').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('seeking').setLabel('Seeking (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Notes (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
+          );
+        await interaction.showModal(modal);
+        return;
+      }
       const payload = await buildMaddenAddToBlockPickerPayload(interaction.guild.id, league.league_id, ownedTeam.team_name, 0, `madtb:add_select:${leagueId}`, `madtb:add_page:${leagueId}`);
       await interaction.reply({ ...payload, ephemeral: true });
+      return;
+    }
+
+    // 7J-137GENERICTRADEBLOCK: non-Madden "Add to Block" modal submit.
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('madtb_add_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const playerName = interaction.fields.getTextInputValue('player_name');
+      const seeking = interaction.fields.getTextInputValue('seeking') || '';
+      const notes = interaction.fields.getTextInputValue('notes') || '';
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const result = await addGenericTradeBlockEntry(interaction.guild.id, league, member, interaction.user.id, playerName, seeking, notes).catch(() => null);
+      if (result?.ok) {
+        // 7J-136NEWSEVENTS: trade rumor — real news now that adding to the
+        // block is an actual working feature for non-Madden leagues.
+        await generateAndPostLeagueNewsEvent(interaction.guild, league, 'trade_block_listing', {
+          playerName, teamName: result.teamName,
+        }).catch(() => null);
+      }
+      await refreshMaddenTradeBlockBoardForLeague(interaction.guild, league).catch(() => null);
+      await interaction.editReply({ embeds: result?.embed ? [result.embed] : undefined, content: result?.embed ? undefined : 'Something went wrong adding that to the trade block.' });
       return;
     }
 
@@ -28273,6 +28932,58 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
     await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
   }
 
+  // 7J-135/136 GENERICNEWS: this is the one shared path every non-Madden
+  // game result flows through (Game Center and structured-schedule leagues
+  // alike) — hooking Power Rankings + News here means neither needs its own
+  // separate trigger wired into each schedule style individually. Skipped
+  // for Madden leagues entirely — they already have both, EA-sync-driven.
+  if (getLeagueSportKey(activeLeague) !== 'madden') {
+    const rankedRows = await computeLeaguePowerRankingRows(interaction.guild, activeLeague);
+    if (rankedRows.length) await updatePanel(interaction.guild, activeLeague, 'league_power_rankings', buildLeaguePowerRankingsEmbed(activeLeague, rankedRows));
+
+    const gameNewsContext = {
+      homeTeam: game.home_team_name, awayTeam: game.away_team_name, homeScore, awayScore, isTie,
+      winner: isTie ? null : winnerName, loser: isTie ? null : (winnerRoleId === game.home_team_role_id ? game.away_team_name : game.home_team_name),
+      margin: isTie ? 0 : Math.abs(homeScore - awayScore),
+    };
+    await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'game_result', gameNewsContext).catch(() => null);
+
+    // 7J-136NEWSEVENTS: power ranking movers — a team that jumped/fell 3+
+    // spots, or newly took #1, is real news. Compared against each team's
+    // OWN previous_rank (already tracked by computeLeaguePowerRankingRows),
+    // not just this game's two participants, since a team can move in the
+    // rankings without having played today (opponents' results shift it).
+    for (const row of rankedRows) {
+      const newRank = rankedRows.indexOf(row) + 1;
+      if (row.previous_rank === null || row.previous_rank === undefined) continue;
+      const delta = row.previous_rank - newRank;
+      if (delta >= 3 || (newRank === 1 && row.previous_rank !== 1)) {
+        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'power_ranking_movers', {
+          team: row.team_name, direction: 'up', oldRank: row.previous_rank, newRank,
+        }).catch(() => null);
+      } else if (delta <= -3) {
+        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'power_ranking_movers', {
+          team: row.team_name, direction: 'down', oldRank: row.previous_rank, newRank,
+        }).catch(() => null);
+      }
+    }
+
+    // 7J-136NEWSEVENTS: win streaks / losing skids — pulls each team's last
+    // 10 FINAL games (most recent first) and counts a run of identical
+    // outcomes from the front. Only fires at real milestones (3/5/7+) so
+    // this doesn't spam a headline after every single game once a team gets
+    // rolling — 3 fires once, 5 fires once, 7 fires once, not every game in
+    // between.
+    for (const [teamRoleId, teamName] of [[game.home_team_role_id, game.home_team_name], [game.away_team_role_id, game.away_team_name]]) {
+      const streak = await getTeamResultStreak(interaction.guild.id, game.league_id, teamRoleId);
+      if ([3, 5, 7, 10].includes(streak.length)) {
+        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, streak.type === 'win' ? 'win_streak' : 'losing_skid', {
+          team: teamName, streakLength: streak.length,
+        }).catch(() => null);
+      }
+    }
+  }
+
   const settings = await getCurrencySettings(interaction.guild.id);
   const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
   const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
@@ -28441,6 +29152,13 @@ async function forceLeagueGameResult(interaction, game, winnerSide) {
 
   if (typeof updateStandingsPanel === 'function') {
     await updateStandingsPanel(interaction.guild, activeLeague).catch(() => null);
+  }
+
+  // 7J-135GENERICNEWS: Power Rankings only here, no News item — a forced
+  // win has no real score to recap, and "X wins by forfeit" isn't the kind
+  // of thing this feature is meant to cover.
+  if (getLeagueSportKey(activeLeague) !== 'madden') {
+    await computeAndPostLeaguePowerRankings(interaction.guild, activeLeague).catch(() => null);
   }
 
   // No currency payout here on purpose — a forced win means no game was
@@ -28638,11 +29356,52 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false) {
       new ButtonBuilder().setCustomId('gamecenter_gamestarted:' + gameId).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
       new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
       new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
+      // 7J-132STREAMHUB: per Hxxdie, Game Center matchup threads need the same
+      // Stream Hub button Madden game threads already have (maddengame_thread_stream)
+      // — announces to the league's configured Streaming Channel (live_channel_id,
+      // added for every league in 7J-125FULLCOVERAGE) using a saved /linkstream link.
+      new ButtonBuilder().setCustomId('gamecenter_stream:' + gameId).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
     ),
   ];
+}
+
+// 7J-133TEAMTHREADJOIN: compares old/new role sets on a member update, and
+// for any newly-added role that matches a registered team role
+// (league_team_roles), adds that member to every currently-open (non-final)
+// game thread for that team — covers both Game Center and structured-
+// schedule non-Madden leagues, since both create their matchup threads
+// through the same league_games.thread_id path (see createLeagueGameCore /
+// createGameCenterThread and the Advance handler's own comment on reusing
+// that path). Best-effort throughout: one failed lookup or thread-add
+// doesn't block the rest.
+async function addMemberToOpenTeamGameThreads(oldMember, newMember) {
+  const newlyAddedRoleIds = [...newMember.roles.cache.keys()].filter(id => !oldMember.roles.cache.has(id));
+  if (!newlyAddedRoleIds.length) return;
+
+  for (const roleId of newlyAddedRoleIds) {
+    const teamRoleResult = await pool.query(
+      `SELECT league_id FROM league_team_roles WHERE role_id = $1 LIMIT 1`,
+      [roleId]
+    ).catch(() => ({ rows: [] }));
+    if (!teamRoleResult.rows.length) continue;
+
+    const openGamesResult = await pool.query(
+      `SELECT id, thread_id FROM league_games
+       WHERE (home_team_role_id = $1 OR away_team_role_id = $1)
+         AND status != 'final'
+         AND thread_id IS NOT NULL`,
+      [roleId]
+    ).catch(() => ({ rows: [] }));
+
+    for (const game of openGamesResult.rows) {
+      const thread = await newMember.guild.channels.fetch(game.thread_id).catch(() => null);
+      if (!thread?.isThread?.()) continue;
+      await thread.members.add(newMember.id).catch(() => null);
+    }
+  }
 }
 
 async function createGameCenterThread(interaction, league, game, { channelIdOverride = null } = {}) {
@@ -32896,6 +33655,21 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
   // individual write site.
   await refreshLeagueHofBoard(interaction.guild, activeLeague).catch(() => null);
 
+  // 7J-136NEWSEVENTS: league_champion + award_winner — this is a real
+  // generic hook (any sport, not just non-Madden), but Madden leagues
+  // already have their own EA-sync-driven news, so it's skipped for them
+  // the same way every other generic news trigger is.
+  if (getLeagueSportKey(activeLeague) !== 'madden') {
+    await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'league_champion', {
+      championTeam: data.champion, seasonLabel: data.seasonLabel,
+    }).catch(() => null);
+    for (const award of awardRows) {
+      await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'award_winner', {
+        playerName: award.value, awardName: award.name, leagueName: activeLeague.league_name,
+      }).catch(() => null);
+    }
+  }
+
   return { ok: true, message: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.` };
 }
 
@@ -33795,36 +34569,48 @@ async function runAdminPanelAutoCreateLeagueRoles(interaction, league) {
 // has 40+ possible channel settings, most of them niche/optional — this
 // covers what a new league actually needs to get going, and anything else
 // is still one click away in the Setup Dashboard.
+// 7J-128CATEGORYEMOJI: category emoji used to be a hardcoded football
+// regardless of sport — an NHL league got 🏈. Picks a real sport-specific
+// emoji instead, falling back to a generic trophy for cfb/fc/other where a
+// single emoji can't represent "every team in the sport" meaningfully.
+function leagueCategoryEmoji(league) {
+  const sportKey = getLeagueSportKey(league);
+  const map = { madden: '🏈', nfl: '🏈', nba: '🏀', nhl: '🏒', mlb: '⚾', fc: '⚽', cfb: '🏈' };
+  return map[sportKey] || '🏆';
+}
+
 async function autoCreateLeagueChannels(guild, league, isMadden) {
-  const category = await guild.channels.create({ name: `🏈 ${league.league_name}`.slice(0, 100), type: ChannelType.GuildCategory });
+  const category = await guild.channels.create({ name: `${leagueCategoryEmoji(league)} ${league.league_name}`.slice(0, 100), type: ChannelType.GuildCategory });
   const created = [];
 
+  // 7J-128CHANNELORDER: explicit order + explicit `position` on each create
+  // call below — per Hxxdie, the previous order came out jumbled in Discord
+  // (channel `position` isn't reliably inferred from creation order alone
+  // once several channels get created back-to-back), forcing an admin to
+  // manually drag everything into a sane order afterward. Grouped as: what
+  // members read first (rules/announcements/staff), the live game-day
+  // channels (standings/streaming/games), the trade cluster together, then
+  // admin/reference channels at the bottom.
   const singleChannelSpecs = [
-    ['league_announcement_channel_id', 'announcements'],
     ['league_rules_channel_id', 'rules'],
+    ['league_announcement_channel_id', 'announcements'],
+    ['staff_channel_id', 'staff'],
     ['standings_channel_id', 'standings'],
-    ['trade_block_channel_id', 'trade-block'],
+    ['live_channel_id', 'streaming'],
+    // game-threads/game-center inserted here, sport-conditional, below
     ['sportsbook_channel_id', 'sportsbook-feed'],
-    ['suspensions_channel_id', 'suspensions'],
-    // 7J-110RELOCATE: trade setup channels, previously never auto-created at
-    // all (a commissioner had to set each one by hand from the Setup
-    // Dashboard) — per Hxxdie, this button should now cover "core channels
-    // and trade setup channels."
-    ['team_owners_channel_id', 'team-owners'],
+    ['trade_block_channel_id', 'trade-block'],
     ['trade_offer_channel_id', 'trade-offer'],
     ['trade_committee_channel_id', 'trade-committee'],
     ['approved_trades_channel_id', 'approved-trades'],
     ['denied_trades_channel_id', 'denied-trades'],
     ['trade_count_channel_id', 'trade-count'],
-    // 7J-125FULLCOVERAGE: per Hxxdie's screenshot, this used to stop short —
-    // Streaming, Staff, History, Playoff Bracket, and Active Check were never
-    // created at all, so a commissioner had to hunt these down and set each
-    // one by hand. These 5 apply to every league regardless of sport.
-    ['live_channel_id', 'streaming'],
-    ['staff_channel_id', 'staff'],
-    ['history_channel_id', 'history'],
+    ['team_owners_channel_id', 'team-owners'],
     ['playoff_bracket_channel_id', 'playoff-bracket'],
     ['active_check_channel_id', 'active-check'],
+    ['history_channel_id', 'history'],
+    // league-hof / madden-news / free-agents inserted here, sport-conditional, below
+    ['suspensions_channel_id', 'suspensions'],
   ];
   // 7J-125FULLCOVERAGE: "keep these custom to the league settings upon
   // creation" — Game Center vs. Game Threads is exactly this. Madden leagues
@@ -33836,19 +34622,17 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   // non-Madden" board (see SETUP_PANEL_OPTIONS' own label for it), so it's
   // conditional the same way.
   if (isMadden) {
-    singleChannelSpecs.push(
-      ['game_threads_channel_id', 'game-threads'],
-      ['madden_news_channel_id', 'madden-news'],
-      ['madden_free_agents_channel_id', 'free-agents'],
-    );
+    singleChannelSpecs.splice(5, 0, ['game_threads_channel_id', 'game-threads']);
+    singleChannelSpecs.push(['madden_news_channel_id', 'madden-news'], ['madden_free_agents_channel_id', 'free-agents']);
   } else {
-    singleChannelSpecs.push(
-      ['game_center_channel_id', 'game-center'],
-      ['league_hof_channel_id', 'league-hof'],
-    );
+    singleChannelSpecs.splice(5, 0, ['game_center_channel_id', 'game-center']);
+    // 7J-135GENERICNEWS: Power Rankings + News Feed, the generic non-Madden
+    // equivalents of Madden's power rankings board / ESPN news channel.
+    singleChannelSpecs.push(['league_hof_channel_id', 'league-hof'], ['league_power_rankings_channel_id', 'power-rankings'], ['league_news_channel_id', 'league-news']);
   }
-  for (const [column, channelName] of singleChannelSpecs) {
-    const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+  for (let i = 0; i < singleChannelSpecs.length; i++) {
+    const [column, channelName] = singleChannelSpecs[i];
+    const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id, position: i }).catch(() => null);
     if (!channel) continue;
     await pool.query(`UPDATE league_settings SET ${column} = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, channel.id]).catch(() => null);
     created.push(channel);
@@ -33873,7 +34657,7 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     const fakeInteraction = { guild, channel: null };
     const panelTypesToPost = isMadden
       ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'madden_free_agents_panel']
-      : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel'];
+      : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel', 'league_power_rankings_panel'];
     for (const panelType of panelTypesToPost) {
       await createConfiguredPanelFromSetup(fakeInteraction, freshLeague, panelType).catch(() => null);
     }
@@ -33907,6 +34691,8 @@ const LEAGUE_OWNED_CHANNEL_COLUMNS = [
   'madden_standings_channel_id', 'madden_power_rankings_channel_id', 'madden_sportsbook_channel_id',
   'game_center_channel_id', 'active_check_channel_id', 'draft_recap_channel_id',
   'madden_franchise_hub_channel_id',
+  // 7J-135GENERICNEWS
+  'league_power_rankings_channel_id', 'league_news_channel_id',
 ];
 const LEAGUE_OWNED_ROLE_COLUMNS = ['league_role_id', 'staff_role_id', 'trade_committee_role_id', 'committee_role_id'];
 
@@ -34009,12 +34795,16 @@ function buildRecruitmentStarterEmbed() {
 
 function buildRecruitmentStarterComponents() {
   return [
+    // 7J-131RECRUITMOVE: Review Applications / Discoverable Setting removed
+    // from here per Hxxdie — both are staff-only, league-scoped actions that
+    // didn't belong mixed in with member-facing buttons on a panel every
+    // member in the server can see. Moved to each league's Commissioner
+    // Panel > Operations instead (commissioner_op:recruitreview /
+    // commissioner_op:recruitdiscoverable).
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('recruitmentpanel_browse').setLabel('Browse Open Teams').setEmoji('🔍').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('recruitmentpanel_discover').setLabel('Discover Leagues').setEmoji('🌐').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('recruitmentpanel_myapplications').setLabel('My Applications').setEmoji('📄').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('recruitmentpanel_review').setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('recruitmentpanel_discoverable_settings').setLabel('Discoverable Setting').setEmoji('⚙️').setStyle(ButtonStyle.Secondary),
     ),
     // 7J-98WAITLIST
     new ActionRowBuilder().addComponents(
@@ -34317,7 +35107,14 @@ function buildBadgeProgressEmbed(user, recognition = {}) {
 // 7J-10BY-DL: Setup dashboard includes League History Channel wiring.
 const MADDEN_ONLY_SETUP_KEYS = new Set([
   'madden_free_agents_channel',
-  'trade_block_channel',
+  // 7J-134TRADEBLOCKDASH: trade_block_channel removed from this set — same
+  // bug class as two earlier sessions' fixes (Trade Block Board itself made
+  // sport-aware, then un-gated from the Panels menu), just in a third spot:
+  // this exclusion meant a non-Madden commissioner couldn't even assign a
+  // channel to trade_block_channel_id from the Setup Dashboard's own picker
+  // — auto-setup still created and wired the channel programmatically
+  // (bypasses this filter), so the channel existed but the Dashboard
+  // wouldn't show or let anyone re-point it, exactly what Hxxdie reported.
   'trade_negotiation_channel',
   'player_search_channel',
   'gm_panel_channel',
@@ -34349,13 +35146,23 @@ const NON_MADDEN_ONLY_SETUP_KEYS = new Set([
   // 7J-61LEAGUEHOF: Madden leagues already have superior Madden-specific
   // Championship History/Award History/HOF views on the Franchise Hub board.
   'league_hof_channel',
+  // 7J-135GENERICNEWS: Madden leagues already have both, EA-sync-driven
+  // (madden_power_rankings_channel / madden_news_channel).
+  'league_power_rankings_channel',
+  'league_news_channel',
 ]);
 
 const MADDEN_ONLY_PANEL_KEYS = new Set([
   'madden_standings_panel',
   'madden_power_rankings_panel',
   'madden_free_agents_panel',
-  'trade_block_board_panel',
+  // 7J-129PANELGAPS: trade_block_board_panel removed from this set — Trade
+  // Block Board was made fully sport-aware last session (Trade Value/Overall
+  // sorts and the football-position filter drop out for non-Madden leagues,
+  // see buildMaddenTradeBlockBoardComponents), so it's genuinely usable by
+  // every league now. This set still excluding it meant non-Madden leagues
+  // couldn't even find "Post/Refresh Trade Block Board" in their own Panels
+  // menu, directly contradicting the fix that made the board itself work.
   'trade_negotiation_starter_panel',
   'player_search_panel',
   'gm_panel_starter_panel',
@@ -34371,9 +35178,16 @@ const MADDEN_ONLY_PANEL_KEYS = new Set([
 // it. Found while wiring in league_hof_panel, which has the same real
 // non-Madden-only requirement (Madden leagues have the superior
 // Madden-specific equivalent on the Franchise Hub board).
+// 7J-129PANELGAPS: game_center_panel added here too — Madden leagues always
+// use the structured Game Threads system (EA-driven schedule), never Game
+// Center, so they had no use for this option but could still see and pick
+// it (it would just fail with "channel not configured," since Madden
+// leagues never get a game_center_channel_id in the first place).
 const NON_MADDEN_ONLY_PANEL_KEYS = new Set([
   'standings_panel',
   'league_hof_panel',
+  'game_center_panel',
+  'league_power_rankings_panel',
 ]);
 
 const SETUP_DASHBOARD_OPTIONS = [
@@ -34386,6 +35200,9 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'live_channel', label: 'Streaming Channel', description: 'Where stream announcements post (/livestream, game thread Stream Hub)', kind: 'channel' },
   { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
   { value: 'league_hof_channel', label: 'League Hall of Fame Board', description: 'Persistent board: Franchise Legacy, Award History, Hall of Fame', kind: 'channel' },
+  // 7J-135GENERICNEWS
+  { value: 'league_power_rankings_channel', label: 'Power Rankings Board', description: 'Generic, non-Madden: auto-updates after every reported game, based on record + point differential', kind: 'channel' },
+  { value: 'league_news_channel', label: 'League News', description: 'Generic, non-Madden: posts a short recap after every reported game', kind: 'channel' },
   { value: 'history_channel', label: 'League History Channel', description: 'Season archives and year-end history posts', kind: 'channel' },
   { value: 'madden_free_agents_channel', label: 'Madden Free Agents Channel', description: 'Live free agent board and offseason free agency panel', kind: 'channel' },
   { value: 'trade_block_channel', label: 'Trade Block Channel', description: 'Live, sortable trade block board', kind: 'channel' },
@@ -34449,6 +35266,7 @@ const ADMIN_SERVERSETUP_MARKER = 'guild';
 const SETUP_PANEL_OPTIONS = [
   { value: 'standings_panel', label: 'Create/Refresh Standings Panel (generic, non-Madden)' },
   { value: 'league_hof_panel', label: 'Post/Refresh League Hall of Fame Board (generic, non-Madden)' },
+  { value: 'league_power_rankings_panel', label: 'Post/Refresh Power Rankings Board (generic, non-Madden)' },
   { value: 'madden_standings_panel', label: 'Post/Refresh Madden Standings Board' },
   { value: 'madden_power_rankings_panel', label: 'Post/Refresh Madden Power Rankings Board' },
   { value: 'madden_franchise_hub_panel', label: 'Post/Refresh Franchise Hub Board' },
@@ -34536,6 +35354,8 @@ function setupDashboardColumn(settingKey) {
     live_channel: 'live_channel_id',
     standings_channel: 'standings_channel_id',
     league_hof_channel: 'league_hof_channel_id',
+    league_power_rankings_channel: 'league_power_rankings_channel_id',
+    league_news_channel: 'league_news_channel_id',
     history_channel: 'history_channel_id',
     madden_free_agents_channel: 'madden_free_agents_channel_id',
     trade_block_channel: 'trade_block_channel_id',
@@ -34599,6 +35419,8 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['live_channel', 'Streaming'],
     ['standings_channel', 'Standings'],
     ['league_hof_channel', 'League Hall of Fame Board'],
+    ['league_power_rankings_channel', 'Power Rankings Board'],
+    ['league_news_channel', 'League News'],
     ['history_channel', 'League History'],
     ['madden_free_agents_channel', 'Madden Free Agents'],
     ['trade_block_channel', 'Trade Block Board'],
@@ -34783,8 +35605,8 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMadde
     // 7J-100AUTOSETUP: only shown on the main view, not while a setting
     // picker is open, to stay under Discord's 5-row cap.
     rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_autocreate_channels:' + leagueId).setLabel('Auto-Setup Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('setup_autocreate_roles:' + leagueId).setLabel('Auto-Create Team Roles').setEmoji('🏗️').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('setup_autocreate_channels:' + leagueId).setLabel('Auto-Setup Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
     ));
   }
 
@@ -34913,6 +35735,17 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const message = await channel.send({ embeds: [embed], components: buildLeagueHofBoardComponents(league.league_id, currentView) });
     await pool.query(`UPDATE madden_league_settings SET league_hof_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
     return 'League Hall of Fame Board posted/refreshed in ' + channel.toString() + '.';
+  }
+
+  // 7J-135GENERICNEWS: generic Power Rankings board, non-Madden only.
+  if (panelType === 'league_power_rankings_panel') {
+    const { channel, error } = await requireTextChannel(league.league_power_rankings_channel_id, interaction.channel, 'Power Rankings channel');
+    if (error) return error + ' Set **Power Rankings Board** from this setup dashboard first.';
+
+    const ranked = await computeLeaguePowerRankingRows(interaction.guild, league);
+    const message = await channel.send({ embeds: [buildLeaguePowerRankingsEmbed(league, ranked)] });
+    await savePanel(league, 'league_power_rankings', channel.id, message.id);
+    return 'Power Rankings Board posted/refreshed in ' + channel.toString() + (ranked.length ? '.' : ' — will populate once games have been reported.');
   }
 
   if (panelType === 'madden_free_agents_panel') {
@@ -39255,6 +40088,71 @@ function maddenTradeBlockLine(row, index = 0) {
   const notes = row.notes ? `\nNotes: ${row.notes}` : '';
   const submitter = row.submitted_by ? `\nGM: <@${row.submitted_by}>` : '';
   return `${index + 1}. **${row.player_name}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${value}${tier}${seek}${notes}${submitter}`;
+}
+
+// 7J-137GENERICTRADEBLOCK: real gap found while wiring in the trade_rumor
+// news event — addMaddenTradeBlockEntry (used by both /maddentrade block add
+// AND the board's own "Add to Block" button) requires finding the player in
+// Madden's SYNCED roster data via findMaddenImportedPlayer. For a non-Madden
+// league, that lookup can never succeed (there's no sync), so "Add to
+// Block" was completely non-functional for them — the board could DISPLAY
+// entries (made sport-aware two sessions ago) but nothing could ever
+// actually get added to it. This is the non-synced equivalent: no roster
+// lookup, no automatic overall/position/value_score (there's no data source
+// for any of that), just the player name and team the person already knows,
+// typed directly. value_score stays 0, which the board already handles
+// correctly (Trade Value sort is hidden for non-Madden leagues — see
+// buildMaddenTradeBlockBoardComponents).
+async function addGenericTradeBlockEntry(guildId, league, member, userId, playerName, seeking = '', notes = '') {
+  const userTeam = member ? await getMemberTeamForLeague(member, league) : null;
+  if (!userTeam?.name) {
+    return {
+      ok: false,
+      embed: new EmbedBuilder()
+        .setTitle('Trade Block')
+        .setColor(0xED4245)
+        .setDescription('I could not detect your team role for this league. Make sure your team role is registered and assigned to you.')
+        .setFooter({ text: 'GG Sports • Trade Block' })
+        .setTimestamp(),
+    };
+  }
+
+  const cleanName = String(playerName || '').trim().slice(0, 100);
+  if (!cleanName) {
+    return { ok: false, embed: new EmbedBuilder().setTitle('Trade Block').setColor(0xED4245).setDescription('Enter a player name.').setFooter({ text: 'GG Sports • Trade Block' }).setTimestamp() };
+  }
+  const cleanSeeking = String(seeking || '').trim().slice(0, 500);
+  const cleanNotes = String(notes || '').trim().slice(0, 500);
+  const playerKey = `${cleanName}:${userTeam.name}`.toLowerCase().replace(/\s+/g, '-').slice(0, 180);
+
+  await pool.query(
+    `INSERT INTO madden_trade_block_entries (
+       guild_id, league_id, player_key, player_name, team_name, position, overall,
+       value_score, trade_tier, seeking, notes, submitted_by, is_active, created_at, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, NULL, NULL, 0, NULL, $6, $7, $8, TRUE, NOW(), NOW())
+     ON CONFLICT (guild_id, league_id, player_key)
+     DO UPDATE SET
+       player_name = EXCLUDED.player_name,
+       team_name = EXCLUDED.team_name,
+       seeking = EXCLUDED.seeking,
+       notes = EXCLUDED.notes,
+       submitted_by = EXCLUDED.submitted_by,
+       is_active = TRUE,
+       updated_at = NOW()`,
+    [guildId, league.league_id, playerKey, cleanName, userTeam.name, cleanSeeking || null, cleanNotes || null, userId]
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Added to Trade Block • ${userTeam.name}`)
+    .setColor(0x57F287)
+    .setDescription(`**${cleanName}** is now available on the ${league.league_name} trade block.`)
+    .addFields(
+      { name: 'Seeking', value: cleanSeeking || 'Not specified', inline: false },
+      { name: 'Notes', value: cleanNotes || 'None', inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Trade Block' })
+    .setTimestamp();
+  return { ok: true, embed, teamName: userTeam.name };
 }
 
 async function addMaddenTradeBlockEntry(guildId, league, member, userId, playerName, seeking = '', notes = '') {
@@ -67631,12 +68529,17 @@ async function showCommissionerAutoDetectSettings(interaction, leagueId) {
 // ---------------------------------------------------------------------------
 // Commissioner/Admin Panel (replaces /setup panel as the single admin surface)
 // ---------------------------------------------------------------------------
+// 7J-127PANELORDER: reordered per Hxxdie for a more seamless setup flow —
+// League Settings first (schedule type especially determines which system
+// a league uses: structured schedule = game threads + Advance, open =
+// Game Center, Madden = EA sync — get that right before touching channels),
+// then Channels & Roles, then Panels, then Operations, then Browse Data.
 const COMMISSIONER_CATEGORIES = [
+  { value: 'league', label: 'League Settings', description: 'Season length, schedule type, and other league-level settings', emoji: '📋' },
   { value: 'setup', label: 'Channels & Roles', description: 'Configure channels and roles', emoji: '🛠️' },
   { value: 'panels', label: 'Panels', description: 'Create/refresh live boards', emoji: '🖼️' },
   { value: 'operations', label: 'Operations', description: 'Run sync, run scans, toggle auto-detection, refresh boards', emoji: '⚙️' },
   { value: 'browse', label: 'Browse Data', description: 'Recent transactions, retirements — by team or league-wide', emoji: '🔍' },
-  { value: 'league', label: 'League Settings', description: 'Season length and other league-level settings', emoji: '📋' },
 ];
 
 function buildCommissionerHomeEmbed(league, settings = {}) {
@@ -67699,7 +68602,20 @@ async function showCommissionerHome(interaction, leagueId, note = null) {
   }
 }
 
-function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, isStructured = false) {
+// 7J-130STARTLEAGUE: hasStarted controls the Advance/Start League label — per
+// Hxxdie, the first press for a structured non-Madden league should read
+// "Start League" (it generates the season schedule AND creates round 1's
+// games/threads — see action === 'advance' below, which already did exactly
+// this on an empty schedule, just under a label that didn't say so), then
+// switch to "Advance" for every press after that. Same button/customId
+// either way — this only changes the label and emoji shown.
+function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, isStructured = false, hasStarted = false) {
+  const advanceButton = () => new ButtonBuilder()
+    .setCustomId('commissioner_op:advance:' + leagueId)
+    .setLabel(hasStarted ? 'Advance' : 'Start League')
+    .setEmoji(hasStarted ? '⏭️' : '🚀')
+    .setStyle(ButtonStyle.Success);
+
   if (!isMaddenLeague) {
     const rows = [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_op:announce:' + leagueId).setLabel('League Announcement').setEmoji('📣').setStyle(ButtonStyle.Primary),
@@ -67709,13 +68625,20 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
       new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
     )];
     if (isStructured) {
-      rows.push(new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('commissioner_op:advance:' + leagueId).setLabel('Advance').setEmoji('⏭️').setStyle(ButtonStyle.Success),
-      ));
+      rows.push(new ActionRowBuilder().addComponents(advanceButton()));
     }
     // 7J-97SUSPEND
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_op:suspensions:' + leagueId).setLabel('Suspensions').setEmoji('🚫').setStyle(ButtonStyle.Danger),
+    ));
+    // 7J-131RECRUITMOVE: Review Applications / Discoverable Setting moved here
+    // from the guild-wide Recruitment panel per Hxxdie — both are staff-only
+    // league-scoped actions that don't belong mixed in with member-facing
+    // buttons (Browse Open Teams, Discover Leagues, My Applications, etc.)
+    // on a panel every member can see.
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('commissioner_op:recruitreview:' + leagueId).setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('commissioner_op:recruitdiscoverable:' + leagueId).setLabel('Discoverable Setting').setEmoji('🌐').setStyle(ButtonStyle.Secondary),
     ));
     rows.push(buildCommissionerBackRow(leagueId));
     return rows;
@@ -67737,10 +68660,12 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
   );
   const rows = [row1, row3];
   if (isStructured) {
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('commissioner_op:advance:' + leagueId).setLabel('Advance').setEmoji('⏭️').setStyle(ButtonStyle.Success),
-    ));
+    rows.push(new ActionRowBuilder().addComponents(advanceButton()));
   }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('commissioner_op:recruitreview:' + leagueId).setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('commissioner_op:recruitdiscoverable:' + leagueId).setLabel('Discoverable Setting').setEmoji('🌐').setStyle(ButtonStyle.Secondary),
+  ));
   rows.push(buildCommissionerBackRow(leagueId));
   return rows;
 }
@@ -67763,10 +68688,15 @@ async function showCommissionerOperations(interaction, leagueId) {
   const isMadden = getLeagueSportKey(league) === 'madden';
   const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
   const isStructured = customSettings.schedule_style === 'structured';
+  // 7J-130STARTLEAGUE: "started" = a schedule has actually been generated —
+  // matches the exact condition action === 'advance' below already used to
+  // decide whether to generate one, so the label always matches what the
+  // button is about to do.
+  const hasStarted = Array.isArray(customSettings.schedule) && customSettings.schedule.length > 0;
   const embed = isMadden
     ? buildMaddenAutoDetectSettingsEmbed(league, await ensureMaddenLeagueSettings(league).catch(() => ({})))
     : buildCommissionerGenericOperationsEmbed(league);
-  const payload = { embeds: [embed], components: buildCommissionerOperationsComponents(leagueId, isMadden, isStructured) };
+  const payload = { embeds: [embed], components: buildCommissionerOperationsComponents(leagueId, isMadden, isStructured, hasStarted) };
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply(payload);
   } else {
