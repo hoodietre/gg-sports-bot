@@ -34780,16 +34780,41 @@ async function autoCreateGuildMultiChannelPanels(guild) {
     created.push(channel);
   }
 
+  // 7J-149TICKETSAUTOSETUP: per Hxxdie — Tickets/Support are guild-wide
+  // (7J-111TICKETSCOPE), so they belong in this same guild-wide auto-setup
+  // flow rather than needing to be configured by hand afterward. Only
+  // creates whichever of the two isn't already set, same "don't clobber an
+  // existing setup" behavior as the Welcome/Leave block below. Posts the
+  // ticket_panel (informational embed with /ticket usage) once both
+  // channels exist, since that panel reads guilds.ticket_channel_id/
+  // support_channel_id directly and doesn't need a league at all.
   const guildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
-  if (guildSettings?.welcome_leave_enabled) {
-    if (!guildSettings.welcome_channel_id) {
+  if (!guildSettings?.ticket_channel_id) {
+    const ticketChannel = await guild.channels.create({ name: 'tickets', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (ticketChannel) {
+      await setGuildTicketSettings(guild.id, guild.name, { ticketChannelId: ticketChannel.id });
+      created.push(ticketChannel);
+    }
+  }
+  if (!guildSettings?.support_channel_id) {
+    const supportChannel = await guild.channels.create({ name: 'support', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (supportChannel) {
+      await setGuildTicketSettings(guild.id, guild.name, { supportChannelId: supportChannel.id });
+      created.push(supportChannel);
+    }
+  }
+  await createConfiguredPanelFromSetup({ guild, channel: null }, null, 'ticket_panel').catch(() => null);
+
+  const refreshedGuildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
+  if (refreshedGuildSettings?.welcome_leave_enabled) {
+    if (!refreshedGuildSettings.welcome_channel_id) {
       const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
       if (welcomeChannel) {
         await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
         created.push(welcomeChannel);
       }
     }
-    if (!guildSettings.leave_channel_id) {
+    if (!refreshedGuildSettings.leave_channel_id) {
       const leaveChannel = await guild.channels.create({ name: 'leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
       if (leaveChannel) {
         await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
