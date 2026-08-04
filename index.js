@@ -4778,7 +4778,8 @@ async function registerCommands() {
 const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
-            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable, s.suspensions_channel_id, s.setup_ticket_channel_id, s.setup_support_channel_id`;
+            s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable, s.suspensions_channel_id, s.setup_ticket_channel_id, s.setup_support_channel_id,
+            s.league_power_rankings_channel_id, s.league_news_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -15781,6 +15782,8 @@ if (interaction.commandName === 'avatar') {
           .setTitle('Add to Trade Block')
           .addComponents(
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('player_name').setLabel('Player name').setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('position').setLabel('Position (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('overall').setLabel('Overall (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('seeking').setLabel('Seeking (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Notes (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
           );
@@ -15799,10 +15802,18 @@ if (interaction.commandName === 'avatar') {
       if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
       await interaction.deferReply({ ephemeral: true });
       const playerName = interaction.fields.getTextInputValue('player_name');
+      // 7J-147TRADEBLOCKFIELDS: per Hxxdie — position and overall now
+      // populate the actual board listing, not just name/seeking/notes.
+      // Both stay optional free text (there's no synced data to validate
+      // against for a non-Madden league, same reasoning as the rest of
+      // this modal).
+      const position = interaction.fields.getTextInputValue('position') || '';
+      const overallRaw = interaction.fields.getTextInputValue('overall') || '';
+      const overall = overallRaw ? Number.parseInt(overallRaw, 10) : null;
       const seeking = interaction.fields.getTextInputValue('seeking') || '';
       const notes = interaction.fields.getTextInputValue('notes') || '';
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      const result = await addGenericTradeBlockEntry(interaction.guild.id, league, member, interaction.user.id, playerName, seeking, notes).catch(() => null);
+      const result = await addGenericTradeBlockEntry(interaction.guild.id, league, member, interaction.user.id, playerName, seeking, notes, position, overall).catch(() => null);
       if (result?.ok) {
         // 7J-136NEWSEVENTS: trade rumor — real news now that adding to the
         // block is an actual working feature for non-Madden leagues.
@@ -34850,6 +34861,16 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   const category = await guild.channels.create({ name: `${leagueCategoryEmoji(league)} ${league.league_name}`.slice(0, 100), type: ChannelType.GuildCategory });
   const created = [];
 
+  // 7J-145SCHEDULEFIX: real bug — this used to decide Game Threads vs. Game
+  // Center purely off isMadden, but per Hxxdie's original ask a NON-Madden
+  // league can also use the structured schedule (Advance/Start League)
+  // system, in which case it needs Game Threads too, not Game Center. Only
+  // a non-Madden league on the OPEN schedule style actually wants Game
+  // Center. Checking league_custom_settings.schedule_style is the real
+  // signal here, not the sport.
+  const customSettings = !isMadden ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
+  const isStructuredNonMadden = !isMadden && customSettings.schedule_style === 'structured';
+
   // 7J-128CHANNELORDER: explicit order + explicit `position` on each create
   // call below — per Hxxdie, the previous order came out jumbled in Discord
   // (channel `position` isn't reliably inferred from creation order alone
@@ -34879,20 +34900,24 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     // league-hof / madden-news / free-agents inserted here, sport-conditional, below
     ['suspensions_channel_id', 'suspensions'],
   ];
-  // 7J-125FULLCOVERAGE: "keep these custom to the league settings upon
-  // creation" — Game Center vs. Game Threads is exactly this. Madden leagues
-  // get a real structured schedule (games/weeks come from EA sync), so they
-  // use Game Threads (auto-created matchup threads per synced game).
-  // Non-Madden leagues have no such sync, so they use Game Center instead
-  // (the manual "Add Game" flow) — creating both would just leave one of them
-  // permanently empty and confusing. League HOF is explicitly the "generic,
-  // non-Madden" board (see SETUP_PANEL_OPTIONS' own label for it), so it's
-  // conditional the same way.
-  if (isMadden) {
+  // 7J-125FULLCOVERAGE / 7J-145SCHEDULEFIX: "keep these custom to the
+  // league settings upon creation" — Game Center vs. Game Threads is
+  // exactly this, and it's a schedule-style decision, not a sport decision.
+  // Madden always uses Game Threads (EA-sync-driven). A non-Madden
+  // STRUCTURED league also uses Game Threads (Advance/Start League
+  // generates them) — the channel just sits empty until Start League is
+  // pressed, nothing gets posted into it at creation time. A non-Madden
+  // OPEN league uses Game Center instead (the manual "Add Game" flow,
+  // with a panel posted immediately). League HOF is explicitly the
+  // "generic, non-Madden" board, so it's conditional on sport only.
+  if (isMadden || isStructuredNonMadden) {
     singleChannelSpecs.splice(5, 0, ['game_threads_channel_id', 'game-threads']);
-    singleChannelSpecs.push(['madden_news_channel_id', 'madden-news'], ['madden_free_agents_channel_id', 'free-agents']);
   } else {
     singleChannelSpecs.splice(5, 0, ['game_center_channel_id', 'game-center']);
+  }
+  if (isMadden) {
+    singleChannelSpecs.push(['madden_news_channel_id', 'madden-news'], ['madden_free_agents_channel_id', 'free-agents']);
+  } else {
     // 7J-135GENERICNEWS: Power Rankings + News Feed, the generic non-Madden
     // equivalents of Madden's power rankings board / ESPN news channel.
     singleChannelSpecs.push(['league_hof_channel_id', 'league-hof'], ['league_power_rankings_channel_id', 'power-rankings'], ['league_news_channel_id', 'league-news']);
@@ -34919,12 +34944,18 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   // deliberately NOT posted here (7J-111TICKETSCOPE) — Tickets/Support are
   // guild-wide now, not per-league, so posting that panel belongs to the
   // guild-wide Admin Panel ticket setup instead of running once per league.
+  // 7J-145SCHEDULEFIX: game_center_panel is only posted for the non-Madden
+  // OPEN case — a structured non-Madden league's game-threads channel stays
+  // empty (no panel, no threads) until Start League is actually pressed,
+  // same as Madden's game-threads channel never gets a pre-populated panel.
   const freshLeague = await getLeagueById(league.league_id).catch(() => null);
   if (freshLeague) {
     const fakeInteraction = { guild, channel: null };
     const panelTypesToPost = isMadden
       ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'madden_free_agents_panel']
-      : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel', 'league_power_rankings_panel'];
+      : isStructuredNonMadden
+        ? ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'league_power_rankings_panel']
+        : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel', 'league_power_rankings_panel'];
     for (const panelType of panelTypesToPost) {
       await createConfiguredPanelFromSetup(fakeInteraction, freshLeague, panelType).catch(() => null);
     }
@@ -40370,7 +40401,7 @@ function maddenTradeBlockLine(row, index = 0) {
 // typed directly. value_score stays 0, which the board already handles
 // correctly (Trade Value sort is hidden for non-Madden leagues — see
 // buildMaddenTradeBlockBoardComponents).
-async function addGenericTradeBlockEntry(guildId, league, member, userId, playerName, seeking = '', notes = '') {
+async function addGenericTradeBlockEntry(guildId, league, member, userId, playerName, seeking = '', notes = '', position = '', overall = null) {
   const userTeam = member ? await getMemberTeamForLeague(member, league) : null;
   if (!userTeam?.name) {
     return {
@@ -40390,29 +40421,40 @@ async function addGenericTradeBlockEntry(guildId, league, member, userId, player
   }
   const cleanSeeking = String(seeking || '').trim().slice(0, 500);
   const cleanNotes = String(notes || '').trim().slice(0, 500);
+  // 7J-147TRADEBLOCKFIELDS: position/overall now populate the board listing
+  // instead of always being NULL — both stay free text/best-effort since
+  // there's no synced roster to validate against for a non-Madden league.
+  // overall specifically is clamped to a sane range rather than trusted
+  // outright, since it also feeds Trade Value sorting math elsewhere for
+  // Madden entries — an out-of-range value here would just look wrong, not
+  // break anything, but there's no reason not to guard it.
+  const cleanPosition = String(position || '').trim().slice(0, 20) || null;
+  const cleanOverall = Number.isInteger(overall) && overall >= 0 && overall <= 999 ? overall : null;
   const playerKey = `${cleanName}:${userTeam.name}`.toLowerCase().replace(/\s+/g, '-').slice(0, 180);
 
   await pool.query(
     `INSERT INTO madden_trade_block_entries (
        guild_id, league_id, player_key, player_name, team_name, position, overall,
        value_score, trade_tier, seeking, notes, submitted_by, is_active, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, NULL, NULL, 0, NULL, $6, $7, $8, TRUE, NOW(), NOW())
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, NULL, $8, $9, $10, TRUE, NOW(), NOW())
      ON CONFLICT (guild_id, league_id, player_key)
      DO UPDATE SET
        player_name = EXCLUDED.player_name,
        team_name = EXCLUDED.team_name,
+       position = EXCLUDED.position,
+       overall = EXCLUDED.overall,
        seeking = EXCLUDED.seeking,
        notes = EXCLUDED.notes,
        submitted_by = EXCLUDED.submitted_by,
        is_active = TRUE,
        updated_at = NOW()`,
-    [guildId, league.league_id, playerKey, cleanName, userTeam.name, cleanSeeking || null, cleanNotes || null, userId]
+    [guildId, league.league_id, playerKey, cleanName, userTeam.name, cleanPosition, cleanOverall, cleanSeeking || null, cleanNotes || null, userId]
   );
 
   const embed = new EmbedBuilder()
     .setTitle(`Added to Trade Block • ${userTeam.name}`)
     .setColor(0x57F287)
-    .setDescription(`**${cleanName}** is now available on the ${league.league_name} trade block.`)
+    .setDescription(`**${cleanName}**${cleanPosition ? ' — ' + cleanPosition : ''}${cleanOverall !== null ? ' • ' + cleanOverall + ' OVR' : ''} is now available on the ${league.league_name} trade block.`)
     .addFields(
       { name: 'Seeking', value: cleanSeeking || 'Not specified', inline: false },
       { name: 'Notes', value: cleanNotes || 'None', inline: false }
@@ -41329,12 +41371,9 @@ async function buildAdminLeagueSetupPayload(guild, lang) {
 
   const components = [];
   if (result.rows.length) {
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId('adminpanel_league_teamrole_select')
-      .setPlaceholder(t(lang, 'league_setup_teamrole_placeholder'))
-      .addOptions(result.rows.map(l => ({ label: l.league_name.slice(0, 100), value: l.league_id.slice(0, 100), description: (l.game_key || 'general').toUpperCase().slice(0, 100) })));
-    components.push(new ActionRowBuilder().addComponents(menu));
-
+    // 7J-146REMOVETEAMROLE: "Choose a league to add a team role to" removed
+    // per Hxxdie — Auto-Create Team Roles (below) and /league teamrole
+    // already cover this; this extra picker was redundant.
     const deleteMenu = new StringSelectMenuBuilder()
       .setCustomId('adminpanel_league_delete_select')
       .setPlaceholder(t(lang, 'league_setup_delete_placeholder'))
