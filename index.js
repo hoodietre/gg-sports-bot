@@ -1590,6 +1590,7 @@ async function initDatabase() {
       target_team_name TEXT NOT NULL,
       target_team_role_id TEXT,
       thread_id TEXT,
+      starter_message_id TEXT,
       status TEXT NOT NULL DEFAULT 'negotiating',
       pending_screenshot_url TEXT,
       pending_submitted_by TEXT,
@@ -1600,6 +1601,11 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  // 7J-140NEGOTIATIONPOLISH: starter_message_id added after the table's
+  // initial creation this session — see the two rough edges this backfills:
+  // disabling "Ready to Submit" once a screenshot is in, and (implicitly)
+  // being able to find that message again to do so.
+  await pool.query(`ALTER TABLE league_trade_negotiations ADD COLUMN IF NOT EXISTS starter_message_id TEXT`);
 
   // 7J-99WAGER: escrowed at acceptance (both amounts deducted immediately,
   // not just at settlement) — prevents a wager being un-payable because
@@ -5133,12 +5139,18 @@ async function createGenericTradeNegotiationThread(guild, league, { senderUserId
     .setDescription('Discuss the trade here. When you\'ve agreed on a deal, press **Ready to Submit** and post a screenshot of the final in-game proposal as your next message — both owners have to confirm it before it goes to the trade committee.')
     .setFooter({ text: 'GG Sports • Trade Negotiation' })
     .setTimestamp();
-  await thread.send({
+  const starterMessage = await thread.send({
     content: `<@${senderUserId}> <@${targetUserId}> private trade negotiation opened.`,
     embeds: [embed],
     components: [buildNegotiationSubmitRow(negotiationId)],
     allowedMentions: { users: [senderUserId, targetUserId], roles: [] },
   }).catch(() => null);
+
+  // 7J-140NEGOTIATIONPOLISH: saved so the screenshot-submit hook can find
+  // and disable this exact button later — see the rough edge this closes.
+  if (starterMessage) {
+    await pool.query(`UPDATE league_trade_negotiations SET starter_message_id = $1 WHERE id = $2`, [starterMessage.id, negotiationId]);
+  }
 
   // 7J-139NEGOTIATIONRUMOR: two teams starting to talk is real news — fires
   // once, right here, not on every message exchanged in the thread.
@@ -8428,6 +8440,17 @@ client.on(Events.MessageCreate, async (message) => {
           components: [buildNegotiationConfirmRow(negotiation.id)],
           allowedMentions: { users: [otherOwner], roles: [] },
         }).catch(() => null);
+
+        // 7J-140NEGOTIATIONPOLISH: disable "Ready to Submit" on the
+        // starter message now that a screenshot is actually in — it no
+        // longer needs pressing again, and leaving it live/clickable
+        // suggested otherwise.
+        if (negotiation.starter_message_id) {
+          const starterMessage = await message.channel.messages.fetch(negotiation.starter_message_id).catch(() => null);
+          if (starterMessage) {
+            await starterMessage.edit({ components: [buildNegotiationSubmitRow(negotiation.id, true)] }).catch(() => null);
+          }
+        }
       }
     }
 
@@ -12815,6 +12838,14 @@ if (interaction.commandName === 'avatar') {
             `UPDATE league_trade_negotiations SET pending_screenshot_url = NULL, pending_submitted_by = NULL, sender_confirmed = FALSE, target_confirmed = FALSE, updated_at = NOW() WHERE id = $1`,
             [negotiationId]
           );
+          // 7J-140NEGOTIATIONPOLISH: re-enable "Ready to Submit" on cancel —
+          // it was disabled the moment a screenshot came in, so cancelling
+          // needs to give it back, or there'd be no visible way to submit
+          // a replacement.
+          if (negotiation.starter_message_id) {
+            const starterMessage = await interaction.channel.messages.fetch(negotiation.starter_message_id).catch(() => null);
+            if (starterMessage) await starterMessage.edit({ components: [buildNegotiationSubmitRow(negotiationId, false)] }).catch(() => null);
+          }
           await interaction.update({ content: `<@${interaction.user.id}> cancelled this screenshot. Post a new one whenever you're ready.`, embeds: [], components: [] });
           return;
         }
@@ -12857,7 +12888,15 @@ if (interaction.commandName === 'avatar') {
           allowedMentions: { roles: [league?.committee_role_id || COMMITTEE_ROLE_ID], users: [] },
         });
         await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
-        await interaction.update({ content: `Both owners confirmed — sent to the trade committee: ${committeeChannel.toString()}`, components: [] });
+        await interaction.update({ content: `Both owners confirmed — sent to the trade committee: ${committeeChannel.toString()}. This thread will archive shortly.`, components: [] });
+        // 7J-140NEGOTIATIONPOLISH: auto-archive the negotiation thread now
+        // that its job is done — the deal itself lives on in the committee
+        // channel and trade_offers row, the thread doesn't need to stay
+        // active. Not deleted, just archived, so the discussion history is
+        // still there if anyone needs to look back at it.
+        if (interaction.channel?.isThread?.()) {
+          await interaction.channel.setArchived(true, 'Trade negotiation submitted to committee').catch(() => null);
+        }
         return;
       }
 
