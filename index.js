@@ -13988,7 +13988,7 @@ if (interaction.commandName === 'avatar') {
         }
 
         if (currentRound >= schedule.length) {
-          await interaction.editReply({ content: `Season schedule complete — all ${schedule.length} round(s) have been played.\n\n**Next steps:**\n• Run \`/league seasonhistory\` to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)\n• Start a new season to generate a new schedule.` });
+          await interaction.editReply({ content: `Season schedule complete — all ${schedule.length} game(s) have been played.\n\n**Next steps:**\n• Run \`/league seasonhistory\` to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)\n• Start a new season to generate a new schedule.` });
           return;
         }
 
@@ -14009,10 +14009,15 @@ if (interaction.commandName === 'avatar') {
         let threadsCreated = 0;
         const threadFailures = [];
 
+        // 7J-150RENAMEROUND: "Round" -> "Game" in every user-facing string
+        // for this structured-schedule Advance flow, per Hxxdie — purely a
+        // display rename, the underlying schedule/current_round data model
+        // is unchanged (and unrelated to the separate tournament-bracket
+        // "Round" terminology elsewhere in the bot, which stays as-is).
         for (const matchup of (roundMatchups || [])) {
           const homeTeam = { id: matchup.home.role_id, name: matchup.home.role_name };
           const awayTeam = { id: matchup.away.role_id, name: matchup.away.role_name };
-          const createResult = await createLeagueGameCore(interaction, league, homeTeam, awayTeam, { weekLabel: `Round ${currentRound}` });
+          const createResult = await createLeagueGameCore(interaction, league, homeTeam, awayTeam, { weekLabel: `Game ${currentRound}` });
           if (!createResult.ok || !createResult.game) continue;
           gamesCreated += 1;
 
@@ -14023,7 +14028,7 @@ if (interaction.commandName === 'avatar') {
           }
         }
 
-        const matchupText = (roundMatchups || []).map(m => `${m.home.role_name} vs ${m.away.role_name}`).join('\n') || 'No matchups this round (bye).';
+        const matchupText = (roundMatchups || []).map(m => `${m.home.role_name} vs ${m.away.role_name}`).join('\n') || 'No matchups this game (bye).';
         const threadNote = threadChannel
           ? `${threadsCreated}/${gamesCreated} matchup thread(s) created in <#${threadChannel.id}>.${threadFailures.length ? '\n⚠️ ' + threadFailures.join('\n⚠️ ') : ''}`
           : 'No Game Threads channel configured — games were created and can still be reported with `/game report`, but set a Game Threads Channel to get auto-created matchup threads with Report Score buttons next time.';
@@ -14032,9 +14037,9 @@ if (interaction.commandName === 'avatar') {
         // season actually starting, not just "advanced," and note the button
         // is now labeled Advance for every press after this one.
         const headline = isFirstStart
-          ? `**League started! Round 1/${schedule.length}**`
-          : `**Advanced to Round ${currentRound}/${schedule.length}**`;
-        const startedNote = isFirstStart ? '\n\nThe Operations button is now labeled **Advance** for future rounds.' : '';
+          ? `**League started! Game 1/${schedule.length}**`
+          : `**Advanced to Game ${currentRound}/${schedule.length}**`;
+        const startedNote = isFirstStart ? '\n\nThe Operations button is now labeled **Advance** for future games.' : '';
         await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}` });
         return;
       }
@@ -14738,7 +14743,7 @@ if (interaction.commandName === 'avatar') {
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at)),
+            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at), false, leagueCategoryEmoji(league)),
           }).catch(() => null);
         }
         if (league) await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -14809,7 +14814,7 @@ if (interaction.commandName === 'avatar') {
         const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
         await interaction.channel.send({
           embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-          components: buildGameCenterThreadComponents(gameId, false, true, wagersEnabled),
+          components: buildGameCenterThreadComponents(gameId, false, true, wagersEnabled, leagueCategoryEmoji(league)),
         }).catch(() => null);
       }
       return;
@@ -15065,7 +15070,7 @@ if (interaction.commandName === 'avatar') {
           const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, false, false, wagersEnabled),
+            components: buildGameCenterThreadComponents(gameId, false, false, wagersEnabled, leagueCategoryEmoji(league)),
           }).catch(() => null);
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -15116,7 +15121,7 @@ if (interaction.commandName === 'avatar') {
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at)),
+            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at), false, leagueCategoryEmoji(league)),
           }).catch(() => null);
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -29618,9 +29623,9 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
 // screenshot doesn't have at all (Madden's score comes from sync). Report
 // Score sits alongside the new Report Issue in row 2 rather than displacing
 // it, since dropping manual score entry would break the core feature.
-function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wagersEnabled = false) {
+function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wagersEnabled = false, sportEmoji = '🏆') {
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('gamecenter_info:' + gameId).setLabel('Matchup Info').setEmoji('🏒').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('gamecenter_info:' + gameId).setLabel('Matchup Info').setEmoji(sportEmoji).setStyle(ButtonStyle.Primary),
   );
   if (wagersEnabled && !isFinal) {
     row1.addComponents(
@@ -29719,7 +29724,7 @@ async function createGameCenterThread(interaction, league, game, { channelIdOver
   await thread.send({
     content: (mentionText ? mentionText + ' ' : '') + 'Matchup thread opened. Report the score here once the game is finished.',
     embeds: [buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id)],
-    components: buildGameCenterThreadComponents(game.id, false, false, wagersEnabled),
+    components: buildGameCenterThreadComponents(game.id, false, false, wagersEnabled, leagueCategoryEmoji(league)),
     allowedMentions: { users: [homeOwner?.id, awayOwner?.id].filter(Boolean), roles: [] },
   }).catch(() => null);
 
