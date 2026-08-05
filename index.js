@@ -79,31 +79,6 @@ function clearParlayDraft(guildId, userId) {
 }
 
 const CLIENT_ID = process.env.CLIENT_ID || '1407760487151833200';
-const DEV_GUILD_ID = process.env.GUILD_ID || '1486545386649686068';
-const COMMAND_GUILD_IDS = (process.env.GUILD_IDS || process.env.GUILD_ID || DEV_GUILD_ID)
-  .split(',')
-  .map(id => id.trim())
-  .filter(Boolean);
-const USE_GLOBAL_COMMANDS = true;
-
-// Legacy fallback IDs for your original server.
-const LEAGUE_ROLE_ID = '1486787668489797843';
-const LIVE_CHANNEL_ID = '1486546017053573223';
-const TEAM_OWNERS_CHANNEL_ID = '1486545641537671198';
-const TRADE_COUNT_CHANNEL_ID = '1486546310059262042';
-const TRADE_BLOCK_CHANNEL_ID = '1486546070077964360';
-const OFFER_A_TRADE_CHANNEL_ID = '1486546108179284148';
-const COMMITTEE_CHANNEL_ID = '1486546187111628891';
-const TRADE_APPROVED_CHANNEL_ID = '1486546234029379714';
-const TRADE_DENIED_CHANNEL_ID = '1486546264404263065';
-const COMMITTEE_ROLE_ID = '1487214037266727003';
-
-const TEAM_ROLE_NAMES = [
-  '76ers', 'Bucks', 'Bulls', 'Cavs', 'Celtics', 'Clippers', 'Grizzlies',
-  'Hawks', 'Heat', 'Hornets', 'Jazz', 'Kings', 'Knicks', 'Lakers', 'Magic',
-  'Mavs', 'Nets', 'Nuggets', 'Pacers', 'Pistons', 'Raptors', 'Rockets',
-  'Spurs', 'Suns', 'Sonics', 'Wolves', 'Blazers', 'Warriors', 'Wizards',
-];
 
 const pendingOfferTargets = new Map();
 const maddenValuesPaginationSessions = new Map();
@@ -227,7 +202,11 @@ async function initDatabase() {
 
   await pool.query(`CREATE TABLE IF NOT EXISTS stream_links (user_id TEXT PRIMARY KEY, stream_url TEXT NOT NULL)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS bot_panels (panel_key TEXT PRIMARY KEY, channel_id TEXT NOT NULL, message_id TEXT NOT NULL)`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS trade_counts (team_name TEXT PRIMARY KEY, trade_count INTEGER NOT NULL DEFAULT 0)`);
+  // 7K-LEGACYCLEANUP: trade_counts (the old single-server, pre-multi-league
+  // table) confirmed fully unreachable — nothing seeds or reads it anymore,
+  // league_trade_counts has been the real source of truth for a long time.
+  // Per Hxxdie, actually drop it rather than just stop referencing it.
+  await pool.query(`DROP TABLE IF EXISTS trade_counts`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trade_block_posts (
@@ -307,14 +286,6 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS welcome_leave_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS welcome_channel_id TEXT`);
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS leave_channel_id TEXT`);
-  // 7J-101REVIEW: SUPERSEDED — original design was a one-time guild-level
-  // prompt shown in the Commissioner Panel. Redesigned per Hxxdie to a
-  // per-user DM instead (see user_review_prompts / runReviewPromptSchedulerTick
-  // below), so these two columns are no longer read or written anywhere.
-  // Left in place rather than dropped, matching this codebase's convention
-  // of never removing columns once added.
-  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS review_prompted_at TIMESTAMP`);
-  await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS review_dismissed BOOLEAN NOT NULL DEFAULT FALSE`);
 
   // 7J-111TICKETSCOPE: Tickets/Support moved from per-league (league_settings.
   // setup_ticket_channel_id/setup_support_channel_id) to guild-wide, per Hxxdie —
@@ -892,6 +863,9 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_negotiation_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS player_search_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS gm_panel_channel_id TEXT`);
+  // 7K-ROSTERPANEL: generic (both sports) — button access for the Team
+  // Roster feature (7K-ROSTER), previously command-only.
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS team_roster_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_announcement_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS staff_channel_id TEXT`); // staff-only notices, e.g. league settings changelog
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_leaders_channel_id TEXT`);
@@ -1566,6 +1540,11 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_power_rankings_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_power_rankings_message_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_news_channel_id TEXT`);
+  // 7J-154WHOGOTNEXT: separate general chat channel so the "Who's Got Next"
+  // button on a Game Center thread can post there instead of inside the
+  // matchup thread itself — per Hxxdie, posting availability call-outs in
+  // the thread would bury the actual game center content.
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS league_chat_channel_id TEXT`);
   // No UI toggle wired up for this yet (unlike Madden's espn_news_enabled,
   // which has a real settings button) — defaults on, but flipping it off
   // currently needs a direct DB update. Flagged as a real gap, not hidden.
@@ -1719,18 +1698,6 @@ async function initDatabase() {
     )
   `);
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS guild_currency_balances (
-      guild_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      balance INTEGER NOT NULL DEFAULT 0,
-      lifetime_earned INTEGER NOT NULL DEFAULT 0,
-      lifetime_spent INTEGER NOT NULL DEFAULT 0,
-      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (guild_id, user_id)
-    )
-  `);
-
   await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS game_played_payout INTEGER NOT NULL DEFAULT 25`);
   await pool.query(`ALTER TABLE guild_currency_settings ADD COLUMN IF NOT EXISTS award_payout INTEGER NOT NULL DEFAULT 50`);
   // 7J-40ACHIEVE: championship payout, parallel to the existing award_payout —
@@ -1763,10 +1730,10 @@ async function initDatabase() {
   `);
 
   // Universal (cross-server) currency balance — replaces per-guild guild_currency_balances
-  // as the source of truth for a user's spendable balance. guild_currency_balances is kept
-  // in place (unused for reads/writes going forward) purely as historical/audit data until
-  // a future cleanup pass; see migrateGuildCurrencyBalancesToGlobal() for the one-time
-  // consolidation into this table.
+  // as the source of truth for a user's spendable balance. The old per-guild table and
+  // its one-time consolidation migration (migrateGuildCurrencyBalancesToGlobal) were
+  // removed in the dead-code sweep — confirmed both live servers had already run the
+  // migration, and per Hxxdie user data gets wiped before public launch anyway.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_currency_balances (
       user_id TEXT PRIMARY KEY,
@@ -2140,7 +2107,6 @@ async function initDatabase() {
       activity_points INTEGER NOT NULL DEFAULT 0,
       legacy_score INTEGER NOT NULL DEFAULT 0,
       championships INTEGER NOT NULL DEFAULT 0,
-      tournament_titles INTEGER NOT NULL DEFAULT 0,
       sportsbook_wins INTEGER NOT NULL DEFAULT 0,
       sportsbook_profit INTEGER NOT NULL DEFAULT 0,
       tickets_resolved INTEGER NOT NULL DEFAULT 0,
@@ -2154,6 +2120,11 @@ async function initDatabase() {
   `);
 
   await pool.query(`ALTER TABLE user_recognition ADD COLUMN IF NOT EXISTS activity_points INTEGER NOT NULL DEFAULT 0`);
+  // 7K-LEGACYCLEANUP: tournament_titles never got incremented anywhere —
+  // the real, accurate tournament title count is computed live from
+  // tournament_history instead (see 7J-42TOURNEY). Fully dropped per
+  // Hxxdie, not just left unreferenced.
+  await pool.query(`ALTER TABLE user_recognition DROP COLUMN IF EXISTS tournament_titles`);
   await pool.query(`UPDATE user_recognition SET activity_points = recognition_points WHERE activity_points = 0 AND recognition_points IS NOT NULL`).catch(() => null);
   // 7J-43ACTIVITY: passive engagement (messages/voice) earns fractional
   // points (+0.2 each) — the column needs to actually hold fractional
@@ -2776,16 +2747,8 @@ async function initDatabase() {
   `);
 
 
-  for (const teamName of TEAM_ROLE_NAMES) {
-    await pool.query(
-      `INSERT INTO trade_counts (team_name, trade_count) VALUES ($1, 0) ON CONFLICT (team_name) DO NOTHING`,
-      [teamName]
-    );
-  }
-
   await loadCurrencyConfig();
   await loadBotSettings();
-  await migrateGuildCurrencyBalancesToGlobal();
   await migrateMaddenSportsbookAutoLinesDefaultOn();
   await migrateSingleChannelPanelsToMultiChannel();
   await migrateStaleScheduleExportDuplicateGames();
@@ -2793,12 +2756,6 @@ async function initDatabase() {
   console.log('Database ready.');
 }
 
-// One-time consolidation of the old per-guild guild_currency_balances into the new
-// global user_currency_balances table, run once ever (guarded by system_migrations).
-// Per-user totals are summed across every server they had a balance in — the policy
-// call made when the economy went universal (see design log, "Migration policy for
-// consolidating existing per-guild guild_currency_balances", resolved as: sum across
-// servers per user). guild_currency_balances itself is left untouched as historical data.
 // One-time enablement of Madden sportsbook auto-lines for leagues created before
 // this defaulted to on. Guarded by system_migrations so this runs exactly once —
 // critical here specifically, since without the guard, any commissioner who
@@ -2938,50 +2895,6 @@ async function migrateStaleScheduleExportDuplicateGames() {
 }
 
 
-
-async function migrateGuildCurrencyBalancesToGlobal() {
-  const MIGRATION_KEY = 'global_currency_balance_consolidation_v1';
-
-  const already = await pool.query(
-    `SELECT 1 FROM system_migrations WHERE migration_key = $1`,
-    [MIGRATION_KEY]
-  );
-  if (already.rows.length > 0) return;
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    await client.query(
-      `INSERT INTO user_currency_balances (user_id, balance, lifetime_earned, lifetime_spent)
-       SELECT
-         user_id,
-         SUM(balance)::int,
-         SUM(lifetime_earned)::int,
-         SUM(lifetime_spent)::int
-       FROM guild_currency_balances
-       GROUP BY user_id
-       ON CONFLICT (user_id) DO UPDATE SET
-         balance = user_currency_balances.balance + EXCLUDED.balance,
-         lifetime_earned = user_currency_balances.lifetime_earned + EXCLUDED.lifetime_earned,
-         lifetime_spent = user_currency_balances.lifetime_spent + EXCLUDED.lifetime_spent,
-         updated_at = NOW()`
-    );
-
-    await client.query(
-      `INSERT INTO system_migrations (migration_key) VALUES ($1)`,
-      [MIGRATION_KEY]
-    );
-
-    await client.query('COMMIT');
-    console.log('[Currency Migration] Consolidated per-guild balances into global user_currency_balances.');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('[Currency Migration] Failed, will retry on next restart:', error?.message || error);
-  } finally {
-    client.release();
-  }
-}
 
 // One-time carry-forward of the existing single-channel Shop/Sportsbook/Bank/Member
 // Profile postings into multi_channel_panels, so upgrading those 4 (+ new Marketplace)
@@ -4779,7 +4692,7 @@ const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
             s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable, s.suspensions_channel_id, s.setup_ticket_channel_id, s.setup_support_channel_id,
-            s.league_power_rankings_channel_id, s.league_news_channel_id`;
+            s.league_power_rankings_channel_id, s.league_news_channel_id, s.league_chat_channel_id, s.team_roster_channel_id`;
 
 async function getLeagueByName(guildId, leagueName) {
   const result = await pool.query(
@@ -4849,10 +4762,6 @@ async function getLeagueTeamRoles(leagueId) {
   return result.rows;
 }
 
-function isLegacyTeamRole(roleName) {
-  return TEAM_ROLE_NAMES.includes(roleName);
-}
-
 async function memberHasStaff(member, league) {
   if (!member) return false;
   const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
@@ -4868,7 +4777,6 @@ async function memberHasCommittee(member, league) {
   const possibleRoleIds = [
     league?.trade_committee_role_id,
     league?.committee_role_id,
-    COMMITTEE_ROLE_ID,
   ].filter(Boolean).map(String);
   const hasCommitteeRole = possibleRoleIds.some(roleId => member.roles.cache.has(roleId));
   return Boolean(isAdmin || canManageServer || hasCommitteeRole);
@@ -4959,6 +4867,58 @@ async function getTeamRosterEntries(leagueId, teamRoleId) {
   return result.rows;
 }
 
+// 7K-ROSTERPANEL: button/panel access for 7K-ROSTER, which previously only
+// had /teamroster add/remove/list — per Hxxdie, a real feature like this
+// can't be command-only. Self-service pattern (resolve the clicking user's
+// own team, same shape as the Madden GM Panel starter) since a shared board
+// can't give every team its own Add/Remove buttons within Discord's 5-row
+// component limit. Add/Remove is restricted to the actual Discord-role
+// holder (true owner), not a GM roster entry — matches the 7K-ROSTER comment
+// ("lets a team owner add other members"), a GM shouldn't be able to add or
+// remove other GMs.
+async function findOwnedTeamRoleForRosterManagement(member, league) {
+  const teamRoles = await getLeagueTeamRoles(league.league_id).catch(() => []);
+  return teamRoles.find(team => member.roles.cache.has(team.role_id)) || null;
+}
+
+function buildTeamRosterPanelStarterEmbed(league) {
+  return new EmbedBuilder()
+    .setTitle(`👥 ${league.league_name} • Team Roster`)
+    .setColor(0x5865F2)
+    .setDescription('Team owners: click below to add or remove players, coaches, or GMs on your roster. A GM can report scores and manage trades for the team, same as the owner.')
+    .setFooter({ text: 'GG Sports • Team Roster' })
+    .setTimestamp();
+}
+
+function buildTeamRosterPanelStarterComponents(leagueId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('teamrosterpanel_open:' + leagueId).setLabel('Manage My Team Roster').setEmoji('👥').setStyle(ButtonStyle.Primary)
+  )];
+}
+
+async function buildTeamRosterPanelEmbed(league, teamRoleName, entries) {
+  const NL = String.fromCharCode(10);
+  const lines = entries.length
+    ? entries.map(e => {
+        const label = e.position === 'gm' ? '🧢 GM' : e.position === 'coach' ? '📋 Coach' : '🎮 Player';
+        return `${label}: <@${e.user_id}>`;
+      })
+    : ['No roster members added yet.'];
+  return new EmbedBuilder()
+    .setTitle(`👥 ${teamRoleName} Roster`)
+    .setColor(0x5865F2)
+    .setDescription(lines.join(NL))
+    .setFooter({ text: 'GG Sports • ' + league.league_name })
+    .setTimestamp();
+}
+
+function buildTeamRosterPanelComponents(leagueId, teamRoleId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`teamrosterpanel_add:${leagueId}:${teamRoleId}`).setLabel('Add Member').setEmoji('➕').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`teamrosterpanel_remove:${leagueId}:${teamRoleId}`).setLabel('Remove Member').setEmoji('➖').setStyle(ButtonStyle.Danger),
+  )];
+}
+
 async function getUserGmTeamForLeague(leagueId, userId) {
   const result = await pool.query(
     `SELECT * FROM league_team_roster WHERE league_id = $1 AND user_id = $2 AND position = 'gm' LIMIT 1`,
@@ -4995,8 +4955,7 @@ async function getMemberTeamForLeague(member, league) {
       }
     }
   }
-  const legacyRole = member.roles.cache.find(role => isLegacyTeamRole(role.name));
-  return legacyRole ? { roleId: legacyRole.id, name: legacyRole.name } : null;
+  return null;
 }
 
 function parseCustomAwards(awardsText) {
@@ -5225,7 +5184,7 @@ async function buildTeamOwnersEmbed(guild, league = null) {
 }
 
 async function buildTradeCountEmbed(league = null) {
-  let rows;
+  let rows = [];
   if (league?.league_id) {
     const result = await pool.query(
       `SELECT t.role_name AS team_name, COALESCE(c.trade_count, 0) AS trade_count
@@ -5235,9 +5194,6 @@ async function buildTradeCountEmbed(league = null) {
        ORDER BY t.role_name ASC`,
       [league.league_id]
     );
-    rows = result.rows;
-  } else {
-    const result = await pool.query('SELECT team_name, trade_count FROM trade_counts ORDER BY team_name ASC');
     rows = result.rows;
   }
 
@@ -8211,7 +8167,7 @@ async function finalizeApprovedTrade(guild, offerId) {
   await pool.query(`UPDATE trade_offers SET status = 'committee_approved' WHERE id = $1`, [offerId]);
   await saveTradeHistory(guild, league, offer);
 
-  const approvedChannelId = league?.approved_channel_id || TRADE_APPROVED_CHANNEL_ID;
+  const approvedChannelId = league?.approved_channel_id;
   const approvedChannel = await guild.channels.fetch(approvedChannelId).catch(() => null);
   if (approvedChannel && approvedChannel.isTextBased()) {
     await approvedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Approved', 0x57F287, { ...offer, status: 'committee_approved' })] });
@@ -8232,9 +8188,6 @@ async function finalizeApprovedTrade(guild, offerId) {
        DO UPDATE SET trade_count = league_trade_counts.trade_count + 1`,
       [league.league_id, offer.target_team_role_id, offer.target_team]
     );
-  } else {
-    await pool.query('UPDATE trade_counts SET trade_count = trade_count + 1 WHERE team_name = $1', [offer.sender_team]);
-    await pool.query('UPDATE trade_counts SET trade_count = trade_count + 1 WHERE team_name = $1', [offer.target_team]);
   }
 
   await recordMaddenNewsEvent(guild, league, {
@@ -8266,7 +8219,7 @@ async function finalizeDeniedTrade(guild, offerId) {
 
   await pool.query(`UPDATE trade_offers SET status = 'committee_denied' WHERE id = $1`, [offerId]);
 
-  const deniedChannelId = league?.denied_channel_id || TRADE_DENIED_CHANNEL_ID;
+  const deniedChannelId = league?.denied_channel_id;
   const deniedChannel = await guild.channels.fetch(deniedChannelId).catch(() => null);
   if (deniedChannel && deniedChannel.isTextBased()) {
     await deniedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Denied', 0xED4245, { ...offer, status: 'committee_denied' })] });
@@ -8459,7 +8412,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (!pendingData) return;
 
     const league = pendingData.leagueId ? await getLeagueById(pendingData.leagueId) : await resolveLeague(message);
-    const offerChannelId = league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID;
+    const offerChannelId = league?.offer_a_trade_channel_id;
     if (message.channel.id !== offerChannelId) return;
 
     const attachment = message.attachments.first();
@@ -8518,7 +8471,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (skipOwnerStep) {
-      const committeeChannel = await message.guild.channels.fetch(league?.committee_channel_id || COMMITTEE_CHANNEL_ID).catch(() => null);
+      const committeeChannel = await message.guild.channels.fetch(league?.committee_channel_id).catch(() => null);
       if (!committeeChannel?.isTextBased?.()) {
         pendingOfferTargets.delete(message.author.id);
         await message.reply('That team has no owner, and CPU trades are allowed here, but no committee channel is configured to route this to. Ask a commissioner to set one.');
@@ -8526,10 +8479,10 @@ client.on(Events.MessageCreate, async (message) => {
       }
       const offerForEmbed = { id: offerId, sender_team: senderTeam.name, target_team: pendingData.targetTeamName, offer_details: '', screenshot_url: attachment.url, status: 'owner_accepted' };
       const committeeMessage = await committeeChannel.send({
-        content: `<@&${league?.committee_role_id || COMMITTEE_ROLE_ID}>`,
+        content: `<@&${league?.committee_role_id}>`,
         embeds: [buildCommitteeEmbed(offerForEmbed, 0, 0)],
         components: [buildCommitteeVoteButtons(offerId)],
-        allowedMentions: { roles: [league?.committee_role_id || COMMITTEE_ROLE_ID], users: [] },
+        allowedMentions: { roles: [league?.committee_role_id], users: [] },
       });
       await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
       pendingOfferTargets.delete(message.author.id);
@@ -9423,25 +9376,6 @@ client.on(Events.GuildCreate, async (guild) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-
-    // 7J-17TOPTRACE: unconditional, fires for every single interaction the bot
-    // receives, before any routing/matching logic runs. Added specifically to
-    // settle whether Discord is even delivering sportsbook board interactions
-    // to the bot at all — every 7J-16TRACE line inside the specific handler
-    // came back empty across multiple attempts, including a freshly-refreshed
-    // board and buttons this code never touched, which needs this broader
-    // check before assuming anything further about that handler's own logic.
-    try {
-      console.log('[INTERACTION TOP TRACE 7J-17TOPTRACE] type=' + interaction.type
-        + ' isButton=' + interaction.isButton?.()
-        + ' isStringSelectMenu=' + interaction.isStringSelectMenu?.()
-        + ' isChatInputCommand=' + interaction.isChatInputCommand?.()
-        + ' customId=' + (interaction.customId ?? 'n/a')
-        + ' commandName=' + (interaction.commandName ?? 'n/a')
-        + ' guildId=' + (interaction.guildId ?? 'n/a'));
-    } catch (traceErr) {
-      console.error('[INTERACTION TOP TRACE 7J-17TOPTRACE] Failed to log:', traceErr?.message || traceErr);
-    }
 
     if (interaction.isAutocomplete()) {
       try {
@@ -12232,7 +12166,7 @@ if (interaction.commandName === 'avatar') {
         const ovr = interaction.fields.getTextInputValue('tradeblock_ovr');
         const salary = interaction.fields.getTextInputValue('tradeblock_salary');
 
-        const channelId = league?.trade_block_channel_id || TRADE_BLOCK_CHANNEL_ID;
+        const channelId = league?.trade_block_channel_id;
         const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
         if (!channel || !channel.isTextBased()) {
           await interaction.reply({ content: 'Trade block channel not found.', ephemeral: true });
@@ -12261,9 +12195,9 @@ if (interaction.commandName === 'avatar') {
           .setTimestamp();
 
         await channel.send({
-          content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}>`,
+          content: `<@&${league?.league_role_id}>`,
           embeds: [embed],
-          allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] },
+          allowedMentions: { roles: [league?.league_role_id], users: [] },
         });
         await interaction.reply({ content: 'Your trade block listing has been posted.', ephemeral: true });
         return;
@@ -12764,14 +12698,15 @@ if (interaction.commandName === 'avatar') {
         const isStaff = staffMember ? await memberHasStaff(staffMember, activeLeague) : false;
 
         if (!isStaff) {
-          await interaction.reply({ content: 'Only staff/admins can use quick ticket actions.', ephemeral: true });
+          await interaction.editReply({ content: 'Only staff/admins can use quick ticket actions.' });
           return;
         }
 
         if (action === 'ticket_quick_claim') {
           await pool.query(`UPDATE support_tickets SET assigned_staff_user_id = $1 WHERE id = $2`, [interaction.user.id, ticket.id]);
           await updateTicketPanel(interaction.guild);
-          await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** claimed by <@' + interaction.user.id + '>.', ephemeral: true });
+          await refreshTicketInfoButtonsOnMessage(interaction).catch(() => null);
+          await interaction.editReply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** claimed by <@' + interaction.user.id + '>.' });
           return;
         }
 
@@ -12782,7 +12717,8 @@ if (interaction.commandName === 'avatar') {
           await addRecognitionPoints(interaction.guild.id, interaction.user.id, 1, 0);
         }
         await updateTicketPanel(interaction.guild);
-        await interaction.reply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** marked **' + newStatus + '**.', ephemeral: true });
+        await refreshTicketInfoButtonsOnMessage(interaction).catch(() => null);
+        await interaction.editReply({ content: 'Ticket **' + shortTicketId(ticket.id) + '** marked **' + newStatus + '**.' });
         return;
       }
 
@@ -12876,17 +12812,17 @@ if (interaction.commandName === 'avatar') {
         );
         await pool.query(`UPDATE league_trade_negotiations SET status = 'submitted', offer_id = $1, updated_at = NOW() WHERE id = $2`, [offerId, negotiationId]);
 
-        const committeeChannel = await interaction.guild.channels.fetch(league?.committee_channel_id || COMMITTEE_CHANNEL_ID).catch(() => null);
+        const committeeChannel = await interaction.guild.channels.fetch(league?.committee_channel_id).catch(() => null);
         if (!committeeChannel?.isTextBased?.()) {
           await interaction.update({ content: 'Both owners confirmed, but no committee channel is configured to send this to. Ask a commissioner to set one.', components: [] });
           return;
         }
         const offerForEmbed = { id: offerId, sender_team: refreshed.sender_team_name, target_team: refreshed.target_team_name, offer_details: '', screenshot_url: refreshed.pending_screenshot_url, status: 'owner_accepted' };
         const committeeMessage = await committeeChannel.send({
-          content: `<@&${league?.committee_role_id || COMMITTEE_ROLE_ID}>`,
+          content: `<@&${league?.committee_role_id}>`,
           embeds: [buildCommitteeEmbed(offerForEmbed, 0, 0)],
           components: [buildCommitteeVoteButtons(offerId)],
-          allowedMentions: { roles: [league?.committee_role_id || COMMITTEE_ROLE_ID], users: [] },
+          allowedMentions: { roles: [league?.committee_role_id], users: [] },
         });
         await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
         await interaction.update({ content: `Both owners confirmed — sent to the trade committee: ${committeeChannel.toString()}. This thread will archive shortly.`, components: [] });
@@ -13051,19 +12987,19 @@ if (interaction.commandName === 'avatar') {
           await interaction.reply({ content: 'Only the targeted team owner can accept this offer.', ephemeral: true });
           return;
         }
-        const guild = await client.guilds.fetch(offer.guild_id || DEV_GUILD_ID);
+        const guild = await client.guilds.fetch(offer.guild_id);
         const league = offer.league_id ? await getLeagueById(offer.league_id) : await getDefaultLeague(guild.id);
         await pool.query(`UPDATE trade_offers SET status = 'owner_accepted', owner_decision_by = $1 WHERE id = $2`, [interaction.user.id, offerId]);
-        const committeeChannel = await client.channels.fetch(league?.committee_channel_id || COMMITTEE_CHANNEL_ID);
+        const committeeChannel = await client.channels.fetch(league?.committee_channel_id);
         if (!committeeChannel || !committeeChannel.isTextBased()) {
           await interaction.reply({ content: 'Committee channel not found.', ephemeral: true });
           return;
         }
         const committeeMessage = await committeeChannel.send({
-          content: `<@&${league?.committee_role_id || COMMITTEE_ROLE_ID}>`,
+          content: `<@&${league?.committee_role_id}>`,
           embeds: [buildCommitteeEmbed({ ...offer, status: 'owner_accepted' }, 0, 0)],
           components: [buildCommitteeVoteButtons(offerId)],
-          allowedMentions: { roles: [league?.committee_role_id || COMMITTEE_ROLE_ID], users: [] },
+          allowedMentions: { roles: [league?.committee_role_id], users: [] },
         });
         await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
         await interaction.update({ content: 'Trade offer accepted and sent to committee.', components: [buildOfferDecisionButtons(offerId, true)] });
@@ -13170,7 +13106,6 @@ if (interaction.commandName === 'avatar') {
     // position in the file.
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sportsbook_pick_game')) {
       if (!interaction.guild) return;
-      console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] Handler entered, customId: ' + interaction.customId);
       try {
         // 7J-15DEFER: was running the DB lookup before acknowledging the
         // interaction at all — any latency in that single query (DB pool
@@ -13181,14 +13116,11 @@ if (interaction.commandName === 'avatar') {
         // defers first before doing any DB work — this one just didn't follow
         // that pattern. Deferred replies get up to 15 minutes, not 3 seconds.
         await interaction.deferReply({ ephemeral: true });
-        console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] deferReply succeeded.');
         const gameId = interaction.values[0];
         const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
-        console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] findSportsbookGame resolved: ' + (sportsbookGame ? sportsbookGame.id + ' status=' + sportsbookGame.status : 'null'));
 
         if (!sportsbookGame || sportsbookGame.status !== 'open') {
           await interaction.editReply({ content: 'That sportsbook game is no longer open.' });
-          console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] editReply (not open) succeeded.');
           return;
         }
 
@@ -13196,7 +13128,6 @@ if (interaction.commandName === 'avatar') {
           content: 'Choose your side for **' + sportsbookGame.game_label + '**.',
           components: [buildSportsbookSideButtons(sportsbookGame)],
         });
-        console.log('[SPORTSBOOK PICK GAME 7J-16TRACE] editReply (side buttons) succeeded.');
         // 7J-21RESET: the reply above is a brand-new ephemeral message, not an
         // update to the board's own message — so Discord's client keeps
         // showing the just-picked option as "selected" (checkmark) on the
@@ -13206,7 +13137,7 @@ if (interaction.commandName === 'avatar') {
         // stays usable for repeat bets on the same game.
         await updateSportsbookPanel(interaction.guild).catch(() => null);
       } catch (err) {
-        console.error('[SPORTSBOOK PICK GAME 7J-16TRACE] Threw: ' + (err?.stack || err?.message || err));
+        console.error('[SPORTSBOOK PICK GAME] Failed:', err?.stack || err?.message || err);
       }
       return;
     }
@@ -13352,7 +13283,7 @@ if (interaction.commandName === 'avatar') {
           // No real owner to negotiate with — keep the original shortcut:
           // upload a screenshot directly, straight to committee.
           pendingOfferTargets.set(interaction.user.id, { targetTeamName, targetTeamRoleId, leagueId: league?.league_id || null, leagueName: league?.league_name || null, createdAt: Date.now() });
-          await interaction.editReply({ content: `**${targetTeamName}** has no owner, and this league allows CPU trades. Upload your trade proposal screenshot as your next message in <#${league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID}> and it'll go straight to committee.` });
+          await interaction.editReply({ content: `**${targetTeamName}** has no owner, and this league allows CPU trades. Upload your trade proposal screenshot as your next message in <#${league?.offer_a_trade_channel_id}> and it'll go straight to committee.` });
           return;
         }
 
@@ -14545,6 +14476,12 @@ if (interaction.commandName === 'avatar') {
       const next = !customSettings.use_team_roster;
       await pool.query(`UPDATE league_custom_settings SET use_team_roster = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, next]);
       await showLeagueCustomizationSection(interaction, leagueId, 'trades', { update: true });
+      // 7K-ROSTERPANEL: point the commissioner at the panel that gives team
+      // owners real button access, rather than leaving them to discover
+      // /teamroster on their own.
+      if (next) {
+        await interaction.followUp({ content: "Team Rosters is now on. Set a **Team Roster Channel** from the Setup Dashboard, then use **Post/Refresh Team Roster Panel** so team owners can manage their roster with buttons instead of `/teamroster`.", ephemeral: true }).catch(() => null);
+      }
       return;
     }
 
@@ -14959,6 +14896,48 @@ if (interaction.commandName === 'avatar') {
         allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
       });
       await interaction.reply({ content: `📺 Posted to <#${streamChannel.id}> — you're streaming this matchup!`, ephemeral: true });
+      return;
+    }
+
+    // 7J-154COINTOSS: pregame coin toss button on the Game Center thread —
+    // same flip logic/embed style as /coinflip, but posted publicly to the
+    // thread since it's meant to settle who kicks/serves/picks first in
+    // front of both teams, not a private per-user roll.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_cointoss:')) {
+      const result = Math.random() < 0.5 ? 'heads' : 'tails';
+      const embed = new EmbedBuilder()
+        .setTitle('🪙 Coin Toss')
+        .setColor(0x5865F2)
+        .setDescription(`**${interaction.user.username}** flipped the coin.`)
+        .addFields({ name: 'Result', value: result === 'heads' ? 'Heads' : 'Tails', inline: true })
+        .setFooter({ text: 'GG Sports • Coin Toss' })
+        .setTimestamp();
+      await interaction.reply({ embeds: [embed] });
+      return;
+    }
+
+    // 7J-154WHOGOTNEXT: posts to the league's League Chat Channel (not the
+    // game thread itself) so a call-out doesn't bury the actual game center
+    // content — same shape as the Stream Hub button's "no config yet"
+    // fallback pattern.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_whogotnext:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+
+      const chatChannelId = league?.league_chat_channel_id;
+      const chatChannel = chatChannelId ? await interaction.guild.channels.fetch(chatChannelId).catch(() => null) : null;
+      if (!chatChannel) {
+        await interaction.reply({ content: 'No League Chat Channel is configured yet — ask a commissioner to set one from the Setup Dashboard (League Chat Channel).', ephemeral: true });
+        return;
+      }
+
+      await chatChannel.send({
+        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `**${interaction.user.username}** is available to play right now — ${game.away_team_name} @ ${game.home_team_name}.`,
+        allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
+      });
+      await interaction.reply({ content: `🙋 Posted to <#${chatChannel.id}>.`, ephemeral: true });
       return;
     }
 
@@ -19190,6 +19169,136 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7K-ROSTERPANEL: Team Roster Panel — button/select-menu access for
+    // 7K-ROSTER (add/remove player/coach/GM), self-service pattern matching
+    // the Madden GM Panel starter. Every handler re-checks that the clicking
+    // user actually holds the specific team role for teamRoleId in the
+    // customId — defense in depth against a stale/shared customId, since
+    // only the true Discord-role holder may manage that team's roster.
+    if (interaction.isButton() && interaction.customId.startsWith('teamrosterpanel_open:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'Could not find that league.', ephemeral: true }); return; }
+      if (!(await isTeamRosterEnabled(league))) {
+        await interaction.reply({ content: 'Team rosters aren\'t enabled for this league. A commissioner can turn this on in `/commissioner panel` → League Settings → League Customization.', ephemeral: true });
+        return;
+      }
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const ownedTeam = member ? await findOwnedTeamRoleForRosterManagement(member, league) : null;
+      if (!ownedTeam) {
+        await interaction.reply({ content: "You don't hold a team owner role in this league, so there's no roster for you to manage.", ephemeral: true });
+        return;
+      }
+      const entries = await getTeamRosterEntries(league.league_id, ownedTeam.role_id);
+      const embed = await buildTeamRosterPanelEmbed(league, ownedTeam.role_name, entries);
+      await interaction.reply({ embeds: [embed], components: buildTeamRosterPanelComponents(leagueId, ownedTeam.role_id), ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('teamrosterpanel_add:')) {
+      const [, leagueId, teamRoleId] = interaction.customId.split(':');
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member?.roles.cache.has(teamRoleId)) {
+        await interaction.reply({ content: 'Only that team\'s owner can manage its roster.', ephemeral: true });
+        return;
+      }
+      const userMenu = new UserSelectMenuBuilder().setCustomId(`teamrosterpanel_adduser:${leagueId}:${teamRoleId}`).setPlaceholder('Choose a member to add');
+      await interaction.reply({ content: '**Add to Roster** — choose a member', components: [new ActionRowBuilder().addComponents(userMenu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('teamrosterpanel_adduser:')) {
+      const [, leagueId, teamRoleId] = interaction.customId.split(':');
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member?.roles.cache.has(teamRoleId)) {
+        await interaction.update({ content: 'Only that team\'s owner can manage its roster.', components: [] });
+        return;
+      }
+      const targetUserId = interaction.values[0];
+      const targetMember = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+      if (targetMember?.user?.bot) {
+        await interaction.update({ content: 'Choose a non-bot user to add.', components: [] });
+        return;
+      }
+      const positionMenu = new StringSelectMenuBuilder()
+        .setCustomId(`teamrosterpanel_addposition:${leagueId}:${teamRoleId}:${targetUserId}`)
+        .setPlaceholder('Choose a role on the roster')
+        .addOptions(
+          { label: 'Player', value: 'player', emoji: '🎮', description: 'Organizational only, no permission change' },
+          { label: 'Coach', value: 'coach', emoji: '📋', description: 'Organizational only, no permission change' },
+          { label: 'GM', value: 'gm', emoji: '🧢', description: 'Can report scores and manage trades, same as the owner' },
+        );
+      await interaction.update({ content: `Adding <@${targetUserId}> — choose their role on the roster.`, components: [new ActionRowBuilder().addComponents(positionMenu)] });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('teamrosterpanel_addposition:')) {
+      const [, leagueId, teamRoleId, targetUserId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!league || !member?.roles.cache.has(teamRoleId)) {
+        await interaction.update({ content: 'Only that team\'s owner can manage its roster.', components: [] });
+        return;
+      }
+      const position = interaction.values[0];
+      await pool.query(
+        `INSERT INTO league_team_roster (id, guild_id, league_id, team_role_id, user_id, position, added_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (league_id, team_role_id, user_id) DO UPDATE SET position = $6, added_by_user_id = $7, added_at = NOW()`,
+        [randomUUID(), interaction.guild.id, league.league_id, teamRoleId, targetUserId, position, interaction.user.id]
+      );
+      const teamRoles = await getLeagueTeamRoles(league.league_id).catch(() => []);
+      const team = teamRoles.find(t => t.role_id === teamRoleId);
+      const entries = await getTeamRosterEntries(league.league_id, teamRoleId);
+      const embed = await buildTeamRosterPanelEmbed(league, team?.role_name || 'Team', entries);
+      await interaction.update({ content: null, embeds: [embed], components: buildTeamRosterPanelComponents(leagueId, teamRoleId) });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('teamrosterpanel_remove:')) {
+      const [, leagueId, teamRoleId] = interaction.customId.split(':');
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member?.roles.cache.has(teamRoleId)) {
+        await interaction.reply({ content: 'Only that team\'s owner can manage its roster.', ephemeral: true });
+        return;
+      }
+      const league = await getLeagueById(leagueId);
+      const entries = await getTeamRosterEntries(league.league_id, teamRoleId);
+      if (!entries.length) {
+        await interaction.reply({ content: 'No roster members to remove yet.', ephemeral: true });
+        return;
+      }
+      const options = await Promise.all(entries.slice(0, 25).map(async e => {
+        const m = await interaction.guild.members.fetch(e.user_id).catch(() => null);
+        const label = (m?.user?.username || e.user_id) + ' — ' + (e.position === 'gm' ? 'GM' : e.position.charAt(0).toUpperCase() + e.position.slice(1));
+        return { label: label.slice(0, 100), value: e.user_id };
+      }));
+      const removeMenu = new StringSelectMenuBuilder()
+        .setCustomId(`teamrosterpanel_removeuser:${leagueId}:${teamRoleId}`)
+        .setPlaceholder('Choose a member to remove')
+        .addOptions(options);
+      await interaction.reply({ content: '**Remove from Roster** — choose a member', components: [new ActionRowBuilder().addComponents(removeMenu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('teamrosterpanel_removeuser:')) {
+      const [, leagueId, teamRoleId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!league || !member?.roles.cache.has(teamRoleId)) {
+        await interaction.update({ content: 'Only that team\'s owner can manage its roster.', components: [] });
+        return;
+      }
+      const targetUserId = interaction.values[0];
+      await pool.query(`DELETE FROM league_team_roster WHERE league_id = $1 AND team_role_id = $2 AND user_id = $3`, [league.league_id, teamRoleId, targetUserId]);
+      const teamRoles = await getLeagueTeamRoles(league.league_id).catch(() => []);
+      const team = teamRoles.find(t => t.role_id === teamRoleId);
+      const entries = await getTeamRosterEntries(league.league_id, teamRoleId);
+      const embed = await buildTeamRosterPanelEmbed(league, team?.role_name || 'Team', entries);
+      await interaction.update({ content: null, embeds: [embed], components: buildTeamRosterPanelComponents(leagueId, teamRoleId) });
+      return;
+    }
+
     if (interaction.commandName === 'draftrecap') {
       if (!interaction.guild) return;
       const recapLeagueName = interaction.options.getString('league');
@@ -21724,14 +21833,6 @@ if (interaction.commandName === 'trade') {
              ON CONFLICT (league_id, role_id)
              DO UPDATE SET trade_count = GREATEST(0, league_trade_counts.trade_count + $4)`,
             [activeLeague.league_id, team.id, team.name, delta]
-          );
-        } else {
-          await pool.query(
-            `INSERT INTO trade_counts (team_name, trade_count)
-             VALUES ($1, GREATEST(0, $2))
-             ON CONFLICT (team_name)
-             DO UPDATE SET trade_count = GREATEST(0, trade_counts.trade_count + $2)`,
-            [team.name, delta]
           );
         }
 
@@ -26733,9 +26834,9 @@ if (shopSubcommand === 'view') {
         return;
       }
       const extraMessage = interaction.options.getString('message');
-      let text = `<@&${activeLeague?.league_role_id || LEAGUE_ROLE_ID}> <@${interaction.user.id}> is available to play right now.`;
+      let text = `<@&${activeLeague?.league_role_id}> <@${interaction.user.id}> is available to play right now.`;
       if (extraMessage) text += ` ${extraMessage}`;
-      await interaction.reply({ content: text, allowedMentions: { roles: [activeLeague?.league_role_id || LEAGUE_ROLE_ID], users: [interaction.user.id] } });
+      await interaction.reply({ content: text, allowedMentions: { roles: [activeLeague?.league_role_id], users: [interaction.user.id] } });
       return;
     }
 
@@ -26756,8 +26857,8 @@ if (shopSubcommand === 'view') {
         await interaction.editReply({ content: 'You need to set your stream first using /linkstream', ephemeral: true });
         return;
       }
-      const channel = await client.channels.fetch(league?.live_channel_id || LIVE_CHANNEL_ID);
-      await channel.send({ content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!**\n${fallback.rows[0].stream_url}`, allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] } });
+      const channel = await client.channels.fetch(league?.live_channel_id);
+      await channel.send({ content: `<@&${league?.league_role_id}> **${interaction.user.username} is LIVE!**\n${fallback.rows[0].stream_url}`, allowedMentions: { roles: [league?.league_role_id], users: [] } });
       await interaction.editReply({ content: 'Your stream has been posted.' });
       return;
     }
@@ -26774,7 +26875,7 @@ if (shopSubcommand === 'view') {
       if (interaction.commandName === 'assignrole') await targetMember.roles.add(role);
       else await targetMember.roles.remove(role);
       const configuredTeamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
-      const isMaddenTeamRole = configuredTeamRoles.some(team => team.role_id === role.id) || isLegacyTeamRole(role.name);
+      const isMaddenTeamRole = configuredTeamRoles.some(team => team.role_id === role.id);
       if (isMaddenTeamRole) await updateTeamOwnersPanel(interaction.guild, league);
 
       // Sync Madden team ownership tables when a team role is assigned/unassigned
@@ -26818,7 +26919,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'setupteamowners') {
-      const channel = await interaction.guild.channels.fetch(league?.team_owners_channel_id || TEAM_OWNERS_CHANNEL_ID);
+      const channel = await interaction.guild.channels.fetch(league?.team_owners_channel_id);
       const message = await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
       await savePanel(league, 'team_owners', channel.id, message.id);
       await interaction.reply({ content: 'Team Owners panel has been created.', ephemeral: true });
@@ -26826,7 +26927,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'setuptradecount') {
-      const channel = await interaction.guild.channels.fetch(league?.trade_count_channel_id || TRADE_COUNT_CHANNEL_ID);
+      const channel = await interaction.guild.channels.fetch(league?.trade_count_channel_id);
       const message = await channel.send({ embeds: [await buildTradeCountEmbed(league)] });
       await savePanel(league, 'trade_count', channel.id, message.id);
       await interaction.reply({ content: 'Trade Count panel has been created.', ephemeral: true });
@@ -26834,7 +26935,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'setupoffertrade') {
-      const channel = await interaction.guild.channels.fetch(league?.offer_a_trade_channel_id || OFFER_A_TRADE_CHANNEL_ID);
+      const channel = await interaction.guild.channels.fetch(league?.offer_a_trade_channel_id);
       const message = await channel.send({ embeds: [buildOfferTradePanelEmbed(league?.league_name || 'League')], components: [buildOfferTradePanelButton(league?.league_id || 'legacy')] });
       await savePanel(league, 'offer_trade', channel.id, message.id);
       await interaction.reply({ content: 'Offer a Trade panel has been created.', ephemeral: true });
@@ -26853,8 +26954,6 @@ if (shopSubcommand === 'view') {
            DO UPDATE SET trade_count = GREATEST(league_trade_counts.trade_count + $4, 0)`,
           [league.league_id, teamRole.id, teamRole.name, increment]
         );
-      } else {
-        await pool.query(`UPDATE trade_counts SET trade_count = GREATEST(trade_count + $1, 0) WHERE team_name = $2`, [increment, teamRole.name]);
       }
       await updateTradeCountPanel(interaction.guild, league);
       await interaction.editReply({ content: `${increment > 0 ? 'Added' : 'Removed'} 1 trade ${increment > 0 ? 'to' : 'from'} ${teamRole}.`, ephemeral: true });
@@ -26862,7 +26961,7 @@ if (shopSubcommand === 'view') {
     }
 
     if (interaction.commandName === 'tradeblock') {
-      const tradeBlockChannelId = league?.trade_block_channel_id || TRADE_BLOCK_CHANNEL_ID;
+      const tradeBlockChannelId = league?.trade_block_channel_id;
       if (interaction.channelId !== tradeBlockChannelId) {
         await interaction.reply({ content: 'This command can only be used in the trade block channel.', ephemeral: true });
         return;
@@ -27263,6 +27362,22 @@ function buildTicketInfoButtons(ticket) {
   }
 
   return row.components.length ? row : null;
+}
+
+// 7J-152TICKETQUICKACTIONS: after a claim/reviewing/resolved quick action,
+// re-render the button row on the original ticket-opened message itself
+// (not just the ephemeral reply) so e.g. "Claim Ticket" disappears once
+// claimed instead of sitting there clickable and stale. interaction.message
+// is the message the button lives on; Close Ticket's row is rebuilt fresh
+// alongside it since it's deterministic from ticketId, no extra query needed.
+async function refreshTicketInfoButtonsOnMessage(interaction) {
+  const [, ticketId] = interaction.customId.split(':');
+  const fresh = await pool.query(`SELECT * FROM support_tickets WHERE id = $1 LIMIT 1`, [ticketId]);
+  if (!fresh.rows.length || !interaction.message) return;
+  const ticket = fresh.rows[0];
+  const infoRow = buildTicketInfoButtons(ticket);
+  const components = infoRow ? [buildTicketCloseRow(ticketId), infoRow] : [buildTicketCloseRow(ticketId)];
+  await interaction.message.edit({ components }).catch(() => null);
 }
 
 async function buildTicketDashboardEmbed(guildId, filter = 'open') {
@@ -28290,7 +28405,6 @@ async function addRecognitionPoints(guildId, userId, points, legacyPoints = 0, l
 async function incrementRecognitionStat(guildId, userId, field, amount = 1) {
   const allowedFields = [
     'championships',
-    'tournament_titles',
     'sportsbook_wins',
     'sportsbook_profit',
     'tickets_resolved',
@@ -28341,9 +28455,6 @@ function getActivityTier(score) {
   return 'Rookie';
 }
 
-function getRecognitionTier(score) {
-  return getLegacyTier(score);
-}
 
 // 7J-43ACTIVITY: universal activity grade. topPercent = what percentage of
 // all GG Sports users this person's universal activity score beats or ties
@@ -28424,7 +28535,10 @@ function buildActivityEmbed(user, row, achievements = [], universalGrade = null)
       { name: 'Legacy Tier', value: getLegacyTier(legacyScore), inline: true },
       { name: 'Legacy Score', value: String(legacyScore), inline: true },
       { name: 'Championships', value: String(profile.championships || 0), inline: true },
-      { name: 'Tournament Titles', value: String(profile.tournament_titles || 0), inline: true },
+      // 7J-153TOURNEYFIELD: Tournament Titles field removed per Hxxdie — it read
+      // the dead, never-incremented user_recognition.tournament_titles column and
+      // always showed 0/stale. The real, live-computed count already shows on the
+      // Franchise Hub / League HOF Member Profile panel (see 7J-42TOURNEY).
       { name: 'Sportsbook Wins', value: String(profile.sportsbook_wins || 0), inline: true },
       { name: 'Sportsbook Profit', value: String(profile.sportsbook_profit || 0), inline: true },
       { name: 'Tickets Resolved', value: String(profile.tickets_resolved || 0), inline: true },
@@ -28436,9 +28550,6 @@ function buildActivityEmbed(user, row, achievements = [], universalGrade = null)
     .setTimestamp();
 }
 
-function buildRecognitionEmbed(user, row) {
-  return buildActivityEmbed(user, row);
-}
 
 
 function getPremiumTierDisplay(tier, status) {
@@ -28706,9 +28817,6 @@ function buildEditItemCoreModal(item) {
     );
 }
 
-function shortInventoryItemId(itemId) {
-  return String(itemId || '').split('-')[0];
-}
 
 
 
@@ -29634,6 +29742,9 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
   }
   row1.addComponents(
     new ButtonBuilder().setCustomId('gamecenter_stream:' + gameId).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+    // 7J-154COINTOSS: pregame coin toss, right on the thread instead of only
+    // via /coinflip — per Hxxdie.
+    new ButtonBuilder().setCustomId('gamecenter_cointoss:' + gameId).setLabel('Coin Toss').setEmoji('🪙').setStyle(ButtonStyle.Secondary),
   );
 
   return [
@@ -29642,6 +29753,10 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
       new ButtonBuilder().setCustomId('gamecenter_gamestarted:' + gameId).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
       new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
       new ButtonBuilder().setCustomId('gamecenter_issue:' + gameId).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger),
+      // 7J-154WHOGOTNEXT: posts to the league's configured League Chat
+      // Channel instead of this thread, per Hxxdie — keeps the call-out
+      // visible without burying the actual game center content.
+      new ButtonBuilder().setCustomId('gamecenter_whogotnext:' + gameId).setLabel("Who's Got Next").setEmoji('🙋').setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
@@ -30473,13 +30588,22 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
   // 7J-118TICKETBUTTONS: Close Ticket button now included right here, so
   // every ticket has a real close path regardless of type — not just the
   // game-issue ones that already had Approve/Deny.
+  // 7J-152TICKETQUICKACTIONS: buildTicketInfoButtons (Claim/Mark Reviewing/
+  // Mark Resolved) already had a fully working handler (ticket_quick_claim/
+  // reviewing/resolved) but was never actually posted anywhere. Added as a
+  // second row here — a freshly opened ticket is always status 'open' with
+  // no assigned staff yet, so a minimal ticket object is enough to build it
+  // correctly without an extra DB round-trip.
+  const freshTicketForButtons = { id: ticketId, status: 'open', assigned_staff_user_id: null };
+  const ticketInfoRow = buildTicketInfoButtons(freshTicketForButtons);
+  const ticketOpenComponents = ticketInfoRow ? [buildTicketCloseRow(ticketId), ticketInfoRow] : [buildTicketCloseRow(ticketId)];
   await thread.send({
     content: '<@' + interaction.user.id + '> your ticket is open here.' + (mentionText ? ' ' + mentionLabel + ': ' + mentionText : ''),
     allowedMentions: {
       users: [interaction.user.id],
       roles: mentionRoleIds,
     },
-    components: [buildTicketCloseRow(ticketId)],
+    components: ticketOpenComponents,
   }).catch(() => null);
 
   if (gameIssueMeta) {
@@ -30849,28 +30973,6 @@ function normalizeActivityTierName(tier) {
   return 'Inactive';
 }
 
-async function ensureUserAvatar(guildId, userId) {
-  await pool.query(
-    `INSERT INTO user_avatar (guild_id, user_id)
-     VALUES ($1, $2)
-     ON CONFLICT (guild_id, user_id) DO NOTHING`,
-    [guildId, userId]
-  );
-
-  const result = await pool.query(
-    `SELECT * FROM user_avatar WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
-    [guildId, userId]
-  );
-
-  return result.rows[0] || {
-    equipped_top: 'none',
-    equipped_bottom: 'none',
-    equipped_headwear: 'none',
-    equipped_accessory: 'Ghost Wristband',
-    equipped_footwear: 'Basic Sneakers',
-    equipped_pet: 'none',
-  };
-}
 
 async function awardUserBadge(guildId, userId, badgeKey, badgeLabel, badgeIcon, source = null) {
   await pool.query(
@@ -30923,27 +31025,7 @@ async function syncProfileBadges(guildId, userId, recognition = null) {
   if (streamUrl) await awardUserBadge(guildId, userId, 'streamer', 'Streamer', '📺', 'stream');
 }
 
-async function getUserBadges(guildId, userId, recognition = null) {
-  await syncProfileBadges(guildId, userId, recognition).catch(() => null);
-  const result = await pool.query(
-    `SELECT * FROM user_badges WHERE guild_id = $1 AND user_id = $2 ORDER BY unlocked_at ASC LIMIT 12`,
-    [guildId, userId]
-  );
-  return result.rows;
-}
 
-function formatAvatarLoadout(avatar) {
-  return [
-    'Top: ' + (avatar.equipped_top || 'none'),
-    'Bottom: ' + (avatar.equipped_bottom || 'none'),
-    'Headwear: ' + (avatar.equipped_headwear || 'none'),
-    'Accessory: ' + (avatar.equipped_accessory || 'Ghost Wristband'),
-    'Footwear: ' + (avatar.equipped_footwear || 'Basic Sneakers'),
-    'Pet: ' + (avatar.equipped_pet || 'none'),
-    'Effect: ' + (avatar.equipped_effect || 'none'),
-    'Background: ' + (avatar.equipped_background || 'Locker Room'),
-  ].join('\n');
-}
 
 
 
@@ -31117,136 +31199,8 @@ async function syncVisualAvatarUnlocks(guildId, userId, recognition = null) {
   await grantVisualAvatarItem(guildId, userId, 'Practice Court', 'background', 'starter');
 }
 
-async function getVisualAvatarInventory(guildId, userId) {
-  await syncVisualAvatarUnlocks(guildId, userId).catch(() => null);
-  const result = await pool.query(
-    `SELECT * FROM user_avatar_inventory
-     WHERE guild_id = $1 AND user_id = $2
-     ORDER BY slot ASC, item_name ASC`,
-    [guildId, userId]
-  );
-  return result.rows;
-}
 
-async function equipVisualAvatarItem(guildId, userId, slot, itemName) {
-  const cleanSlot = String(slot || '').toLowerCase();
-  if (!VISUAL_AVATAR_SLOTS.includes(cleanSlot)) {
-    return { ok: false, message: 'Invalid slot. Use: ' + VISUAL_AVATAR_SLOTS.join(', ') };
-  }
 
-  await syncVisualAvatarUnlocks(guildId, userId).catch(() => null);
-
-  const itemResult = await pool.query(
-    `SELECT * FROM user_avatar_inventory
-     WHERE guild_id = $1 AND user_id = $2 AND LOWER(item_name) = LOWER($3)
-     LIMIT 1`,
-    [guildId, userId, itemName]
-  );
-
-  if (!itemResult.rows.length) return { ok: false, message: 'You have not unlocked that cosmetic yet.' };
-
-  const item = itemResult.rows[0];
-  if (item.slot !== cleanSlot) return { ok: false, message: '**' + item.item_name + '** belongs in **' + item.slot + '**, not **' + cleanSlot + '**.' };
-
-  const columnMap = {
-    headwear: 'equipped_headwear',
-    top: 'equipped_top',
-    bottom: 'equipped_bottom',
-    accessory: 'equipped_accessory',
-    footwear: 'equipped_footwear',
-    pet: 'equipped_pet',
-    effect: 'equipped_effect',
-    background: 'equipped_background',
-  };
-
-  await pool.query(
-    `UPDATE user_avatar SET ${columnMap[cleanSlot]} = $1, updated_at = NOW()
-     WHERE guild_id = $2 AND user_id = $3`,
-    [item.item_name, guildId, userId]
-  );
-
-  return { ok: true, message: 'Equipped **' + item.item_name + '** to **' + cleanSlot + '**.' };
-}
-
-function buildVisualAvatarSvg(userLabel, avatar, preview = {}) {
-  const top = preview.top || avatar.equipped_top || 'none';
-  const bottom = preview.bottom || avatar.equipped_bottom || 'none';
-  const headwear = preview.headwear || avatar.equipped_headwear || 'none';
-  const accessory = preview.accessory || avatar.equipped_accessory || 'Ghost Wristband';
-  const footwear = preview.footwear || avatar.equipped_footwear || 'Basic Sneakers';
-  const pet = preview.pet || avatar.equipped_pet || 'none';
-  const effect = preview.effect || avatar.equipped_effect || 'none';
-  const background = preview.background || avatar.equipped_background || 'Locker Room';
-
-  const bgGrad = String(background).toLowerCase().includes('tunnel')
-    ? ['#111827', '#374151']
-    : String(background).toLowerCase().includes('court')
-      ? ['#78350f', '#f59e0b']
-      : ['#18181b', '#3f3f46'];
-
-  const topColor = avatarColorForItem(top, '#ffffff');
-  const bottomColor = avatarColorForItem(bottom, '#2f3542');
-  const shoeColor = avatarColorForItem(footwear, '#f8fafc');
-  const chainColor = avatarColorForItem(accessory, '#f5d742');
-
-  const hasCrown = String(headwear).toLowerCase().includes('crown');
-  const hasShades = String(headwear).toLowerCase().includes('shades') || String(headwear).toLowerCase().includes('betting');
-  const hasAura = String(effect).toLowerCase().includes('aura');
-  const hasPet = String(pet).toLowerCase() !== 'none';
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<svg width="900" height="1200" viewBox="0 0 900 1200" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="${bgGrad[0]}"/>
-      <stop offset="100%" stop-color="${bgGrad[1]}"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000000" flood-opacity="0.45"/>
-    </filter>
-    <radialGradient id="aura" cx="50%" cy="45%" r="55%">
-      <stop offset="0%" stop-color="#facc15" stop-opacity="0.45"/>
-      <stop offset="100%" stop-color="#facc15" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-  <rect width="900" height="1200" fill="url(#bg)"/>
-  <rect x="70" y="80" width="760" height="1040" rx="48" fill="#000000" opacity="0.22" stroke="#facc15" stroke-width="4"/>
-  <text x="450" y="150" text-anchor="middle" font-family="Arial Black, Impact, sans-serif" font-size="54" fill="#ffffff">${String(userLabel).replace(/[<>&]/g, '')}</text>
-  <text x="450" y="198" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" fill="#facc15">GG SPORTS AVATAR</text>
-  ${hasAura ? '<circle cx="450" cy="575" r="310" fill="url(#aura)"/>' : ''}
-  <g filter="url(#shadow)">
-    <ellipse cx="450" cy="1010" rx="220" ry="38" fill="#000000" opacity="0.38"/>
-    <path d="M360 410 C365 350 535 350 540 410 L520 625 L380 625 Z" fill="#d8a47f"/>
-    <circle cx="450" cy="330" r="88" fill="#d8a47f"/>
-    <path d="M370 300 C395 225 505 225 530 300 C495 270 405 270 370 300Z" fill="#111827"/>
-    ${hasCrown ? '<path d="M370 228 L405 170 L450 225 L500 170 L535 228 L520 260 L385 260 Z" fill="#ffd700" stroke="#ffffff" stroke-width="5"/>' : ''}
-    ${hasShades ? '<g><rect x="385" y="315" width="54" height="26" rx="10" fill="#020617"/><rect x="461" y="315" width="54" height="26" rx="10" fill="#020617"/><line x1="439" y1="328" x2="461" y2="328" stroke="#020617" stroke-width="8"/></g>' : '<g><circle cx="420" cy="330" r="7" fill="#111827"/><circle cx="480" cy="330" r="7" fill="#111827"/></g>'}
-    <path d="M418 368 C438 384 464 384 484 368" fill="none" stroke="#7c2d12" stroke-width="6" stroke-linecap="round"/>
-    <path d="M320 455 C360 410 540 410 580 455 L550 690 L350 690 Z" fill="${topColor}" stroke="#111827" stroke-width="8"/>
-    <text x="450" y="550" text-anchor="middle" font-family="Arial Black, sans-serif" font-size="42" fill="${topColor === '#111111' ? '#facc15' : '#111827'}">GG</text>
-    <path d="M333 472 L255 660" stroke="${topColor}" stroke-width="48" stroke-linecap="round"/>
-    <path d="M567 472 L645 660" stroke="${topColor}" stroke-width="48" stroke-linecap="round"/>
-    <circle cx="247" cy="675" r="28" fill="#d8a47f"/>
-    <circle cx="653" cy="675" r="28" fill="#d8a47f"/>
-    ${String(accessory).toLowerCase().includes('chain') ? '<path d="M395 448 C430 490 470 490 505 448" fill="none" stroke="' + chainColor + '" stroke-width="14" stroke-linecap="round"/>' : ''}
-    ${String(accessory).toLowerCase().includes('watch') ? '<rect x="625" y="640" width="48" height="30" rx="8" fill="#facc15" stroke="#111827" stroke-width="5"/>' : ''}
-    ${String(accessory).toLowerCase().includes('wristband') ? '<rect x="222" y="640" width="52" height="28" rx="8" fill="#facc15" stroke="#111827" stroke-width="4"/>' : ''}
-    <path d="M360 682 L442 682 L432 875 L345 875 Z" fill="${bottomColor}" stroke="#111827" stroke-width="8"/>
-    <path d="M458 682 L540 682 L555 875 L468 875 Z" fill="${bottomColor}" stroke="#111827" stroke-width="8"/>
-    <path d="M345 875 L432 875 L418 990 L360 990 Z" fill="#d8a47f"/>
-    <path d="M468 875 L555 875 L540 990 L482 990 Z" fill="#d8a47f"/>
-    <path d="M330 992 C365 960 420 962 445 1005 C405 1020 360 1020 330 992Z" fill="${shoeColor}" stroke="#111827" stroke-width="7"/>
-    <path d="M455 1005 C480 962 535 960 570 992 C540 1020 495 1020 455 1005Z" fill="${shoeColor}" stroke="#111827" stroke-width="7"/>
-    ${hasPet ? '<g><ellipse cx="675" cy="930" rx="70" ry="48" fill="#facc15" stroke="#111827" stroke-width="7"/><circle cx="640" cy="895" r="34" fill="#facc15" stroke="#111827" stroke-width="7"/><circle cx="630" cy="888" r="5" fill="#111827"/><circle cx="650" cy="888" r="5" fill="#111827"/><text x="675" y="1010" text-anchor="middle" font-family="Arial Black" font-size="22" fill="#ffffff">PET</text></g>' : ''}
-  </g>
-  <g font-family="Arial, sans-serif" font-size="22" fill="#e5e7eb">
-    <text x="110" y="1080">TOP: ${top}</text>
-    <text x="110" y="1110">BOTTOM: ${bottom}</text>
-    <text x="460" y="1080">ACCESSORY: ${accessory}</text>
-    <text x="460" y="1110">FOOTWEAR: ${footwear}</text>
-  </g>
-</svg>`;
-}
 
 
 function avatarHexToRgb(hex, fallback = [255, 255, 255]) {
@@ -33173,56 +33127,8 @@ function buildVisualAvatarPng(userLabel, avatar, preview = {}) {
 }
 
 
-function buildAvatarAttachment(user, avatar, preview = {}) {
-  const png = buildVisualAvatarPng(user.username, avatar, preview);
-  return new AttachmentBuilder(png, { name: 'avatar.png' });
-}
 
-function buildVisualAvatarEmbed(user, avatar, previewLabel = null) {
-  const embed = new EmbedBuilder()
-    .setTitle((previewLabel ? 'Preview • ' : '') + user.username + ' Avatar')
-    .setColor(0xFEE75C)
-    .setImage('attachment://avatar.png')
-    .addFields(
-      { name: 'Headwear', value: avatar.equipped_headwear || 'none', inline: true },
-      { name: 'Top', value: avatar.equipped_top || 'none', inline: true },
-      { name: 'Bottom', value: avatar.equipped_bottom || 'none', inline: true },
-      { name: 'Accessory', value: avatar.equipped_accessory || 'Ghost Wristband', inline: true },
-      { name: 'Footwear', value: avatar.equipped_footwear || 'Basic Sneakers', inline: true },
-      { name: 'Background', value: avatar.equipped_background || 'Locker Room', inline: true }
-    )
-    .setFooter({ text: 'GG Sports • Visual Avatar V1' })
-    .setTimestamp();
 
-  if (previewLabel) embed.setDescription('Previewing: **' + previewLabel + '**');
-  return embed;
-}
-
-function buildVisualWardrobeEmbed(user, items) {
-  const NL = String.fromCharCode(10);
-  const grouped = {};
-  for (const item of items) {
-    if (!grouped[item.slot]) grouped[item.slot] = [];
-    grouped[item.slot].push(item.item_name + (item.source ? ' — ' + item.source : ''));
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle(user.username + ' Wardrobe')
-    .setColor(0x5865F2)
-    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
-    .setFooter({ text: 'GG Sports • Wardrobe' })
-    .setTimestamp();
-
-  for (const slot of VISUAL_AVATAR_SLOTS) {
-    embed.addFields({
-      name: slot.charAt(0).toUpperCase() + slot.slice(1),
-      value: grouped[slot]?.length ? grouped[slot].join(NL).slice(0, 1024) : 'None unlocked',
-      inline: false,
-    });
-  }
-
-  return embed;
-}
 
 async function getShopPreviewItem(guildId, itemName) {
   const result = await pool.query(
@@ -34067,7 +33973,7 @@ async function buildMemberMilestonesEmbed(guild, targetUser) {
   await ensureRecognitionProfile(guild.id, targetUser.id);
 
   const profileResult = await pool.query(
-    `SELECT activity_points, legacy_score, championships, tournament_titles, sportsbook_wins, sportsbook_profit, tickets_resolved, games_played
+    `SELECT activity_points, legacy_score, championships, sportsbook_wins, sportsbook_profit, tickets_resolved, games_played
      FROM user_recognition
      WHERE guild_id = $1 AND user_id = $2
      LIMIT 1`,
@@ -34952,6 +34858,12 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     // equivalents of Madden's power rankings board / ESPN news channel.
     singleChannelSpecs.push(['league_hof_channel_id', 'league-hof'], ['league_power_rankings_channel_id', 'power-rankings'], ['league_news_channel_id', 'league-news']);
   }
+  // 7J-154WHOGOTNEXT: general chat channel for the Who's Got Next button —
+  // applies to every league regardless of sport, so it's an unconditional
+  // push after the sport-specific branches above rather than spliced in,
+  // which would've disturbed the splice(5, ...) index math for
+  // game-threads/game-center.
+  singleChannelSpecs.push(['league_chat_channel_id', 'league-chat']);
   for (let i = 0; i < singleChannelSpecs.length; i++) {
     const [column, channelName] = singleChannelSpecs[i];
     const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id, position: i }).catch(() => null);
@@ -35021,6 +34933,10 @@ const LEAGUE_OWNED_CHANNEL_COLUMNS = [
   'madden_franchise_hub_channel_id',
   // 7J-135GENERICNEWS
   'league_power_rankings_channel_id', 'league_news_channel_id',
+  // 7J-154WHOGOTNEXT
+  'league_chat_channel_id',
+  // 7K-ROSTERPANEL
+  'team_roster_channel_id',
 ];
 const LEAGUE_OWNED_ROLE_COLUMNS = ['league_role_id', 'staff_role_id', 'trade_committee_role_id', 'committee_role_id'];
 
@@ -35527,6 +35443,8 @@ const SETUP_DASHBOARD_OPTIONS = [
   // commissioner had no way to actually set it from the setup dashboard.
   { value: 'live_channel', label: 'Streaming Channel', description: 'Where stream announcements post (/livestream, game thread Stream Hub)', kind: 'channel' },
   { value: 'standings_channel', label: 'Standings Channel', description: 'Where standings panels live', kind: 'channel' },
+  // 7J-154WHOGOTNEXT
+  { value: 'league_chat_channel', label: 'League Chat Channel', description: 'Where the Game Center "Who\'s Got Next" button posts, instead of inside the matchup thread', kind: 'channel' },
   { value: 'league_hof_channel', label: 'League Hall of Fame Board', description: 'Persistent board: Franchise Legacy, Award History, Hall of Fame', kind: 'channel' },
   // 7J-135GENERICNEWS
   { value: 'league_power_rankings_channel', label: 'Power Rankings Board', description: 'Generic, non-Madden: auto-updates after every reported game, based on record + point differential', kind: 'channel' },
@@ -35537,6 +35455,9 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'trade_negotiation_channel', label: 'Trade Negotiation Channel', description: 'Panel to start a trade negotiation for a player', kind: 'channel' },
   { value: 'player_search_channel', label: 'Player Search Channel', description: 'Panel to search/browse all players', kind: 'channel' },
   { value: 'gm_panel_channel', label: 'GM Panel Channel', description: 'Panel for team owners to open their GM dashboard', kind: 'channel' },
+  // 7K-ROSTERPANEL: generic (both sports), unlike GM Panel Channel above
+  // which is Madden-only.
+  { value: 'team_roster_channel', label: 'Team Roster Channel', description: 'Panel for team owners to add/remove players, coaches, and GMs — only useful once Team Rosters is enabled in League Customization', kind: 'channel' },
   { value: 'league_announcement_channel', label: 'League Announcement Channel', description: 'Where announcements posted from the commissioner panel go', kind: 'channel' },
   { value: 'staff_channel', label: 'Staff Channel', description: 'Where league settings changes and other staff-only notices post', kind: 'channel' },
   { value: 'league_leaders_channel', label: 'League Leaders Channel', description: 'Live, switchable stat leaders board', kind: 'channel' },
@@ -35603,6 +35524,7 @@ const SETUP_PANEL_OPTIONS = [
   { value: 'trade_negotiation_starter_panel', label: 'Post/Refresh Trade Negotiation Starter' },
   { value: 'player_search_panel', label: 'Post/Refresh Player Search Panel' },
   { value: 'gm_panel_starter_panel', label: 'Post/Refresh GM Panel Starter' },
+  { value: 'team_roster_starter_panel', label: 'Post/Refresh Team Roster Panel' },
   { value: 'league_leaders_panel', label: 'Post/Refresh League Leaders Board' },
   { value: 'award_race_panel', label: 'Post/Refresh Award Race Board' },
   // 7J-112SERVERSETUP: member_profile_starter_panel/bank_starter_panel/
@@ -35680,6 +35602,7 @@ function setupDashboardColumn(settingKey) {
     staff_role: 'staff_role_id',
     trade_committee_role: 'trade_committee_role_id',
     live_channel: 'live_channel_id',
+    league_chat_channel: 'league_chat_channel_id',
     standings_channel: 'standings_channel_id',
     league_hof_channel: 'league_hof_channel_id',
     league_power_rankings_channel: 'league_power_rankings_channel_id',
@@ -35690,6 +35613,7 @@ function setupDashboardColumn(settingKey) {
     trade_negotiation_channel: 'trade_negotiation_channel_id',
     player_search_channel: 'player_search_channel_id',
     gm_panel_channel: 'gm_panel_channel_id',
+    team_roster_channel: 'team_roster_channel_id',
     league_announcement_channel: 'league_announcement_channel_id',
     staff_channel: 'staff_channel_id',
     league_leaders_channel: 'league_leaders_channel_id',
@@ -36131,6 +36055,18 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     return 'GM Panel starter posted/refreshed in ' + channel.toString() + '.';
   }
 
+  if (panelType === 'team_roster_starter_panel') {
+    const configuredChannelId = league.team_roster_channel_id;
+    const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'team roster channel');
+    if (error) return error + ' Set **Team Roster Channel** from this setup dashboard first.';
+    const message = await channel.send({
+      embeds: [buildTeamRosterPanelStarterEmbed(league)],
+      components: buildTeamRosterPanelStarterComponents(league.league_id),
+    });
+    await savePanel(league, 'team_roster_starter', channel.id, message.id);
+    return 'Team Roster Panel starter posted/refreshed in ' + channel.toString() + '.';
+  }
+
   if (panelType === 'league_leaders_panel') {
     const configuredChannelId = league.league_leaders_channel_id;
     const { channel, error } = await requireTextChannel(configuredChannelId, interaction.channel, 'league leaders channel');
@@ -36256,12 +36192,6 @@ function normalizeMaddenWeekFilterInput(week) {
   return value.replace(/^week\s*(\d+)$/i, 'Week $1').replace(/^preseason\s*week\s*(\d+)$/i, 'Preseason Week $1');
 }
 
-function isPlaceholderZeroZero(game) {
-  const status = String(game?.status || '').toLowerCase();
-  const away = Number(game?.away_score ?? 0);
-  const home = Number(game?.home_score ?? 0);
-  return away === 0 && home === 0 && status !== 'completed_with_real_score';
-}
 
 
 function formatMaddenGameScore(game) {
@@ -36278,35 +36208,6 @@ function formatMaddenGameScore(game) {
   return ' • ' + away + '-' + home;
 }
 
-function formatMaddenTeamGameLine(teamName, game) {
-  const isHome = String(game.home_team || '').toLowerCase() === String(teamName || '').toLowerCase();
-  const opp = isHome ? game.away_team : game.home_team;
-  const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
-  const resolvedHomeScore = scoreInfo.homeScore ?? game.home_score;
-  const resolvedAwayScore = scoreInfo.awayScore ?? game.away_score;
-  const teamScore = isHome ? resolvedHomeScore : resolvedAwayScore;
-  const oppScore = isHome ? resolvedAwayScore : resolvedHomeScore;
-  const status = String(game.status || 'scheduled').toLowerCase();
-
-  let result;
-  if (status === 'completed_with_real_score' || ((status === 'completed' || status === 'final') && (Number(teamScore) !== 0 || Number(oppScore) !== 0))) {
-    result = Number(teamScore) > Number(oppScore)
-      ? 'W ' + teamScore + '-' + oppScore
-      : Number(teamScore) < Number(oppScore)
-        ? 'L ' + teamScore + '-' + oppScore
-        : 'T ' + teamScore + '-' + oppScore;
-  } else if (status === 'completed' || status === 'final') {
-    const winner = resolveMaddenWinnerFromRawGame(game, game.home_team, game.away_team);
-    if (winner === 'tie') result = 'T';
-    else if ((isHome && winner === 'home') || (!isHome && winner === 'away')) result = 'W';
-    else if ((isHome && winner === 'away') || (!isHome && winner === 'home')) result = 'L';
-    else result = 'completed';
-  } else {
-    result = 'scheduled';
-  }
-
-  return '**' + (game.week_label || 'Week TBD') + '** ' + (isHome ? 'vs ' : '@ ') + opp + ' — ' + result;
-}
 
 
 function getMaddenDivisionSortRank(divisionName) {
@@ -38188,9 +38089,6 @@ const MADDEN_DRAFT_PICK_VALUE_TABLE = {
   7: [14.2, 13.8, 13.4, 13, 12.6, 12.2, 11.8, 11.4, 11, 10.6, 10.2, 9.8, 9.4, 9, 8.6, 8.2, 7.8, 7.4, 7, 6.6, 6.2, 5.8, 5.4, 5, 4.6, 4.2, 3.8, 3.4, 3, 2.6, 2.2, 1.8],
 };
 
-function buildMaddenDraftPickCommandChoices() {
-  return [];
-}
 
 function maddenDraftPickTeamKeys(teamName) {
   const raw = String(teamName || '').trim();
@@ -38500,9 +38398,6 @@ function maddenTeamNeedSeverity(score) {
   return { emoji: '✅', label: 'Stable', stars: '★☆☆☆☆' };
 }
 
-function maddenTeamNeedEmoji(score) {
-  return maddenTeamNeedSeverity(score).emoji;
-}
 
 function maddenTeamNeedUserLine(row, index, includeDepth = true) {
   const severity = maddenTeamNeedSeverity(row?.needScore);
@@ -38724,19 +38619,7 @@ function maddenPlayerAvailability(player, teamNeed = null) {
   return { score, label, hideAsTarget, reasons: [...new Set(reasons)], valueScore, marketClass };
 }
 
-function maddenAvailabilityText(player, teamNeed = null) {
-  const availability = maddenPlayerAvailability(player, teamNeed);
-  const reason = availability.reasons?.[0] ? ` • ${availability.reasons[0]}` : '';
-  return `Availability: ${availability.label}${reason}`;
-}
 
-function maddenRealisticTargetSort(a, b, targetTeamNeed = null) {
-  const avA = maddenPlayerAvailability(a);
-  const avB = maddenPlayerAvailability(b);
-  const va = calculateMaddenPlayerValue(a);
-  const vb = calculateMaddenPlayerValue(b);
-  return (avB.score - avA.score) || (Number(vb.valueScore || 0) - Number(va.valueScore || 0));
-}
 
 
 // 7J-10BO: GM Assistant 2.0 target scoring.
@@ -39108,20 +38991,6 @@ function maddenTradeChipLine(item, index) {
   return `${index + 1}. **${maddenValuePlayerName(row)}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR • ${Number(item.value?.valueScore || 0).toFixed(0)} • ${item.availability?.label || 'Medium'} availability${reason}`;
 }
 
-function maddenTradeChipDebugText(items = []) {
-  const debug = items.debug || {};
-  return [
-    `Players Evaluated: ${Number(debug.playersEvaluated || 0)}`,
-    `Protected Players: ${Number(debug.protectedCount || 0)}`,
-    `Core Young Assets: ${Number(debug.coreYoungCount || 0)}`,
-    `Need Position Exclusions: ${Number(debug.needExcludedCount || 0)}`,
-    `Surplus Position Players: ${Number(debug.surplusCount || 0)}`,
-    `Premium Chips: ${Number(debug.premiumCount || 0)}`,
-    `Veteran Chips: ${Number(debug.veteranCount || 0)}`,
-    `Depth Chips: ${Number(debug.depthCount || 0)}`,
-    `Fallback Used: ${debug.fallbackUsed ? 'YES' : 'NO'}`,
-  ].join('\n');
-}
 
 function maddenTradeChipSections(items = []) {
   if (!items.length) return [{ title: 'Possible Trade Chips', text: 'No movable assets found after fallback.' }];
@@ -39138,9 +39007,6 @@ function maddenTradeChipSections(items = []) {
   return sections;
 }
 
-function maddenTradeChipSectionText(items = []) {
-  return maddenTradeChipSections(items).map(s => `**${s.title}**\n${s.text}`).join('\n\n');
-}
 
 
 function maddenBuildGmTargetList(allPlayers, teamKey, needGroups, targetTeamNeed, allNeedsModel, limit = 12) {
@@ -39345,14 +39211,6 @@ function buildMaddenTradeNegotiationThreadButtons(negotiationId) {
   ];
 }
 
-function buildMaddenTradeNegotiationProposalButtons(negotiationId) {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`maddentrade_neg_interest:${negotiationId}:interested`).setLabel('Interested').setEmoji('✅').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`maddentrade_neg_interest:${negotiationId}:decline`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger)
-    ),
-  ];
-}
 
 function buildMaddenTradeNegotiationHubEmbed(league, listing, negotiation, requesterUserId) {
   const value = Number(listing.value_score || 0) > 0 ? Number(listing.value_score || 0).toFixed(0) : 'N/A';
@@ -39374,20 +39232,6 @@ function buildMaddenTradeNegotiationHubEmbed(league, listing, negotiation, reque
     .setTimestamp();
 }
 
-function buildMaddenTradeNegotiationProposalEmbed(negotiation) {
-  return new EmbedBuilder()
-    .setTitle('Trade Proposal Received')
-    .setColor(0xFEE75C)
-    .addFields(
-      { name: 'From', value: `${maddenTeamDisplayName(negotiation.requesting_team || 'Requesting Team')} • <@${negotiation.requesting_user_id}>`, inline: false },
-      { name: 'To', value: `${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')} • <@${negotiation.listing_user_id}>`, inline: false },
-      { name: 'Target', value: `**${negotiation.player_name}**`, inline: false },
-      { name: 'Offer', value: maddenSafeEmbedText(negotiation.offer_text || 'No offer text provided.', 1024), inline: false },
-      { name: 'Message', value: maddenSafeEmbedText(negotiation.message || 'No message provided.', 1024), inline: false }
-    )
-    .setFooter({ text: 'GG Sports • 7J-10BX-G Private Negotiation Workflow' })
-    .setTimestamp();
-}
 
 function buildMaddenTradeNegotiationStarterEmbed(league) {
   return new EmbedBuilder()
@@ -39481,53 +39325,7 @@ async function createMaddenTradeNegotiationHub(guildId, league, member, userId, 
   };
 }
 
-function buildMaddenTradeNegotiationAnalyzeModal(negotiationId) {
-  return new ModalBuilder()
-    .setCustomId(`maddentrade_neg_analyze_modal:${negotiationId}`)
-    .setTitle('Analyze Trade Offer')
-    .addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('neg_offer_assets')
-          .setLabel('Players Offered')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true)
-          .setPlaceholder('Matthew Stafford\nZach Sieler')
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('neg_offer_picks')
-          .setLabel('Draft Picks Offered')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(false)
-          .setPlaceholder('2026 MIA Round 1 Pick 4\n2027 MIA Round 2 Pick 4')
-      )
-    );
-}
 
-function buildMaddenTradeNegotiationProposalModal(negotiationId) {
-  return new ModalBuilder()
-    .setCustomId(`maddentrade_neg_proposal_modal:${negotiationId}`)
-    .setTitle('Send Trade Proposal')
-    .addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('neg_proposal_offer')
-          .setLabel('Offer')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true)
-          .setPlaceholder('Matthew Stafford + 2026 Round 1 Pick')
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
-          .setCustomId('neg_proposal_message')
-          .setLabel('Message')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(false)
-          .setPlaceholder('Interested in this player. Let me know what you think.')
-      )
-    );
-}
 
 async function createMaddenTradeNegotiationThread(negotiation, discordClient, fallbackChannelId = null) {
   if (!negotiation) return { ok: false, message: 'Negotiation not found.' };
@@ -40220,9 +40018,8 @@ async function submitMaddenNegotiationPackageToCommittee(interaction, negotiatio
   const committeeChannelIds = [
     league?.trade_committee_channel_id,
     league?.committee_channel_id,
-    COMMITTEE_CHANNEL_ID,
   ].filter(Boolean);
-  const committeeRoleId = league?.trade_committee_role_id || league?.committee_role_id || COMMITTEE_ROLE_ID;
+  const committeeRoleId = league?.trade_committee_role_id || league?.committee_role_id;
   let committeeChannel = null;
   let lastError = null;
   for (const channelId of [...new Set(committeeChannelIds)]) {
@@ -40358,11 +40155,6 @@ async function getMaddenActiveTradeBlockRows(guildId, leagueId, filters = {}) {
   return result.rows || [];
 }
 
-function maddenTradeBlockMatchKeyForRow(row) {
-  const name = String(maddenValuePlayerName(row) || row?.player_name || row?.full_name || '').trim().toLowerCase();
-  const team = maddenTradeNormalizeTeamKey(row?.resolved_team_name || row?.team_name || row?.team || '');
-  return `${team}:${name}`;
-}
 
 function maddenTradeBlockEntryMatchesPlayer(entry, player) {
   if (!entry || !player) return false;
@@ -40409,14 +40201,6 @@ function maddenTradeBlockRichPlayerText(row, index = 0) {
   return `${icon} **${row.player_name}**\n${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${seeking}${notes}`;
 }
 
-function maddenTradeBlockLine(row, index = 0) {
-  const value = Number(row.value_score || 0) > 0 ? ` • Value: **${Number(row.value_score || 0).toFixed(0)}**` : '';
-  const tier = row.trade_tier ? ` • ${row.trade_tier}` : '';
-  const seek = row.seeking ? `\nSeeking: ${row.seeking}` : '';
-  const notes = row.notes ? `\nNotes: ${row.notes}` : '';
-  const submitter = row.submitted_by ? `\nGM: <@${row.submitted_by}>` : '';
-  return `${index + 1}. **${row.player_name}** — ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${value}${tier}${seek}${notes}${submitter}`;
-}
 
 // 7J-137GENERICTRADEBLOCK: real gap found while wiring in the trade_rumor
 // news event — addMaddenTradeBlockEntry (used by both /maddentrade block add
@@ -41973,10 +41757,6 @@ Filters: ${filterText}`)
   };
 }
 
-async function buildMaddenTradeFinderEmbed(guildId, league, playerName, options = {}) {
-  const payload = await buildMaddenTradeFinderPayload(guildId, league, playerName, options);
-  return payload.embed;
-}
 
 function buildMaddenTradeFinderPaginationComponents(token, page = 0, totalPages = 1) {
   if (totalPages <= 1) return [];
@@ -42385,32 +42165,6 @@ function maddenTeamRecordText(teamRow) {
   return ties > 0 ? `${wins}-${losses}-${ties}` : `${wins}-${losses}`;
 }
 
-async function getMaddenTeamOffDefRanks(guildId, leagueId, teamName) {
-  const result = await pool.query(
-    `WITH ranked AS (
-       SELECT
-         team_name,
-         wins,
-         losses,
-         ties,
-         points_for,
-         points_against,
-         DENSE_RANK() OVER (ORDER BY points_for DESC) AS offense_rank,
-         DENSE_RANK() OVER (ORDER BY points_against ASC) AS defense_rank,
-         DENSE_RANK() OVER (ORDER BY (points_for - points_against) DESC) AS diff_rank
-       FROM madden_imported_team_stats
-       WHERE guild_id = $1::text
-         AND league_id::text = $2::text
-     )
-     SELECT *
-     FROM ranked
-     WHERE LOWER(team_name) = LOWER($3)
-        OR LOWER(team_name) = LOWER($4)
-     LIMIT 1`,
-    [guildId, leagueId, teamName, getMaddenTeamAbbrev(teamName)]
-  );
-  return result.rows?.[0] || null;
-}
 
 
 function maddenFormatRankNumber(value) {
@@ -42608,38 +42362,6 @@ function buildMaddenUpgradedTeamEmbed(league, team, games, topPlayers, ranks, le
 }
 
 
-function buildMaddenImportedTeamEmbed(league, team, games, players) {
-  const NL = String.fromCharCode(10);
-  const pf = Number(team?.points_for || 0);
-  const pa = Number(team?.points_against || 0);
-  const diff = pf - pa;
-
-  const recentLines = games.length
-    ? [...games]
-        .sort((a, b) => maddenWeekSortValue(a.week_label) - maddenWeekSortValue(b.week_label))
-        .map(game => formatMaddenGameResultForTeam(game, team.team_name))
-        .join(NL)
-    : 'No imported games found for this team.';
-
-  const playerLines = players.length
-    ? players.map(player => player.player_name + ' • ' + (player.position || 'POS') + (player.overall !== null && player.overall !== undefined ? ' • OVR ' + player.overall : '')).join(NL).slice(0, 1024)
-    : 'No imported players found for this team.';
-
-  return new EmbedBuilder()
-    .setTitle('Madden Team • ' + (team?.team_name || 'Unknown') + ' • ' + league.league_name)
-    .setColor(0xFEE75C)
-    .addFields(
-      { name: 'Record', value: Number(team?.wins || 0) + '-' + Number(team?.losses || 0) + (Number(team?.ties || 0) ? '-' + Number(team?.ties || 0) : ''), inline: true },
-      { name: 'PF / PA', value: pf + ' / ' + pa, inline: true },
-      { name: 'Point Diff', value: (diff >= 0 ? '+' : '') + diff, inline: true },
-      { name: 'Discord Team Role', value: team?.team_role_id ? '<@&' + team.team_role_id + '>' : 'Not mapped', inline: true },
-      { name: 'Coach', value: team?.owner_user_id ? '<@' + team.owner_user_id + '>' : 'Unassigned', inline: true },
-      { name: 'Recent Games', value: recentLines.slice(0, 1024), inline: false },
-      { name: 'Top Imported Players', value: playerLines, inline: false }
-    )
-    .setFooter({ text: 'GG Sports • Madden Team View • EA Direct weekly snapshot' })
-    .setTimestamp();
-}
 
 function buildMaddenRecentGamesEmbed(league, rows) {
   const NL = String.fromCharCode(10);
@@ -42930,77 +42652,7 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
 }
 
 
-function summarizeMaddenPlayerImportPayload(payload, label = 'unknown') {
-  const root = payload && typeof payload === 'object' ? payload : {};
-  const summary = {
-    label,
-    rootKeys: Object.keys(root).slice(0, 40),
-    directPlayers: Array.isArray(root.players) ? root.players.length : 0,
-    rosters: Array.isArray(root.rosters) ? root.rosters.length : 0,
-    roster: Array.isArray(root.roster) ? root.roster.length : 0,
-    teamRosters: Array.isArray(root.teamRosters) ? root.teamRosters.length : 0,
-    leagueTeams: Array.isArray(root.leagueTeams) ? root.leagueTeams.length : 0,
-    teamInfoList: Array.isArray(root.teamInfoList) ? root.teamInfoList.length : 0,
-    rosterInfoList: Array.isArray(root.rosterInfoList) ? root.rosterInfoList.length : 0,
-    playerInfoList: Array.isArray(root.playerInfoList) ? root.playerInfoList.length : 0,
-    freeAgentPlayers: Array.isArray(root.freeAgentPlayers) ? root.freeAgentPlayers.length : 0,
-    freeAgents: Array.isArray(root.freeAgents) ? root.freeAgents.length : 0,
-  };
 
-  const nestedCounts = [];
-  for (const key of Object.keys(root).slice(0, 80)) {
-    const value = root[key];
-    if (Array.isArray(value)) nestedCounts.push(`${key}:${value.length}`);
-    else if (value && typeof value === 'object') {
-      for (const childKey of Object.keys(value).slice(0, 20)) {
-        const child = value[childKey];
-        if (Array.isArray(child)) nestedCounts.push(`${key}.${childKey}:${child.length}`);
-      }
-    }
-  }
-  summary.nestedCounts = nestedCounts.slice(0, 40);
-  return summary;
-}
-
-function extractMaddenPlayerRowsFromPayload(payload) {
-  if (!payload || typeof payload !== 'object') return [];
-  const candidates = [
-    payload.players,
-    payload.roster,
-    payload.rosters,
-    payload.teamRosters,
-    payload.playerInfoList,
-    payload.rosterInfoList,
-    payload.freeAgentPlayers,
-    payload.freeAgents,
-    payload.data?.players,
-    payload.data?.roster,
-    payload.data?.rosters,
-    payload.data?.playerInfoList,
-    payload.data?.rosterInfoList,
-  ].filter(Array.isArray);
-
-  const rows = [];
-  for (const candidate of candidates) {
-    for (const item of candidate) {
-      if (Array.isArray(item)) rows.push(...item);
-      else if (item && typeof item === 'object') {
-        const nested = item.players || item.roster || item.rosters || item.playerInfoList || item.rosterInfoList || item.teamRosterInfoList;
-        if (Array.isArray(nested)) rows.push(...nested);
-        else rows.push(item);
-      }
-    }
-  }
-
-  const seen = new Set();
-  return rows.filter(row => {
-    if (!row || typeof row !== 'object') return false;
-    const key = String(row.rosterId || row.roster_id || row.presentationId || row.presentation_id || row.fullName || row.full_name || JSON.stringify(row).slice(0, 100));
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
 
 
 async function importMaddenPlayersFromArray(guild, league, rows, weekLabel = null) {
@@ -43704,12 +43356,6 @@ function readJsonRequest(req) {
   });
 }
 
-function isAuthorizedInternalApiRequest(req) {
-  if (!GGSPORTS_API_SECRET) return true;
-  const headerSecret = req.headers['x-gg-sports-secret'];
-  const bearer = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  return headerSecret === GGSPORTS_API_SECRET || bearer === GGSPORTS_API_SECRET;
-}
 
 
 
@@ -44372,25 +44018,6 @@ function isMaddenImportedGameActuallyFinal(game) {
   return ['completed', 'final', 'complete', 'completed_with_real_score'].includes(status);
 }
 
-function formatMaddenRecentGameResultForTeam(game, teamName) {
-  if (!isMaddenImportedGameActuallyFinal(game)) return 'scheduled';
-
-  const canonicalTeam = canonicalMaddenTeamNameFromAny(teamName);
-  const homeTeam = canonicalMaddenTeamNameFromAny(game.home_team || game.homeTeam);
-  const awayTeam = canonicalMaddenTeamNameFromAny(game.away_team || game.awayTeam);
-  const homeScore = parseNumberOrNull(game.home_score ?? game.homeScore) ?? 0;
-  const awayScore = parseNumberOrNull(game.away_score ?? game.awayScore) ?? 0;
-
-  if (homeScore === awayScore) return 'T';
-
-  const isHome = canonicalTeam && homeTeam && canonicalTeam.toLowerCase() === homeTeam.toLowerCase();
-  const isAway = canonicalTeam && awayTeam && canonicalTeam.toLowerCase() === awayTeam.toLowerCase();
-
-  if (isHome) return homeScore > awayScore ? 'W' : 'L';
-  if (isAway) return awayScore > homeScore ? 'W' : 'L';
-
-  return 'completed';
-}
 
 
 
@@ -46448,14 +46075,14 @@ async function handleMaddenGameThreadButton(interaction) {
     // Posts to the server's connected streaming channel (same destination as
     // /livestream), not just a message in the game thread — so the announcement
     // actually reaches whoever's watching that channel for live streams.
-    const streamChannel = await client.channels.fetch(league?.live_channel_id || LIVE_CHANNEL_ID).catch(() => null);
+    const streamChannel = await client.channels.fetch(league?.live_channel_id).catch(() => null);
     if (!streamChannel) {
       await safeReply({ content: 'Could not find the connected streaming channel — ask a commissioner to check the streaming channel setup.', ephemeral: true });
       return;
     }
     await streamChannel.send({
-      content: `<@&${league?.league_role_id || LEAGUE_ROLE_ID}> **${interaction.user.username} is LIVE!** — ${game.away_team} @ ${game.home_team}\n${url}`,
-      allowedMentions: { roles: [league?.league_role_id || LEAGUE_ROLE_ID], users: [] },
+      content: `<@&${league?.league_role_id}> **${interaction.user.username} is LIVE!** — ${game.away_team} @ ${game.home_team}\n${url}`,
+      allowedMentions: { roles: [league?.league_role_id], users: [] },
     });
     await safeReply({ content: `📺 Posted to <#${streamChannel.id}> — you're streaming this matchup!`, ephemeral: true });
     return;
@@ -47087,9 +46714,6 @@ function maddenBydaKeyNorm(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-function maddenBydaIsPlainObject(value) {
-  return value && typeof value === 'object' && !Array.isArray(value);
-}
 
 function maddenBydaDeepFirst(raw, aliases = [], fallback = null) {
   const root = maddenBydRaw(raw);
@@ -47460,23 +47084,8 @@ async function getMaddenBydeTeamContext(guildId, leagueId, teamInput) {
   };
 }
 
-function maddenBydeTeamMatches(rowTeam, ctx) {
-  const raw = String(rowTeam || '').trim().toLowerCase();
-  const names = [ctx?.rawTeamName, ctx?.teamName, ctx?.externalTeamId, getMaddenTeamAbbrev(ctx?.teamName)]
-    .filter(Boolean)
-    .map(v => String(v).trim().toLowerCase());
-  return names.includes(raw);
-}
 
-async function maddenBydeTeamDisplayName(guildId, leagueId, teamName) {
-  const ctx = await getMaddenBydeTeamContext(guildId, leagueId, teamName);
-  return ctx.displayName || maddenTeamDisplayName(teamName);
-}
 
-async function maddenBydeTeamLogoUrl(guildId, leagueId, teamName) {
-  const ctx = await getMaddenBydeTeamContext(guildId, leagueId, teamName);
-  return getMaddenTeamLogoUrl(ctx.teamName) || getMaddenTeamLogoUrl(teamName);
-}
 
 async function getMaddenExpandedPlayerRow(guildId, leagueId, playerInput) {
   await ensureMaddenFranchiseDataTables();
@@ -48108,11 +47717,6 @@ async function buildMaddenTeamProfileEmbed(guildId, league, teamInput) {
   return embed;
 }
 
-function estimateMaddenTradeCapImpactForPackage(packageData = {}) {
-  const sendCap = [...(packageData.players || []), ...(packageData.picks || [])].reduce((sum, item) => sum + Number(item.cap_hit || item.capHit || 0), 0);
-  const receiveCap = [...(packageData.target_players || []), ...(packageData.target_picks || [])].reduce((sum, item) => sum + Number(item.cap_hit || item.capHit || 0), 0);
-  return { sendCap, receiveCap, netCap: receiveCap - sendCap };
-}
 
 
 async function ensureMaddenFreeAgencyTables() {
@@ -48515,10 +48119,6 @@ async function buildMaddenFreeAgentsMessagePayload(guildId, league, options = {}
   };
 }
 
-async function buildMaddenFreeAgentsEmbed(guildId, league, options = {}) {
-  const payload = await buildMaddenFreeAgentsMessagePayload(guildId, league, { ...options, userId: null });
-  return payload.embeds[0];
-}
 
 async function setMaddenFreeAgentsChannel(leagueId, channelId) {
   await ensureMaddenFreeAgencyTables();
@@ -48572,9 +48172,6 @@ async function updateMaddenFreeAgentPanelState(guildId, leagueId, { page = 0, po
   ).catch(() => null);
 }
 
-async function updateMaddenFreeAgentPanelPage(guildId, leagueId, page = 0) {
-  return updateMaddenFreeAgentPanelState(guildId, leagueId, { page });
-}
 
 async function refreshMaddenFreeAgentsPanelForLeague(guild, league) {
   await ensureMaddenFreeAgencyTables();
@@ -49062,17 +48659,6 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
 }
 
 
-function maddenTransactionNewsEventType(eventType) {
-  const key = String(eventType || '').toLowerCase();
-  if (key === 'drafted') return 'player_drafted';
-  if (key === 'expiring_contract' || key === 'entered_free_agency') return 'contract_expired';
-  if (key === 'free_agent_available') return 'free_agent_available';
-  if (key === 'signed' || key === 'free_agency_signing') return 'free_agent_signing';
-  if (key === 're_signed') return 'player_re_signed';
-  if (key === 'released') return 'player_released';
-  if (key === 'team_change') return 'player_team_change';
-  return 'transaction';
-}
 
 function maddenTransactionPrettyLabel(eventType) {
   const key = String(eventType || '').toLowerCase();
@@ -50356,19 +49942,6 @@ async function getMaddenTopCapViolationRows(guildId, leagueId, limit = 8) {
   return result.rows || [];
 }
 
-async function getMaddenTopCapSpaceRows(guildId, leagueId, limit = 5) {
-  if (typeof getMaddenCleanTopCapSpaceRows === 'function') return await getMaddenCleanTopCapSpaceRows(guildId, leagueId, limit);
-  const result = await pool.query(
-    `SELECT team_name, cap_space, active_cap, dead_cap, player_count
-     FROM madden_team_cap
-     WHERE guild_id = $1 AND league_id::text = $2::text
-       AND LOWER(COALESCE(team_name, '')) NOT IN ('fa', 'free agent', 'free agents', 'freeagents')
-     ORDER BY cap_space DESC
-     LIMIT $3`,
-    [String(guildId), String(leagueId), Math.max(1, Math.min(Number(limit || 5), 20))]
-  ).catch(() => ({ rows: [] }));
-  return (result.rows || []).filter(isMaddenRealTeamCapRow);
-}
 
 
 function isMaddenRealTeamCapRow(row) {
@@ -50754,17 +50327,7 @@ async function buildMaddenNewsFeedEmbed(guildId, league) {
 }
 
 
-function formatMaddenRecordsPlayerLine(row, metricLabel) {
-  if (!row) return 'No data yet.';
-  const team = getMaddenTeamAbbrev(row.resolved_team_name || row.stat_team_name || row.team_name);
-  const teamText = team ? ` (${team})` : '';
-  return `**${row.player_name || 'Unknown Player'}${teamText}** — ${formatMaddenLeaderNumber(row.leader_value)} ${metricLabel}`;
-}
 
-function formatMaddenRecordsTeamLine(row, valueText) {
-  if (!row) return 'No data yet.';
-  return `**${row.team_name || 'Unknown Team'}** — ${valueText}`;
-}
 
 function maddenRecordMedal(index) {
   return ['🥇', '🥈', '🥉'][index] || `${index + 1}.`;
@@ -50786,10 +50349,6 @@ function formatMaddenRecordsTeamTopList(rows, valueBuilder) {
   return list.map((row, index) => `${maddenRecordMedal(index)} **${row.team_name || 'Unknown Team'}** — ${valueBuilder(row)}`).join('\n');
 }
 
-async function getMaddenSingleRecordLeader(guildId, leagueId, categoryKey) {
-  const result = await getMaddenLeagueLeaders(guildId, leagueId, categoryKey, null, 1).catch(() => ({ rows: [], category: MADDEN_LEADER_CATEGORIES[categoryKey] }));
-  return { row: result.rows?.[0] || null, category: result.category || MADDEN_LEADER_CATEGORIES[categoryKey] };
-}
 
 async function getMaddenTopRecordLeaders(guildId, leagueId, categoryKey, limit = 3) {
   const result = await getMaddenLeagueLeaders(guildId, leagueId, categoryKey, null, limit).catch(() => ({ rows: [], category: MADDEN_LEADER_CATEGORIES[categoryKey] }));
@@ -51295,16 +50854,6 @@ function isMaddenDynastyScoredGame(game) {
   return Number.isFinite(homeScore) && Number.isFinite(awayScore) && (homeScore !== 0 || awayScore !== 0);
 }
 
-function getMaddenDynastyGameWinner(game) {
-  const home = String(game?.home_team || '').trim();
-  const away = String(game?.away_team || '').trim();
-  const homeScore = Number(game?.home_score ?? 0);
-  const awayScore = Number(game?.away_score ?? 0);
-  if (!home || !away || !isMaddenDynastyScoredGame(game)) return null;
-  if (homeScore > awayScore) return { winner: home, loser: away, isTie: false };
-  if (awayScore > homeScore) return { winner: away, loser: home, isTie: false };
-  return { winner: null, loser: null, isTie: true, home, away };
-}
 
 function getMaddenDynastyGameSortValue(game) {
   return maddenWeekSortValue(game?.week_label) * 1000000000000 + Number(new Date(game?.played_at || game?.imported_at || 0).getTime() || 0);
@@ -51421,13 +50970,6 @@ function formatMaddenDynastyPowerWatchLine(row) {
   return `👑 **${maddenTeamDisplayNameWithLogo(row.team_name)}** — Power Rank #${row.rank}${movementText} • Score ${formatMaddenPowerScore(row.power_score)}`;
 }
 
-async function getMaddenDynastyCurrentStreakRows(guildId, leagueId) {
-  const games = await getMaddenDynastyGameHistoryRows(guildId, leagueId);
-  return buildMaddenDynastyRecordsFromGames(games)
-    .filter(row => row.streak_type === 'W' && Number(row.streak_count || 0) > 0)
-    .sort((a, b) => Number(b.streak_count || 0) - Number(a.streak_count || 0) || Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name).localeCompare(String(b.team_name)))
-    .slice(0, 5);
-}
 
 
 async function ensureMaddenChampionshipHistoryTable() {
@@ -57151,11 +56693,6 @@ function maddenValueDevComponent(devTrait) {
   return -0.20;
 }
 
-function maddenValueSpeedComponent(speed) {
-  const n = Number(speed || 0);
-  if (!n) return 0;
-  return Math.max(-0.10, Math.min(0.35, (n - 80) / 100));
-}
 
 function maddenValueYearsComponent(yearsLeft) {
   const n = Math.round(Number(yearsLeft || 0));
@@ -57366,22 +56903,6 @@ function maddenSafeEmbedText(value, limit = 1024) {
   return text.length > limit ? text.slice(0, Math.max(0, limit - 3)) + '...' : text;
 }
 
-function maddenChunkLines(lines = [], limit = 950) {
-  const chunks = [];
-  let current = '';
-  for (const rawLine of lines) {
-    const line = String(rawLine || '').trim();
-    if (!line) continue;
-    if ((current + (current ? '\n' : '') + line).length > limit) {
-      if (current) chunks.push(current);
-      current = line.slice(0, limit);
-    } else {
-      current += (current ? '\n' : '') + line;
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks.length ? chunks.slice(0, 4) : ['No Madden players found. Run `/madden sync` first.'];
-}
 
 function buildMaddenValuesPaginationComponents(token, page = 0, totalPages = 1) {
   if (totalPages <= 1) return [];
@@ -59171,338 +58692,8 @@ function cloneEaBlazeSessionForSingleReplay(session) {
   };
 }
 
-async function probeEaSingleUseSessionReplay(context, guild, league) {
-  const enabled = String(process.env.EA_SINGLE_USE_SESSION_REPLAY_ENABLED || 'false').toLowerCase() === 'true';
-  if (!enabled) return null;
-
-  const activeSession = context.activeBlazeSession || null;
-  const trace = {
-    token: summarizeEaTokenForSessionTrace(context.token),
-    externalLeagueId: context.externalLeagueId,
-    leagueName: league?.league_name,
-    activeSession: activeSession ? {
-      requestId: activeSession.requestId,
-      blazeId: activeSession.blazeId,
-      sessionKeyLength: String(activeSession.sessionKey || '').length,
-    } : null,
-    attempts: [],
-  };
-
-  if (!activeSession?.sessionKey) {
-    trace.error = 'No active LeagueHub session available for single-use replay.';
-    console.log('[EA SINGLE USE REPLAY 7J-5BU] ' + JSON.stringify(trace).slice(0, 12000));
-    return trace;
-  }
-
-  const weekResult = await pool.query(
-    `SELECT week_label
-     FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id = $2
-     GROUP BY week_label
-     ORDER BY week_label DESC
-     LIMIT 1`,
-    [guild.id, league.league_id]
-  );
-
-  const weekLabel = weekResult.rows?.[0]?.week_label || 'Week 1';
-  const weekNumber = maddenWeekNumberFromLabel(weekLabel) || 1;
-  const exportWeekIndex = Math.max(0, weekNumber - 1);
-  const mcaSeasonWeek = weekNumber + 3;
-
-  const candidates = [
-    {
-      label: 'control-leaguehub-811',
-      commandName: 'Mobile_Career_GetLeagueHub',
-      commandId: 811,
-      payload: { leagueId: Number(context.externalLeagueId) },
-    },
-    {
-      label: 'minimal-standings-802-league-only',
-      commandName: 'Mobile_Career_GetStandings',
-      commandId: 802,
-      payload: { leagueId: Number(context.externalLeagueId) },
-    },
-    {
-      label: 'minimal-teamstats-803-league-only',
-      commandName: 'Mobile_Career_GetTeamStats',
-      commandId: 803,
-      payload: { leagueId: Number(context.externalLeagueId) },
-    },
-    {
-      label: 'minimal-weeklystats-804-league-only',
-      commandName: 'Mobile_Career_GetWeeklyStats',
-      commandId: 804,
-      payload: { leagueId: Number(context.externalLeagueId) },
-    },
-    {
-      label: 'minimal-seasonstats-805-league-only',
-      commandName: 'Mobile_Career_GetSeasonStats',
-      commandId: 805,
-      payload: { leagueId: Number(context.externalLeagueId) },
-    },
-    {
-      label: 'snallapa-teamstats-803-week',
-      commandName: 'Mobile_Career_GetTeamStats',
-      commandId: 803,
-      payload: { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage: 1 },
-    },
-    {
-      label: 'snallapa-weeklystats-804-week',
-      commandName: 'Mobile_Career_GetWeeklyStats',
-      commandId: 804,
-      payload: { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage: 1 },
-    },
-    {
-      label: 'mca-teamstats-803-season-week',
-      commandName: 'Mobile_Career_GetTeamStats',
-      commandId: 803,
-      payload: { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, seasonWeekType: 1 },
-    },
-  ];
-
-  const maxAttempts = Number(process.env.EA_SINGLE_USE_SESSION_REPLAY_MAX_ATTEMPTS || 4);
-  const selected = candidates.slice(0, Math.max(1, Math.min(maxAttempts, candidates.length)));
-
-  console.log('[EA SINGLE USE REPLAY TRACE 7J-5BU] ' + JSON.stringify({
-    weekLabel,
-    derived: { weekNumber, exportWeekIndex, mcaSeasonWeek },
-    strategy: 'clone active LeagueHub session per candidate; one request per cloned session; no loops on same session',
-    selected,
-  }).slice(0, 12000));
-
-  for (const candidate of selected) {
-    const replaySession = cloneEaBlazeSessionForSingleReplay(activeSession);
-    const attempt = {
-      ...candidate,
-      sessionBefore: {
-        requestId: replaySession?.requestId,
-        sessionKeyLength: String(replaySession?.sessionKey || '').length,
-      },
-    };
-
-    try {
-      const response = await sendEaBlazeCareerModeCommandWithSession(
-        context.token,
-        replaySession,
-        candidate.commandName,
-        candidate.commandId,
-        candidate.payload,
-        { componentId: 2060, componentName: 'careermode' }
-      );
-
-      const value = response?.responseInfo?.value || response;
-      attempt.success = true;
-      attempt.topKeys = Object.keys(value || {}).slice(0, 60);
-      attempt.arrays = deepFindArraysByKey(value, [
-        'teamStandingInfoList',
-        'teamStatInfoList',
-        'gameScheduleInfoList',
-        'stats',
-        'teams',
-        'games',
-        'teamStats',
-        'teamStatsInfoList',
-      ]).map(item => ({
-        path: item.path,
-        key: item.key,
-        length: Array.isArray(item.rows) ? item.rows.length : 0,
-        sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
-          ? Object.keys(item.rows[0]).slice(0, 80)
-          : [],
-        sample: Array.isArray(item.rows)
-          ? item.rows.slice(0, 2).map(row => compactMaddenRawExcerpt(row))
-          : [],
-      })).slice(0, 10);
-      attempt.scoreLikeFields = collectMaddenScoreLikeFields(value);
-      attempt.scorePairs = deepFindMaddenNumericScorePairs(value).slice(0, 20);
-
-      trace.attempts.push(attempt);
-      console.log('[EA SINGLE USE REPLAY HIT 7J-5BU] ' + JSON.stringify(attempt).slice(0, 16000));
-    } catch (error) {
-      attempt.success = false;
-      attempt.error = String(error?.message || error).slice(0, 1000);
-      trace.attempts.push(attempt);
-      console.log('[EA SINGLE USE REPLAY FAIL 7J-5BU] ' + JSON.stringify(attempt));
-    }
-  }
-
-  console.log('[EA SINGLE USE REPLAY SUMMARY 7J-5BU] ' + JSON.stringify({
-    activeSession: trace.activeSession,
-    weekLabel,
-    derived: { weekNumber, exportWeekIndex, mcaSeasonWeek },
-    successes: trace.attempts.filter(a => a.success).length,
-    failures: trace.attempts.filter(a => !a.success).length,
-    successAttempts: trace.attempts.filter(a => a.success).map(a => ({
-      label: a.label,
-      commandName: a.commandName,
-      commandId: a.commandId,
-      payload: a.payload,
-      arrays: a.arrays,
-      scoreLikeKeys: Object.keys(a.scoreLikeFields || {}).slice(0, 80),
-      scorePairs: a.scorePairs,
-    })),
-    errorBuckets: trace.attempts.filter(a => !a.success).reduce((acc, a) => {
-      const key = (a.error || '').slice(0, 200);
-      acc[key] = (acc[key] || 0) + 1;
-      return acc;
-    }, {}),
-  }).slice(0, 18000));
-
-  return trace;
-}
 
 
-async function probeSnallapaSessionEscalation(context, guild, league) {
-  const enabled = String(process.env.EA_SESSION_ESCALATION_PROBE_ENABLED || 'true').toLowerCase() !== 'false';
-  if (!enabled) return null;
-
-  const trace = {
-    token: summarizeEaTokenForSessionTrace(context.token),
-    externalLeagueId: context.externalLeagueId,
-    leagueName: league?.league_name,
-    attempts: [],
-  };
-
-  const baseSession = context.activeBlazeSession || context.blazeSession || context.session || null;
-
-  if (!baseSession?.sessionKey) {
-    trace.baseSessionError = 'No active LeagueHub Blaze session found on sync context. Existing-session harvest cannot run.';
-    trace.contextKeys = Object.keys(context || {}).slice(0, 80);
-    console.log('[SNALLAPA EXISTING SESSION HARVEST 7J-5BT] ' + JSON.stringify(trace).slice(0, 12000));
-    return trace;
-  }
-
-  trace.baseSession = {
-    source: 'context.activeBlazeSession',
-    blazeId: baseSession?.blazeId,
-    requestId: baseSession?.requestId,
-    sessionKeyLength: String(baseSession?.sessionKey || '').length,
-  };
-
-  const weekResult = await pool.query(
-    `SELECT week_label
-     FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id = $2
-     GROUP BY week_label
-     ORDER BY week_label DESC
-     LIMIT 1`,
-    [guild.id, league.league_id]
-  );
-
-  const weekLabel = weekResult.rows?.[0]?.week_label || 'Week 1';
-  const weekNumber = maddenWeekNumberFromLabel(weekLabel) || 1;
-  const exportWeekIndex = Math.max(0, weekNumber - 1);
-  const mcaSeasonWeek = weekNumber + 3;
-
-  const payloads = [
-    { label: 'league-only', payload: { leagueId: Number(context.externalLeagueId) } },
-    { label: 'snallapa-export-week', payload: { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage: 1 } },
-    { label: 'snallapa-export-week-stageIndex', payload: { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stageIndex: 1 } },
-    { label: 'mca-season-week', payload: { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, seasonWeekType: 1 } },
-  ];
-
-  const commandTests = [
-    { label: 'known-working-leaguehub-reuse', name: 'Mobile_Career_GetLeagueHub', id: 811, payload: { leagueId: Number(context.externalLeagueId) } },
-    { label: 'standings-export-reuse', name: 'Mobile_Career_GetStandings', id: 802 },
-    { label: 'teamstats-export-reuse', name: 'Mobile_Career_GetTeamStats', id: 803 },
-    { label: 'weeklystats-export-reuse', name: 'Mobile_Career_GetWeeklyStats', id: 804 },
-    { label: 'seasonstats-export-reuse', name: 'Mobile_Career_GetSeasonStats', id: 805 },
-  ];
-
-  const componentVariants = [
-    { componentId: 2060, componentName: 'careermode', label: 'career-2060' },
-    { componentId: 2060, componentName: 'stats', label: 'stats-name-2060' },
-    { componentId: 2060, componentName: 'madden', label: 'madden-name-2060' },
-  ];
-
-  let attemptCount = 0;
-  const maxAttempts = Number(process.env.EA_EXISTING_SESSION_HARVEST_MAX_ATTEMPTS || 40);
-
-  for (const command of commandTests) {
-    const payloadSet = command.payload
-      ? [{ label: 'command-default', payload: command.payload }]
-      : payloads;
-
-    for (const p of payloadSet) {
-      for (const component of componentVariants) {
-        if (attemptCount >= maxAttempts) break;
-        attemptCount += 1;
-
-        const attempt = {
-          commandLabel: command.label,
-          commandName: command.name,
-          commandId: command.id,
-          payloadLabel: p.label,
-          payload: p.payload,
-          component,
-          sessionBefore: {
-            requestId: baseSession.requestId,
-            sessionKeyLength: String(baseSession.sessionKey || '').length,
-          },
-        };
-
-        try {
-          const response = await sendEaBlazeCareerModeCommandWithSession(
-            context.token,
-            baseSession,
-            command.name,
-            command.id,
-            p.payload,
-            component
-          );
-          const value = response?.responseInfo?.value || response;
-          attempt.success = true;
-          attempt.topKeys = Object.keys(value || {}).slice(0, 40);
-          attempt.arrays = deepFindArraysByKey(value, [
-            'teamStandingInfoList',
-            'teamStatInfoList',
-            'gameScheduleInfoList',
-            'stats',
-            'teams',
-            'games',
-          ]).map(item => ({
-            path: item.path,
-            key: item.key,
-            length: Array.isArray(item.rows) ? item.rows.length : 0,
-            sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
-              ? Object.keys(item.rows[0]).slice(0, 50)
-              : [],
-          })).slice(0, 8);
-          attempt.scoreLikeKeys = Object.keys(collectMaddenScoreLikeFields(value)).slice(0, 50);
-          trace.attempts.push(attempt);
-
-          console.log('[SNALLAPA EXISTING SESSION HARVEST HIT 7J-5BT] ' + JSON.stringify(attempt).slice(0, 12000));
-        } catch (error) {
-          attempt.success = false;
-          attempt.error = String(error?.message || error).slice(0, 900);
-          trace.attempts.push(attempt);
-
-          console.log('[SNALLAPA EXISTING SESSION HARVEST FAIL 7J-5BT] ' + JSON.stringify(attempt));
-        }
-      }
-      if (attemptCount >= maxAttempts) break;
-    }
-    if (attemptCount >= maxAttempts) break;
-  }
-
-  console.log('[SNALLAPA EXISTING SESSION HARVEST SUMMARY 7J-5BT] ' + JSON.stringify({
-    token: trace.token,
-    baseSession: trace.baseSession,
-    externalLeagueId: trace.externalLeagueId,
-    weekLabel,
-    derived: { weekNumber, exportWeekIndex, mcaSeasonWeek },
-    successes: trace.attempts.filter(a => a.success).length,
-    failures: trace.attempts.filter(a => !a.success).length,
-    successAttempts: trace.attempts.filter(a => a.success).slice(0, 12),
-    errorBuckets: trace.attempts.filter(a => !a.success).reduce((acc, a) => {
-      const key = (a.error || '').slice(0, 160);
-      acc[key] = (acc[key] || 0) + 1;
-      return acc;
-    }, {}),
-  }).slice(0, 18000));
-
-  return trace;
-}
 
 
 async function sendEaBlazeCareerModeCommand(token, commandName, commandId, requestPayload = {}, options = {}) {
@@ -59850,160 +59041,9 @@ function buildEaStandingsPayloadVariantsFromHub(hubPayload, leagueId) {
   return unique.slice(0, 8);
 }
 
-async function probeEaStandingsCommandsWithHubContext(token, leagueId, hubPayload) {
-  const payloadVariants = buildEaStandingsPayloadVariantsFromHub(hubPayload, leagueId);
-
-  const commandCandidates = [
-    { name: 'Mobile_Career_GetStandings', id: 802 },
-    { name: 'Mobile_Career_GetTeamStats', id: 803 },
-  ];
-
-  const results = [];
-  for (const command of commandCandidates) {
-    for (const requestPayload of payloadVariants) {
-      try {
-        const response = await sendEaBlazeCareerModeCommand(token, command.name, command.id, requestPayload);
-        const value = response?.responseInfo?.value || response;
-        const arrays = deepFindArraysByKey(value, [
-          'standings',
-          'teamStandings',
-          'leagueStandings',
-          'teamStandingsInfoList',
-          'standingInfoList',
-          'teamStats',
-          'teamStatsInfoList',
-          'seasonTeamStatsInfoList',
-          'leagueTeamStats',
-          'rankings',
-          'stats'
-        ]);
-
-        logEaProbePayload(command.name + '#' + command.id + ' payload=' + JSON.stringify(requestPayload), response);
-
-        results.push({
-          commandName: command.name,
-          commandId: command.id,
-          payload: requestPayload,
-          success: true,
-          topKeys: Object.keys(value || {}),
-          candidateArrayCount: arrays.length,
-          candidateArrays: arrays.map(a => ({ path: a.path, key: a.key, length: Array.isArray(a.rows) ? a.rows.length : 0 })).slice(0, 10),
-          raw: value,
-        });
-
-        if (arrays.some(a => Array.isArray(a.rows) && a.rows.length >= 30)) {
-          console.log('[EA STANDINGS FOUND] ' + JSON.stringify({
-            commandName: command.name,
-            commandId: command.id,
-            payload: requestPayload,
-            arrays: arrays.map(a => ({ path: a.path, key: a.key, length: Array.isArray(a.rows) ? a.rows.length : 0 })).slice(0, 10),
-          }));
-          return results;
-        }
-      } catch (error) {
-        console.log('[EA STANDINGS PROBE FAIL] ' + JSON.stringify({
-          commandName: command.name,
-          commandId: command.id,
-          payload: requestPayload,
-          error: String(error?.message || error).slice(0, 220),
-        }));
-        results.push({
-          commandName: command.name,
-          commandId: command.id,
-          payload: requestPayload,
-          success: false,
-          error: String(error?.message || error).slice(0, 500),
-        });
-      }
-    }
-  }
-
-  return results;
-}
 
 
-async function probeEaStandingsCommands(token, leagueId) {
-  const leagueNumber = Number(leagueId);
-  const payloadVariants = [
-    { leagueId: leagueNumber },
-    { leagueId: leagueNumber, weekIndex: 0 },
-  ];
 
-  const commandCandidates = [
-    { name: 'Mobile_Career_GetStandings', id: 802 },
-    { name: 'Mobile_Career_GetTeamStats', id: 803 },
-    { name: 'Mobile_Career_GetLeagueStandings', id: 804 },
-    { name: 'Mobile_Career_GetSeasonStats', id: 805 },
-    { name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
-    { name: 'Mobile_Career_GetPowerRankings', id: 814 },
-    { name: 'Mobile_Career_GetTeamRankings', id: 815 },
-  ];
-
-  const results = [];
-  for (const command of commandCandidates) {
-    for (const requestPayload of payloadVariants) {
-      try {
-        const response = await sendEaBlazeCareerModeCommand(token, command.name, command.id, requestPayload);
-        const value = response?.responseInfo?.value || response;
-        const arrays = deepFindArraysByKey(value, [
-          'standings',
-          'teamStandings',
-          'leagueStandings',
-          'teamStandingsInfoList',
-          'standingInfoList',
-          'teamStats',
-          'teamStatsInfoList',
-          'seasonTeamStatsInfoList',
-          'leagueTeamStats',
-          'rankings',
-          'stats'
-        ]);
-
-        logEaProbePayload(command.name + '#' + command.id + ' payload=' + JSON.stringify(requestPayload), response);
-
-        results.push({
-          commandName: command.name,
-          commandId: command.id,
-          payload: requestPayload,
-          success: true,
-          topKeys: Object.keys(value || {}),
-          candidateArrayCount: arrays.length,
-          candidateArrays: arrays.map(a => ({ path: a.path, key: a.key, length: Array.isArray(a.rows) ? a.rows.length : 0 })).slice(0, 10),
-          raw: value,
-        });
-
-        if (arrays.some(a => Array.isArray(a.rows) && a.rows.length >= 30)) {
-          return results;
-        }
-      } catch (error) {
-        console.log('[EA STANDINGS PROBE FAIL] ' + JSON.stringify({
-          commandName: command.name,
-          commandId: command.id,
-          payload: requestPayload,
-          error: String(error?.message || error).slice(0, 180),
-        }));
-        results.push({
-          commandName: command.name,
-          commandId: command.id,
-          payload: requestPayload,
-          success: false,
-          error: String(error?.message || error).slice(0, 500),
-        });
-      }
-    }
-  }
-
-  return results;
-}
-
-function extractEaStandingsRowsFromProbeResults(probeResults) {
-  for (const result of probeResults || []) {
-    if (!result?.success || !result.raw) continue;
-    const rows = extractEaStandingsRowsFromHub(result.raw);
-    if (rows.length) return rows;
-  }
-  return [];
-}
 
 
 
@@ -60036,46 +59076,6 @@ function summarizeEaHubShape(value, depth = 0, maxDepth = 4) {
   return out;
 }
 
-function logEaHubRawInspection(hubPayload) {
-  try {
-    const arrays = deepFindArraysByKey(hubPayload, [
-      'teamIdInfoList',
-      'leagueSchedule',
-      'teamStandingsInfoList',
-      'standings',
-      'teamStandings',
-      'leagueStandings',
-      'teamStatsInfoList',
-      'teamStats',
-      'userInfoMap',
-      'playerInfoList',
-      'rosterInfoList',
-      'players',
-      'rosters',
-      'depthChartInfoList'
-    ]);
-
-    const summary = {
-      topKeys: Object.keys(hubPayload || {}),
-      candidateArrays: arrays.map(item => ({
-        path: item.path,
-        key: item.key,
-        length: Array.isArray(item.rows) ? item.rows.length : 0,
-        sampleKeys: Array.isArray(item.rows) && item.rows[0] && typeof item.rows[0] === 'object'
-          ? Object.keys(item.rows[0])
-          : [],
-        sample: Array.isArray(item.rows) && item.rows[0]
-          ? summarizeEaHubShape(item.rows[0], 0, 2)
-          : null,
-      })).slice(0, 60),
-      shape: summarizeEaHubShape(hubPayload, 0, 3),
-    };
-
-    console.log('[EA HUB RAW]', JSON.stringify(summary, null, 2).slice(0, 20000));
-  } catch (error) {
-    console.error('[EA HUB RAW] failed to summarize hub payload:', error?.message || error);
-  }
-}
 
 
 function deepFindArraysByKey(root, wantedKeys = []) {
@@ -60415,32 +59415,6 @@ function normalizeEaLeagueTeamsDeepFromHub(hubPayload) {
   return mergeEaHubNativeRecordsIntoTeams(hubPayload, Array.from(byTeamKey.values()));
 }
 
-function normalizeEaWeekLabel(game) {
-  const explicit = getAnyValue(game, ['displayedWeek', 'weekTitle', 'week_label', 'weekLabel'], null);
-  if (explicit) return String(explicit);
-
-  const rawWeek = parseNumberOrNull(getAnyValue(game, ['week', 'weekIndex', 'seasonWeek'], null));
-  const weekType = parseNumberOrNull(getAnyValue(game, ['weekType', 'seasonWeekType', 'stageIndex'], null));
-
-  if (rawWeek !== null) {
-    if (weekType === 0) return 'Preseason Week ' + String(rawWeek + 1);
-
-    // EA regular season schedule rows commonly use week=4 for Regular Season Week 1
-    // because preseason weeks occupy indices 0-3. Convert only for regular season.
-    if (weekType === 1 || weekType === null) {
-      const regularWeek = rawWeek >= 4 ? rawWeek - 3 : rawWeek + 1;
-      return 'Week ' + String(regularWeek);
-    }
-
-    if (weekType === 2) return 'Wildcard Round';
-    if (weekType === 3) return 'Divisional Round';
-    if (weekType === 4) return 'Conference Championship';
-    if (weekType === 5 || weekType === 6) return 'Super Bowl';
-    return 'Week ' + String(rawWeek + 1);
-  }
-
-  return 'Week TBD';
-}
 
 function getTeamNameFromGameSide(game, side, maps) {
   const prefix = side === 'home' ? 'home' : 'away';
@@ -60813,29 +59787,6 @@ function normalizeEaLeagueTeamsFromHub(hubPayload) {
   return teamRows;
 }
 
-function normalizeEaScheduleFromHub(hubPayload) {
-  const schedule = hubPayload?.gameScheduleHubInfo?.leagueSchedule;
-  if (!Array.isArray(schedule)) return [];
-
-  return schedule.map(item => {
-    const game = item?.seasonGameInfo || item || {};
-    const weekType = getFirstValue(game, ['weekType'], null);
-    const week = getFirstValue(game, ['week'], null);
-    const weekLabel = getFirstValue(game, ['displayedWeek'], week !== null ? 'Week ' + String(Number(week) + 1) : null);
-
-    return {
-      id: getFirstValue(item, ['seasonGameKey', 'id'], null) || [weekType, week, getFirstValue(game, ['awayTeam'], ''), getFirstValue(game, ['homeTeam'], '')].join('-'),
-      external_game_id: getFirstValue(item, ['seasonGameKey', 'id'], null),
-      week_label: weekLabel,
-      home_team: getFirstValue(game, ['homeName', 'homeTeamName', 'homeCityName'], 'Home'),
-      away_team: getFirstValue(game, ['awayName', 'awayTeamName', 'awayCityName'], 'Away'),
-      home_score: getFirstValue(game, ['homeScore', 'homeTeamScore'], null),
-      away_score: getFirstValue(game, ['awayScore', 'awayTeamScore'], null),
-      status: game.isGamePlayed ? 'completed' : 'scheduled',
-      raw: item,
-    };
-  });
-}
 
 async function getConnectedEaTokenForLeague(leagueId) {
   const result = await pool.query(
@@ -60909,71 +59860,6 @@ async function getEaDirectLeagueSyncContext(league) {
 }
 
 
-async function getEaBlazeLeagueHubWithRefreshRetry(context) {
-  const preRefreshToken = { ...context.token };
-
-  try {
-    return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
-  } catch (error) {
-    const isExpired = isEaExpiredTokenError(error);
-    const isInvalidRequest = isEaInvalidRequestTokenError(error);
-
-    if (!isExpired && !isInvalidRequest) throw error;
-
-    if (isInvalidRequest && !isExpired) {
-      console.log('[EA Direct] Blaze rejected current token with invalid request before refresh:', summarizeEaTokenForLog(context.token));
-    }
-
-    console.log('[EA Direct] Blaze login token error. Refreshing and retrying LeagueHub once.', {
-      expired: isExpired,
-      invalidRequest: isInvalidRequest,
-      tokenBeforeRefresh: summarizeEaTokenForLog(context.token),
-    });
-
-    const refreshed = await refreshEaConnectionTokens(context.connection, context.token.refreshToken);
-
-    const refreshedToken = {
-      ...context.token,
-      accessToken: refreshed.accessToken,
-      refreshToken: refreshed.refreshToken,
-      expiry: refreshed.expiry,
-    };
-
-    console.log('[EA Direct] Retrying Blaze login with refreshed token:', summarizeEaTokenForLog(refreshedToken));
-
-    try {
-      context.token = refreshedToken;
-      return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
-    } catch (refreshError) {
-      console.log('[EA Direct] Refreshed token Blaze retry failed:', {
-        expired: isEaExpiredTokenError(refreshError),
-        invalidRequest: isEaInvalidRequestTokenError(refreshError),
-        error: String(refreshError?.message || refreshError).slice(0, 500),
-      });
-
-      // Diagnostic fallback:
-      // If a freshly refreshed access token is rejected as AUTH_ERR_INVALID_REQUEST,
-      // retry the pre-refresh token once. This distinguishes:
-      //   A) refresh output is not Blaze-compatible
-      //   B) Blaze login is rejecting this connection generally
-      if (isEaInvalidRequestTokenError(refreshError) && preRefreshToken?.accessToken) {
-        console.log('[EA Direct] Trying pre-refresh access token once for compatibility comparison:', summarizeEaTokenForLog(preRefreshToken));
-        try {
-          context.token = preRefreshToken;
-          return await getEaBlazeLeagueHub(context.token, context.externalLeagueId);
-        } catch (previousTokenError) {
-          console.log('[EA Direct] Pre-refresh token fallback also failed:', {
-            expired: isEaExpiredTokenError(previousTokenError),
-            invalidRequest: isEaInvalidRequestTokenError(previousTokenError),
-            error: String(previousTokenError?.message || previousTokenError).slice(0, 500),
-          });
-        }
-      }
-
-      throw refreshError;
-    }
-  }
-}
 
 
 async function getEaBlazeLeagueHubWithRefreshRetryDetailed(context) {
@@ -61249,39 +60135,6 @@ function resolveMaddenScoresFromRawGameDeep(gameRow) {
   };
 }
 
-async function inspectMaddenDeepRawScoreCandidates(guild, league) {
-  const gamesResult = await pool.query(
-    `SELECT *
-     FROM madden_imported_games
-     WHERE guild_id = $1
-       AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
-     ORDER BY week_label DESC, imported_at DESC
-     LIMIT 12`,
-    [guild.id, league.league_id]
-  );
-
-  const samples = gamesResult.rows.map(game => {
-    const deep = resolveMaddenScoresFromRawGameDeep(game);
-    return {
-      week: game.week_label,
-      matchup: game.away_team + ' @ ' + game.home_team,
-      dbScore: String(game.away_score) + '-' + String(game.home_score),
-      source: deep.source,
-      hasRealScore: deep.hasRealScore,
-      homeScore: deep.homeScore,
-      awayScore: deep.awayScore,
-      candidates: (deep.candidates || []).slice(0, 8),
-    };
-  });
-
-  console.log('[Madden Deep Raw Score Candidates 7J-5BQ] ' + JSON.stringify({
-    inspectedGames: samples.length,
-    samples,
-  }).slice(0, 14000));
-
-  return samples;
-}
 
 
 function resolveMaddenScoresFromRawGame(gameRow) {
@@ -63355,59 +62208,7 @@ function extractRequestInfoSeasonGameAnalytics(entry, index) {
 }
 
 
-async function logMaddenTeamStatsDbTruth(guild, league, label = 'unknown') {
-  const rows = await pool.query(
-    `SELECT team_name, wins, losses, ties, points_for, points_against, imported_at
-     FROM madden_imported_team_stats
-     WHERE guild_id = $1 AND league_id = $2
-     ORDER BY team_name ASC`,
-    [guild.id, league.league_id]
-  );
 
-  const focus = rows.rows.filter(row =>
-    ['dolphins', 'bills'].includes(String(row.team_name || '').toLowerCase())
-  );
-
-  console.log('[MADDEN TEAM STATS DB TRUTH 7J-5D] ' + JSON.stringify({
-    label,
-    totalRows: rows.rows.length,
-    focus,
-    sample: rows.rows.slice(0, 12),
-  }).slice(0, 12000));
-
-  return rows.rows;
-}
-
-async function logMaddenDisplaySourceTruth(guild, league, teamName = 'Dolphins') {
-  const importedTeamStats = await pool.query(
-    `SELECT *
-     FROM madden_imported_team_stats
-     WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($3)
-     LIMIT 1`,
-    [guild.id, league.league_id, teamName]
-  );
-
-  const importedGames = await pool.query(
-    `SELECT week_label, away_team, home_team, away_score, home_score, status, imported_at
-     FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id = $2
-       AND (LOWER(away_team) = LOWER($3) OR LOWER(home_team) = LOWER($3))
-     ORDER BY week_label ASC, imported_at DESC
-     LIMIT 12`,
-    [guild.id, league.league_id, teamName]
-  );
-
-  console.log('[MADDEN DISPLAY SOURCE TRUTH 7J-5D] ' + JSON.stringify({
-    teamName,
-    importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
-    importedGamesRows: importedGames.rows || [],
-  }).slice(0, 12000));
-
-  return {
-    importedTeamStatsRow: importedTeamStats.rows?.[0] || null,
-    importedGamesRows: importedGames.rows || [],
-  };
-}
 
 
 async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
@@ -63537,10 +62338,6 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
         pa: team.teamTotalPointsAllowed,
       })).slice(0, 16),
     }));
-
-    await logMaddenTeamStatsDbTruth(guild, league, 'immediately-after-requestinfo-write');
-    await logMaddenDisplaySourceTruth(guild, league, 'Dolphins');
-    await logMaddenDisplaySourceTruth(guild, league, 'Bills');
   }
 
   return { seasonGameAnalytics, teamAnalytics };
@@ -63925,543 +62722,11 @@ function summarizeSnallapaExportProbe(command, requestPayload, response) {
   };
 }
 
-async function probeSnallapaCommandMapReconstruction(context, guild, league) {
-  const enabled = String(process.env.EA_SNALLAPA_COMMAND_MAP_PROBE_ENABLED || 'false').toLowerCase() === 'true';
-  if (!enabled) return [];
 
-  const weekResult = await pool.query(
-    `SELECT week_label, COUNT(*)::int AS games
-     FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id = $2
-     GROUP BY week_label
-     ORDER BY week_label DESC
-     LIMIT 3`,
-    [guild.id, league.league_id]
-  );
 
-  const weeks = (weekResult.rows || []).map(row => row.week_label).filter(Boolean);
-  if (!weeks.length) {
-    console.log('[SNALLAPA COMMAND MAP 7J-5BR] No imported weeks available.');
-    return [];
-  }
 
-  // Reconstructed from Snallapa's export destination names:
-  // standings -> StandingExport.teamStandingInfoList
-  // schedules -> SchedulesExport.gameScheduleInfoList
-  // teamStats -> TeamStatsExport.teamStatInfoList
-  // player stat exports -> weekly stat info lists
-  // We probe the likely command ids close to the known Madden mobile career ids.
-  const commandMap = [
-    { exportType: 'standings', name: 'Mobile_Career_GetStandings', id: 802 },
-    { exportType: 'teamStats', name: 'Mobile_Career_GetTeamStats', id: 803 },
-    { exportType: 'weeklyStats', name: 'Mobile_Career_GetWeeklyStats', id: 804 },
-    { exportType: 'seasonStats', name: 'Mobile_Career_GetSeasonStats', id: 805 },
-    { exportType: 'gameStats', name: 'Mobile_Career_GetGameStats', id: 806 },
-    { exportType: 'teamStatsInfo', name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
-    { exportType: 'gameStatsInfo', name: 'Mobile_Career_GetGameStatsInfo', id: 809 },
-    { exportType: 'gameInfo', name: 'Mobile_Career_GetGameInfo', id: 810 },
-    { exportType: 'leagueHub', name: 'Mobile_Career_GetLeagueHub', id: 811 },
-    { exportType: 'seasonGame', name: 'Mobile_Career_GetSeasonGame', id: 812 },
-    { exportType: 'gameDetails', name: 'Mobile_Career_GetGameDetails', id: 813 },
-    { exportType: 'powerRankings', name: 'Mobile_Career_GetPowerRankings', id: 814 },
-    { exportType: 'teamRankings', name: 'Mobile_Career_GetTeamRankings', id: 815 },
-    { exportType: 'gameResult', name: 'Mobile_Career_GetGameResult', id: 816 },
-    { exportType: 'boxScore', name: 'Mobile_Career_GetBoxScore', id: 817 },
-    { exportType: 'scoringSummary', name: 'Mobile_Career_GetScoringSummary', id: 818 },
-  ];
 
-  function pushUnique(list, payload) {
-    const clean = {};
-    for (const [key, value] of Object.entries(payload || {})) {
-      if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
-    }
-    const key = JSON.stringify(clean);
-    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(clean);
-  }
 
-  const gamesResult = await pool.query(
-    `SELECT *
-     FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
-     ORDER BY week_label DESC, imported_at DESC
-     LIMIT 2`,
-    [guild.id, league.league_id]
-  );
-
-  const sampleGame = gamesResult.rows?.[0] || null;
-  const rawGame = sampleGame ? extractMaddenRawGamePayload(sampleGame) : {};
-  const sampleSeasonGameKey = sampleGame ? extractMaddenSeasonGameKeyFromAny(sampleGame) : null;
-
-  const results = [];
-  let attempted = 0;
-  const maxAttempts = Number(process.env.EA_SNALLAPA_COMMAND_MAP_MAX_ATTEMPTS || 48);
-
-  for (const weekLabel of weeks) {
-    const weekNumber = maddenWeekNumberFromLabel(weekLabel);
-    const exportWeekIndex = weekNumber !== null ? Math.max(0, weekNumber - 1) : null;
-    const mcaSeasonWeek = weekNumber !== null ? weekNumber + 3 : null;
-    const stage = 1;
-    const seasonWeekType = 1;
-
-    const payloadVariants = [];
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId) });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stageIndex: stage });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, weekType: seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: weekNumber, stage });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: weekNumber, weekType: seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: mcaSeasonWeek, weekType: seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, weekType: seasonWeekType });
-
-    if (sampleSeasonGameKey) {
-      pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonGameKey: Number(sampleSeasonGameKey) });
-      pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), gameId: Number(sampleSeasonGameKey) });
-      pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonGameKey: Number(sampleSeasonGameKey), weekIndex: exportWeekIndex, stage });
-      pushUnique(payloadVariants, {
-        leagueId: Number(context.externalLeagueId),
-        seasonGameKey: Number(sampleSeasonGameKey),
-        homeTeam: getAnyValue(rawGame, ['homeTeam'], null),
-        awayTeam: getAnyValue(rawGame, ['awayTeam'], null),
-        week: getAnyValue(rawGame, ['week'], null),
-        weekType: getAnyValue(rawGame, ['weekType'], null),
-      });
-    }
-
-    console.log('[SNALLAPA COMMAND MAP TRACE 7J-5BR] ' + JSON.stringify({
-      weekLabel,
-      derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage, seasonWeekType },
-      sampleGame: sampleGame ? {
-        matchup: sampleGame.away_team + ' @ ' + sampleGame.home_team,
-        seasonGameKey: sampleSeasonGameKey,
-        rawKeys: Object.keys(rawGame || {}).slice(0, 50),
-      } : null,
-      payloadVariants: payloadVariants.slice(0, 16),
-      commandMap: commandMap.map(c => c.exportType + ':' + c.name + ':' + c.id),
-    }).slice(0, 12000));
-
-    for (const command of commandMap) {
-      for (const payload of payloadVariants) {
-        if (attempted >= maxAttempts) break;
-        attempted += 1;
-
-        try {
-          const response = await sendEaBlazeCareerModeCommand(context.token, command.name, command.id, payload);
-          const summary = summarizeSnallapaExportProbe(command, payload, response);
-          const record = { success: true, weekLabel, ...summary };
-          results.push(record);
-
-          console.log('[SNALLAPA COMMAND MAP HIT 7J-5BR] ' + JSON.stringify(record).slice(0, 14000));
-
-          const hasUsefulArray = (summary.arrays || []).some(a => Number(a.length || 0) > 0);
-          const hasScorePair = (summary.scorePairs || []).some(pair => pair.hasRealScore);
-          const scoreKeys = Object.keys(summary.scoreLikeFields || {}).filter(key => /score|point|pts|for|against|total|stat/i.test(key));
-
-          if (hasUsefulArray || hasScorePair || scoreKeys.length) {
-            console.log('[SNALLAPA COMMAND MAP CANDIDATE 7J-5BR] ' + JSON.stringify({
-              weekLabel,
-              commandName: command.name,
-              commandId: command.id,
-              exportType: command.exportType,
-              payload,
-              arrays: summary.arrays,
-              scorePairs: summary.scorePairs,
-              scoreKeys: scoreKeys.slice(0, 100),
-              scoreLikeFields: summary.scoreLikeFields,
-            }).slice(0, 18000));
-          }
-        } catch (error) {
-          const fail = {
-            success: false,
-            weekLabel,
-            commandName: command.name,
-            commandId: command.id,
-            exportType: command.exportType,
-            payload,
-            error: String(error?.message || error).slice(0, 900),
-          };
-          results.push(fail);
-          console.log('[SNALLAPA COMMAND MAP FAIL 7J-5BR] ' + JSON.stringify(fail));
-        }
-      }
-      if (attempted >= maxAttempts) break;
-    }
-
-    if (attempted >= maxAttempts) break;
-  }
-
-  console.log('[SNALLAPA COMMAND MAP SUMMARY 7J-5BR] ' + JSON.stringify({
-    attempted,
-    successes: results.filter(r => r.success).length,
-    failures: results.filter(r => !r.success).length,
-    commandsTried: [...new Set(results.map(r => r.commandName))],
-    successfulPayloads: results.filter(r => r.success).map(r => ({
-      weekLabel: r.weekLabel,
-      exportType: r.exportType,
-      commandName: r.commandName,
-      commandId: r.commandId,
-      payload: r.payload,
-      arrays: r.arrays,
-      scorePairs: r.scorePairs,
-      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 80),
-    })).slice(0, 20),
-  }).slice(0, 18000));
-
-  return results;
-}
-
-
-async function probeEaTeamStatsMirrorSource(context, guild, league) {
-  const enabled = String(process.env.EA_TEAMSTATS_PROBE_ENABLED || 'false').toLowerCase() === 'true';
-  if (!enabled) return [];
-
-  const currentWeekResult = await pool.query(
-    `SELECT week_label, COUNT(*)::int AS games
-     FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id = $2
-     GROUP BY week_label
-     ORDER BY week_label DESC
-     LIMIT 4`,
-    [guild.id, league.league_id]
-  );
-
-  const weekLabels = (currentWeekResult.rows || [])
-    .map(row => row.week_label)
-    .filter(Boolean);
-
-  if (!weekLabels.length) {
-    console.log('[EA TEAMSTATS MIRROR PROBE 7J-5BP] No imported weeks available.');
-    return [];
-  }
-
-  const commandCandidates = [
-    // Snallapa MaddenExportDestination.teamStats consumes TeamStatsExport.teamStatInfoList.
-    // Command ids are inferred from earlier EA probes and Snallapa export naming.
-    { name: 'Mobile_Career_GetTeamStats', id: 803 },
-    { name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
-    { name: 'Mobile_Career_GetSeasonStats', id: 805 },
-    { name: 'Mobile_Career_GetWeeklyStats', id: 804 },
-  ];
-
-  const results = [];
-  let attempted = 0;
-  const maxAttempts = Number(process.env.EA_TEAMSTATS_PROBE_MAX_ATTEMPTS || 32);
-
-  function pushUnique(list, payload) {
-    const clean = {};
-    for (const [key, value] of Object.entries(payload || {})) {
-      if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
-    }
-    const key = JSON.stringify(clean);
-    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(clean);
-  }
-
-  for (const weekLabel of weekLabels) {
-    const weekNumber = maddenWeekNumberFromLabel(weekLabel);
-    const exportWeekIndex = weekNumber !== null ? Math.max(0, weekNumber - 1) : null;
-    const mcaSeasonWeek = weekNumber !== null ? weekNumber + 3 : null;
-    const stage = 1;
-    const seasonWeekType = 1;
-
-    const payloadVariants = [];
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stage });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, stageIndex: stage });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, weekType: seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), weekIndex: exportWeekIndex, seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: weekNumber, weekType: seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), week: mcaSeasonWeek, weekType: seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId), seasonWeek: mcaSeasonWeek, seasonWeekType });
-    pushUnique(payloadVariants, { leagueId: Number(context.externalLeagueId) });
-
-    console.log('[SNALLAPA TEAMSTATS TRACE 7J-5BP] ' + JSON.stringify({
-      clue: 'Snallapa export destination posts TeamStatsExport.teamStatInfoList to /week/{stage}/{week}/teamstats',
-      weekLabel,
-      derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage, seasonWeekType },
-      payloadVariants,
-      commands: commandCandidates.map(c => c.name + ':' + c.id),
-    }).slice(0, 9000));
-
-    for (const command of commandCandidates) {
-      for (const requestPayload of payloadVariants) {
-        if (attempted >= maxAttempts) break;
-        attempted += 1;
-
-        try {
-          const response = await sendEaBlazeCareerModeCommand(context.token, command.name, command.id, requestPayload);
-          const summary = summarizeEaTeamStatsProbeValue(command, requestPayload, response);
-          const record = { success: true, weekLabel, ...summary };
-          results.push(record);
-
-          console.log('[EA TEAMSTATS MIRROR HIT 7J-5BP] ' + JSON.stringify(record).slice(0, 12000));
-
-          const arraysWithRows = (summary.arrays || []).filter(a => Number(a.length || 0) > 0);
-          const scoreKeys = Object.keys(summary.scoreLikeFields || {}).filter(key => /score|point|pts|for|against|total/i.test(key));
-
-          if (arraysWithRows.length || scoreKeys.length) {
-            console.log('[EA TEAMSTATS MIRROR CANDIDATE 7J-5BP] ' + JSON.stringify({
-              commandName: command.name,
-              commandId: command.id,
-              payload: requestPayload,
-              arrays: arraysWithRows,
-              scoreKeys: scoreKeys.slice(0, 80),
-              scoreLikeFields: summary.scoreLikeFields,
-            }).slice(0, 15000));
-          }
-        } catch (error) {
-          const fail = {
-            success: false,
-            weekLabel,
-            commandName: command.name,
-            commandId: command.id,
-            payload: requestPayload,
-            error: String(error?.message || error).slice(0, 800),
-          };
-          results.push(fail);
-          console.log('[EA TEAMSTATS MIRROR FAIL 7J-5BP] ' + JSON.stringify(fail));
-        }
-      }
-      if (attempted >= maxAttempts) break;
-    }
-    if (attempted >= maxAttempts) break;
-  }
-
-  console.log('[EA TEAMSTATS MIRROR SUMMARY 7J-5BP] ' + JSON.stringify({
-    attempted,
-    successes: results.filter(r => r.success).length,
-    failures: results.filter(r => !r.success).length,
-    commandsTried: [...new Set(results.map(r => r.commandName))],
-    successfulPayloads: results.filter(r => r.success).map(r => ({
-      weekLabel: r.weekLabel,
-      commandName: r.commandName,
-      commandId: r.commandId,
-      payload: r.payload,
-      arrays: r.arrays,
-      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 50),
-    })).slice(0, 16),
-  }).slice(0, 15000));
-
-  return results;
-}
-
-
-async function probeEaDirectScoreSources(context, guild, league) {
-  const enabled = String(process.env.EA_SCORE_DISCOVERY_ENABLED || 'false').toLowerCase() === 'true';
-  if (!enabled) return [];
-
-  const gamesResult = await pool.query(
-    `SELECT *
-     FROM madden_imported_games
-     WHERE guild_id = $1
-       AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
-     ORDER BY week_label DESC, imported_at DESC
-     LIMIT 2`,
-    [guild.id, league.league_id]
-  );
-
-  const sampleGames = gamesResult.rows || [];
-  if (!sampleGames.length) {
-    console.log('[EA SCORE SOURCE DISCOVERY 7J-5BO] No completed games available for score-source probing.');
-    return [];
-  }
-
-  // Snallabot reference:
-  // Dashboard export calls exporter.exportCurrentWeek(), exporter.exportAllWeeks(), or
-  // exporter.exportSpecificWeeks([{ weekIndex: exportValue.week - 1, stage: exportValue.stage }]).
-  // So this probe focuses on export-style WEEK payloads first, not game-id-only payloads.
-  const commandCandidates = [
-    { name: 'Mobile_Career_GetWeeklyStats', id: 804 },
-    { name: 'Mobile_Career_GetSeasonStats', id: 805 },
-    { name: 'Mobile_Career_GetGameStats', id: 806 },
-    { name: 'Mobile_Career_GetTeamStatsInfo', id: 808 },
-    { name: 'Mobile_Career_GetGameStatsInfo', id: 809 },
-    { name: 'Mobile_Career_GetGameInfo', id: 810 },
-    { name: 'Mobile_Career_GetGameDetails', id: 813 },
-    { name: 'Mobile_Career_GetBoxScore', id: 817 },
-    { name: 'Mobile_Career_GetScoringSummary', id: 818 },
-  ];
-
-  const results = [];
-  let attempted = 0;
-  const maxAttempts = Number(process.env.EA_SCORE_DISCOVERY_MAX_ATTEMPTS || 36);
-
-  function pushUnique(list, payload) {
-    const clean = {};
-    for (const [key, value] of Object.entries(payload || {})) {
-      if (value !== null && value !== undefined && !Number.isNaN(value)) clean[key] = value;
-    }
-    const key = JSON.stringify(clean);
-    if (!list.some(existing => JSON.stringify(existing) === key)) list.push(clean);
-  }
-
-  const leagueCtx = {
-    leagueId: Number(context.externalLeagueId),
-    leagueIdString: String(context.externalLeagueId),
-  };
-
-  for (const game of sampleGames) {
-    const rawGame = extractMaddenRawGamePayload(game);
-    const seasonGameKey = extractMaddenSeasonGameKeyFromAny(game);
-    const weekNumber = maddenWeekNumberFromLabel(game.week_label);
-
-    // Snallabot exportSpecificWeeks passes weekIndex = userWeek - 1.
-    // EA Hub internals sometimes use Madden's seasonWeek index, where regular Week 1 starts after preseason.
-    const exportWeekIndex = weekNumber !== null ? Math.max(0, weekNumber - 1) : null;
-    const mcaSeasonWeek = weekNumber !== null ? weekNumber + 3 : null;
-    const stage = 1;
-    const seasonWeekType = 1;
-
-    const payloadVariants = [];
-
-    // Export-style weekly payloads, based directly on Snallabot's exportSpecificWeeks shape.
-    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, stage });
-    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, stageIndex: stage });
-    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, weekType: seasonWeekType });
-    pushUnique(payloadVariants, { ...leagueCtx, weekIndex: exportWeekIndex, seasonWeekType });
-    pushUnique(payloadVariants, { ...leagueCtx, week: exportWeekIndex, stage });
-    pushUnique(payloadVariants, { ...leagueCtx, week: weekNumber, stage });
-    pushUnique(payloadVariants, { ...leagueCtx, seasonWeek: mcaSeasonWeek, seasonWeekType });
-
-    // Game-detail style payloads.
-    pushUnique(payloadVariants, { ...leagueCtx, seasonGameKey: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
-    pushUnique(payloadVariants, { ...leagueCtx, gameId: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
-    pushUnique(payloadVariants, { ...leagueCtx, game: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
-    pushUnique(payloadVariants, { ...leagueCtx, scheduleId: Number(seasonGameKey), weekIndex: exportWeekIndex, stage });
-
-    // Raw field carry-through variants.
-    pushUnique(payloadVariants, {
-      ...leagueCtx,
-      seasonGameKey: Number(seasonGameKey),
-      homeTeam: getAnyValue(rawGame, ['homeTeam'], null),
-      awayTeam: getAnyValue(rawGame, ['awayTeam'], null),
-      week: getAnyValue(rawGame, ['week'], null),
-      weekType: getAnyValue(rawGame, ['weekType'], null),
-    });
-
-    console.log('[SNALLAPA TRACE 7J-5BO] ' + JSON.stringify({
-      source: 'snallabot routes.ts uses exportSpecificWeeks([{ weekIndex: exportValue.week - 1, stage: exportValue.stage }])',
-      game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey },
-      derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage, seasonWeekType },
-      payloadVariants: payloadVariants.slice(0, 14),
-      commands: commandCandidates.map(c => c.name + ':' + c.id),
-    }).slice(0, 9000));
-
-    for (const command of commandCandidates) {
-      for (const requestPayload of payloadVariants) {
-        if (attempted >= maxAttempts) break;
-        attempted += 1;
-
-        try {
-          const response = await sendEaBlazeCareerModeCommand(context.token, command.name, command.id, requestPayload);
-          const summary = summarizeEaScoreProbeValue(command, requestPayload, response);
-          const record = {
-            success: true,
-            game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey },
-            derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage },
-            ...summary,
-          };
-          results.push(record);
-
-          console.log('[EA SCORE SOURCE DISCOVERY HIT 7J-5BO] ' + JSON.stringify(record).slice(0, 9000));
-
-          const scoreKeys = Object.keys(summary.scoreLikeFields || {}).filter(key => /score|point|pts|stat|total/i.test(key));
-          if (scoreKeys.length) {
-            console.log('[EA SCORE SOURCE DISCOVERY FOUND SCORE-LIKE DATA 7J-5BO] ' + JSON.stringify({
-              commandName: command.name,
-              commandId: command.id,
-              payload: requestPayload,
-              scoreKeys: scoreKeys.slice(0, 80),
-              scoreLikeFields: summary.scoreLikeFields,
-              arrays: summary.arrays,
-            }).slice(0, 12000));
-          }
-        } catch (error) {
-          const fail = {
-            success: false,
-            game: { week: game.week_label, matchup: game.away_team + ' @ ' + game.home_team, seasonGameKey },
-            derived: { weekNumber, exportWeekIndex, mcaSeasonWeek, stage },
-            commandName: command.name,
-            commandId: command.id,
-            payload: requestPayload,
-            error: String(error?.message || error).slice(0, 700),
-          };
-          results.push(fail);
-          console.log('[EA SCORE SOURCE DISCOVERY FAIL 7J-5BO] ' + JSON.stringify(fail));
-        }
-      }
-      if (attempted >= maxAttempts) break;
-    }
-
-    if (attempted >= maxAttempts) break;
-  }
-
-  console.log('[EA SCORE SOURCE DISCOVERY SUMMARY 7J-5BO] ' + JSON.stringify({
-    attempted,
-    successes: results.filter(r => r.success).length,
-    failures: results.filter(r => !r.success).length,
-    commandsTried: [...new Set(results.map(r => r.commandName))],
-    successfulPayloads: results.filter(r => r.success).map(r => ({
-      commandName: r.commandName,
-      commandId: r.commandId,
-      payload: r.payload,
-      scoreLikeKeys: Object.keys(r.scoreLikeFields || {}).slice(0, 40),
-      arrays: r.arrays,
-    })).slice(0, 12),
-  }).slice(0, 12000));
-
-  return results;
-}
-
-async function inspectMaddenCompletedGameRawScores(guild, league) {
-  const gamesResult = await pool.query(
-    `SELECT *
-     FROM madden_imported_games
-     WHERE guild_id = $1
-       AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
-     ORDER BY week_label ASC, imported_at DESC
-     LIMIT 8`,
-    [guild.id, league.league_id]
-  );
-
-  const samples = gamesResult.rows.map(game => {
-    const parsedRaw = (() => {
-      try {
-        return typeof game.raw_payload === 'string' ? JSON.parse(game.raw_payload) : (game.raw_payload || {});
-      } catch {
-        return {};
-      }
-    })();
-
-    const rawGame = extractMaddenRawGamePayload(game);
-    const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
-
-    return {
-      db: {
-        id: game.external_game_id,
-        week: game.week_label,
-        matchup: game.away_team + ' @ ' + game.home_team,
-        status: game.status,
-        dbScore: String(game.away_score) + '-' + String(game.home_score),
-      },
-      scoreInfo,
-      parsedRawTopKeys: Object.keys(parsedRaw || {}).slice(0, 50),
-      rawGameKeys: Object.keys(rawGame || {}).slice(0, 80),
-      scoreLikeFields: collectMaddenScoreLikeFields(parsedRaw),
-      rawGameScoreLikeFields: collectMaddenScoreLikeFields(rawGame),
-      rawExcerpt: compactMaddenRawExcerpt(parsedRaw),
-    };
-  });
-
-  console.log('[Madden Raw Score Inspector 7J-5BO] ' + JSON.stringify({
-    inspectedGames: samples.length,
-    samples,
-  }).slice(0, 18000));
-
-  return samples.length;
-}
 
 
 async function recalculateMaddenStandingsFromImportedGames(guild, league) {
@@ -64618,44 +62883,6 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
 }
 
 
-async function recalculateMaddenTeamPointsFromImportedGames(guild, league) {
-  const teamsResult = await pool.query(
-    `SELECT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`,
-    [guild.id, league.league_id]
-  );
-
-  for (const row of teamsResult.rows) {
-    const teamName = row.team_name;
-    const gamesResult = await pool.query(
-      `SELECT * FROM madden_imported_games
-       WHERE guild_id = $1 AND league_id = $2
-         AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'complete', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
-         AND (LOWER(home_team) = LOWER($3) OR LOWER(away_team) = LOWER($3))`,
-      [guild.id, league.league_id, teamName]
-    );
-
-    let pf = 0;
-    let pa = 0;
-
-    for (const game of gamesResult.rows) {
-      const isHome = String(game.home_team || '').toLowerCase() === String(teamName || '').toLowerCase();
-      const teamScore = Number(isHome ? game.home_score : game.away_score);
-      const oppScore = Number(isHome ? game.away_score : game.home_score);
-      if (!Number.isFinite(teamScore) || !Number.isFinite(oppScore)) continue;
-      pf += teamScore;
-      pa += oppScore;
-    }
-
-    await pool.query(
-      `UPDATE madden_imported_team_stats
-       SET points_for = CASE WHEN $3 > 0 OR $4 > 0 THEN $3 ELSE points_for END,
-           points_against = CASE WHEN $3 > 0 OR $4 > 0 THEN $4 ELSE points_against END,
-           imported_at = NOW()
-       WHERE guild_id = $1 AND league_id = $2 AND LOWER(team_name) = LOWER($5)`,
-      [guild.id, league.league_id, pf, pa, teamName]
-    );
-  }
-}
 
 
 async function runMaddenEaDirectSync(guild, league, options = {}) {
@@ -64886,9 +63113,6 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     await recalculateMaddenStandingsFromImportedGames(guild, league).catch(error => {
       console.error('[Madden Sync] Multi-week standings accumulator failed:', error?.message || error);
     });
-    await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-accumulator').catch(error => {
-      console.error('[Madden Sync] DB truth after accumulator failed:', error?.message || error);
-    });
     await harvestRequestInfoTeamAnalytics(context, guild, league, hub).catch(error => {
       console.error('[Madden Sync] RequestInfo PF/PA post-accumulator reapply failed:', error?.message || error);
     });
@@ -64940,33 +63164,6 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       return { players: 0, stats: 0 };
     });
     console.log('[MADDEN PLAYER IMPORT COUNTS 7J-7ZP] ' + JSON.stringify(maddenPlayerImportCounts));
-    await logMaddenTeamStatsDbTruth(guild, league, 'after-standings-export-7j5d').catch(error => {
-      console.error('[Madden Sync] DB truth after standings export failed:', error?.message || error);
-    });
-    await logMaddenTeamStatsDbTruth(guild, league, 'after-schedule-derived-pfpa-synthesis').catch(error => {
-      console.error('[Madden Sync] DB truth after schedule PF/PA synthesis failed:', error?.message || error);
-    });
-    await logMaddenTeamStatsDbTruth(guild, league, 'after-requestinfo-post-accumulator-reapply').catch(error => {
-      console.error('[Madden Sync] DB truth after RequestInfo reapply failed:', error?.message || error);
-    });
-    await inspectMaddenCompletedGameRawScores(guild, league).catch(error => {
-      console.error('[Madden Sync] Raw score inspector failed:', error?.message || error);
-    });
-    await probeEaDirectScoreSources(context, guild, league).catch(error => {
-      console.error('[Madden Sync] EA score source discovery failed:', error?.message || error);
-    });
-    await probeEaTeamStatsMirrorSource(context, guild, league).catch(error => {
-      console.error('[Madden Sync] TeamStats mirror probe failed:', error?.message || error);
-    });
-    await inspectMaddenDeepRawScoreCandidates(guild, league).catch(error => {
-      console.error('[Madden Sync] Deep raw score candidate inspector failed:', error?.message || error);
-    });
-    await probeSnallapaCommandMapReconstruction(context, guild, league).catch(error => {
-      console.error('[Madden Sync] Snallapa command-map probe failed:', error?.message || error);
-    });
-    await probeEaSingleUseSessionReplay(context, guild, league).catch(error => {
-      console.error('[Madden Sync] Single-use session replay probe failed:', error?.message || error);
-    });
 
     await syncMaddenFranchises(guild, league).catch(() => null);
     await cleanupMaddenTradeBlockAfterRosterSync(guild.id, league.league_id).catch(() => null);
@@ -65011,13 +63208,6 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       '\n\n' + advanceStatusLine +
       '\n\n📊 **EA reports current week:** ' + (eaHubCtx?.displayedWeek || 'unknown') +
       '\n📋 **Week label breakdown:** ' + (weekLabelBreakdown || '(no games found)');
-
-    await logMaddenTeamStatsDbTruth(guild, league, 'final-before-sync-run-complete').catch(error => {
-      console.error('[Madden Sync] Final DB truth probe failed:', error?.message || error);
-    });
-    await logMaddenDisplaySourceTruth(guild, league, 'Dolphins').catch(error => {
-      console.error('[Madden Sync] Final display source truth probe failed:', error?.message || error);
-    });
 
     await pool.query(
       `UPDATE madden_sync_runs
@@ -65823,9 +64013,6 @@ function buildMaddenEaPersonaComponents(leagueId) {
   ];
 }
 
-function buildMaddenEaFranchiseComponents(leagueId) {
-  return buildMaddenEaDynamicLeagueComponents(leagueId, []);
-}
 
 
 function buildMaddenEaDynamicLeagueComponents(leagueId, leagueRows = []) {
@@ -65862,10 +64049,6 @@ function buildMaddenEaDynamicLeagueComponents(leagueId, leagueRows = []) {
   ];
 }
 
-async function getMaddenEaLeagueChoiceComponents(leagueId, userId) {
-  const choices = await getEaLeagueChoicesForConnection(leagueId, userId).catch(() => []);
-  return buildMaddenEaDynamicLeagueComponents(leagueId, choices);
-}
 
 
 async function markLeagueEaDirectEnabled(leagueId, enabled = true) {
@@ -66489,63 +64672,6 @@ async function runMaddenExternalFetchSync(guild, league, options = {}) {
 }
 
 
-async function runMaddenExternalSyncPlaceholder(guild, league, options = {}) {
-  const settings = await ensureMaddenLeagueSettings(league);
-  const runId = randomUUID();
-
-  await pool.query(
-    `INSERT INTO madden_sync_runs (id, guild_id, league_id, source, status, week_label, message)
-     VALUES ($1, $2, $3, $4, 'running', $5, $6)`,
-    [runId, guild.id, league.league_id, settings.sync_source || 'unlinked', options.week || null, 'Madden sync started.']
-  );
-
-  // V1 foundation: no external provider API is hardcoded yet.
-  // This creates the import pipeline, sync log, and local franchise/team bridge.
-  // Once the exact Neon/league export source is confirmed, this function becomes the real fetch/import worker.
-  await syncMaddenFranchises(guild, league).catch(() => null);
-
-  const teams = await pool.query(
-    `SELECT * FROM madden_franchises WHERE guild_id = $1 AND league_id = $2 ORDER BY team_name ASC`,
-    [guild.id, league.league_id]
-  );
-
-  for (const team of teams.rows) {
-    await pool.query(
-      `INSERT INTO madden_imported_team_stats (guild_id, league_id, team_name, team_role_id, owner_user_id, wins, losses, ties)
-       VALUES ($1, $2, $3, $4, $5, 0, 0, 0)
-       ON CONFLICT (league_id, team_name)
-       DO UPDATE SET team_role_id = $4, owner_user_id = $5, imported_at = NOW()`,
-      [guild.id, league.league_id, team.team_name, team.team_role_id, team.owner_user_id || null]
-    );
-  }
-
-  const message = settings.sync_source
-    ? 'Sync foundation completed. Teams were bridged locally. External fetch/import worker is ready for provider wiring.'
-    : 'No external Madden source linked yet. Use /madden link first. Local teams were still bridged.';
-
-  await pool.query(
-    `UPDATE madden_sync_runs
-     SET status = 'completed',
-         message = $2,
-         imported_teams = $3,
-         completed_at = NOW()
-     WHERE id = $1`,
-    [runId, message, teams.rows.length]
-  );
-
-  await pool.query(
-    `UPDATE madden_league_settings
-     SET last_sync_at = NOW(),
-         last_sync_status = 'completed',
-         last_sync_message = $2,
-         updated_at = NOW()
-     WHERE league_id = $1`,
-    [league.league_id, message]
-  );
-
-  const runResult = await pool.query(`SELECT * FROM madden_sync_runs WHERE id = $1 LIMIT 1`, [runId]);
-  return runResult.rows[0] || { id: runId, status: 'completed', message };
-}
 
 async function getMaddenImportedStatus(guildId, leagueId) {
   const [teams, games, players, runs] = await Promise.all([
