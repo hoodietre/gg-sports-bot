@@ -37,7 +37,15 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    // 7J-PUBLICPREP-INTENTS: MessageContent (privileged) intentionally
+    // dropped, per Hxxdie — it was only used for passive message-activity
+    // points (+0.2/message), and privileged intents cap the bot at 100
+    // servers without going through Discord's verification process
+    // (which requires a hosted ToS/Privacy Policy). Not worth that cost for
+    // 0.2 points. Can revisit if richer message-based tracking is wanted
+    // later. GuildMessages (non-privileged) is still needed — ticket
+    // evidence and trade-negotiation screenshot detection both read
+    // message.attachments, not message.content.
     // 7J-43ACTIVITY: required for voice-activity tracking — VoiceStateUpdate
     // events simply never fire without this. Not a privileged intent, no
     // Developer Portal toggle needed, just this array entry.
@@ -96,6 +104,15 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('railway.app')
     ? { rejectUnauthorized: false }
     : false,
+});
+
+// 7J-PUBLICPREP-POOLERROR: without this, an idle client hitting a backend/
+// network error (more likely as guild count and concurrent DB load grow)
+// throws an unhandled 'error' event that only ever gets caught by the
+// generic process-level uncaughtException logger below — no pool context,
+// easy to miss. Explicit handler keeps it visible and non-fatal.
+pool.on('error', (error) => {
+  console.error('Postgres pool error (idle client):', error);
 });
 
 // Currency is a single global identity (GG Coins by default) and per-server payout
@@ -2197,17 +2214,12 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE user_global_activity ADD COLUMN IF NOT EXISTS achievement_score_raw INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`ALTER TABLE user_global_activity ADD COLUMN IF NOT EXISTS seasons_completed INTEGER NOT NULL DEFAULT 0`);
 
-  // 7J-43ACTIVITY: last-counted-message timestamp per (guild, user), used to
-  // enforce the 60s cooldown on message-activity points without needing to
-  // scan message history.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_message_activity_cooldown (
-      guild_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      last_counted_at TIMESTAMP NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (guild_id, user_id)
-    )
-  `);
+  // 7J-PUBLICPREP-INTENTS: user_message_activity_cooldown backed passive
+  // message-activity tracking, which required the MessageContent privileged
+  // intent — dropped per Hxxdie (see intents block) rather than pay the
+  // Discord-verification cost for +0.2 activity/message. Per the same
+  // drop-it-fully convention as trade_counts above.
+  await pool.query(`DROP TABLE IF EXISTS user_message_activity_cooldown`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_awards (
@@ -8417,15 +8429,10 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot || !message.guild) return;
 
-    // 7J-43ACTIVITY: passive message activity — +0.2 activity per message,
-    // only messages 25+ characters (trimmed, so whitespace-padding to hit
-    // the length doesn't count), max once per 60s per (guild, user) to block
-    // spam-farming. No league attribution (not reliably determinable from a
-    // channel in a multi-league server) — server + universal only. This runs
-    // unconditionally at the top of the listener, before any of the
-    // ticket-evidence/pending-offer logic below, so it isn't accidentally
-    // skipped by an early return elsewhere in this function.
-    await trackPassiveMessageActivity(message).catch(error => console.warn('[7J-43ACTIVITY] message tracking failed:', error?.message || error));
+    // 7J-PUBLICPREP-INTENTS: passive message-activity tracking removed here
+    // (was +0.2/message, 25+ chars, 60s cooldown) — depended on the
+    // MessageContent privileged intent, which was dropped per Hxxdie. See
+    // the intents block above for the full reasoning.
 
     if (message.channel?.isThread() && message.attachments.size > 0) {
       const ticket = await getOpenTicketByThread(message.guild.id, message.channel.id);
@@ -28145,39 +28152,11 @@ async function checkSportsbookAchievements(guildId, userId, singleWinAmount = nu
   }
 }
 
-// 7J-43ACTIVITY: passive message activity. 60s cooldown enforced via
-// user_message_activity_cooldown rather than an in-memory Map so it
-// survives bot restarts correctly (a restart mid-cooldown shouldn't let
-// someone immediately farm a free point).
-const PASSIVE_MESSAGE_MIN_LENGTH = 25;
-const PASSIVE_MESSAGE_COOLDOWN_MS = 60 * 1000;
-const PASSIVE_MESSAGE_POINTS = 0.2;
-
-async function trackPassiveMessageActivity(message) {
-  const content = String(message.content || '').trim();
-  if (content.length < PASSIVE_MESSAGE_MIN_LENGTH) return;
-
-  const guildId = message.guild.id;
-  const userId = message.author.id;
-
-  const cooldownResult = await pool.query(
-    `SELECT last_counted_at FROM user_message_activity_cooldown WHERE guild_id = $1 AND user_id = $2 LIMIT 1`,
-    [guildId, userId]
-  ).catch(() => ({ rows: [] }));
-  const lastCountedAt = cooldownResult.rows[0]?.last_counted_at ? new Date(cooldownResult.rows[0].last_counted_at).getTime() : 0;
-  if (Date.now() - lastCountedAt < PASSIVE_MESSAGE_COOLDOWN_MS) return;
-
-  await pool.query(
-    `INSERT INTO user_message_activity_cooldown (guild_id, user_id, last_counted_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (guild_id, user_id) DO UPDATE SET last_counted_at = NOW()`,
-    [guildId, userId]
-  ).catch(() => null);
-
-  // No leagueId — passive engagement isn't reliably attributable to one
-  // league in a multi-league server, so this only hits server + universal.
-  await addActivityPoints(guildId, userId, PASSIVE_MESSAGE_POINTS, 0).catch(() => null);
-}
+// 7J-PUBLICPREP-INTENTS: trackPassiveMessageActivity (message-content-based
+// activity points) removed along with the MessageContent intent — see the
+// intents block near the top of the file. user_message_activity_cooldown's
+// CREATE TABLE was removed too; per Hxxdie's standing convention, dead
+// things get removed completely rather than left as unused scaffolding.
 
 // 7J-43ACTIVITY: passive voice activity. In-memory session tracking
 // (guildId:userId -> session state) rather than a persisted table —
