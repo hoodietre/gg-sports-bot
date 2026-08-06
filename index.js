@@ -4708,13 +4708,32 @@ function getRegisteredCommands() {
   return commands;
 }
 
-async function registerCommands() {
+// 7J-PUBLICPREP-CMDREG: registers guild slash commands for a single guild.
+// Pulled out of registerCommands() so a brand-new guild (GuildCreate) can get
+// its commands immediately, instead of only ever getting them at bot boot.
+async function registerCommandsForGuild(guildId, commands) {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const commandList = commands || getRegisteredCommands();
+  try {
+    console.log('Registering guild commands for:', guildId);
+    await rest.put(
+      Routes.applicationGuildCommands(CLIENT_ID, guildId),
+      { body: commandList }
+    );
+    console.log('Guild commands synced for ' + guildId + ':', commandList.length);
+    return true;
+  } catch (error) {
+    console.error('Guild command sync failed for ' + guildId + ':', error);
+    return false;
+  }
+}
+
+async function registerCommands() {
   const commands = getRegisteredCommands();
 
   console.log('Prepared command count:', commands.length);
   console.log('Registered command names:', commands.map(command => command.name).join(', '));
-  console.log('Registering guild commands only for fast/stable testing...');
+  console.log('Registering guild commands for all known guilds...');
 
   const guildIds = new Set();
 
@@ -4736,16 +4755,7 @@ async function registerCommands() {
   }
 
   for (const guildId of guildIds) {
-    try {
-      console.log('Registering guild commands for:', guildId);
-      await rest.put(
-        Routes.applicationGuildCommands(CLIENT_ID, guildId),
-        { body: commands }
-      );
-      console.log('Guild commands synced for ' + guildId + ':', commands.length);
-    } catch (error) {
-      console.error('Guild command sync failed for ' + guildId + ':', error);
-    }
+    await registerCommandsForGuild(guildId, commands);
   }
 }
 
@@ -9445,6 +9455,13 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
 });
 
 client.on(Events.GuildCreate, async (guild) => {
+  // 7J-PUBLICPREP-CMDREG: previously commands were only ever registered at
+  // bot boot for whatever guilds were in the cache at that moment — a new
+  // guild added the bot, got the welcome DM telling them to run /league
+  // create, and that command (and every other one) simply didn't exist for
+  // them until Hxxdie happened to restart the bot. Register this guild's
+  // commands first, so by the time the DM below arrives, the commands work.
+  await registerCommandsForGuild(guild.id).catch(err => console.error('Guild command registration on join failed:', err?.message));
   await sendNewServerOwnerOnboardingDM(guild).catch(err => console.error('New server owner onboarding DM failed:', err?.message));
 });
 
