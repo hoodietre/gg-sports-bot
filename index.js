@@ -2750,6 +2750,7 @@ async function initDatabase() {
   await loadCurrencyConfig();
   await loadBotSettings();
   await migrateMaddenSportsbookAutoLinesDefaultOn();
+  await migrateMaddenSportsbookGamesLegacyLeagueGameLink();
   await migrateSingleChannelPanelsToMultiChannel();
   await migrateStaleScheduleExportDuplicateGames();
 
@@ -2762,6 +2763,76 @@ async function initDatabase() {
 // deliberately disables this *after* the migration runs would get silently
 // re-enabled on the next bot restart. A plain unconditional UPDATE would do that;
 // this migration-key guard is what prevents it.
+// 7J-157PROPLOCK: one-time backfill for sportsbook_games rows created before
+// league_game_id was set at creation time (see generateMaddenPlayerPropLines
+// and the Madden auto-line creator) — without this, the Game Started lock
+// fix only protects props/lines created going forward, leaving anything
+// already open (like the exact prop Hxxdie's bug report was about)
+// permanently unlockable since nothing would ever backfill the link.
+// Moneylines: linked via the existing reverse FK already stored on
+// madden_imported_games.sportsbook_game_id — a direct, certain match.
+// Player props: no reverse FK exists for these, so resolved via the same
+// subject_ref -> madden_players.team_name -> madden_imported_games
+// (home_team/away_team) path already proven correct elsewhere in this
+// codebase (see the self-bet team-ownership check). Only touches rows
+// that are still open and unlinked — never overwrites an existing link,
+// never touches a settled/closed row.
+async function migrateMaddenSportsbookGamesLegacyLeagueGameLink() {
+  const MIGRATION_KEY = 'madden_sportsbook_games_legacy_league_game_link_v1';
+
+  const already = await pool.query(
+    `SELECT 1 FROM system_migrations WHERE migration_key = $1`,
+    [MIGRATION_KEY]
+  );
+  if (already.rows.length > 0) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const moneylineResult = await client.query(
+      `UPDATE sportsbook_games sg
+       SET league_game_id = mig.id
+       FROM madden_imported_games mig
+       WHERE mig.sportsbook_game_id = sg.id
+         AND sg.league_game_id IS NULL
+         AND sg.status = 'open'`
+    );
+
+    const propResult = await client.query(
+      `UPDATE sportsbook_games sg
+       SET league_game_id = mig.id
+       FROM madden_players mp, madden_imported_games mig
+       WHERE sg.bet_type = 'stat_prop'
+         AND sg.league_game_id IS NULL
+         AND sg.status = 'open'
+         AND sg.subject_ref IS NOT NULL
+         AND mp.league_id = sg.league_id
+         AND (mp.roster_id = sg.subject_ref OR mp.presentation_id = sg.subject_ref)
+         AND mig.league_id = sg.league_id
+         AND mig.status != 'final'
+         AND (LOWER(mig.home_team) = LOWER(mp.team_name) OR LOWER(mig.away_team) = LOWER(mp.team_name))`
+    ).catch(err => {
+      console.error('[Sportsbook Migration] Legacy prop link backfill failed:', err?.message || err);
+      return { rowCount: 0 };
+    });
+
+    await client.query(
+      `INSERT INTO system_migrations (migration_key) VALUES ($1)`,
+      [MIGRATION_KEY]
+    );
+
+    await client.query('COMMIT');
+    console.log('[Sportsbook Migration] Legacy league_game_id backfill: '
+      + moneylineResult.rowCount + ' moneyline(s), ' + (propResult.rowCount || 0) + ' prop(s) linked.');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('[Sportsbook Migration] Legacy league_game_id backfill failed:', error);
+  } finally {
+    client.release();
+  }
+}
+
 async function migrateMaddenSportsbookAutoLinesDefaultOn() {
   const MIGRATION_KEY = 'madden_sportsbook_auto_lines_default_on_v1';
 
@@ -4405,13 +4476,15 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
     const currencySettings = await getCurrencySettings(guild.id).catch(() => null);
     const awardPayout = Number(currencySettings?.award_payout ?? 50);
     const championshipPayout = clampPayoutRate('championship_payout', Number(currencySettings?.championship_payout ?? 150));
-    // 7J-40ACHIEVE: anti-abuse guard placeholder — Hxxdie's call is a minimum
-    // 6 users in the league to qualify for achievement rewards (adjusted down
-    // from the originally-discussed 10), but NOT wired in yet, deliberately,
-    // until testing wraps. When ready: count real league members here (not
-    // just teams) and skip the grantAchievement calls below if under
-    // threshold, while still recording the award/championship history rows
-    // either way so nothing is lost.
+    // 7J-40ACHIEVE: anti-abuse guard, wired in per Hxxdie — minimum 6 real
+    // (non-bot) members holding the League Role to qualify for achievement
+    // currency rewards. Below threshold, the award/championship history
+    // rows below still get recorded either way (nothing lost, and the
+    // Franchise Hub's Award History/Hall of Fame views stay accurate) —
+    // only the grantAchievement currency payout is skipped.
+    const leagueRole = league.league_role_id ? await guild.roles.fetch(league.league_role_id).catch(() => null) : null;
+    const realLeagueMemberCount = leagueRole ? leagueRole.members.filter(m => !m.user.bot).size : 0;
+    const meetsAchievementThreshold = realLeagueMemberCount >= 6;
     for (const award of awards) {
       await pool.query(
         `INSERT INTO madden_award_history (guild_id, league_id, season_label, award_key, award_name, player_key, player_name, team_name, position, value_snapshot, status, finalized_at, updated_at)
@@ -4431,7 +4504,7 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
       // last season's already-claimed key.
       if (award.team_name) {
         const awardOwnerId = await findMaddenOwnerForTeamName(guild.id, league.league_id, award.team_name).catch(() => null);
-        if (awardOwnerId) {
+        if (awardOwnerId && meetsAchievementThreshold) {
           const granted = await grantAchievement(guild.id, league.league_id, awardOwnerId, `award_${award.award_key}_${achievementSeasonKey}`, 'award', award.award_name, awardPayout);
           if (granted) await addRecognitionPoints(guild.id, awardOwnerId, 10, 25, league.league_id).catch(() => null);
         }
@@ -4445,7 +4518,7 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
          DO UPDATE SET champion_team = EXCLUDED.champion_team, runner_up_team = EXCLUDED.runner_up_team, champion_owner_user_id = EXCLUDED.champion_owner_user_id, value_snapshot = EXCLUDED.value_snapshot, finalized_at = NOW(), updated_at = NOW()`,
         [guild.id, String(league.league_id), seasonLabel, championName, runnerUpName || null, championOwnerId || null, JSON.stringify({ super_bowl: sb, champion: championName, runner_up: runnerUpName })]
       ).catch(() => null);
-      if (championOwnerId) {
+      if (championOwnerId && meetsAchievementThreshold) {
         // 7J-40ACHIEVE / 7J-41SEASON: this legacy/activity/championships bump
         // previously had NO dedup at all — clicking confirm twice on the same
         // season would have silently double-counted it every time. Now gated
@@ -13924,8 +13997,26 @@ if (interaction.commandName === 'avatar') {
         }
 
         const roundMatchups = schedule[currentRound];
+        // 7J-156ROUNDROTATION: capture the label of the round that was just
+        // active BEFORE incrementing — currentRound here is still the old
+        // value, which is exactly the label number used when that round's
+        // threads were created (labels are 1-based, current_round is stored
+        // as however many rounds have been advanced through so far). Null
+        // on the very first Start League press, since there's no prior
+        // round's threads yet.
+        const previousRoundLabel = currentRound > 0 ? `Game ${currentRound}` : null;
         currentRound += 1;
         await pool.query(`UPDATE league_custom_settings SET current_round = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, currentRound]);
+
+        // Delete the previous round's game threads before creating the new
+        // round's — per Hxxdie, these were piling up indefinitely since
+        // nothing ever cleaned them up. Discord threads only; the
+        // league_games rows (scores, standings history) are untouched.
+        let previousRoundCleanup = null;
+        if (previousRoundLabel) {
+          previousRoundCleanup = await deleteLeagueGameThreadsForWeekSilent(interaction.guild, league, previousRoundLabel)
+            .catch(err => { console.error('[Structured Advance] Previous round thread cleanup failed:', err?.message || err); return { deleted: 0, failed: 0 }; });
+        }
 
         // Structured-schedule matchups used to only get a bare, unlabeled Discord
         // thread here — no league_games row, no team assignment stored, no way to
@@ -13971,7 +14062,10 @@ if (interaction.commandName === 'avatar') {
           ? `**League started! Game 1/${schedule.length}**`
           : `**Advanced to Game ${currentRound}/${schedule.length}**`;
         const startedNote = isFirstStart ? '\n\nThe Operations button is now labeled **Advance** for future games.' : '';
-        await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}` });
+        const cleanupNote = previousRoundCleanup && (previousRoundCleanup.deleted || previousRoundCleanup.failed)
+          ? `\n🧹 Cleaned up ${previousRoundLabel}: ${previousRoundCleanup.deleted} old thread(s) removed${previousRoundCleanup.failed ? `, ${previousRoundCleanup.failed} failed` : ''}.`
+          : '';
+        await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}${cleanupNote}` });
         return;
       }
 
@@ -14678,9 +14772,10 @@ if (interaction.commandName === 'avatar') {
         if (interaction.channel?.isThread?.()) {
           const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+          const reportCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at), false, leagueCategoryEmoji(league)),
+            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at), false, leagueCategoryEmoji(league), reportCustomSettings.schedule_style !== 'structured'),
           }).catch(() => null);
         }
         if (league) await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -14748,10 +14843,11 @@ if (interaction.commandName === 'avatar') {
       const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
       const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
       if (interaction.channel?.isThread?.()) {
-        const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
+        const gameStartedCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+        const wagersEnabled = gameStartedCustomSettings.wagers_enabled === true;
         await interaction.channel.send({
           embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-          components: buildGameCenterThreadComponents(gameId, false, true, wagersEnabled, leagueCategoryEmoji(league)),
+          components: buildGameCenterThreadComponents(gameId, false, true, wagersEnabled, leagueCategoryEmoji(league), gameStartedCustomSettings.schedule_style !== 'structured'),
         }).catch(() => null);
       }
       return;
@@ -15046,10 +15142,11 @@ if (interaction.commandName === 'avatar') {
         if (interaction.channel?.isThread?.()) {
           const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
-          const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
+          const resetCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+          const wagersEnabled = resetCustomSettings.wagers_enabled === true;
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, false, false, wagersEnabled, leagueCategoryEmoji(league)),
+            components: buildGameCenterThreadComponents(gameId, false, false, wagersEnabled, leagueCategoryEmoji(league), resetCustomSettings.schedule_style !== 'structured'),
           }).catch(() => null);
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -15098,9 +15195,10 @@ if (interaction.commandName === 'avatar') {
         if (interaction.channel?.isThread?.()) {
           const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
           const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+          const forceWinCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
           await interaction.channel.send({
             embeds: [buildGameCenterMatchupEmbed(league, updatedGame, homeOwner?.id, awayOwner?.id)],
-            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at), false, leagueCategoryEmoji(league)),
+            components: buildGameCenterThreadComponents(gameId, true, Boolean(updatedGame?.game_started_at), false, leagueCategoryEmoji(league), forceWinCustomSettings.schedule_style !== 'structured'),
           }).catch(() => null);
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
@@ -27788,14 +27886,6 @@ async function buildSportsbookPanelEmbed(guildId) {
     [guildId]
   );
 
-  const recentResult = await pool.query(
-    `SELECT * FROM sportsbook_games
-     WHERE guild_id = $1 AND status = 'settled'
-     ORDER BY settled_at DESC NULLS LAST
-     LIMIT 5`,
-    [guildId]
-  );
-
   // Sectioned by bet type — no exposed short-ID codes anywhere in here. Selection
   // now happens via select menus (real matchup/prop names as the visible option),
   // so there's nothing for a code to need to correlate to anymore.
@@ -27844,14 +27934,6 @@ async function buildSportsbookPanelEmbed(guildId) {
   if (!moneylines.length && !playerProps.length && !freeformProps.length) {
     embed.addFields({ name: 'Open Lines', value: 'No open sportsbook lines right now — check back soon.', inline: false });
   }
-
-  const recentLines = recentResult.rows.length
-    ? recentResult.rows.map(row => {
-        const winnerLabel = row.winner_side === 'home' ? row.home_label : row.away_label;
-        return `**${row.game_label}** — ✅ ${winnerLabel}`;
-      }).join(NL)
-    : 'No settled results yet.';
-  embed.addFields({ name: '📋 Recent Results', value: recentLines.slice(0, 1000), inline: false });
 
   return embed;
 }
@@ -29171,6 +29253,36 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
   return { sportsbookGame, winners, losers, totalPaid, parlayResult };
 }
 
+// 7J-156ROUNDROTATION: structured-schedule equivalent of
+// deleteMaddenWeekThreadsSilent (Madden's weekly auto-rotation) — the
+// Advance flow was creating each new round's game threads without ever
+// cleaning up the previous round's, leaving old completed-round threads
+// sitting there indefinitely. Deletes the actual Discord threads only —
+// the league_games rows themselves (scores, standings history) are left
+// untouched.
+async function deleteLeagueGameThreadsForWeekSilent(guild, league, weekLabel) {
+  if (!weekLabel) return { deleted: 0, failed: 0 };
+  const result = await pool.query(
+    `SELECT * FROM league_games
+     WHERE guild_id = $1 AND league_id = $2
+       AND LOWER(COALESCE(week_label, '')) = LOWER($3)
+       AND thread_id IS NOT NULL`,
+    [guild.id, league.league_id, weekLabel]
+  ).catch(() => ({ rows: [] }));
+  let deleted = 0, failed = 0;
+  for (const game of result.rows || []) {
+    const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+    if (thread) {
+      const ok = await thread.delete('GG Sports structured league round rotation').catch(() => false);
+      if (ok !== false) deleted++;
+      else failed++;
+    } else {
+      deleted++; // already gone from Discord — still counts as cleared
+    }
+  }
+  return { deleted, failed };
+}
+
 // 7K-GC: Game Center — shared game create/report/reset logic.
 // Extracted so /game add, /game report, /game reset, and the new Game Center
 // panel (buttons + matchup threads, built for open-schedule leagues that don't
@@ -29542,9 +29654,27 @@ async function forceLeagueGameResult(interaction, game, winnerSide) {
     ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets.'
     : '';
 
+  // 7J-155FORCEDWINWAGER: a forced result previously left any accepted
+  // Game Center wager (the peer-to-peer "Wager" button system, separate
+  // from the sportsbook board above) permanently stuck — settleGameWager
+  // only knew how to determine a winner from real scores, which a forced
+  // result never has. Now settles it directly in favor of whoever staff
+  // decided won.
+  const wagerSettlement = await settleGameWager(
+    interaction.guild,
+    { id: game.id, home_team: game.home_team_name, away_team: game.away_team_name },
+    winnerName
+  ).catch(error => {
+    console.error('Wager settlement (forced win) failed:', error);
+    return null;
+  });
+  const wagerText = wagerSettlement?.settled
+    ? String.fromCharCode(10) + 'Wager settled in favor of **' + winnerName + '**.'
+    : '';
+
   return {
     ok: true,
-    message: `🔨 Forced win recorded: **${winnerName}** over ${loserName}. No score, no currency payout — standings updated.${sportsbookText}`,
+    message: `🔨 Forced win recorded: **${winnerName}** over ${loserName}. No score, no currency payout — standings updated.${sportsbookText}${wagerText}`,
   };
 }
 
@@ -29731,7 +29861,7 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
 // screenshot doesn't have at all (Madden's score comes from sync). Report
 // Score sits alongside the new Report Issue in row 2 rather than displacing
 // it, since dropping manual score entry would break the core feature.
-function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wagersEnabled = false, sportEmoji = '🏆') {
+function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wagersEnabled = false, sportEmoji = '🏆', isOpenSchedule = true) {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('gamecenter_info:' + gameId).setLabel('Matchup Info').setEmoji(sportEmoji).setStyle(ButtonStyle.Primary),
   );
@@ -29747,17 +29877,25 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
     new ButtonBuilder().setCustomId('gamecenter_cointoss:' + gameId).setLabel('Coin Toss').setEmoji('🪙').setStyle(ButtonStyle.Secondary),
   );
 
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gamecenter_gamestarted:' + gameId).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
+    new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
+    new ButtonBuilder().setCustomId('gamecenter_issue:' + gameId).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger),
+  );
+  if (isOpenSchedule) {
+    // 7J-154WHOGOTNEXT: open-schedule leagues only, per Hxxdie — a
+    // structured-schedule league already advances round-by-round on a fixed
+    // cadence, so "who's available to play right now" doesn't apply the
+    // same way it does for open-schedule leagues, which have no fixed
+    // matchup order and rely on this to organize pickup games.
+    row2.addComponents(
+      new ButtonBuilder().setCustomId('gamecenter_whogotnext:' + gameId).setLabel("Who's Got Next").setEmoji('🙋').setStyle(ButtonStyle.Secondary),
+    );
+  }
+
   return [
     row1,
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gamecenter_gamestarted:' + gameId).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
-      new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
-      new ButtonBuilder().setCustomId('gamecenter_issue:' + gameId).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger),
-      // 7J-154WHOGOTNEXT: posts to the league's configured League Chat
-      // Channel instead of this thread, per Hxxdie — keeps the call-out
-      // visible without burying the actual game center content.
-      new ButtonBuilder().setCustomId('gamecenter_whogotnext:' + gameId).setLabel("Who's Got Next").setEmoji('🙋').setStyle(ButtonStyle.Secondary),
-    ),
+    row2,
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
       new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
@@ -29835,11 +29973,12 @@ async function createGameCenterThread(interaction, league, game, { channelIdOver
   await pool.query(`UPDATE league_games SET thread_id = $1, updated_at = NOW() WHERE id = $2`, [thread.id, game.id]);
 
   const mentionText = [homeOwner ? `<@${homeOwner.id}>` : null, awayOwner ? `<@${awayOwner.id}>` : null].filter(Boolean).join(' ');
-  const wagersEnabled = (await ensureLeagueCustomSettings(league).catch(() => ({}))).wagers_enabled === true;
+  const createThreadCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  const wagersEnabled = createThreadCustomSettings.wagers_enabled === true;
   await thread.send({
     content: (mentionText ? mentionText + ' ' : '') + 'Matchup thread opened. Report the score here once the game is finished.',
     embeds: [buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id)],
-    components: buildGameCenterThreadComponents(game.id, false, false, wagersEnabled, leagueCategoryEmoji(league)),
+    components: buildGameCenterThreadComponents(game.id, false, false, wagersEnabled, leagueCategoryEmoji(league), createThreadCustomSettings.schedule_style !== 'structured'),
     allowedMentions: { users: [homeOwner?.id, awayOwner?.id].filter(Boolean), roles: [] },
   }).catch(() => null);
 
@@ -34610,39 +34749,53 @@ async function notifyWaitlistForMemberLeaveIfTeamHolder(member) {
 // team names to which side actually won — a tie refunds both sides rather
 // than guessing. Both amounts were already escrowed at acceptance, so this
 // only ever pays out/refunds, never deducts again.
-async function settleGameWager(guild, game) {
+async function settleGameWager(guild, game, forcedWinningTeamName = null) {
   const result = await pool.query(
     `SELECT * FROM game_wagers WHERE game_id = $1 AND status = 'accepted' LIMIT 1`,
     [game.id]
   ).catch(() => ({ rows: [] }));
   const wager = result.rows[0];
-  if (!wager) return;
-
-  const homeScore = Number(game.home_score);
-  const awayScore = Number(game.away_score);
-  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return;
+  if (!wager) return null;
 
   const pot = wager.amount * 2;
-  if (homeScore === awayScore) {
-    await addCurrency(wager.guild_id, wager.proposer_user_id, wager.amount, 'wager_refund', 'Wager push (tie) — refunded', null);
-    await addCurrency(wager.guild_id, wager.opponent_user_id, wager.amount, 'wager_refund', 'Wager push (tie) — refunded', null);
-    await pool.query(`UPDATE game_wagers SET status = 'pushed', settled_at = NOW() WHERE id = $1`, [wager.id]);
-    return;
+  let winningTeam;
+
+  // 7J-155FORCEDWINWAGER: a staff-forced result (forfeit/dispute override)
+  // has no real score by design — game.home_score/away_score are NULL — so
+  // there's nothing to compare. The caller already knows exactly who won
+  // (that's the whole point of a forced result), so it passes the winning
+  // team name directly instead, skipping the score comparison and the
+  // tie/push path entirely (a forced result is never a tie — winnerSide is
+  // always explicitly 'home' or 'away').
+  if (forcedWinningTeamName) {
+    winningTeam = forcedWinningTeamName;
+  } else {
+    const homeScore = Number(game.home_score);
+    const awayScore = Number(game.away_score);
+    if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return null;
+
+    if (homeScore === awayScore) {
+      await addCurrency(wager.guild_id, wager.proposer_user_id, wager.amount, 'wager_refund', 'Wager push (tie) — refunded', null);
+      await addCurrency(wager.guild_id, wager.opponent_user_id, wager.amount, 'wager_refund', 'Wager push (tie) — refunded', null);
+      await pool.query(`UPDATE game_wagers SET status = 'pushed', settled_at = NOW() WHERE id = $1`, [wager.id]);
+      return { pushed: true };
+    }
+    winningTeam = homeScore > awayScore ? game.home_team : game.away_team;
   }
 
-  const winningTeam = homeScore > awayScore ? game.home_team : game.away_team;
   const winnerUserId = String(wager.proposer_team).toLowerCase() === String(winningTeam).toLowerCase()
     ? wager.proposer_user_id
     : String(wager.opponent_team).toLowerCase() === String(winningTeam).toLowerCase()
       ? wager.opponent_user_id
       : null;
-  if (!winnerUserId) return; // team names didn't match either side — leave it for staff to sort out manually rather than guess
+  if (!winnerUserId) return null; // team names didn't match either side — leave it for staff to sort out manually rather than guess
 
   await addCurrency(wager.guild_id, winnerUserId, pot, 'wager_win', `Wager won: ${game.away_team} @ ${game.home_team}`, null);
   await pool.query(`UPDATE game_wagers SET status = 'settled', winner_user_id = $1, settled_at = NOW() WHERE id = $2`, [winnerUserId, wager.id]);
   const winnerUser = await client.users.fetch(winnerUserId).catch(() => null);
   const settings = await getCurrencySettings(guild.id).catch(() => ({ currency_icon: '🪙' }));
   await winnerUser?.send({ content: `🎉 You won your wager on **${game.away_team} @ ${game.home_team}**! ${settings.currency_icon} ${pot} has been added to your balance.` }).catch(() => null);
+  return { settled: true, winnerUserId, pot };
 }
 
 async function notifyWaitlistForVacantTeam(guild, league, teamName) {
@@ -46128,13 +46281,19 @@ async function handleMaddenGameThreadButton(interaction) {
       `UPDATE madden_imported_games SET game_started_at = NOW(), game_started_by_user_id = $2 WHERE id = $1`,
       [game.id, interaction.user.id]
     );
-    if (game.sportsbook_game_id) {
-      await pool.query(
-        `UPDATE sportsbook_games SET game_started_at = NOW(), game_started_by_user_id = $2, bets_lock_at = $3
-         WHERE id = $1 AND status = 'open'`,
-        [game.sportsbook_game_id, interaction.user.id, lockAt]
-      ).catch(() => null);
-    }
+    // 7J-157PROPLOCK: was only locking the single moneyline row via
+    // game.sportsbook_game_id — every player prop tied to this same matchup
+    // (auto-generated separately, one sportsbook_games row per player/stat)
+    // never got touched at all, leaving them fully bettable indefinitely.
+    // league_game_id now links every related row (moneyline and props alike)
+    // back to this game at creation time; id = $1 stays as a fallback for
+    // any row created before this fix that predates league_game_id being set.
+    const lockedGamesResult = await pool.query(
+      `UPDATE sportsbook_games SET game_started_at = NOW(), game_started_by_user_id = $2, bets_lock_at = $3
+       WHERE (id = $1 OR league_game_id = $4) AND status = 'open'
+       RETURNING id`,
+      [game.sportsbook_game_id, interaction.user.id, lockAt, game.id]
+    ).catch(() => ({ rows: [] }));
 
     const lockEmbed = new EmbedBuilder()
       .setTitle('🔒 Game Started')
@@ -46143,7 +46302,7 @@ async function handleMaddenGameThreadButton(interaction) {
       .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
       .setTimestamp();
     await interaction.editReply({ embeds: [lockEmbed] });
-    if (game.sportsbook_game_id) {
+    if (lockedGamesResult.rows.length) {
       await postSportsbookFeed(interaction.guild, lockEmbed).catch(() => null);
     }
 
@@ -46189,12 +46348,10 @@ async function handleMaddenGameThreadButton(interaction) {
       `UPDATE madden_imported_games SET home_score = NULL, away_score = NULL, status = 'scheduled', game_started_at = NULL, game_started_by_user_id = NULL, rewards_paid_at = NULL WHERE id = $1`,
       [game.id]
     );
-    if (game.sportsbook_game_id) {
-      await pool.query(
-        `UPDATE sportsbook_games SET status = 'open', winner_side = NULL, settled_at = NULL, settled_by_game_report = FALSE, game_started_at = NULL, game_started_by_user_id = NULL, bets_lock_at = NULL, bets_locked = FALSE WHERE id = $1`,
-        [game.sportsbook_game_id]
-      ).catch(() => null);
-    }
+    await pool.query(
+      `UPDATE sportsbook_games SET status = 'open', winner_side = NULL, settled_at = NULL, settled_by_game_report = FALSE, game_started_at = NULL, game_started_by_user_id = NULL, bets_lock_at = NULL, bets_locked = FALSE WHERE id = $1 OR league_game_id = $2`,
+      [game.sportsbook_game_id, game.id]
+    ).catch(() => null);
     const resetEmbed = new EmbedBuilder()
       .setTitle('🔄 Game Reset')
       .setColor(0xED4245)
@@ -65621,10 +65778,10 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
           `INSERT INTO sportsbook_games
             (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds,
              created_by_user_id, bet_type, subject_type, subject_ref, subject_display_name,
-             stat_key, stat_threshold, stat_line, prop_week_index, source, auto_generated)
+             stat_key, stat_threshold, stat_line, prop_week_index, source, auto_generated, league_game_id)
            VALUES ($1, $2, $3::uuid, $4, $5, $6, -110, -110, 'system', 'stat_prop', 'player',
-             $7, $8, $9, $10, $4, $11, 'madden_auto_prop', TRUE)`,
-          [sportsbookGameId, guild.id, league.league_id, statLine, `Over ${threshold} ${statConfig.label}`, `Under ${threshold} ${statConfig.label}`, playerRef, displayName, statKey, threshold, weekIndex]
+             $7, $8, $9, $10, $4, $11, 'madden_auto_prop', TRUE, $12)`,
+          [sportsbookGameId, guild.id, league.league_id, statLine, `Over ${threshold} ${statConfig.label}`, `Under ${threshold} ${statConfig.label}`, playerRef, displayName, statKey, threshold, weekIndex, game.id]
         ).catch(err => {
           console.error('[MADDEN PROP AUTO] Failed to create prop:', err?.message || err);
           return null;
@@ -65748,10 +65905,10 @@ async function autoCreateMaddenSportsbookLines(guild, league, weekLabel) {
     await pool.query(
       `INSERT INTO sportsbook_games
         (id, guild_id, league_id, game_label, home_label, away_label, home_odds, away_odds,
-         source, auto_generated, created_by_user_id)
-       VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, 'madden_auto', TRUE, 'system')`,
+         source, auto_generated, created_by_user_id, league_game_id)
+       VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, 'madden_auto', TRUE, 'system', $9)`,
       [sbGameId, guild.id, league.league_id, gameLabel, homeLabel, awayLabel,
-       odds.homeOdds, odds.awayOdds]
+       odds.homeOdds, odds.awayOdds, game.id]
     ).catch(err => {
       console.error('[MADDEN SPORTSBOOK AUTO] Failed to create line:', err?.message || err);
       return null;
