@@ -29155,18 +29155,23 @@ async function stripeApiRequest(method, path, formParams = null) {
 }
 
 // Stripe's form-encoding for nested objects is bracket-style:
-// metadata[guild_id]=123 — this flattens a one-level-deep object into that
-// shape so callers can pass plain nested objects.
-function flattenStripeFormParams(params) {
+// metadata[guild_id]=123, nested arbitrarily deep for structures like
+// subscription_data[metadata][guild_id]=123. Recurses to any depth rather
+// than flattening one level only — a one-level version silently mishandled
+// subscription_data.metadata (itself a nested object one level below
+// subscription_data) by String()-ing it into the literal text
+// "[object Object]", which Stripe correctly rejected with "Invalid value
+// for `metadata`" the first time this ran against a real Checkout Session
+// (2026-08-07).
+function flattenStripeFormParams(params, parentKey = '') {
   const flat = {};
   for (const [key, value] of Object.entries(params)) {
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      for (const [subKey, subValue] of Object.entries(value)) {
-        if (subValue === undefined || subValue === null) continue;
-        flat[`${key}[${subKey}]`] = String(subValue);
-      }
-    } else if (value !== undefined && value !== null) {
-      flat[key] = String(value);
+    if (value === undefined || value === null) continue;
+    const fullKey = parentKey ? `${parentKey}[${key}]` : key;
+    if (typeof value === 'object' && !Array.isArray(value)) {
+      Object.assign(flat, flattenStripeFormParams(value, fullKey));
+    } else {
+      flat[fullKey] = String(value);
     }
   }
   return flat;
