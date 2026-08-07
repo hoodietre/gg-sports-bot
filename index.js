@@ -23,7 +23,7 @@ import {
   InteractionContextType,
 } from 'discord.js';
 import pkg from 'pg';
-import { randomUUID, randomBytes, createHash, constants as cryptoConstants } from 'crypto';
+import { randomUUID, randomBytes, createHash, createHmac, timingSafeEqual, constants as cryptoConstants } from 'crypto';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -87,6 +87,47 @@ function clearParlayDraft(guildId, userId) {
 }
 
 const CLIENT_ID = process.env.CLIENT_ID || '1407760487151833200';
+// 7J-PUBLICPREP-SUPPORTSERVER: single source of truth for the support server
+// invite, referenced from onboarding (new-guild welcome DM) and /help.
+const GG_SPORTS_SUPPORT_SERVER_URL = 'https://discord.gg/gadAfZ6pJV';
+
+// ---------------------------------------------------------------------------
+// 7J-PREMIUM: real-money subscription infrastructure. Per
+// GG-Sports-Payment-Business-Infrastructure-Spec.md (business decisions
+// finalized by Hxxdie) — Stripe Checkout + Billing + webhooks, guild-level
+// entitlement (not per-user), 14-day no-card trial, 3-attempt dunning
+// (retry cadence itself is configured in the Stripe Dashboard, not here —
+// we just react to the webhook events Stripe sends per attempt), founder
+// pricing, and a lock-not-delete policy on lapse. See inline comments at
+// each piece for how it maps back to the spec.
+// ---------------------------------------------------------------------------
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const STRIPE_PRICE_ID_MONTHLY = process.env.STRIPE_PRICE_ID_MONTHLY || '';
+const STRIPE_PRICE_ID_ANNUAL = process.env.STRIPE_PRICE_ID_ANNUAL || '';
+const STRIPE_API_BASE = 'https://api.stripe.com/v1';
+const STRIPE_IS_LIVE_MODE = STRIPE_SECRET_KEY.startsWith('sk_live_');
+
+// 7J-PREMIUM: refuse to boot in a production configuration with non-live
+// Stripe keys — a broken prod webhook silently pointed at test keys (or
+// vice versa) is exactly the kind of thing that should fail loudly at
+// startup, not quietly charge nobody (or charge someone's test card) in
+// production. Opt-in via either Railway's own environment name or an
+// explicit override, since we can't assume how "production" is signaled
+// on every deploy target.
+const GG_SPORTS_REQUIRES_LIVE_STRIPE =
+  process.env.RAILWAY_ENVIRONMENT === 'production' ||
+  process.env.STRIPE_REQUIRE_LIVE_MODE === 'true';
+
+const FREE_TIER_LEAGUE_CAP = 2; // per Hxxdie — unlimited on Premium
+const PREMIUM_TRIAL_DAYS = 14;
+const PREMIUM_TRIAL_WARNING_HOURS_BEFORE = 24;
+const PREMIUM_GRACE_PERIOD_DAYS = 30;
+const PREMIUM_DUNNING_MAX_ATTEMPTS = 3;
+const PREMIUM_MONTHLY_PRICE_DISPLAY = '$10/month';
+const PREMIUM_ANNUAL_PRICE_DISPLAY = '$100/year (2 months free)';
+const PREMIUM_MONTHLY_PRICE_CENTS = 1000;
+const PREMIUM_ANNUAL_PRICE_CENTS = 10000;
 
 const pendingOfferTargets = new Map();
 const maddenValuesPaginationSessions = new Map();
@@ -104,6 +145,17 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes('railway.app')
     ? { rejectUnauthorized: false }
     : false,
+  // 7J-PUBLICPREP-POOLSIZE: previously unset (pg default: max 10, no
+  // explicit timeouts). Bumped modestly and made explicit ahead of public
+  // launch — more concurrent guilds means more concurrent interaction
+  // handlers competing for a connection at once. idleTimeoutMillis lets the
+  // pool release connections it isn't using; connectionTimeoutMillis fails
+  // fast (instead of hanging a Discord interaction indefinitely) if the DB
+  // is ever genuinely saturated. Revisit this number under real load rather
+  // than guessing further.
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
 // 7J-PUBLICPREP-POOLERROR: without this, an idle client hitting a backend/
@@ -2302,6 +2354,69 @@ async function initDatabase() {
     )
   `);
 
+  // 7J-PREMIUM: premium_memberships above was per-user (guild_id + user_id)
+  // and never actually had a grant path wired to it — no purchase flow
+  // existed. Real subscription entitlement belongs to the guild, not an
+  // individual, and survives ownership changes/payer departure (spec
+  // Section 3), so this is a new table rather than a reshape of the old
+  // one. premium_memberships is left in place, unused, rather than dropped
+  // — it's not confirmed dead in the same sense as e.g. trade_counts was
+  // (no prior real usage to verify against), just superseded before it was
+  // ever load-bearing.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS premium_entitlements (
+      guild_id TEXT PRIMARY KEY REFERENCES guilds(guild_id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'free', -- free | trialing | active | past_due | lapsed
+      plan TEXT, -- monthly | annual | NULL
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      current_period_end TIMESTAMP,
+      cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE,
+      is_founder_pricing BOOLEAN NOT NULL DEFAULT FALSE,
+      trial_started_at TIMESTAMP,
+      trial_ends_at TIMESTAMP,
+      trial_warning_sent_at TIMESTAMP,
+      payer_user_id TEXT, -- original purchaser/trial claimant — reference only, not the entitlement owner
+      billing_manager_user_id TEXT,
+      dunning_attempt_count INTEGER NOT NULL DEFAULT 0,
+      lapsed_at TIMESTAMP,
+      grace_notice_sent_at TIMESTAMP,
+      source TEXT NOT NULL DEFAULT 'stripe', -- stripe | manual
+      manual_granted_by TEXT,
+      manual_expires_at TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_premium_entitlements_stripe_customer ON premium_entitlements(stripe_customer_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_premium_entitlements_stripe_subscription ON premium_entitlements(stripe_subscription_id)`);
+
+  // Global (not per-guild) — trial eligibility is tracked by the claiming
+  // owner's Discord user ID specifically so leave/re-add or a brand-new
+  // server can't be used to re-claim (spec Section 2).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS premium_trial_claims (
+      owner_user_id TEXT PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      claimed_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Append-only event log — current state lives on premium_entitlements,
+  // this is what /botowner metrics computes conversion/churn/MRR from.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS premium_billing_events (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      plan TEXT,
+      amount_cents INTEGER,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_premium_billing_events_guild ON premium_billing_events(guild_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_premium_billing_events_type ON premium_billing_events(event_type)`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sportsbook_parlays (
       id UUID PRIMARY KEY,
@@ -3804,9 +3919,16 @@ function buildCommands() {
 
     new SlashCommandBuilder()
       .setName('premium')
-      .setDescription('Premium membership and feature commands')
-      .addSubcommand(sc => sc.setName('status').setDescription('Show premium membership status').addUserOption(o => o.setName('user').setDescription('User to view').setRequired(false)))
-      .addSubcommand(sc => sc.setName('features').setDescription('Show planned premium GG Sports features')),
+      .setDescription('GG Sports Premium subscription commands')
+      .addSubcommand(sc => sc.setName('status').setDescription('Show this server\'s Premium status'))
+      .addSubcommand(sc => sc.setName('features').setDescription('Show what Premium unlocks'))
+      .addSubcommand(sc => sc.setName('trial').setDescription('Start a 14-day Premium trial for this server (no card required) — server owner only'))
+      .addSubcommand(sc => sc.setName('subscribe').setDescription('Get a checkout link to subscribe this server to Premium').addStringOption(o => o.setName('plan').setDescription('Monthly or annual').setRequired(true).addChoices({ name: 'Monthly ($10/mo)', value: 'monthly' }, { name: 'Annual ($100/yr — 2 months free)', value: 'annual' })))
+      .addSubcommand(sc => sc.setName('cancel').setDescription('Cancel this server\'s Premium subscription (access continues until period end)'))
+      .addSubcommandGroup(g => g.setName('billingmanager')
+        .setDescription('Manage who besides the server owner can manage billing')
+        .addSubcommand(sc => sc.setName('set').setDescription('Designate a billing manager').addUserOption(o => o.setName('user').setDescription('User to designate').setRequired(true)))
+        .addSubcommand(sc => sc.setName('clear').setDescription('Remove the current billing manager'))),
 
     new SlashCommandBuilder()
       .setName('coinflip')
@@ -3926,6 +4048,7 @@ function buildCommands() {
       .setDescription('League setup and management commands')
       .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game type: nba, mlb, madden, general').setRequired(false)))
       .addSubcommand(sc => sc.setName('delete').setDescription('Delete/deactivate a league').addStringOption(o => o.setName('name').setDescription('League name to delete').setRequired(true)))
+      .addSubcommand(sc => sc.setName('reactivate').setDescription('Reactivate a previously deleted/locked league').addStringOption(o => o.setName('name').setDescription('League name to reactivate').setRequired(true)))
       .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('game').setDescription('nba, mlb, madden, general').setRequired(true)))
       .addSubcommand(sc => sc.setName('playoffsettings').setDescription('Set playoff team count for a league').addIntegerOption(o => o.setName('teams').setDescription('Number of teams that make playoffs').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
@@ -4001,7 +4124,17 @@ function buildCommands() {
         .addIntegerOption(o => o.setName('min').setDescription('Minimum allowed value').setRequired(true))
         .addIntegerOption(o => o.setName('max').setDescription('Maximum allowed value').setRequired(true)))
       .addSubcommand(sc => sc.setName('currencyconfig').setDescription('View the current global currency identity and payout bounds'))
-      .addSubcommand(sc => sc.setName('panel').setDescription('Open the bot owner control panel (buttons instead of typing subcommands)')),
+      .addSubcommand(sc => sc.setName('panel').setDescription('Open the bot owner control panel (buttons instead of typing subcommands)'))
+      .addSubcommand(sc => sc
+        .setName('grantpremium')
+        .setDescription('Manually grant Premium to a server, bypassing Stripe (comps/beta/dispute resolution)')
+        .addStringOption(o => o.setName('guild').setDescription('Guild ID to grant Premium to').setRequired(true))
+        .addIntegerOption(o => o.setName('days').setDescription('Duration in days (omit for a permanent grant)').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('revokepremium')
+        .setDescription('Revoke a manually-granted Premium comp from a server')
+        .addStringOption(o => o.setName('guild').setDescription('Guild ID to revoke from').setRequired(true)))
+      .addSubcommand(sc => sc.setName('metrics').setDescription('Premium subscription business metrics (MRR, conversion, churn, ARPU)')),
 
     new SlashCommandBuilder()
       .setName('teamroster')
@@ -8346,8 +8479,50 @@ function startGGSportsInternalApiServer() {
         return;
       }
 
+      // 7J-PREMIUM: simple static return pages for Stripe Checkout's
+      // success_url/cancel_url — Checkout requires real URLs, and the
+      // actual confirmation happens via webhook + Discord DM, so these
+      // just tell the person to go back to Discord.
+      if (req.method === 'GET' && url.pathname === '/premium/success') {
+        sendHtmlResponse(res, 200, 'Payment received — head back to Discord, GG Sports will confirm there shortly.');
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/premium/cancel') {
+        sendHtmlResponse(res, 200, 'Checkout cancelled — no charge was made. You can close this tab.');
+        return;
+      }
+
       if (req.method !== 'POST') {
         sendJsonResponse(res, 404, { error: 'Not found.' });
+        return;
+      }
+
+      // 7J-PREMIUM: Stripe webhook signature verification needs the RAW
+      // request body — readJsonRequest() below parses JSON first and
+      // consumes the stream, so this route is handled before that call,
+      // with its own raw-body read.
+      if (url.pathname === '/api/stripe/webhook') {
+        const rawBody = await readRawRequestBody(req);
+        try {
+          verifyStripeWebhookSignature(rawBody, req.headers['stripe-signature']);
+        } catch (error) {
+          console.error('[7J-PREMIUM] Stripe webhook signature verification failed:', error?.message || error);
+          sendJsonResponse(res, 400, { error: 'Invalid signature.' });
+          return;
+        }
+        let event;
+        try {
+          event = JSON.parse(rawBody);
+        } catch {
+          sendJsonResponse(res, 400, { error: 'Invalid JSON body.' });
+          return;
+        }
+        // Acknowledge immediately, process after — Stripe retries on any
+        // non-2xx or slow response, and our handling can involve several
+        // sequential DB/Discord calls that shouldn't hold the webhook open.
+        sendJsonResponse(res, 200, { received: true });
+        handleStripeWebhookEvent(client, event).catch(error =>
+          console.error('[7J-PREMIUM] Webhook event handling failed:', event?.type, error?.message || error));
         return;
       }
 
@@ -8383,6 +8558,7 @@ function startGGSportsInternalApiServer() {
     if (EA_DIRECT_CONNECT_URL) console.log('EA connect URL:', EA_DIRECT_CONNECT_URL);
     if (EA_DIRECT_RETRIEVE_PERSONAS_URL) console.log('EA retrieve personas URL:', EA_DIRECT_RETRIEVE_PERSONAS_URL);
     if (EA_DIRECT_SELECT_LEAGUE_URL) console.log('EA select league URL:', EA_DIRECT_SELECT_LEAGUE_URL);
+    console.log('Stripe mode:', STRIPE_SECRET_KEY ? (STRIPE_IS_LIVE_MODE ? 'LIVE' : 'test') : 'not configured');
   });
 
   return ggSportsInternalApiServer;
@@ -8392,6 +8568,15 @@ function startGGSportsInternalApiServer() {
 client.once(Events.ClientReady, async () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
   console.log(`BOOT MARKER: jeans-fix-check @ ${new Date().toISOString()}`);
+
+  // 7J-PREMIUM: refuse to boot in a production configuration without live
+  // Stripe keys — see the constant's definition for why. Checked before
+  // anything else starts.
+  if (GG_SPORTS_REQUIRES_LIVE_STRIPE && STRIPE_SECRET_KEY && !STRIPE_IS_LIVE_MODE) {
+    console.error('[7J-PREMIUM] Refusing to start: production environment detected but STRIPE_SECRET_KEY is a test key, not live. Set live Stripe keys or unset STRIPE_REQUIRE_LIVE_MODE/RAILWAY_ENVIRONMENT if this is intentional.');
+    process.exit(1);
+  }
+
   try {
     await initDatabase();
     await registerCommands();
@@ -8407,6 +8592,9 @@ client.once(Events.ClientReady, async () => {
     startBirthdayChristmasGiftSchedulerLoop(client);
     startReviewPromptSchedulerLoop(client);
     console.log('Birthday/Christmas gift scheduler loop started.');
+    startPremiumTrialSchedulerLoop(client);
+    startPremiumGraceNoticeLoop(client);
+    console.log('Premium trial/grace scheduler loops started.');
 
     const application = await client.application?.fetch().catch(() => null);
     if (application?.owner?.id && !botOwnerUserId) botOwnerUserId = application.owner.id;
@@ -9406,7 +9594,8 @@ function buildNewServerOwnerWelcomeEmbed(guild) {
       "Here's how to get set up:" + String.fromCharCode(10) + String.fromCharCode(10) +
       '**1.** `/league create` — create your first league.' + String.fromCharCode(10) +
       '**2.** `/commissioner panel` — the control panel for everything else: channels/roles, live boards, operations, and league customization.' + String.fromCharCode(10) + String.fromCharCode(10) +
-      "Prefer a written walkthrough? `/setupguide` has the full order, or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members."
+      "Prefer a written walkthrough? `/setupguide` has the full order, or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members." + String.fromCharCode(10) + String.fromCharCode(10) +
+      `Questions or stuck on something? Join the support server: ${GG_SPORTS_SUPPORT_SERVER_URL}`
     )
     .setFooter({ text: 'GG Sports' })
     .setTimestamp();
@@ -10503,6 +10692,67 @@ if (interaction.commandName === 'avatar') {
 
       if (subcommand === 'panel') {
         await showBotOwnerPanelHome(interaction, { update: false });
+        return;
+      }
+
+      if (subcommand === 'grantpremium') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const guildId = interaction.options.getString('guild', true).trim();
+        const days = interaction.options.getInteger('days');
+
+        const guild = await client.guilds.fetch(guildId).catch(() => null);
+        if (!guild) {
+          await interaction.editReply({ content: 'Bot is not in a guild with that ID.' });
+          return;
+        }
+
+        await ensureGuildEntitlementRow(guildId);
+        const manualExpiresAt = days ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
+        await pool.query(
+          `UPDATE premium_entitlements SET
+             status = 'active', source = 'manual', manual_granted_by = $2, manual_expires_at = $3,
+             plan = NULL, stripe_customer_id = NULL, stripe_subscription_id = NULL, cancel_at_period_end = FALSE,
+             dunning_attempt_count = 0, updated_at = NOW()
+           WHERE guild_id = $1`,
+          [guildId, interaction.user.id, manualExpiresAt]
+        );
+        await recordPremiumBillingEvent(guildId, 'manual_grant', {});
+
+        await interaction.editReply({
+          content: `Premium manually granted to **${guild.name}** (${guildId})${manualExpiresAt ? `, expires <t:${Math.floor(manualExpiresAt.getTime() / 1000)}:F>` : ' — permanent'}.`,
+        });
+
+        const dmEmbed = new EmbedBuilder()
+          .setTitle('🎁 GG Sports Premium — Manually Granted')
+          .setColor(0x57F287)
+          .setDescription(`The bot owner has granted this server Premium access${manualExpiresAt ? `, expiring <t:${Math.floor(manualExpiresAt.getTime() / 1000)}:F>` : ' with no expiration'}.`)
+          .setFooter({ text: 'GG Sports • Premium' })
+          .setTimestamp();
+        const entitlement = await getGuildEntitlement(guildId);
+        await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
+        return;
+      }
+
+      if (subcommand === 'revokepremium') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const guildId = interaction.options.getString('guild', true).trim();
+        const entitlement = await getGuildEntitlement(guildId);
+
+        if (entitlement.source !== 'manual' || entitlement.status !== 'active') {
+          await interaction.editReply({ content: 'That server does not have an active manual Premium grant to revoke.' });
+          return;
+        }
+
+        await interaction.editReply({ content: `Revoking manual Premium grant for guild ${guildId}...` });
+        await lapsePremiumGuild(client, guildId, 'canceled');
+        await interaction.editReply({ content: `Manual Premium grant revoked for guild ${guildId}. Any leagues beyond the Free Tier cap have been locked (not deleted).` });
+        return;
+      }
+
+      if (subcommand === 'metrics') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const embed = await buildPremiumMetricsEmbed();
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
 
@@ -23563,6 +23813,29 @@ if (shopSubcommand === 'view') {
 
         const leagueName = interaction.options.getString('name');
         const gameKey = (interaction.options.getString('game') || 'general').toLowerCase();
+
+        // 7J-PREMIUM: Free Tier league cap. The INSERT below can either
+        // create a brand-new league or reactivate an existing same-named
+        // one via ON CONFLICT — only the cases that actually increase the
+        // guild's active league count need to be checked against the cap.
+        const existingLeagueResult = await pool.query(
+          `SELECT is_active FROM leagues WHERE guild_id = $1 AND LOWER(league_name) = LOWER($2) LIMIT 1`,
+          [interaction.guild.id, leagueName]
+        );
+        const existingLeague = existingLeagueResult.rows[0];
+        const wouldIncreaseActiveCount = !existingLeague || !existingLeague.is_active;
+
+        if (wouldIncreaseActiveCount && !(await isGuildPremiumActive(interaction.guild.id))) {
+          const activeCount = await countActiveLeaguesForGuild(interaction.guild.id);
+          if (activeCount >= FREE_TIER_LEAGUE_CAP) {
+            await interaction.reply({
+              content: `This server is on the Free Tier (${FREE_TIER_LEAGUE_CAP} active league max) and is already at the cap. Try \`/premium trial\` for 14 days of unlimited leagues (no card required), \`/premium subscribe\` to go Premium, or \`/league delete\` an existing league to free up a slot.`,
+              ephemeral: true,
+            });
+            return;
+          }
+        }
+
         const leagueId = randomUUID();
 
         await pool.query(
@@ -23589,6 +23862,39 @@ if (shopSubcommand === 'view') {
         );
 
         await interaction.reply({ content: 'League created/configured: **' + leagueName + '**.', ephemeral: true });
+        return;
+      }
+
+      if (leagueSubcommand === 'reactivate') {
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
+          await interaction.reply({ content: 'You do not have permission to reactivate leagues.', ephemeral: true });
+          return;
+        }
+
+        const leagueName = interaction.options.getString('name');
+        const lockedResult = await pool.query(
+          `SELECT league_id, league_name FROM leagues WHERE guild_id = $1 AND LOWER(league_name) = LOWER($2) AND is_active = FALSE LIMIT 1`,
+          [interaction.guild.id, leagueName]
+        );
+        const lockedLeague = lockedResult.rows[0];
+        if (!lockedLeague) {
+          await interaction.reply({ content: 'No locked/deleted league found with that name.', ephemeral: true });
+          return;
+        }
+
+        if (!(await isGuildPremiumActive(interaction.guild.id))) {
+          const activeCount = await countActiveLeaguesForGuild(interaction.guild.id);
+          if (activeCount >= FREE_TIER_LEAGUE_CAP) {
+            await interaction.reply({
+              content: `Reactivating **${lockedLeague.league_name}** would put this server over the Free Tier's ${FREE_TIER_LEAGUE_CAP}-league cap. \`/league delete\` another active league first, or go Premium for unlimited leagues.`,
+              ephemeral: true,
+            });
+            return;
+          }
+        }
+
+        await pool.query(`UPDATE leagues SET is_active = TRUE WHERE league_id = $1`, [lockedLeague.league_id]);
+        await interaction.reply({ content: `Reactivated: **${lockedLeague.league_name}**.`, ephemeral: true });
         return;
       }
 
@@ -24511,25 +24817,122 @@ if (shopSubcommand === 'view') {
 
     if (interaction.commandName === 'premium') {
       if (!interaction.guild) return;
+      const premiumGroup = interaction.options.getSubcommandGroup(false);
       const premiumSubcommand = interaction.options.getSubcommand();
 
-      if (premiumSubcommand === 'status') {
+      if (!premiumGroup && premiumSubcommand === 'status') {
         await interaction.deferReply({ ephemeral: true });
-        const targetUser = interaction.options.getUser('user') || interaction.user;
-        const result = await pool.query(
-          `SELECT * FROM premium_memberships
-           WHERE guild_id = $1 AND user_id = $2
-           LIMIT 1`,
-          [interaction.guild.id, targetUser.id]
-        );
-
-        await interaction.editReply({ embeds: [buildPremiumStatusEmbed(targetUser, result.rows[0] || null)], ephemeral: true });
+        const entitlement = await getGuildEntitlement(interaction.guild.id);
+        await interaction.editReply({ embeds: [buildPremiumStatusEmbed(interaction.guild, entitlement)] });
         return;
       }
 
-      if (premiumSubcommand === 'features') {
+      if (!premiumGroup && premiumSubcommand === 'features') {
         await interaction.reply({ embeds: [buildPremiumFeaturesEmbed()], ephemeral: true });
         return;
+      }
+
+      if (!premiumGroup && premiumSubcommand === 'trial') {
+        await interaction.deferReply({ ephemeral: true });
+        const ownerId = interaction.guild.ownerId || (await interaction.guild.fetchOwner().catch(() => null))?.id;
+        if (interaction.user.id !== ownerId) {
+          await interaction.editReply({ content: 'Only this server\'s owner can start the Premium trial (trial eligibility is tracked per Discord account).' });
+          return;
+        }
+
+        const existingClaim = await pool.query(`SELECT * FROM premium_trial_claims WHERE owner_user_id = $1 LIMIT 1`, [interaction.user.id]);
+        if (existingClaim.rows.length) {
+          await interaction.editReply({ content: 'You\'ve already claimed a GG Sports Premium trial on a different server — each Discord account gets one trial. `/premium subscribe` to go straight to a paid plan instead.' });
+          return;
+        }
+
+        const entitlement = await getGuildEntitlement(interaction.guild.id);
+        if (entitlement.status !== 'free') {
+          await interaction.editReply({ content: `This server already has a Premium status (${entitlement.status}) — check \`/premium status\`.` });
+          return;
+        }
+
+        const trialEndsAt = new Date(Date.now() + PREMIUM_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+        await pool.query(
+          `UPDATE premium_entitlements SET status = 'trialing', trial_started_at = NOW(), trial_ends_at = $2, trial_warning_sent_at = NULL, payer_user_id = $3, updated_at = NOW() WHERE guild_id = $1`,
+          [interaction.guild.id, trialEndsAt, interaction.user.id]
+        );
+        await pool.query(`INSERT INTO premium_trial_claims (owner_user_id, guild_id) VALUES ($1, $2)`, [interaction.user.id, interaction.guild.id]);
+        await recordPremiumBillingEvent(interaction.guild.id, 'trial_started', {});
+
+        await interaction.editReply({
+          embeds: [new EmbedBuilder()
+            .setTitle('🎉 GG Sports Premium Trial Started')
+            .setColor(0x57F287)
+            .setDescription(`14 days of Premium access, no card required. Trial ends <t:${Math.floor(trialEndsAt.getTime() / 1000)}:F>. Subscribe any time before then with \`/premium subscribe\` to keep access without interruption.`)
+            .setFooter({ text: 'GG Sports • Premium' })
+            .setTimestamp()],
+        });
+        return;
+      }
+
+      if (!premiumGroup && premiumSubcommand === 'subscribe') {
+        await interaction.deferReply({ ephemeral: true });
+        const plan = interaction.options.getString('plan', true);
+        try {
+          const checkoutUrl = await createPremiumCheckoutSession(interaction.guild, interaction.user, plan);
+          const button = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setLabel('Complete Checkout').setStyle(ButtonStyle.Link).setURL(checkoutUrl)
+          );
+          await interaction.editReply({ content: 'This link is for you to complete checkout for **' + interaction.guild.name + '** — it expires shortly if unused.', components: [button] });
+        } catch (error) {
+          await interaction.editReply({ content: 'Could not start checkout: ' + (error?.message || 'Unknown error.') });
+        }
+        return;
+      }
+
+      if (!premiumGroup && premiumSubcommand === 'cancel') {
+        await interaction.deferReply({ ephemeral: true });
+        const entitlement = await getGuildEntitlement(interaction.guild.id);
+        if (!(await isBillingAuthorized(interaction, entitlement))) {
+          await interaction.editReply({ content: 'Only the server owner or the designated billing manager can cancel Premium.' });
+          return;
+        }
+        if (entitlement.source === 'manual') {
+          await interaction.editReply({ content: 'This server\'s Premium was granted manually (not via Stripe) — contact the bot owner to change it.' });
+          return;
+        }
+        if (!entitlement.stripe_subscription_id) {
+          await interaction.editReply({ content: 'No active Stripe subscription found for this server.' });
+          return;
+        }
+        try {
+          await cancelPremiumSubscriptionAtPeriodEnd(entitlement);
+          await interaction.editReply({
+            content: entitlement.current_period_end
+              ? `Cancelled — Premium access continues through <t:${Math.floor(new Date(entitlement.current_period_end).getTime() / 1000)}:F>, then this server drops to the Free Tier. No refunds are issued for the remaining period.`
+              : 'Cancelled — Premium access continues through the end of the current billing period, then this server drops to the Free Tier.',
+          });
+        } catch (error) {
+          await interaction.editReply({ content: 'Could not cancel: ' + (error?.message || 'Unknown error.') });
+        }
+        return;
+      }
+
+      if (premiumGroup === 'billingmanager') {
+        const ownerId = interaction.guild.ownerId || (await interaction.guild.fetchOwner().catch(() => null))?.id;
+        if (interaction.user.id !== ownerId) {
+          await interaction.reply({ content: 'Only the server owner can designate a billing manager.', ephemeral: true });
+          return;
+        }
+        await ensureGuildEntitlementRow(interaction.guild.id);
+
+        if (premiumSubcommand === 'set') {
+          const target = interaction.options.getUser('user', true);
+          await pool.query(`UPDATE premium_entitlements SET billing_manager_user_id = $2, updated_at = NOW() WHERE guild_id = $1`, [interaction.guild.id, target.id]);
+          await interaction.reply({ content: `<@${target.id}> can now manage billing (subscribe/cancel) for this server alongside you.`, ephemeral: true });
+          return;
+        }
+        if (premiumSubcommand === 'clear') {
+          await pool.query(`UPDATE premium_entitlements SET billing_manager_user_id = NULL, updated_at = NOW() WHERE guild_id = $1`, [interaction.guild.id]);
+          await interaction.reply({ content: 'Billing manager removed — only you can manage billing now.', ephemeral: true });
+          return;
+        }
       }
     }
 
@@ -28630,47 +29033,728 @@ function buildActivityEmbed(user, row, achievements = [], universalGrade = null)
 
 
 
-function getPremiumTierDisplay(tier, status) {
-  if (!tier || status !== 'active') return 'Free';
-  return tier;
+// =============================================================================
+// 7J-PREMIUM: Real-money subscription infrastructure (Stripe).
+// Per GG-Sports-Payment-Business-Infrastructure-Spec.md — business decisions
+// finalized by Hxxdie. This block covers: the Stripe REST wrapper (raw fetch,
+// same pattern as the EA integration — no SDK dependency added), guild-level
+// entitlement read/write helpers, billing-event logging for metrics, DM/
+// announcement notifications, free-tier league-cap locking, the shared lapse
+// handler, checkout/cancel flows, webhook signature verification + dispatch,
+// and the trial scheduler.
+// =============================================================================
+
+// --- Stripe REST wrapper ---------------------------------------------------
+// Raw fetch, not the stripe npm package — same approach already used for the
+// EA Direct integration elsewhere in this file, so no new dependency.
+async function stripeApiRequest(method, path, formParams = null) {
+  if (!STRIPE_SECRET_KEY) throw new Error('STRIPE_SECRET_KEY is not configured.');
+  const headers = {
+    Authorization: 'Basic ' + Buffer.from(STRIPE_SECRET_KEY + ':').toString('base64'),
+  };
+  let body;
+  if (formParams) {
+    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    body = new URLSearchParams(formParams).toString();
+  }
+  const response = await fetch(STRIPE_API_BASE + path, { method, headers, body });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = json?.error?.message || `Stripe API error (${response.status})`;
+    throw new Error(message);
+  }
+  return json;
 }
 
-function buildPremiumStatusEmbed(user, membership) {
-  const isActive = membership?.status === 'active';
-  const tier = getPremiumTierDisplay(membership?.premium_tier, membership?.status);
-  const source = membership?.source || 'Not connected';
-  const expires = membership?.expires_at ? new Date(membership.expires_at).toLocaleDateString('en-US') : 'No expiration set';
+// Stripe's form-encoding for nested objects is bracket-style:
+// metadata[guild_id]=123 — this flattens a one-level-deep object into that
+// shape so callers can pass plain nested objects.
+function flattenStripeFormParams(params) {
+  const flat = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      for (const [subKey, subValue] of Object.entries(value)) {
+        if (subValue === undefined || subValue === null) continue;
+        flat[`${key}[${subKey}]`] = String(subValue);
+      }
+    } else if (value !== undefined && value !== null) {
+      flat[key] = String(value);
+    }
+  }
+  return flat;
+}
 
-  return new EmbedBuilder()
-    .setTitle('Premium Status')
-    .setColor(isActive ? 0xFEE75C : 0x5865F2)
-    .setThumbnail(user.displayAvatarURL({ dynamic: true }))
-    .addFields(
-      { name: 'User', value: '<@' + user.id + '>', inline: true },
-      { name: 'Tier', value: tier, inline: true },
-      { name: 'Status', value: isActive ? 'Active' : 'Free / Inactive', inline: true },
-      { name: 'Source', value: source, inline: true },
-      { name: 'Expires', value: expires, inline: true }
+// --- Entitlement read/write helpers -----------------------------------------
+
+async function ensureGuildEntitlementRow(guildId) {
+  // premium_entitlements.guild_id has an FK to guilds(guild_id) — but a
+  // guild otherwise only gets a guilds row when /league create runs, and
+  // someone can reasonably run /premium trial or /premium subscribe before
+  // ever creating a league. Upsert guilds first so that FK never fails.
+  const guildName = client.guilds.cache.get(guildId)?.name || guildId;
+  await pool.query(
+    `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO NOTHING`,
+    [guildId, guildName]
+  );
+  await pool.query(
+    `INSERT INTO premium_entitlements (guild_id) VALUES ($1) ON CONFLICT (guild_id) DO NOTHING`,
+    [guildId]
+  );
+}
+
+async function getGuildEntitlement(guildId) {
+  await ensureGuildEntitlementRow(guildId);
+  const result = await pool.query(`SELECT * FROM premium_entitlements WHERE guild_id = $1 LIMIT 1`, [guildId]);
+  return result.rows[0];
+}
+
+// True if this guild currently has Premium-tier access, whether via an
+// active/trialing Stripe subscription or an unexpired manual comp grant.
+function isEntitlementPremiumActive(entitlement) {
+  if (!entitlement) return false;
+  if (entitlement.source === 'manual') {
+    if (!entitlement.manual_expires_at) return entitlement.status === 'active'; // permanent comp
+    return entitlement.status === 'active' && new Date(entitlement.manual_expires_at).getTime() > Date.now();
+  }
+  if (entitlement.status === 'trialing') {
+    return entitlement.trial_ends_at ? new Date(entitlement.trial_ends_at).getTime() > Date.now() : true;
+  }
+  if (entitlement.status === 'active' || entitlement.status === 'past_due') {
+    // past_due still counts as active — spec Section 5: "No feature
+    // degradation during retries," access only actually drops on full lapse.
+    return true;
+  }
+  return false;
+}
+
+async function isGuildPremiumActive(guildId) {
+  const entitlement = await getGuildEntitlement(guildId);
+  return isEntitlementPremiumActive(entitlement);
+}
+
+async function recordPremiumBillingEvent(guildId, eventType, { plan = null, amountCents = null } = {}) {
+  await pool.query(
+    `INSERT INTO premium_billing_events (id, guild_id, event_type, plan, amount_cents) VALUES ($1, $2, $3, $4, $5)`,
+    [randomUUID(), guildId, eventType, plan, amountCents]
+  ).catch(error => console.error('[7J-PREMIUM] Failed to record billing event:', eventType, error?.message || error));
+}
+
+// Owner is always checked live (not cached) per spec Section 3. Billing
+// manager is whatever's stored on the entitlement row, if anyone.
+async function isBillingAuthorized(interaction, entitlement) {
+  const guild = interaction.guild;
+  if (!guild) return false;
+  if (entitlement?.billing_manager_user_id === interaction.user.id) return true;
+  const ownerId = guild.ownerId || (await guild.fetchOwner().catch(() => null))?.id;
+  return ownerId === interaction.user.id;
+}
+
+// --- Notifications -----------------------------------------------------------
+
+// Best-effort DM to the live server owner and, if set and different, the
+// designated billing manager. Never throws — a closed-DMs owner shouldn't
+// block the billing state change itself.
+async function dmPremiumNotice(guild, entitlement, embed) {
+  const owner = await guild.fetchOwner().catch(() => null);
+  const targets = new Set();
+  if (owner) targets.add(owner.id);
+  if (entitlement?.billing_manager_user_id) targets.add(entitlement.billing_manager_user_id);
+
+  for (const userId of targets) {
+    const user = await client.users.fetch(userId).catch(() => null);
+    if (!user) continue;
+    await user.send({ embeds: [embed] }).catch(() => null);
+  }
+}
+
+// Posts to every active league's configured announcement channel in the
+// guild — Premium is a guild-level unlock, and a guild can have more than
+// one active league, so every league's community should see why sportsbook/
+// shop/tournaments etc. just appeared or disappeared.
+async function postPremiumGuildAnnouncement(guild, embed) {
+  const leagues = await getActiveLeaguesForGuild(guild.id).catch(() => []);
+  for (const league of leagues) {
+    const settingsResult = await pool.query(
+      `SELECT league_announcement_channel_id FROM league_settings WHERE league_id = $1 LIMIT 1`,
+      [league.league_id]
+    ).catch(() => ({ rows: [] }));
+    const channelId = settingsResult.rows[0]?.league_announcement_channel_id;
+    if (!channelId) continue;
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel?.isTextBased?.()) continue;
+    await channel.send({ embeds: [embed] }).catch(() => null);
+  }
+}
+
+// --- Free-tier league cap ----------------------------------------------------
+
+async function countActiveLeaguesForGuild(guildId) {
+  const result = await pool.query(`SELECT COUNT(*)::int AS count FROM leagues WHERE guild_id = $1 AND is_active = TRUE`, [guildId]);
+  return result.rows[0]?.count || 0;
+}
+
+// Called whenever a guild drops out of Premium (lapse, trial expiry, manual
+// grant expiry). Locks (is_active = FALSE — the same soft-disable every
+// other part of this codebase already uses and already filters on) the
+// oldest active leagues beyond the Free Tier cap, keeping the most
+// recently-created leagues active as the default selection. This is a
+// deliberate default, not a picker UI (see handoff notes) — the owner/
+// billing manager can rearrange afterward with /league delete (locks one)
+// and /league reactivate (unlocks one, blocked if it would exceed the cap),
+// both of which already exist / are added alongside this feature.
+async function enforceFreeTierLeagueCap(guild) {
+  const activeResult = await pool.query(
+    `SELECT league_id, league_name FROM leagues WHERE guild_id = $1 AND is_active = TRUE ORDER BY created_at DESC`,
+    [guild.id]
+  );
+  const active = activeResult.rows;
+  if (active.length <= FREE_TIER_LEAGUE_CAP) return { lockedCount: 0, lockedNames: [] };
+
+  const toLock = active.slice(FREE_TIER_LEAGUE_CAP);
+  for (const league of toLock) {
+    await pool.query(`UPDATE leagues SET is_active = FALSE WHERE league_id = $1`, [league.league_id]);
+  }
+  return { lockedCount: toLock.length, lockedNames: toLock.map(l => l.league_name) };
+}
+
+// --- Shared lapse handler -----------------------------------------------------
+
+// One shared path for every way a guild can leave Premium: trial expiring
+// unpaid, dunning exhausting all 3 attempts, or a cancellation reaching the
+// end of its paid period. Spec Section 6 treats all three identically —
+// lock (don't delete), 30-day grace period, notify.
+async function lapsePremiumGuild(client, guildId, reason) {
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) return;
+
+  const entitlement = await getGuildEntitlement(guildId);
+  await pool.query(
+    `UPDATE premium_entitlements SET status = 'lapsed', lapsed_at = NOW(), updated_at = NOW() WHERE guild_id = $1`,
+    [guildId]
+  );
+
+  const lockResult = await enforceFreeTierLeagueCap(guild).catch(() => ({ lockedCount: 0, lockedNames: [] }));
+
+  await recordPremiumBillingEvent(guildId, reason === 'trial_expired' ? 'trial_lapsed' : 'lapsed', { plan: entitlement.plan });
+
+  const reasonText = reason === 'trial_expired'
+    ? "Your 14-day GG Sports Premium trial has ended without converting to a paid subscription."
+    : reason === 'payment_failed'
+      ? "GG Sports Premium billing failed after 3 attempts and the subscription has lapsed."
+      : "Your GG Sports Premium subscription has ended.";
+
+  const lockedNote = lockResult.lockedCount
+    ? `\n\n**${lockResult.lockedCount} league(s) beyond the Free Tier cap (${FREE_TIER_LEAGUE_CAP}) have been locked, not deleted:** ${lockResult.lockedNames.join(', ')}. Nothing is lost — reactivating Premium restores full access instantly.`
+    : '';
+
+  const dmEmbed = new EmbedBuilder()
+    .setTitle('⏬ GG Sports Premium — Downgraded to Free Tier')
+    .setColor(0xED4245)
+    .setDescription(
+      `${reasonText}${lockedNote}\n\nLocked data is retained for **${PREMIUM_GRACE_PERIOD_DAYS} days**. Reactivate any time within that window with \`/premium subscribe\` for full, instant restoration.`
     )
-    .setFooter({ text: 'GG Sports • Premium Foundation' })
+    .setFooter({ text: 'GG Sports • Premium' })
     .setTimestamp();
+  await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
+
+  const announceEmbed = new EmbedBuilder()
+    .setTitle('GG Sports Premium has ended for this server')
+    .setColor(0xED4245)
+    .setDescription(
+      `This server's Premium subscription has ended, so some features/leagues are temporarily locked (not deleted) rather than the bot being broken. Server staff can reactivate any time with \`/premium subscribe\`.`
+    )
+    .setTimestamp();
+  await postPremiumGuildAnnouncement(guild, announceEmbed).catch(() => null);
+}
+
+// --- Stripe checkout / cancel flows ------------------------------------------
+
+function priceIdForPlan(plan) {
+  return plan === 'annual' ? STRIPE_PRICE_ID_ANNUAL : STRIPE_PRICE_ID_MONTHLY;
+}
+
+async function createPremiumCheckoutSession(guild, user, plan) {
+  const priceId = priceIdForPlan(plan);
+  if (!priceId) throw new Error('Stripe price ID is not configured for this plan yet — contact the bot owner.');
+  const baseUrl = process.env.GGSPORTS_PUBLIC_BASE_URL;
+  if (!baseUrl) throw new Error('GGSPORTS_PUBLIC_BASE_URL is not configured — Stripe Checkout needs a public return URL.');
+
+  const session = await stripeApiRequest('POST', '/checkout/sessions', flattenStripeFormParams({
+    mode: 'subscription',
+    client_reference_id: guild.id,
+    success_url: `${baseUrl}/premium/success`,
+    cancel_url: `${baseUrl}/premium/cancel`,
+    'line_items[0][price]': priceId,
+    'line_items[0][quantity]': 1,
+    metadata: { guild_id: guild.id, user_id: user.id, plan },
+    subscription_data: { metadata: { guild_id: guild.id, plan } },
+  }));
+  return session.url;
+}
+
+async function cancelPremiumSubscriptionAtPeriodEnd(entitlement) {
+  if (!entitlement?.stripe_subscription_id) throw new Error('No active Stripe subscription found for this server.');
+  await stripeApiRequest('POST', `/subscriptions/${entitlement.stripe_subscription_id}`, { cancel_at_period_end: 'true' });
+  await pool.query(
+    `UPDATE premium_entitlements SET cancel_at_period_end = TRUE, updated_at = NOW() WHERE guild_id = $1`,
+    [entitlement.guild_id]
+  );
+}
+
+// --- Webhook signature verification + dispatch -------------------------------
+
+// Stripe-Signature header format: t=<timestamp>,v1=<hex hmac>[,v0=...]
+// Signed payload is "<timestamp>.<raw body>", HMAC-SHA256 with the webhook
+// signing secret. Constant-time compare via timingSafeEqual.
+function verifyStripeWebhookSignature(rawBody, signatureHeader) {
+  if (!STRIPE_WEBHOOK_SECRET) throw new Error('STRIPE_WEBHOOK_SECRET is not configured.');
+  if (!signatureHeader) throw new Error('Missing Stripe-Signature header.');
+
+  const parts = Object.fromEntries(
+    signatureHeader.split(',').map(part => part.split('=')).map(([k, v]) => [k, v])
+  );
+  const timestamp = parts.t;
+  const expectedSig = parts.v1;
+  if (!timestamp || !expectedSig) throw new Error('Malformed Stripe-Signature header.');
+
+  const signedPayload = `${timestamp}.${rawBody}`;
+  const computedSig = createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(signedPayload, 'utf8').digest('hex');
+
+  const expectedBuf = Buffer.from(expectedSig, 'hex');
+  const computedBuf = Buffer.from(computedSig, 'hex');
+  if (expectedBuf.length !== computedBuf.length || !timingSafeEqual(expectedBuf, computedBuf)) {
+    throw new Error('Stripe webhook signature mismatch.');
+  }
+
+  // Reject anything older than 5 minutes — standard Stripe replay-attack guard.
+  const ageSeconds = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (ageSeconds > 300) throw new Error('Stripe webhook timestamp too old.');
+}
+
+function planFromStripePriceId(priceId) {
+  if (priceId === STRIPE_PRICE_ID_ANNUAL) return 'annual';
+  if (priceId === STRIPE_PRICE_ID_MONTHLY) return 'monthly';
+  return null;
+}
+
+async function handleStripeCheckoutCompleted(client, session) {
+  const guildId = session.client_reference_id || session.metadata?.guild_id;
+  if (!guildId) { console.error('[7J-PREMIUM] checkout.session.completed with no guild_id.'); return; }
+  if (session.mode !== 'subscription' || !session.subscription) return;
+
+  const subscription = await stripeApiRequest('GET', `/subscriptions/${session.subscription}`);
+  const priceId = subscription.items?.data?.[0]?.price?.id;
+  const plan = planFromStripePriceId(priceId) || session.metadata?.plan || null;
+  const periodEnd = subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null;
+
+  const existing = await getGuildEntitlement(guildId);
+  const isFounderPricing = !existing.lapsed_at; // never lapsed before => first-ever subscribe => founder pricing
+
+  await pool.query(
+    `UPDATE premium_entitlements SET
+       status = 'active', plan = $2, stripe_customer_id = $3, stripe_subscription_id = $4,
+       current_period_end = $5, cancel_at_period_end = FALSE, is_founder_pricing = $6,
+       payer_user_id = $7, dunning_attempt_count = 0, source = 'stripe', updated_at = NOW()
+     WHERE guild_id = $1`,
+    [guildId, plan, session.customer, session.subscription, periodEnd, isFounderPricing, session.metadata?.user_id || null]
+  );
+
+  await recordPremiumBillingEvent(guildId, existing.status === 'trialing' ? 'trial_converted' : 'payment_succeeded', { plan });
+
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) return;
+  const entitlement = await getGuildEntitlement(guildId);
+
+  const dmEmbed = new EmbedBuilder()
+    .setTitle('✅ GG Sports Premium — Active')
+    .setColor(0x57F287)
+    .setDescription(
+      `Payment received — this server now has Premium access${isFounderPricing ? ' at **founder pricing**, locked in for as long as your subscription stays active without a lapse' : ''}.`
+    )
+    .setFooter({ text: 'GG Sports • Premium' })
+    .setTimestamp();
+  await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
+
+  const announceEmbed = new EmbedBuilder()
+    .setTitle('🎉 This server has upgraded to GG Sports Premium!')
+    .setColor(0x57F287)
+    .setDescription(buildPremiumFeaturesEmbed().data.description || 'Premium features are now unlocked.')
+    .addFields(buildPremiumFeaturesEmbed().data.fields || [])
+    .setTimestamp();
+  await postPremiumGuildAnnouncement(guild, announceEmbed).catch(() => null);
+}
+
+async function handleStripeInvoicePaid(client, invoice) {
+  const entResult = await pool.query(`SELECT * FROM premium_entitlements WHERE stripe_customer_id = $1 LIMIT 1`, [invoice.customer]);
+  const entitlement = entResult.rows[0];
+  if (!entitlement) return;
+
+  // Renewal invoices don't go through checkout.session.completed again —
+  // this is the ongoing "still paying" signal for month 2+/year 2+.
+  const periodEnd = invoice.lines?.data?.[0]?.period?.end ? new Date(invoice.lines.data[0].period.end * 1000) : entitlement.current_period_end;
+  await pool.query(
+    `UPDATE premium_entitlements SET status = 'active', current_period_end = $2, dunning_attempt_count = 0, updated_at = NOW() WHERE guild_id = $1`,
+    [entitlement.guild_id, periodEnd]
+  );
+
+  // Only fire the "payment succeeded" DM/announcement for renewals — the
+  // very first payment on a subscription is already covered by
+  // checkout.session.completed above, and invoice.paid also fires for that
+  // first invoice, which would otherwise double-notify.
+  if (invoice.billing_reason === 'subscription_cycle') {
+    await recordPremiumBillingEvent(entitlement.guild_id, 'payment_succeeded', { plan: entitlement.plan, amountCents: invoice.amount_paid });
+    const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
+    if (guild) {
+      const dmEmbed = new EmbedBuilder()
+        .setTitle('✅ GG Sports Premium — Renewed')
+        .setColor(0x57F287)
+        .setDescription('Your renewal payment went through — Premium continues uninterrupted.')
+        .setFooter({ text: 'GG Sports • Premium' })
+        .setTimestamp();
+      await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
+    }
+  }
+}
+
+async function handleStripeInvoicePaymentFailed(client, invoice) {
+  const entResult = await pool.query(`SELECT * FROM premium_entitlements WHERE stripe_customer_id = $1 LIMIT 1`, [invoice.customer]);
+  const entitlement = entResult.rows[0];
+  if (!entitlement) return;
+
+  const attemptCount = (entitlement.dunning_attempt_count || 0) + 1;
+  await pool.query(
+    `UPDATE premium_entitlements SET status = 'past_due', dunning_attempt_count = $2, updated_at = NOW() WHERE guild_id = $1`,
+    [entitlement.guild_id, attemptCount]
+  );
+  await recordPremiumBillingEvent(entitlement.guild_id, 'payment_failed', { plan: entitlement.plan });
+
+  const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
+  if (!guild) return;
+  const updatedEntitlement = await getGuildEntitlement(entitlement.guild_id);
+
+  const dmEmbed = new EmbedBuilder()
+    .setTitle(`⚠️ GG Sports Premium — Payment Attempt ${attemptCount} Failed`)
+    .setColor(0xED4245)
+    .setDescription(
+      attemptCount >= PREMIUM_DUNNING_MAX_ATTEMPTS
+        ? `The ${attemptCount}${attemptCount === 3 ? 'rd' : 'th'} and final payment attempt failed. Premium access will lapse — update your payment method and reactivate with \`/premium subscribe\` to avoid any data lock.`
+        : `A payment attempt failed (attempt ${attemptCount} of ${PREMIUM_DUNNING_MAX_ATTEMPTS}). Access is unaffected while retries continue, but please update your payment method to avoid a lapse.`
+    )
+    .setFooter({ text: 'GG Sports • Premium' })
+    .setTimestamp();
+  await dmPremiumNotice(guild, updatedEntitlement, dmEmbed).catch(() => null);
+
+  // Stripe manages the actual retry cadence/count per its own dunning
+  // settings — we mirror its outcome rather than drive it. If Stripe's
+  // final attempt already reported 3+ failures, treat it as a full lapse
+  // now rather than waiting on a separate subscription.deleted event that
+  // may or may not follow immediately.
+  if (attemptCount >= PREMIUM_DUNNING_MAX_ATTEMPTS) {
+    await lapsePremiumGuild(client, entitlement.guild_id, 'payment_failed');
+  }
+}
+
+async function handleStripeSubscriptionDeleted(client, subscription) {
+  const entResult = await pool.query(`SELECT * FROM premium_entitlements WHERE stripe_subscription_id = $1 LIMIT 1`, [subscription.id]);
+  const entitlement = entResult.rows[0];
+  if (!entitlement || entitlement.status === 'lapsed') return; // already handled via dunning exhaustion above
+  await lapsePremiumGuild(client, entitlement.guild_id, 'canceled');
+}
+
+async function handleStripeWebhookEvent(client, event) {
+  switch (event.type) {
+    case 'checkout.session.completed':
+      await handleStripeCheckoutCompleted(client, event.data.object);
+      break;
+    case 'invoice.paid':
+      await handleStripeInvoicePaid(client, event.data.object);
+      break;
+    case 'invoice.payment_failed':
+      await handleStripeInvoicePaymentFailed(client, event.data.object);
+      break;
+    case 'customer.subscription.deleted':
+      await handleStripeSubscriptionDeleted(client, event.data.object);
+      break;
+    case 'customer.subscription.updated': {
+      const subscription = event.data.object;
+      const entResult = await pool.query(`SELECT guild_id FROM premium_entitlements WHERE stripe_subscription_id = $1 LIMIT 1`, [subscription.id]);
+      const guildId = entResult.rows[0]?.guild_id;
+      if (guildId) {
+        await pool.query(
+          `UPDATE premium_entitlements SET cancel_at_period_end = $2, current_period_end = $3, updated_at = NOW() WHERE guild_id = $1`,
+          [guildId, !!subscription.cancel_at_period_end, subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null]
+        );
+      }
+      break;
+    }
+    default:
+      break; // ignore anything we don't act on
+  }
+}
+
+// --- Trial scheduler ----------------------------------------------------------
+
+let premiumTrialSchedulerTimer = null;
+let premiumTrialSchedulerRunning = false;
+
+async function runPremiumTrialSchedulerTick(client) {
+  if (premiumTrialSchedulerRunning) return;
+  premiumTrialSchedulerRunning = true;
+  try {
+    // Warning pass — trials inside the last 24h, not yet warned.
+    const warningWindow = await pool.query(
+      `SELECT * FROM premium_entitlements
+       WHERE status = 'trialing'
+         AND trial_ends_at IS NOT NULL
+         AND trial_ends_at <= NOW() + ($1::text || ' hours')::interval
+         AND trial_ends_at > NOW()
+         AND trial_warning_sent_at IS NULL`,
+      [PREMIUM_TRIAL_WARNING_HOURS_BEFORE]
+    ).catch(() => ({ rows: [] }));
+
+    for (const entitlement of warningWindow.rows) {
+      const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
+      if (!guild) continue;
+      const dmEmbed = new EmbedBuilder()
+        .setTitle('⚠️ ATTENTION REQUIRED — GG Sports Premium Trial Ending Soon')
+        .setColor(0xED4245)
+        .setDescription(
+          `Your 14-day Premium trial ends within the next ${PREMIUM_TRIAL_WARNING_HOURS_BEFORE} hours. Subscribe with \`/premium subscribe\` to keep Premium access — otherwise this server will drop to the Free Tier and any leagues beyond the ${FREE_TIER_LEAGUE_CAP}-league cap will be locked (not deleted).`
+        )
+        .setFooter({ text: 'GG Sports • Premium' })
+        .setTimestamp();
+      await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
+      await pool.query(`UPDATE premium_entitlements SET trial_warning_sent_at = NOW() WHERE guild_id = $1`, [entitlement.guild_id]).catch(() => null);
+    }
+
+    // Expiry pass — trials past their end date, never converted to paid.
+    const expired = await pool.query(
+      `SELECT guild_id FROM premium_entitlements WHERE status = 'trialing' AND trial_ends_at IS NOT NULL AND trial_ends_at <= NOW()`
+    ).catch(() => ({ rows: [] }));
+
+    for (const row of expired.rows) {
+      await lapsePremiumGuild(client, row.guild_id, 'trial_expired').catch(error =>
+        console.error('[7J-PREMIUM] Trial expiry lapse failed for guild', row.guild_id, error?.message || error));
+    }
+
+    // Manual (comp) grant expiry — same idea, no Stripe involved.
+    const manualExpired = await pool.query(
+      `SELECT guild_id FROM premium_entitlements WHERE source = 'manual' AND status = 'active' AND manual_expires_at IS NOT NULL AND manual_expires_at <= NOW()`
+    ).catch(() => ({ rows: [] }));
+    for (const row of manualExpired.rows) {
+      await lapsePremiumGuild(client, row.guild_id, 'canceled').catch(() => null);
+    }
+  } catch (error) {
+    console.error('[7J-PREMIUM] Trial scheduler tick failed:', error);
+  } finally {
+    premiumTrialSchedulerRunning = false;
+  }
+}
+
+function startPremiumTrialSchedulerLoop(client) {
+  if (premiumTrialSchedulerTimer) clearInterval(premiumTrialSchedulerTimer);
+  // Hourly — trial warnings/expiry don't need finer granularity, and this
+  // matches the cadence of the other hourly scheduler (birthday/Christmas
+  // gifts) already in this file.
+  premiumTrialSchedulerTimer = setInterval(() => {
+    runPremiumTrialSchedulerTick(client).catch(error => console.error('[7J-PREMIUM] Trial scheduler tick failed:', error));
+  }, 60 * 60 * 1000);
+  setTimeout(() => runPremiumTrialSchedulerTick(client).catch(() => null), 45 * 1000);
+}
+
+// --- Grace-period expiry notice (NOT automatic deletion — see handoff) ------
+
+// 7J-PREMIUM-GRACENOTICE: per spec Section 6, locked data past the 30-day
+// grace period "may be permanently deleted." Deliberately NOT auto-executed
+// here — every other "delete" in this codebase is actually a soft
+// is_active = FALSE (see /league delete), and there's no precedent anywhere
+// for an unattended job that hard-deletes real rows. Wiring up actual
+// permanent deletion is a real decision (what exactly gets purged, cascade
+// behavior, whether it's reversible) that deserves an explicit go-ahead
+// rather than a quiet cron job. This tick only sends a final notice once the
+// grace window has passed; nothing is deleted by this code.
+let premiumGraceNoticeTimer = null;
+let premiumGraceNoticeRunning = false;
+
+async function runPremiumGraceNoticeTick(client) {
+  if (premiumGraceNoticeRunning) return;
+  premiumGraceNoticeRunning = true;
+  try {
+    const pastGrace = await pool.query(
+      `SELECT * FROM premium_entitlements
+       WHERE status = 'lapsed'
+         AND lapsed_at IS NOT NULL
+         AND lapsed_at <= NOW() - ($1::text || ' days')::interval
+         AND grace_notice_sent_at IS NULL`,
+      [PREMIUM_GRACE_PERIOD_DAYS]
+    ).catch(() => ({ rows: [] }));
+
+    for (const entitlement of pastGrace.rows) {
+      const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
+      if (guild) {
+        const dmEmbed = new EmbedBuilder()
+          .setTitle('GG Sports Premium — Grace Period Ended')
+          .setColor(0xED4245)
+          .setDescription(
+            `The ${PREMIUM_GRACE_PERIOD_DAYS}-day grace period for this server's locked data has passed. Locked leagues remain locked and intact for now — reactivate Premium with \`/premium subscribe\` any time to restore full access.`
+          )
+          .setFooter({ text: 'GG Sports • Premium' })
+          .setTimestamp();
+        await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
+      }
+      await pool.query(`UPDATE premium_entitlements SET grace_notice_sent_at = NOW() WHERE guild_id = $1`, [entitlement.guild_id]).catch(() => null);
+    }
+  } catch (error) {
+    console.error('[7J-PREMIUM] Grace notice tick failed:', error);
+  } finally {
+    premiumGraceNoticeRunning = false;
+  }
+}
+
+function startPremiumGraceNoticeLoop(client) {
+  if (premiumGraceNoticeTimer) clearInterval(premiumGraceNoticeTimer);
+  premiumGraceNoticeTimer = setInterval(() => {
+    runPremiumGraceNoticeTick(client).catch(error => console.error('[7J-PREMIUM] Grace notice tick failed:', error));
+  }, 6 * 60 * 60 * 1000); // every 6 hours — a day-granularity threshold doesn't need hourly polling
+  setTimeout(() => runPremiumGraceNoticeTick(client).catch(() => null), 90 * 1000);
+}
+
+// --- Embeds (rewritten for guild-level entitlement) --------------------------
+
+function buildPremiumStatusEmbed(guild, entitlement) {
+  const isActive = isEntitlementPremiumActive(entitlement);
+  const statusLabel = {
+    free: 'Free Tier',
+    trialing: 'Trial Active',
+    active: 'Premium Active',
+    past_due: 'Premium Active (payment retrying)',
+    lapsed: 'Lapsed — Locked Data in Grace Period',
+  }[entitlement?.status] || 'Free Tier';
+
+  const embed = new EmbedBuilder()
+    .setTitle('GG Sports Premium — Status')
+    .setColor(isActive ? 0x57F287 : 0x5865F2)
+    .addFields(
+      { name: 'Server', value: guild.name, inline: true },
+      { name: 'Status', value: statusLabel, inline: true },
+      { name: 'Plan', value: entitlement?.plan ? (entitlement.plan === 'annual' ? 'Annual' : 'Monthly') : 'None', inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Premium' })
+    .setTimestamp();
+
+  if (entitlement?.status === 'trialing' && entitlement.trial_ends_at) {
+    embed.addFields({ name: 'Trial Ends', value: `<t:${Math.floor(new Date(entitlement.trial_ends_at).getTime() / 1000)}:F>`, inline: true });
+  }
+  if ((entitlement?.status === 'active' || entitlement?.status === 'past_due') && entitlement.current_period_end) {
+    embed.addFields({
+      name: entitlement.cancel_at_period_end ? 'Access Ends' : 'Renews',
+      value: `<t:${Math.floor(new Date(entitlement.current_period_end).getTime() / 1000)}:F>`,
+      inline: true,
+    });
+  }
+  if (entitlement?.is_founder_pricing) {
+    embed.addFields({ name: 'Founder Pricing', value: 'Locked in ✅', inline: true });
+  }
+  if (entitlement?.source === 'manual') {
+    embed.addFields({
+      name: 'Grant Type',
+      value: entitlement.manual_expires_at ? `Manual comp, expires <t:${Math.floor(new Date(entitlement.manual_expires_at).getTime() / 1000)}:D>` : 'Manual comp (permanent)',
+      inline: true,
+    });
+  }
+  if (entitlement?.billing_manager_user_id) {
+    embed.addFields({ name: 'Billing Manager', value: `<@${entitlement.billing_manager_user_id}>`, inline: true });
+  }
+  if (!isActive) {
+    embed.addFields({ name: 'Free Tier League Cap', value: `${FREE_TIER_LEAGUE_CAP} active league(s)`, inline: true });
+  }
+  return embed;
 }
 
 function buildPremiumFeaturesEmbed() {
   return new EmbedBuilder()
     .setTitle('GG Sports Premium Features')
     .setColor(0xFEE75C)
-    .setDescription('Premium infrastructure is now in place. Payment integrations are planned for a later phase.')
-    .addFields(
-      { name: 'Premium Leagues', value: 'Unlock advanced league tools, richer panels, and deeper server customization.', inline: false },
-      { name: 'Premium Tournaments', value: 'Future support for paid tournaments, premium brackets, enhanced rewards, and featured events.', inline: false },
-      { name: 'Premium Bot Features', value: 'Advanced analytics, automation tools, franchise dashboards, and priority feature modules.', inline: false },
-      { name: 'Cosmetic Perks', value: 'Profile badges, premium icons, prestige visuals, and future custom profile themes.', inline: false },
-      { name: 'Future Integrations', value: 'Prepared for Patreon, Stripe, and Discord monetization without enabling payments yet.', inline: false }
+    .setDescription(
+      `Core league management is free forever. Premium (${PREMIUM_MONTHLY_PRICE_DISPLAY} or ${PREMIUM_ANNUAL_PRICE_DISPLAY}) unlocks advanced tooling and removes the Free Tier's ${FREE_TIER_LEAGUE_CAP}-league cap. \`/premium trial\` gets you 14 days, no card required.`
     )
-    .setFooter({ text: 'GG Sports • Premium Foundation' })
+    .addFields(
+      { name: 'GM-Assistant Tooling', value: 'Free Agents board, Trade Values, Trade Finder/Analyzer/Negotiator, Trade Needs, Draft Recap grades + auto-post.', inline: false },
+      { name: 'Economy System', value: 'Shop, Sportsbook, and Marketplace — the full interconnected currency/economy system.', inline: false },
+      { name: 'Tournaments & Legacy', value: 'Tournament hosting and the Legacy achievement/leaderboard system.', inline: false },
+      { name: 'Avatar Depth', value: 'Deeper cosmetic customization, unlockables, and marketplace (as that system grows).', inline: false },
+      { name: 'Scale', value: `Unlimited leagues per server (Free Tier: ${FREE_TIER_LEAGUE_CAP}), faster sync/auto-detect intervals, longer history retention.`, inline: false },
+    )
+    .setFooter({ text: 'GG Sports • Premium' })
     .setTimestamp();
 }
+
+// --- Business metrics (spec Section 10) --------------------------------------
+
+async function buildPremiumMetricsEmbed() {
+  const [activeStripeResult, manualResult, mrrInputResult, trialStartedResult, trialConvertedResult,
+    everPaidResult, lapsedResult, recoveryResult] = await Promise.all([
+    pool.query(`SELECT plan, COUNT(*)::int AS count FROM premium_entitlements WHERE source = 'stripe' AND status IN ('active','past_due') GROUP BY plan`),
+    pool.query(`SELECT COUNT(*)::int AS count FROM premium_entitlements WHERE source = 'manual' AND status = 'active' AND (manual_expires_at IS NULL OR manual_expires_at > NOW())`),
+    pool.query(`SELECT plan, COUNT(*)::int AS count FROM premium_entitlements WHERE source = 'stripe' AND status IN ('active','past_due') GROUP BY plan`),
+    pool.query(`SELECT COUNT(DISTINCT guild_id)::int AS count FROM premium_billing_events WHERE event_type = 'trial_started'`),
+    pool.query(`SELECT COUNT(DISTINCT guild_id)::int AS count FROM premium_billing_events WHERE event_type = 'trial_converted'`),
+    pool.query(`SELECT COUNT(DISTINCT guild_id)::int AS count FROM premium_billing_events WHERE event_type IN ('payment_succeeded', 'trial_converted')`),
+    pool.query(`SELECT COUNT(DISTINCT guild_id)::int AS count FROM premium_billing_events WHERE event_type = 'lapsed'`),
+    pool.query(`
+      WITH lapses AS (
+        SELECT guild_id, created_at AS lapsed_at FROM premium_billing_events WHERE event_type = 'lapsed'
+      )
+      SELECT
+        COUNT(*)::int AS total_lapses,
+        COUNT(*) FILTER (WHERE EXISTS (
+          SELECT 1 FROM premium_billing_events e
+          WHERE e.guild_id = lapses.guild_id
+            AND e.event_type IN ('payment_succeeded', 'manual_grant')
+            AND e.created_at > lapses.lapsed_at
+            AND e.created_at <= lapses.lapsed_at + INTERVAL '${PREMIUM_GRACE_PERIOD_DAYS} days'
+        ))::int AS recovered_count
+      FROM lapses
+    `),
+  ]);
+
+  const activeByPlan = Object.fromEntries(mrrInputResult.rows.map(r => [r.plan || 'unknown', r.count]));
+  const monthlyCount = activeByPlan.monthly || 0;
+  const annualCount = activeByPlan.annual || 0;
+  const manualCount = manualResult.rows[0]?.count || 0;
+  const mrrCents = monthlyCount * PREMIUM_MONTHLY_PRICE_CENTS + annualCount * (PREMIUM_ANNUAL_PRICE_CENTS / 12);
+  const activePaidCount = monthlyCount + annualCount;
+
+  const trialStarted = trialStartedResult.rows[0]?.count || 0;
+  const trialConverted = trialConvertedResult.rows[0]?.count || 0;
+  const conversionRate = trialStarted ? (trialConverted / trialStarted) * 100 : 0;
+
+  const everPaid = everPaidResult.rows[0]?.count || 0;
+  const lapsedCount = lapsedResult.rows[0]?.count || 0;
+  const churnRate = everPaid ? (lapsedCount / everPaid) * 100 : 0;
+
+  const arpu = activePaidCount ? mrrCents / activePaidCount / 100 : 0;
+
+  const totalLapses = recoveryResult.rows[0]?.total_lapses || 0;
+  const recoveredCount = recoveryResult.rows[0]?.recovered_count || 0;
+  const recoveryRate = totalLapses ? (recoveredCount / totalLapses) * 100 : 0;
+
+  return new EmbedBuilder()
+    .setTitle('GG Sports Premium — Business Metrics')
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'MRR', value: `$${(mrrCents / 100).toFixed(2)}`, inline: true },
+      { name: 'Active Paid Guilds', value: `${activePaidCount} (${monthlyCount} monthly / ${annualCount} annual)`, inline: true },
+      { name: 'Manual Comp Guilds', value: String(manualCount), inline: true },
+      { name: 'Trial → Paid Conversion', value: `${conversionRate.toFixed(1)}% (${trialConverted}/${trialStarted})`, inline: true },
+      { name: 'Churn Rate (lifetime)', value: `${churnRate.toFixed(1)}% (${lapsedCount}/${everPaid} ever-paid)`, inline: true },
+      { name: 'ARPU', value: `$${arpu.toFixed(2)}/mo`, inline: true },
+      { name: `Grace Recovery (${PREMIUM_GRACE_PERIOD_DAYS}d)`, value: `${recoveryRate.toFixed(1)}% (${recoveredCount}/${totalLapses})`, inline: true },
+    )
+    .setFooter({ text: 'GG Sports • Premium Metrics (v1, lifetime totals)' })
+    .setTimestamp();
+}
+
 
 function buildLegacyLeaderboardEmbed(rows) {
   const NL = String.fromCharCode(10);
@@ -31073,6 +32157,11 @@ function buildHelpEmbed() {
         value:
           'Use **/commissioner panel** for setup order and day-to-day operations (sync, scans, auto-detection, playoffs, Game Center, browsing Madden data). /setupguide has the full written walkthrough. Individual slash commands under /league, /game, /shop, /sportsbook, /ticket, and /tournament still work as manual backups.',
         inline: false,
+      },
+      {
+        name: 'Need More Help?',
+        value: `Join the support server: ${GG_SPORTS_SUPPORT_SERVER_URL}`,
+        inline: false,
       }
     )
     .setFooter({ text: 'GG Sports • Help' })
@@ -31842,9 +32931,15 @@ function startBirthdayChristmasGiftSchedulerLoop(client) {
 async function runReviewPromptSchedulerTick(client) {
   if (!botSettingsCache.review_link || !botSettingsCache.review_prompt_enabled) return;
 
-  // Discovery pass.
+  // Discovery pass. 7J-PUBLICPREP-REVIEWSCALE: previously one awaited
+  // INSERT per member (guild × league × team × member, all sequential) —
+  // fine at 2 test servers, but a real cost once this runs across many
+  // public guilds on a single daily tick. Now collects unique member IDs
+  // per guild first and does one batched INSERT per guild instead. Same
+  // ON CONFLICT DO NOTHING semantics, just fewer round trips.
   for (const guild of client.guilds.cache.values()) {
     const leagues = await getActiveLeaguesForGuild(guild.id).catch(() => []);
+    const memberIds = new Set();
     for (const league of leagues) {
       const teams = await getLeagueTeamRoles(league.league_id).catch(() => []);
       for (const team of teams) {
@@ -31852,13 +32947,17 @@ async function runReviewPromptSchedulerTick(client) {
         if (!role) continue;
         for (const member of role.members.values()) {
           if (member.user.bot) continue;
-          await pool.query(
-            `INSERT INTO user_review_prompts (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`,
-            [member.id]
-          ).catch(() => null);
+          memberIds.add(member.id);
         }
       }
     }
+    if (!memberIds.size) continue;
+    await pool.query(
+      `INSERT INTO user_review_prompts (user_id)
+       SELECT * FROM unnest($1::text[])
+       ON CONFLICT (user_id) DO NOTHING`,
+      [Array.from(memberIds)]
+    ).catch(() => null);
   }
 
   // Prompting pass.
@@ -43483,6 +44582,14 @@ function sendJsonResponse(res, statusCode, payload) {
   res.end(body);
 }
 
+// 7J-PREMIUM: tiny plain-text/HTML response for Stripe Checkout's static
+// success/cancel return pages — no templating needed, just something a
+// browser tab can show.
+function sendHtmlResponse(res, statusCode, message) {
+  res.writeHead(statusCode, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:4rem;"><p>${message}</p></body></html>`);
+}
+
 function readJsonRequest(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -43501,6 +44608,25 @@ function readJsonRequest(req) {
         reject(new Error('Invalid JSON body.'));
       }
     });
+    req.on('error', reject);
+  });
+}
+
+// 7J-PREMIUM: like readJsonRequest above, but returns the raw string
+// unparsed — Stripe webhook signature verification is defined over the
+// exact raw bytes, so JSON.parse-then-restringify would not reliably
+// reproduce the same signed payload.
+function readRawRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 2_000_000) {
+        req.destroy();
+        reject(new Error('Request body too large.'));
+      }
+    });
+    req.on('end', () => resolve(body));
     req.on('error', reject);
   });
 }
