@@ -17319,6 +17319,31 @@ if (interaction.commandName === 'avatar') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true }); return; }
       const leagueName = interaction.fields.getTextInputValue('name');
       const gameKey = (interaction.fields.getTextInputValue('game') || 'general').toLowerCase().trim();
+
+      // 7J-PREMIUM-PANELCAPFIX: this button/modal path created leagues
+      // directly and never had the Free Tier cap check that /league create
+      // got — confirmed live (2026-08-07): 3 leagues created here on a
+      // Free Tier server with the 2-league cap silently ignored. Same
+      // check as /league create, copied here rather than shared, since the
+      // two paths take input from different sources (modal fields vs.
+      // slash command options).
+      const existingLeagueResult = await pool.query(
+        `SELECT is_active FROM leagues WHERE guild_id = $1 AND LOWER(league_name) = LOWER($2) LIMIT 1`,
+        [interaction.guild.id, leagueName]
+      );
+      const existingLeague = existingLeagueResult.rows[0];
+      const wouldIncreaseActiveCount = !existingLeague || !existingLeague.is_active;
+      if (wouldIncreaseActiveCount && !(await isGuildPremiumActive(interaction.guild.id))) {
+        const activeCount = await countActiveLeaguesForGuild(interaction.guild.id);
+        if (activeCount >= FREE_TIER_LEAGUE_CAP) {
+          await interaction.reply({
+            content: `This server is on the Free Tier (${FREE_TIER_LEAGUE_CAP} active league max) and is already at the cap. Try \`/premium trial\` for 14 days of unlimited leagues (no card required), \`/premium subscribe\` to go Premium, or delete an existing league to free up a slot.`,
+            ephemeral: true,
+          });
+          return;
+        }
+      }
+
       const leagueId = randomUUID();
       await pool.query(
         `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`,
@@ -19262,6 +19287,18 @@ if (interaction.commandName === 'avatar') {
         const name = interaction.options.getString('name');
         const game = interaction.options.getString('game').toLowerCase();
         const seasonLength = interaction.options.getInteger('season_length');
+
+        // 7J-PREMIUM-PANELCAPFIX: third league-creation path found missing
+        // the Free Tier cap check (alongside /league create and the Admin
+        // Panel's Create League button/modal) — confirmed live 2026-08-07.
+        if (!(await isGuildPremiumActive(interaction.guild.id))) {
+          const activeCount = await countActiveLeaguesForGuild(interaction.guild.id);
+          if (activeCount >= FREE_TIER_LEAGUE_CAP) {
+            await interaction.editReply({ content: `This server is on the Free Tier (${FREE_TIER_LEAGUE_CAP} active league max) and is already at the cap. Try \`/premium trial\` for 14 days of unlimited leagues (no card required), \`/premium subscribe\` to go Premium, or delete an existing league to free up a slot.` });
+            return;
+          }
+        }
+
         const leagueId = randomUUID();
         await pool.query(`INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`, [interaction.guild.id, interaction.guild.name]);
         await pool.query(`INSERT INTO leagues (league_id, guild_id, league_name, game_key, season_length) VALUES ($1, $2, $3, $4, $5)`, [leagueId, interaction.guild.id, name, game, seasonLength]);
