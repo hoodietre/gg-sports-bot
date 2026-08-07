@@ -4149,7 +4149,17 @@ function buildCommands() {
         .setName('revokepremium')
         .setDescription('Revoke a manually-granted Premium comp from a server')
         .addStringOption(o => o.setName('guild').setDescription('Guild ID to revoke from').setRequired(true)))
-      .addSubcommand(sc => sc.setName('metrics').setDescription('Premium subscription business metrics (MRR, conversion, churn, ARPU)')),
+      .addSubcommand(sc => sc.setName('metrics').setDescription('Premium subscription business metrics (MRR, conversion, churn, ARPU)'))
+      .addSubcommand(sc => sc
+        .setName('premiumsimulate')
+        .setDescription('DEBUG: backdate a Premium timestamp for a guild so a scheduler tick treats it as due')
+        .addStringOption(o => o.setName('guild').setDescription('Guild ID').setRequired(true))
+        .addStringOption(o => o.setName('action').setDescription('Which stage to force-trigger').setRequired(true).addChoices(
+          { name: 'Expire trial now (guild must be trialing)', value: 'expire_trial_now' },
+          { name: 'Expire grace period now (guild must be lapsed)', value: 'expire_grace_now' },
+          { name: 'Make purge due now (grace notice must already be sent)', value: 'make_purge_due_now' },
+        )))
+      .addSubcommand(sc => sc.setName('premiumticks').setDescription('DEBUG: force all Premium scheduler ticks (trial/grace/purge) to run right now, instead of waiting')),
 
     new SlashCommandBuilder()
       .setName('teamroster')
@@ -10769,6 +10779,60 @@ if (interaction.commandName === 'avatar') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const embed = await buildPremiumMetricsEmbed();
         await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      // 7J-PREMIUM-DEBUG: testing the trial/grace/purge lifecycle for real
+      // would otherwise mean waiting 14 real days for a trial to expire,
+      // then 30 more for the grace period, then 3 more for the purge
+      // buffer. These two commands backdate the relevant timestamp and let
+      // the scheduler ticks run on demand instead of on their normal
+      // hourly/6-hourly interval, so the whole lifecycle can be exercised
+      // in minutes. Bot-owner only (same gate as the rest of /botowner).
+      if (subcommand === 'premiumsimulate') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const guildId = interaction.options.getString('guild', true).trim();
+        const action = interaction.options.getString('action', true);
+        const entitlement = await getGuildEntitlement(guildId);
+
+        if (action === 'expire_trial_now') {
+          if (entitlement.status !== 'trialing') {
+            await interaction.editReply({ content: `Guild is not currently trialing (status: ${entitlement.status}). Run \`/premium trial\` there first.` });
+            return;
+          }
+          await pool.query(`UPDATE premium_entitlements SET trial_ends_at = NOW() - INTERVAL '1 minute' WHERE guild_id = $1`, [guildId]);
+          await interaction.editReply({ content: `Backdated trial_ends_at for ${guildId}. Run \`/botowner premiumticks\` now to trigger the expiry.` });
+          return;
+        }
+
+        if (action === 'expire_grace_now') {
+          if (entitlement.status !== 'lapsed') {
+            await interaction.editReply({ content: `Guild is not currently lapsed (status: ${entitlement.status}). Trigger a lapse first (expire a trial, or cancel+expire a subscription).` });
+            return;
+          }
+          await pool.query(`UPDATE premium_entitlements SET lapsed_at = NOW() - INTERVAL '${PREMIUM_GRACE_PERIOD_DAYS + 1} days' WHERE guild_id = $1`, [guildId]);
+          await interaction.editReply({ content: `Backdated lapsed_at for ${guildId}. Run \`/botowner premiumticks\` now to trigger the grace-period notice.` });
+          return;
+        }
+
+        if (action === 'make_purge_due_now') {
+          if (entitlement.status !== 'lapsed' || !entitlement.grace_notice_sent_at) {
+            await interaction.editReply({ content: `Guild must be lapsed with a grace notice already sent first (run \`expire_grace_now\` + \`/botowner premiumticks\` first).` });
+            return;
+          }
+          await pool.query(`UPDATE premium_entitlements SET grace_notice_sent_at = NOW() - INTERVAL '${PREMIUM_PURGE_BUFFER_HOURS + 1} hours' WHERE guild_id = $1`, [guildId]);
+          await interaction.editReply({ content: `⚠️ Backdated grace_notice_sent_at for ${guildId}. Running \`/botowner premiumticks\` now will **permanently delete** that guild's locked leagues. Make sure this is a real test guild you're OK losing locked league data on.` });
+          return;
+        }
+        return;
+      }
+
+      if (subcommand === 'premiumticks') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await runPremiumTrialSchedulerTick(client).catch(error => console.error('[7J-PREMIUM-DEBUG] trial tick error:', error));
+        await runPremiumGraceNoticeTick(client).catch(error => console.error('[7J-PREMIUM-DEBUG] grace tick error:', error));
+        await runPremiumPurgeTick(client).catch(error => console.error('[7J-PREMIUM-DEBUG] purge tick error:', error));
+        await interaction.editReply({ content: 'Ran trial, grace-notice, and purge ticks. Check DMs/announcements and `/premium status` on the guild(s) you backdated.' });
         return;
       }
 
