@@ -2381,6 +2381,7 @@ async function initDatabase() {
       dunning_attempt_count INTEGER NOT NULL DEFAULT 0,
       lapsed_at TIMESTAMP,
       grace_notice_sent_at TIMESTAMP,
+      permanently_deleted_at TIMESTAMP,
       source TEXT NOT NULL DEFAULT 'stripe', -- stripe | manual
       manual_granted_by TEXT,
       manual_expires_at TIMESTAMP,
@@ -8593,7 +8594,8 @@ client.once(Events.ClientReady, async () => {
     console.log('Birthday/Christmas gift scheduler loop started.');
     startPremiumTrialSchedulerLoop(client);
     startPremiumGraceNoticeLoop(client);
-    console.log('Premium trial/grace scheduler loops started.');
+    startPremiumPurgeLoop(client);
+    console.log('Premium trial/grace/purge scheduler loops started.');
 
     const application = await client.application?.fetch().catch(() => null);
     if (application?.owner?.id && !botOwnerUserId) botOwnerUserId = application.owner.id;
@@ -10711,7 +10713,7 @@ if (interaction.commandName === 'avatar') {
           `UPDATE premium_entitlements SET
              status = 'active', source = 'manual', manual_granted_by = $2, manual_expires_at = $3,
              plan = NULL, stripe_customer_id = NULL, stripe_subscription_id = NULL, cancel_at_period_end = FALSE,
-             dunning_attempt_count = 0, updated_at = NOW()
+             dunning_attempt_count = 0, lapsed_at = NULL, grace_notice_sent_at = NULL, permanently_deleted_at = NULL, updated_at = NOW()
            WHERE guild_id = $1`,
           [guildId, interaction.user.id, manualExpiresAt]
         );
@@ -17466,6 +17468,111 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isButton() && interaction.customId === 'adminpanel_back') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
       await showAdminPanelHome(interaction, { update: true });
+      return;
+    }
+
+    // 7J-PREMIUM-PANEL: Premium & Billing category handlers. Base viewing
+    // access matches every other Admin Panel category (userCanUseLeagueSetup
+    // below); trial/billing-manager actions additionally require the live
+    // guild owner specifically, same restriction as the /premium slash
+    // command subcommands they mirror.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_premium_trial') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const ownerId = interaction.guild.ownerId || (await interaction.guild.fetchOwner().catch(() => null))?.id;
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({ content: 'Only this server\'s owner can start the Premium trial.', ephemeral: true });
+        return;
+      }
+      const existingClaim = await pool.query(`SELECT * FROM premium_trial_claims WHERE owner_user_id = $1 LIMIT 1`, [interaction.user.id]);
+      if (existingClaim.rows.length) {
+        await interaction.reply({ content: 'You\'ve already claimed a GG Sports Premium trial on a different server — each Discord account gets one trial.', ephemeral: true });
+        return;
+      }
+      const entitlement = await getGuildEntitlement(interaction.guild.id);
+      if (entitlement.status !== 'free') {
+        await interaction.reply({ content: `This server already has a Premium status (${entitlement.status}).`, ephemeral: true });
+        return;
+      }
+      const trialEndsAt = new Date(Date.now() + PREMIUM_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+      await pool.query(
+        `UPDATE premium_entitlements SET status = 'trialing', trial_started_at = NOW(), trial_ends_at = $2, trial_warning_sent_at = NULL, payer_user_id = $3, updated_at = NOW() WHERE guild_id = $1`,
+        [interaction.guild.id, trialEndsAt, interaction.user.id]
+      );
+      await pool.query(`INSERT INTO premium_trial_claims (owner_user_id, guild_id) VALUES ($1, $2)`, [interaction.user.id, interaction.guild.id]);
+      await recordPremiumBillingEvent(interaction.guild.id, 'trial_started', {});
+      const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
+      await interaction.update(await buildAdminPremiumPayload(interaction.guild, lang));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_premium_subscribe:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const plan = interaction.customId.split(':')[1];
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        const checkoutUrl = await createPremiumCheckoutSession(interaction.guild, interaction.user, plan);
+        const button = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel('Complete Checkout').setStyle(ButtonStyle.Link).setURL(checkoutUrl)
+        );
+        await interaction.editReply({ content: 'This link is for you to complete checkout — it expires shortly if unused.', components: [button] });
+      } catch (error) {
+        await interaction.editReply({ content: 'Could not start checkout: ' + (error?.message || 'Unknown error.') });
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_premium_cancel') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const entitlement = await getGuildEntitlement(interaction.guild.id);
+      if (!(await isBillingAuthorized(interaction, entitlement))) {
+        await interaction.reply({ content: 'Only the server owner or the designated billing manager can cancel Premium.', ephemeral: true });
+        return;
+      }
+      if (!entitlement.stripe_subscription_id) {
+        await interaction.reply({ content: 'No active Stripe subscription found for this server.', ephemeral: true });
+        return;
+      }
+      try {
+        await cancelPremiumSubscriptionAtPeriodEnd(entitlement);
+        const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
+        await interaction.reply({
+          content: entitlement.current_period_end
+            ? `Cancelled — Premium access continues through <t:${Math.floor(new Date(entitlement.current_period_end).getTime() / 1000)}:F>. No refunds are issued for the remaining period.`
+            : 'Cancelled — Premium access continues through the end of the current billing period.',
+          ephemeral: true,
+        });
+        await interaction.message.edit(await buildAdminPremiumPayload(interaction.guild, lang)).catch(() => null);
+      } catch (error) {
+        await interaction.reply({ content: 'Could not cancel: ' + (error?.message || 'Unknown error.'), ephemeral: true });
+      }
+      return;
+    }
+
+    if (interaction.isUserSelectMenu() && interaction.customId === 'adminpanel_premium_billingmanager_select') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const ownerId = interaction.guild.ownerId || (await interaction.guild.fetchOwner().catch(() => null))?.id;
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({ content: 'Only the server owner can designate a billing manager.', ephemeral: true });
+        return;
+      }
+      await ensureGuildEntitlementRow(interaction.guild.id);
+      const target = interaction.values[0];
+      await pool.query(`UPDATE premium_entitlements SET billing_manager_user_id = $2, updated_at = NOW() WHERE guild_id = $1`, [interaction.guild.id, target]);
+      const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
+      await interaction.update(await buildAdminPremiumPayload(interaction.guild, lang));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'adminpanel_premium_billingmanager_clear') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: t(await getEffectiveLanguage(interaction.guild.id, interaction.user.id), 'admin_panel_no_permission'), ephemeral: true }); return; }
+      const ownerId = interaction.guild.ownerId || (await interaction.guild.fetchOwner().catch(() => null))?.id;
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({ content: 'Only the server owner can clear the billing manager.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE premium_entitlements SET billing_manager_user_id = NULL, updated_at = NOW() WHERE guild_id = $1`, [interaction.guild.id]);
+      const lang = await getEffectiveLanguage(interaction.guild.id, interaction.user.id);
+      await interaction.update(await buildAdminPremiumPayload(interaction.guild, lang));
       return;
     }
 
@@ -29331,7 +29438,8 @@ async function handleStripeCheckoutCompleted(client, session) {
     `UPDATE premium_entitlements SET
        status = 'active', plan = $2, stripe_customer_id = $3, stripe_subscription_id = $4,
        current_period_end = $5, cancel_at_period_end = FALSE, is_founder_pricing = $6,
-       payer_user_id = $7, dunning_attempt_count = 0, source = 'stripe', updated_at = NOW()
+       payer_user_id = $7, dunning_attempt_count = 0, source = 'stripe',
+       lapsed_at = NULL, grace_notice_sent_at = NULL, permanently_deleted_at = NULL, updated_at = NOW()
      WHERE guild_id = $1`,
     [guildId, plan, session.customer, session.subscription, periodEnd, isFounderPricing, session.metadata?.user_id || null]
   );
@@ -29539,17 +29647,29 @@ function startPremiumTrialSchedulerLoop(client) {
   setTimeout(() => runPremiumTrialSchedulerTick(client).catch(() => null), 45 * 1000);
 }
 
-// --- Grace-period expiry notice (NOT automatic deletion — see handoff) ------
+// --- Grace-period expiry notice + automated permanent deletion --------------
 
-// 7J-PREMIUM-GRACENOTICE: per spec Section 6, locked data past the 30-day
-// grace period "may be permanently deleted." Deliberately NOT auto-executed
-// here — every other "delete" in this codebase is actually a soft
-// is_active = FALSE (see /league delete), and there's no precedent anywhere
-// for an unattended job that hard-deletes real rows. Wiring up actual
-// permanent deletion is a real decision (what exactly gets purged, cascade
-// behavior, whether it's reversible) that deserves an explicit go-ahead
-// rather than a quiet cron job. This tick only sends a final notice once the
-// grace window has passed; nothing is deleted by this code.
+// 7J-PREMIUM-PURGE: per Hxxdie — permanent deletion after the 30-day grace
+// period is now real, not notify-only. Two-stage to keep "make a reasonable
+// effort to notify before deletion" actually meaningful rather than notice
+// and deletion firing in the same tick: the grace-notice DM goes out once
+// lapsed_at is 30+ days old, then actual deletion only happens
+// PREMIUM_PURGE_BUFFER_HOURS after THAT notice — giving the owner a real
+// window to react to the exact message warning them, not just a courtesy
+// heads-up moments before the row is gone. Self-correcting: if the guild
+// reactivates in between (handleStripeCheckoutCompleted / manual grant),
+// status leaves 'lapsed' and both queries below stop matching that guild
+// automatically — no separate "cancel the purge" step needed.
+//
+// Deletion only ever touches LOCKED leagues (is_active = FALSE, the excess
+// beyond the Free Tier cap) — active leagues within the cap are never
+// purged, since those remain fully accessible on the Free Tier. Safe from
+// an FK standpoint: every table referencing leagues(league_id) already
+// declares ON DELETE CASCADE or ON DELETE SET NULL (checked directly
+// against the schema before wiring this up), so a real DELETE FROM leagues
+// cleans up correctly.
+const PREMIUM_PURGE_BUFFER_HOURS = 72;
+
 let premiumGraceNoticeTimer = null;
 let premiumGraceNoticeRunning = false;
 
@@ -29568,12 +29688,18 @@ async function runPremiumGraceNoticeTick(client) {
 
     for (const entitlement of pastGrace.rows) {
       const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
-      if (guild) {
+      const lockedResult = await pool.query(
+        `SELECT league_name FROM leagues WHERE guild_id = $1 AND is_active = FALSE ORDER BY created_at DESC`,
+        [entitlement.guild_id]
+      ).catch(() => ({ rows: [] }));
+      const lockedNames = lockedResult.rows.map(r => r.league_name);
+
+      if (guild && lockedNames.length) {
         const dmEmbed = new EmbedBuilder()
-          .setTitle('GG Sports Premium — Grace Period Ended')
+          .setTitle('⚠️ FINAL NOTICE — GG Sports Premium Data Deletion')
           .setColor(0xED4245)
           .setDescription(
-            `The ${PREMIUM_GRACE_PERIOD_DAYS}-day grace period for this server's locked data has passed. Locked leagues remain locked and intact for now — reactivate Premium with \`/premium subscribe\` any time to restore full access.`
+            `The ${PREMIUM_GRACE_PERIOD_DAYS}-day grace period for this server's locked data has passed. **The following locked league(s) will be permanently deleted in ${PREMIUM_PURGE_BUFFER_HOURS / 24} days unless Premium is reactivated:** ${lockedNames.join(', ')}.\n\nReactivate any time before then with \`/premium subscribe\` to restore everything with no data loss. After deletion, this cannot be undone.`
           )
           .setFooter({ text: 'GG Sports • Premium' })
           .setTimestamp();
@@ -29594,6 +29720,76 @@ function startPremiumGraceNoticeLoop(client) {
     runPremiumGraceNoticeTick(client).catch(error => console.error('[7J-PREMIUM] Grace notice tick failed:', error));
   }, 6 * 60 * 60 * 1000); // every 6 hours — a day-granularity threshold doesn't need hourly polling
   setTimeout(() => runPremiumGraceNoticeTick(client).catch(() => null), 90 * 1000);
+}
+
+let premiumPurgeTimer = null;
+let premiumPurgeRunning = false;
+
+async function runPremiumPurgeTick(client) {
+  if (premiumPurgeRunning) return;
+  premiumPurgeRunning = true;
+  try {
+    const duePurge = await pool.query(
+      `SELECT * FROM premium_entitlements
+       WHERE status = 'lapsed'
+         AND grace_notice_sent_at IS NOT NULL
+         AND grace_notice_sent_at <= NOW() - ($1::text || ' hours')::interval
+         AND permanently_deleted_at IS NULL`,
+      [PREMIUM_PURGE_BUFFER_HOURS]
+    ).catch(() => ({ rows: [] }));
+
+    for (const entitlement of duePurge.rows) {
+      const lockedResult = await pool.query(
+        `SELECT league_id, league_name FROM leagues WHERE guild_id = $1 AND is_active = FALSE`,
+        [entitlement.guild_id]
+      ).catch(() => ({ rows: [] }));
+      const lockedLeagues = lockedResult.rows;
+
+      // Nothing locked (e.g. they were never over the Free Tier cap to
+      // begin with) — nothing to purge, just mark this guild done so the
+      // tick stops re-checking it every run.
+      if (!lockedLeagues.length) {
+        await pool.query(`UPDATE premium_entitlements SET permanently_deleted_at = NOW() WHERE guild_id = $1`, [entitlement.guild_id]).catch(() => null);
+        continue;
+      }
+
+      const leagueIds = lockedLeagues.map(l => l.league_id);
+      const leagueNames = lockedLeagues.map(l => l.league_name);
+
+      try {
+        await pool.query(`DELETE FROM leagues WHERE league_id = ANY($1::uuid[])`, [leagueIds]);
+      } catch (error) {
+        console.error('[7J-PREMIUM] Purge DELETE failed for guild', entitlement.guild_id, error);
+        continue; // leave permanently_deleted_at NULL — will retry next tick
+      }
+
+      await pool.query(`UPDATE premium_entitlements SET permanently_deleted_at = NOW() WHERE guild_id = $1`, [entitlement.guild_id]).catch(() => null);
+      await recordPremiumBillingEvent(entitlement.guild_id, 'data_purged', {});
+
+      const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
+      if (guild) {
+        const dmEmbed = new EmbedBuilder()
+          .setTitle('🗑️ GG Sports Premium — Locked Data Deleted')
+          .setColor(0x2B2D31)
+          .setDescription(`The following locked league(s) have been permanently deleted after the grace period elapsed with no reactivation: **${leagueNames.join(', ')}**. This cannot be undone.`)
+          .setFooter({ text: 'GG Sports • Premium' })
+          .setTimestamp();
+        await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
+      }
+    }
+  } catch (error) {
+    console.error('[7J-PREMIUM] Purge tick failed:', error);
+  } finally {
+    premiumPurgeRunning = false;
+  }
+}
+
+function startPremiumPurgeLoop(client) {
+  if (premiumPurgeTimer) clearInterval(premiumPurgeTimer);
+  premiumPurgeTimer = setInterval(() => {
+    runPremiumPurgeTick(client).catch(error => console.error('[7J-PREMIUM] Purge tick failed:', error));
+  }, 6 * 60 * 60 * 1000);
+  setTimeout(() => runPremiumPurgeTick(client).catch(() => null), 120 * 1000);
 }
 
 // --- Embeds (rewritten for guild-level entitlement) --------------------------
@@ -42361,6 +42557,10 @@ function getAdminPanelCategories(lang) {
     { value: 'shop', label: t(lang, 'cat_shop_label'), description: t(lang, 'cat_shop_desc'), emoji: '🛍️' },
     { value: 'sportsbook', label: t(lang, 'cat_sportsbook_label'), description: t(lang, 'cat_sportsbook_desc'), emoji: '📊' },
     { value: 'tournament', label: t(lang, 'cat_tournament_label'), description: t(lang, 'cat_tournament_desc'), emoji: '🏆' },
+    // 7J-PREMIUM-PANEL: guild-level, not league-level, so this lives here
+    // (Admin Panel) rather than the per-league Commissioner Panel — same
+    // reasoning as Server Setup above.
+    { value: 'premium', label: 'Premium & Billing', description: 'Subscription status, trial, billing manager', emoji: '💎' },
     { value: 'settings', label: t(lang, 'cat_settings_label'), description: t(lang, 'cat_settings_desc'), emoji: '⚙️' },
   ];
 }
@@ -42524,6 +42724,56 @@ async function buildAdminSportsbookPayload(guild, lang) {
 // the new Server Setup category per Hxxdie, leaving just Language +
 // Onboarding — freed up enough row budget that this no longer needs to be
 // split at all.
+// 7J-PREMIUM-PANEL: Premium & Billing category — mirrors /premium's
+// subcommands as buttons/selects so nobody has to leave the panel or know
+// the slash commands exist, matching how the rest of this bot's setup flow
+// works. Viewing is gated the same as every other Admin Panel category
+// (userCanUseLeagueSetup, checked before this ever gets called); the
+// specific owner-only actions (billing manager assignment, trial start)
+// re-check live guild ownership inside their own handlers below, same as
+// the /premium slash command does.
+async function buildAdminPremiumPayload(guild, lang) {
+  const entitlement = await getGuildEntitlement(guild.id);
+  const isActive = isEntitlementPremiumActive(entitlement);
+
+  const embed = buildPremiumStatusEmbed(guild, entitlement);
+  const components = [];
+
+  if (!isActive && entitlement.status === 'free') {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_premium_trial').setLabel('Start 14-Day Trial').setEmoji('🎉').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('adminpanel_premium_subscribe:monthly').setLabel(`Subscribe Monthly (${PREMIUM_MONTHLY_PRICE_DISPLAY})`).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('adminpanel_premium_subscribe:annual').setLabel(`Subscribe Annual (${PREMIUM_ANNUAL_PRICE_DISPLAY})`).setStyle(ButtonStyle.Primary),
+    ));
+  } else if (entitlement.status === 'trialing') {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_premium_subscribe:monthly').setLabel(`Subscribe Monthly (${PREMIUM_MONTHLY_PRICE_DISPLAY})`).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('adminpanel_premium_subscribe:annual').setLabel(`Subscribe Annual (${PREMIUM_ANNUAL_PRICE_DISPLAY})`).setStyle(ButtonStyle.Primary),
+    ));
+  } else if (entitlement.source === 'stripe' && (entitlement.status === 'active' || entitlement.status === 'past_due')) {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_premium_cancel').setLabel(entitlement.cancel_at_period_end ? 'Cancellation Already Scheduled' : 'Cancel Subscription').setStyle(ButtonStyle.Danger).setDisabled(!!entitlement.cancel_at_period_end),
+    ));
+  } else if (entitlement.status === 'lapsed') {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_premium_subscribe:monthly').setLabel(`Reactivate Monthly (${PREMIUM_MONTHLY_PRICE_DISPLAY})`).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('adminpanel_premium_subscribe:annual').setLabel(`Reactivate Annual (${PREMIUM_ANNUAL_PRICE_DISPLAY})`).setStyle(ButtonStyle.Primary),
+    ));
+  }
+
+  components.push(new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder().setCustomId('adminpanel_premium_billingmanager_select').setPlaceholder(entitlement.billing_manager_user_id ? 'Change billing manager (owner only)' : 'Set a billing manager (owner only)')
+  ));
+  if (entitlement.billing_manager_user_id) {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_premium_billingmanager_clear').setLabel('Clear Billing Manager').setStyle(ButtonStyle.Secondary),
+    ));
+  }
+  components.push(buildAdminPanelBackRow(lang));
+
+  return { embeds: [embed], components };
+}
+
 async function buildAdminSettingsPayload(guild, lang) {
   const settings = await getGuildSettings(guild.id, guild.name);
   const currentLang = SUPPORTED_LANGUAGES.find(l => l.value === settings.language) || SUPPORTED_LANGUAGES[0];
@@ -42687,6 +42937,7 @@ async function showAdminPanelCategory(interaction, category, { update = true } =
   else if (category === 'sportsbook') payload = await buildAdminSportsbookPayload(interaction.guild, lang);
   else if (category === 'tournament') payload = await buildTournamentManagerHomePayload(interaction.guild);
   else if (category === 'serversetup') payload = await buildAdminServerSetupPayload(interaction.guild, lang);
+  else if (category === 'premium') payload = await buildAdminPremiumPayload(interaction.guild, lang);
   else if (category === 'settings') payload = await buildAdminSettingsPayload(interaction.guild, lang);
   else payload = { content: 'Unknown section.', embeds: [], components: [buildAdminPanelBackRow(lang)] };
   const finalPayload = { content: null, ...payload };
