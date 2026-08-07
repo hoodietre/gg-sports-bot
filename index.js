@@ -4048,7 +4048,6 @@ function buildCommands() {
       .setDescription('League setup and management commands')
       .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game type: nba, mlb, madden, general').setRequired(false)))
       .addSubcommand(sc => sc.setName('delete').setDescription('Delete/deactivate a league').addStringOption(o => o.setName('name').setDescription('League name to delete').setRequired(true)))
-      .addSubcommand(sc => sc.setName('reactivate').setDescription('Reactivate a previously deleted/locked league').addStringOption(o => o.setName('name').setDescription('League name to reactivate').setRequired(true)))
       .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('game').setDescription('nba, mlb, madden, general').setRequired(true)))
       .addSubcommand(sc => sc.setName('playoffsettings').setDescription('Set playoff team count for a league').addIntegerOption(o => o.setName('teams').setDescription('Number of teams that make playoffs').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
@@ -23865,38 +23864,16 @@ if (shopSubcommand === 'view') {
         return;
       }
 
-      if (leagueSubcommand === 'reactivate') {
-        if (!(await userCanUseLeagueSetup(interaction, null))) {
-          await interaction.reply({ content: 'You do not have permission to reactivate leagues.', ephemeral: true });
-          return;
-        }
-
-        const leagueName = interaction.options.getString('name');
-        const lockedResult = await pool.query(
-          `SELECT league_id, league_name FROM leagues WHERE guild_id = $1 AND LOWER(league_name) = LOWER($2) AND is_active = FALSE LIMIT 1`,
-          [interaction.guild.id, leagueName]
-        );
-        const lockedLeague = lockedResult.rows[0];
-        if (!lockedLeague) {
-          await interaction.reply({ content: 'No locked/deleted league found with that name.', ephemeral: true });
-          return;
-        }
-
-        if (!(await isGuildPremiumActive(interaction.guild.id))) {
-          const activeCount = await countActiveLeaguesForGuild(interaction.guild.id);
-          if (activeCount >= FREE_TIER_LEAGUE_CAP) {
-            await interaction.reply({
-              content: `Reactivating **${lockedLeague.league_name}** would put this server over the Free Tier's ${FREE_TIER_LEAGUE_CAP}-league cap. \`/league delete\` another active league first, or go Premium for unlimited leagues.`,
-              ephemeral: true,
-            });
-            return;
-          }
-        }
-
-        await pool.query(`UPDATE leagues SET is_active = TRUE WHERE league_id = $1`, [lockedLeague.league_id]);
-        await interaction.reply({ content: `Reactivated: **${lockedLeague.league_name}**.`, ephemeral: true });
-        return;
-      }
+      // 7J-25CAPFIX: dedicated /league reactivate subcommand removed —
+      // pushed the top-level /league command to 26 subcommands, over
+      // Discord's hard 25-option-per-command limit, and crashed command
+      // registration entirely (ExpectedConstraintError,
+      // lengthLessThanOrEqual 25) the instant Hxxdie tested it live.
+      // Reactivating a locked league doesn't need its own subcommand:
+      // /league create already does it via the ON CONFLICT (guild_id,
+      // league_name) DO UPDATE SET is_active = TRUE path a few lines up —
+      // running /league create with the exact same name un-locks it, and
+      // that path already carries the same Free Tier cap check.
 
       if (leagueSubcommand === 'list') {
         await interaction.deferReply({ ephemeral: true });
@@ -36705,7 +36682,7 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'gm_panel_channel', label: 'GM Panel Channel', description: 'Panel for team owners to open their GM dashboard', kind: 'channel' },
   // 7K-ROSTERPANEL: generic (both sports), unlike GM Panel Channel above
   // which is Madden-only.
-  { value: 'team_roster_channel', label: 'Team Roster Channel', description: 'Panel for team owners to add/remove players, coaches, and GMs — only useful once Team Rosters is enabled in League Customization', kind: 'channel' },
+  { value: 'team_roster_channel', label: 'Team Roster Channel', description: 'Team owners add/remove players, coaches, GMs — requires Team Rosters enabled in League Customization', kind: 'channel' },
   { value: 'league_announcement_channel', label: 'League Announcement Channel', description: 'Where announcements posted from the commissioner panel go', kind: 'channel' },
   { value: 'staff_channel', label: 'Staff Channel', description: 'Where league settings changes and other staff-only notices post', kind: 'channel' },
   { value: 'league_leaders_channel', label: 'League Leaders Channel', description: 'Live, switchable stat leaders board', kind: 'channel' },
