@@ -2395,6 +2395,17 @@ async function initDatabase() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_premium_entitlements_stripe_customer ON premium_entitlements(stripe_customer_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_premium_entitlements_stripe_subscription ON premium_entitlements(stripe_subscription_id)`);
+  // 7J-PREMIUM-SCHEMAFIX: CREATE TABLE IF NOT EXISTS above is a no-op once
+  // the table already exists on a live deploy — columns added to that block
+  // after the table's first-ever creation (permanently_deleted_at, added
+  // when automated purge was built, after this bot had already been
+  // deployed and run once) never actually land without an explicit ALTER
+  // TABLE. This is exactly what broke the first live checkout test
+  // (2026-08-07: "column permanently_deleted_at ... does not exist").
+  // Both listed defensively — safe no-ops via IF NOT EXISTS if already
+  // present — so this class of bug can't recur silently for this table.
+  await pool.query(`ALTER TABLE premium_entitlements ADD COLUMN IF NOT EXISTS grace_notice_sent_at TIMESTAMP`);
+  await pool.query(`ALTER TABLE premium_entitlements ADD COLUMN IF NOT EXISTS permanently_deleted_at TIMESTAMP`);
 
   // Global (not per-guild) — trial eligibility is tracked by the claiming
   // owner's Discord user ID specifically so leave/re-add or a brand-new
