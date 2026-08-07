@@ -6316,6 +6316,68 @@ async function updateTeamOwnersPanel(guild, league = null) {
   await updatePanel(guild, league, 'team_owners', await buildTeamOwnersEmbed(guild, league));
 }
 
+// 7J-COMMANDHUB-TEAMOWNERSYNC: whether roleId is one of this league's
+// registered team roles — used to gate an updateTeamOwnersPanel refresh so
+// it only fires on actual ownership-relevant role changes, not any
+// arbitrary role add/remove.
+async function isRegisteredTeamRole(league, roleId) {
+  if (!league?.league_id || !roleId) return false;
+  const teamRoles = await getLeagueTeamRoles(league.league_id);
+  return teamRoles.some(team => team.role_id === roleId);
+}
+
+// 7J-COMMANDHUB: shared by /commissioner assignrole|unassignrole and the
+// new Commissioner Panel Assign/Remove Role buttons — one place for the
+// role add/remove + Team Owners panel refresh + Madden ownership sync +
+// pending-game-thread-owners-avatar check, instead of duplicating all of
+// that a third time for the panel flow.
+async function performCommissionerRoleAction(guild, league, targetUserId, roleId, action) {
+  const targetMember = await guild.members.fetch(targetUserId).catch(() => null);
+  const role = await guild.roles.fetch(roleId).catch(() => null);
+  if (!targetMember || !role) return { ok: false, message: 'Could not find that member or role anymore.' };
+
+  if (action === 'assign') await targetMember.roles.add(role).catch(() => null);
+  else await targetMember.roles.remove(role).catch(() => null);
+
+  const isTeamRole = await isRegisteredTeamRole(league, role.id);
+  if (isTeamRole) {
+    await updateTeamOwnersPanel(guild, league).catch(() => null);
+
+    if (league?.league_id) {
+      const newOwnerId = action === 'assign' ? targetUserId : null;
+      await pool.query(
+        `UPDATE madden_imported_team_stats SET owner_user_id = $3, imported_at = NOW()
+         WHERE guild_id = $1 AND league_id::text = $2::text AND team_role_id = $4`,
+        [guild.id, String(league.league_id), newOwnerId, role.id]
+      ).catch(() => null);
+      await pool.query(
+        `UPDATE madden_franchises SET owner_user_id = $3, updated_at = NOW()
+         WHERE guild_id = $1 AND league_id::text = $2::text AND team_role_id = $4`,
+        [guild.id, String(league.league_id), newOwnerId, role.id]
+      ).catch(() => null);
+
+      if (newOwnerId) {
+        const pendingGames = await pool.query(
+          `SELECT * FROM madden_imported_games
+           WHERE guild_id = $1 AND league_id::text = $2::text
+             AND thread_id IS NOT NULL AND owners_avatar_posted = FALSE
+             AND (away_team_role_id = $3 OR home_team_role_id = $3)`,
+          [guild.id, String(league.league_id), role.id]
+        ).catch(() => ({ rows: [] }));
+        for (const pendingGame of pendingGames.rows) {
+          await maybePostGameThreadOwnersAvatar(guild, league, pendingGame).catch(error =>
+            console.error('[Game Thread Owners Avatar] post-role-action check failed:', error));
+        }
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    message: `${action === 'assign' ? 'Assigned' : 'Removed'} ${role} ${action === 'assign' ? 'to' : 'from'} ${targetMember}.`,
+  };
+}
+
 async function updateTradeCountPanel(guild, league = null) {
   await updatePanel(guild, league, 'trade_count', await buildTradeCountEmbed(league));
 }
@@ -12265,6 +12327,11 @@ if (interaction.commandName === 'avatar') {
       if (league?.league_role_id) {
         await applicantMember.roles.add(league.league_role_id).catch(err => console.error('[Recruitment] Failed to assign league role on approval:', err?.message || err));
       }
+      // 7J-COMMANDHUB-TEAMOWNERSYNC: this is always a team role (recruitment
+      // applications only exist for team roles), so the Team Owners panel
+      // needs to reflect the new owner immediately, not just on the next
+      // manual /commissioner assignrole.
+      await updateTeamOwnersPanel(interaction.guild, league).catch(() => null);
       await pool.query(`UPDATE league_recruitment_applications SET role_granted_at = NOW() WHERE id = $1`, [appId]);
       await interaction.editReply({ content: `Approved. <@${app.applicant_user_id}> is now **${role.name}**.`, embeds: [], components: [] });
       await applicantMember.send({ content: `🎉 Your application for **${role.name}** in **${league?.league_name || 'the league'}** was approved! You've been assigned the team role.` }).catch(() => null);
@@ -12347,6 +12414,10 @@ if (interaction.commandName === 'avatar') {
         return;
       }
       await member.roles.add(role.id).catch(() => null);
+      // 7J-COMMANDHUB-TEAMOWNERSYNC: self-service team claim also changes
+      // ownership — same refresh as the recruitment-approval and
+      // assignrole paths.
+      if (league) await updateTeamOwnersPanel(guild, league).catch(() => null);
       const note = existingOwner ? ` Heads up — <@${existingOwner.id}> already has this role too; a commissioner can sort out ownership if that's not intended.` : '';
       await interaction.update({
         content: `You're set as **${role.name}**${league ? ' in ' + league.league_name : ''}.${note}`,
@@ -12659,6 +12730,11 @@ if (interaction.commandName === 'avatar') {
         }
         if (pending.removeLeagueRole && kickTargetLeague?.league_role_id) {
           await targetMember.roles.remove(kickTargetLeague.league_role_id).catch(() => null);
+        }
+        // 7J-COMMANDHUB-TEAMOWNERSYNC: a kick removing a team role is an
+        // ownership change just as much as assigning one is.
+        if (kickTargetLeague && pending.teamRoleIds.length) {
+          await updateTeamOwnersPanel(interaction.guild, kickTargetLeague).catch(() => null);
         }
 
         // 7J-98WAITLIST: a kick is one of the two clear "team just became
@@ -14602,6 +14678,45 @@ if (interaction.commandName === 'avatar') {
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('count').setLabel('Number of teams (placeholder names)').setStyle(TextInputStyle.Short).setRequired(true).setValue('20'))
         );
       await interaction.showModal(modal);
+      return;
+    }
+
+    // 7J-COMMANDHUB: Assign Role / Remove Role buttons — same
+    // performCommissionerRoleAction + userCanUseLeagueSetup gating as
+    // /commissioner assignrole|unassignrole. Two-step: button → pick a
+    // member → pick a role → execute, since Discord buttons can't collect
+    // two different inputs in one step.
+    if (interaction.isButton() && (interaction.customId.startsWith('setup_assignrole:') || interaction.customId.startsWith('setup_removerole:'))) {
+      const action = interaction.customId.startsWith('setup_assignrole:') ? 'assign' : 'unassign';
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const userMenu = new UserSelectMenuBuilder().setCustomId(`setup_roleaction_user:${action}:${leagueId}`).setPlaceholder(`Choose a member to ${action === 'assign' ? 'give a role to' : 'remove a role from'}`);
+      await interaction.reply({ content: `**${action === 'assign' ? 'Assign Role' : 'Remove Role'}** — choose a member`, components: [new ActionRowBuilder().addComponents(userMenu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('setup_roleaction_user:')) {
+      const [, action, leagueId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const targetUserId = interaction.values[0];
+      const roleMenu = new RoleSelectMenuBuilder().setCustomId(`setup_roleaction_role:${action}:${leagueId}:${targetUserId}`).setPlaceholder(`Choose a role to ${action === 'assign' ? 'assign' : 'remove'}`);
+      await interaction.update({ content: `**${action === 'assign' ? 'Assign Role' : 'Remove Role'}** — choose a role for <@${targetUserId}>`, components: [new ActionRowBuilder().addComponents(roleMenu)] });
+      return;
+    }
+
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('setup_roleaction_role:')) {
+      const [, action, leagueId, targetUserId] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const roleId = interaction.values[0];
+      await interaction.deferUpdate();
+      const result = await performCommissionerRoleAction(interaction.guild, league, targetUserId, roleId, action);
+      await interaction.editReply({ content: result.message, components: [] });
       return;
     }
 
@@ -25013,50 +25128,8 @@ if (shopSubcommand === 'view') {
       const targetUser = interaction.options.getUser('member');
       const role = interaction.options.getRole('role');
       await interaction.deferReply({ ephemeral: true });
-      const targetMember = await interaction.guild.members.fetch(targetUser.id);
-      if (roleActionSubcommand === 'assignrole') await targetMember.roles.add(role);
-      else await targetMember.roles.remove(role);
-      const configuredTeamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
-      const isMaddenTeamRole = configuredTeamRoles.some(team => team.role_id === role.id);
-      if (isMaddenTeamRole) await updateTeamOwnersPanel(interaction.guild, league);
-
-      // Sync Madden team ownership tables when a team role is assigned/unassigned
-      if (isMaddenTeamRole && league?.league_id) {
-        const newOwnerId = roleActionSubcommand === 'assignrole' ? targetUser.id : null;
-        await pool.query(
-          `UPDATE madden_imported_team_stats
-           SET owner_user_id = $3, imported_at = NOW()
-           WHERE guild_id = $1 AND league_id::text = $2::text
-             AND team_role_id = $4`,
-          [interaction.guild.id, String(league.league_id), newOwnerId, role.id]
-        ).catch(() => null);
-        await pool.query(
-          `UPDATE madden_franchises
-           SET owner_user_id = $3, updated_at = NOW()
-           WHERE guild_id = $1 AND league_id::text = $2::text
-             AND team_role_id = $4`,
-          [interaction.guild.id, String(league.league_id), newOwnerId, role.id]
-        ).catch(() => null);
-
-        // If this role's team has an existing game thread waiting on both owners to
-        // be set, check whether this newly-claimed role is the missing piece —
-        // covers the "team claimed after the thread already exists" case (thread
-        // creation itself already handles the "both already claimed" case).
-        if (newOwnerId) {
-          const pendingGames = await pool.query(
-            `SELECT * FROM madden_imported_games
-             WHERE guild_id = $1 AND league_id::text = $2::text
-               AND thread_id IS NOT NULL AND owners_avatar_posted = FALSE
-               AND (away_team_role_id = $3 OR home_team_role_id = $3)`,
-            [interaction.guild.id, String(league.league_id), role.id]
-          ).catch(() => ({ rows: [] }));
-          for (const pendingGame of pendingGames.rows) {
-            await maybePostGameThreadOwnersAvatar(interaction.guild, league, pendingGame).catch(error =>
-              console.error('[Game Thread Owners Avatar] post-assignrole check failed:', error));
-          }
-        }
-      }
-      await interaction.editReply({ content: `${roleActionSubcommand === 'assignrole' ? 'Assigned' : 'Removed'} ${role} ${roleActionSubcommand === 'assignrole' ? 'to' : 'from'} ${targetMember}.`, ephemeral: true });
+      const result = await performCommissionerRoleAction(interaction.guild, league, targetUser.id, role.id, roleActionSubcommand === 'assignrole' ? 'assign' : 'unassign');
+      await interaction.editReply({ content: result.message, ephemeral: true });
       return;
     }
 
@@ -34126,6 +34199,10 @@ async function grantPendingRecruitmentRolesOnJoin(member) {
     if (league?.league_role_id) {
       await member.roles.add(league.league_role_id).catch(err => console.error('[Recruitment] grantPendingRecruitmentRolesOnJoin league role add failed:', err?.message));
     }
+    // 7J-COMMANDHUB-TEAMOWNERSYNC: same as the immediate-approval path —
+    // this is always a team role, so refresh the panel now that the owner
+    // has actually joined and received it.
+    if (league) await updateTeamOwnersPanel(member.guild, league).catch(() => null);
     await pool.query(`UPDATE league_recruitment_applications SET role_granted_at = NOW() WHERE id = $1`, [app.id]);
     await member.send({ content: `🎉 Welcome! Your **${role.name}** team role from your approved recruitment application has been assigned.` }).catch(() => null);
   }
@@ -34756,6 +34833,12 @@ function buildSetupDashboardComponents(leagueId, selectedSetting = null, isMadde
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('setup_autocreate_roles:' + leagueId).setLabel('Auto-Create Team Roles').setEmoji('🏗️').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('setup_autocreate_channels:' + leagueId).setLabel('Auto-Setup Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
+      // 7J-COMMANDHUB: buttons for /commissioner assignrole|unassignrole —
+      // same commissioner-tier gating, same underlying
+      // performCommissionerRoleAction helper. Added to this existing row
+      // rather than a new one to stay under Discord's 5-row cap.
+      new ButtonBuilder().setCustomId('setup_assignrole:' + leagueId).setLabel('Assign Role').setEmoji('➕').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('setup_removerole:' + leagueId).setLabel('Remove Role').setEmoji('➖').setStyle(ButtonStyle.Secondary),
     ));
   }
 
