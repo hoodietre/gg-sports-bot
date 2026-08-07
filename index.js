@@ -112,12 +112,16 @@ const STRIPE_IS_LIVE_MODE = STRIPE_SECRET_KEY.startsWith('sk_live_');
 // Stripe keys — a broken prod webhook silently pointed at test keys (or
 // vice versa) is exactly the kind of thing that should fail loudly at
 // startup, not quietly charge nobody (or charge someone's test card) in
-// production. Opt-in via either Railway's own environment name or an
-// explicit override, since we can't assume how "production" is signaled
-// on every deploy target.
-const GG_SPORTS_REQUIRES_LIVE_STRIPE =
-  process.env.RAILWAY_ENVIRONMENT === 'production' ||
-  process.env.STRIPE_REQUIRE_LIVE_MODE === 'true';
+// production. Purely opt-in via an explicit env var — this deliberately
+// does NOT also check RAILWAY_ENVIRONMENT === 'production', because Railway
+// names its default environment "production" for virtually every project
+// regardless of whether a separate staging environment exists. Gating on
+// that meant this fired on every single deploy with a test key, including
+// the completely normal test-mode testing this bot was built to allow
+// (crashed the bot the first time it was actually tried — see chat history
+// around 2026-08-07). Set STRIPE_REQUIRE_LIVE_MODE=true only once you're
+// intentionally ready to hard-require live keys.
+const GG_SPORTS_REQUIRES_LIVE_STRIPE = process.env.STRIPE_REQUIRE_LIVE_MODE === 'true';
 
 const FREE_TIER_LEAGUE_CAP = 2; // per Hxxdie — unlimited on Premium
 const PREMIUM_TRIAL_DAYS = 14;
@@ -8569,11 +8573,11 @@ client.once(Events.ClientReady, async () => {
   console.log(`GG Sports is online as ${client.user.tag}`);
   console.log(`BOOT MARKER: jeans-fix-check @ ${new Date().toISOString()}`);
 
-  // 7J-PREMIUM: refuse to boot in a production configuration without live
-  // Stripe keys — see the constant's definition for why. Checked before
-  // anything else starts.
+  // 7J-PREMIUM: refuse to boot with STRIPE_REQUIRE_LIVE_MODE=true set but a
+  // non-live Stripe key — see the constant's definition for why this is
+  // opt-in only. Checked before anything else starts.
   if (GG_SPORTS_REQUIRES_LIVE_STRIPE && STRIPE_SECRET_KEY && !STRIPE_IS_LIVE_MODE) {
-    console.error('[7J-PREMIUM] Refusing to start: production environment detected but STRIPE_SECRET_KEY is a test key, not live. Set live Stripe keys or unset STRIPE_REQUIRE_LIVE_MODE/RAILWAY_ENVIRONMENT if this is intentional.');
+    console.error('[7J-PREMIUM] Refusing to start: STRIPE_REQUIRE_LIVE_MODE=true but STRIPE_SECRET_KEY is a test key, not live. Set live Stripe keys, or unset STRIPE_REQUIRE_LIVE_MODE if you meant to test with a test key.');
     process.exit(1);
   }
 
