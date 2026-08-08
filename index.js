@@ -9716,17 +9716,22 @@ function buildNewServerOwnerWelcomeEmbed(guild) {
     .setTitle(`👋 Thanks for adding GG Sports to ${guild.name}!`)
     .setColor(0x5865F2)
     .setDescription(
-      "Here's how to get set up:" + String.fromCharCode(10) + String.fromCharCode(10) +
-      '**1.** `/league create` — create your first league.' + String.fromCharCode(10) +
-      '**2.** `/commissioner panel` — the control panel for everything else: channels/roles, live boards, operations, and league customization.' + String.fromCharCode(10) + String.fromCharCode(10) +
-      "Prefer a written walkthrough? `/setupguide` has the full order (and shows what's free vs. Premium at each step), or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members." + String.fromCharCode(10) + String.fromCharCode(10) +
-      // 7J-COMMANDHUB-ONBOARDING: per Hxxdie — the trial deserves a mention
-      // right here, not buried behind a command someone has to already
-      // know exists. Core league management (rosters, trades, standings,
-      // schedule, playoffs) is free forever; Premium adds GM analytics
-      // tools, the Economy system (Shop/Sportsbook/Bank/Marketplace/
-      // Avatar), Tournaments, and deeper Madden boards.
-      '💎 **Free vs. Premium:** core league management (rosters, trades, standings, schedule, playoffs, staff tools) is free forever, no time limit. Premium unlocks GM analytics tools, the full Economy system (Shop/Sportsbook/Bank/Marketplace/Avatar), Tournaments, and deeper Madden boards (Free Agents, News, Power Rankings, League History, Franchise Hub).' + String.fromCharCode(10) + String.fromCharCode(10) +
+      // 7J-COMMANDHUB-ONBOARDING: per Hxxdie (live-tested) — the exact
+      // order matters here, not just "these steps exist somewhere."
+      // League Settings has to come before Channels & Roles because it
+      // directly affects what auto-setup creates. Team Roles has to come
+      // before Auto-Setup Channels because the channel/panel/board setup
+      // needs to already know the league's roles and team roles to work
+      // correctly — reversing that order was a real problem found in
+      // testing.
+      "Here's the recommended order to get set up:" + String.fromCharCode(10) + String.fromCharCode(10) +
+      '**1.** Open the **Admin Panel** → **League Setup** → **Create League**.' + String.fromCharCode(10) +
+      '**2.** Press **Auto Create League Roles**, then **Continue in Commissioner Panel**.' + String.fromCharCode(10) +
+      '**3.** In the Commissioner Panel, go to **League Settings** first — season length, standings system, playoffs, etc. actually drive what auto-setup builds next.' + String.fromCharCode(10) +
+      '**4.** Then **Channels & Roles** → press **Auto Create Team Roles**, then **Auto Setup Channels** — in that order, or the channels/boards won\'t know the team roles yet.' + String.fromCharCode(10) +
+      '**5.** Premium/trial servers: also run **Auto Setup Server Channels** from Admin Panel → Server Setup for the Economy/Shop/Sportsbook/Tickets category.' + String.fromCharCode(10) + String.fromCharCode(10) +
+      "Worth checking too (easy to forget): onboarding DM toggle, Welcome/Leave, language, Wagers, and (Madden) auto-detect/ESPN news/auto-sportsbook — all in Admin Panel → Server Setup. `/setupguide` has the full written walkthrough with all of this in order, or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members." + String.fromCharCode(10) + String.fromCharCode(10) +
+      '💎 **Free vs. Premium:** core league management (rosters, trades, standings, schedule, playoffs, staff tools) is free forever, no time limit. Premium unlocks GM analytics tools, the full Economy system (Shop/Sportsbook/Bank/Marketplace/Avatar), Tickets, Tournaments, and deeper Madden boards.' + String.fromCharCode(10) + String.fromCharCode(10) +
       '`/premium trial` gets you **14 days of full Premium access, no card required** — the fastest way to see everything the bot can do before deciding.' + String.fromCharCode(10) + String.fromCharCode(10) +
       `Questions or stuck on something? Join the support server: ${GG_SPORTS_SUPPORT_SERVER_URL}`
     )
@@ -15904,6 +15909,19 @@ if (interaction.commandName === 'avatar') {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage playoffs.', ephemeral: true }); return; }
+      // 7J-COMMANDHUB-PLAYOFFGATE: per Hxxdie — playoff team count and
+      // actually running/advancing playoffs (Start/Report, both above)
+      // stay Free regardless of tier; games still get made in Game
+      // Center/threads either way. Only the *visual auto-updating bracket
+      // board* is Premium. Real gap found and fixed here: this button
+      // previously had no premium check at all, and falls back to
+      // whatever channel it's run in when no dedicated channel is
+      // configured — meaning a Free Tier commissioner could post the
+      // board manually and fully bypass the paywall, even though the
+      // dedicated channel itself was correctly skipped by auto-setup.
+      // Auto-setup skipping channel creation was never real enforcement
+      // by itself, same lesson as the centralized interaction gate.
+      if (!(await requirePremiumFeature(interaction, 'Playoff Bracket Board'))) return;
       const bracketResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]);
       const bracketState = bracketResult.rows[0];
       if (!bracketState) { await interaction.reply({ content: 'No bracket to post yet — start playoffs first.', ephemeral: true }); return; }
@@ -17752,15 +17770,15 @@ if (interaction.commandName === 'avatar') {
       const { category, channels } = await autoCreateGuildMultiChannelPanels(interaction.guild);
       const payload = await buildAdminServerSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       // 7J-COMMANDHUB-PAYWALL: message now reflects what actually got
-      // created — Free Tier only gets Recruitment (+ Tickets/Support/
-      // Welcome/Leave if applicable), not the full premium panel list this
-      // used to unconditionally claim.
+      // created — Free Tier gets Recruitment + Welcome/Leave only; Premium
+      // adds Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile plus
+      // Tickets/Support.
       const isPremiumGuild = await isGuildPremiumActive(interaction.guild.id);
       const panelSummary = isPremiumGuild
-        ? 'posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment panels'
-        : 'posted the Recruitment panel (Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile are Premium — `/premium trial` unlocks them for 14 days, no card required)';
+        ? 'posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment/Tickets/Support panels'
+        : 'posted the Recruitment panel (Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Tickets/Support are Premium — `/premium trial` unlocks them for 14 days, no card required)';
       await interaction.editReply({
-        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and ${panelSummary}${channels.length > 7 ? ' (Welcome/Leave channels included)' : ''}. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
+        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and ${panelSummary}. Welcome/Leave channels included and enabled. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
         ...payload,
       });
       return;
@@ -29834,77 +29852,81 @@ function buildSetupGuideEmbed() {
     .setTitle('GG Sports Setup Guide')
     .setColor(0x5865F2)
     .setDescription(
-      'Use this guide in order when setting up a new server or new league. **Most of this is now done from `/commissioner panel`** — one interactive control panel covering channels/roles, live panels, operations, league customization, and (for Madden leagues) browsing transactions/retirements and auto-detect settings. Individual slash commands below still work as manual backups.\n\n' +
-      // 7J-COMMANDHUB-ONBOARDING: per Hxxdie — "new users don't necessarily
-      // know everything that's available unless they go looking for it."
-      // Every section below is now labeled 🆓/💎 so it's obvious at a
-      // glance what's free vs. what needs a subscription, instead of
-      // reading like one flat mandatory checklist. Free steps come first
-      // (a fully working league needs zero of the premium stuff), Premium
-      // add-ons are their own clearly separated block after.
+      'Follow this **in order** — the sequence matters, not just which steps exist. **Most of this is done from the Admin Panel and `/commissioner panel`** — interactive control panels covering channels/roles, live panels, operations, and league customization. Individual slash commands below still work as manual backups.\n\n' +
+      // 7J-COMMANDHUB-ONBOARDING: per Hxxdie (live-tested) — two real
+      // ordering dependencies, not just style preference. League Settings
+      // has to come before Channels & Roles because season/schedule/
+      // standings settings directly affect what auto-setup builds. Team
+      // Roles has to come before Auto-Setup Channels because the
+      // channels/boards being created need to already know the league's
+      // team roles to populate correctly — doing it in the wrong order was
+      // a real, confirmed problem.
       '**🆓 Free** = works forever, no time limit. **💎 Premium** = needs an active subscription or trial — try `/premium trial` for 14 days of full access, no card required.'
     )
     .addFields(
       {
         name: '1. Create the League 🆓',
         value:
-          '**/league create** — creates the league record (pick a game type from the dropdown, not free text — this drives auto-setup below).\n' +
-          '**/commissioner panel** — open the control panel (also works via `/league info`/`/league settings` for a read-only check).\n' +
+          '**Admin Panel** → **League Setup** → **Create League** (pick the game type from the dropdown, not free text — this drives everything below). `/league create` still works as a manual backup.\n' +
           '**/league delete** — disables/removes a league when needed.',
         inline: false,
       },
       {
-        name: '2. Set Staff, League Roles, and Team Roles 🆓',
+        name: '2. Auto Create League Roles 🆓',
         value:
-          '`/commissioner panel` → **Channels & Roles** covers staff role, league role, and team roles in one place.\n' +
-          'Manual backups: **/league staff**, **/league teamrole**, and (for individual role assign/remove) **/commissioner assignrole**/**unassignrole**.\n' +
-          'Team roles matter for owners, standings, trades, game validation, and playoffs.',
+          'Right after creating the league, press **Auto Create League Roles**, then **Continue in Commissioner Panel**. Manual backups: **/league staff**, **/league teamrole**, **/commissioner assignrole**/**unassignrole**.',
         inline: false,
       },
       {
-        name: '3. Auto-Setup Channels & Boards 🆓 + 💎',
+        name: '3. League Settings — Do This Before Channels 🆓',
         value:
-          '`/commissioner panel` → **Channels & Roles** → **Auto-Setup Channels** creates and populates a full channel set in one click — announcements, rules, staff, standings, streaming, schedule/game threads, the whole trade cluster (block/negotiation/committee/verdicts/counts), team owners, active check, suspensions, league chat, all 🆓 Free.\n' +
-          'On Premium, the same click also adds Free Agents, Madden News, Power Rankings, League History, Playoff Bracket, GM Panel, and Franchise Hub — no manual per-channel setup needed either way.',
+          'In the Commissioner Panel, go to **League Settings** *first*: season length, schedule style, standings system, ties, conferences/divisions, playoff seeding, CPU trades, trade limits, and which awards to track (`/league awards`). These actually drive what auto-setup builds next — get them right before creating channels, not after. (Madden leagues: most of this section is hidden, since it follows EA sync data instead.)',
         inline: false,
       },
       {
-        name: '4. Games, Standings, and Playoffs 🆓',
+        name: '4. Channels & Roles — Team Roles First, Then Channels 🆓 + 💎',
         value:
-          'Non-Madden, open-schedule leagues: `/commissioner panel` → **Channels & Roles** → set a **Game Center Channel**, then post the Game Center panel — click **Add Game** to schedule a matchup with no typing; it opens a private thread per game with Report Score/Reset Game buttons built in.\n' +
+          'Still in Commissioner Panel → **Channels & Roles**: press **Auto Create Team Roles** *first*, then **Auto-Setup Channels** *second*. In that order — the channel/board setup needs the team roles to already exist to populate correctly.\n' +
+          'Free creates: announcements, rules, staff, standings, streaming, schedule/game threads, the full trade cluster (block/negotiation/committee/verdicts/counts), team owners, active check, suspensions, league chat. Premium adds: Free Agents, Madden News, Weekly Updates board, Player Search, League Leaders, Award Race, Draft Recap, Madden Standings, Playoff Bracket, GM Panel, and Franchise Hub.',
+        inline: false,
+      },
+      {
+        name: '5. Premium/Trial Servers: Auto Setup Server Channels 💎',
+        value:
+          '**Admin Panel** → **Server Setup** → **Auto Setup Server Channels** — creates Shop/Sportsbook/Marketplace/Avatar/Bank/Tickets/Support in one click (Member Profile and Recruitment come with it too, both Free). Also creates and enables Welcome/Leave channels regardless of tier.',
+        inline: false,
+      },
+      {
+        name: '6. Don\'t Forget These — Easy to Overlook 🆓',
+        value:
+          'All in **Admin Panel** → **Server Setup**: onboarding DM toggle, Welcome/Leave message content, server language, Wagers toggle (1v1 game-thread bets, separate from Sportsbook). Madden leagues specifically: **Commissioner Panel** → **Operations** → auto-detect threshold, ESPN news toggle, auto-sportsbook-lines toggle.',
+        inline: false,
+      },
+      {
+        name: '7. Games, Standings, and Playoffs 🆓',
+        value:
+          'Non-Madden, open-schedule leagues: set a **Game Center Channel**, then post the Game Center panel — click **Add Game** to schedule a matchup with no typing; it opens a private thread per game with Report Score/Reset Game buttons built in.\n' +
           'Manual backups: **/game add**, **/game report**, **/game reset**, **/game standings**.\n' +
-          'Playoffs need Premium for the bracket board (`/commissioner panel` → **Operations** → **Playoffs**, or `/league playoffsettings` for team count) — the games/standings themselves stay Free either way.',
+          'Playoffs run 🆓 Free at every tier: `/league playoffsettings` sets team count, and **Operations** → **Playoffs** (Start/Report) actually progresses the games through Game Center/threads. Only the visual auto-updating **bracket board** (Post/Refresh Bracket Panel) is 💎 Premium — without it, playoffs still work exactly the same, there\'s just no live bracket graphic.',
         inline: false,
       },
       {
-        name: '5. League Customization 🆓',
+        name: '8. Madden Leagues 🆓 + 💎',
         value:
-          '`/commissioner panel` → **League Settings** → season length, schedule style, standings system (W/L, points, or point differential), ties, conferences/divisions, playoff seeding, CPU trades, trade limits, and which awards this league tracks (`/league awards`). Everything here actually drives standings display, playoff seeding, and trade limits — not just labels.',
+          '**/madden connect** then **/madden sync** to pull EA data — this is 🆓 Free and drives the core trade/standings/roster pipeline. **Operations** for sync/scans/auto-detection.\n' +
+          '💎 Premium adds: **/maddenfreeagents**, **/maddennews**, **/maddenplayer**, the Madden Trade Analyzer/Find/Needs/GM tools (`/maddentrade`), Draft Recap grades, League History posts, League Leaders, Award Race, and the GM Panel/Franchise Hub boards.',
         inline: false,
       },
       {
-        name: '6. Madden Leagues 🆓 + 💎',
+        name: '9. Economy, Shop, Sportsbook, Tickets, Tournaments 💎',
         value:
-          '**/madden connect** then **/madden sync** to pull EA data — this is 🆓 Free and drives the core trade/standings/roster pipeline. `/commissioner panel` → **Operations** for sync/scans/auto-detection.\n' +
-          '💎 Premium adds: **/maddenfreeagents**, **/maddennews**, **/maddenplayer**, the Madden Trade Analyzer/Find/Needs/GM tools (`/maddentrade`), Draft Recap grades, League History posts, and the GM Panel/Franchise Hub boards.',
+          '**/league currency** (payout rates), **/economy**, **/shop**, **/sportsbook**, plus Bank, Marketplace, Avatar, **/ticket**, **/tournament**, and **/legacy** are all Premium. **/profile** (member profile) is Premium too. **/activity**/**/activityleaderboard** (engagement tracking) stay 🆓 Free. Step 5 above creates most of these channels in one click.',
         inline: false,
       },
       {
-        name: '7. Economy, Shop, Sportsbook 💎',
+        name: '10. Trade System 🆓 + 💎',
         value:
-          'The whole currency/economy system is Premium: **/league currency** (payout rates), **/economy** (balance/give/take/transfer), **/shop** (createitem/createcosmetic/panel/cart/checkout/inventory), **/sportsbook** (create/limits/refund/leaderboards), plus the Bank, Marketplace, and Avatar shop. Auto-Setup Server Channels (Admin Panel → Server Setup) creates all of these in one click once Premium is active.',
-        inline: false,
-      },
-      {
-        name: '8. Tickets, Tournaments, Legacy, Profiles 💎',
-        value:
-          '**/ticket** (support tickets), **/tournament** (bracket hosting), **/legacy** (all-time greatness ranking), and **/profile** (member profile card) are all Premium. **/activity**/**/activityleaderboard** (engagement tracking) stay 🆓 Free.',
-        inline: false,
-      },
-      {
-        name: '9. Recommended Launch Order',
-        value:
-          'Create league → `/commissioner panel` for roles/channels → run **Auto-Setup Channels** → configure league settings → (Premium) run **Auto-Setup Server Channels** for the economy category → configure currency/sportsbook → add games or set up Game Center → report games → run playoffs.',
+          'The whole basic trade flow is 🆓 Free — trade block, starting a negotiation, committee voting, verdicts, counts. Only the **Trade Analyzer** and **Generate Packages** tools inside a negotiation (and the standalone Trade Builder) are 💎 Premium — analysis, not the trade itself.',
         inline: false,
       }
     )
@@ -29917,18 +29939,18 @@ function buildQuickSetupEmbed() {
     .setTitle('GG Sports Quick Setup')
     .setColor(0x57F287)
     .setDescription(
-      "Fast checklist for setting up a new league. Everything below can be done from `/commissioner panel`. 🆓 = free forever, 💎 = needs Premium (`/premium trial` for 14 days free, no card)."
+      "Fast checklist, in order — the order matters (League Settings before Channels, Team Roles before Auto-Setup Channels). 🆓 = free forever, 💎 = needs Premium (`/premium trial` for 14 days free, no card)."
     )
     .addFields(
-      { name: '1. Create league 🆓', value: '/league create', inline: true },
-      { name: '2. Open control panel 🆓', value: '/commissioner panel', inline: true },
-      { name: '3. Set roles + team roles 🆓', value: 'Panel → Channels & Roles', inline: true },
-      { name: '4. Auto-Setup Channels 🆓+💎', value: 'Panel → Channels & Roles\n(Premium unlocks more boards)', inline: true },
-      { name: '5. League Customization 🆓', value: 'Panel → League Settings', inline: true },
-      { name: '6. Start season 🆓', value: 'Panel → Game Center, or\n/game add + /game report', inline: true },
-      { name: '7. Track activity 🆓', value: '/activity\n/activityleaderboard', inline: true },
-      { name: '8. Economy/Shop/Sportsbook 💎', value: '/league currency\nAdmin Panel → Server Setup', inline: true },
-      { name: '9. Tickets/Tournaments/Legacy 💎', value: '/ticket\n/tournament\n/legacy', inline: true }
+      { name: '1. Create league 🆓', value: 'Admin Panel → League Setup → Create League', inline: true },
+      { name: '2. League roles 🆓', value: 'Auto Create League Roles → Continue in Commissioner Panel', inline: true },
+      { name: '3. League Settings 🆓', value: 'Commissioner Panel → League Settings (do this before step 4)', inline: true },
+      { name: '4. Team roles + channels 🆓+💎', value: 'Channels & Roles → Auto Create Team Roles, then Auto-Setup Channels (in that order)', inline: true },
+      { name: '5. Premium/trial servers 💎', value: 'Admin Panel → Server Setup → Auto Setup Server Channels', inline: true },
+      { name: '6. Easy to forget 🆓', value: 'Onboarding DM, Welcome/Leave, language, Wagers (Admin Panel → Server Setup)', inline: true },
+      { name: '7. Start season 🆓', value: 'Panel → Game Center, or\n/game add + /game report', inline: true },
+      { name: '8. Track activity 🆓', value: '/activity\n/activityleaderboard', inline: true },
+      { name: '9. Trade Analyzer/Packages 💎', value: 'Basic trade flow stays free —\nonly analysis tools are Premium', inline: true }
     )
     .setFooter({ text: 'GG Sports • Quick Setup' })
     .setTimestamp();
@@ -29965,7 +29987,7 @@ function buildCommandsGuideEmbed() {
         name: 'Games + Standings 🆓',
         value:
           '/game add, /game report, /game reset, /game schedule, /game standings, /game adjuststandings\n' +
-          '/league playoffsettings — playoff team count; running playoffs (bracket board) is 💎 Premium\n' +
+          '/league playoffsettings — playoff team count, 🆓 Free; running/advancing playoffs is 🆓 Free too, only the visual bracket board is 💎 Premium\n' +
           'Open-schedule leagues without game threads: Commissioner Panel → Game Center panel (Add Game → private matchup thread with built-in Report/Reset buttons)',
         inline: false,
       },
@@ -33860,44 +33882,60 @@ async function autoCreateGuildMultiChannelPanels(guild) {
   // (7J-111TICKETSCOPE), so they belong in this same guild-wide auto-setup
   // flow rather than needing to be configured by hand afterward. Only
   // creates whichever of the two isn't already set, same "don't clobber an
-  // existing setup" behavior as the Welcome/Leave block below. Posts the
-  // ticket_panel (informational embed with /ticket usage) once both
-  // channels exist, since that panel reads guilds.ticket_channel_id/
-  // support_channel_id directly and doesn't need a league at all.
+  // existing setup" behavior as the Welcome/Leave block below.
+  // 7J-COMMANDHUB-PAYWALL: Tickets/Support are Premium (per Hxxdie's full
+  // free/premium breakdown) — gated the same way as shop/sportsbook/etc.
+  // above, so Free Tier doesn't get a channel for a feature it can't
+  // actually use (the /ticket command and ticket_ panel buttons are
+  // already gated separately).
+  // 7J-COMMANDHUB-TICKETSUPPORTSPLIT: Tickets gets the plain instructional
+  // panel (/ticket open|dispute|game usage); Support gets the richer
+  // button-based panel — matches the existing distinction between
+  // /ticket panel and /ticket supportpanel elsewhere in this codebase,
+  // rather than posting the same content to both.
   const guildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
-  if (!guildSettings?.ticket_channel_id) {
-    const ticketChannel = await guild.channels.create({ name: 'tickets', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-    if (ticketChannel) {
-      await setGuildTicketSettings(guild.id, guild.name, { ticketChannelId: ticketChannel.id });
-      created.push(ticketChannel);
+  if (isPremium) {
+    if (!guildSettings?.ticket_channel_id) {
+      const ticketChannel = await guild.channels.create({ name: 'tickets', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+      if (ticketChannel) {
+        await setGuildTicketSettings(guild.id, guild.name, { ticketChannelId: ticketChannel.id });
+        created.push(ticketChannel);
+      }
     }
-  }
-  if (!guildSettings?.support_channel_id) {
-    const supportChannel = await guild.channels.create({ name: 'support', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-    if (supportChannel) {
-      await setGuildTicketSettings(guild.id, guild.name, { supportChannelId: supportChannel.id });
-      created.push(supportChannel);
+    if (!guildSettings?.support_channel_id) {
+      const supportChannel = await guild.channels.create({ name: 'support', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+      if (supportChannel) {
+        await setGuildTicketSettings(guild.id, guild.name, { supportChannelId: supportChannel.id });
+        await supportChannel.send({ embeds: [buildSupportPanelEmbed()], components: [buildSupportPanelButtons()] }).catch(() => null);
+        created.push(supportChannel);
+      }
     }
+    await createConfiguredPanelFromSetup({ guild, channel: null }, null, 'ticket_panel').catch(() => null);
   }
-  await createConfiguredPanelFromSetup({ guild, channel: null }, null, 'ticket_panel').catch(() => null);
 
+  // 7J-COMMANDHUB-WELCOMELEAVE: previously gated behind welcome_leave_enabled
+  // already being TRUE — but that defaults to FALSE for every fresh guild,
+  // so in practice these channels never got created via this button at all
+  // (confirmed by Hxxdie's live testing). Now creates them unconditionally
+  // (not Premium-gated — Welcome/Leave is basic onboarding utility, not a
+  // paywalled feature) and turns the feature on at the same time — no
+  // point creating the channels and leaving the feature off.
   const refreshedGuildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
-  if (refreshedGuildSettings?.welcome_leave_enabled) {
-    if (!refreshedGuildSettings.welcome_channel_id) {
-      const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-      if (welcomeChannel) {
-        await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
-        created.push(welcomeChannel);
-      }
-    }
-    if (!refreshedGuildSettings.leave_channel_id) {
-      const leaveChannel = await guild.channels.create({ name: 'leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-      if (leaveChannel) {
-        await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
-        created.push(leaveChannel);
-      }
+  if (!refreshedGuildSettings?.welcome_channel_id) {
+    const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (welcomeChannel) {
+      await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
+      created.push(welcomeChannel);
     }
   }
+  if (!refreshedGuildSettings?.leave_channel_id) {
+    const leaveChannel = await guild.channels.create({ name: 'leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (leaveChannel) {
+      await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
+      created.push(leaveChannel);
+    }
+  }
+  await setGuildWelcomeLeaveEnabled(guild.id, guild.name, true);
 
   return { category, channels: created };
 }
@@ -33995,12 +34033,23 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     ['league_rules_channel_id', 'rules'],
     ['league_announcement_channel_id', 'announcements'],
     ['staff_channel_id', 'staff'],
-    ['standings_channel_id', 'standings'],
+    // 7J-COMMANDHUB-FULLCOVERAGE: generic 'standings' channel only for
+    // non-Madden now — Madden gets its own dedicated madden-standings
+    // channel/board below (real synced data), so both existing side by
+    // side would be redundant, confusing duplicates.
+    ...(isMadden ? [] : [['standings_channel_id', 'standings']]),
     ['live_channel_id', 'streaming'],
     // game-threads/game-center inserted here, sport-conditional, below
     ['sportsbook_channel_id', 'sportsbook-feed', true],
     ['trade_block_channel_id', 'trade-block'],
-    ['trade_offer_channel_id', 'trade-offer'],
+    // 7J-COMMANDHUB-TRADESPLIT: per Hxxdie (live-tested) — Trade
+    // Negotiation Starter (buildMaddenTradeNegotiationStarterEmbed) is
+    // Madden-only; Trade Offer (buildOfferTradePanelEmbed, the generic
+    // system /league offerpanel also uses) is non-Madden-only. Was
+    // previously creating both channels unconditionally for every league
+    // and posting both starter panels regardless of sport — Madden
+    // leagues were getting the wrong (non-Madden) Trade Offer panel.
+    ...(isMadden ? [['trade_negotiation_channel_id', 'trade-negotiation']] : [['trade_offer_channel_id', 'trade-offer']]),
     ['trade_committee_channel_id', 'trade-committee'],
     ['approved_trades_channel_id', 'approved-trades'],
     ['denied_trades_channel_id', 'denied-trades'],
@@ -34009,7 +34058,7 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     ['playoff_bracket_channel_id', 'playoff-bracket', true],
     ['active_check_channel_id', 'active-check'],
     ['history_channel_id', 'history', true],
-    // league-hof / madden-news / free-agents inserted here, sport-conditional, below
+    // league-hof / madden-news / free-agents / etc. inserted here, sport-conditional, below
     ['suspensions_channel_id', 'suspensions'],
   ];
   // 7J-125FULLCOVERAGE / 7J-145SCHEDULEFIX: "keep these custom to the
@@ -34033,12 +34082,25 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     // 3 channels when all the others are created and populated." Both
     // Premium; weekly-updates is a plain destination channel (Madden sync
     // posts into it over time, no starter panel to post) and stays Free.
+    // 7J-COMMANDHUB-FULLCOVERAGE: player-search, league-leaders,
+    // award-race, draft-recap, madden-sportsbook were all confirmed
+    // missing entirely from auto-setup (live-tested by Hxxdie against a
+    // Premium league — "still missing many major features") — added here.
+    // madden-standings is Free (standings itself is core/free even for
+    // Madden; only the manual standings_system *setting* doesn't apply to
+    // Madden, per the League Settings fix above — the board still should).
     singleChannelSpecs.push(
       ['madden_news_channel_id', 'madden-news', true],
       ['madden_free_agents_channel_id', 'free-agents', true],
       ['gm_panel_channel_id', 'madden-gm', true],
       ['madden_franchise_hub_channel_id', 'franchise-hub', true],
       ['madden_weekly_updates_channel_id', 'weekly-updates'],
+      ['madden_standings_channel_id', 'madden-standings'],
+      ['player_search_channel_id', 'player-search', true],
+      ['league_leaders_channel_id', 'league-leaders', true],
+      ['award_race_channel_id', 'award-race', true],
+      ['draft_recap_channel_id', 'draft-recap', true],
+      ['madden_sportsbook_channel_id', 'madden-sportsbook', true],
     );
   } else {
     // 7J-135GENERICNEWS: Power Rankings + News Feed, the generic non-Madden
@@ -34068,35 +34130,40 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   // appropriate channels right away, same "functional out of the box" goal
   // this function always had — the Multi-Channel Panels (guild-wide) already
   // do this themselves; this is the equivalent for the per-league channels
-  // just created above. Streaming/Staff/History/Playoff Bracket/Active Check
-  // don't have a static panel to post (they're destinations for
-  // live/manual/periodic content, not persistent boards), so only the
-  // channels that actually have a corresponding panel type get one. Uses a
-  // minimal interaction-shaped object since createConfiguredPanelFromSetup
-  // only reads .guild (and .channel as a fallback we don't need, since every
-  // channel id it looks up was just set on freshLeague below). ticket_panel is
-  // deliberately NOT posted here (7J-111TICKETSCOPE) — Tickets/Support are
-  // guild-wide now, not per-league, so posting that panel belongs to the
-  // guild-wide Admin Panel ticket setup instead of running once per league.
+  // just created above. Streaming/Staff/History/Playoff Bracket/Active
+  // Check/Draft Recap/Madden Sportsbook don't have a static panel to post
+  // (they're destinations for live/manual/periodic content, not persistent
+  // boards), so only the channels that actually have a corresponding panel
+  // type get one. Uses a minimal interaction-shaped object since
+  // createConfiguredPanelFromSetup only reads .guild (and .channel as a
+  // fallback we don't need, since every channel id it looks up was just
+  // set on freshLeague below). ticket_panel is deliberately NOT posted
+  // here (7J-111TICKETSCOPE) — Tickets/Support are guild-wide now, not
+  // per-league, handled by Auto Setup Server Channels instead.
   // 7J-145SCHEDULEFIX: game_center_panel is only posted for the non-Madden
   // OPEN case — a structured non-Madden league's game-threads channel stays
   // empty (no panel, no threads) until Start League is actually pressed,
   // same as Madden's game-threads channel never gets a pre-populated panel.
-  // 7J-COMMANDHUB-PAYWALL: madden_free_agents_panel, gm_panel_starter_panel,
-  // madden_franchise_hub_panel, and league_hof_panel (Legacy-tied) are
-  // Premium-only — same isPremiumLeague check as the channel creation
-  // above, so a Free Tier league doesn't get a channel AND a panel posted
-  // into a channel that doesn't exist anyway.
+  // 7J-COMMANDHUB-FULLCOVERAGE: trade_negotiation_starter_panel and
+  // league_rules_panel are Free, all league types — league_rules_panel in
+  // particular was never posted by this function at all before (the
+  // channel got created but sat empty). player_search_panel,
+  // league_leaders_panel, award_race_panel, madden_standings_panel are all
+  // Madden-only additions matching the new channels above.
   const freshLeague = await getLeagueById(league.league_id).catch(() => null);
   if (freshLeague) {
     const fakeInteraction = { guild, channel: null };
+    // 7J-COMMANDHUB-TRADESPLIT: trade_negotiation_starter_panel (Madden)
+    // and trade_offer_panel (non-Madden) are mutually exclusive per sport,
+    // same as game_center_panel/game_threads or league_hof/franchise_hub
+    // — fixed here alongside the matching channel-creation fix above.
     let panelTypesToPost = isMadden
-      ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'madden_free_agents_panel', 'gm_panel_starter_panel', 'madden_franchise_hub_panel']
+      ? ['league_rules_panel', 'trade_block_board_panel', 'trade_negotiation_starter_panel', 'team_owners_panel', 'trade_count_panel', 'madden_standings_panel', 'madden_free_agents_panel', 'player_search_panel', 'league_leaders_panel', 'award_race_panel', 'gm_panel_starter_panel', 'madden_franchise_hub_panel']
       : isStructuredNonMadden
-        ? ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'league_power_rankings_panel']
-        : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel', 'league_power_rankings_panel'];
+        ? ['league_rules_panel', 'standings_panel', 'trade_block_board_panel', 'trade_offer_panel', 'team_owners_panel', 'trade_count_panel', 'league_hof_panel', 'league_power_rankings_panel']
+        : ['league_rules_panel', 'standings_panel', 'trade_block_board_panel', 'trade_offer_panel', 'team_owners_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel', 'league_power_rankings_panel'];
     if (!isPremiumLeague) {
-      const PREMIUM_AUTO_PANEL_TYPES = new Set(['madden_free_agents_panel', 'gm_panel_starter_panel', 'madden_franchise_hub_panel', 'league_hof_panel', 'league_power_rankings_panel']);
+      const PREMIUM_AUTO_PANEL_TYPES = new Set(['madden_free_agents_panel', 'gm_panel_starter_panel', 'madden_franchise_hub_panel', 'league_hof_panel', 'league_power_rankings_panel', 'player_search_panel', 'league_leaders_panel', 'award_race_panel']);
       panelTypesToPost = panelTypesToPost.filter(type => !PREMIUM_AUTO_PANEL_TYPES.has(type));
     }
     for (const panelType of panelTypesToPost) {
@@ -66563,11 +66630,17 @@ const LEAGUE_CUSTOMIZATION_SECTIONS = [
 // Madden playoff bracket is built entirely from EA-synced game/schedule
 // rows (madden_imported_games with EA scheduleId) — playoff_team_count and
 // playoff_seeding_method are never referenced anywhere in a Madden-specific
-// path. Same for season_length/schedule_style. Only these two sections are
-// filtered — Standings (ties toggle still matters), Trades, Awards, and
-// Conferences/Divisions weren't confirmed inapplicable, so left alone
-// rather than guessed at.
-const MADDEN_HIDDEN_CUSTOMIZATION_SECTIONS = new Set(['season', 'playoffs']);
+// path. Same for season_length/schedule_style.
+// 7J-COMMANDHUB-MADDENSETTINGS: per Hxxdie (live-tested) — Standings and
+// Conferences/Divisions belong on this list too, for the same reason:
+// re-verified via code search (not just taken on faith) that
+// standings_system and conferences/divisions are never read anywhere in a
+// Madden-specific path — Madden's standings board and team
+// conference/division alignment both come entirely from EA sync data, not
+// these manual settings. Trades and Awards were checked at the time of the
+// original filter and weren't confirmed inapplicable, so they're still
+// left alone.
+const MADDEN_HIDDEN_CUSTOMIZATION_SECTIONS = new Set(['season', 'playoffs', 'standings', 'conferences']);
 
 function filterLeagueCustomizationSections(isMaddenLeague) {
   if (!isMaddenLeague) return LEAGUE_CUSTOMIZATION_SECTIONS;
@@ -66581,15 +66654,15 @@ async function buildCommissionerLeagueEmbed(league) {
   const embed = new EmbedBuilder()
     .setTitle(`📋 League Customization • ${league.league_name}`)
     .setColor(0x5865F2)
-    .setDescription(`Sport: **${sportKey.toUpperCase()}**\nPick a section below to configure. These settings apply to standings, playoffs, and future schedule/trade features as they're built.` + (isMadden ? '\n\n*Season/schedule and playoff structure follow this league\'s Madden sync and aren\'t manually configurable — those sections are hidden below.*' : ''))
+    .setDescription(`Sport: **${sportKey.toUpperCase()}**\nPick a section below to configure. These settings apply to standings, playoffs, and future schedule/trade features as they're built.` + (isMadden ? '\n\n*Season/schedule, playoff structure, standings, and conferences/divisions all follow this league\'s Madden sync and aren\'t manually configurable — those sections are hidden below.*' : ''))
     .addFields(
-      { name: 'Standings System', value: customSettings.standings_system === 'points' ? 'Points-based' : 'W/L Record', inline: true },
       { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
     )
     .setFooter({ text: 'GG Sports • Commissioner Panel' })
     .setTimestamp();
   if (!isMadden) {
     embed.addFields(
+      { name: 'Standings System', value: customSettings.standings_system === 'points' ? 'Points-based' : 'W/L Record', inline: true },
       { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
       { name: 'Schedule Style', value: customSettings.schedule_style === 'structured' ? 'Structured' : 'Open', inline: true },
       { name: 'Playoff Teams', value: String(league.playoff_team_count || 8), inline: true },
