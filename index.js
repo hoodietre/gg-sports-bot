@@ -34267,12 +34267,48 @@ async function deleteLeagueDiscordInfrastructure(guild, league) {
 // Hxxdie, fc has too many real teams to enumerate, and club/pro-am leagues
 // don't have real team names to begin with). teamCount only matters for the
 // placeholder path — the real lists are always used in full.
+// 7J-COMMANDHUB-ROLEPREFIX: builds the Discord-visible role name — team
+// name always stays fully intact and untruncated (that's the part people
+// actually need to read), the league-name prefix gets shortened first if
+// the combination would exceed Discord's 100-char role name cap. Distinct
+// from what gets stored in league_team_roles.role_name (see below) — the
+// DB column stays the plain team name always, since it's exact-matched
+// (case-insensitive) against EA sync team names and other lookups
+// elsewhere in this codebase; only the Discord-facing display name changes.
+function buildPrefixedTeamRoleName(leagueName, teamName, guild) {
+  const suffix = ' ' + teamName;
+  let safeLeagueName = leagueName;
+  if (('[' + safeLeagueName + ']' + suffix).length > 100) {
+    const maxLeagueNameLen = Math.max(1, 100 - suffix.length - 2);
+    safeLeagueName = leagueName.slice(0, maxLeagueNameLen);
+  }
+  let candidate = `[${safeLeagueName}]${suffix}`.slice(0, 100);
+  // Safety net — collisions shouldn't happen once every league is prefixed
+  // with its own name, but a second league with an identical or truncated-
+  // identical name is possible, so fall back to a numeric suffix rather
+  // than silently creating another duplicate.
+  if (guild && guild.roles.cache.some(r => r.name === candidate)) {
+    for (let n = 2; n < 20; n++) {
+      const numbered = `${candidate.slice(0, 100 - String(n).length - 1)} ${n}`;
+      if (!guild.roles.cache.some(r => r.name === numbered)) { candidate = numbered; break; }
+    }
+  }
+  return candidate;
+}
+
 async function autoCreateLeagueTeamRoles(guild, league, teamCount = 32) {
   const sportKey = getLeagueSportKey(league);
   const names = REAL_TEAM_NAMES[sportKey] || Array.from({ length: teamCount }, (_, i) => `Team ${i + 1}`);
   const createdRoles = [];
   for (const name of names) {
-    const role = await guild.roles.create({ name, mentionable: true, reason: `Auto-created team role for ${league.league_name}` }).catch(() => null);
+    // 7J-COMMANDHUB-ROLEPREFIX: per Hxxdie (live-tested) — two leagues of
+    // the same sport (e.g. two Madden leagues) were creating two fully
+    // identical sets of 32 role names, with no way to tell them apart in
+    // the server's role list. Discord-visible name gets the league prefix;
+    // role_name in the DB stays the plain team name (see
+    // buildPrefixedTeamRoleName's comment for why that split matters).
+    const displayName = buildPrefixedTeamRoleName(league.league_name, name, guild);
+    const role = await guild.roles.create({ name: displayName, mentionable: true, reason: `Auto-created team role for ${league.league_name}` }).catch(() => null);
     if (!role) continue;
     await pool.query(
       `INSERT INTO league_team_roles (league_id, role_id, role_name) VALUES ($1, $2, $3)
@@ -35384,14 +35420,27 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
   if (panelType === 'team_owners_panel') {
     const { channel, error } = await requireTextChannel(league.team_owners_channel_id, interaction.channel, 'team owners channel');
     if (error) return error;
-    await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
+    // 7J-COMMANDHUB-TEAMOWNERSAVE: real root cause of "Team Owners board
+    // still isn't updating" — this never called savePanel, so
+    // updateTeamOwnersPanel (correctly called from every real ownership-
+    // change path already) had no saved {channel_id, message_id} to find
+    // and silently no-op'd every single time. Every earlier fix (ensuring
+    // the update gets *called*, fixing the member-cache read) was
+    // necessary but not sufficient without this.
+    const message = await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
+    await savePanel(league, 'team_owners', channel.id, message.id);
     return 'Team Owners panel posted in ' + channel.toString() + '.';
   }
 
   if (panelType === 'trade_count_panel') {
     const { channel, error } = await requireTextChannel(league.trade_count_channel_id, interaction.channel, 'trade count channel');
     if (error) return error;
-    await channel.send({ embeds: [await buildTradeCountEmbed(league)] });
+    // 7J-COMMANDHUB-TEAMOWNERSAVE: same exact bug as Team Owners above —
+    // updateTradeCountPanel is already correctly called from real trade-
+    // count-changing code, but had nothing to update since this never
+    // saved the panel reference.
+    const message = await channel.send({ embeds: [await buildTradeCountEmbed(league)] });
+    await savePanel(league, 'trade_count', channel.id, message.id);
     return 'Trade Count panel posted in ' + channel.toString() + '.';
   }
 
@@ -35407,7 +35456,12 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     // existed — buildOfferTradePanelEmbed/buildOfferTradePanelButton, same
     // ones /league offerpanel and the initial league-creation flow use — this
     // branch just wasn't calling them.
-    await channel.send({ embeds: [buildOfferTradePanelEmbed(league.league_name)], components: [buildOfferTradePanelButton(league.league_id)] });
+    // 7J-COMMANDHUB-TEAMOWNERSAVE: added savePanel here too, matching every
+    // other panel type's convention — no current caller needs to live-
+    // update this one, but a second manual "Post/Refresh" click deserves
+    // the same tracked-message pattern as everything else for consistency.
+    const message = await channel.send({ embeds: [buildOfferTradePanelEmbed(league.league_name)], components: [buildOfferTradePanelButton(league.league_id)] });
+    await savePanel(league, 'trade_offer', channel.id, message.id);
     return 'Trade Offer panel posted in ' + channel.toString() + '.';
   }
 
