@@ -4063,9 +4063,25 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName('league')
       .setDescription('League setup and management commands')
-      .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game type: nba, mlb, madden, general').setRequired(false)))
+      .addSubcommand(sc => sc.setName('create').setDescription('Create/configure league').addStringOption(o => o.setName('name').setDescription('League name').setRequired(true)).addStringOption(o => o.setName('game').setDescription('Game type').setRequired(false).addChoices(
+        { name: 'Madden (NFL)', value: 'madden' },
+        { name: 'NBA', value: 'nba' },
+        { name: 'MLB', value: 'mlb' },
+        { name: 'NHL', value: 'nhl' },
+        { name: 'CFB', value: 'cfb' },
+        { name: 'FC (Soccer)', value: 'fc' },
+        { name: 'General/Other', value: 'general' },
+      )))
       .addSubcommand(sc => sc.setName('delete').setDescription('Delete/deactivate a league').addStringOption(o => o.setName('name').setDescription('League name to delete').setRequired(true)))
-      .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('game').setDescription('nba, mlb, madden, general').setRequired(true)))
+      .addSubcommand(sc => sc.setName('game').setDescription('Set league game type').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('game').setDescription('Game type').setRequired(true).addChoices(
+        { name: 'Madden (NFL)', value: 'madden' },
+        { name: 'NBA', value: 'nba' },
+        { name: 'MLB', value: 'mlb' },
+        { name: 'NHL', value: 'nhl' },
+        { name: 'CFB', value: 'cfb' },
+        { name: 'FC (Soccer)', value: 'fc' },
+        { name: 'General/Other', value: 'general' },
+      )))
       .addSubcommand(sc => sc.setName('playoffsettings').setDescription('Set playoff team count for a league').addIntegerOption(o => o.setName('teams').setDescription('Number of teams that make playoffs').setRequired(true)).addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('info').setDescription('View league information').addStringOption(o => o.setName('name').setDescription('League name').setRequired(false)))
       .addSubcommand(sc => sc.setName('edit').setDescription('Rename league').addStringOption(o => o.setName('league').setDescription('Current league name').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('new_name').setDescription('New league name').setRequired(true)))
@@ -5376,6 +5392,17 @@ async function createGenericTradeNegotiationThread(guild, league, { senderUserId
 async function buildTeamOwnersEmbed(guild, league = null) {
   const lines = [];
   const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : null;
+
+  // 7J-COMMANDHUB-TEAMOWNERSYNC: role.members below only reflects
+  // discord.js's local member cache — the GuildMembers intent lets the bot
+  // *receive* member events, it does not bulk-populate the cache by
+  // itself. Without an explicit fetch, role.members silently returns
+  // whichever subset of members happened to already be cached (often
+  // near-empty on a quiet server), which is exactly what was producing
+  // "Unassigned or not cached" even right after a real, successful role
+  // assignment. One bulk fetch here makes the cache-based lookup below
+  // actually reliable.
+  await guild.members.fetch().catch(() => null);
 
   // 7J-65TEAMOWNERS (corrected): matches the established pattern from
   // isMaddenUserVsUserGame earlier this session — checks both
@@ -8225,6 +8252,15 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
 // ---------------------------------------------------------------------------
 const tournamentCreateSessions = new Map();
 const leagueKickConfirmations = new Map();
+// 7J-COMMANDHUB-GAMESELECT: modals can't contain select menus (Discord API
+// limitation — TextInput only), so the panel's "Create League" flow is
+// modal-for-name, then a real select menu for game type, rather than
+// asking someone to correctly type "nba/mlb/nhl/cfb/fc/madden/general"
+// freehand — the whole point being to prevent a misnamed game type quietly
+// breaking that league's auto-setup (wrong team-name list, wrong
+// standings/playoff format, etc.). Short-lived, in-memory, same pattern as
+// leagueKickConfirmations above.
+const pendingPanelLeagueCreations = new Map();
 const commissionerSeasonHistorySessions = new Map();
 const TOURNAMENT_FORMAT_OPTIONS = [
   { value: 'single_elim', label: 'Single Elimination' },
@@ -10207,8 +10243,32 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
 
   try {
+    // 7J-COMMANDHUB-PAYWALL: centralized gate for every button/select/modal
+    // belonging to a Premium-only system — catches them by customId prefix
+    // in ONE place, before any real handler runs. This is what actually
+    // solves the "trial ends, but the panel/board is still sitting there
+    // and still clickable" problem: without this, downgrading only stops
+    // *new* slash-command usage, not interaction with whatever premium
+    // panels already got posted during a trial or before a lapse. Verified
+    // each prefix against the real customId strings in this file rather
+    // than guessing (e.g. franchise hub is 'madfranchisehub:', not
+    // 'franchisehub_'; tournaments are 'tourneypanel_', not 'tournament_').
+    const PREMIUM_GATED_CUSTOM_ID_PREFIXES = [
+      ['shop_', 'Shop'], ['sportsbook_', 'Sportsbook'], ['bank_', 'Bank'], ['economy_', 'Economy'],
+      ['marketplace_', 'Marketplace'], ['avatarpanel_', 'Avatar'], ['gmpanel_', 'GM Panel'],
+      ['ticket_', 'Tickets'], ['tourneypanel_', 'Tournaments'], ['madfranchisehub:', 'Franchise Hub'],
+    ];
+    if (
+      interaction.guild &&
+      (interaction.isButton() || interaction.isStringSelectMenu() || interaction.isUserSelectMenu() || interaction.isRoleSelectMenu() || interaction.isChannelSelectMenu() || interaction.isModalSubmit())
+    ) {
+      const matchedGate = PREMIUM_GATED_CUSTOM_ID_PREFIXES.find(([prefix]) => interaction.customId?.startsWith(prefix));
+      if (matchedGate && !(await requirePremiumFeature(interaction, matchedGate[1]))) return;
+    }
+
 if (interaction.commandName === 'avatar') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Avatar'))) return;
       const avatarSubcommand = interaction.options.getSubcommand();
 
       if (avatarSubcommand === 'view') {
@@ -12241,6 +12301,11 @@ if (interaction.commandName === 'avatar') {
       if (!league) { await interaction.editReply({ content: 'That league no longer exists.', components: [] }); return; }
       if (!(await memberHasStaff(interaction.member, league))) { await interaction.followUp({ content: 'You need staff permissions to change this setting.', ephemeral: true }); return; }
       const enabled = valueStr === 'true';
+      // 7J-COMMANDHUB-PAYWALL: per Hxxdie — recruitment itself (applications
+      // within your own server) stays free; only turning ON cross-server
+      // discoverability is Premium. Turning off is never blocked — nobody
+      // should be stuck unable to opt back out just because they lapsed.
+      if (enabled && !(await requirePremiumFeature(interaction, 'Cross-Server League Discoverability'))) return;
       await pool.query(
         `INSERT INTO league_settings (league_id, recruitment_discoverable, updated_at) VALUES ($1, $2, NOW())
          ON CONFLICT (league_id) DO UPDATE SET recruitment_discoverable = $2, updated_at = NOW()`,
@@ -13987,6 +14052,18 @@ if (interaction.commandName === 'avatar') {
         await interaction.update(payload);
         return;
       }
+
+      // 7J-COMMANDHUB-PAYWALL: single choke point for every manually-posted
+      // Setup Dashboard panel type — covers free agents, both power
+      // rankings variants, league leaders, award race, and league HOF
+      // (ties to the already-Premium /legacy system) in one place, rather
+      // than needing a separate gate at each panel type's own trigger.
+      const PREMIUM_PANEL_TYPES = new Set([
+        'madden_free_agents_panel', 'league_hof_panel', 'league_power_rankings_panel',
+        'madden_power_rankings_panel', 'league_leaders_panel', 'award_race_panel',
+        'gm_panel_starter_panel', 'madden_franchise_hub_panel',
+      ]);
+      if (PREMIUM_PANEL_TYPES.has(panelType) && !(await requirePremiumFeature(interaction, setupDashboardLabel(panelType) || 'This board'))) return;
 
       const message = await createConfiguredPanelFromSetup(interaction, league, panelType);
       const embed = buildSetupPanelMenuEmbed(league);
@@ -16609,6 +16686,13 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: 'Pick at least one player for Side B before continuing.', ephemeral: true });
         return;
       }
+      // 7J-COMMANDHUB-PAYWALL: this is the actual "Analyze Trade" trigger,
+      // reached both from the GM Panel (already gated via gmpanel_) and
+      // from the trade block directly (not gated by that prefix) — gating
+      // here, at the one place both paths converge, covers both per
+      // Hxxdie's "this should also take effect when building a trade from
+      // the trade block" instruction.
+      if (!(await requirePremiumFeature(interaction, 'Trade Analyzer'))) return;
       await interaction.update({ content: 'Analyzing trade…', embeds: [], components: [] });
       const resultPayload = await buildMaddenTradeWizardResultPayload(interaction, token);
       await interaction.editReply(resultPayload);
@@ -17489,7 +17573,6 @@ if (interaction.commandName === 'avatar') {
         .setTitle('Create League')
         .addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('League name').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game').setLabel('Game (nba/mlb/nhl/cfb/fc/madden/general)').setStyle(TextInputStyle.Short).setRequired(true)),
         );
       await interaction.showModal(modal);
       return;
@@ -17498,15 +17581,11 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isModalSubmit() && interaction.customId === 'adminpanel_league_create_modal') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true }); return; }
       const leagueName = interaction.fields.getTextInputValue('name');
-      const gameKey = (interaction.fields.getTextInputValue('game') || 'general').toLowerCase().trim();
 
-      // 7J-PREMIUM-PANELCAPFIX: this button/modal path created leagues
-      // directly and never had the Free Tier cap check that /league create
-      // got — confirmed live (2026-08-07): 3 leagues created here on a
-      // Free Tier server with the 2-league cap silently ignored. Same
-      // check as /league create, copied here rather than shared, since the
-      // two paths take input from different sources (modal fields vs.
-      // slash command options).
+      // 7J-PREMIUM-PANELCAPFIX: same Free Tier cap check as /league create,
+      // done here (before asking for game type) rather than after, so a
+      // capped-out server doesn't get shown a game picker for a league
+      // that's about to get blocked anyway.
       const existingLeagueResult = await pool.query(
         `SELECT is_active FROM leagues WHERE guild_id = $1 AND LOWER(league_name) = LOWER($2) LIMIT 1`,
         [interaction.guild.id, leagueName]
@@ -17524,6 +17603,46 @@ if (interaction.commandName === 'avatar') {
         }
       }
 
+      // 7J-COMMANDHUB-GAMESELECT: modals can't hold select menus, so game
+      // type is a real follow-up select instead of a freehand text field —
+      // was previously easy to typo/misname, silently breaking that
+      // league's auto-setup (wrong team names, wrong standings format).
+      const confirmId = randomUUID();
+      pendingPanelLeagueCreations.set(confirmId, { leagueName, requestedBy: interaction.user.id });
+      setTimeout(() => pendingPanelLeagueCreations.delete(confirmId), 5 * 60 * 1000);
+
+      const gameMenu = new StringSelectMenuBuilder()
+        .setCustomId(`adminpanel_league_create_game:${confirmId}`)
+        .setPlaceholder('Choose the game type')
+        .addOptions(
+          { label: 'Madden (NFL)', value: 'madden' },
+          { label: 'NBA', value: 'nba' },
+          { label: 'MLB', value: 'mlb' },
+          { label: 'NHL', value: 'nhl' },
+          { label: 'CFB', value: 'cfb' },
+          { label: 'FC (Soccer)', value: 'fc' },
+          { label: 'General/Other', value: 'general' },
+        );
+      await interaction.reply({ content: `League name set: **${leagueName}**. Now choose the game type:`, components: [new ActionRowBuilder().addComponents(gameMenu)], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('adminpanel_league_create_game:')) {
+      const confirmId = interaction.customId.split(':')[1];
+      const pending = pendingPanelLeagueCreations.get(confirmId);
+      if (!pending) {
+        await interaction.update({ content: 'This league creation timed out — press **Create League** again.', components: [] });
+        return;
+      }
+      if (interaction.user.id !== pending.requestedBy) {
+        await interaction.reply({ content: 'Only the person who started this can pick the game type.', ephemeral: true });
+        return;
+      }
+      pendingPanelLeagueCreations.delete(confirmId);
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create leagues.', ephemeral: true }); return; }
+
+      const { leagueName } = pending;
+      const gameKey = interaction.values[0];
       const leagueId = randomUUID();
       await pool.query(
         `INSERT INTO guilds (guild_id, guild_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET guild_name = EXCLUDED.guild_name`,
@@ -17531,12 +17650,12 @@ if (interaction.commandName === 'avatar') {
       );
       await pool.query(
         `INSERT INTO leagues (league_id, guild_id, league_name, game_key) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (guild_id, league_name) DO UPDATE SET is_active = TRUE`,
+         ON CONFLICT (guild_id, league_name) DO UPDATE SET is_active = TRUE, game_key = EXCLUDED.game_key`,
         [leagueId, interaction.guild.id, leagueName, gameKey]
       );
       const savedLeague = await getLeagueByName(interaction.guild.id, leagueName);
       await pool.query(`INSERT INTO league_settings (league_id) VALUES ($1) ON CONFLICT (league_id) DO NOTHING`, [savedLeague.league_id]);
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferUpdate();
       const payload = await buildAdminLeagueSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       await interaction.editReply({ content: `League created: **${leagueName}** (${gameKey.toUpperCase()}).`, ...payload });
       return;
@@ -17624,8 +17743,16 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply({ ephemeral: true });
       const { category, channels } = await autoCreateGuildMultiChannelPanels(interaction.guild);
       const payload = await buildAdminServerSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
+      // 7J-COMMANDHUB-PAYWALL: message now reflects what actually got
+      // created — Free Tier only gets Recruitment (+ Tickets/Support/
+      // Welcome/Leave if applicable), not the full premium panel list this
+      // used to unconditionally claim.
+      const isPremiumGuild = await isGuildPremiumActive(interaction.guild.id);
+      const panelSummary = isPremiumGuild
+        ? 'posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment panels'
+        : 'posted the Recruitment panel (Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile are Premium — `/premium trial` unlocks them for 14 days, no card required)';
       await interaction.editReply({
-        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment panels${channels.length > 7 ? ' (Welcome/Leave channels included)' : ''}. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
+        content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and ${panelSummary}${channels.length > 7 ? ' (Welcome/Leave channels included)' : ''}. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
         ...payload,
       });
       return;
@@ -18769,6 +18896,7 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (action === 'packages') {
+        if (!(await requirePremiumFeature(interaction, 'Trade Package Generator'))) return;
         await interaction.deferReply({ ephemeral: true });
         const result = await postMaddenNegotiationGeneratedPackages(interaction, negotiation, league);
         await interaction.editReply({ content: result.message });
@@ -18776,6 +18904,7 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (action === 'analyze') {
+        if (!(await requirePremiumFeature(interaction, 'Trade Analyzer'))) return;
         const pkg = parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json);
         if (!pkg) {
           await interaction.reply({ content: 'No package selected yet. Press **Generate Packages**, then **Select Package** on one of the package embeds.', ephemeral: true });
@@ -19781,6 +19910,7 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.commandName === 'draftrecap') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Draft Recap'))) return;
       const recapLeagueName = interaction.options.getString('league');
       const recapLeague = recapLeagueName ? await getLeagueByName(interaction.guild.id, recapLeagueName) : await getDefaultLeague(interaction.guild.id);
       if (!recapLeague) {
@@ -19867,6 +19997,7 @@ if (gameSubcommand === 'report') {
 
     if (interaction.commandName === 'profile') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Member Profile'))) return;
       const profileSubcommand = interaction.options.getSubcommand();
 
       if (profileSubcommand === 'legacy') {
@@ -20055,6 +20186,14 @@ if (gameSubcommand === 'report') {
 
       const tradeSubcommand = interaction.options.getSubcommand(false);
       const tradeSubcommandGroup = interaction.options.getSubcommandGroup(false);
+
+      // 7J-COMMANDHUB-PAYWALL: per Hxxdie — trade block/negotiation stay
+      // free (they're the entry points into the already-free trade
+      // channels), but the dedicated GM-assistant analytics subcommands
+      // (analyze/find/needs/gm) are Premium.
+      if (['analyze', 'find', 'needs', 'gm'].includes(tradeSubcommand)) {
+        if (!(await requirePremiumFeature(interaction, 'Madden Trade Analyzer'))) return;
+      }
 
       if (tradeSubcommandGroup === 'block') {
         const leagueName = interaction.options.getString('league');
@@ -20394,6 +20533,7 @@ if (gameSubcommand === 'report') {
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: true });
       }
+      if (!(await requirePremiumFeature(interaction, 'Madden News'))) return;
       const subcommand = interaction.options.getSubcommand(false);
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
@@ -20554,6 +20694,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: true });
       }
+      if (!(await requirePremiumFeature(interaction, 'Player Search'))) return;
       const subcommand = interaction.options.getSubcommand(false);
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
@@ -20611,6 +20752,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: true });
       }
+      if (!(await requirePremiumFeature(interaction, 'Free Agents'))) return;
       const subcommand = interaction.options.getSubcommand(false);
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
@@ -20793,6 +20935,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
         return;
       }
       if (subcommand === 'historypost') {
+        if (!(await requirePremiumFeature(interaction, 'League History'))) return;
         const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
         const embed = await buildMaddenLeagueHistoryYearEndEmbed(interaction.guild, activeLeague);
         if (confirm) {
@@ -22073,6 +22216,7 @@ if (interaction.commandName === 'commissioner') {
 
     if (interaction.commandName === 'gm') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'GM Panel'))) return;
       const gmSubcommand = interaction.options.getSubcommand();
 
       if (gmSubcommand === 'panel') {
@@ -22307,6 +22451,7 @@ if (interaction.commandName === 'trade') {
 
     if (interaction.commandName === 'economy') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Economy'))) return;
       const economySubcommand = interaction.options.getSubcommand();
       const settings = await getCurrencySettings(interaction.guild.id);
 
@@ -22450,6 +22595,7 @@ if (interaction.commandName === 'trade') {
 
     if (interaction.commandName === 'shop') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Shop'))) return;
       const shopSubcommand = interaction.options.getSubcommand();
       if (shopSubcommand === 'createcosmetic') {
         // Deferred immediately — this handler does multiple DB queries plus a full
@@ -23013,6 +23159,7 @@ if (shopSubcommand === 'view') {
 
     if (interaction.commandName === 'tournament') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Tournaments'))) return;
       const tournamentSubcommand = interaction.options.getSubcommand();
 
       if (tournamentSubcommand === 'panel') {
@@ -23184,6 +23331,7 @@ if (shopSubcommand === 'view') {
 
     if (interaction.commandName === 'ticket') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Tickets'))) return;
       const ticketSubcommand = interaction.options.getSubcommand();
 
       if (ticketSubcommand === 'open') {
@@ -24434,6 +24582,7 @@ if (shopSubcommand === 'view') {
     if (interaction.commandName === 'legacy') {
       await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Legacy'))) return;
 
       const result = await pool.query(
         `SELECT * FROM user_recognition
@@ -24451,6 +24600,7 @@ if (shopSubcommand === 'view') {
 
     if (interaction.commandName === 'sportsbook') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Sportsbook'))) return;
       const subcommand = interaction.options.getSubcommand();
 
       if (subcommand === 'refund') {
@@ -24960,6 +25110,7 @@ if (shopSubcommand === 'view') {
     if (interaction.commandName === 'shop') {
       await interaction.deferReply({ ephemeral: true });
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Shop'))) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const result = await pool.query(
         `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE ORDER BY created_at DESC LIMIT 50`,
@@ -24994,6 +25145,7 @@ if (shopSubcommand === 'view') {
     if (interaction.commandName === 'economy') {
       await interaction.deferReply();
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Economy'))) return;
       const settings = await getCurrencySettings(interaction.guild.id);
       const totalResult = await pool.query(
         `SELECT COALESCE(SUM(balance), 0)::int AS total_balance, COUNT(*)::int AS users_with_balance
@@ -26763,6 +26915,28 @@ function isEntitlementPremiumActive(entitlement) {
 async function isGuildPremiumActive(guildId) {
   const entitlement = await getGuildEntitlement(guildId);
   return isEntitlementPremiumActive(entitlement);
+}
+
+// 7J-COMMANDHUB-PAYWALL: shared gate for actual Premium/Advanced features
+// (as opposed to the Free Tier league-count cap, which is enforced
+// separately at league creation). Per Hxxdie's audit request — before this,
+// isGuildPremiumActive was only ever checked at league creation; every
+// other "Premium" feature (GM tooling, Economy/Shop/Sportsbook, avatar
+// depth, etc.) had zero real enforcement despite being documented as
+// premium-only. Replies with a consistent upsell message and returns false
+// if not premium; returns true (and replies nothing) if premium — callers
+// do `if (!(await requirePremiumFeature(interaction, 'Shop'))) return;`
+// right at the top of a handler, before any other work.
+async function requirePremiumFeature(interaction, featureName) {
+  if (!interaction.guild) return true; // DM-context commands aren't guild-tiered
+  if (await isGuildPremiumActive(interaction.guild.id)) return true;
+  const message = `**${featureName}** is a GG Sports Premium feature. Try \`/premium trial\` for 14 days of full access (no card required), or \`/premium subscribe\` to go Premium.`;
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => null);
+  } else {
+    await interaction.reply({ content: message, ephemeral: true }).catch(() => null);
+  }
+  return false;
 }
 
 async function recordPremiumBillingEvent(guildId, eventType, { plan = null, amountCents = null } = {}) {
@@ -33645,15 +33819,28 @@ async function notifyWaitlistForVacantTeam(guild, league, teamName) {
 async function autoCreateGuildMultiChannelPanels(guild) {
   const category = await guild.channels.create({ name: 'GG Sports', type: ChannelType.GuildCategory });
   const created = [];
-  const panelSpecs = [
-    ['shop', 'shop'],
-    ['sportsbook', 'sportsbook-board'],
-    ['marketplace', 'marketplace'],
-    ['avatar', 'avatar'],
-    ['bank', 'bank'],
-    ['profile', 'member-profile'],
-    ['recruitment', 'recruitment'],
+  // 7J-COMMANDHUB-PAYWALL: per Hxxdie's full free/premium breakdown —
+  // shop/sportsbook/marketplace/avatar/bank/member-profile are all
+  // Premium; recruitment (applications) stays free (only the cross-server
+  // Discover Leagues *discoverability toggle* is Premium, gated separately
+  // where that toggle actually flips). Free Tier guilds simply don't get
+  // the premium-only channels created here at all — combined with the
+  // centralized interaction gate, this means neither the channel nor a
+  // working panel exists for Free Tier, rather than an unusable channel
+  // sitting there.
+  const isPremium = await isGuildPremiumActive(guild.id);
+  const allPanelSpecs = [
+    ['shop', 'shop', true],
+    ['sportsbook', 'sportsbook-board', true],
+    ['marketplace', 'marketplace', true],
+    ['avatar', 'avatar', true],
+    ['bank', 'bank', true],
+    ['profile', 'member-profile', true],
+    ['recruitment', 'recruitment', false],
   ];
+  const panelSpecs = allPanelSpecs
+    .filter(([, , premiumOnly]) => !premiumOnly || isPremium)
+    .map(([panelType, channelName]) => [panelType, channelName]);
   for (const [panelType, channelName] of panelSpecs) {
     const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id }).catch(() => null);
     if (!channel) continue;
@@ -33767,6 +33954,17 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   const category = await guild.channels.create({ name: `${leagueCategoryEmoji(league)} ${league.league_name}`.slice(0, 100), type: ChannelType.GuildCategory });
   const created = [];
 
+  // 7J-COMMANDHUB-PAYWALL: per Hxxdie's full free/premium breakdown for
+  // per-league channels — Free Tier gets: announcements, rules, staff,
+  // standings, streaming, game threads/center, trade block/negotiation/
+  // committee/verdicts/counts, team owners, active check, suspensions,
+  // league chat. Premium adds: free agents, news, power rankings, history,
+  // playoff bracket, and (for non-Madden) their generic equivalents plus
+  // League HOF (ties to the already-Premium /legacy system). Checked once
+  // here and reused below for both channel creation and panel posting, so
+  // the two stay in sync.
+  const isPremiumLeague = await isGuildPremiumActive(guild.id);
+
   // 7J-145SCHEDULEFIX: real bug — this used to decide Game Threads vs. Game
   // Center purely off isMadden, but per Hxxdie's original ask a NON-Madden
   // league can also use the structured schedule (Advance/Start League)
@@ -33785,14 +33983,14 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   // members read first (rules/announcements/staff), the live game-day
   // channels (standings/streaming/games), the trade cluster together, then
   // admin/reference channels at the bottom.
-  const singleChannelSpecs = [
+  let singleChannelSpecs = [
     ['league_rules_channel_id', 'rules'],
     ['league_announcement_channel_id', 'announcements'],
     ['staff_channel_id', 'staff'],
     ['standings_channel_id', 'standings'],
     ['live_channel_id', 'streaming'],
     // game-threads/game-center inserted here, sport-conditional, below
-    ['sportsbook_channel_id', 'sportsbook-feed'],
+    ['sportsbook_channel_id', 'sportsbook-feed', true],
     ['trade_block_channel_id', 'trade-block'],
     ['trade_offer_channel_id', 'trade-offer'],
     ['trade_committee_channel_id', 'trade-committee'],
@@ -33800,9 +33998,9 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     ['denied_trades_channel_id', 'denied-trades'],
     ['trade_count_channel_id', 'trade-count'],
     ['team_owners_channel_id', 'team-owners'],
-    ['playoff_bracket_channel_id', 'playoff-bracket'],
+    ['playoff_bracket_channel_id', 'playoff-bracket', true],
     ['active_check_channel_id', 'active-check'],
-    ['history_channel_id', 'history'],
+    ['history_channel_id', 'history', true],
     // league-hof / madden-news / free-agents inserted here, sport-conditional, below
     ['suspensions_channel_id', 'suspensions'],
   ];
@@ -33822,11 +34020,22 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     singleChannelSpecs.splice(5, 0, ['game_center_channel_id', 'game-center']);
   }
   if (isMadden) {
-    singleChannelSpecs.push(['madden_news_channel_id', 'madden-news'], ['madden_free_agents_channel_id', 'free-agents']);
+    // 7J-COMMANDHUB-AUTOSETUP: madden-gm and franchise-hub added per
+    // Hxxdie — "no point in having a commissioner manually create and post
+    // 3 channels when all the others are created and populated." Both
+    // Premium; weekly-updates is a plain destination channel (Madden sync
+    // posts into it over time, no starter panel to post) and stays Free.
+    singleChannelSpecs.push(
+      ['madden_news_channel_id', 'madden-news', true],
+      ['madden_free_agents_channel_id', 'free-agents', true],
+      ['gm_panel_channel_id', 'madden-gm', true],
+      ['madden_franchise_hub_channel_id', 'franchise-hub', true],
+      ['madden_weekly_updates_channel_id', 'weekly-updates'],
+    );
   } else {
     // 7J-135GENERICNEWS: Power Rankings + News Feed, the generic non-Madden
     // equivalents of Madden's power rankings board / ESPN news channel.
-    singleChannelSpecs.push(['league_hof_channel_id', 'league-hof'], ['league_power_rankings_channel_id', 'power-rankings'], ['league_news_channel_id', 'league-news']);
+    singleChannelSpecs.push(['league_hof_channel_id', 'league-hof', true], ['league_power_rankings_channel_id', 'power-rankings', true], ['league_news_channel_id', 'league-news', true]);
   }
   // 7J-154WHOGOTNEXT: general chat channel for the Who's Got Next button —
   // applies to every league regardless of sport, so it's an unconditional
@@ -33834,6 +34043,11 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   // which would've disturbed the splice(5, ...) index math for
   // game-threads/game-center.
   singleChannelSpecs.push(['league_chat_channel_id', 'league-chat']);
+
+  if (!isPremiumLeague) {
+    singleChannelSpecs = singleChannelSpecs.filter(([, , premiumOnly]) => !premiumOnly);
+  }
+
   for (let i = 0; i < singleChannelSpecs.length; i++) {
     const [column, channelName] = singleChannelSpecs[i];
     const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id, position: i }).catch(() => null);
@@ -33860,14 +34074,23 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   // OPEN case — a structured non-Madden league's game-threads channel stays
   // empty (no panel, no threads) until Start League is actually pressed,
   // same as Madden's game-threads channel never gets a pre-populated panel.
+  // 7J-COMMANDHUB-PAYWALL: madden_free_agents_panel, gm_panel_starter_panel,
+  // madden_franchise_hub_panel, and league_hof_panel (Legacy-tied) are
+  // Premium-only — same isPremiumLeague check as the channel creation
+  // above, so a Free Tier league doesn't get a channel AND a panel posted
+  // into a channel that doesn't exist anyway.
   const freshLeague = await getLeagueById(league.league_id).catch(() => null);
   if (freshLeague) {
     const fakeInteraction = { guild, channel: null };
-    const panelTypesToPost = isMadden
-      ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'madden_free_agents_panel']
+    let panelTypesToPost = isMadden
+      ? ['trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'madden_free_agents_panel', 'gm_panel_starter_panel', 'madden_franchise_hub_panel']
       : isStructuredNonMadden
         ? ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'league_power_rankings_panel']
         : ['standings_panel', 'trade_block_board_panel', 'team_owners_panel', 'trade_offer_panel', 'trade_count_panel', 'league_hof_panel', 'game_center_panel', 'league_power_rankings_panel'];
+    if (!isPremiumLeague) {
+      const PREMIUM_AUTO_PANEL_TYPES = new Set(['madden_free_agents_panel', 'gm_panel_starter_panel', 'madden_franchise_hub_panel', 'league_hof_panel', 'league_power_rankings_panel']);
+      panelTypesToPost = panelTypesToPost.filter(type => !PREMIUM_AUTO_PANEL_TYPES.has(type));
+    }
     for (const panelType of panelTypesToPost) {
       await createConfiguredPanelFromSetup(fakeInteraction, freshLeague, panelType).catch(() => null);
     }
