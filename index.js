@@ -9719,7 +9719,15 @@ function buildNewServerOwnerWelcomeEmbed(guild) {
       "Here's how to get set up:" + String.fromCharCode(10) + String.fromCharCode(10) +
       '**1.** `/league create` — create your first league.' + String.fromCharCode(10) +
       '**2.** `/commissioner panel` — the control panel for everything else: channels/roles, live boards, operations, and league customization.' + String.fromCharCode(10) + String.fromCharCode(10) +
-      "Prefer a written walkthrough? `/setupguide` has the full order, or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members." + String.fromCharCode(10) + String.fromCharCode(10) +
+      "Prefer a written walkthrough? `/setupguide` has the full order (and shows what's free vs. Premium at each step), or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members." + String.fromCharCode(10) + String.fromCharCode(10) +
+      // 7J-COMMANDHUB-ONBOARDING: per Hxxdie — the trial deserves a mention
+      // right here, not buried behind a command someone has to already
+      // know exists. Core league management (rosters, trades, standings,
+      // schedule, playoffs) is free forever; Premium adds GM analytics
+      // tools, the Economy system (Shop/Sportsbook/Bank/Marketplace/
+      // Avatar), Tournaments, and deeper Madden boards.
+      '💎 **Free vs. Premium:** core league management (rosters, trades, standings, schedule, playoffs, staff tools) is free forever, no time limit. Premium unlocks GM analytics tools, the full Economy system (Shop/Sportsbook/Bank/Marketplace/Avatar), Tournaments, and deeper Madden boards (Free Agents, News, Power Rankings, League History, Franchise Hub).' + String.fromCharCode(10) + String.fromCharCode(10) +
+      '`/premium trial` gets you **14 days of full Premium access, no card required** — the fastest way to see everything the bot can do before deciding.' + String.fromCharCode(10) + String.fromCharCode(10) +
       `Questions or stuck on something? Join the support server: ${GG_SPORTS_SUPPORT_SERVER_URL}`
     )
     .setFooter({ text: 'GG Sports' })
@@ -29826,96 +29834,77 @@ function buildSetupGuideEmbed() {
     .setTitle('GG Sports Setup Guide')
     .setColor(0x5865F2)
     .setDescription(
-      'Use this guide in order when setting up a new server or new league. **Most of this is now done from `/commissioner panel`** — one interactive control panel covering channels/roles, live panels, operations, league customization, and (for Madden leagues) browsing transactions/retirements and auto-detect settings. Individual slash commands below still work as manual backups.'
+      'Use this guide in order when setting up a new server or new league. **Most of this is now done from `/commissioner panel`** — one interactive control panel covering channels/roles, live panels, operations, league customization, and (for Madden leagues) browsing transactions/retirements and auto-detect settings. Individual slash commands below still work as manual backups.\n\n' +
+      // 7J-COMMANDHUB-ONBOARDING: per Hxxdie — "new users don't necessarily
+      // know everything that's available unless they go looking for it."
+      // Every section below is now labeled 🆓/💎 so it's obvious at a
+      // glance what's free vs. what needs a subscription, instead of
+      // reading like one flat mandatory checklist. Free steps come first
+      // (a fully working league needs zero of the premium stuff), Premium
+      // add-ons are their own clearly separated block after.
+      '**🆓 Free** = works forever, no time limit. **💎 Premium** = needs an active subscription or trial — try `/premium trial` for 14 days of full access, no card required.'
     )
     .addFields(
       {
-        name: '1. Create the League',
+        name: '1. Create the League 🆓',
         value:
-          '**/league create** — creates the league record.\n' +
+          '**/league create** — creates the league record (pick a game type from the dropdown, not free text — this drives auto-setup below).\n' +
           '**/commissioner panel** — open the control panel (also works via `/league info`/`/league settings` for a read-only check).\n' +
           '**/league delete** — disables/removes a league when needed.',
         inline: false,
       },
       {
-        name: '2. Set Staff, League Roles, and Team Roles',
+        name: '2. Set Staff, League Roles, and Team Roles 🆓',
         value:
           '`/commissioner panel` → **Channels & Roles** covers staff role, league role, and team roles in one place.\n' +
-          'Manual backups: **/league staff**, **/league teamrole**.\n' +
-          'Team roles matter for owners, standings, trades, game validation, playoffs, and preventing users from betting on their own games.',
+          'Manual backups: **/league staff**, **/league teamrole**, and (for individual role assign/remove) **/commissioner assignrole**/**unassignrole**.\n' +
+          'Team roles matter for owners, standings, trades, game validation, and playoffs.',
         inline: false,
       },
       {
-        name: '3. Configure Core Channels & Panels',
+        name: '3. Auto-Setup Channels & Boards 🆓 + 💎',
         value:
-          '`/commissioner panel` → **Channels & Roles** sets every channel (standings, sportsbook, tournament, Game Center, tickets, and more); → **Panels** posts/refreshes the live boards for whichever channels you set.\n' +
-          'Manual backups: **/league standingschannel**, **/league sportsbookchannel**, **/league sportsbookfeed**, **/league tournamentchannel**, **/ticket panel**, **/ticket supportpanel**.',
+          '`/commissioner panel` → **Channels & Roles** → **Auto-Setup Channels** creates and populates a full channel set in one click — announcements, rules, staff, standings, streaming, schedule/game threads, the whole trade cluster (block/negotiation/committee/verdicts/counts), team owners, active check, suspensions, league chat, all 🆓 Free.\n' +
+          'On Premium, the same click also adds Free Agents, Madden News, Power Rankings, League History, Playoff Bracket, GM Panel, and Franchise Hub — no manual per-channel setup needed either way.',
         inline: false,
       },
       {
-        name: '4. Configure Economy + Payouts',
-        value:
-          '**/league currency** — sets currency name/icon and payout values.\n' +
-          'Use this to control game played payout, win payout, and award payout.\n' +
-          '**/economy balance** — checks balance.\n' +
-          '**/economy give/take/transfer** — manages currency.',
-        inline: false,
-      },
-      {
-        name: '5. Set Up the Shop',
-        value:
-          '**/shop createitem** — creates an item for sale.\n**/shop createcosmetic** — creates a visual avatar cosmetic.\n**/shop preview** — previews cosmetics before purchase.\n' +
-          '**/shop panel** — posts the permanent shop panel with item buttons.\n' +
-          '**/shop cart** — users view their cart.\n' +
-          '**/shop checkout** — users confirm purchases.\n' +
-          '**/shop inventory** — users/staff view owned items.',
-        inline: false,
-      },
-      {
-        name: '6. Set Up Sportsbook',
-        value:
-          '**/league sportsbookchannel** — choose the feed channel.\n' +
-          '**/league sportsbookfeed** — turn feed alerts on/off.\n' +
-          '**/sportsbook create** — manually create a betting line.\n' +
-          '**/sportsbook limits** — set max bet/max payout.\n' +
-          '**/sportsbook refund** — refund open bets if a game is cancelled or created wrong.\n' +
-          '**/sportsbook leaderboards** — view sportsbook performance.',
-        inline: false,
-      },
-      {
-        name: '7. Games, Standings, and Playoffs',
+        name: '4. Games, Standings, and Playoffs 🆓',
         value:
           'Non-Madden, open-schedule leagues: `/commissioner panel` → **Channels & Roles** → set a **Game Center Channel**, then post the Game Center panel — click **Add Game** to schedule a matchup with no typing; it opens a private thread per game with Report Score/Reset Game buttons built in.\n' +
           'Manual backups: **/game add**, **/game report**, **/game reset**, **/game standings**.\n' +
-          'Playoffs (all league types): `/commissioner panel` → **Operations** → **Playoffs** (Start/Report/Post Bracket Panel) — tracks real bracket state, series scores, and auto-advances rounds. `/league playoffsettings` sets team count.',
+          'Playoffs need Premium for the bracket board (`/commissioner panel` → **Operations** → **Playoffs**, or `/league playoffsettings` for team count) — the games/standings themselves stay Free either way.',
         inline: false,
       },
       {
-        name: '8. League Customization',
+        name: '5. League Customization 🆓',
         value:
-          '`/commissioner panel` → **League Settings** → season length, schedule style, standings system (W/L, points, or point differential), ties, conferences/divisions, playoff seeding, CPU trades, trade limits, and which awards this league tracks. Everything here actually drives standings display, playoff seeding, and trade limits — not just labels.',
+          '`/commissioner panel` → **League Settings** → season length, schedule style, standings system (W/L, points, or point differential), ties, conferences/divisions, playoff seeding, CPU trades, trade limits, and which awards this league tracks (`/league awards`). Everything here actually drives standings display, playoff seeding, and trade limits — not just labels.',
         inline: false,
       },
       {
-        name: '9. Madden Leagues Only',
+        name: '6. Madden Leagues 🆓 + 💎',
         value:
-          '**/madden connect** then **/madden sync** to pull EA data. `/commissioner panel` → **Operations** for sync/scans/auto-detection and **Auto-Detect Settings** (threshold, review channel, ESPN news, sportsbook auto-lines) — or → **Browse Data** to view recent transactions/retirements by team without typing a command.',
+          '**/madden connect** then **/madden sync** to pull EA data — this is 🆓 Free and drives the core trade/standings/roster pipeline. `/commissioner panel` → **Operations** for sync/scans/auto-detection.\n' +
+          '💎 Premium adds: **/maddenfreeagents**, **/maddennews**, **/maddenplayer**, the Madden Trade Analyzer/Find/Needs/GM tools (`/maddentrade`), Draft Recap grades, League History posts, and the GM Panel/Franchise Hub boards.',
         inline: false,
       },
       {
-        name: '10. Awards, Activity, Legacy, and Profiles',
+        name: '7. Economy, Shop, Sportsbook 💎',
         value:
-          '**/league awards** — opens the customizable awards form.\n' +
-          '**/activity** — shows current engagement/activity tier.\n' +
-          '**/activityleaderboard** — shows top active users.\n' +
-          '**/legacy** — shows permanent greatness/legacy ranking.\n' +
-          '**/profile franchise/activity/earnings/milestones/badges** — shows long-term user identity.',
+          'The whole currency/economy system is Premium: **/league currency** (payout rates), **/economy** (balance/give/take/transfer), **/shop** (createitem/createcosmetic/panel/cart/checkout/inventory), **/sportsbook** (create/limits/refund/leaderboards), plus the Bank, Marketplace, and Avatar shop. Auto-Setup Server Channels (Admin Panel → Server Setup) creates all of these in one click once Premium is active.',
         inline: false,
       },
       {
-        name: '11. Recommended Launch Order',
+        name: '8. Tickets, Tournaments, Legacy, Profiles 💎',
         value:
-          'Create league → `/commissioner panel` for roles/channels → configure currency/payouts → create shop → post panels → configure sportsbook → add games (or set up Game Center) → report games → run playoffs → post awards.',
+          '**/ticket** (support tickets), **/tournament** (bracket hosting), **/legacy** (all-time greatness ranking), and **/profile** (member profile card) are all Premium. **/activity**/**/activityleaderboard** (engagement tracking) stay 🆓 Free.',
+        inline: false,
+      },
+      {
+        name: '9. Recommended Launch Order',
+        value:
+          'Create league → `/commissioner panel` for roles/channels → run **Auto-Setup Channels** → configure league settings → (Premium) run **Auto-Setup Server Channels** for the economy category → configure currency/sportsbook → add games or set up Game Center → report games → run playoffs.',
         inline: false,
       }
     )
@@ -29927,17 +29916,19 @@ function buildQuickSetupEmbed() {
   return new EmbedBuilder()
     .setTitle('GG Sports Quick Setup')
     .setColor(0x57F287)
-    .setDescription('Fast checklist for setting up a new league. Everything below except league creation and currency can be done from `/commissioner panel`.')
+    .setDescription(
+      "Fast checklist for setting up a new league. Everything below can be done from `/commissioner panel`. 🆓 = free forever, 💎 = needs Premium (`/premium trial` for 14 days free, no card)."
+    )
     .addFields(
-      { name: '1. Create league', value: '/league create', inline: true },
-      { name: '2. Open control panel', value: '/commissioner panel', inline: true },
-      { name: '3. Set roles + team roles', value: 'Panel → Channels & Roles', inline: true },
-      { name: '4. Set channels', value: 'Panel → Channels & Roles', inline: true },
-      { name: '5. Configure currency', value: '/league currency', inline: true },
-      { name: '6. Post panels', value: 'Panel → Panels', inline: true },
-      { name: '7. League Customization', value: 'Panel → League Settings', inline: true },
-      { name: '8. Start season', value: 'Panel → Game Center, or\n/game add + /game report', inline: true },
-      { name: '9. Track users', value: '/activity\n/legacy\n/profile franchise', inline: true }
+      { name: '1. Create league 🆓', value: '/league create', inline: true },
+      { name: '2. Open control panel 🆓', value: '/commissioner panel', inline: true },
+      { name: '3. Set roles + team roles 🆓', value: 'Panel → Channels & Roles', inline: true },
+      { name: '4. Auto-Setup Channels 🆓+💎', value: 'Panel → Channels & Roles\n(Premium unlocks more boards)', inline: true },
+      { name: '5. League Customization 🆓', value: 'Panel → League Settings', inline: true },
+      { name: '6. Start season 🆓', value: 'Panel → Game Center, or\n/game add + /game report', inline: true },
+      { name: '7. Track activity 🆓', value: '/activity\n/activityleaderboard', inline: true },
+      { name: '8. Economy/Shop/Sportsbook 💎', value: '/league currency\nAdmin Panel → Server Setup', inline: true },
+      { name: '9. Tickets/Tournaments/Legacy 💎', value: '/ticket\n/tournament\n/legacy', inline: true }
     )
     .setFooter({ text: 'GG Sports • Quick Setup' })
     .setTimestamp();
@@ -29947,58 +29938,60 @@ function buildCommandsGuideEmbed() {
   return new EmbedBuilder()
     .setTitle('GG Sports Commands')
     .setColor(0x5865F2)
-    .setDescription('Commands are organized by hub. Use /commissioner panel for the interactive commissioner control panel (channels/roles, live panels, operations, league customization, and Madden browse/auto-detect tools) or /setupguide for full setup instructions.')
+    .setDescription('Commands are organized by hub (🆓 free, 💎 Premium — `/premium trial` for 14 days free). Use /commissioner panel for the interactive commissioner control panel (channels/roles, live panels, operations, league customization, and Madden browse/auto-detect tools) or /setupguide for full setup instructions.')
     .addFields(
       {
-        name: 'Commissioner Panel (recommended)',
+        name: 'Commissioner Panel (recommended) 🆓',
         value:
           '**/commissioner panel** — one control panel covering everything below with no typing required: Channels & Roles, Panels, Operations (sync/scans/auto-detection/playoffs/Game Center), Browse Data (Madden transactions/retirements), and League Settings.',
         inline: false,
       },
       {
-        name: 'League Setup',
+        name: 'League Setup 🆓',
         value:
           '/league create, /league delete, /league info, /league list, /league settings\n' +
-          '/league staff, /league teamrole, /league standingschannel, /league tournamentchannel\n' +
-          '/league sportsbookchannel, /league sportsbookfeed, /league currency, /league awards',
+          '/league staff, /league teamrole, /league standingschannel\n' +
+          '/league currency, /league awards 🆓 · /league tournamentchannel, /league sportsbookchannel, /league sportsbookfeed 💎',
         inline: false,
       },
       {
-        name: 'Madden',
+        name: 'Madden 🆓 + 💎',
         value:
-          '/madden connect, /madden connections, /madden disconnect, /madden link, /madden sync, /madden autosync, /madden syncfeed, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise',
+          '🆓 Core sync: /madden connect, /madden connections, /madden disconnect, /madden link, /madden sync, /madden autosync, /madden syncfeed, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise\n' +
+          '💎 /maddenfreeagents, /maddennews, /maddenplayer, /maddentrade (analyze/find/needs/gm), /draftrecap',
         inline: false,
       },
       {
-        name: 'Games + Standings',
+        name: 'Games + Standings 🆓',
         value:
           '/game add, /game report, /game reset, /game schedule, /game standings, /game adjuststandings\n' +
-          '/league playoffsettings — playoff team count; run playoffs from Commissioner Panel → Operations → Playoffs\n' +
+          '/league playoffsettings — playoff team count; running playoffs (bracket board) is 💎 Premium\n' +
           'Open-schedule leagues without game threads: Commissioner Panel → Game Center panel (Add Game → private matchup thread with built-in Report/Reset buttons)',
         inline: false,
       },
       {
-        name: 'Sportsbook',
+        name: 'Sportsbook 💎',
         value:
           '/sportsbook board, /sportsbook create, /sportsbook place, /sportsbook settle\n' +
           '/sportsbook refund, /sportsbook limits, /sportsbook leaderboards, /sportsbook mybets, /sportsbook parlay',
         inline: false,
       },
       {
-        name: 'Shop + Economy',
+        name: 'Shop + Economy 💎',
         value:
           '/shop view, /shop panel, /shop createitem, /shop createcosmetic, /shop preview, /shop removeitem, /shop cart, /shop checkout, /shop inventory\n' +
           '/economy balance, /economy transfer, /economy give, /economy take, /economy richest, /economy transactions',
         inline: false,
       },
       {
-        name: 'Trade System',
+        name: 'Trade System 🆓',
         value:
-          '/trade setup, /trade settings, /trade block, /trade history, /trade team, /trade addcount, /trade removecount, /trade tradecountpanel, /trade offerpanel',
+          '/trade setup, /trade settings, /trade block, /trade history, /trade team, /trade addcount, /trade removecount, /trade tradecountpanel, /trade offerpanel\n' +
+          '(Generic trade infrastructure — free for every sport. Madden-specific trade *analytics* live under /maddentrade, 💎 Premium.)',
         inline: false,
       },
       {
-        name: 'Tickets + Tournaments',
+        name: 'Tickets + Tournaments 💎',
         value:
           '/ticket open, /ticket dispute, /ticket game, /ticket list, /ticket panel, /ticket supportpanel\n' +
           '/tournament create, /tournament join, /tournament list, /tournament start, /tournament report — or Commissioner Panel → Panels → Tournament Panel',
@@ -30007,12 +30000,13 @@ function buildCommandsGuideEmbed() {
       {
         name: 'Profiles, Activity, Legacy',
         value:
-          '/profile user, /profile franchise, /profile activity, /profile earnings, /profile milestones, /profile badges\n' +
-          '/activity, /activityleaderboard, /legacy, /premium status, /premium features',
+          '🆓 /activity, /activityleaderboard\n' +
+          '💎 /profile user, /profile franchise, /profile activity, /profile earnings, /profile milestones, /profile badges, /legacy\n' +
+          '/premium status, /premium features, /premium trial, /premium subscribe',
         inline: false,
       },
       {
-        name: 'Utilities',
+        name: 'Utilities 🆓',
         value:
           '/ping, /coinflip, /whogotnext, /streamlink, /commissioner assignrole, /commissioner unassignrole',
         inline: false,
@@ -30034,24 +30028,38 @@ function buildHelpEmbed() {
         name: 'New Server Owners',
         value:
           '**/commissioner panel** — interactive commissioner control panel, the recommended starting point.\n' +
-          '**/setupguide** — full step-by-step setup guide.\n' +
+          '**/setupguide** — full step-by-step setup guide (shows what\'s free vs. Premium at each step).\n' +
           '**/quicksetup** — short setup checklist.\n' +
           '**/commands** — categorized command directory.',
         inline: false,
       },
       {
-        name: 'Regular League Members',
+        name: 'Regular League Members — Free',
         value:
           '**/game schedule** and **/game standings** — league info.\n' +
+          '**/activity**, **/activityleaderboard** — engagement tracking.\n' +
+          '**/streamlink**, **/whogotnext**, **/coinflip** — quick utilities.',
+        inline: false,
+      },
+      {
+        name: 'Regular League Members — Premium',
+        value:
           '**/shop view**, **/shop cart**, **/shop checkout** — shop system.\n' +
           '**/sportsbook board**, **/sportsbook place**, **/sportsbook mybets** — betting.\n' +
-          '**/activity**, **/legacy**, **/profile user** — progression.',
+          '**/legacy**, **/profile user**, **/avatar view** — progression & cosmetics.',
         inline: false,
       },
       {
         name: 'Staff / Admins',
         value:
           'Use **/commissioner panel** for setup order and day-to-day operations (sync, scans, auto-detection, playoffs, Game Center, browsing Madden data). /setupguide has the full written walkthrough. Individual slash commands under /league, /game, /shop, /sportsbook, /ticket, and /tournament still work as manual backups.',
+        inline: false,
+      },
+      {
+        name: 'GG Sports Premium',
+        value:
+          'Core league management is free forever. Premium unlocks GM analytics tools, the Economy system (Shop/Sportsbook/Bank/Marketplace/Avatar), Tournaments, Legacy, and deeper Madden boards.\n' +
+          '**/premium trial** — 14 days free, no card required.\n**/premium status** — check this server\'s current tier.\n**/premium subscribe** — go Premium.',
         inline: false,
       },
       {
