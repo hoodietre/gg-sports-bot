@@ -13447,7 +13447,7 @@ if (interaction.commandName === 'avatar') {
           }
         };
 
-        await openSupportTicket(interaction, panelType === 'game' ? 'gamerequest' : ticketType);
+        await openSupportTicket(interaction, panelType === 'game' ? 'gamerequest' : ticketType, { isPrivate: true });
         return;
       }
 
@@ -23724,17 +23724,17 @@ if (shopSubcommand === 'view') {
       const ticketSubcommand = interaction.options.getSubcommand();
 
       if (ticketSubcommand === 'open') {
-        await openSupportTicket(interaction, 'support');
+        await openSupportTicket(interaction, 'support', { isPrivate: true });
         return;
       }
 
       if (ticketSubcommand === 'dispute') {
-        await openSupportTicket(interaction, 'dispute');
+        await openSupportTicket(interaction, 'dispute', { isPrivate: true });
         return;
       }
 
       if (ticketSubcommand === 'game') {
-        await openSupportTicket(interaction, 'gamerequest');
+        await openSupportTicket(interaction, 'gamerequest', { isPrivate: true });
         return;
       }
 
@@ -30000,7 +30000,7 @@ async function openGameIssueTicket(interaction, ticketType) {
   // else (button/modal) needed the same code path, since those interactions
   // don't have .options at all. openSupportTicket now takes these as an
   // explicit overrides object instead, so both paths can share one function.
-  await openSupportTicket(interaction, 'gamerequest', { subject, description, leagueName: activeLeague.league_name });
+  await openSupportTicket(interaction, 'gamerequest', { subject, description, leagueName: activeLeague.league_name, isPrivate: true, involvedUserIds: [opponentUserId].filter(Boolean) });
   delete interaction.ggSportsReviewButtons;
   delete interaction.ggSportsGameIssueMeta;
 }
