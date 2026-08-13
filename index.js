@@ -431,6 +431,12 @@ async function initDatabase() {
     )
   `);
   await pool.query(`ALTER TABLE leagues ADD COLUMN IF NOT EXISTS season_length INTEGER`);
+  // Distinguishes a league the bot soft-locked for exceeding the Free Tier
+  // cap (reversible on reactivation) from one the owner deliberately
+  // deleted via League Setup (permanent — roles/channels already gone).
+  // Both share is_active = FALSE, so this column is the only safe way to
+  // tell them apart when restoring or purging.
+  await pool.query(`ALTER TABLE leagues ADD COLUMN IF NOT EXISTS premium_locked_at TIMESTAMPTZ`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_settings (
@@ -27045,9 +27051,24 @@ async function enforceFreeTierLeagueCap(guild) {
 
   const toLock = active.slice(FREE_TIER_LEAGUE_CAP);
   for (const league of toLock) {
-    await pool.query(`UPDATE leagues SET is_active = FALSE WHERE league_id = $1`, [league.league_id]);
+    await pool.query(`UPDATE leagues SET is_active = FALSE, premium_locked_at = NOW() WHERE league_id = $1`, [league.league_id]);
   }
   return { lockedCount: toLock.length, lockedNames: toLock.map(l => l.league_name) };
+}
+
+// Reverses enforceFreeTierLeagueCap. Only ever restores leagues the BOT
+// locked (premium_locked_at IS NOT NULL) — never touches leagues the owner
+// deliberately deleted through League Setup, since those already had their
+// Discord roles/channels removed and restoring is_active for them would
+// leave the bot pointing at resources that no longer exist.
+async function restorePremiumCapLockedLeagues(guildId) {
+  const result = await pool.query(
+    `UPDATE leagues SET is_active = TRUE, premium_locked_at = NULL
+     WHERE guild_id = $1 AND premium_locked_at IS NOT NULL
+     RETURNING league_name`,
+    [guildId]
+  );
+  return { restoredCount: result.rows.length, restoredNames: result.rows.map(r => r.league_name) };
 }
 
 // --- Shared lapse handler -----------------------------------------------------
@@ -27195,15 +27216,22 @@ async function handleStripeCheckoutCompleted(client, session) {
 
   await recordPremiumBillingEvent(guildId, existing.status === 'trialing' ? 'trial_converted' : 'payment_succeeded', { plan });
 
+  // If this guild had leagues locked for exceeding the Free Tier cap (e.g.
+  // resubscribing via a fresh checkout after a full lapse), restore them now.
+  const restoreResult = await restorePremiumCapLockedLeagues(guildId).catch(() => ({ restoredCount: 0, restoredNames: [] }));
+
   const guild = await client.guilds.fetch(guildId).catch(() => null);
   if (!guild) return;
   const entitlement = await getGuildEntitlement(guildId);
 
+  const restoredNote = restoreResult.restoredCount
+    ? `\n\n**${restoreResult.restoredCount} previously-locked league(s) restored:** ${restoreResult.restoredNames.join(', ')}. Full access is back instantly.`
+    : '';
   const dmEmbed = new EmbedBuilder()
     .setTitle('✅ GG Sports Premium — Active')
     .setColor(0x57F287)
     .setDescription(
-      `Payment received — this server now has Premium access${isFounderPricing ? ' at **founder pricing**, locked in for as long as your subscription stays active without a lapse' : ''}.`
+      `Payment received — this server now has Premium access${isFounderPricing ? ' at **founder pricing**, locked in for as long as your subscription stays active without a lapse' : ''}.${restoredNote}`
     )
     .setFooter({ text: 'GG Sports • Premium' })
     .setTimestamp();
@@ -27226,10 +27254,17 @@ async function handleStripeInvoicePaid(client, invoice) {
   // Renewal invoices don't go through checkout.session.completed again —
   // this is the ongoing "still paying" signal for month 2+/year 2+.
   const periodEnd = invoice.lines?.data?.[0]?.period?.end ? new Date(invoice.lines.data[0].period.end * 1000) : entitlement.current_period_end;
+  const wasLapsedOrPastDue = entitlement.status === 'lapsed' || entitlement.status === 'past_due';
   await pool.query(
-    `UPDATE premium_entitlements SET status = 'active', current_period_end = $2, dunning_attempt_count = 0, updated_at = NOW() WHERE guild_id = $1`,
+    `UPDATE premium_entitlements SET status = 'active', current_period_end = $2, dunning_attempt_count = 0, lapsed_at = NULL, updated_at = NOW() WHERE guild_id = $1`,
     [entitlement.guild_id, periodEnd]
   );
+
+  // If this guild had leagues locked for exceeding the Free Tier cap,
+  // restore them now that Premium is active again.
+  const restoreResult = wasLapsedOrPastDue
+    ? await restorePremiumCapLockedLeagues(entitlement.guild_id).catch(() => ({ restoredCount: 0, restoredNames: [] }))
+    : { restoredCount: 0, restoredNames: [] };
 
   // Only fire the "payment succeeded" DM/announcement for renewals — the
   // very first payment on a subscription is already covered by
@@ -27239,10 +27274,13 @@ async function handleStripeInvoicePaid(client, invoice) {
     await recordPremiumBillingEvent(entitlement.guild_id, 'payment_succeeded', { plan: entitlement.plan, amountCents: invoice.amount_paid });
     const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
     if (guild) {
+      const restoredNote = restoreResult.restoredCount
+        ? `\n\n**${restoreResult.restoredCount} previously-locked league(s) restored:** ${restoreResult.restoredNames.join(', ')}. Full access is back instantly.`
+        : '';
       const dmEmbed = new EmbedBuilder()
         .setTitle('✅ GG Sports Premium — Renewed')
         .setColor(0x57F287)
-        .setDescription('Your renewal payment went through — Premium continues uninterrupted.')
+        .setDescription(`Your renewal payment went through — Premium continues uninterrupted.${restoredNote}`)
         .setFooter({ text: 'GG Sports • Premium' })
         .setTimestamp();
       await dmPremiumNotice(guild, entitlement, dmEmbed).catch(() => null);
@@ -27439,7 +27477,7 @@ async function runPremiumGraceNoticeTick(client) {
     for (const entitlement of pastGrace.rows) {
       const guild = await client.guilds.fetch(entitlement.guild_id).catch(() => null);
       const lockedResult = await pool.query(
-        `SELECT league_name FROM leagues WHERE guild_id = $1 AND is_active = FALSE ORDER BY created_at DESC`,
+        `SELECT league_name FROM leagues WHERE guild_id = $1 AND premium_locked_at IS NOT NULL ORDER BY created_at DESC`,
         [entitlement.guild_id]
       ).catch(() => ({ rows: [] }));
       const lockedNames = lockedResult.rows.map(r => r.league_name);
@@ -27490,7 +27528,7 @@ async function runPremiumPurgeTick(client) {
 
     for (const entitlement of duePurge.rows) {
       const lockedResult = await pool.query(
-        `SELECT league_id, league_name FROM leagues WHERE guild_id = $1 AND is_active = FALSE`,
+        `SELECT league_id, league_name FROM leagues WHERE guild_id = $1 AND premium_locked_at IS NOT NULL`,
         [entitlement.guild_id]
       ).catch(() => ({ rows: [] }));
       const lockedLeagues = lockedResult.rows;
