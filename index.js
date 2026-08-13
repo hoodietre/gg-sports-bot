@@ -30123,16 +30123,23 @@ async function openSupportTicket(interaction, ticketType, overrides = {}) {
       }
     }
   } else {
-    const starter = await baseChannel.send({
-      content: starterContent,
-      embeds: [starterEmbed],
-      allowedMentions: { users: [interaction.user.id], roles: mentionRoleIds },
-    });
-    thread = await starter.startThread({
+    // 7J-TICKETCHANNELCLUTTER: per Hxxdie — posting the starter message in
+    // baseChannel first (the old channel.send().startThread() pattern) left
+    // a permanent message sitting in the support channel for every single
+    // ticket ever opened, burying the Support Center panel further up with
+    // each one. Same fix as the private-thread branch above: create the
+    // thread directly on the channel (no parent message required for a
+    // PublicThread either — that's specific to threads.create()), then send
+    // the starter content/embed as the thread's first message instead.
+    thread = await baseChannel.threads.create({
       name: threadName,
+      type: ChannelType.PublicThread,
       autoArchiveDuration: 1440,
       reason: 'GG Sports ' + ticketType + ' ticket',
     }).catch(() => null);
+    if (thread) {
+      await thread.send({ content: starterContent, embeds: [starterEmbed], allowedMentions: { users: [interaction.user.id], roles: mentionRoleIds } }).catch(() => null);
+    }
   }
 
   if (!thread) {
