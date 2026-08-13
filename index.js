@@ -13222,7 +13222,7 @@ if (interaction.commandName === 'avatar') {
         }
         const ticketId = interaction.customId.split(':')[1];
         const ticketResult = await pool.query(
-          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id = $2 AND status = 'open' LIMIT 1`,
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND id = $2 AND status != 'closed' LIMIT 1`,
           [interaction.guild.id, ticketId]
         );
         if (!ticketResult.rows.length) {
@@ -13230,7 +13230,59 @@ if (interaction.commandName === 'avatar') {
           return;
         }
         await closeTicketFlow(interaction, ticketResult.rows[0]);
-        await interaction.message?.edit({ components: [] }).catch(() => null);
+        // Info and Transcript stay usable after closing — a transcript is if
+        // anything more useful once a ticket is done. Only Close Ticket
+        // itself gets dropped, since closing an already-closed ticket has
+        // nothing to do.
+        const ticketIdForRow = ticketResult.rows[0].id;
+        await interaction.message?.edit({ components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('ticket_info:' + ticketIdForRow).setLabel('Info').setEmoji('ℹ️').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('ticket_transcript:' + ticketIdForRow).setLabel('Transcript').setEmoji('📄').setStyle(ButtonStyle.Secondary),
+        )] }).catch(() => null);
+        return;
+      }
+
+      if (interaction.customId.startsWith('ticket_info:')) {
+        if (!interaction.guild) return;
+        const ticketId = interaction.customId.split(':')[1];
+        const ticketResult = await pool.query(`SELECT * FROM support_tickets WHERE guild_id = $1 AND id = $2 LIMIT 1`, [interaction.guild.id, ticketId]);
+        if (!ticketResult.rows.length) {
+          await interaction.reply({ content: 'Could not find that ticket.', ephemeral: true });
+          return;
+        }
+        const ticket = ticketResult.rows[0];
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to view ticket info.', ephemeral: true });
+          return;
+        }
+        await interaction.reply({ embeds: [buildTicketInfoEmbed(ticket)], ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId.startsWith('ticket_transcript:')) {
+        if (!interaction.guild) return;
+        await interaction.deferReply({ ephemeral: true });
+        const ticketId = interaction.customId.split(':')[1];
+        const ticketResult = await pool.query(`SELECT * FROM support_tickets WHERE guild_id = $1 AND id = $2 LIMIT 1`, [interaction.guild.id, ticketId]);
+        if (!ticketResult.rows.length) {
+          await interaction.editReply({ content: 'Could not find that ticket.' });
+          return;
+        }
+        const ticket = ticketResult.rows[0];
+        const activeLeague = ticket.league_id ? await getLeagueById(ticket.league_id) : await resolveLeague(interaction);
+        const viewer = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const isTicketOwner = ticket.user_id === interaction.user.id;
+        const isStaff = viewer ? await memberHasStaff(viewer, activeLeague) : false;
+        if (!isTicketOwner && !isStaff) {
+          await interaction.editReply({ content: 'Only the ticket owner or staff can view this transcript.' });
+          return;
+        }
+        const transcriptResult = await pool.query(
+          `SELECT * FROM ticket_transcripts WHERE guild_id = $1 AND ticket_id = $2 ORDER BY message_created_at ASC LIMIT 40`,
+          [interaction.guild.id, ticket.id]
+        );
+        await interaction.editReply({ embeds: [buildTicketTranscriptEmbed(ticket, transcriptResult.rows)] });
         return;
       }
 
@@ -23693,7 +23745,7 @@ if (shopSubcommand === 'view') {
         }
 
         const ticketResult = await pool.query(
-          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status != 'closed' LIMIT 1`,
           [interaction.guild.id, interaction.channel.id]
         );
 
@@ -23797,7 +23849,7 @@ if (shopSubcommand === 'view') {
         }
 
         const ticketResult = await pool.query(
-          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+          `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status != 'closed' LIMIT 1`,
           [interaction.guild.id, interaction.channel.id]
         );
 
@@ -25717,9 +25769,16 @@ async function closeTicketFlow(interaction, ticket, closeReason = null) {
 // 7J-118TICKETBUTTONS: per Hxxdie, tickets need a real Close Ticket button —
 // posted in every ticket thread right after it opens (see openSupportTicket),
 // not just the game-issue review ones that already had Approve/Deny.
+// 7J-TICKETBUTTONDISCOVERY: Info and Transcript joined this same row per
+// Hxxdie — the bot shouldn't rely on anyone knowing /ticket info or
+// /ticket transcript exist by memory. This row (unlike buildTicketInfoButtons
+// below, which hides once a ticket is closed) always renders, since info and
+// transcript stay relevant after closing too.
 function buildTicketCloseRow(ticketId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('ticket_close:' + ticketId).setLabel('Close Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('ticket_close:' + ticketId).setLabel('Close Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ticket_info:' + ticketId).setLabel('Info').setEmoji('ℹ️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ticket_transcript:' + ticketId).setLabel('Transcript').setEmoji('📄').setStyle(ButtonStyle.Secondary),
   );
 }
 
@@ -25826,7 +25885,7 @@ function buildTicketEvidenceEmbed(ticket, rows) {
 
 async function getOpenTicketByThread(guildId, threadId) {
   const result = await pool.query(
-    `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status = 'open' LIMIT 1`,
+    `SELECT * FROM support_tickets WHERE guild_id = $1 AND thread_id = $2 AND status != 'closed' LIMIT 1`,
     [guildId, threadId]
   );
   return result.rows[0] || null;
