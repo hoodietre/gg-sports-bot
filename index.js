@@ -10428,14 +10428,20 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isButton() && interaction.customId.startsWith('shop_scope:')) {
       if (!interaction.guild) return;
       const scope = interaction.customId.split(':')[1] === 'global' ? 'global' : 'server';
-      const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
+      const isSwitchingFromEphemeral = interaction.message?.flags?.has?.(MessageFlags.Ephemeral);
+      const items = await getRecentShopArrivals(interaction.guild.id, scope);
+      const payload = items.length
+        ? { embeds: [buildShopWhatsNewEmbed(items, scope)], components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`shop_whatsnew_continue:${scope}`).setLabel('Continue to Shop').setEmoji('➡️').setStyle(ButtonStyle.Primary)
+          )] }
+        : await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
       // The persistent Shop panel is shared/visible to the whole channel —
       // clicking it there must open a fresh ephemeral reply, never edit the
       // shared message itself. The "Switch to X Shop" button that appears
       // inside an already-open ephemeral browse view is different: that
       // message is already private to this one user, so it should update
       // in place instead of stacking a second ephemeral reply.
-      if (interaction.message?.flags?.has?.(MessageFlags.Ephemeral)) {
+      if (isSwitchingFromEphemeral) {
         await interaction.update(payload).catch(() => null);
       } else {
         await interaction.reply({ ...payload, ephemeral: true });
@@ -10443,10 +10449,28 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('shop_whatsnew_continue:')) {
+      if (!interaction.guild) return;
+      const scope = interaction.customId.split(':')[1] === 'global' ? 'global' : 'server';
+      const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
+      await interaction.update(payload).catch(() => null);
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'avatarpanel_shop') {
       try {
-        const payload = await buildAvatarShopWhatsNewPayload(interaction.guild);
-        await interaction.reply({ ...payload, ephemeral: true });
+        const items = await getRecentShopArrivals(interaction.guild.id, 'mixed');
+        if (items.length) {
+          const embed = buildShopWhatsNewEmbed(items, 'mixed');
+          const continueRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('avatarshop_whatsnew_continue').setLabel('Continue to Shop').setEmoji('➡️').setStyle(ButtonStyle.Primary)
+          );
+          await interaction.reply({ embeds: [embed], components: [continueRow], ephemeral: true });
+        } else {
+          // 7J-SHOPWHATSNEW: per Hxxdie — this page should never appear
+          // when there's nothing new, only pop up when there genuinely is.
+          await openAvatarShopPanel(interaction);
+        }
       } catch (error) {
         console.error('[Avatar] avatarpanel_shop (What\'s New) failed:', error);
         await interaction.reply({ content: 'Something went wrong opening the avatar shop. Check the bot logs for `[Avatar] avatarpanel_shop failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
@@ -32654,61 +32678,58 @@ async function getShopPreviewItem(guildId, itemName) {
 }
 
 
+// 7J-SHOPWHATSNEW: shared by the character-customization Avatar Shop
+// ('mixed' scope, unchanged from its original behavior) and the new
+// Avatar Shop / Server Shop split buttons on the general Shop panel
+// ('global'/'server' scope, matching ggBuildPermanentShopPayload's own
+// split). Callers check the returned array's length themselves to decide
+// whether to show the interstitial at all — per Hxxdie, this page should
+// never appear when there's nothing new, only when there genuinely is.
+async function getRecentShopArrivals(guildId, scope) {
+  const scopeClause = scope === 'server' ? 'guild_id = $1' : scope === 'global' ? 'guild_id IS NULL' : '(guild_id = $1 OR guild_id IS NULL)';
+  const params = scope === 'global' ? [] : [guildId];
+  const result = await pool.query(
+    `SELECT * FROM shop_items
+     WHERE ${scopeClause} AND is_active = TRUE
+       AND created_at >= NOW() - INTERVAL '14 days'
+     ORDER BY is_featured DESC, created_at DESC
+     LIMIT 10`,
+    params
+  );
+  return result.rows;
+}
+
+function buildShopWhatsNewEmbed(items, scope) {
+  const NL = String.fromCharCode(10);
+  const embed = new EmbedBuilder().setColor(0xFEE75C).setFooter({ text: 'GG Sports • Shop' }).setTimestamp();
+  const lines = items.map(item => {
+    const onSale = item.sale_price !== null && item.sale_price !== undefined && Number(item.sale_price) < Number(item.price);
+    const priceText = onSale
+      ? `~~${item.price}~~ **${item.sale_price}** 🔥 ON SALE`
+      : `**${item.price}**`;
+    const featuredTag = item.is_featured ? '⭐ ' : '';
+    const rarityPrefix = item.is_cosmetic ? rarityIcon(item.rarity) + ' ' : '🆕 ';
+    return `${featuredTag}${rarityPrefix}**${item.item_name}** — ${priceText}`;
+  });
+  embed
+    .setTitle('🆕✨ NEW IN THE SHOP! ✨🆕')
+    .setDescription(`**Fresh gear just dropped!** Here's what's new:${NL}${NL}${lines.join(NL)}`);
+  if (scope !== 'server') {
+    // Tattoos are an avatar-cosmetic teaser — doesn't belong on a page
+    // scoped to a server's own non-cosmetic added items (player upgrades,
+    // age reductions, etc.).
+    embed.addFields({ name: '👀 Coming Soon', value: '**Tattoos!** New ink is in the works — stay tuned.', inline: false });
+  }
+  return embed;
+}
+
 // Ad-style "What's New" page shown when hitting the Go Shopping button, before the
 // actual shop hub — new-arrival highlights (and, once the sales feature is built out,
 // discount call-outs via sale_price) so the shop gets some spotlight/promo treatment
 // instead of dropping straight into the category browser every time.
-async function buildAvatarShopWhatsNewPayload(guild) {
-  const result = await pool.query(
-    `SELECT * FROM shop_items
-     WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE
-       AND created_at >= NOW() - INTERVAL '14 days'
-     ORDER BY is_featured DESC, created_at DESC
-     LIMIT 10`,
-    [guild.id]
-  );
-  const items = result.rows;
-  const NL = String.fromCharCode(10);
-
-  const embed = new EmbedBuilder()
-    .setColor(0xFEE75C)
-    .setFooter({ text: 'GG Sports • Shop' })
-    .setTimestamp();
-
-  if (!items.length) {
-    embed
-      .setTitle('🛍️ The Shop')
-      .setDescription("No new arrivals in the last couple weeks — but check back soon, new gear drops all the time!");
-  } else {
-    const lines = items.map(item => {
-      const onSale = item.sale_price !== null && item.sale_price !== undefined && Number(item.sale_price) < Number(item.price);
-      const priceText = onSale
-        ? `~~${item.price}~~ **${item.sale_price}** 🔥 ON SALE`
-        : `**${item.price}**`;
-      const featuredTag = item.is_featured ? '⭐ ' : '';
-      const rarityPrefix = item.is_cosmetic ? rarityIcon(item.rarity) + ' ' : '🆕 ';
-      return `${featuredTag}${rarityPrefix}**${item.item_name}** — ${priceText}`;
-    });
-    embed
-      .setTitle('🆕✨ NEW IN THE SHOP! ✨🆕')
-      .setDescription(`**Fresh gear just dropped!** Here's what's new:${NL}${NL}${lines.join(NL)}`);
-  }
-
-  const continueRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('avatarshop_whatsnew_continue').setLabel('Continue to Shop').setEmoji('➡️').setStyle(ButtonStyle.Primary)
-  );
-
-  // Coming-soon teaser — tattoos are held until after launch, but the page is the
-  // natural spot to build hype for what's next. Update/remove this field once
-  // tattoos actually ship (see Track A).
-  embed.addFields({
-    name: '👀 Coming Soon',
-    value: '**Tattoos!** New ink is in the works — stay tuned.',
-    inline: false,
-  });
-
-  return { embeds: [embed], components: [continueRow] };
-}
+// (Logic now inlined at the avatarpanel_shop button handler above, since it needs to
+// branch on whether there's anything new before deciding whether to show this page at
+// all — see getRecentShopArrivals/buildShopWhatsNewEmbed.)
 
 function rarityIcon(rarity) {
   const r = String(rarity || 'common').toLowerCase();
