@@ -1594,6 +1594,12 @@ async function initDatabase() {
   // owners in a game thread, entirely separate from the sportsbook/
   // moneylines. See game_wagers table below.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS wagers_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  // Same bug class as the schedule/current_round fix above — rules_text was
+  // added to the CREATE TABLE literal but never backfilled for existing
+  // tables. Root cause of the "column rules_text of relation
+  // league_custom_settings does not exist" error when posting rules from
+  // Commissioner Panel → Operations → Rules.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS rules_text TEXT`);
 
   // 7J-135GENERICNEWS: per Hxxdie — Madden leagues have ESPN-style news
   // (generateMaddenESPNNews) and Power Rankings, both entirely EA-sync-
@@ -6345,8 +6351,18 @@ async function updatePanel(guild, league, panelKey, embed, components = []) {
   if (message) await message.edit({ embeds: [embed], components });
 }
 
+function buildTeamOwnersPanelComponents(leagueId) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`teamownerspanel_leave:${leagueId}`).setLabel('Leave Team').setEmoji('🚪').setStyle(ButtonStyle.Danger)
+  )];
+}
+
 async function updateTeamOwnersPanel(guild, league = null) {
-  await updatePanel(guild, league, 'team_owners', await buildTeamOwnersEmbed(guild, league));
+  // Bug: this never passed components, so updatePanel's components=[]
+  // default silently wiped the Leave Team button on every single refresh —
+  // and every real ownership change (claim, kick, trade) calls this,
+  // meaning the button would vanish almost immediately after being posted.
+  await updatePanel(guild, league, 'team_owners', await buildTeamOwnersEmbed(guild, league), league ? buildTeamOwnersPanelComponents(league.league_id) : []);
 }
 
 // 7J-COMMANDHUB-TEAMOWNERSYNC: whether roleId is one of this league's
@@ -8258,6 +8274,50 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
 // ---------------------------------------------------------------------------
 const tournamentCreateSessions = new Map();
 const leagueKickConfirmations = new Map();
+
+// Shared by staff-initiated removal (Commissioner Panel Kick button, /league
+// kick) and self-service leave (GM Panel / Team Owners Panel Leave Team
+// buttons) — both remove team + league roles via the exact same
+// confirm/cancel button handler already wired up below for /league kick
+// (leaguekick_confirm:/leaguekick_cancel:), since that handler works purely
+// off the stored `pending` object and doesn't care who populated it.
+function presentLeagueRoleRemoval(interaction, { league, targetUser, teamRoleIds, teamRoleNames, removeLeagueRole, reason, requestedByUserId, isSelfLeave }) {
+  const confirmId = randomUUID();
+  leagueKickConfirmations.set(confirmId, {
+    guildId: interaction.guild.id,
+    leagueId: league.league_id,
+    leagueName: league.league_name,
+    targetUserId: targetUser.id,
+    reason,
+    teamRoleIds,
+    removeLeagueRole,
+    requestedBy: requestedByUserId,
+  });
+  setTimeout(() => leagueKickConfirmations.delete(confirmId), 5 * 60 * 1000); // Confirmation expires in 5 minutes.
+
+  const rolesSummary = [
+    teamRoleNames.length ? `Team role(s): **${teamRoleNames.join(', ')}**` : null,
+    removeLeagueRole ? 'League member role' : null,
+  ].filter(Boolean).join('\n');
+
+  const confirmEmbed = new EmbedBuilder()
+    .setTitle(isSelfLeave ? '⚠️ Confirm Leave Team' : '⚠️ Confirm Removal')
+    .setColor(0xED4245)
+    .setDescription(isSelfLeave
+      ? `Leave your team in **${league.league_name}**?`
+      : `Remove **${targetUser.username}** from **${league.league_name}**?`)
+    .addFields(
+      { name: 'Roles to remove', value: rolesSummary, inline: false },
+      { name: 'Reason', value: reason, inline: false },
+    )
+    .setFooter({ text: 'This removes league/team roles only — it does not remove them from the Discord server.' });
+
+  const confirmRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`leaguekick_confirm:${confirmId}`).setLabel(isSelfLeave ? 'Leave Team' : 'Confirm Removal').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`leaguekick_cancel:${confirmId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return { embed: confirmEmbed, row: confirmRow };
+}
 // 7J-COMMANDHUB-GAMESELECT: modals can't contain select menus (Discord API
 // limitation — TextInput only), so the panel's "Create League" flow is
 // modal-for-name, then a real select menu for game type, rather than
@@ -8936,21 +8996,30 @@ const SHOP_PANEL_SORTS = {
 };
 const SHOP_PANEL_PAGE_SIZE = 10;
 
-async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_asc') {
+// 7J-SHOPSPLIT: per Hxxdie — a server admin's own added items (player
+// upgrades, age reductions, etc.) were getting lost, mixed in with every
+// bot-owner global item in one combined list. scope splits the same
+// underlying query/render logic two ways instead of building a parallel
+// system: 'global' = guild_id IS NULL (bot-owner catalog, branded "Avatar
+// Shop" per Hxxdie's naming since most global items are cosmetic today),
+// 'server' = guild_id = this guild (admin-added items only).
+async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_asc', scope = 'server') {
   const settings = await getCurrencySettings(guildId);
   const sortConfig = SHOP_PANEL_SORTS[sort] || SHOP_PANEL_SORTS.price_asc;
   const safeOffset = Math.max(0, Number(offset) || 0);
+  const scopeClause = scope === 'global' ? 'guild_id IS NULL' : 'guild_id = $1';
+  const scopeParams = scope === 'global' ? [] : [guildId];
 
   const countResult = await pool.query(
-    `SELECT COUNT(*)::int AS total FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE`,
-    [guildId]
+    `SELECT COUNT(*)::int AS total FROM shop_items WHERE ${scopeClause} AND is_active = TRUE AND is_award_only = FALSE`,
+    scopeParams
   ).catch(() => ({ rows: [{ total: 0 }] }));
   const totalItems = Number(countResult.rows[0]?.total || 0);
 
   const result = await pool.query(
-    `SELECT * FROM shop_items WHERE (guild_id = $1 OR guild_id IS NULL) AND is_active = TRUE AND is_award_only = FALSE
-     ORDER BY ${sortConfig.orderBy} LIMIT $2 OFFSET $3`,
-    [guildId, SHOP_PANEL_PAGE_SIZE, safeOffset]
+    `SELECT * FROM shop_items WHERE ${scopeClause} AND is_active = TRUE AND is_award_only = FALSE
+     ORDER BY ${sortConfig.orderBy} LIMIT $${scopeParams.length + 1} OFFSET $${scopeParams.length + 2}`,
+    [...scopeParams, SHOP_PANEL_PAGE_SIZE, safeOffset]
   );
 
   const hasNext = safeOffset + result.rows.length < totalItems;
@@ -8959,10 +9028,11 @@ async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_as
   const totalPages = Math.max(1, Math.ceil(totalItems / SHOP_PANEL_PAGE_SIZE));
 
   const NL = String.fromCharCode(10);
+  const scopeLabel = scope === 'global' ? 'Avatar Shop' : 'Server Shop';
   const embed = new EmbedBuilder()
-    .setTitle('GG Sports Shop')
+    .setTitle(`GG Sports Shop — ${scopeLabel}`)
     .setColor(0xFEE75C)
-    .setFooter({ text: `GG Sports • Shop • Page ${pageNumber}/${totalPages} • Sorted by ${sortConfig.label}` })
+    .setFooter({ text: `GG Sports • ${scopeLabel} • Page ${pageNumber}/${totalPages} • Sorted by ${sortConfig.label}` })
     .setTimestamp();
 
   embed.setDescription(result.rows.length
@@ -8972,7 +9042,7 @@ async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_as
         (item.is_cosmetic ? ' • ' + rarityIcon(item.rarity) + ' ' + (item.rarity || 'common') + ' • ' + (item.avatar_slot || inferAvatarSlotFromItem(item)) : '') +
         (item.description ? NL + item.description : '')
       ).join(NL + NL)
-    : (totalItems > 0 ? 'No items on this page.' : 'No active shop items yet.'));
+    : (totalItems > 0 ? 'No items on this page.' : (scope === 'server' ? 'This server hasn\'t added any items yet — staff can add some from the Shop admin tools.' : 'No active shop items yet.')));
 
   const rows = [];
   for (let i = 0; i < result.rows.length; i += 5) {
@@ -8988,18 +9058,18 @@ async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_as
     rows.push(row);
   }
 
-  // 7J-57SHOPPAGE: pagination row — customIds carry the target offset and
-  // current sort so the handler can re-render without needing any stored
-  // per-user session state (the panel is shared/persistent, refreshed by
-  // any viewer's click).
+  // 7J-57SHOPPAGE: pagination row — customIds carry the target offset,
+  // current sort, and scope so the handler can re-render without needing
+  // any stored per-user session state (the panel is shared/persistent,
+  // refreshed by any viewer's click).
   rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`shop_panel_page:${Math.max(0, safeOffset - SHOP_PANEL_PAGE_SIZE)}:${sort}`).setLabel('◀ Back').setStyle(ButtonStyle.Secondary).setDisabled(!hasPrev),
-    new ButtonBuilder().setCustomId(`shop_panel_page:${safeOffset + SHOP_PANEL_PAGE_SIZE}:${sort}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(!hasNext),
+    new ButtonBuilder().setCustomId(`shop_panel_page:${Math.max(0, safeOffset - SHOP_PANEL_PAGE_SIZE)}:${sort}:${scope}`).setLabel('◀ Back').setStyle(ButtonStyle.Secondary).setDisabled(!hasPrev),
+    new ButtonBuilder().setCustomId(`shop_panel_page:${safeOffset + SHOP_PANEL_PAGE_SIZE}:${sort}:${scope}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled(!hasNext),
   ));
 
   rows.push(new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
-      .setCustomId(`shop_panel_sort:${safeOffset}`)
+      .setCustomId(`shop_panel_sort:${safeOffset}:${scope}`)
       .setPlaceholder('Sort: ' + sortConfig.label)
       .addOptions(Object.entries(SHOP_PANEL_SORTS).map(([value, cfg]) => ({ label: cfg.label, value, default: value === sort })))
   ));
@@ -9007,7 +9077,7 @@ async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_as
   if (rows.length < 5) {
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('shop_view_cart').setLabel('View Cart').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('avatarpanel_shop').setLabel('Go Shopping').setEmoji('🛍️').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId('shop_scope:' + (scope === 'global' ? 'server' : 'global')).setLabel(scope === 'global' ? 'Switch to Server Shop' : 'Switch to Avatar Shop').setEmoji('🔀').setStyle(ButtonStyle.Primary)
     ));
   }
 
@@ -9022,11 +9092,36 @@ async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_as
 // defined; everything else (post, refresh-all, list, remove) is generic.
 // ---------------------------------------------------------------------------
 
+// 7J-SHOPSPLIT: persistent panel now lands here — a simple choice between
+// Avatar Shop (global) and Server Shop (this guild's own items) — instead
+// of immediately dumping both into one mixed list. Same lightweight
+// starter-panel pattern as Bank/Profile/Marketplace above.
+function buildShopStarterEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🛍️ GG Sports Shop')
+    .setColor(0xFEE75C)
+    .setDescription('Choose a shop to browse — **Avatar Shop** for cosmetics and other global items, or **Server Shop** for items this server has added.')
+    .setFooter({ text: 'GG Sports • Shop' })
+    .setTimestamp();
+}
+
+function buildShopStarterComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('shop_scope:global').setLabel('Avatar Shop').setEmoji('🛍️').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('shop_scope:server').setLabel('Server Shop').setEmoji('🏪').setStyle(ButtonStyle.Primary),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('shop_view_cart').setLabel('View Cart').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
 function getMultiChannelPanelInfo(panelType) {
   const registry = {
     shop: {
       label: 'Shop Panel',
-      build: async (guild) => ggBuildPermanentShopPayload(guild.id),
+      build: async () => ({ embeds: [buildShopStarterEmbed()], components: buildShopStarterComponents() }),
     },
     sportsbook: {
       label: 'Sportsbook Board',
@@ -10273,9 +10368,10 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     // than guessing (e.g. franchise hub is 'madfranchisehub:', not
     // 'franchisehub_'; tournaments are 'tourneypanel_', not 'tournament_').
     const PREMIUM_GATED_CUSTOM_ID_PREFIXES = [
-      ['shop_', 'Shop'], ['sportsbook_', 'Sportsbook'], ['bank_', 'Bank'], ['economy_', 'Economy'],
-      ['marketplace_', 'Marketplace'], ['avatarpanel_', 'Avatar'], ['gmpanel_', 'GM Panel'],
+      ['shop_', 'Shop'], ['sportsbook_', 'Sportsbook'], ['bankpanel', 'Bank'], ['economy_', 'Economy'],
+      ['marketplace', 'Marketplace'], ['avatarpanel_', 'Avatar'], ['gmpanel_', 'GM Panel'],
       ['ticket_', 'Tickets'], ['tourneypanel_', 'Tournaments'], ['madfranchisehub:', 'Franchise Hub'],
+      ['memberprofile', 'Member Profile'],
     ];
     if (
       interaction.guild &&
@@ -10325,6 +10421,24 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: 'Something went wrong opening the locker room. Check the bot logs for `[Avatar] avatarpanel_locker failed` for details.', flags: MessageFlags.Ephemeral }).catch((e2) => {
           console.error('[Avatar] avatarpanel_locker: fallback reply also failed:', e2);
         });
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('shop_scope:')) {
+      if (!interaction.guild) return;
+      const scope = interaction.customId.split(':')[1] === 'global' ? 'global' : 'server';
+      const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
+      // The persistent Shop panel is shared/visible to the whole channel —
+      // clicking it there must open a fresh ephemeral reply, never edit the
+      // shared message itself. The "Switch to X Shop" button that appears
+      // inside an already-open ephemeral browse view is different: that
+      // message is already private to this one user, so it should update
+      // in place instead of stacking a second ephemeral reply.
+      if (interaction.message?.flags?.has?.(MessageFlags.Ephemeral)) {
+        await interaction.update(payload).catch(() => null);
+      } else {
+        await interaction.reply({ ...payload, ephemeral: true });
       }
       return;
     }
@@ -11657,6 +11771,7 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.commandName === 'marketplace') {
       if (!interaction.guild) return;
+      if (!(await requirePremiumFeature(interaction, 'Marketplace'))) return;
       const subcommand = interaction.options.getSubcommand();
       const settings = await getCurrencySettings(interaction.guild.id);
 
@@ -11691,6 +11806,16 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      return;
+    }
+
+    // Single gate covering every marketplace panel button/select/modal below —
+    // these are reached directly from a persistent panel message, bypassing
+    // the /marketplace command-level gate above entirely, so they need their
+    // own check rather than relying on the user having typed the command.
+    if ((interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit())
+        && interaction.customId.startsWith('marketplace')
+        && !(await requirePremiumFeature(interaction, 'Marketplace'))) {
       return;
     }
 
@@ -13432,8 +13557,8 @@ if (interaction.commandName === 'avatar') {
       // page button on any shared board elsewhere in the bot.
       if (interaction.isButton() && interaction.customId.startsWith('shop_panel_page:')) {
         if (!interaction.guild) return;
-        const [, offsetRaw, sort] = interaction.customId.split(':');
-        const payload = await ggBuildPermanentShopPayload(interaction.guild.id, Number(offsetRaw) || 0, sort || 'price_asc');
+        const [, offsetRaw, sort, scope] = interaction.customId.split(':');
+        const payload = await ggBuildPermanentShopPayload(interaction.guild.id, Number(offsetRaw) || 0, sort || 'price_asc', scope || 'server');
         await interaction.update(payload).catch(() => null);
         return;
       }
@@ -13675,10 +13800,11 @@ if (interaction.commandName === 'avatar') {
     // symptom of the handler simply never firing. Relocated here, logic unchanged.
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('shop_panel_sort:')) {
       if (!interaction.guild) return;
+      const [, , scope] = interaction.customId.split(':');
       const sort = interaction.values[0];
       // Changing sort resets to page 1 — a saved offset from the
       // previous sort order wouldn't line up with the new ordering.
-      const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, sort);
+      const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, sort, scope || 'server');
       await interaction.update(payload).catch(() => null);
       return;
     }
@@ -14327,6 +14453,41 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('commissioneropkick_user:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.update({ content: 'You do not have permission to remove users from this league.', components: [] });
+        return;
+      }
+      const targetUserId = interaction.values[0];
+      const targetMember = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+      if (!targetMember) { await interaction.update({ content: 'Could not find that member in this server.', components: [] }); return; }
+
+      const teamRoles = await getLeagueTeamRoles(league.league_id);
+      const heldTeamRoles = teamRoles.filter(t => targetMember.roles.cache.has(t.role_id));
+      const hasLeagueRole = Boolean(league.league_role_id) && targetMember.roles.cache.has(league.league_role_id);
+
+      if (!heldTeamRoles.length && !hasLeagueRole) {
+        await interaction.update({ content: `${targetMember.user.username} doesn't appear to hold any roles for **${league.league_name}**.`, components: [] });
+        return;
+      }
+
+      const { embed, row } = presentLeagueRoleRemoval(interaction, {
+        league,
+        targetUser: targetMember.user,
+        teamRoleIds: heldTeamRoles.map(t => t.role_id),
+        teamRoleNames: heldTeamRoles.map(t => t.role_name),
+        removeLeagueRole: hasLeagueRole,
+        reason: 'Removed via Commissioner Panel',
+        requestedByUserId: interaction.user.id,
+        isSelfLeave: false,
+      });
+      await interaction.update({ content: null, embeds: [embed], components: [row] });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('commissioner_op:')) {
       const [, action, leagueId] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
@@ -14375,6 +14536,12 @@ if (interaction.commandName === 'avatar') {
       if (action === 'recruitdiscoverable') {
         await interaction.deferReply({ ephemeral: true });
         await runRecruitmentDiscoverableSettings(interaction, league);
+        return;
+      }
+
+      if (action === 'kick') {
+        const userMenu = new UserSelectMenuBuilder().setCustomId(`commissioneropkick_user:${leagueId}`).setPlaceholder('Choose a user to remove');
+        await interaction.reply({ content: `**Kick from ${league.league_name}** — choose a user to remove`, components: [new ActionRowBuilder().addComponents(userMenu)], ephemeral: true });
         return;
       }
 
@@ -16856,6 +17023,104 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('teamownerspanel_leave:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+
+      const teamRoles = await getLeagueTeamRoles(league.league_id);
+      const heldTeamRoles = teamRoles.filter(t => interaction.member.roles.cache.has(t.role_id));
+      if (!heldTeamRoles.length) {
+        await interaction.reply({ content: "You don't currently own a team in this league.", ephemeral: true });
+        return;
+      }
+
+      if (heldTeamRoles.length > 1) {
+        // Unusual (staff manually assigned more than one), but possible —
+        // ask which team to leave rather than guessing.
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId(`teamownerspanel_leave_pick:${leagueId}`)
+          .setPlaceholder('Choose which team to leave')
+          .addOptions(heldTeamRoles.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
+        await interaction.reply({ content: 'You hold multiple team roles in this league — choose which to leave:', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+        return;
+      }
+
+      const hasLeagueRole = Boolean(league.league_role_id) && interaction.member.roles.cache.has(league.league_role_id);
+      const { embed, row } = presentLeagueRoleRemoval(interaction, {
+        league,
+        targetUser: interaction.user,
+        teamRoleIds: [heldTeamRoles[0].role_id],
+        teamRoleNames: [heldTeamRoles[0].role_name],
+        removeLeagueRole: hasLeagueRole,
+        reason: 'Left team (self-service, Team Owners panel)',
+        requestedByUserId: interaction.user.id,
+        isSelfLeave: true,
+      });
+      await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('teamownerspanel_leave_pick:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      const roleId = interaction.values[0];
+      const teamRoles = await getLeagueTeamRoles(league.league_id);
+      const teamRole = teamRoles.find(t => t.role_id === roleId);
+      if (!teamRole || !interaction.member.roles.cache.has(roleId)) {
+        await interaction.update({ content: 'You no longer hold that team role.', components: [] });
+        return;
+      }
+      const hasLeagueRole = Boolean(league.league_role_id) && interaction.member.roles.cache.has(league.league_role_id);
+      const { embed, row } = presentLeagueRoleRemoval(interaction, {
+        league,
+        targetUser: interaction.user,
+        teamRoleIds: [teamRole.role_id],
+        teamRoleNames: [teamRole.role_name],
+        removeLeagueRole: hasLeagueRole,
+        reason: 'Left team (self-service, Team Owners panel)',
+        requestedByUserId: interaction.user.id,
+        isSelfLeave: true,
+      });
+      await interaction.update({ content: null, embeds: [embed], components: [row] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gmpanel_leave:')) {
+      const [, leagueId, encTeam] = interaction.customId.split(':');
+      const teamName = decodeURIComponent(encTeam);
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+
+      // Resolve via the roles the user actually holds, same reliable method
+      // getMaddenTeamOwnedByUser uses — never trust the teamName string alone,
+      // since it's just a label carried in the button's customId.
+      const teamRoles = await getLeagueTeamRoles(league.league_id);
+      const heldTeamRoles = teamRoles.filter(t => interaction.member.roles.cache.has(t.role_id));
+      if (!heldTeamRoles.length) {
+        await interaction.reply({ content: "You don't currently hold a team role in this league.", ephemeral: true });
+        return;
+      }
+      // Prefer the one matching the panel's own team (the common case);
+      // otherwise fall back to whichever team role they actually hold.
+      const teamRole = heldTeamRoles.find(t => t.role_name.toLowerCase() === teamName.toLowerCase()) || heldTeamRoles[0];
+
+      const hasLeagueRole = Boolean(league.league_role_id) && interaction.member.roles.cache.has(league.league_role_id);
+      const { embed, row } = presentLeagueRoleRemoval(interaction, {
+        league,
+        targetUser: interaction.user,
+        teamRoleIds: [teamRole.role_id],
+        teamRoleNames: [teamRole.role_name],
+        removeLeagueRole: hasLeagueRole,
+        reason: 'Left team (self-service, GM Panel)',
+        requestedByUserId: interaction.user.id,
+        isSelfLeave: true,
+      });
+      await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('gmpanel_open:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -17375,6 +17640,14 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // Single gate covering every bank panel button/select/modal below — same
+    // "panel button bypasses the command-level gate" issue as marketplace.
+    if ((interaction.isButton() || interaction.isUserSelectMenu() || interaction.isModalSubmit())
+        && interaction.customId.startsWith('bankpanel')
+        && !(await requirePremiumFeature(interaction, 'Bank'))) {
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'bankpanel_open') {
       await showBankHome(interaction, interaction.user, { update: false });
       return;
@@ -17441,6 +17714,15 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isButton() && interaction.customId === 'bankpanel_transactions') {
       const embed = await buildBankTransactionsEmbed(interaction.guild, interaction.user);
       await interaction.update({ content: null, embeds: [embed], components: [buildBankBackRow()] });
+      return;
+    }
+
+    // Single gate covering every member profile panel button/select/modal
+    // below — same issue as marketplace/bank: these are reached directly
+    // from a persistent panel message and bypass the /profile command gate.
+    if ((interaction.isButton() || interaction.isUserSelectMenu() || interaction.isStringSelectMenu() || interaction.isModalSubmit())
+        && interaction.customId.startsWith('memberprofile')
+        && !(await requirePremiumFeature(interaction, 'Member Profile'))) {
       return;
     }
 
@@ -22828,8 +23110,7 @@ if (interaction.commandName === 'trade') {
           return;
         }
 
-        const payload = await ggBuildPermanentShopPayload(interaction.guild.id);
-        const message = await channel.send(payload);
+        const message = await channel.send({ embeds: [buildShopStarterEmbed()], components: buildShopStarterComponents() });
 
         await pool.query(`DELETE FROM shop_panels WHERE guild_id = $1`, [interaction.guild.id]);
         await pool.query(
@@ -27089,6 +27370,18 @@ async function lapsePremiumGuild(client, guildId, reason) {
 
   const lockResult = await enforceFreeTierLeagueCap(guild).catch(() => ({ lockedCount: 0, lockedNames: [] }));
 
+  // Cross-Server League Discoverability is a Premium feature — turn it off
+  // for every league in this guild so it doesn't linger visible on the
+  // Discover Leagues board after Premium lapses. The board query also
+  // double-checks live Premium status independently (see
+  // buildDiscoverLeaguesPayload), but clearing the flag here keeps the
+  // toggle's own displayed state accurate too.
+  await pool.query(
+    `UPDATE league_settings SET recruitment_discoverable = FALSE
+     WHERE league_id IN (SELECT league_id FROM leagues WHERE guild_id = $1)`,
+    [guildId]
+  ).catch(error => console.error('[7J-PREMIUM] Failed to clear recruitment_discoverable on lapse:', error?.message || error));
+
   await recordPremiumBillingEvent(guildId, reason === 'trial_expired' ? 'trial_lapsed' : 'lapsed', { plan: entitlement.plan });
 
   const reasonText = reason === 'trial_expired'
@@ -27142,6 +27435,7 @@ async function createPremiumCheckoutSession(guild, user, plan) {
     'line_items[0][quantity]': 1,
     metadata: { guild_id: guild.id, user_id: user.id, plan },
     subscription_data: { metadata: { guild_id: guild.id, plan } },
+    'automatic_tax[enabled]': true,
   }));
   return session.url;
 }
@@ -27640,10 +27934,20 @@ function buildPremiumFeaturesEmbed() {
       `Core league management is free forever. Premium (${PREMIUM_MONTHLY_PRICE_DISPLAY} or ${PREMIUM_ANNUAL_PRICE_DISPLAY}) unlocks advanced tooling and removes the Free Tier's ${FREE_TIER_LEAGUE_CAP}-league cap. \`/premium trial\` gets you 14 days, no card required.`
     )
     .addFields(
-      { name: 'GM-Assistant Tooling', value: 'Free Agents board, Trade Values, Trade Finder/Analyzer/Negotiator, Trade Needs, Draft Recap grades + auto-post.', inline: false },
-      { name: 'Economy System', value: 'Shop, Sportsbook, and Marketplace — the full interconnected currency/economy system.', inline: false },
+      // 7J-PREMIUMLISTAUDIT: cross-checked against every requirePremiumFeature
+      // call, PREMIUM_PANEL_TYPES entry, and PREMIUM_GATED_CUSTOM_ID_PREFIXES
+      // entry in the codebase — several real, already-gated features
+      // (Member Profile, Bank, Tickets, Player Search, Madden News, Trade
+      // Package Generator, League History, Playoff Bracket Board, Cross-
+      // Server League Discoverability, and the dashboard boards) were
+      // missing from this list entirely, meaning the sales pitch undersold
+      // what a subscriber actually gets.
+      { name: 'GM Panel & Trade Tools', value: 'GM Panel, Free Agents board, Player Search, Madden News, Trade Values, Trade Finder/Analyzer/Package Generator/Negotiator, Trade Needs, Draft Recap grades + auto-post.', inline: false },
+      { name: 'Economy System', value: 'Shop, Sportsbook, Marketplace, and Bank — the full interconnected currency/economy system.', inline: false },
+      { name: 'Community Boards', value: 'League Leaders, Award Race, Power Rankings, League Hall of Fame, Franchise Hub, Playoff Bracket Board, League History, Member Profile.', inline: false },
       { name: 'Tournaments & Legacy', value: 'Tournament hosting and the Legacy achievement/leaderboard system.', inline: false },
       { name: 'Avatar Depth', value: 'Deeper cosmetic customization, unlockables, and marketplace (as that system grows).', inline: false },
+      { name: 'Support & Growth', value: 'Ticket system, plus Cross-Server League Discoverability — get listed on the Discover Leagues board other servers browse.', inline: false },
       { name: 'Scale', value: `Unlimited leagues per server (Free Tier: ${FREE_TIER_LEAGUE_CAP}), faster sync/auto-detect intervals, longer history retention.`, inline: false },
     )
     .setFooter({ text: 'GG Sports • Premium' })
@@ -34504,13 +34808,23 @@ function recruitmentStatusEmoji(status) {
 // one implementation, two entry points.
 async function buildDiscoverLeaguesPayload(page) {
   const pageSize = 5;
+  // Joined against premium_entitlements so a guild that lapses stops
+  // appearing here immediately, even if recruitment_discoverable never got
+  // cleared for some reason — the toggle alone isn't trusted as the sole
+  // gate, since discoverability is a Premium feature.
   const countResult = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM leagues l JOIN league_settings s ON s.league_id = l.league_id WHERE l.is_active = TRUE AND s.recruitment_discoverable = TRUE`
+    `SELECT COUNT(*)::int AS count FROM leagues l
+     JOIN league_settings s ON s.league_id = l.league_id
+     JOIN premium_entitlements p ON p.guild_id = l.guild_id
+     WHERE l.is_active = TRUE AND s.recruitment_discoverable = TRUE AND p.status IN ('active', 'trialing', 'past_due')`
   );
   const totalLeagues = countResult.rows[0]?.count || 0;
   const leaguesResult = await pool.query(
-    `SELECT l.league_id, l.guild_id, l.league_name FROM leagues l JOIN league_settings s ON s.league_id = l.league_id
-     WHERE l.is_active = TRUE AND s.recruitment_discoverable = TRUE ORDER BY l.league_name ASC LIMIT $1 OFFSET $2`,
+    `SELECT l.league_id, l.guild_id, l.league_name FROM leagues l
+     JOIN league_settings s ON s.league_id = l.league_id
+     JOIN premium_entitlements p ON p.guild_id = l.guild_id
+     WHERE l.is_active = TRUE AND s.recruitment_discoverable = TRUE AND p.status IN ('active', 'trialing', 'past_due')
+     ORDER BY l.league_name ASC LIMIT $1 OFFSET $2`,
     [pageSize, page * pageSize]
   );
 
@@ -35466,7 +35780,7 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     // and silently no-op'd every single time. Every earlier fix (ensuring
     // the update gets *called*, fixing the member-cache read) was
     // necessary but not sufficient without this.
-    const message = await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)] });
+    const message = await channel.send({ embeds: [await buildTeamOwnersEmbed(interaction.guild, league)], components: buildTeamOwnersPanelComponents(league.league_id) });
     await savePanel(league, 'team_owners', channel.id, message.id);
     return 'Team Owners panel posted in ' + channel.toString() + '.';
   }
@@ -40304,7 +40618,12 @@ function buildMaddenGmPanelHomeComponents(leagueId, teamName) {
     .setCustomId(`gmpanel_category:${leagueId}:${encTeam}`)
     .setPlaceholder('Choose a section')
     .addOptions(GM_PANEL_CATEGORIES.map(c => ({ label: c.label, value: c.value, description: c.description, emoji: c.emoji })));
-  return [new ActionRowBuilder().addComponents(menu)];
+  return [
+    new ActionRowBuilder().addComponents(menu),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`gmpanel_leave:${leagueId}:${encTeam}`).setLabel('Leave Team').setEmoji('🚪').setStyle(ButtonStyle.Danger)
+    ),
+  ];
 }
 
 function buildMaddenGmPanelBackRow(leagueId, teamName) {
@@ -66549,6 +66868,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     // 7J-97SUSPEND
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_op:suspensions:' + leagueId).setLabel('Suspensions').setEmoji('🚫').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('commissioner_op:kick:' + leagueId).setLabel('Kick').setEmoji('👢').setStyle(ButtonStyle.Danger),
     ));
     // 7J-131RECRUITMOVE: Review Applications / Discoverable Setting moved here
     // from the guild-wide Recruitment panel per Hxxdie — both are staff-only
@@ -66584,6 +66904,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
   rows.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('commissioner_op:recruitreview:' + leagueId).setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('commissioner_op:recruitdiscoverable:' + leagueId).setLabel('Discoverable Setting').setEmoji('🌐').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('commissioner_op:kick:' + leagueId).setLabel('Kick').setEmoji('👢').setStyle(ButtonStyle.Danger),
   ));
   rows.push(buildCommissionerBackRow(leagueId));
   return rows;
