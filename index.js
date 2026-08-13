@@ -27324,6 +27324,7 @@ async function handleStripeWebhookEvent(client, event) {
     default:
       break; // ignore anything we don't act on
   }
+  console.log(`[7J-PREMIUM][TEMP-DEBUG] Processed webhook event: ${event.type}`); // TEMP: remove after live-mode testing is done
 }
 
 // --- Trial scheduler ----------------------------------------------------------
