@@ -27267,7 +27267,7 @@ async function isGuildPremiumActive(guildId) {
 async function requirePremiumFeature(interaction, featureName) {
   if (!interaction.guild) return true; // DM-context commands aren't guild-tiered
   if (await isGuildPremiumActive(interaction.guild.id)) return true;
-  const message = `**${featureName}** is a GG Sports Premium feature. Try \`/premium trial\` for 14 days of full access (no card required), or \`/premium subscribe\` to go Premium.`;
+  const message = `**${featureName}** is a GG Sports Premium feature. This server hasn't unlocked it yet — a server admin can try \`/premium trial\` for 14 days of full access (no card required), or \`/premium subscribe\` to go Premium for the whole server.`;
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => null);
   } else {
