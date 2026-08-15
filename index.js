@@ -40080,12 +40080,31 @@ async function hydrateMaddenNegotiationPackageTargetSide(guildId, league, negoti
   return recalculateMaddenNegotiationPackage(clean);
 }
 
+// 7J-NEGDEDUPE: per Hxxdie's live-testing catch — a package ended up with
+// the same player listed (and valued) twice on one side, inflating that
+// side's total and producing a skewed grade. Root insertion point wasn't
+// fully pinned down from the click sequence alone, so this guards at the
+// one choke point every package (generated, edited, or rebuilt) already
+// passes through — regardless of how a duplicate gets in, it can't survive
+// past here.
+function dedupeMaddenNegotiationAssetList(list, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const item of (list || [])) {
+    const key = keyFn(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 function recalculateMaddenNegotiationPackage(pkg) {
   const clean = { ...(pkg || {}) };
-  clean.players = Array.isArray(clean.players) ? clean.players : [];
-  clean.picks = Array.isArray(clean.picks) ? clean.picks : [];
-  clean.target_players = Array.isArray(clean.target_players) ? clean.target_players : [];
-  clean.target_picks = Array.isArray(clean.target_picks) ? clean.target_picks : [];
+  clean.players = dedupeMaddenNegotiationAssetList(Array.isArray(clean.players) ? clean.players : [], p => String(p.player_name || '').toLowerCase());
+  clean.picks = dedupeMaddenNegotiationAssetList(Array.isArray(clean.picks) ? clean.picks : [], p => String(p.label || p.raw || '').toLowerCase());
+  clean.target_players = dedupeMaddenNegotiationAssetList(Array.isArray(clean.target_players) ? clean.target_players : [], p => String(p.player_name || '').toLowerCase());
+  clean.target_picks = dedupeMaddenNegotiationAssetList(Array.isArray(clean.target_picks) ? clean.target_picks : [], p => String(p.label || p.raw || '').toLowerCase());
   const offerPlayerTotal = clean.players.reduce((sum, p) => sum + Number(p.value_score || p.valueScore || 0), 0);
   const offerPickTotal = clean.picks.reduce((sum, p) => sum + Number(p.value_score || p.valueScore || 0), 0);
   const targetPlayerTotal = clean.target_players.reduce((sum, p) => sum + Number(p.value_score || p.valueScore || 0), 0);
