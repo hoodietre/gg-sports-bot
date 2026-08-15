@@ -2958,6 +2958,14 @@ async function migrateMaddenSportsbookGamesLegacyLeagueGameLink() {
          AND sg.status = 'open'`
     );
 
+    // SAVEPOINT here is load-bearing, not decorative: a plain JS .catch() around
+    // this query does NOT protect the transaction — Postgres aborts the entire
+    // transaction on any query error the instant it happens, regardless of
+    // whether the JS promise rejection gets caught. Without a real SAVEPOINT to
+    // roll back to, a failure in this query was silently dooming the
+    // system_migrations INSERT and COMMIT below it every single time, which is
+    // exactly what was happening (see the text/uuid mismatch this fixed).
+    await client.query('SAVEPOINT prop_backfill');
     const propResult = await client.query(
       `UPDATE sportsbook_games sg
        SET league_game_id = mig.id
@@ -2966,13 +2974,14 @@ async function migrateMaddenSportsbookGamesLegacyLeagueGameLink() {
          AND sg.league_game_id IS NULL
          AND sg.status = 'open'
          AND sg.subject_ref IS NOT NULL
-         AND mp.league_id = sg.league_id
+         AND mp.league_id = sg.league_id::text
          AND (mp.roster_id = sg.subject_ref OR mp.presentation_id = sg.subject_ref)
          AND mig.league_id = sg.league_id
          AND mig.status != 'final'
          AND (LOWER(mig.home_team) = LOWER(mp.team_name) OR LOWER(mig.away_team) = LOWER(mp.team_name))`
-    ).catch(err => {
+    ).catch(async err => {
       console.error('[Sportsbook Migration] Legacy prop link backfill failed:', err?.message || err);
+      await client.query('ROLLBACK TO SAVEPOINT prop_backfill');
       return { rowCount: 0 };
     });
 
@@ -9490,16 +9499,32 @@ async function refreshAllMultiChannelPanelPostings(guild, panelType) {
   let refreshed = 0, reposted = 0, failed = 0;
 
   for (const row of result.rows) {
-    const channel = await guild.channels.fetch(row.channel_id).catch(() => null);
+    const channel = await guild.channels.fetch(row.channel_id).catch(err => {
+      console.error(`[PANEL REFRESH] ${panelType} channel fetch failed for ${row.channel_id}:`, err?.message || err);
+      return null;
+    });
     if (!channel || !channel.isTextBased()) { failed++; continue; }
 
-    const message = await channel.messages.fetch(row.message_id).catch(() => null);
+    const message = await channel.messages.fetch(row.message_id).catch(err => {
+      console.error(`[PANEL REFRESH] ${panelType} message fetch failed for ${row.message_id} in #${channel.name}:`, err?.message || err);
+      return null;
+    });
     if (message) {
-      await message.edit(payload).catch(() => null);
-      await pool.query(`UPDATE multi_channel_panels SET updated_at = NOW() WHERE id = $1`, [row.id]);
-      refreshed++;
+      const edited = await message.edit(payload).catch(err => {
+        console.error(`[PANEL REFRESH] ${panelType} message edit failed for ${row.message_id} in #${channel.name}:`, err?.message || err);
+        return null;
+      });
+      if (edited) {
+        await pool.query(`UPDATE multi_channel_panels SET updated_at = NOW() WHERE id = $1`, [row.id]);
+        refreshed++;
+      } else {
+        failed++;
+      }
     } else {
-      const newMessage = await channel.send(payload).catch(() => null);
+      const newMessage = await channel.send(payload).catch(err => {
+        console.error(`[PANEL REFRESH] ${panelType} repost failed in #${channel.name}:`, err?.message || err);
+        return null;
+      });
       if (newMessage) {
         await pool.query(`UPDATE multi_channel_panels SET message_id = $1, updated_at = NOW() WHERE id = $2`, [newMessage.id, row.id]);
         reposted++;
