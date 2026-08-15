@@ -1945,6 +1945,10 @@ async function initDatabase() {
   `);
   await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS start_time TEXT`);
   await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS rules TEXT`);
+  // Computed UTC epoch (seconds) from starts_at/start_time + the organizer's
+  // picked timezone — powers a <t:EPOCH:F> Discord timestamp tag, which
+  // Discord's client auto-renders in each viewer's own local time/format.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS starts_at_epoch BIGINT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_entries (
@@ -7818,11 +7822,6 @@ async function getTournamentActionAvailability(tournament, entries, matches) {
   const hasMatches = matches.length > 0;
   const isFull = Boolean(tournament.max_entries) && entryCount >= tournament.max_entries;
   const reportable = matches.filter(m => m.status === 'scheduled' && m.player1_user_id && m.player2_user_id);
-  let hasHistory = false;
-  if (tournament.status === 'completed') {
-    const historyResult = await pool.query(`SELECT 1 FROM tournament_history WHERE tournament_id = $1 LIMIT 1`, [tournament.id]);
-    hasHistory = historyResult.rows.length > 0;
-  }
 
   const notOpenReason = `Registration is ${tournament.status === 'closed' ? 'closed' : tournament.status}, not open.`;
 
@@ -7830,8 +7829,13 @@ async function getTournamentActionAvailability(tournament, entries, matches) {
     join: tournament.status !== 'open' ? { enabled: false, reason: notOpenReason }
       : isFull ? { enabled: false, reason: 'Tournament is full.' }
       : { enabled: true, reason: null },
-    close: tournament.status === 'open' ? { enabled: true, reason: null }
-      : { enabled: false, reason: `Registration is already ${tournament.status === 'closed' ? 'closed' : tournament.status}.` },
+    registrationToggle: tournament.status === 'open'
+      ? { key: 'close', label: 'Close Registration', emoji: '🔒', enabled: true, reason: null }
+      : tournament.status === 'closed'
+      ? { key: 'reopen', label: 'Open Registration', emoji: '🔓', enabled: true, reason: null }
+      : { key: 'close', label: 'Close Registration', emoji: '🔒', enabled: false, reason: `Tournament is already ${tournament.status}.` },
+    edit: ['open', 'closed'].includes(tournament.status) ? { enabled: true, reason: null }
+      : { enabled: false, reason: `Locked once the tournament is ${tournament.status} — settings can't change after it starts.` },
     setseed: (['open', 'closed'].includes(tournament.status) && entryCount > 0 && !hasMatches) ? { enabled: true, reason: null }
       : !entryCount ? { enabled: false, reason: 'No entries to seed yet.' }
       : hasMatches ? { enabled: false, reason: 'Bracket already generated — seeding is locked.' }
@@ -7847,9 +7851,6 @@ async function getTournamentActionAvailability(tournament, entries, matches) {
       ? (reportable.length ? { enabled: true, reason: null } : { enabled: false, reason: 'No reportable matches right now.' })
       : { enabled: false, reason: 'Only available once the tournament is active.' },
     bracket: hasMatches ? { enabled: true, reason: null } : { enabled: false, reason: 'No bracket generated yet — start the tournament first.' },
-    setmvp: tournament.status === 'completed'
-      ? (hasHistory ? { enabled: true, reason: null } : { enabled: false, reason: 'Tournament history record not found yet.' })
-      : { enabled: false, reason: 'Only available once the tournament is completed.' },
     postpone: ['open', 'closed', 'active'].includes(tournament.status) ? { enabled: true, reason: null }
       : { enabled: false, reason: `Can't postpone a tournament that's already ${tournament.status}.` },
     postpanel: { enabled: true, reason: null },
@@ -7860,9 +7861,10 @@ async function getTournamentActionAvailability(tournament, entries, matches) {
 }
 
 const TOURNAMENT_ACTION_LABELS = {
-  join: 'Join Tournament', close: 'Close Registration', setseed: 'Set Seed', shuffle: 'Shuffle Seeds',
-  start: 'Start Tournament', report: 'Report Match', bracket: 'View Bracket', setmvp: 'Set MVP',
-  postpone: 'Postpone', postpanel: 'Post/Refresh Panel', cancel: 'Cancel Tournament', delete: 'Delete Tournament',
+  join: 'Join Tournament', close: 'Close Registration', reopen: 'Open Registration', edit: 'Edit Tournament',
+  setseed: 'Set Seed', shuffle: 'Shuffle Seeds', start: 'Start Tournament', report: 'Report Match',
+  bracket: 'View Bracket', postpone: 'Postpone', postpanel: 'Post/Refresh Panel',
+  cancel: 'Cancel Tournament', delete: 'Delete Tournament',
 };
 
 function buildTournamentInfoEmbed(settings, tournament, entries, availability) {
@@ -7889,16 +7891,21 @@ function buildTournamentInfoEmbed(settings, tournament, entries, availability) {
       { name: 'Buy-in', value: buyIn, inline: true },
       { name: 'Prize Pool', value: prizePool, inline: true },
       { name: 'Prize', value: tournament.prize || 'Not listed', inline: true },
-      { name: 'Start', value: (tournament.starts_at || 'TBD') + (tournament.start_time ? ' at ' + tournament.start_time : ''), inline: true },
+      { name: 'Start', value: (tournament.starts_at || 'TBD') + (tournament.start_time ? ' at ' + tournament.start_time : '') + (tournament.starts_at_epoch ? ` (<t:${tournament.starts_at_epoch}:F>, your local time)` : ''), inline: true },
       { name: 'Rules', value: tournament.rules || 'None set.', inline: false },
       { name: 'Registered', value: entryLines, inline: false },
     );
 
   // Only list disabled actions that actually have a reason (delete/postpanel
-  // are unconditional so they'd never appear here).
+  // are unconditional so they'd never appear here). registrationToggle is
+  // handled separately since its label/key are dynamic (Close vs Open
+  // Registration) rather than a fixed TOURNAMENT_ACTION_LABELS entry.
   const lockedLines = Object.entries(availability)
-    .filter(([, state]) => !state.enabled)
+    .filter(([key, state]) => key !== 'registrationToggle' && !state.enabled)
     .map(([key, state]) => `**${TOURNAMENT_ACTION_LABELS[key]}** — ${state.reason}`);
+  if (!availability.registrationToggle.enabled) {
+    lockedLines.unshift(`**${availability.registrationToggle.label}** — ${availability.registrationToggle.reason}`);
+  }
   if (lockedLines.length) {
     embed.addFields({ name: '🔒 Not Yet Available', value: lockedLines.join(NL), inline: false });
   }
@@ -7914,18 +7921,26 @@ function buildTournamentActionRows(tournament, availability) {
     .setStyle(style)
     .setDisabled(!availability[key].enabled);
 
+  const toggle = availability.registrationToggle;
+  const toggleButton = new ButtonBuilder()
+    .setCustomId(`tourneypanel_${toggle.key}:${tournament.id}`)
+    .setLabel(toggle.label)
+    .setEmoji(toggle.emoji)
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(!toggle.enabled);
+
   const rows = [
     new ActionRowBuilder().addComponents(
       btn('join', '🎟️', ButtonStyle.Success),
-      btn('close', '🔒', ButtonStyle.Secondary),
+      toggleButton,
       btn('setseed', '🔢', ButtonStyle.Secondary),
       btn('shuffle', '🔀', ButtonStyle.Secondary),
       btn('start', '🚀', ButtonStyle.Success),
     ),
     new ActionRowBuilder().addComponents(
+      btn('edit', '✏️', ButtonStyle.Secondary),
       btn('report', '📋', ButtonStyle.Primary),
       btn('bracket', '🗂️', ButtonStyle.Secondary),
-      btn('setmvp', '⭐', ButtonStyle.Primary),
       btn('postpone', '🕐', ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
@@ -8330,7 +8345,188 @@ async function buildTournamentManagerViewPayload(guild, tournament) {
 // time/rules) exceeds a modal's 5-field cap, so this is a session-backed
 // multi-step flow: selects first, then two bridged modals.
 // ---------------------------------------------------------------------------
+const TOURNAMENT_MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+// No year select — a tournament date is essentially always "the next
+// occurrence" of a given month/day, so we infer the year rather than adding
+// a 3rd select row (Discord caps messages at 5 rows total, and this picker
+// already needs most of that budget across its two steps).
+function inferTournamentYear(month, day) {
+  const now = new Date();
+  const candidate = new Date(now.getFullYear(), month - 1, day);
+  return candidate < now ? now.getFullYear() + 1 : now.getFullYear();
+}
+
+// Best-effort parse of the OLD free-text start_time values (e.g. "7:30 PM
+// EST") back into hour/minute/ampm for pre-filling Edit's picker. Falls back
+// to nothing pre-selected if it doesn't match — acceptable, since the user
+// re-picks it either way.
+const TOURNAMENT_TIMEZONE_ALIASES = {
+  EST: 'ET', EDT: 'ET', ET: 'ET',
+  CST: 'CT', CDT: 'CT', CT: 'CT', // bare "CST" defaults to US Central, not Taiwan — too ambiguous to guess from free text either way
+  MST: 'MT', MDT: 'MT', MT: 'MT',
+  PST: 'PT', PDT: 'PT', PT: 'PT',
+  COT: 'COT',
+  CET: 'CET', CEST: 'CET',
+  WET: 'WET', WEST: 'WET',
+  BRT: 'BRT', BRST: 'BRT',
+  JST: 'JST',
+  KST: 'KST',
+  UTC: 'UTC', GMT: 'UTC',
+};
+
+function parseLegacyTournamentTime(text) {
+  if (!text) return {};
+  const match = /(\d{1,2}):?(\d{2})?\s*(AM|PM)/i.exec(text);
+  if (!match) return {};
+  const hour = Number.parseInt(match[1], 10);
+  const minute = match[2] ? Number.parseInt(match[2], 10) : 0;
+  const roundedMinute = Math.round(minute / 30) * 30 % 60;
+  if (hour < 1 || hour > 12) return {};
+  const tzMatch = /\b(EST|EDT|ET|CST|CDT|CT|MST|MDT|MT|PST|PDT|PT|COT|CET|CEST|WET|WEST|BRT|BRST|JST|KST|UTC|GMT)\b/i.exec(text);
+  const timezone = tzMatch ? TOURNAMENT_TIMEZONE_ALIASES[tzMatch[1].toUpperCase()] : undefined;
+  return { hour, minute: roundedMinute, ampm: match[3].toUpperCase(), ...(timezone ? { timezone } : {}) };
+}
+
+// Step A of the date/time picker: month + day. `prefix` is either
+// 'tourneycreate' or 'tourneyedit' so this one pair of builders serves both
+// flows — each flow's session object just needs month/day/hour/minute/ampm
+// fields, same shape either way.
+function buildDateTimePickerStepA(prefix, token, session) {
+  const monthMenu = new StringSelectMenuBuilder()
+    .setCustomId(`${prefix}_dtmonth:${token}`)
+    .setPlaceholder('Month')
+    .addOptions(TOURNAMENT_MONTH_NAMES.map((name, i) => ({ label: name, value: String(i + 1), default: session.month === i + 1 })));
+  const dayMenu = new StringSelectMenuBuilder()
+    .setCustomId(`${prefix}_dtday:${token}`)
+    .setPlaceholder('Day')
+    .addOptions(Array.from({ length: 31 }, (_, i) => ({ label: String(i + 1), value: String(i + 1), default: session.day === i + 1 })));
+  const continueRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${prefix}_dtdatecontinue:${token}`).setLabel('Continue to Time').setStyle(ButtonStyle.Primary).setDisabled(!session.month || !session.day)
+  );
+  const picked = session.month && session.day ? `${TOURNAMENT_MONTH_NAMES[session.month - 1]} ${session.day}` : 'not picked yet';
+  return {
+    content: `**Pick a date — Step 1 of 2**\nDate: **${picked}**`,
+    embeds: [], components: [new ActionRowBuilder().addComponents(monthMenu), new ActionRowBuilder().addComponents(dayMenu), continueRow],
+  };
+}
+
+// Step B: hour (1-12) + minute (5-min increments) + AM/PM.
+// Covers all 8 languages the bot supports (SUPPORTED_LANGUAGES above) plus
+// the original 4 US zones — a select menu holds up to 25 options in one row
+// regardless of count, so there's no cost to including all of these (unlike
+// adding a whole extra select, which would've broken the 5-row cap).
+const TOURNAMENT_TIMEZONE_OPTIONS = [
+  { label: 'Eastern (ET) — US/Canada', value: 'ET' },
+  { label: 'Central (CT) — US/Canada, Mexico', value: 'CT' },
+  { label: 'Mountain (MT) — US/Canada', value: 'MT' },
+  { label: 'Pacific (PT) — US/Canada', value: 'PT' },
+  { label: 'Colombia/Peru (COT) — no DST', value: 'COT' },
+  { label: 'Central European (CET) — FR/DE/ES', value: 'CET' },
+  { label: 'Western European (WET) — Portugal, UK/Ireland', value: 'WET' },
+  { label: 'Brasília (BRT) — Brazil, Argentina, Chile', value: 'BRT' },
+  { label: 'Japan (JST)', value: 'JST' },
+  { label: 'Korea (KST)', value: 'KST' },
+  { label: 'Taiwan (CST)', value: 'TWT' },
+  { label: 'UTC', value: 'UTC' },
+];
+
+// 7J-TOURNEYTZ: timezone was missing entirely from the original picker — the
+// old free-text field let people type e.g. "8:00 PM EST" including zone,
+// but the select-based replacement dropped it. Adding it back means a 4th
+// select is needed here, and Discord caps a message at 5 component rows
+// total (3 selects + AM/PM + Continue would've been 5 already, no room for
+// a 4th). So Hour+Minute are merged into one "Time" select at 30-minute
+// increments (down from 5-minute) to free up the row Timezone needed.
+function buildDateTimePickerStepB(prefix, token, session) {
+  const timeMenu = new StringSelectMenuBuilder()
+    .setCustomId(`${prefix}_dttimeslot:${token}`)
+    .setPlaceholder('Time')
+    .addOptions(Array.from({ length: 24 }, (_, i) => {
+      const hour = Math.floor(i / 2) + 1;
+      const minute = i % 2 === 0 ? 0 : 30;
+      const value = `${hour}:${minute}`;
+      const label = `${hour}:${String(minute).padStart(2, '0')}`;
+      return { label, value, default: session.hour === hour && session.minute === minute };
+    }));
+  const ampmMenu = new StringSelectMenuBuilder()
+    .setCustomId(`${prefix}_dtampm:${token}`)
+    .setPlaceholder('AM / PM')
+    .addOptions([
+      { label: 'AM', value: 'AM', default: session.ampm === 'AM' },
+      { label: 'PM', value: 'PM', default: session.ampm === 'PM' },
+    ]);
+  const timezoneMenu = new StringSelectMenuBuilder()
+    .setCustomId(`${prefix}_dttimezone:${token}`)
+    .setPlaceholder('Time zone')
+    .addOptions(TOURNAMENT_TIMEZONE_OPTIONS.map(tz => ({ ...tz, default: session.timezone === tz.value })));
+  const continueRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${prefix}_dttimecontinue:${token}`).setLabel('Continue').setStyle(ButtonStyle.Primary)
+      .setDisabled(session.hour == null || session.minute == null || !session.ampm || !session.timezone)
+  );
+  const datePicked = `${TOURNAMENT_MONTH_NAMES[session.month - 1]} ${session.day}`;
+  const timePicked = (session.hour != null && session.minute != null && session.ampm && session.timezone)
+    ? `${session.hour}:${String(session.minute).padStart(2, '0')} ${session.ampm} ${session.timezone}` : 'not picked yet';
+  return {
+    content: `**Pick a time — Step 2 of 2**\nDate: **${datePicked}**\nTime: **${timePicked}**`,
+    embeds: [], components: [new ActionRowBuilder().addComponents(timeMenu), new ActionRowBuilder().addComponents(ampmMenu), new ActionRowBuilder().addComponents(timezoneMenu), continueRow],
+  };
+}
+
+// Maps each picker value to a real IANA zone so we can compute an accurate
+// UTC moment (DST-aware for that specific date) using only built-in
+// Intl/Date — no external timezone library needed.
+const TOURNAMENT_TIMEZONE_IANA = {
+  ET: 'America/New_York', CT: 'America/Chicago', MT: 'America/Denver', PT: 'America/Los_Angeles',
+  COT: 'America/Bogota', CET: 'Europe/Paris', WET: 'Europe/Lisbon', BRT: 'America/Sao_Paulo',
+  JST: 'Asia/Tokyo', KST: 'Asia/Seoul', TWT: 'Asia/Taipei', UTC: 'UTC',
+};
+
+// 7J-TOURNEYUTC: per Hxxdie — every viewer should see the tournament's start
+// time converted to THEIR OWN local time, not just whatever zone the
+// organizer picked. Discord itself does this automatically for us: a
+// <t:EPOCH:F> tag in message content renders in each viewer's own device
+// timezone/locale, client-side, with zero per-user setup needed. The only
+// work on our end is computing an accurate UTC epoch from the organizer's
+// picked wall-clock time + zone, which does need to be DST-aware (e.g. "7:30
+// PM ET" is a different UTC moment in January than in July).
+//
+// Standard technique for converting "wall-clock time in zone X" to UTC using
+// only Intl/Date: format a UTC guess back through the target zone, measure
+// the drift, and correct for it.
+function tournamentWallClockToUtcEpoch(year, month, day, hour24, minute, ianaZone) {
+  const utcGuess = Date.UTC(year, month - 1, day, hour24, minute);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: ianaZone, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const parts = {};
+  for (const p of formatter.formatToParts(new Date(utcGuess))) parts[p.type] = p.value;
+  const asUtc = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour) === 24 ? 0 : Number(parts.hour), Number(parts.minute), Number(parts.second)
+  );
+  return utcGuess - (asUtc - utcGuess);
+}
+
+function tournamentDiscordTimestamp(session) {
+  const ianaZone = TOURNAMENT_TIMEZONE_IANA[session.timezone];
+  if (!ianaZone) return null;
+  const hour24 = session.ampm === 'PM' ? (session.hour % 12) + 12 : session.hour % 12;
+  const year = inferTournamentYear(session.month, session.day);
+  const epochMs = tournamentWallClockToUtcEpoch(year, session.month, session.day, hour24, session.minute, ianaZone);
+  return Math.floor(epochMs / 1000);
+}
+
+function finalizeTournamentDateTime(session) {
+  const year = inferTournamentYear(session.month, session.day);
+  session.date = `${year}-${String(session.month).padStart(2, '0')}-${String(session.day).padStart(2, '0')}`;
+  session.time = `${session.hour}:${String(session.minute).padStart(2, '0')} ${session.ampm} ${session.timezone}`;
+  session.startsAtEpoch = tournamentDiscordTimestamp(session);
+}
 const tournamentCreateSessions = new Map();
+const tournamentEditSessions = new Map();
+const tournamentPostponeSessions = new Map();
 const leagueKickConfirmations = new Map();
 
 // Shared by staff-initiated removal (Commissioner Panel Kick button, /league
@@ -8412,32 +8608,74 @@ function buildTournamentCreateStep1Payload(token, session) {
 function buildTournamentCreateModal1(session) {
   return new ModalBuilder()
     .setCustomId(`tourneycreate_modal1:${session.token}`)
-    .setTitle('Create Tournament (2 of 3)')
+    .setTitle('Create Tournament (3 of 4)')
     .addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Tournament name').setStyle(TextInputStyle.Short).setRequired(true)),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game').setLabel('Game').setStyle(TextInputStyle.Short).setRequired(true)),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_entries').setLabel('Max entries (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('buy_in').setLabel('Buy-in (optional, 0 = free)').setStyle(TextInputStyle.Short).setRequired(false).setValue('0')),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('Date (e.g. 2026-07-20)').setStyle(TextInputStyle.Short).setRequired(false)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('prize').setLabel('Prize description (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
     );
 }
 
 function buildTournamentCreateModal2(session) {
   return new ModalBuilder()
     .setCustomId(`tourneycreate_modal2:${session.token}`)
-    .setTitle('Create Tournament (3 of 3)')
+    .setTitle('Create Tournament (4 of 4)')
     .addComponents(
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('Time (e.g. 8:00 PM EST)').setStyle(TextInputStyle.Short).setRequired(false)),
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rules').setLabel('Rules (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
     );
+}
+
+// 7J-TOURNEYEDIT: per Hxxdie — no way to fix a typo or adjust settings once
+// a tournament existed. Locked once status leaves open/closed (see the edit
+// key in getTournamentActionAvailability) since changing format/entries
+// after people have paid buy-ins or a bracket exists gets messy fast.
+// Format itself is deliberately NOT editable here — it drives bracket
+// generation, so changing it after creation risks a mismatch with any
+// entries/seeding already in place; recreating the tournament is the safer
+// path for that specific change. Mirrors the creation wizard's session +
+// two-modal-with-a-continue-button-bridge pattern (Discord doesn't allow a
+// modal submit to directly open a second modal).
+function buildTournamentEditModal1(session, tournament) {
+  return new ModalBuilder()
+    .setCustomId(`tourneyedit_modal1:${session.token}`)
+    .setTitle('Edit Tournament (2 of 3)')
+    .addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Tournament name').setStyle(TextInputStyle.Short).setRequired(true).setValue(tournament.tournament_name || '')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game').setLabel('Game').setStyle(TextInputStyle.Short).setRequired(true).setValue(tournament.game || '')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('max_entries').setLabel('Max entries (optional)').setStyle(TextInputStyle.Short).setRequired(false).setValue(tournament.max_entries ? String(tournament.max_entries) : '')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('buy_in').setLabel('Buy-in (0 = free)').setStyle(TextInputStyle.Short).setRequired(false).setValue(String(tournament.buy_in ?? 0))),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('prize').setLabel('Prize description (optional)').setStyle(TextInputStyle.Short).setRequired(false).setValue(tournament.prize || '')),
+    );
+}
+
+function buildTournamentEditModal2(session, tournament) {
+  return new ModalBuilder()
+    .setCustomId(`tourneyedit_modal2:${session.token}`)
+    .setTitle('Edit Tournament (3 of 3)')
+    .addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rules').setLabel('Rules (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(tournament.rules || '')),
+    );
+}
+
+async function finalizeTournamentEdit(guild, session) {
+  await pool.query(
+    `UPDATE tournaments SET tournament_name = $2, game = $3, max_entries = $4, buy_in = $5, starts_at = $6, start_time = $7, prize = $8, rules = $9, starts_at_epoch = $10, updated_at = NOW()
+     WHERE id = $1`,
+    [session.tournamentId, session.name, session.game, session.maxEntries, session.buyIn, session.date || null, session.time || null, session.prize || null, session.rules || null, session.startsAtEpoch || null]
+  );
+  const tournament = await findTournament(guild.id, session.tournamentId);
+  await updateTournamentPanel(guild, tournament).catch(() => null);
+  return tournament;
 }
 
 async function finalizeTournamentCreation(guild, session) {
   const tournamentId = randomUUID();
   await pool.query(
-    `INSERT INTO tournaments (id, guild_id, tournament_name, game, format, max_entries, buy_in, starts_at, start_time, rules, created_by_user_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-    [tournamentId, guild.id, session.name, session.game, session.format, session.maxEntries, session.buyIn, session.date || null, session.time || null, session.rules || null, session.userId]
+    `INSERT INTO tournaments (id, guild_id, tournament_name, game, format, max_entries, buy_in, starts_at, start_time, rules, starts_at_epoch, created_by_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+    [tournamentId, guild.id, session.name, session.game, session.format, session.maxEntries, session.buyIn, session.date || null, session.time || null, session.rules || null, session.startsAtEpoch || null, session.userId]
   );
   const tournament = await findTournament(guild.id, tournamentId);
   const channel = await guild.channels.fetch(session.channelId).catch(() => null);
@@ -8481,7 +8719,7 @@ function buildTournamentRegistrationEmbed(tournament, entries) {
       { name: 'Format', value: (TOURNAMENT_FORMAT_OPTIONS.find(o => o.value === tournament.format)?.label) || tournament.format || 'single_elim', inline: true },
       { name: 'Buy-in', value: buyInText, inline: true },
       { name: 'Date', value: tournament.starts_at || 'TBD', inline: true },
-      { name: 'Time', value: tournament.start_time || 'TBD', inline: true },
+      { name: 'Time', value: (tournament.start_time || 'TBD') + (tournament.starts_at_epoch ? `\n<t:${tournament.starts_at_epoch}:F> (your local time)` : ''), inline: true },
       { name: 'Entries', value: capacityText, inline: true },
       { name: 'Rules', value: (tournament.rules || 'No special rules posted.').slice(0, 1024), inline: false },
       { name: 'Registered', value: entryLines.slice(0, 1024), inline: false },
@@ -17309,6 +17547,146 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_edit:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to edit tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      if (!['open', 'closed'].includes(tournament.status)) {
+        await interaction.reply({ content: `Settings are locked once the tournament is ${tournament.status}.`, ephemeral: true });
+        return;
+      }
+      const token = randomBytes(6).toString('hex');
+      // Pre-fill from the existing tournament: starts_at is 'YYYY-MM-DD' (our
+      // own format from a prior save), start_time may still be an old
+      // free-typed value from before this picker existed — best-effort
+      // parsed, falls back to nothing pre-selected if it doesn't match.
+      const [, existingMonth, existingDay] = /^\d{4}-(\d{2})-(\d{2})$/.exec(tournament.starts_at || '') || [];
+      const legacyTime = parseLegacyTournamentTime(tournament.start_time);
+      const session = {
+        token, tournamentId,
+        month: existingMonth ? Number(existingMonth) : null,
+        day: existingDay ? Number(existingDay) : null,
+        ...legacyTime,
+      };
+      tournamentEditSessions.set(token, session);
+      await interaction.reply({ ...buildDateTimePickerStepA('tourneyedit', token, session), ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dtmonth:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
+      session.month = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneyedit', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dtday:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneyedit', token, session));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneyedit_dtdatecontinue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
+      await interaction.update(buildDateTimePickerStepB('tourneyedit', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dttimeslot:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
+      const [hour, minute] = interaction.values[0].split(':').map(Number);
+      session.hour = hour;
+      session.minute = minute;
+      await interaction.update(buildDateTimePickerStepB('tourneyedit', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dtampm:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
+      session.ampm = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('tourneyedit', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dttimezone:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
+      session.timezone = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('tourneyedit', token, session));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneyedit_dttimecontinue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Click Edit Tournament again.', ephemeral: true }); return; }
+      finalizeTournamentDateTime(session);
+      const tournament = await findTournament(interaction.guild.id, session.tournamentId);
+      if (!tournament) { await interaction.update({ content: 'Tournament not found.', components: [] }); return; }
+      await interaction.showModal(buildTournamentEditModal1(session, tournament));
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('tourneyedit_modal1:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Click Edit Tournament again.', ephemeral: true }); return; }
+      const maxEntriesRaw = interaction.fields.getTextInputValue('max_entries');
+      const buyInRaw = interaction.fields.getTextInputValue('buy_in');
+      const maxEntries = maxEntriesRaw ? Number.parseInt(maxEntriesRaw, 10) : null;
+      const buyIn = buyInRaw ? Number.parseInt(buyInRaw, 10) : 0;
+      if ((maxEntries !== null && (!Number.isInteger(maxEntries) || maxEntries < 2)) || !Number.isInteger(buyIn) || buyIn < 0) {
+        await interaction.reply({ content: 'Max entries must be a whole number 2 or greater (or blank), and buy-in must be 0 or greater.', ephemeral: true });
+        return;
+      }
+      session.name = interaction.fields.getTextInputValue('name');
+      session.game = interaction.fields.getTextInputValue('game');
+      session.maxEntries = maxEntries;
+      session.buyIn = buyIn;
+      session.prize = interaction.fields.getTextInputValue('prize') || null;
+      const continueRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`tourneyedit_continue:${token}`).setLabel('Continue to Rules').setStyle(ButtonStyle.Primary)
+      );
+      await interaction.reply({ content: '**Edit Tournament — Step 2 of 3 complete.** Click below to finish.', components: [continueRow], ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneyedit_continue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Click Edit Tournament again.', ephemeral: true }); return; }
+      const tournament = await findTournament(interaction.guild.id, session.tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      await interaction.showModal(buildTournamentEditModal2(session, tournament));
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('tourneyedit_modal2:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Click Edit Tournament again.', ephemeral: true }); return; }
+      session.rules = interaction.fields.getTextInputValue('rules') || null;
+      await interaction.deferReply({ ephemeral: true });
+      const tournament = await finalizeTournamentEdit(interaction.guild, session);
+      tournamentEditSessions.delete(token);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.editReply({ content: `**${tournament.tournament_name}** updated.`, ...payload });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId === 'tourneypanel_create') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create tournaments.', ephemeral: true }); return; }
       const token = randomBytes(6).toString('hex');
@@ -17342,6 +17720,70 @@ if (interaction.commandName === 'avatar') {
       const session = tournamentCreateSessions.get(token);
       if (!session) { await interaction.reply({ content: 'This session expired. Click Create Tournament again.', ephemeral: true }); return; }
       if (!session.channelId) { await interaction.reply({ content: 'Pick a channel before continuing.', ephemeral: true }); return; }
+      await interaction.update(buildDateTimePickerStepA('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dtmonth:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
+      session.month = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dtday:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneycreate_dtdatecontinue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
+      await interaction.update(buildDateTimePickerStepB('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dttimeslot:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
+      const [hour, minute] = interaction.values[0].split(':').map(Number);
+      session.hour = hour;
+      session.minute = minute;
+      await interaction.update(buildDateTimePickerStepB('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dtampm:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
+      session.ampm = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dttimezone:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
+      session.timezone = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneycreate_dttimecontinue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Click Create Tournament again.', ephemeral: true }); return; }
+      finalizeTournamentDateTime(session);
       await interaction.showModal(buildTournamentCreateModal1(session));
       return;
     }
@@ -17362,11 +17804,11 @@ if (interaction.commandName === 'avatar') {
       session.game = interaction.fields.getTextInputValue('game');
       session.maxEntries = maxEntries;
       session.buyIn = buyIn;
-      session.date = interaction.fields.getTextInputValue('date') || null;
+      session.prize = interaction.fields.getTextInputValue('prize') || null;
       const continueRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`tourneycreate_continue2:${token}`).setLabel('Continue to Time & Rules').setStyle(ButtonStyle.Primary)
+        new ButtonBuilder().setCustomId(`tourneycreate_continue2:${token}`).setLabel('Continue to Rules').setStyle(ButtonStyle.Primary)
       );
-      await interaction.reply({ content: `**Create Tournament — Step 2 of 3 complete.** Click below to finish.`, components: [continueRow], ephemeral: true });
+      await interaction.reply({ content: `**Create Tournament — Step 3 of 4 complete.** Click below to finish.`, components: [continueRow], ephemeral: true });
       return;
     }
 
@@ -17382,7 +17824,6 @@ if (interaction.commandName === 'avatar') {
       const token = interaction.customId.split(':')[1];
       const session = tournamentCreateSessions.get(token);
       if (!session) { await interaction.reply({ content: 'This session expired. Click Create Tournament again.', ephemeral: true }); return; }
-      session.time = interaction.fields.getTextInputValue('time') || null;
       session.rules = interaction.fields.getTextInputValue('rules') || null;
       await interaction.deferReply({ ephemeral: true });
       const { tournament, panelPosted, panelError } = await finalizeTournamentCreation(interaction.guild, session);
@@ -17470,6 +17911,20 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_reopen:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      // Per Hxxdie — closing registration by mistake (or wanting to accept a
+      // few more entries) had no way back before this. Only meaningful while
+      // still 'closed' (not yet started) — reusing the same status column the
+      // Close button already writes to.
+      await pool.query(`UPDATE tournaments SET status = 'open', updated_at = NOW() WHERE id = $1 AND status = 'closed'`, [tournamentId]);
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      await interaction.update({ content: 'Registration reopened.', ...payload });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_setseed:')) {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
       const tournamentId = interaction.customId.split(':')[1];
@@ -17514,55 +17969,6 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply({ ephemeral: true });
       const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
       await interaction.editReply({ content: `Seed set to **${seed}** for <@${targetUserId}>.`, ...payload });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_setmvp:')) {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
-      const tournamentId = interaction.customId.split(':')[1];
-      const entries = await getTournamentEntries(tournamentId);
-      if (!entries.length) { await interaction.reply({ content: 'No entries found for this tournament.', ephemeral: true }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId('tourneypanel_setmvp_pick:' + tournamentId)
-        .setPlaceholder('Choose the MVP')
-        .addOptions(entries.slice(0, 25).map(e => ({
-          label: (e.entry_name || 'Entry').slice(0, 100),
-          value: e.user_id.slice(0, 100),
-        })));
-      await interaction.reply({ content: '**Set MVP** — choose an entry', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
-      return;
-    }
-
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypanel_setmvp_pick:')) {
-      const tournamentId = interaction.customId.split(':')[1];
-      const targetUserId = interaction.values[0];
-      const modal = new ModalBuilder()
-        .setCustomId(`tourneypanel_setmvp_modal:${tournamentId}:${targetUserId}`)
-        .setTitle('Set MVP')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('payout').setLabel('Payout (optional, 0 = none)').setStyle(TextInputStyle.Short).setRequired(false).setValue('0'))
-        );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('tourneypanel_setmvp_modal:')) {
-      const [, tournamentId, targetUserId] = interaction.customId.split(':');
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
-      const tournament = await findTournament(interaction.guild.id, tournamentId);
-      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
-      const historyResult = await pool.query(`SELECT * FROM tournament_history WHERE guild_id = $1 AND tournament_id = $2 ORDER BY completed_at DESC LIMIT 1`, [interaction.guild.id, tournamentId]);
-      if (!historyResult.rows.length) { await interaction.reply({ content: 'This tournament has not been completed yet, so an MVP cannot be recorded.', ephemeral: true }); return; }
-      const payoutRaw = interaction.fields.getTextInputValue('payout');
-      const payout = payoutRaw ? Number.parseInt(payoutRaw, 10) : 0;
-      if (!Number.isInteger(payout) || payout < 0) { await interaction.reply({ content: 'Payout must be a whole number 0 or greater.', ephemeral: true }); return; }
-      await pool.query(`UPDATE tournament_history SET mvp_user_id = $1, mvp_payout = $2 WHERE id = $3`, [targetUserId, payout, historyResult.rows[0].id]);
-      if (payout > 0) {
-        await addCurrency(interaction.guild.id, targetUserId, payout, 'tournament_mvp', `Tournament MVP: ${tournament.tournament_name}`, interaction.user.id);
-      }
-      await interaction.deferReply({ ephemeral: true });
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
-      await interaction.editReply({ content: `<@${targetUserId}> set as MVP${payout > 0 ? ` and awarded **${payout}** currency.` : '.'}`, ...payload });
       return;
     }
 
@@ -17637,27 +18043,87 @@ if (interaction.commandName === 'avatar') {
       const tournamentId = interaction.customId.split(':')[1];
       const tournament = await findTournament(interaction.guild.id, tournamentId);
       if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
-      const modal = new ModalBuilder()
-        .setCustomId(`tourneypanel_postpone_modal:${tournamentId}`)
-        .setTitle('Postpone Tournament')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('New date').setStyle(TextInputStyle.Short).setRequired(false).setValue(tournament.starts_at || '')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('New time').setStyle(TextInputStyle.Short).setRequired(false).setValue(tournament.start_time || '')),
-        );
-      await interaction.showModal(modal);
+      const token = randomBytes(6).toString('hex');
+      const [, existingMonth, existingDay] = /^\d{4}-(\d{2})-(\d{2})$/.exec(tournament.starts_at || '') || [];
+      const legacyTime = parseLegacyTournamentTime(tournament.start_time);
+      const session = {
+        token, tournamentId,
+        month: existingMonth ? Number(existingMonth) : null,
+        day: existingDay ? Number(existingDay) : null,
+        ...legacyTime,
+      };
+      tournamentPostponeSessions.set(token, session);
+      await interaction.reply({ ...buildDateTimePickerStepA('tourneypostpone', token, session), ephemeral: true });
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('tourneypanel_postpone_modal:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dtmonth:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      session.month = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneypostpone', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dtday:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneypostpone', token, session));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypostpone_dtdatecontinue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      await interaction.update(buildDateTimePickerStepB('tourneypostpone', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dttimeslot:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      const [hour, minute] = interaction.values[0].split(':').map(Number);
+      session.hour = hour;
+      session.minute = minute;
+      await interaction.update(buildDateTimePickerStepB('tourneypostpone', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dtampm:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      session.ampm = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('tourneypostpone', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dttimezone:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      session.timezone = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('tourneypostpone', token, session));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypostpone_dttimecontinue:')) {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
-      const tournamentId = interaction.customId.split(':')[1];
-      const date = interaction.fields.getTextInputValue('date') || null;
-      const time = interaction.fields.getTextInputValue('time') || null;
-      await pool.query(`UPDATE tournaments SET starts_at = $2, start_time = $3, updated_at = NOW() WHERE id = $1`, [tournamentId, date, time]);
-      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      finalizeTournamentDateTime(session);
+      await pool.query(`UPDATE tournaments SET starts_at = $2, start_time = $3, starts_at_epoch = $4, updated_at = NOW() WHERE id = $1`, [session.tournamentId, session.date, session.time, session.startsAtEpoch || null]);
+      tournamentPostponeSessions.delete(token);
+      const tournament = await findTournament(interaction.guild.id, session.tournamentId);
       await updateTournamentPanel(interaction.guild, tournament).catch(() => null);
       const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
-      await interaction.reply({ content: `**${tournament.tournament_name}** rescheduled to ${date || 'TBD'} at ${time || 'TBD'}.`, ...payload, ephemeral: true });
+      await interaction.update({ content: `**${tournament.tournament_name}** rescheduled to ${session.date} at ${session.time}.`, ...payload });
       return;
     }
 
