@@ -56226,7 +56226,7 @@ function buildSyntheticMaddenPlayerFromStats(statRow) {
     firstName = compactMatch[1];
     lastName = compactMatch[2];
   } else if (parts.length >= 2) {
-    firstName = parts.slice(0, -1).join('\n');
+    firstName = parts.slice(0, -1).join(' ');
     lastName = parts[parts.length - 1];
   }
 
@@ -57722,7 +57722,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
     }
     const firstName = getAnyValue(row, ['firstName', 'first'], null);
     const lastName = getAnyValue(row, ['lastName', 'last'], null);
-    const fullName = getAnyValue(row, ['fullName', 'name', 'playerName'], null) || [firstName, lastName].filter(Boolean).join('\n').trim() || null;
+    const fullName = getAnyValue(row, ['fullName', 'name', 'playerName'], null) || [firstName, lastName].filter(Boolean).join(' ').trim() || null;
     const position = getAnyValue(row, ['position', 'pos'], null);
     const jerseyNumber = getAnyValue(row, ['jerseyNum', 'jerseyNumber', 'number'], null);
     const overall = parseNumberOrNull(getAnyValue(row, ['overallRating', 'playerBestOvr', 'ovr', 'overall'], null));
@@ -62070,7 +62070,7 @@ async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label 
       pa: team.teamTotalPointsAllowed,
       sources: team.sourcePaths,
       topThreats: (team.topThreats || []).slice(0, 2).map(p => ({
-        name: [p.firstName, p.lastName].filter(Boolean).join('\n'),
+        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
         ovr: p.ovr,
         s1: p.stat1Label,
         v1: p.stat1Value,
@@ -62540,7 +62540,7 @@ async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub
       paRank: team.teamTotalPointsAllowedRank,
       sourcePaths: team.sourcePaths,
       topThreats: (team.topThreats || []).slice(0, 3).map(p => ({
-        name: [p.firstName, p.lastName].filter(Boolean).join('\n'),
+        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
         ovr: p.ovr,
         s1: p.stat1Label,
         v1: p.stat1Value,
@@ -62725,7 +62725,7 @@ async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
       pfRank: team.teamTotalPointsScoredRank,
       paRank: team.teamTotalPointsAllowedRank,
       topThreats: (team.topThreats || []).slice(0, 3).map(p => ({
-        name: [p.firstName, p.lastName].filter(Boolean).join('\n'),
+        name: [p.firstName, p.lastName].filter(Boolean).join(' '),
         ovr: p.ovr,
         s1: p.stat1Label,
         v1: p.stat1Value,
