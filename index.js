@@ -3372,12 +3372,6 @@ function buildCommands() {
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addBooleanOption(o => o.setName('confirm').setDescription('Save the lock checkpoint? Leave false for preview.').setRequired(false)))
       .addSubcommand(sc => sc
-        .setName('historypost')
-        .setDescription('Staff: post or rebuild the clean Madden season history archive')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('season').setDescription('Optional season label').setRequired(false))
-        .addBooleanOption(o => o.setName('confirm').setDescription('Post to the configured league history channel?').setRequired(false)))
-      .addSubcommand(sc => sc
         .setName('superbowlmvp')
         .setDescription('Preview the detected Super Bowl MVP for the season archive')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
@@ -14910,6 +14904,19 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      if (action === 'repostseasonhistory') {
+        // Manual backup/re-post button per Hxxdie — the season archive now
+        // posts automatically on its own after every sync that detects a
+        // completed championship game (see checkAndAutoPostMaddenSeasonHistory).
+        // This exists purely as a fallback: re-posting after editing awards,
+        // catching a season that finished before auto-post existed, etc.
+        if (!(await requirePremiumFeature(interaction, 'League History'))) return;
+        await interaction.deferReply({ ephemeral: true });
+        const result = await postMaddenLeagueHistoryYearEndReport(interaction.guild, league, interaction.user.id);
+        await interaction.editReply({ content: result.posted ? `Season archive posted to <#${result.channelId}>.` : `Could not post the season archive: ${result.reason || 'Unknown reason'}` });
+        return;
+      }
+
       if (action === 'suspensions') {
         await interaction.deferUpdate();
         const result = await pool.query(
@@ -21851,18 +21858,6 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       if (subcommand === 'offseasonlock') {
         const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
         await interaction.editReply({ embeds: [await buildMaddenOffseasonLockEmbed(interaction.guild, activeLeague, confirm, interaction.user.id)] });
-        return;
-      }
-      if (subcommand === 'historypost') {
-        if (!(await requirePremiumFeature(interaction, 'League History'))) return;
-        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
-        const embed = await buildMaddenLeagueHistoryYearEndEmbed(interaction.guild, activeLeague);
-        if (confirm) {
-          const result = await postMaddenLeagueHistoryYearEndReport(interaction.guild, activeLeague, interaction.user.id);
-          await interaction.editReply({ content: result.posted ? `Season archive posted to <#${result.channelId}>.` : `Season archive preview generated, but could not post: ${result.reason || 'Unknown reason'}`, embeds: [embed] });
-        } else {
-          await interaction.editReply({ content: 'Preview only. Rerun with `confirm:true` to post this to the configured history channel.', embeds: [embed] });
-        }
         return;
       }
       if (subcommand === 'superbowlmvp') {
@@ -51378,6 +51373,13 @@ async function ensureMaddenChampionshipHistoryTable() {
   await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'detected'`);
   await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  // 7J-AUTOHISTORYPOST: per Hxxdie — historypost shouldn't need a manual
+  // command at all; the bot should notice a Super Bowl winner on its own
+  // and post automatically. This tracks whether that's already happened
+  // for a given detected championship, so a sync running again afterward
+  // (e.g. once the next season's early games start coming in) doesn't
+  // re-post a duplicate archive every single time.
+  await pool.query(`ALTER TABLE madden_championship_history ADD COLUMN IF NOT EXISTS auto_posted_at TIMESTAMPTZ`);
 }
 
 function maddenSeasonCloseSeasonLabel() {
@@ -51512,6 +51514,36 @@ async function refreshMaddenDetectedChampionship(guildId, leagueId) {
     ]
   );
   return candidate;
+}
+
+// 7J-AUTOHISTORYPOST: per Hxxdie — auto-detects a newly-finished season and
+// posts the archive to the configured history channel with zero manual
+// command needed. Safe to call after every sync: refreshMaddenDetectedChampionship
+// is cheap and a no-op when nothing's detected, and auto_posted_at guards
+// against reposting the same season's archive on every subsequent sync.
+async function checkAndAutoPostMaddenSeasonHistory(guild, league) {
+  if (!guild || !league?.league_id) return { posted: false };
+  const candidate = await refreshMaddenDetectedChampionship(guild.id, league.league_id).catch(() => null);
+  if (!candidate) return { posted: false };
+  if (!(await isGuildPremiumActive(guild.id))) return { posted: false, reason: 'not_premium' };
+
+  const existingResult = await pool.query(
+    `SELECT auto_posted_at FROM madden_championship_history
+     WHERE guild_id = $1 AND league_id = $2 AND season_label = $3 AND status = 'detected'
+     LIMIT 1`,
+    [guild.id, String(league.league_id), candidate.season_label]
+  ).catch(() => ({ rows: [] }));
+  if (existingResult.rows[0]?.auto_posted_at) return { posted: false, reason: 'already_posted' };
+
+  const result = await postMaddenLeagueHistoryYearEndReport(guild, league, null);
+  if (result.posted) {
+    await pool.query(
+      `UPDATE madden_championship_history SET auto_posted_at = NOW()
+       WHERE guild_id = $1 AND league_id = $2 AND season_label = $3 AND status = 'detected'`,
+      [guild.id, String(league.league_id), candidate.season_label]
+    ).catch(() => null);
+  }
+  return result;
 }
 
 function formatMaddenSeasonCloseChampionLine(row) {
@@ -63621,6 +63653,14 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
        WHERE league_id = $1`,
       [league.league_id, String(context.externalLeagueId), message]
     );
+
+    // 7J-AUTOHISTORYPOST: per Hxxdie — no manual command needed to post the
+    // season archive. This is the EA Direct sync path, the one actually
+    // driving Advance+Sync for most leagues — cheap no-op once nothing
+    // new is detected or the season's already been posted.
+    if (importedGames > 0) {
+      await checkAndAutoPostMaddenSeasonHistory(guild, league).catch(() => null);
+    }
   } catch (error) {
     const message = 'EA Direct sync failed: ' + (isEaExpiredTokenError(error) ? 'EA token expired and refresh failed. Run /madden connect again. Details: ' : isEaInvalidRequestTokenError(error) ? 'EA refreshed token was rejected by Blaze. Run /madden connect again if this persists. Details: ' : '') + (error?.message || error);
     await pool.query(
@@ -65028,6 +65068,15 @@ async function runMaddenExternalFetchSync(guild, league, options = {}) {
   // Always keep local Discord team bridge updated too.
   await syncMaddenFranchises(guild, league).catch(error => errors.push('local team bridge: ' + error.message));
   await cleanupMaddenTradeBlockAfterRosterSync(guild.id, league.league_id).catch(error => errors.push('trade block cleanup: ' + error.message));
+
+  // 7J-AUTOHISTORYPOST: per Hxxdie — no manual command needed to post the
+  // season archive; check right after every sync that actually imported
+  // games, since that's the only data source a championship game could
+  // show up in. checkAndAutoPostMaddenSeasonHistory is a cheap no-op once
+  // nothing new is detected or the season's already been posted.
+  if (totals.games > 0) {
+    await checkAndAutoPostMaddenSeasonHistory(guild, league).catch(error => errors.push('season history auto-post: ' + error.message));
+  }
 
   const status = successfulEndpoints > 0 ? 'completed' : 'failed';
   const message = successfulEndpoints > 0
@@ -67518,6 +67567,7 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     new ButtonBuilder().setCustomId('commissioner_op:recruitreview:' + leagueId).setLabel('Review Applications').setEmoji('✅').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('commissioner_op:recruitdiscoverable:' + leagueId).setLabel('Discoverable Setting').setEmoji('🌐').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('commissioner_op:kick:' + leagueId).setLabel('Kick').setEmoji('👢').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('commissioner_op:repostseasonhistory:' + leagueId).setLabel('Repost Season Archive').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
   ));
   rows.push(buildCommissionerBackRow(leagueId));
   return rows;
