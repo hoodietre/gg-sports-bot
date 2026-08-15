@@ -7806,7 +7806,66 @@ function buildTournamentsEmbed(settings, rows) {
   return embed;
 }
 
-function buildTournamentInfoEmbed(settings, tournament, entries) {
+// 7J-TOURNEYREDESIGN: per Hxxdie — the old panel only showed buttons that
+// were currently valid, hiding everything else (e.g. Start Tournament was
+// invisible until you closed registration). That's exactly what caused the
+// "I don't see a Start button" confusion: the button wasn't missing, it was
+// conditionally hidden with no explanation. Every action now always renders;
+// ones that aren't valid yet show disabled with an inline reason instead of
+// vanishing.
+async function getTournamentActionAvailability(tournament, entries, matches) {
+  const entryCount = entries.length;
+  const hasMatches = matches.length > 0;
+  const isFull = Boolean(tournament.max_entries) && entryCount >= tournament.max_entries;
+  const reportable = matches.filter(m => m.status === 'scheduled' && m.player1_user_id && m.player2_user_id);
+  let hasHistory = false;
+  if (tournament.status === 'completed') {
+    const historyResult = await pool.query(`SELECT 1 FROM tournament_history WHERE tournament_id = $1 LIMIT 1`, [tournament.id]);
+    hasHistory = historyResult.rows.length > 0;
+  }
+
+  const notOpenReason = `Registration is ${tournament.status === 'closed' ? 'closed' : tournament.status}, not open.`;
+
+  return {
+    join: tournament.status !== 'open' ? { enabled: false, reason: notOpenReason }
+      : isFull ? { enabled: false, reason: 'Tournament is full.' }
+      : { enabled: true, reason: null },
+    close: tournament.status === 'open' ? { enabled: true, reason: null }
+      : { enabled: false, reason: `Registration is already ${tournament.status === 'closed' ? 'closed' : tournament.status}.` },
+    setseed: (['open', 'closed'].includes(tournament.status) && entryCount > 0 && !hasMatches) ? { enabled: true, reason: null }
+      : !entryCount ? { enabled: false, reason: 'No entries to seed yet.' }
+      : hasMatches ? { enabled: false, reason: 'Bracket already generated — seeding is locked.' }
+      : { enabled: false, reason: 'Only available before the tournament starts.' },
+    shuffle: (tournament.status === 'closed' && entryCount > 0 && !hasMatches) ? { enabled: true, reason: null }
+      : tournament.status !== 'closed' ? { enabled: false, reason: 'Close registration first.' }
+      : hasMatches ? { enabled: false, reason: 'Bracket already generated — seeding is locked.' }
+      : { enabled: false, reason: 'No entries to shuffle.' },
+    start: tournament.status === 'closed'
+      ? (entryCount >= 2 ? { enabled: true, reason: null } : { enabled: false, reason: `Need at least 2 entries to start (currently ${entryCount}).` })
+      : { enabled: false, reason: tournament.status === 'open' ? 'Close registration first.' : `Tournament is already ${tournament.status}.` },
+    report: tournament.status === 'active'
+      ? (reportable.length ? { enabled: true, reason: null } : { enabled: false, reason: 'No reportable matches right now.' })
+      : { enabled: false, reason: 'Only available once the tournament is active.' },
+    bracket: hasMatches ? { enabled: true, reason: null } : { enabled: false, reason: 'No bracket generated yet — start the tournament first.' },
+    setmvp: tournament.status === 'completed'
+      ? (hasHistory ? { enabled: true, reason: null } : { enabled: false, reason: 'Tournament history record not found yet.' })
+      : { enabled: false, reason: 'Only available once the tournament is completed.' },
+    postpone: ['open', 'closed', 'active'].includes(tournament.status) ? { enabled: true, reason: null }
+      : { enabled: false, reason: `Can't postpone a tournament that's already ${tournament.status}.` },
+    postpanel: { enabled: true, reason: null },
+    cancel: !['cancelled', 'completed'].includes(tournament.status) ? { enabled: true, reason: null }
+      : { enabled: false, reason: `Tournament is already ${tournament.status}.` },
+    delete: { enabled: true, reason: null },
+  };
+}
+
+const TOURNAMENT_ACTION_LABELS = {
+  join: 'Join Tournament', close: 'Close Registration', setseed: 'Set Seed', shuffle: 'Shuffle Seeds',
+  start: 'Start Tournament', report: 'Report Match', bracket: 'View Bracket', setmvp: 'Set MVP',
+  postpone: 'Postpone', postpanel: 'Post/Refresh Panel', cancel: 'Cancel Tournament', delete: 'Delete Tournament',
+};
+
+function buildTournamentInfoEmbed(settings, tournament, entries, availability) {
   const NL = String.fromCharCode(10);
   const buyIn = Number(tournament.buy_in) > 0 ? `${settings.currency_icon} ${tournament.buy_in} ${settings.currency_name}` : 'Free Entry';
   const prizePool = `${settings.currency_icon} ${tournament.prize_pool || 0} ${settings.currency_name}`;
@@ -7818,23 +7877,68 @@ function buildTournamentInfoEmbed(settings, tournament, entries) {
       }).join(NL)
     : 'No entries yet.';
 
-  return new EmbedBuilder()
-    .setTitle(`${tournament.tournament_name}`)
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 ${tournament.tournament_name}`)
     .setColor(0xED4245)
     .addFields(
       { name: 'Tournament ID', value: shortTournamentId(tournament.id), inline: true },
-      { name: 'Game', value: tournament.game || 'TBD', inline: true },
-      { name: 'Format', value: tournament.format, inline: true },
       { name: 'Status', value: tournament.status, inline: true },
       { name: 'Entries', value: maxEntries, inline: true },
+      { name: 'Game', value: tournament.game || 'TBD', inline: true },
+      { name: 'Format', value: tournament.format, inline: true },
       { name: 'Buy-in', value: buyIn, inline: true },
       { name: 'Prize Pool', value: prizePool, inline: true },
       { name: 'Prize', value: tournament.prize || 'Not listed', inline: true },
-      { name: 'Start Date', value: tournament.starts_at || 'TBD', inline: true },
-      { name: 'Entries', value: entryLines, inline: false }
-    )
-    .setFooter({ text: 'GG Sports • Tournament Info' })
-    .setTimestamp();
+      { name: 'Start', value: (tournament.starts_at || 'TBD') + (tournament.start_time ? ' at ' + tournament.start_time : ''), inline: true },
+      { name: 'Rules', value: tournament.rules || 'None set.', inline: false },
+      { name: 'Registered', value: entryLines, inline: false },
+    );
+
+  // Only list disabled actions that actually have a reason (delete/postpanel
+  // are unconditional so they'd never appear here).
+  const lockedLines = Object.entries(availability)
+    .filter(([, state]) => !state.enabled)
+    .map(([key, state]) => `**${TOURNAMENT_ACTION_LABELS[key]}** — ${state.reason}`);
+  if (lockedLines.length) {
+    embed.addFields({ name: '🔒 Not Yet Available', value: lockedLines.join(NL), inline: false });
+  }
+
+  return embed.setFooter({ text: 'GG Sports • Tournament Manager' }).setTimestamp();
+}
+
+function buildTournamentActionRows(tournament, availability) {
+  const btn = (key, emoji, style) => new ButtonBuilder()
+    .setCustomId(`tourneypanel_${key}:${tournament.id}`)
+    .setLabel(TOURNAMENT_ACTION_LABELS[key])
+    .setEmoji(emoji)
+    .setStyle(style)
+    .setDisabled(!availability[key].enabled);
+
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      btn('join', '🎟️', ButtonStyle.Success),
+      btn('close', '🔒', ButtonStyle.Secondary),
+      btn('setseed', '🔢', ButtonStyle.Secondary),
+      btn('shuffle', '🔀', ButtonStyle.Secondary),
+      btn('start', '🚀', ButtonStyle.Success),
+    ),
+    new ActionRowBuilder().addComponents(
+      btn('report', '📋', ButtonStyle.Primary),
+      btn('bracket', '🗂️', ButtonStyle.Secondary),
+      btn('setmvp', '⭐', ButtonStyle.Primary),
+      btn('postpone', '🕐', ButtonStyle.Secondary),
+    ),
+    new ActionRowBuilder().addComponents(
+      btn('postpanel', '📣', ButtonStyle.Secondary),
+      btn('cancel', '🚫', ButtonStyle.Danger),
+      btn('delete', '🗑️', ButtonStyle.Danger),
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('tourneypanel_home').setLabel('Back to Tournaments').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('adminpanel_back').setLabel('Back to Admin Panel').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+  return rows;
 }
 
 function buildTournamentChampionEmbed(settings, tournament, championUserId, prizePaid = 0) {
@@ -8210,59 +8314,13 @@ async function buildTournamentManagerHomePayload(guild) {
   return { embeds: [embed], components };
 }
 
-function buildTournamentManagerBackRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('tourneypanel_home').setLabel('⬅ Back to Tournaments').setStyle(ButtonStyle.Secondary)
-  );
-}
-
 async function buildTournamentManagerViewPayload(guild, tournament) {
   const settings = await getCurrencySettings(guild.id);
   const entries = await getTournamentEntries(tournament.id);
-  const embed = buildTournamentInfoEmbed(settings, tournament, entries);
-  const rows = [];
-
-  const row1 = new ActionRowBuilder();
-  if (tournament.status === 'open') {
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_join:${tournament.id}`).setLabel('Join Tournament').setEmoji('🎟️').setStyle(ButtonStyle.Success));
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_close:${tournament.id}`).setLabel('Close Registration').setEmoji('🔒').setStyle(ButtonStyle.Secondary));
-  }
-  if (['open', 'closed'].includes(tournament.status) && !(await getTournamentMatches(tournament.id)).length) {
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_setseed:${tournament.id}`).setLabel('Set Seed').setEmoji('🔢').setStyle(ButtonStyle.Secondary));
-  }
-  if (tournament.status === 'closed') {
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_shuffle:${tournament.id}`).setLabel('Shuffle Seeds').setEmoji('🔀').setStyle(ButtonStyle.Secondary));
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_start:${tournament.id}`).setLabel('Start Tournament').setEmoji('🚀').setStyle(ButtonStyle.Success));
-  }
-  if (tournament.status === 'active') {
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_report:${tournament.id}`).setLabel('Report Match').setEmoji('📋').setStyle(ButtonStyle.Primary));
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_bracket:${tournament.id}`).setLabel('View Bracket').setEmoji('🗂️').setStyle(ButtonStyle.Secondary));
-  }
-  if (tournament.status === 'completed') {
-    row1.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_setmvp:${tournament.id}`).setLabel('Set MVP').setEmoji('⭐').setStyle(ButtonStyle.Primary));
-  }
-  if (row1.components.length) rows.push(row1);
-
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`tourneypanel_postpanel:${tournament.id}`).setLabel('Post/Refresh Panel').setEmoji('📣').setStyle(ButtonStyle.Secondary)
-  );
-  if (['open', 'closed', 'active'].includes(tournament.status)) {
-    row2.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_postpone:${tournament.id}`).setLabel('Postpone').setEmoji('🕒').setStyle(ButtonStyle.Secondary));
-  }
-  rows.push(row2);
-
-  const row3 = new ActionRowBuilder();
-  if (['open', 'closed', 'active'].includes(tournament.status)) {
-    row3.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_cancel:${tournament.id}`).setLabel('Cancel Tournament').setEmoji('🛑').setStyle(ButtonStyle.Danger));
-  }
-  row3.addComponents(new ButtonBuilder().setCustomId(`tourneypanel_delete:${tournament.id}`).setLabel('Delete Tournament').setEmoji('🗑️').setStyle(ButtonStyle.Danger));
-  rows.push(row3);
-
-  rows.push(buildTournamentManagerBackRow());
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Admin Panel').setStyle(ButtonStyle.Secondary)
-  ));
-
+  const matches = await getTournamentMatches(tournament.id);
+  const availability = await getTournamentActionAvailability(tournament, entries, matches);
+  const embed = buildTournamentInfoEmbed(settings, tournament, entries, availability);
+  const rows = buildTournamentActionRows(tournament, availability);
   return { embeds: [embed], components: rows };
 }
 
