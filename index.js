@@ -13424,7 +13424,7 @@ if (interaction.commandName === 'avatar') {
         if (!interaction.guild) return;
 
         const panelType = interaction.customId.split(':')[1] || 'support';
-        const ticketType = panelType === 'dispute' ? 'dispute' : 'support';
+        const ticketType = panelType === 'dispute' ? 'dispute' : panelType === 'game' ? 'gamerequest' : panelType === 'shop' ? 'shop' : 'support';
         const subjectMap = {
           support: 'Support Request',
           dispute: 'Dispute Review',
@@ -13447,7 +13447,7 @@ if (interaction.commandName === 'avatar') {
           }
         };
 
-        await openSupportTicket(interaction, panelType === 'game' ? 'gamerequest' : ticketType, { isPrivate: true });
+        await openSupportTicket(interaction, ticketType, { isPrivate: true });
         return;
       }
 
