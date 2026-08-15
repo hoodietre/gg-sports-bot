@@ -34098,7 +34098,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'Member Since', value: memberSinceDisplay, inline: true },
       { name: 'League Scope', value: activeLeague ? activeLeague.league_name : 'All Leagues', inline: true },
       { name: '⚡ Activity', value: activityIcon + ' ' + normalizedActivityTier + ' • ' + String(recognition.activity_points || 0) + ' pts', inline: true },
-      { name: '🏆 Legacy', value: legacyIcon + ' ' + legacyTier.name + ' • ' + String(recognition.legacy_score || 0) + ' pts', inline: true },
+      { name: '🏆 Legacy', value: legacyIcon + ' ' + (legacyTier.name || legacyTier) + ' • ' + String(recognition.legacy_score || 0) + ' pts', inline: true },
       { name: 'Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
       { name: 'All-Time Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
       { name: 'All-Time Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
