@@ -8397,17 +8397,24 @@ function buildDateTimePickerStepA(prefix, token, session) {
     .setCustomId(`${prefix}_dtmonth:${token}`)
     .setPlaceholder('Month')
     .addOptions(TOURNAMENT_MONTH_NAMES.map((name, i) => ({ label: name, value: String(i + 1), default: session.month === i + 1 })));
-  const dayMenu = new StringSelectMenuBuilder()
-    .setCustomId(`${prefix}_dtday:${token}`)
-    .setPlaceholder('Day')
-    .addOptions(Array.from({ length: 31 }, (_, i) => ({ label: String(i + 1), value: String(i + 1), default: session.day === i + 1 })));
+  // Discord caps a select menu at 25 options — 31 days doesn't fit in one,
+  // and no month has ≤25 days (even February has 28), so this split is
+  // unavoidable rather than being solvable by scoping to the chosen month.
+  const day1Menu = new StringSelectMenuBuilder()
+    .setCustomId(`${prefix}_dtday1:${token}`)
+    .setPlaceholder('Day (1–16)')
+    .addOptions(Array.from({ length: 16 }, (_, i) => ({ label: String(i + 1), value: String(i + 1), default: session.day === i + 1 })));
+  const day2Menu = new StringSelectMenuBuilder()
+    .setCustomId(`${prefix}_dtday2:${token}`)
+    .setPlaceholder('Day (17–31)')
+    .addOptions(Array.from({ length: 15 }, (_, i) => ({ label: String(i + 17), value: String(i + 17), default: session.day === i + 17 })));
   const continueRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`${prefix}_dtdatecontinue:${token}`).setLabel('Continue to Time').setStyle(ButtonStyle.Primary).setDisabled(!session.month || !session.day)
   );
   const picked = session.month && session.day ? `${TOURNAMENT_MONTH_NAMES[session.month - 1]} ${session.day}` : 'not picked yet';
   return {
     content: `**Pick a date — Step 1 of 2**\nDate: **${picked}**`,
-    embeds: [], components: [new ActionRowBuilder().addComponents(monthMenu), new ActionRowBuilder().addComponents(dayMenu), continueRow],
+    embeds: [], components: [new ActionRowBuilder().addComponents(monthMenu), new ActionRowBuilder().addComponents(day1Menu), new ActionRowBuilder().addComponents(day2Menu), continueRow],
   };
 }
 
@@ -17583,7 +17590,16 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dtday:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dtday1:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentEditSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneyedit', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneyedit_dtday2:')) {
       const token = interaction.customId.split(':')[1];
       const session = tournamentEditSessions.get(token);
       if (!session) { await interaction.update({ content: 'This session expired. Click Edit Tournament again.', components: [] }); return; }
@@ -17733,7 +17749,16 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dtday:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dtday1:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentCreateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneycreate', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneycreate_dtday2:')) {
       const token = interaction.customId.split(':')[1];
       const session = tournamentCreateSessions.get(token);
       if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
@@ -18066,7 +18091,16 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dtday:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dtday1:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = tournamentPostponeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('tourneypostpone', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('tourneypostpone_dtday2:')) {
       const token = interaction.customId.split(':')[1];
       const session = tournamentPostponeSessions.get(token);
       if (!session) { await interaction.update({ content: 'This session expired. Click Postpone again.', components: [] }); return; }
