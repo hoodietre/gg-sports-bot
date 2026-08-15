@@ -3608,20 +3608,6 @@ function buildCommands() {
         .addStringOption(o => o.setName('team').setDescription('Team name').setRequired(true).setAutocomplete(true))),
 
     new SlashCommandBuilder()
-      .setName('maddenplayer')
-      .setDescription('Expanded Madden player attribute and progression tools')
-      .addSubcommand(sc => sc
-        .setName('attributes')
-        .setDescription('Show full imported attributes and contract data for a player')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true)))
-      .addSubcommand(sc => sc
-        .setName('progression')
-        .setDescription('Show saved progression/change history for a player')
-        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
-        .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true).setAutocomplete(true))),
-
-    new SlashCommandBuilder()
       .setName('maddenteam')
       .setDescription('Expanded Madden team rankings and profiles')
       .addSubcommand(sc => sc
@@ -10281,7 +10267,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
-        if (['maddencap', 'maddenplayer', 'maddenteam', 'maddendiagnostics', 'maddenverify'].includes(commandName)) {
+        if (['maddencap', 'maddenteam', 'maddendiagnostics', 'maddenverify'].includes(commandName)) {
           const focused = interaction.options.getFocused(true);
           if (focused?.name === 'league') {
             const choices = await getMaddenLeagueAutocompleteChoices(interaction.guild.id, focused.value, 'madden');
@@ -17136,6 +17122,18 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('madplayer_progression:')) {
+      const [, leagueId, encodedName] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const playerName = decodeURIComponent(encodedName || '');
+      await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, league.league_id).catch(() => null);
+      const embed = await buildMaddenPlayerProgressionEmbed(interaction.guild.id, league, playerName);
+      await interaction.editReply({ embeds: [embed] });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('madneg_start:')) {
       const leagueId = interaction.customId.split(':')[1];
       await showMaddenTeamPicker(interaction, 'neg', leagueId, { update: false });
@@ -21634,33 +21632,6 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden verify command.' });
-      return;
-    }
-
-    if (interaction.commandName === 'maddenplayer') {
-      if (!interaction.guild) return;
-      if (!interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ ephemeral: true });
-      }
-      if (!(await requirePremiumFeature(interaction, 'Player Search'))) return;
-      const subcommand = interaction.options.getSubcommand(false);
-      const leagueName = interaction.options.getString('league');
-      const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
-      if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
-        return;
-      }
-      const player = interaction.options.getString('player');
-      await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
-      if (subcommand === 'attributes') {
-        await interaction.editReply({ embeds: [await buildMaddenPlayerAttributesEmbed(interaction.guild.id, activeLeague, player)] });
-        return;
-      }
-      if (subcommand === 'progression') {
-        await interaction.editReply({ embeds: [await buildMaddenPlayerProgressionEmbed(interaction.guild.id, activeLeague, player)] });
-        return;
-      }
-      await interaction.editReply({ content: 'Unknown Madden player command.' });
       return;
     }
 
@@ -30905,7 +30876,7 @@ function buildSetupGuideEmbed() {
         name: '8. Madden Leagues 🆓 + 💎',
         value:
           '**/madden connect** then **/madden sync** to pull EA data — this is 🆓 Free and drives the core trade/standings/roster pipeline. **Operations** for sync/scans/auto-detection.\n' +
-          '💎 Premium adds: **/maddenfreeagents**, **/maddennews**, **/maddenplayer**, the Madden Trade Analyzer/Find/Needs/GM tools (`/maddentrade`), Draft Recap grades, League History posts, League Leaders, Award Race, and the GM Panel/Franchise Hub boards.',
+          '💎 Premium adds: **/maddenfreeagents**, **/maddennews**, the Player Search panel, the Madden Trade Analyzer/Find/Needs/GM tools (`/maddentrade`), Draft Recap grades, League History posts, League Leaders, Award Race, and the GM Panel/Franchise Hub boards.',
         inline: false,
       },
       {
@@ -30971,7 +30942,7 @@ function buildCommandsGuideEmbed() {
         name: 'Madden 🆓 + 💎',
         value:
           '🆓 Core sync: /madden connect, /madden connections, /madden disconnect, /madden link, /madden sync, /madden autosync, /madden syncfeed, /madden settings, /madden imported, /madden standings, /madden schedule, /madden players, /madden team, /madden recentgames, /madden importteams, /madden importgames, /madden importstandings, /madden importplayers, /madden setup, /madden league, /madden teams, /madden franchise\n' +
-          '💎 /maddenfreeagents, /maddennews, /maddenplayer, /maddentrade (analyze/find/needs/gm), /draftrecap',
+          '💎 /maddenfreeagents, /maddennews, Player Search panel, /maddentrade (analyze/find/needs/gm), /draftrecap',
         inline: false,
       },
       {
@@ -34104,7 +34075,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'All-Time Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
       { name: 'Sportsbook Record', value: String(bets.won_bets || 0) + '-' + String(bets.lost_bets || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(bets.net_profit || 0), inline: false },
       { name: 'Parlays', value: 'Won: ' + String(parlays.won_parlays || 0) + ' • Settled: ' + String(parlays.settled_parlays || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(parlays.parlay_profit || 0), inline: false },
-      { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • MVPs: ' + String(tournaments.tournament_mvps || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
+      { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
       { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false },
       { name: '🌐 Universal Activity Grade', value: universalGradeDisplay, inline: false },
       { name: 'Badges', value: badgesDisplay.slice(0, 1024), inline: false },
@@ -39584,7 +39555,15 @@ function buildMaddenPlayerProfileActionRow(leagueId, playerName) {
       .setCustomId('madneg_from_profile:' + leagueId + ':' + encodeURIComponent(String(playerName || '').slice(0, 80)))
       .setLabel('Start Negotiation')
       .setEmoji('🤝')
-      .setStyle(ButtonStyle.Primary)
+      .setStyle(ButtonStyle.Primary),
+    // 7J-MADDENPLAYERRETIRE: per Hxxdie, /maddenplayer progression migrated
+    // here rather than kept as a separate command — Player Search now fully
+    // encompasses it.
+    new ButtonBuilder()
+      .setCustomId('madplayer_progression:' + leagueId + ':' + encodeURIComponent(String(playerName || '').slice(0, 80)))
+      .setLabel('View Progression')
+      .setEmoji('📈')
+      .setStyle(ButtonStyle.Secondary)
   )];
 }
 
@@ -47866,31 +47845,6 @@ async function buildMaddenVerifyStandingsEmbed(guildId, league, teamInput) {
   });
   embed.addFields({ name: `Completed Games Counted (${gameLines.length})`, value: maddenSafeEmbedText(gameLines.join('\n'), 3900), inline: false });
 
-  return embed;
-}
-
-async function buildMaddenPlayerAttributesEmbed(guildId, league, playerInput) {
-  const row = await getMaddenExpandedPlayerRow(guildId, league.league_id, playerInput);
-  const embed = new EmbedBuilder()
-    .setTitle(`🧬 Player Attributes • ${league.league_name}`)
-    .setColor(0x5865F2)
-    .setFooter({ text: 'GG Sports • 7J-10BY-DE Player Attributes' })
-    .setTimestamp();
-  if (!row) {
-    embed.setDescription(`No expanded attribute record found for **${playerInput}** yet. Run Madden sync, then try again.`);
-    return embed;
-  }
-  const attrs = maddenBydRaw(row.attributes);
-  const teamCtx = await getMaddenBydeTeamContext(guildId, league.league_id, row.team_name || 'Free Agent');
-  embed.setTitle(`🧬 ${row.player_name}`);
-  embed.setDescription(`**${teamCtx.displayName || maddenTeamDisplayName(row.team_name || 'Free Agent')}** • ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR`);
-  embed.addFields(
-    { name: 'Core Info', value: [`Dev: **${row.dev_trait || 'Unknown'}**`, `Archetype: **${row.archetype || 'Unknown'}**`, `Age: **${row.age ?? 'N/A'}**`].join('\n'), inline: true },
-    { name: 'Contract', value: [`Status: **${row.contract_status || 'Unknown'}**`, `Years Left: **${row.years_left ?? 'N/A'}**`, `Cap Hit: **${formatMaddenMoney(row.cap_hit || 0)}**`].join('\n'), inline: true },
-    { name: 'Top Attributes', value: maddenSafeEmbedText(maddenBydTopAttributesLine(attrs, 18, row.position), 1024), inline: false }
-  );
-  const logo = getMaddenTeamLogoUrl(teamCtx.teamName) || getMaddenTeamLogoUrl(row.team_name);
-  if (logo) embed.setThumbnail(logo);
   return embed;
 }
 
@@ -57398,6 +57352,16 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
     .setTimestamp();
 }
 
+// Madden stores height as total inches (e.g. 74) — meaningless to display
+// raw; converts to the familiar 6'2" format.
+function formatMaddenHeight(totalInches) {
+  const n = Number(totalInches);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const feet = Math.floor(n / 12);
+  const inches = Math.round(n % 12);
+  return `${feet}'${inches}"`;
+}
+
 function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = [], valueRankContext = {}) {
   const displayName = maddenPlayerDisplayName(player);
   const teamName = player.resolved_team_name || player.team_name || 'Free Agent';
@@ -57411,13 +57375,16 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
 
   const physical = [
     player.age ? `Age ${player.age}` : null,
-    player.height ? `Height ${player.height}` : null,
+    player.height ? `Height ${formatMaddenHeight(player.height) || player.height}` : null,
     player.weight ? `Weight ${player.weight}` : null,
     raw.college ? `College ${raw.college}` : null,
   ].filter(Boolean).join(' • ');
 
   const byType = Object.fromEntries((statRows || []).map(row => [row.stat_type, row]));
   const fields = [];
+
+  const rawArchetype = maddenDcFirstDeep(raw, ['archetype', 'playerArchetype', 'schemeArchetype', 'archetypeName', 'scheme'], null);
+  const archetypeText = rawArchetype && !/^\d+$/.test(String(rawArchetype).trim()) ? String(rawArchetype) : null;
 
   fields.push({
     name: 'Player Info',
@@ -57426,6 +57393,7 @@ function buildMaddenPlayerProfileEmbed(league, player, statRows = [], ranks = []
       `**Position:** ${posText}`,
       `**Overall:** ${ovrText}`,
       `**Development:** ${devText}`,
+      archetypeText ? `**Archetype:** ${archetypeText}` : null,
       jerseyText ? `**Jersey:** ${jerseyText}` : null,
     ].filter(Boolean).join('\n'),
     inline: false,
