@@ -9485,6 +9485,72 @@ async function postOrRefreshMultiChannelPanel(guild, panelType, channel) {
 // deleted out from under it, reposts fresh in that same channel rather than silently
 // dropping it. Used both by the manual "Refresh All" button and by auto-refresh call
 // sites (after a purchase, a new open game, etc.) that used to target a single panel.
+// ---------------------------------------------------------------------------
+// 7J-PERMALERT: self-diagnosing permission issues, per Hxxdie — a channel
+// the bot can't access is a completely invisible failure mode from inside
+// the bot's own error handling (every failure point in this codebase
+// defensively catches and continues, which is correct for resilience but
+// means a real, ongoing problem like "the bot was never given access to
+// #sportsbook-board" can silently persist for weeks with zero signal to
+// anyone). This distinguishes actual Discord permission errors (codes 50001
+// Missing Access, 50013 Missing Permissions) from other failure types, and
+// DMs the server owner — cooled down per distinct issue so a broken channel
+// doesn't spam a DM on every single sync/refresh attempt.
+// ---------------------------------------------------------------------------
+async function ensureBotPermissionAlertsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot_permission_alerts (
+      guild_id TEXT NOT NULL,
+      alert_key TEXT NOT NULL,
+      last_sent_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, alert_key)
+    )
+  `);
+}
+
+function isDiscordPermissionError(err) {
+  const code = err?.code ?? err?.rawError?.code;
+  return code === 50001 || code === 50013;
+}
+
+// alertKey should uniquely identify the specific channel+action so different
+// broken channels each get their own alert/cooldown rather than one masking
+// another. 24h cooldown per key — enough to avoid spam from a busy sync
+// loop, short enough that a real unresolved problem keeps surfacing.
+async function notifyOwnerOfBotPermissionIssue(guild, alertKey, channelId, description) {
+  if (!guild) return;
+  await ensureBotPermissionAlertsTable().catch(() => null);
+
+  const recent = await pool.query(
+    `SELECT 1 FROM bot_permission_alerts WHERE guild_id = $1 AND alert_key = $2 AND last_sent_at > NOW() - INTERVAL '24 hours'`,
+    [guild.id, alertKey]
+  ).catch(() => ({ rows: [] }));
+  if (recent.rows.length) return;
+
+  await pool.query(
+    `INSERT INTO bot_permission_alerts (guild_id, alert_key, last_sent_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (guild_id, alert_key) DO UPDATE SET last_sent_at = NOW()`,
+    [guild.id, alertKey]
+  ).catch(() => null);
+
+  const owner = await guild.fetchOwner().catch(() => null);
+  if (!owner) return;
+
+  const embed = new EmbedBuilder()
+    .setTitle('⚠️ GG Sports needs a permission fixed')
+    .setColor(0xED4245)
+    .setDescription(description)
+    .addFields(
+      { name: 'Channel', value: channelId ? `<#${channelId}>` : 'Unknown', inline: true },
+      { name: 'What to check', value: 'Edit that channel\'s permissions and make sure the GG Sports bot role has **View Channel**, **Send Messages**, **Embed Links**, and **Read Message History**.', inline: false },
+    )
+    .setFooter({ text: `GG Sports • ${guild.name}` })
+    .setTimestamp();
+
+  await owner.send({ embeds: [embed] }).catch(() => null);
+}
+
 async function refreshAllMultiChannelPanelPostings(guild, panelType) {
   const info = getMultiChannelPanelInfo(panelType);
   if (!info || !guild) return { refreshed: 0, reposted: 0, failed: 0, total: 0 };
@@ -9501,17 +9567,29 @@ async function refreshAllMultiChannelPanelPostings(guild, panelType) {
   for (const row of result.rows) {
     const channel = await guild.channels.fetch(row.channel_id).catch(err => {
       console.error(`[PANEL REFRESH] ${panelType} channel fetch failed for ${row.channel_id}:`, err?.message || err);
+      if (isDiscordPermissionError(err)) {
+        notifyOwnerOfBotPermissionIssue(guild, `panel:${panelType}:${row.channel_id}`, row.channel_id,
+          `I can't see the channel your **${info.label}** is posted in, so it hasn't been updating.`).catch(() => null);
+      }
       return null;
     });
     if (!channel || !channel.isTextBased()) { failed++; continue; }
 
     const message = await channel.messages.fetch(row.message_id).catch(err => {
       console.error(`[PANEL REFRESH] ${panelType} message fetch failed for ${row.message_id} in #${channel.name}:`, err?.message || err);
+      if (isDiscordPermissionError(err)) {
+        notifyOwnerOfBotPermissionIssue(guild, `panel:${panelType}:${row.channel_id}`, row.channel_id,
+          `I don't have permission to read message history in **#${channel.name}**, so your **${info.label}** hasn't been updating.`).catch(() => null);
+      }
       return null;
     });
     if (message) {
       const edited = await message.edit(payload).catch(err => {
         console.error(`[PANEL REFRESH] ${panelType} message edit failed for ${row.message_id} in #${channel.name}:`, err?.message || err);
+        if (isDiscordPermissionError(err)) {
+          notifyOwnerOfBotPermissionIssue(guild, `panel:${panelType}:${row.channel_id}`, row.channel_id,
+            `I don't have permission to edit messages in **#${channel.name}**, so your **${info.label}** hasn't been updating.`).catch(() => null);
+        }
         return null;
       });
       if (edited) {
@@ -9523,6 +9601,10 @@ async function refreshAllMultiChannelPanelPostings(guild, panelType) {
     } else {
       const newMessage = await channel.send(payload).catch(err => {
         console.error(`[PANEL REFRESH] ${panelType} repost failed in #${channel.name}:`, err?.message || err);
+        if (isDiscordPermissionError(err)) {
+          notifyOwnerOfBotPermissionIssue(guild, `panel:${panelType}:${row.channel_id}`, row.channel_id,
+            `I don't have permission to send messages in **#${channel.name}**, so your **${info.label}** hasn't been posting.`).catch(() => null);
+        }
         return null;
       });
       if (newMessage) {
@@ -13162,7 +13244,7 @@ if (interaction.commandName === 'avatar') {
           return;
         }
         if (sportsbookGame.bets_locked) {
-          await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
+          await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 5-minute window has passed.', ephemeral: true });
           return;
         }
         const selfBetConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
@@ -15099,6 +15181,19 @@ if (interaction.commandName === 'avatar') {
         currentRound += 1;
         await pool.query(`UPDATE league_custom_settings SET current_round = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, currentRound]);
 
+        // 7J-UNSCOREDADVANCE: per Hxxdie — structured-schedule games are on a
+        // fixed round-by-round clock (unlike open-schedule, which has no
+        // deadline at all), so a round that never got its score reported
+        // before the league advances is the one clear, well-defined trigger
+        // point to consider that game abandoned. Runs before thread deletion
+        // below so owners still have a real channel to be pinged in, not
+        // just a DM that might go unread.
+        let unscoredCleanup = null;
+        if (previousRoundLabel) {
+          unscoredCleanup = await refundUnscoredStructuredGamesForRound(interaction.guild, league, previousRoundLabel)
+            .catch(err => { console.error('[Structured Advance] Unscored game cleanup failed:', err?.message || err); return { checked: 0, refunded: 0 }; });
+        }
+
         // Delete the previous round's game threads before creating the new
         // round's — per Hxxdie, these were piling up indefinitely since
         // nothing ever cleaned them up. Discord threads only; the
@@ -15156,7 +15251,10 @@ if (interaction.commandName === 'avatar') {
         const cleanupNote = previousRoundCleanup && (previousRoundCleanup.deleted || previousRoundCleanup.failed)
           ? `\n🧹 Cleaned up ${previousRoundLabel}: ${previousRoundCleanup.deleted} old thread(s) removed${previousRoundCleanup.failed ? `, ${previousRoundCleanup.failed} failed` : ''}.`
           : '';
-        await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}${cleanupNote}` });
+        const unscoredNote = unscoredCleanup && unscoredCleanup.checked
+          ? `\n⚠️ ${unscoredCleanup.checked} game(s) from ${previousRoundLabel} never had a final score reported${unscoredCleanup.refunded ? ` — ${unscoredCleanup.refunded} open bet line(s) refunded` : ''}. Involved owners have been notified.`
+          : '';
+        await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}${cleanupNote}${unscoredNote}` });
         return;
       }
 
@@ -15796,6 +15894,30 @@ if (interaction.commandName === 'avatar') {
 
       await interaction.update({ content: 'Creating matchup…', components: [] });
 
+      // 7J-UNSCOREDBLOCK: per Hxxdie — open-schedule leagues have no fixed
+      // cadence forcing a score to ever get reported (unlike structured,
+      // which has the Advance button as a natural checkpoint), so without
+      // this a team could just keep adding new games indefinitely while
+      // old ones sit unreported forever. Checked against both teams, not
+      // just the clicking user, since a team can have more than one
+      // acting owner/GM.
+      const openScheduleSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      if (openScheduleSettings.schedule_style !== 'structured') {
+        const unscoredExisting = await pool.query(
+          `SELECT * FROM league_games
+           WHERE guild_id = $1 AND league_id = $2 AND status != 'final'
+             AND (home_team_role_id = $3 OR away_team_role_id = $3 OR home_team_role_id = $4 OR away_team_role_id = $4)
+           ORDER BY created_at ASC LIMIT 1`,
+          [interaction.guild.id, leagueId, homeRoleId, awayRoleId]
+        ).catch(() => ({ rows: [] }));
+        const blocker = unscoredExisting.rows[0];
+        if (blocker) {
+          const blockedTeamName = [homeRoleId, awayRoleId].includes(blocker.home_team_role_id) ? blocker.home_team_name : blocker.away_team_name;
+          await interaction.editReply({ content: `**${blockedTeamName}** still has an unreported game (**${blocker.away_team_name} @ ${blocker.home_team_name}**) — report that score first before scheduling a new one.` });
+          return;
+        }
+      }
+
       const createResult = await createLeagueGameCore(interaction, league, homeRole, awayRole, {});
       if (!createResult.ok) {
         await interaction.editReply({ content: createResult.message });
@@ -15816,6 +15938,18 @@ if (interaction.commandName === 'avatar') {
       const game = await findLeagueGameById(interaction.guild.id, gameId);
       if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
       if (game.status === 'final') { await interaction.reply({ content: 'This game has already been reported.', ephemeral: true }); return; }
+
+      // 7J-GSGAME: per Hxxdie — Game Started exists to open a real, fair
+      // betting window before the outcome is locked in. Someone could
+      // otherwise wait until the game is already effectively over, press
+      // Game Started, and report the score seconds later — technically
+      // satisfying "press it before reporting" while defeating the entire
+      // point. Report Score is blocked for a full 20 minutes after Game
+      // Started is pressed — longer than the 5-minute betting lock itself —
+      // so there's no way to compress that window into nothing. Staff still
+      // have the separate Force Win override for genuine corrections.
+      const gsBlock = gameCenterReportScoreLockBlock(game);
+      if (gsBlock) { await interaction.reply({ content: gsBlock, ephemeral: true }); return; }
 
       const modal = new ModalBuilder()
         .setCustomId('gamecenter_report_submit:' + gameId)
@@ -15885,6 +16019,9 @@ if (interaction.commandName === 'avatar') {
       const game = await findLeagueGameById(interaction.guild.id, gameId);
       if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
 
+      const gsBlockSubmit = gameCenterReportScoreLockBlock(game);
+      if (gsBlockSubmit) { await interaction.reply({ content: gsBlockSubmit, ephemeral: true }); return; }
+
       const homeScore = Number.parseInt(interaction.fields.getTextInputValue('home_score'), 10);
       const awayScore = Number.parseInt(interaction.fields.getTextInputValue('away_score'), 10);
       if (!Number.isInteger(homeScore) || !Number.isInteger(awayScore) || homeScore < 0 || awayScore < 0) {
@@ -15916,7 +16053,7 @@ if (interaction.commandName === 'avatar') {
     // 7J-48LOCK: Track H item 26 — anti-late-betting exploit. Either team
     // owner in the matchup OR staff can press this, per Hxxdie. Locks every
     // sportsbook_games row tied to this league_game (moneyline + any props)
-    // to close in 15 minutes — not immediately, so people already watching
+    // to close in 5 minutes — not immediately, so people already watching
     // the stream mid-game still get a fair warning window to get a last bet
     // in before it locks, rather than the line vanishing without notice.
     if (interaction.isButton() && interaction.customId.startsWith('gamecenter_gamestarted:')) {
@@ -15944,7 +16081,7 @@ if (interaction.commandName === 'avatar') {
 
       await interaction.deferReply();
 
-      const lockAt = new Date(Date.now() + 15 * 60 * 1000);
+      const lockAt = new Date(Date.now() + 5 * 60 * 1000);
       await pool.query(
         `UPDATE league_games SET game_started_at = NOW(), game_started_by_user_id = $2, updated_at = NOW() WHERE id = $1`,
         [game.id, interaction.user.id]
@@ -15960,7 +16097,7 @@ if (interaction.commandName === 'avatar') {
       const lockEmbed = new EmbedBuilder()
         .setTitle('🔒 Game Started')
         .setColor(0xFEE75C)
-        .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **15 minutes**.`)
+        .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **5 minutes**.`)
         .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
         .setTimestamp();
       await interaction.editReply({ embeds: [lockEmbed] });
@@ -18732,6 +18869,32 @@ if (interaction.commandName === 'avatar') {
       await interaction.editReply({
         content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and ${panelSummary}. Welcome/Leave channels included and enabled. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
         ...payload,
+      });
+      return;
+    }
+
+    // 7J-PERMAUDIT: on-demand full sweep, per Hxxdie — checks every
+    // configured channel across every league plus the guild-wide panels in
+    // one pass, rather than waiting to find out reactively next time
+    // something tries to post there and fails.
+    if (interaction.isButton() && interaction.customId === 'adminpanel_serversetup_checkperms') {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const problems = await auditGuildChannelPermissions(interaction.guild).catch(err => {
+        console.error('[PERM AUDIT] Failed:', err?.message || err);
+        return null;
+      });
+      if (problems === null) {
+        await interaction.editReply({ content: 'Something went wrong running the permission check — try again in a moment.' });
+        return;
+      }
+      if (!problems.length) {
+        await interaction.editReply({ content: '✅ All configured channels look good — the bot can see and post in every one of them.' });
+        return;
+      }
+      const lines = problems.slice(0, 20).map(p => `**${p.label}** (<#${p.channelId}>) — ${p.issue}`);
+      await interaction.editReply({
+        content: `⚠️ Found **${problems.length}** channel(s) with a problem:\n\n${lines.join('\n')}${problems.length > 20 ? `\n…and ${problems.length - 20} more.` : ''}\n\nFor a missing-permission channel, edit its permissions and make sure the GG Sports bot role has View Channel, Send Messages, Embed Links, and Read Message History.`,
       });
       return;
     }
@@ -25863,7 +26026,7 @@ if (shopSubcommand === 'view') {
           payout = sportsbookBounds.max_payout;
         }
         if (sportsbookGame.bets_locked) {
-          await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 15-minute window has passed.', ephemeral: true });
+          await interaction.reply({ content: '🔒 Betting on this game has closed \u2014 "Game Started" was pressed and the 5-minute window has passed.', ephemeral: true });
           return;
         }
         const selfBetConflict = await checkSportsbookSelfBetConflict(interaction.guild, sportsbookGame, interaction.user.id);
@@ -29303,6 +29466,69 @@ async function createLeagueGameCore(interaction, activeLeague, home, away, { sch
   return { ok: true, game };
 }
 
+// 7J-UNSCOREDADVANCE: structured-schedule leagues advance on a fixed round
+// clock — if a round's score was never reported by the time the commissioner
+// advances past it, per Hxxdie: refund any open bets on that game (with a
+// clear reason so bettors aren't left guessing why their currency came
+// back), and DM both team owners so they know to report scores promptly on
+// future rounds rather than letting them pile up unreported.
+async function refundUnscoredStructuredGamesForRound(guild, league, weekLabel) {
+  const unscoredGames = await pool.query(
+    `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3 AND status != 'final'`,
+    [guild.id, league.league_id, weekLabel]
+  ).catch(() => ({ rows: [] }));
+
+  let refunded = 0;
+  for (const game of unscoredGames.rows || []) {
+    const openLines = await pool.query(
+      `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND league_game_id = $2 AND status = 'open'`,
+      [guild.id, game.id]
+    ).catch(() => ({ rows: [] }));
+
+    for (const line of openLines.rows || []) {
+      await refundSportsbookGameBets(
+        guild,
+        line,
+        'system',
+        `${weekLabel} advanced without a final score being reported for ${game.away_team_name} @ ${game.home_team_name} — bets refunded automatically.`
+      ).catch(err => console.error('[Structured Advance] Refund failed for unscored game:', err?.message || err));
+      refunded += 1;
+    }
+
+    const homeOwner = await findTeamOwnerByRoleId(guild, game.home_team_role_id).catch(() => null);
+    const awayOwner = await findTeamOwnerByRoleId(guild, game.away_team_role_id).catch(() => null);
+    const reminderText = `Your **${weekLabel}** matchup (**${game.away_team_name} @ ${game.home_team_name}**) in **${league.league_name}** advanced without a final score ever being reported${openLines.rows.length ? ' — any open bets on it have been refunded' : ''}. Please report scores promptly once a game finishes so this doesn't happen again.`;
+    for (const owner of [homeOwner, awayOwner].filter(Boolean)) {
+      await owner.send({ content: reminderText }).catch(() => null);
+    }
+  }
+
+  return { checked: (unscoredGames.rows || []).length, refunded };
+}
+
+// 7J-GSGAME: shared guard for both the Report Score button and its modal
+// submit — blocks reporting for 20 minutes after Game Started is pressed,
+// so pressing Game Started right before reporting can't be used to
+// technically satisfy the requirement while skipping the real betting
+// window it exists to protect. Deliberately longer than the 5-minute
+// betting lock itself (bets_lock_at, set where Game Started is pressed) —
+// these are two independent timers now, per Hxxdie: betting closes fast so
+// a real in-progress game doesn't stay bettable too long, but reporting
+// stays blocked well past that so there's no incentive to rush a report
+// the moment betting closes. Games that never had Game Started pressed at
+// all aren't blocked here — that's the existing, separate refund-on-settle
+// behavior's job.
+function gameCenterReportScoreLockBlock(game) {
+  if (!game?.game_started_at) return null;
+  const LOCK_DELAY_MS = 20 * 60 * 1000;
+  const elapsed = Date.now() - new Date(game.game_started_at).getTime();
+  if (elapsed < LOCK_DELAY_MS) {
+    const remainingMin = Math.ceil((LOCK_DELAY_MS - elapsed) / 60000);
+    return `Scores can't be reported until 20 minutes after Game Started is pressed — try again in about ${remainingMin} minute${remainingMin === 1 ? '' : 's'}.`;
+  }
+  return null;
+}
+
 async function reportLeagueGameCore(interaction, game, homeScore, awayScore, overtimeLoss = false) {
   const activeLeague = await getLeagueById(game.league_id);
   if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
@@ -29823,6 +30049,12 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
     embed.addFields({ name: 'Final Score', value: `${game.home_team_name} ${game.home_score} - ${game.away_score} ${game.away_team_name}`, inline: false });
   } else {
     embed.setDescription('When the game is finished, either team can report the score below.');
+    // 7J-GSREMIND: same reminder as Madden's game thread embed, per Hxxdie —
+    // nothing was telling people to actually press Game Started, so it just
+    // wasn't happening. Only shown while it's still actionable.
+    if (!game.game_started_at) {
+      embed.addFields({ name: '⏰ Before You Play', value: 'Once your game actually starts, press **Game Started** below — it locks betting on this matchup and keeps settlement accurate.', inline: false });
+    }
   }
   embed.setFooter({ text: `GG Sports • Game Center • ID ${shortGameId(game.id)}` }).setTimestamp();
   return embed;
@@ -35186,6 +35418,55 @@ const LEAGUE_OWNED_CHANNEL_COLUMNS = [
   'team_roster_channel_id',
 ];
 const LEAGUE_OWNED_ROLE_COLUMNS = ['league_role_id', 'staff_role_id', 'trade_committee_role_id', 'committee_role_id'];
+
+// 7J-PERMAUDIT: on-demand counterpart to the automatic alert in
+// refreshAllMultiChannelPanelPostings — that one only fires reactively, the
+// next time something actually tries to post and fails. This checks every
+// configured channel across every league in the guild (plus the 7 guild-wide
+// multi-channel panels) in one pass, so a commissioner can catch a broken
+// permission before it silently breaks something for weeks, per Hxxdie's ask.
+async function auditGuildChannelPermissions(guild) {
+  const REQUIRED_PERMS = ['ViewChannel', 'SendMessages', 'EmbedLinks', 'ReadMessageHistory'];
+  const problems = [];
+  const checked = new Set();
+
+  async function checkOne(channelId, label) {
+    if (!channelId || checked.has(channelId)) return;
+    checked.add(channelId);
+    const channel = await guild.channels.fetch(channelId).catch(err => ({ __error: err }));
+    if (!channel || channel.__error) {
+      const code = channel?.__error?.code;
+      if (code === 10003) problems.push({ channelId, label, issue: 'Channel no longer exists (deleted) — reconfigure this in setup.' });
+      else problems.push({ channelId, label, issue: `Could not access this channel (${channel?.__error?.message || 'unknown error'}).` });
+      return;
+    }
+    if (!channel.isTextBased?.()) return;
+    const me = await guild.members.fetchMe().catch(() => null);
+    if (!me) return;
+    const perms = channel.permissionsFor(me);
+    const missing = REQUIRED_PERMS.filter(p => !perms?.has(PermissionFlagsBits[p]));
+    if (missing.length) {
+      problems.push({ channelId, label, issue: `Missing: ${missing.join(', ')}` });
+    }
+  }
+
+  const leaguesResult = await pool.query(`SELECT league_id FROM leagues WHERE guild_id = $1 AND is_active = TRUE`, [guild.id]).catch(() => ({ rows: [] }));
+  for (const row of leaguesResult.rows || []) {
+    const league = await getLeagueById(row.league_id).catch(() => null);
+    if (!league) continue;
+    for (const col of LEAGUE_OWNED_CHANNEL_COLUMNS) {
+      if (league[col]) await checkOne(league[col], `${league.league_name} — ${col.replace(/_channel_id$/, '').replace(/_/g, ' ')}`);
+    }
+  }
+
+  const panelRows = await pool.query(`SELECT DISTINCT channel_id, panel_type FROM multi_channel_panels WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
+  for (const row of panelRows.rows || []) {
+    const info = getMultiChannelPanelInfo(row.panel_type);
+    await checkOne(row.channel_id, info?.label || row.panel_type);
+  }
+
+  return problems;
+}
 
 async function deleteLeagueDiscordInfrastructure(guild, league) {
   const deletedChannelIds = [];
@@ -41768,6 +42049,7 @@ async function buildAdminServerSetupPayload(guild, lang) {
   const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('adminpanel_serversetup_autosetup').setLabel('Auto Setup Server Channels').setEmoji('🏗️').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('adminpanel_serversetup_welcomeleave').setLabel('Welcome/Leave Setup').setEmoji('👋').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('adminpanel_serversetup_checkperms').setLabel('Check Bot Permissions').setEmoji('🔐').setStyle(ButtonStyle.Secondary),
   );
 
   const multiChannelMenu = new StringSelectMenuBuilder()
@@ -45918,8 +46200,16 @@ async function buildMaddenGameThreadEmbed(league, game, owners = {}) {
     }
   }
 
-  embed.addFields({ name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for matchup tools.', inline: false })
-    .setFooter({ text: 'GG Sports • 7J-10BY-BA1 Auto Game Threads' })
+  embed.addFields({ name: 'How To Use This Thread', value: 'Schedule your matchup, coordinate streams, discuss availability, and use the buttons below for matchup tools.', inline: false });
+  // 7J-GSREMIND: per Hxxdie — Game Started only gets pressed if someone
+  // remembers to press it, and nothing in the thread was actually telling
+  // people to. Shown only while it's still actionable (not started, not
+  // final yet) rather than cluttering the thread forever once it no longer
+  // applies.
+  if (!game.game_started_at && !hasScore) {
+    embed.addFields({ name: '⏰ Before You Play', value: 'Once your game actually starts, press **Game Started** below — it locks betting on this matchup and keeps settlement accurate.', inline: false });
+  }
+  embed.setFooter({ text: 'GG Sports • 7J-10BY-BA1 Auto Game Threads' })
     .setTimestamp();
   if (awayLogo) embed.setAuthor({ name: `${getMaddenTeamAbbrev(game.away_team) || game.away_team} at ${getMaddenTeamAbbrev(game.home_team) || game.home_team}`, iconURL: awayLogo });
   if (homeLogo) embed.setThumbnail(homeLogo);
@@ -46558,7 +46848,7 @@ async function handleMaddenGameThreadButton(interaction) {
 
     await interaction.deferReply();
 
-    const lockAt = new Date(Date.now() + 15 * 60 * 1000);
+    const lockAt = new Date(Date.now() + 5 * 60 * 1000);
     await pool.query(
       `UPDATE madden_imported_games SET game_started_at = NOW(), game_started_by_user_id = $2 WHERE id = $1`,
       [game.id, interaction.user.id]
@@ -46580,7 +46870,7 @@ async function handleMaddenGameThreadButton(interaction) {
     const lockEmbed = new EmbedBuilder()
       .setTitle('🔒 Game Started')
       .setColor(0xFEE75C)
-      .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **15 minutes**.`)
+      .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **5 minutes**.`)
       .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
       .setTimestamp();
     await interaction.editReply({ embeds: [lockEmbed] });
@@ -64717,9 +65007,9 @@ function startTradeThreadCleanupLoop(client) {
 }
 
 // 7J-48LOCK: Track H item 26 — anti-late-betting exploit. Sweeps for any
-// sportsbook_games whose 15-minute bets_lock_at window has passed and
+// sportsbook_games whose 5-minute bets_lock_at window has passed and
 // finalizes the lock. Deliberately a persisted-timestamp + periodic-sweep
-// pattern rather than a per-game in-memory setTimeout — a 15-minute
+// pattern rather than a per-game in-memory setTimeout — a 5-minute
 // in-memory timer could get silently dropped by a bot restart/redeploy
 // mid-window, which is an unacceptable failure mode for something with
 // real financial-integrity stakes (unlike, say, the voice-activity
