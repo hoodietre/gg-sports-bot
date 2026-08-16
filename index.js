@@ -15429,12 +15429,33 @@ if (interaction.commandName === 'avatar') {
     }
 
     // 7J-100AUTOSETUP
+    // 7J-LEAGUECHANNELCONFIRM: same risk as the guild-wide Auto Setup
+    // Server Channels button — creates a brand new category and full set
+    // of channels every time, with no check for an existing setup.
     if (interaction.isButton() && interaction.customId.startsWith('setup_autocreate_channels:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
       if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
-      await interaction.deferReply({ ephemeral: true });
+      const configuredCount = LEAGUE_OWNED_CHANNEL_COLUMNS.filter(col => league[col]).length;
+      const warning = configuredCount
+        ? `\n\n⚠️ **${league.league_name}** already has **${configuredCount}** channel(s) configured. Running this again will create a **full second category** with duplicate channels — it does not detect or reuse what's already there.`
+        : '';
+      const components = [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`setup_autocreate_channels_confirm:${leagueId}:yes`).setLabel(configuredCount ? 'Create Duplicate Setup Anyway' : 'Continue').setEmoji('✅').setStyle(configuredCount ? ButtonStyle.Danger : ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`setup_autocreate_channels_confirm:${leagueId}:no`).setLabel('Cancel').setEmoji('❌').setStyle(ButtonStyle.Secondary),
+      )];
+      await interaction.reply({ content: `Auto-create channels for **${league.league_name}**?${warning}`, components, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('setup_autocreate_channels_confirm:')) {
+      const [, leagueId, choice] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      if (choice === 'no') { await interaction.update({ content: 'Cancelled — no channels were created.', components: [] }); return; }
+      await interaction.update({ content: `Creating channels for **${league.league_name}**…`, components: [] });
       const isMadden = getLeagueSportKey(league) === 'madden';
       const { category, channels } = await autoCreateLeagueChannels(interaction.guild, league, isMadden);
       await interaction.editReply({
@@ -15443,14 +15464,42 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-TEAMROLECONFIRM: same misclick risk as Auto Create League Roles,
+    // arguably worse — this creates a FULL duplicate set of team roles (real
+    // team names or placeholders) plus duplicate league_team_roles rows
+    // every single time it's run, unconditionally, regardless of whether
+    // the league already has a complete set. Confirm step first, always;
+    // the actual creation (real-team-name leagues) or the team-count modal
+    // (placeholder leagues) only happens after Yes.
     if (interaction.isButton() && interaction.customId.startsWith('setup_autocreate_roles:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
       if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+
+      const existingTeamRoles = await getLeagueTeamRoles(league.league_id);
+      const warning = existingTeamRoles.length
+        ? `\n\n⚠️ **${league.league_name}** already has **${existingTeamRoles.length}** team role(s) registered. Running this again will create a **full duplicate set** of new Discord roles and register them alongside the existing ones — it does not replace or skip what's already there.`
+        : '';
+      const content = `Auto-create team roles for **${league.league_name}**?${warning}`;
+      const components = [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`setup_autocreate_roles_confirm:${leagueId}:yes`).setLabel(existingTeamRoles.length ? 'Create Duplicate Roles Anyway' : 'Continue').setEmoji('✅').setStyle(existingTeamRoles.length ? ButtonStyle.Danger : ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`setup_autocreate_roles_confirm:${leagueId}:no`).setLabel('Cancel').setEmoji('❌').setStyle(ButtonStyle.Secondary),
+      )];
+      await interaction.reply({ content, components, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('setup_autocreate_roles_confirm:')) {
+      const [, leagueId, choice] = interaction.customId.split(':');
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      if (choice === 'no') { await interaction.update({ content: 'Cancelled — no roles were created.', components: [] }); return; }
+
       const sportKey = getLeagueSportKey(league);
       if (REAL_TEAM_NAMES[sportKey]) {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.update({ content: `Creating roles for **${league.league_name}**…`, components: [] });
         const roles = await autoCreateLeagueTeamRoles(interaction.guild, league);
         await interaction.editReply({ content: `Created **${roles.length}** real ${sportKey.toUpperCase()} team roles and registered them to **${league.league_name}**.` });
         return;
@@ -15921,6 +15970,22 @@ if (interaction.commandName === 'avatar') {
 
       await interaction.update({ content: 'Creating matchup…', components: [] });
 
+      // 7J-DOUBLEPREFIX: per Hxxdie — matchup titles/thread names were
+      // showing the league-disambiguation prefix twice ("[OPEN] Team A @
+      // [OPEN] Team B"), because this was passing the live Discord role's
+      // display name (which legitimately carries "[LeagueName] " for
+      // uniqueness across the guild's role list) straight into the game
+      // record. league_team_roles.role_name is the plain, unprefixed name
+      // that was always meant for this — pull that instead.
+      const plainNamesResult = await pool.query(
+        `SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 AND role_id IN ($2, $3)`,
+        [leagueId, homeRoleId, awayRoleId]
+      ).catch(() => ({ rows: [] }));
+      const plainHomeName = plainNamesResult.rows.find(r => r.role_id === homeRoleId)?.role_name || homeRole.name;
+      const plainAwayName = plainNamesResult.rows.find(r => r.role_id === awayRoleId)?.role_name || awayRole.name;
+      const homeTeamObj = { id: homeRole.id, name: plainHomeName };
+      const awayTeamObj = { id: awayRole.id, name: plainAwayName };
+
       // 7J-UNSCOREDBLOCK: per Hxxdie — open-schedule leagues have no fixed
       // cadence forcing a score to ever get reported (unlike structured,
       // which has the Advance button as a natural checkpoint), so without
@@ -15945,7 +16010,7 @@ if (interaction.commandName === 'avatar') {
         }
       }
 
-      const createResult = await createLeagueGameCore(interaction, league, homeRole, awayRole, {});
+      const createResult = await createLeagueGameCore(interaction, league, homeTeamObj, awayTeamObj, {});
       if (!createResult.ok) {
         await interaction.editReply({ content: createResult.message });
         return;
@@ -16293,7 +16358,11 @@ if (interaction.commandName === 'avatar') {
     // same flip logic/embed style as /coinflip, but posted publicly to the
     // thread since it's meant to settle who kicks/serves/picks first in
     // front of both teams, not a private per-user roll.
-    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_cointoss:')) {
+    // 7J-PREGAMETOOLS: relocated from the matchup thread to the Game Center
+    // panel, per Hxxdie — same flip logic/embed as before, just no longer
+    // tied to an already-created game. Posts publicly in whatever channel
+    // the panel lives in, same visibility as it had in the thread.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_panel_cointoss:')) {
       const result = Math.random() < 0.5 ? 'heads' : 'tails';
       const embed = new EmbedBuilder()
         .setTitle('🪙 Coin Toss')
@@ -16306,15 +16375,25 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    // 7J-154WHOGOTNEXT: posts to the league's League Chat Channel (not the
-    // game thread itself) so a call-out doesn't bury the actual game center
-    // content — same shape as the Stream Hub button's "no config yet"
-    // fallback pattern.
-    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_whogotnext:')) {
-      const gameId = interaction.customId.split(':')[1];
-      const game = await findLeagueGameById(interaction.guild.id, gameId);
-      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
-      const league = await getLeagueById(game.league_id);
+    // 7J-PREGAMETOOLS: redesigned per Hxxdie — this used to post about a
+    // specific already-created matchup, which made no sense once it's
+    // available before any game exists ("available to play" immediately
+    // followed by naming a scheduled opponent). Now resolves which team the
+    // clicking user actually owns in this league and posts a plain
+    // availability call-out with no matchup attached — organizing an actual
+    // opponent still happens via Add Game afterward.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_panel_whogotnext:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+
+      const teamRoles = await getLeagueTeamRoles(league.league_id);
+      const ownedTeams = teamRoles.filter(t => interaction.member.roles.cache.has(t.role_id));
+      if (!ownedTeams.length) {
+        await interaction.reply({ content: "You don't currently own a team in this league, so there's no team to signal availability for.", ephemeral: true });
+        return;
+      }
+      const teamNames = ownedTeams.map(t => t.role_name).join(' / ');
 
       const chatChannelId = league?.league_chat_channel_id;
       const chatChannel = chatChannelId ? await interaction.guild.channels.fetch(chatChannelId).catch(() => null) : null;
@@ -16324,7 +16403,7 @@ if (interaction.commandName === 'avatar') {
       }
 
       await chatChannel.send({
-        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `**${interaction.user.username}** is available to play right now — ${game.away_team_name} @ ${game.home_team_name}.`,
+        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `🙋 **${interaction.user.username}** (${teamNames}) is available to play right now — head to Game Center and use **Add Game** to schedule a matchup.`,
         allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
       });
       await interaction.reply({ content: `🙋 Posted to <#${chatChannel.id}>.`, ephemeral: true });
@@ -18903,9 +18982,34 @@ if (interaction.commandName === 'avatar') {
     // Welcome/Leave is enabled but not yet pointed at a channel) also creates
     // those two channels. Renamed from "Auto Setup Channels" and moved here
     // from League Setup per Hxxdie — none of this was ever league-specific.
+    // 7J-SERVERSETUPCONFIRM: same misclick-safety pass as the role buttons —
+    // this one is guild-wide and creates a brand new "GG Sports" category
+    // plus a fresh channel + registered multi_channel_panels row for each
+    // panel type, every single time, with no existing-setup check at all.
+    // Re-running it doesn't update anything — it creates a full second
+    // category and duplicate channels, and since panels are tracked per
+    // channel_id (not deduped per guild+type), every future refresh would
+    // then post into both the old and new copies indefinitely.
     if (interaction.isButton() && interaction.customId === 'adminpanel_serversetup_autosetup') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
-      await interaction.deferReply({ ephemeral: true });
+      const existingCategory = interaction.guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === 'GG Sports');
+      const existingPanelCount = await pool.query(`SELECT COUNT(*)::int AS n FROM multi_channel_panels WHERE guild_id = $1`, [interaction.guild.id]).then(r => r.rows[0]?.n || 0).catch(() => 0);
+      const warning = (existingCategory || existingPanelCount)
+        ? `\n\n⚠️ This server already has${existingCategory ? ' a **GG Sports** category' : ''}${existingCategory && existingPanelCount ? ' and' : ''}${existingPanelCount ? ` **${existingPanelCount}** registered panel channel(s)` : ''} set up. Running this again will create a **full second category** with duplicate channels — it does not detect or reuse what's already there.`
+        : '';
+      const components = [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('adminpanel_serversetup_autosetup_confirm:yes').setLabel(warning ? 'Create Duplicate Setup Anyway' : 'Continue').setEmoji('✅').setStyle(warning ? ButtonStyle.Danger : ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('adminpanel_serversetup_autosetup_confirm:no').setLabel('Cancel').setEmoji('❌').setStyle(ButtonStyle.Secondary),
+      )];
+      await interaction.reply({ content: `Run Auto Setup Server Channels?${warning}`, components, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_serversetup_autosetup_confirm:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const choice = interaction.customId.split(':')[1];
+      if (choice === 'no') { await interaction.update({ content: 'Cancelled — nothing was created.', components: [] }); return; }
+      await interaction.update({ content: 'Setting up server channels…', components: [] });
       const { category, channels } = await autoCreateGuildMultiChannelPanels(interaction.guild);
       const payload = await buildAdminServerSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       // 7J-COMMANDHUB-PAYWALL: message now reflects what actually got
@@ -18922,6 +19026,7 @@ if (interaction.commandName === 'avatar') {
       });
       return;
     }
+
 
     // 7J-PERMAUDIT: on-demand full sweep, per Hxxdie — checks every
     // configured channel across every league plus the guild-wide panels in
@@ -18942,10 +19047,43 @@ if (interaction.commandName === 'avatar') {
         await interaction.editReply({ content: '✅ All configured channels look good — the bot can see and post in every one of them.' });
         return;
       }
-      const lines = problems.slice(0, 20).map(p => `**${p.label}** (<#${p.channelId}>) — ${p.issue}`);
-      await interaction.editReply({
-        content: `⚠️ Found **${problems.length}** channel(s) with a problem:\n\n${lines.join('\n')}${problems.length > 20 ? `\n…and ${problems.length - 20} more.` : ''}\n\nFor a missing-permission channel, edit its permissions and make sure the GG Sports bot role has View Channel, Send Messages, Embed Links, and Read Message History.`,
-      });
+
+      // 7J-PERMAUDITFIX: per Hxxdie — with a lot of stale channel refs, this
+      // crashed on Discord's 2000-char raw content limit. Embed description
+      // budget is 4096, and separating "channel deleted" (a setup/
+      // reconfigure problem) from "channel exists but bot can't use it" (an
+      // actual permission problem) makes a long list far easier to scan,
+      // since the two categories need completely different fixes.
+      const deleted = problems.filter(p => p.issue.startsWith('Channel no longer exists'));
+      const permIssues = problems.filter(p => !p.issue.startsWith('Channel no longer exists'));
+
+      function formatList(list, limit) {
+        const lines = [];
+        let budget = 0;
+        for (const p of list.slice(0, limit)) {
+          const line = `**${p.label}** (<#${p.channelId}>) — ${p.issue}`;
+          if (budget + line.length > 950) { lines.push(`…and ${list.length - lines.length} more.`); break; }
+          lines.push(line);
+          budget += line.length;
+        }
+        return lines.join('\n');
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle('🔐 Bot Permission Check')
+        .setColor(0xED4245)
+        .setDescription(`Found **${problems.length}** channel(s) with a problem.`)
+        .setFooter({ text: 'GG Sports • Server Setup' })
+        .setTimestamp();
+      if (permIssues.length) {
+        embed.addFields({ name: `⚠️ Permission issues (${permIssues.length})`, value: formatList(permIssues, 15) });
+      }
+      if (deleted.length) {
+        embed.addFields({ name: `🗑️ Deleted channels, need reconfiguring (${deleted.length})`, value: formatList(deleted, 15) });
+      }
+      embed.addFields({ name: 'For permission issues', value: 'Edit that channel and make sure the GG Sports bot role has View Channel, Send Messages, Embed Links, and Read Message History.' });
+
+      await interaction.editReply({ content: null, embeds: [embed] });
       return;
     }
 
@@ -28940,13 +29078,31 @@ async function getSportsbookSettings(guildId) {
   return result.rows[0] || { guild_id: guildId, feed_channel_id: null, big_bet_threshold: 500 };
 }
 
+// 7J-FEEDSILENT: same silent-swallow pattern as the earlier
+// refreshAllMultiChannelPanelPostings bug — per Hxxdie, a game created a
+// sportsbook line but nothing posted to #sportsbook-feed with zero error
+// anywhere. Now logs the real failure and fires the same permission-issue
+// owner alert this function's sibling already uses.
 async function postSportsbookFeed(guild, embed) {
   const settings = await getSportsbookSettings(guild.id);
   if (!settings.feed_channel_id) return;
 
-  const channel = await guild.channels.fetch(settings.feed_channel_id).catch(() => null);
+  const channel = await guild.channels.fetch(settings.feed_channel_id).catch(err => {
+    console.error(`[SPORTSBOOK FEED] channel fetch failed for ${settings.feed_channel_id}:`, err?.message || err);
+    if (isDiscordPermissionError(err)) {
+      notifyOwnerOfBotPermissionIssue(guild, `sportsbookfeed:${settings.feed_channel_id}`, settings.feed_channel_id,
+        `I can't see your Sportsbook Feed channel, so nothing has been posting there.`).catch(() => null);
+    }
+    return null;
+  });
   if (!channel || !channel.isTextBased()) return;
-  await channel.send({ embeds: [embed] }).catch(() => null);
+  await channel.send({ embeds: [embed] }).catch(err => {
+    console.error(`[SPORTSBOOK FEED] send failed in #${channel.name}:`, err?.message || err);
+    if (isDiscordPermissionError(err)) {
+      notifyOwnerOfBotPermissionIssue(guild, `sportsbookfeed:${settings.feed_channel_id}`, settings.feed_channel_id,
+        `I don't have permission to send messages in **#${channel.name}**, so your Sportsbook Feed hasn't been posting.`).catch(() => null);
+    }
+  });
 }
 
 function buildSportsbookBetAlertEmbed(settings, user, game, side, amount, odds, payout, isBigBet = false) {
@@ -30083,16 +30239,37 @@ function buildGameCenterPanelEmbed(league, openGames) {
   return embed;
 }
 
-function buildGameCenterPanelComponents(leagueId) {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('gamecenter_add:' + leagueId).setLabel('Add Game').setEmoji('➕').setStyle(ButtonStyle.Success),
-  )];
+function buildGameCenterPanelComponents(leagueId, isOpenSchedule = true) {
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gamecenter_add:' + leagueId).setLabel('Add Game').setEmoji('➕').setStyle(ButtonStyle.Success),
+    ),
+  ];
+  // 7J-PREGAMETOOLS: relocated here from the matchup thread, per Hxxdie —
+  // both are useful before a matchup even exists (Coin Toss for home/away
+  // on an odd-matchup-count schedule, Who's Got Next to signal availability
+  // before anyone's picked an opponent), so gating either one behind an
+  // already-created game never made sense. Who's Got Next stays
+  // open-schedule-only (same reasoning as its original thread placement —
+  // structured leagues already have a fixed round order via Advance), but
+  // Coin Toss applies to either schedule style, per Hxxdie.
+  const pregameRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gamecenter_panel_cointoss:' + leagueId).setLabel('Coin Toss').setEmoji('🪙').setStyle(ButtonStyle.Secondary),
+  );
+  if (isOpenSchedule) {
+    pregameRow.addComponents(
+      new ButtonBuilder().setCustomId('gamecenter_panel_whogotnext:' + leagueId).setLabel("Who's Got Next").setEmoji('🙋').setStyle(ButtonStyle.Secondary),
+    );
+  }
+  rows.push(pregameRow);
+  return rows;
 }
 
 async function updateGameCenterPanel(guild, league) {
   if (!guild || !league?.league_id) return;
   const openGames = await getOpenLeagueGames(guild.id, league.league_id);
-  await updatePanel(guild, league, 'game_center', buildGameCenterPanelEmbed(league, openGames), buildGameCenterPanelComponents(league.league_id));
+  const panelCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  await updatePanel(guild, league, 'game_center', buildGameCenterPanelEmbed(league, openGames), buildGameCenterPanelComponents(league.league_id, panelCustomSettings.schedule_style !== 'structured'));
 }
 
 function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
@@ -30119,7 +30296,7 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
       embed.addFields({ name: '⏰ Before You Play', value: 'Once your game actually starts, press **Game Started** below — it locks betting on this matchup and keeps settlement accurate.', inline: false });
     }
   }
-  embed.setFooter({ text: `GG Sports • Game Center • ID ${shortGameId(game.id)}` }).setTimestamp();
+  embed.setFooter({ text: `GG Sports • Game Center • ${league.league_name} • ID ${shortGameId(game.id)}` }).setTimestamp();
   return embed;
 }
 
@@ -30144,26 +30321,19 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
   }
   row1.addComponents(
     new ButtonBuilder().setCustomId('gamecenter_stream:' + gameId).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
-    // 7J-154COINTOSS: pregame coin toss, right on the thread instead of only
-    // via /coinflip — per Hxxdie.
-    new ButtonBuilder().setCustomId('gamecenter_cointoss:' + gameId).setLabel('Coin Toss').setEmoji('🪙').setStyle(ButtonStyle.Secondary),
   );
 
+  // 7J-PREGAMETOOLS: Coin Toss and Who's Got Next moved out of the matchup
+  // thread entirely, per Hxxdie — both are pre-game tools (deciding
+  // home/away for a not-yet-scheduled game, signaling availability before
+  // anyone's opponent is even picked), so tying them to one specific
+  // already-created matchup thread never made sense. Both now live on the
+  // Game Center panel instead — see buildGameCenterPanelComponents.
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('gamecenter_gamestarted:' + gameId).setLabel(isStarted ? 'Game Started ✓' : 'Game Started').setEmoji('🔒').setStyle(ButtonStyle.Primary).setDisabled(isFinal || isStarted),
     new ButtonBuilder().setCustomId('gamecenter_report:' + gameId).setLabel('Report Score').setEmoji('📝').setStyle(ButtonStyle.Success).setDisabled(isFinal),
     new ButtonBuilder().setCustomId('gamecenter_issue:' + gameId).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger),
   );
-  if (isOpenSchedule) {
-    // 7J-154WHOGOTNEXT: open-schedule leagues only, per Hxxdie — a
-    // structured-schedule league already advances round-by-round on a fixed
-    // cadence, so "who's available to play right now" doesn't apply the
-    // same way it does for open-schedule leagues, which have no fixed
-    // matchup order and rely on this to organize pickup games.
-    row2.addComponents(
-      new ButtonBuilder().setCustomId('gamecenter_whogotnext:' + gameId).setLabel("Who's Got Next").setEmoji('🙋').setStyle(ButtonStyle.Secondary),
-    );
-  }
 
   return [
     row1,
@@ -30220,7 +30390,13 @@ async function createGameCenterThread(interaction, league, game, { channelIdOver
     return { ok: false, message: 'the configured Game Center channel could not be found.' };
   }
 
-  const safeName = `${game.away_team_name}-at-${game.home_team_name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'matchup';
+  // 7J-DOUBLEPREFIX: league name now shown once, as its own thread-name
+  // segment, rather than twice (once per team name, since team names used
+  // to carry the full "[LeagueName] " prefix meant for Discord role
+  // uniqueness, not matchup display). See the gamecenter_away handler for
+  // where the underlying double-prefix bug in stored team names was fixed.
+  const leagueSlug = league.league_name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20);
+  const safeName = `${leagueSlug ? leagueSlug + '-' : ''}${game.away_team_name}-at-${game.home_team_name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'matchup';
   const thread = await channel.threads.create({
     name: safeName,
     type: ChannelType.PrivateThread,
@@ -36627,9 +36803,10 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     if (error) return error;
 
     const openGames = await getOpenLeagueGames(interaction.guild.id, league.league_id);
+    const panelPostCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
     const message = await channel.send({
       embeds: [buildGameCenterPanelEmbed(league, openGames)],
-      components: buildGameCenterPanelComponents(league.league_id),
+      components: buildGameCenterPanelComponents(league.league_id, panelPostCustomSettings.schedule_style !== 'structured'),
     });
     await savePanel(league, 'game_center', channel.id, message.id);
     return 'Game Center panel posted/refreshed in ' + channel.toString() + '. Click **Add Game** on it to schedule a matchup — a private thread with both teams opens automatically.';
