@@ -18910,8 +18910,8 @@ if (interaction.commandName === 'avatar') {
         return;
       }
       if (result.rows.length === 1) {
-        await interaction.deferReply({ ephemeral: true });
-        await runAdminPanelAutoCreateLeagueRoles(interaction, result.rows[0]);
+        const league = await getLeagueById(result.rows[0].league_id);
+        await interaction.reply({ ...buildAutoCreateRolesConfirmPayload(league), ephemeral: true });
         return;
       }
       const menu = new StringSelectMenuBuilder()
@@ -18927,6 +18927,19 @@ if (interaction.commandName === 'avatar') {
       const leagueId = interaction.values[0];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      await interaction.update(buildAutoCreateRolesConfirmPayload(league));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('adminpanel_autosetup_roles_confirm:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+      const [, leagueId, choice] = interaction.customId.split(':');
+      if (choice === 'no') {
+        await interaction.update({ content: 'Cancelled — no roles were created.', components: [] });
+        return;
+      }
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
       await interaction.update({ content: `Creating roles for **${league.league_name}**…`, components: [] });
       await runAdminPanelAutoCreateLeagueRoles(interaction, league);
       return;
@@ -35152,6 +35165,35 @@ async function autoCreateGuildMultiChannelPanels(guild) {
 }
 
 // 7J-110RELOCATE: creates the three per-league roles (league/staff/trade
+// 7J-ROLECONFIRM: per Hxxdie — misclicked this instead of Create League
+// (they sit stacked in the same League Setup section, both green) and it
+// silently created a second, orphaned set of league roles for a league that
+// already had them. runAdminPanelAutoCreateLeagueRoles always creates brand
+// new Discord roles regardless of whether ones already exist — only which
+// ones league_settings ends up *pointing at* is conditional (COALESCE), so
+// a duplicate run doesn't just confuse things, it leaves real dangling
+// roles in the server's role list with nothing referencing them. This
+// builds a confirm step naming the exact league and, if it already has any
+// of the three roles set, an explicit warning before anything gets created.
+function buildAutoCreateRolesConfirmPayload(league) {
+  const existing = [
+    league.league_role_id ? `League Role: <@&${league.league_role_id}>` : null,
+    league.staff_role_id ? `Staff Role: <@&${league.staff_role_id}>` : null,
+    league.trade_committee_role_id ? `Trade Committee Role: <@&${league.trade_committee_role_id}>` : null,
+  ].filter(Boolean);
+
+  const warning = existing.length
+    ? `\n\n⚠️ **${league.league_name}** already has role(s) set:\n${existing.join('\n')}\n\nRunning this again will create **brand new** Discord roles and leave these existing ones in place, unassigned and orphaned, unless you delete them yourself afterward.`
+    : '';
+
+  const content = `Auto-create League/Staff/Trade Committee roles for **${league.league_name}**?${warning}`;
+  const components = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`adminpanel_autosetup_roles_confirm:${league.league_id}:yes`).setLabel(existing.length ? 'Create Duplicate Roles Anyway' : 'Create Roles').setEmoji('✅').setStyle(existing.length ? ButtonStyle.Danger : ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`adminpanel_autosetup_roles_confirm:${league.league_id}:no`).setLabel('Cancel').setEmoji('❌').setStyle(ButtonStyle.Secondary),
+  )];
+  return { content, components };
+}
+
 // committee) and saves them via the canonical Setup Dashboard columns, then
 // offers a button straight into that league's Commissioner Panel so the
 // admin can keep going without hunting for it. Called either right after a
@@ -41838,14 +41880,18 @@ async function buildAdminLeagueSetupPayload(guild, lang) {
   // home for it. Auto Create League Roles stays here since roles genuinely ARE
   // per-league settings — clicking it opens a league picker rather than acting
   // on all of them at once. Only shown once at least one league exists.
-  if (result.rows.length) {
-    components.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('adminpanel_autosetup_roles').setLabel('Auto Create League Roles').setEmoji('🏗️').setStyle(ButtonStyle.Success),
-    ));
-  }
+  // 7J-BUTTONORDER: Create League now sits above Auto Create League Roles —
+  // per Hxxdie, the natural order is create the league first, roles second,
+  // and the previous order (roles above create) contributed to a misclick
+  // that auto-created duplicate roles for an already-set-up league.
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('adminpanel_league_create').setLabel(t(lang, 'league_setup_create_button')).setEmoji('➕').setStyle(ButtonStyle.Success)
   ));
+  if (result.rows.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_autosetup_roles').setLabel('Auto Create League Roles').setEmoji('🏗️').setStyle(ButtonStyle.Secondary),
+    ));
+  }
   components.push(buildAdminPanelBackRow(lang));
   return { embeds: [embed], components };
 }
