@@ -5106,8 +5106,25 @@ async function findTeamOwnerByRoleId(guild, roleId) {
     if (fetchedMember) return fetchedMember;
   }
 
-  // Avoid guild-wide member fetches here. Discord rate limits opcode 8 heavily.
-  // If the owner is not cached, payouts safely skip instead of breaking /game report.
+  // 7J-GENERICOWNERFIX: per Hxxdie — a manually role-assigned owner in a
+  // generic (non-Madden) league was never found, because both fallbacks
+  // above are dead ends for generic leagues: the DB check only covers
+  // madden_franchises/madden_imported_team_stats, which don't exist for a
+  // generic league at all, and role.members only reflects whoever's
+  // already in discord.js's local cache — the GuildMembers intent lets the
+  // bot *receive* member events, it doesn't bulk-populate the cache by
+  // itself. buildTeamOwnersEmbed (Team Owners panel) already does a bulk
+  // guild.members.fetch() before checking role.members and works reliably
+  // because of it — this was the one path still missing that same fetch.
+  // Kept as the very last resort (only reached once the cheap paths above
+  // have both missed) so this doesn't turn every call into a full-guild
+  // fetch — Discord rate limits opcode 8 heavily, and this function runs
+  // far more often than the Team Owners panel refreshes.
+  await guild.members.fetch().catch(() => null);
+  const refreshedRole = guild.roles.cache.get(roleId);
+  const fetchedCachedOwner = refreshedRole?.members.find(member => !member.user.bot);
+  if (fetchedCachedOwner) return fetchedCachedOwner;
+
   return null;
 }
 
@@ -5118,7 +5135,14 @@ async function findTeamOwnerByRoleName(guild, teamRoleName) {
   const cachedOwner = role.members.find(member => !member.user.bot);
   if (cachedOwner) return cachedOwner;
 
-  // Avoid guild-wide member fetches here. Discord rate limits opcode 8 heavily.
+  // 7J-GENERICOWNERFIX: same fix as findTeamOwnerByRoleId's, same reason —
+  // role.members only reflects discord.js's local cache, which the
+  // GuildMembers intent alone doesn't bulk-populate. Last resort only.
+  await guild.members.fetch().catch(() => null);
+  const refreshedRole = guild.roles.cache.find(r => r.name === teamRoleName);
+  const fetchedCachedOwner = refreshedRole?.members.find(member => !member.user.bot);
+  if (fetchedCachedOwner) return fetchedCachedOwner;
+
   return null;
 }
 
@@ -30204,20 +30228,24 @@ async function deleteLeagueGameCore(interaction, game, reason = 'Game deleted by
     const reversal = await resetLeagueGameCore(interaction, game, reason);
     if (!reversal.ok) return reversal;
     standingsNote = ' Standings rolled back.';
-  } else {
-    // Not final — resetLeagueGameCore would refuse this, and there's no
-    // standings entry to reverse yet, but any open bet still needs
-    // refunding since we're about to delete the game out from under it.
-    const openLines = await pool.query(
-      `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND league_game_id = $2 AND status = 'open'`,
-      [interaction.guild.id, game.id]
-    ).catch(() => ({ rows: [] }));
-    for (const line of openLines.rows || []) {
-      await refundSportsbookGameBets(interaction.guild, line, interaction.user.id, reason).catch(err =>
-        console.error('[Delete Game] Refund failed:', err?.message || err));
-    }
-    if (openLines.rows.length) standingsNote = ` ${openLines.rows.length} open sportsbook bet(s) refunded.`;
   }
+
+  // Any open sportsbook line still needs refunding and closing before the
+  // game disappears out from under it — whether it was never settled to
+  // begin with (non-final branch), or resetLeagueGameCore just reopened it
+  // above (final branch, where resetSportsbookForLeagueGame deliberately
+  // sets status back to 'open' since Reset Game's whole point is letting
+  // the game be replayed and re-reported — the wrong outcome here, since
+  // we're deleting the game rather than giving it a second chance).
+  const openLines = await pool.query(
+    `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND league_game_id = $2 AND status = 'open'`,
+    [interaction.guild.id, game.id]
+  ).catch(() => ({ rows: [] }));
+  for (const line of openLines.rows || []) {
+    await refundSportsbookGameBets(interaction.guild, line, interaction.user.id, reason).catch(err =>
+      console.error('[Delete Game] Refund failed:', err?.message || err));
+  }
+  if (openLines.rows.length) standingsNote += ` ${openLines.rows.length} open sportsbook bet(s) refunded.`;
 
   if (game.thread_id) {
     const thread = await interaction.guild.channels.fetch(game.thread_id).catch(() => null);
