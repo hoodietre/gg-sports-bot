@@ -6346,7 +6346,13 @@ async function updatePanel(guild, league, panelKey, embed, components = []) {
 
 function buildTeamOwnersPanelComponents(leagueId) {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`teamownerspanel_leave:${leagueId}`).setLabel('Leave Team').setEmoji('🚪').setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId(`teamownerspanel_leave:${leagueId}`).setLabel('Leave Team').setEmoji('🚪').setStyle(ButtonStyle.Danger),
+    // 7J-TOAPPLY: per Hxxdie — someone looking at Team Owners to see who's
+    // available shouldn't have to go hunt down a separate Recruitment
+    // panel just to apply for an open one. Reuses the exact same vacant-
+    // team picker → modal flow as Browse Open Teams, just pre-scoped to
+    // this league instead of asking which league first.
+    new ButtonBuilder().setCustomId(`teamownerspanel_apply:${leagueId}`).setLabel('Apply to Join').setEmoji('🙋').setStyle(ButtonStyle.Primary),
   )];
 }
 
@@ -12567,6 +12573,7 @@ if (interaction.commandName === 'avatar') {
       );
       const notInServerNote = targetMember ? '' : ` You're not currently a member of **${targetGuild.name}** — if approved, I'll send you an invite.`;
       await interaction.editReply({ content: `Application submitted for **${role.name}** in **${league.league_name}**. A commissioner will review it — check \`My Applications\` for status.${notInServerNote}` });
+      await notifyLeagueStaffOfNewApplication(targetGuild, league, role.name, interaction.user).catch(err => console.error('[Recruitment] Staff notify failed:', err?.message || err));
       return;
     }
 
@@ -12922,6 +12929,26 @@ if (interaction.commandName === 'avatar') {
 
       const applicantMember = await interaction.guild.members.fetch(app.applicant_user_id).catch(() => null);
       await pool.query(`UPDATE league_recruitment_applications SET status = 'approved', decided_by_user_id = $1, decided_at = NOW() WHERE id = $2`, [interaction.user.id, appId]);
+
+      // 7J-AUTODECLINE: per Hxxdie — someone approved for one team in a
+      // league shouldn't still have a live pending application sitting for
+      // a different team in that same league. Scoped to this league only
+      // (not every league they've ever applied to) since owning a team in
+      // one league says nothing about an unrelated league's roster.
+      const otherPending = await pool.query(
+        `UPDATE league_recruitment_applications
+         SET status = 'declined', decided_by_user_id = $1, decision_note = 'Auto-declined — applicant was approved for another team in this league', decided_at = NOW()
+         WHERE league_id = $2 AND applicant_user_id = $3 AND status = 'pending' AND id != $4
+         RETURNING team_name`,
+        [interaction.user.id, league.league_id, app.applicant_user_id, appId]
+      ).catch(() => ({ rows: [] }));
+      if (otherPending.rows.length) {
+        const applicantUserForDecline = applicantMember?.user || await client.users.fetch(app.applicant_user_id).catch(() => null);
+        const declinedNames = otherPending.rows.map(r => `**${r.team_name}**`).join(', ');
+        await applicantUserForDecline?.send({
+          content: `Since you were approved for **${role.name}** in **${league?.league_name || 'the league'}**, your other pending application(s) for ${declinedNames} in that league were automatically declined.`,
+        }).catch(() => null);
+      }
 
       if (!applicantMember) {
         // 7J-90DISCOVERY: applicant applied from Discover Leagues and isn't
@@ -17604,6 +17631,29 @@ if (interaction.commandName === 'avatar') {
         isSelfLeave: true,
       });
       await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+      return;
+    }
+
+    // 7J-TOAPPLY: reuses the exact same select customId
+    // (recruitmentpanel_apply_team_select) the Discover Leagues flow
+    // already wires up, so this needs no new modal/submit handling — just
+    // the vacancy lookup pre-scoped to this one league instead of asking
+    // which league first.
+    if (interaction.isButton() && interaction.customId.startsWith('teamownerspanel_apply:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const vacant = await getVacantLeagueTeams(interaction.guild, league);
+      if (!vacant.length) { await interaction.editReply({ content: `No open teams in **${league.league_name}** right now — check back later or ask a commissioner about the waitlist.` }); return; }
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`recruitmentpanel_apply_team_select:${league.league_id}`)
+        .setPlaceholder('Pick a team to apply for')
+        .addOptions(vacant.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
+      await interaction.editReply({
+        content: `**${vacant.length}** open team${vacant.length === 1 ? '' : 's'} in **${league.league_name}**. Pick one to apply:`,
+        components: [new ActionRowBuilder().addComponents(menu)],
+      });
       return;
     }
 
@@ -35689,6 +35739,42 @@ async function resolveOrPickRecruitmentLeague(interaction, actionKey) {
   await interaction.editReply({ content: 'This server runs more than one league — which one?', components: [new ActionRowBuilder().addComponents(menu)] });
   return null;
 }
+
+// 7J-APPNOTIFY: per Hxxdie — a pending application previously sat silent
+// until someone happened to open the Recruitment panel and check. DMs
+// everyone holding the league's staff role (the closest match this
+// codebase has to "the commissioners" for a specific league — staff isn't
+// a single person). Falls back to the live guild owner if no staff role is
+// configured, or if one is configured but nobody currently holds it, so a
+// fresh/lightly-staffed league doesn't just get skipped silently.
+async function notifyLeagueStaffOfNewApplication(guild, league, teamName, applicant) {
+  const targets = new Set();
+  if (league?.staff_role_id) {
+    const staffRole = await guild.roles.fetch(league.staff_role_id).catch(() => null);
+    if (staffRole) {
+      for (const member of staffRole.members.filter(m => !m.user.bot).values()) targets.add(member.id);
+    }
+  }
+  if (!targets.size) {
+    const owner = await guild.fetchOwner().catch(() => null);
+    if (owner) targets.add(owner.id);
+  }
+  if (!targets.size) return;
+
+  const embed = new EmbedBuilder()
+    .setTitle('📥 New Recruitment Application')
+    .setColor(0x5865F2)
+    .setDescription(`**${applicant.tag || applicant.username}** applied for **${teamName}** in **${league.league_name}** (${guild.name}).`)
+    .addFields({ name: 'Review it', value: 'Open the Recruitment panel in that server and use **Review Applications**.', inline: false })
+    .setFooter({ text: 'GG Sports • Recruitment' })
+    .setTimestamp();
+
+  for (const userId of targets) {
+    const user = await client.users.fetch(userId).catch(() => null);
+    await user?.send({ embeds: [embed] }).catch(() => null);
+  }
+}
+
 
 async function runRecruitmentBrowse(interaction, league) {
   const vacant = await getVacantLeagueTeams(interaction.guild, league);
