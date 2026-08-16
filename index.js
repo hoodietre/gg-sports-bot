@@ -16360,9 +16360,12 @@ if (interaction.commandName === 'avatar') {
     // front of both teams, not a private per-user roll.
     // 7J-PREGAMETOOLS: relocated from the matchup thread to the Game Center
     // panel, per Hxxdie — same flip logic/embed as before, just no longer
-    // tied to an already-created game. Posts publicly in whatever channel
-    // the panel lives in, same visibility as it had in the thread.
+    // tied to an already-created game. Also cross-posts to League Chat (if
+    // configured) so it doesn't just sit buried in Game Center — per
+    // Hxxdie's follow-up ask.
     if (interaction.isButton() && interaction.customId.startsWith('gamecenter_panel_cointoss:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId).catch(() => null);
       const result = Math.random() < 0.5 ? 'heads' : 'tails';
       const embed = new EmbedBuilder()
         .setTitle('🪙 Coin Toss')
@@ -16372,6 +16375,12 @@ if (interaction.commandName === 'avatar') {
         .setFooter({ text: 'GG Sports • Coin Toss' })
         .setTimestamp();
       await interaction.reply({ embeds: [embed] });
+
+      const chatChannelId = league?.league_chat_channel_id;
+      const chatChannel = chatChannelId ? await interaction.guild.channels.fetch(chatChannelId).catch(() => null) : null;
+      if (chatChannel && chatChannel.id !== interaction.channel?.id) {
+        await chatChannel.send({ embeds: [embed] }).catch(() => null);
+      }
       return;
     }
 
@@ -16380,8 +16389,13 @@ if (interaction.commandName === 'avatar') {
     // available before any game exists ("available to play" immediately
     // followed by naming a scheduled opponent). Now resolves which team the
     // clicking user actually owns in this league and posts a plain
-    // availability call-out with no matchup attached — organizing an actual
-    // opponent still happens via Add Game afterward.
+    // availability call-out with no matchup attached.
+    // 7J-WHOGOTNEXTCLARITY: wording revised again per Hxxdie — the first
+    // rewrite ("head to Game Center and use Add Game") risked several
+    // people all independently rushing to schedule against the same
+    // person at once. This is meant to start a conversation, not be a
+    // starting gun — made that explicit rather than pointing straight at
+    // the Add Game button.
     if (interaction.isButton() && interaction.customId.startsWith('gamecenter_panel_whogotnext:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -16403,7 +16417,7 @@ if (interaction.commandName === 'avatar') {
       }
 
       await chatChannel.send({
-        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `🙋 **${interaction.user.username}** (${teamNames}) is available to play right now — head to Game Center and use **Add Game** to schedule a matchup.`,
+        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `🙋 **${interaction.user.username}** (${teamNames}) is free to play right now — reply here to work out who's up, then schedule it from Game Center once you've agreed.`,
         allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
       });
       await interaction.reply({ content: `🙋 Posted to <#${chatChannel.id}>.`, ephemeral: true });
@@ -16524,6 +16538,47 @@ if (interaction.commandName === 'avatar') {
         }
         await updateGameCenterPanel(interaction.guild, league).catch(() => null);
       }
+      return;
+    }
+
+    // 7J-GHOSTDELETE: confirm-gated since deletion is permanent — no reopen
+    // path like Reset has. Modal for the reason so both notified owners get
+    // real context (e.g. "opponent went unresponsive") instead of a bare
+    // cancellation notice.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_delete:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only staff can delete a game.', ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId('gamecenter_delete_modal:' + gameId)
+        .setTitle('Delete This Game?')
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('reason').setLabel('Reason (sent to both owners)').setStyle(TextInputStyle.Short).setRequired(true).setValue('Opponent unresponsive').setMaxLength(200)
+          ),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('gamecenter_delete_modal:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only staff can delete a game.', ephemeral: true });
+        return;
+      }
+      const reason = interaction.fields.getTextInputValue('reason').trim() || 'Game deleted by staff';
+      await interaction.deferReply();
+      const result = await deleteLeagueGameCore(interaction, game, reason);
+      await interaction.editReply({ content: result.message });
       return;
     }
 
@@ -30100,6 +30155,62 @@ async function forceLeagueGameResult(interaction, game, winnerSide) {
   };
 }
 
+// 7J-GHOSTDELETE: per Hxxdie — Reset Game only works on already-final games
+// (it reopens them). There was no way to get out of a game that was
+// scheduled but never played because one side went unresponsive — the
+// other owner would just be stuck waiting forever with no path forward.
+// This fully cancels a game at any status: reverses standings if it had
+// already been reported final (reusing resetLeagueGameCore's reversal
+// logic), refunds/closes any open sportsbook line, archives the thread
+// rather than deleting it outright (keeps the conversation history
+// retrievable if needed), and removes the league_games row entirely —
+// unlike Reset, this can't be undone, hence the confirm step at the call
+// site.
+async function deleteLeagueGameCore(interaction, game, reason = 'Game deleted by staff') {
+  const activeLeague = await getLeagueById(game.league_id);
+  if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
+
+  let standingsNote = '';
+  if (game.status === 'final') {
+    const reversal = await resetLeagueGameCore(interaction, game, reason);
+    if (!reversal.ok) return reversal;
+    standingsNote = ' Standings rolled back.';
+  } else {
+    // Not final — resetLeagueGameCore would refuse this, and there's no
+    // standings entry to reverse yet, but any open bet still needs
+    // refunding since we're about to delete the game out from under it.
+    const openLines = await pool.query(
+      `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND league_game_id = $2 AND status = 'open'`,
+      [interaction.guild.id, game.id]
+    ).catch(() => ({ rows: [] }));
+    for (const line of openLines.rows || []) {
+      await refundSportsbookGameBets(interaction.guild, line, interaction.user.id, reason).catch(err =>
+        console.error('[Delete Game] Refund failed:', err?.message || err));
+    }
+    if (openLines.rows.length) standingsNote = ` ${openLines.rows.length} open sportsbook bet(s) refunded.`;
+  }
+
+  if (game.thread_id) {
+    const thread = await interaction.guild.channels.fetch(game.thread_id).catch(() => null);
+    await thread?.setArchived(true, reason).catch(() => null);
+  }
+
+  const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id).catch(() => null);
+  const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id).catch(() => null);
+  const cancelNote = `Your matchup **${game.away_team_name} @ ${game.home_team_name}** in **${activeLeague.league_name}** was cancelled by staff.${reason ? ` Reason: ${reason}` : ''}`;
+  for (const owner of [homeOwner, awayOwner].filter(Boolean)) {
+    await owner.send({ content: cancelNote }).catch(() => null);
+  }
+
+  await pool.query(`DELETE FROM league_games WHERE id = $1`, [game.id]);
+  await updateGameCenterPanel(interaction.guild, activeLeague).catch(() => null);
+
+  return {
+    ok: true,
+    message: `🗑️ Deleted: **${game.away_team_name} @ ${game.home_team_name}**.${standingsNote} Both owners were notified.`,
+  };
+}
+
 async function resetLeagueGameCore(interaction, game, reason = 'Game reset') {
   const activeLeague = await getLeagueById(game.league_id);
   if (!activeLeague) return { ok: false, message: 'Could not find the league for that game.' };
@@ -30341,6 +30452,13 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
       new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
+      // 7J-GHOSTDELETE: per Hxxdie — a team owner who gets ghosted by their
+      // scheduled opponent shouldn't be stuck waiting forever with no way
+      // out. Unlike Reset (which only works on already-final games and
+      // just reopens them), this works at any status and permanently
+      // removes the game — always enabled, confirmed via a Yes/No step at
+      // the handler since it can't be undone.
+      new ButtonBuilder().setCustomId('gamecenter_delete:' + gameId).setLabel('Delete Game (Staff)').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
     ),
   ];
 }
