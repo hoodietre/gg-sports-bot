@@ -15307,6 +15307,28 @@ if (interaction.commandName === 'avatar') {
           ? `\n⚠️ ${unscoredCleanup.checked} game(s) from ${previousRoundLabel} never had a final score reported${unscoredCleanup.refunded ? ` — ${unscoredCleanup.refunded} open bet line(s) refunded` : ''}. Involved owners have been notified.`
           : '';
         await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}${cleanupNote}${unscoredNote}` });
+
+        // 7J-STRUCTUREDANNOUNCE: per Hxxdie — Madden leagues already
+        // announce a week advance publicly (game_threads_created news
+        // event, routed to League Announcement); structured non-Madden
+        // leagues had no equivalent, so members had no way to know a new
+        // round existed short of noticing a new thread themselves.
+        const announceChannelId = league.league_announcement_channel_id;
+        const announceChannel = announceChannelId ? await interaction.guild.channels.fetch(announceChannelId).catch(() => null) : null;
+        if (announceChannel?.isTextBased?.()) {
+          const announceEmbed = new EmbedBuilder()
+            .setTitle(isFirstStart ? '🏆 Season Started' : '📅 League Advanced')
+            .setColor(0x5865F2)
+            .setDescription(`${headline.replace(/\*\*/g, '')}\n\n${matchupText}`)
+            .addFields({ name: 'Game Threads', value: threadChannel ? `${threadsCreated}/${gamesCreated} created in <#${threadChannel.id}>.` : 'No Game Threads channel configured.', inline: false })
+            .setFooter({ text: `GG Sports • ${league.league_name}` })
+            .setTimestamp();
+          await announceChannel.send({
+            content: league.league_role_id ? `<@&${league.league_role_id}>` : undefined,
+            embeds: [announceEmbed],
+            allowedMentions: { roles: league.league_role_id ? [league.league_role_id] : [] },
+          }).catch(() => null);
+        }
         return;
       }
 
@@ -16608,6 +16630,16 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: 'Only staff can delete a game.', ephemeral: true });
         return;
       }
+      // 7J-STRUCTUREDNODELETE: same reasoning as hiding the button —
+      // deleting a game from a fixed structured schedule permanently
+      // leaves that team with fewer games than everyone else, with no way
+      // to add it back in. Checked here too in case a stale button from
+      // before this change (or a Refresh on an old thread) still shows it.
+      const deleteCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      if (deleteCustomSettings.schedule_style === 'structured') {
+        await interaction.reply({ content: "Structured-schedule games can't be deleted — it would leave that team with fewer games than everyone else with no way to add it back. An unreported game already gets auto-refunded when the league advances past it.", ephemeral: true });
+        return;
+      }
       const modal = new ModalBuilder()
         .setCustomId('gamecenter_delete_modal:' + gameId)
         .setTitle('Delete This Game?')
@@ -16627,6 +16659,11 @@ if (interaction.commandName === 'avatar') {
       const league = await getLeagueById(game.league_id);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
         await interaction.reply({ content: 'Only staff can delete a game.', ephemeral: true });
+        return;
+      }
+      const deleteModalCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      if (deleteModalCustomSettings.schedule_style === 'structured') {
+        await interaction.reply({ content: "Structured-schedule games can't be deleted.", ephemeral: true });
         return;
       }
       const reason = interaction.fields.getTextInputValue('reason').trim() || 'Game deleted by staff';
@@ -30575,21 +30612,30 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
     new ButtonBuilder().setCustomId('gamecenter_issue:' + gameId).setLabel('Report Issue').setEmoji('🛠️').setStyle(ButtonStyle.Danger),
   );
 
-  return [
-    row1,
-    row2,
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
-      new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
-      // 7J-GHOSTDELETE: per Hxxdie — a team owner who gets ghosted by their
-      // scheduled opponent shouldn't be stuck waiting forever with no way
-      // out. Unlike Reset (which only works on already-final games and
-      // just reopens them), this works at any status and permanently
-      // removes the game — always enabled, confirmed via a Yes/No step at
-      // the handler since it can't be undone.
+  const staffRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('gamecenter_forcewin:' + gameId).setLabel('Force Win (Staff)').setEmoji('🔨').setStyle(ButtonStyle.Secondary).setDisabled(isFinal),
+    new ButtonBuilder().setCustomId('gamecenter_reset:' + gameId).setLabel('Reset Game (Staff)').setEmoji('🔄').setStyle(ButtonStyle.Danger).setDisabled(!isFinal),
+  );
+  // 7J-GHOSTDELETE: per Hxxdie — a team owner who gets ghosted by their
+  // scheduled opponent shouldn't be stuck waiting forever with no way out.
+  // Unlike Reset (which only works on already-final games and just reopens
+  // them), this works at any status and permanently removes the game —
+  // confirmed via a Yes/No step at the handler since it can't be undone.
+  // 7J-STRUCTUREDNODELETE: open-schedule only, per Hxxdie — a structured
+  // league runs a fixed generated schedule with no way to add a specific
+  // game back in for a given round, so deleting one there permanently
+  // leaves that team with fewer games than everyone else. Structured
+  // leagues don't need this escape valve anyway: the ghosting scenario is
+  // already handled differently there — an unreported game just gets
+  // auto-refunded (with both owners notified) the moment the league
+  // advances past that round, no manual staff action required.
+  if (isOpenSchedule) {
+    staffRow.addComponents(
       new ButtonBuilder().setCustomId('gamecenter_delete:' + gameId).setLabel('Delete Game (Staff)').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
-    ),
-  ];
+    );
+  }
+
+  return [row1, row2, staffRow];
 }
 
 // 7J-133TEAMTHREADJOIN: compares old/new role sets on a member update, and
