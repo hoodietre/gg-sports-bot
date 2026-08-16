@@ -16385,9 +16385,11 @@ if (interaction.commandName === 'avatar') {
     // front of both teams, not a private per-user roll.
     // 7J-PREGAMETOOLS: relocated from the matchup thread to the Game Center
     // panel, per Hxxdie — same flip logic/embed as before, just no longer
-    // tied to an already-created game. Also cross-posts to League Chat (if
-    // configured) so it doesn't just sit buried in Game Center — per
-    // Hxxdie's follow-up ask.
+    // tied to an already-created game.
+    // 7J-COINTOSSCHATONLY: per Hxxdie's follow-up — should post to League
+    // Chat only, not also publicly in Game Center. The click itself gets an
+    // ephemeral acknowledgment instead of a public post in the panel
+    // channel.
     if (interaction.isButton() && interaction.customId.startsWith('gamecenter_panel_cointoss:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId).catch(() => null);
@@ -16399,13 +16401,15 @@ if (interaction.commandName === 'avatar') {
         .addFields({ name: 'Result', value: result === 'heads' ? 'Heads' : 'Tails', inline: true })
         .setFooter({ text: 'GG Sports • Coin Toss' })
         .setTimestamp();
-      await interaction.reply({ embeds: [embed] });
 
       const chatChannelId = league?.league_chat_channel_id;
       const chatChannel = chatChannelId ? await interaction.guild.channels.fetch(chatChannelId).catch(() => null) : null;
-      if (chatChannel && chatChannel.id !== interaction.channel?.id) {
-        await chatChannel.send({ embeds: [embed] }).catch(() => null);
+      if (!chatChannel) {
+        await interaction.reply({ content: 'No League Chat Channel is configured yet — ask a commissioner to set one from the Setup Dashboard (League Chat Channel).', ephemeral: true });
+        return;
       }
+      await chatChannel.send({ embeds: [embed] }).catch(() => null);
+      await interaction.reply({ content: `🪙 Posted to <#${chatChannel.id}> — **${result === 'heads' ? 'Heads' : 'Tails'}**.`, ephemeral: true });
       return;
     }
 
