@@ -16225,6 +16225,31 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-THREADREFRESH: staff-only, posts a brand new message into the
+    // thread with the current embed and the full up-to-date button set —
+    // covers threads created before a new button (like Delete Game) was
+    // added, since Discord never retroactively updates an already-sent
+    // message's components on its own.
+    if (interaction.isButton() && interaction.customId.startsWith('gamecenter_refresh:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.reply({ content: 'Only staff can refresh this thread.', ephemeral: true });
+        return;
+      }
+      const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
+      const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
+      const refreshCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const wagersEnabled = refreshCustomSettings.wagers_enabled === true;
+      await interaction.reply({
+        embeds: [buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id)],
+        components: buildGameCenterThreadComponents(gameId, game.status === 'final', Boolean(game.game_started_at), wagersEnabled, leagueCategoryEmoji(league), refreshCustomSettings.schedule_style !== 'structured'),
+      });
+      return;
+    }
+
     // 7J-141GAMETHREADBUTTONS: Wager — same straight 1v1 bet as Madden's
     // version, reusing the exact same game_wagers table and the generic
     // gamewager_accept:/gamewager_decline: buttons (neither of those two
@@ -30432,6 +30457,12 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
   }
   row1.addComponents(
     new ButtonBuilder().setCustomId('gamecenter_stream:' + gameId).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
+    // 7J-THREADREFRESH: per Hxxdie — an old thread's message keeps whatever
+    // button set it was created with; Discord doesn't retroactively update
+    // it when the bot's code changes (e.g. Delete Game not existing on
+    // threads created before it was added). Staff-only, posts a fresh
+    // message with the current embed + full up-to-date button set.
+    new ButtonBuilder().setCustomId('gamecenter_refresh:' + gameId).setLabel('Refresh Buttons (Staff)').setEmoji('🔁').setStyle(ButtonStyle.Secondary),
   );
 
   // 7J-PREGAMETOOLS: Coin Toss and Who's Got Next moved out of the matchup
