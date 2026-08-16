@@ -13321,7 +13321,8 @@ if (interaction.commandName === 'avatar') {
         const feedSettings = await getSportsbookSettings(interaction.guild.id);
         await postSportsbookFeed(
           interaction.guild,
-          buildSportsbookBetAlertEmbed(settings, interaction.user, sportsbookGame, side, amount, odds, payout, amount >= Number(feedSettings.big_bet_threshold || 500))
+          buildSportsbookBetAlertEmbed(settings, interaction.user, sportsbookGame, side, amount, odds, payout, amount >= Number(feedSettings.big_bet_threshold || 500)),
+          sportsbookGame.league_id
         );
         const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
         await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
@@ -16219,7 +16220,7 @@ if (interaction.commandName === 'avatar') {
       await interaction.editReply({ embeds: [lockEmbed] });
 
       if (lockedGamesResult.rows.length) {
-        await postSportsbookFeed(interaction.guild, lockEmbed).catch(() => null);
+        await postSportsbookFeed(interaction.guild, lockEmbed, game.league_id).catch(() => null);
       }
 
       const updatedGame = await findLeagueGameById(interaction.guild.id, gameId);
@@ -26364,7 +26365,8 @@ if (shopSubcommand === 'view') {
         await updateSportsbookPanel(interaction.guild).catch(() => null);
         await postSportsbookFeed(
           interaction.guild,
-          buildSportsbookBetAlertEmbed(settings, interaction.user, sportsbookGame, side, amount, odds, payout, amount >= bigBetThreshold)
+          buildSportsbookBetAlertEmbed(settings, interaction.user, sportsbookGame, side, amount, odds, payout, amount >= bigBetThreshold),
+          sportsbookGame.league_id
         );
 
         await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
@@ -27523,36 +27525,87 @@ async function buildSportsbookPanelEmbed(guildId) {
     .setFooter({ text: 'GG Sports • Live Sportsbook Board' })
     .setTimestamp();
 
+  // 7J-SPORTGROUPING: per Hxxdie — everything was rendering under one
+  // hardcoded "🏈 MONEYLINES" regardless of sport (an MLB matchup showed a
+  // football emoji), and multiple leagues of the same sport were only
+  // distinguishable by an accidental double-prefix in team names that got
+  // cleaned up separately. Now groups by actual sport with the right
+  // emoji, and only prefixes a line with its league name when that
+  // specific sport has more than one distinct league among the currently
+  // open lines — a guild running just one league per sport (the common
+  // case) sees no added clutter at all.
+  const distinctLeagueIds = [...new Set(openResult.rows.map(r => r.league_id).filter(Boolean))];
+  const leagueLookup = new Map();
+  if (distinctLeagueIds.length) {
+    const leagueRows = await pool.query(
+      `SELECT league_id, league_name, game_key FROM leagues WHERE league_id = ANY($1::uuid[])`,
+      [distinctLeagueIds]
+    ).catch(() => ({ rows: [] }));
+    for (const row of leagueRows.rows) leagueLookup.set(row.league_id, row);
+  }
+  const sportEmoji = { madden: '🏈', nfl: '🏈', nba: '🏀', nhl: '🏒', mlb: '⚾', fc: '⚽', cfb: '🏈' };
+  function groupBySport(rows) {
+    const bySport = new Map();
+    for (const row of rows) {
+      const leagueInfo = leagueLookup.get(row.league_id);
+      const sportKey = leagueInfo?.game_key || 'other';
+      if (!bySport.has(sportKey)) bySport.set(sportKey, { emoji: sportEmoji[sportKey] || '🏆', label: sportKey.toUpperCase(), rows: [], leagueNames: new Set() });
+      const group = bySport.get(sportKey);
+      group.rows.push(row);
+      if (leagueInfo?.league_name) group.leagueNames.add(leagueInfo.league_name);
+    }
+    return [...bySport.values()].sort((a, b) => b.rows.length - a.rows.length);
+  }
+  function leaguePrefix(group, row) {
+    if (group.leagueNames.size <= 1) return '';
+    const name = leagueLookup.get(row.league_id)?.league_name;
+    return name ? `[${name}] ` : '';
+  }
+
+  // 7J-FIELDCAP: sport-grouping multiplies field count (one per section per
+  // sport instead of one per section total) — safe for the realistic case
+  // of a couple sports per guild, but capped defensively so a guild running
+  // many sports/leagues at once can't blow past Discord's embed limits.
+  let fieldsRemaining = 20;
+  function addCappedField(name, value) {
+    if (fieldsRemaining <= 0) return;
+    embed.addFields({ name, value, inline: false });
+    fieldsRemaining -= 1;
+  }
+
   if (moneylines.length) {
-    embed.addFields({
-      name: '🏈 MONEYLINES',
-      value: moneylines.slice(0, 8).map(row =>
-        `**${row.away_label}** ${formatAmericanOdds(row.away_odds)}  @  **${row.home_label}** ${formatAmericanOdds(row.home_odds)}${NL}` +
-        `↳ ${row.bet_count} bet(s) • ${row.total_handle} handle`
-      ).join(NL).slice(0, 1024),
-      inline: false,
-    });
+    for (const group of groupBySport(moneylines)) {
+      addCappedField(
+        `${group.emoji} MONEYLINES — ${group.label}`,
+        group.rows.slice(0, 8).map(row =>
+          `**${leaguePrefix(group, row)}${row.away_label}** ${formatAmericanOdds(row.away_odds)}  @  **${leaguePrefix(group, row)}${row.home_label}** ${formatAmericanOdds(row.home_odds)}${NL}` +
+          `↳ ${row.bet_count} bet(s) • ${row.total_handle} handle`
+        ).join(NL).slice(0, 1024)
+      );
+    }
   }
 
   if (playerProps.length) {
-    embed.addFields({
-      name: '🎯 PLAYER PROPS',
-      value: playerProps.slice(0, 8).map(row =>
-        `**${row.subject_display_name}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}${NL}` +
-        `↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`
-      ).join(NL).slice(0, 1024),
-      inline: false,
-    });
+    for (const group of groupBySport(playerProps)) {
+      addCappedField(
+        `🎯 PLAYER PROPS — ${group.label}`,
+        group.rows.slice(0, 8).map(row =>
+          `**${leaguePrefix(group, row)}${row.subject_display_name}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}${NL}` +
+          `↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`
+        ).join(NL).slice(0, 1024)
+      );
+    }
   }
 
   if (freeformProps.length) {
-    embed.addFields({
-      name: '🎫 FEATURED PROPS',
-      value: freeformProps.slice(0, 8).map(row =>
-        `**${row.game_label}**${NL}↳ ${row.home_label} ${formatAmericanOdds(row.home_odds)} • ${row.away_label} ${formatAmericanOdds(row.away_odds)}`
-      ).join(NL).slice(0, 1024),
-      inline: false,
-    });
+    for (const group of groupBySport(freeformProps)) {
+      addCappedField(
+        `🎫 FEATURED PROPS — ${group.label}`,
+        group.rows.slice(0, 8).map(row =>
+          `**${leaguePrefix(group, row)}${row.game_label}**${NL}↳ ${row.home_label} ${formatAmericanOdds(row.home_odds)} • ${row.away_label} ${formatAmericanOdds(row.away_odds)}`
+        ).join(NL).slice(0, 1024)
+      );
+    }
   }
 
   if (!moneylines.length && !playerProps.length && !freeformProps.length) {
@@ -29186,19 +29239,32 @@ async function getSportsbookSettings(guildId) {
   return result.rows[0] || { guild_id: guildId, feed_channel_id: null, big_bet_threshold: 500 };
 }
 
-// 7J-FEEDSILENT: same silent-swallow pattern as the earlier
-// refreshAllMultiChannelPanelPostings bug — per Hxxdie, a game created a
-// sportsbook line but nothing posted to #sportsbook-feed with zero error
-// anywhere. Now logs the real failure and fires the same permission-issue
-// owner alert this function's sibling already uses.
-async function postSportsbookFeed(guild, embed) {
+// 7J-FEEDCHANNELFIX: per Hxxdie — the feed stayed completely silent even
+// after the earlier logging fix, because it was silently no-op'ing on its
+// very first line (no channel configured) before ever reaching that
+// logging. Root cause: two disconnected "sportsbook feed channel" settings
+// existed in this codebase. Madden's own sportsbook-line posting path
+// already correctly prioritizes league.sportsbook_channel_id (the
+// per-league setting Auto Setup actually creates a real "sportsbook-feed"
+// channel for) — this generic function instead only ever read the
+// guild-wide sportsbook_settings.feed_channel_id, which nothing
+// auto-populates and which nobody had manually configured. Now takes an
+// optional leagueId and prioritizes the per-league channel, matching
+// Madden's already-correct behavior, while still falling back to the
+// guild-wide setting for anyone who did configure that manually.
+async function postSportsbookFeed(guild, embed, leagueId = null) {
   const settings = await getSportsbookSettings(guild.id);
-  if (!settings.feed_channel_id) return;
+  let feedChannelId = settings.feed_channel_id || null;
+  if (leagueId) {
+    const league = await getLeagueById(leagueId).catch(() => null);
+    if (league?.sportsbook_channel_id) feedChannelId = league.sportsbook_channel_id;
+  }
+  if (!feedChannelId) return;
 
-  const channel = await guild.channels.fetch(settings.feed_channel_id).catch(err => {
-    console.error(`[SPORTSBOOK FEED] channel fetch failed for ${settings.feed_channel_id}:`, err?.message || err);
+  const channel = await guild.channels.fetch(feedChannelId).catch(err => {
+    console.error(`[SPORTSBOOK FEED] channel fetch failed for ${feedChannelId}:`, err?.message || err);
     if (isDiscordPermissionError(err)) {
-      notifyOwnerOfBotPermissionIssue(guild, `sportsbookfeed:${settings.feed_channel_id}`, settings.feed_channel_id,
+      notifyOwnerOfBotPermissionIssue(guild, `sportsbookfeed:${feedChannelId}`, feedChannelId,
         `I can't see your Sportsbook Feed channel, so nothing has been posting there.`).catch(() => null);
     }
     return null;
@@ -29207,7 +29273,7 @@ async function postSportsbookFeed(guild, embed) {
   await channel.send({ embeds: [embed] }).catch(err => {
     console.error(`[SPORTSBOOK FEED] send failed in #${channel.name}:`, err?.message || err);
     if (isDiscordPermissionError(err)) {
-      notifyOwnerOfBotPermissionIssue(guild, `sportsbookfeed:${settings.feed_channel_id}`, settings.feed_channel_id,
+      notifyOwnerOfBotPermissionIssue(guild, `sportsbookfeed:${feedChannelId}`, feedChannelId,
         `I don't have permission to send messages in **#${channel.name}**, so your Sportsbook Feed hasn't been posting.`).catch(() => null);
     }
   });
@@ -29542,7 +29608,7 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
     .setFooter({ text: 'GG Sports • Auto Sportsbook' })
     .setTimestamp();
 
-  await postSportsbookFeed(interaction.guild, feedEmbed);
+  await postSportsbookFeed(interaction.guild, feedEmbed, leagueGame.league_id);
   return sportsbookGame;
 }
 
@@ -29626,7 +29692,7 @@ async function resetSportsbookForLeagueGame(guild, leagueGame, issuedByUserId, r
     .setFooter({ text: 'GG Sports • Game Reset' })
     .setTimestamp();
 
-  await postSportsbookFeed(guild, embed).catch(() => null);
+  await postSportsbookFeed(guild, embed, sportsbookGame.league_id).catch(() => null);
 
   return { reset: true, refundedCount, refundedAmount };
 }
@@ -29715,7 +29781,7 @@ async function autoSettleSportsbookForLeagueGame(interaction, leagueGame, winner
     .setFooter({ text: 'GG Sports • Auto Sportsbook' })
     .setTimestamp();
 
-  await postSportsbookFeed(interaction.guild, feedEmbed);
+  await postSportsbookFeed(interaction.guild, feedEmbed, sportsbookGame.league_id);
 
   return { sportsbookGame, winners, losers, totalPaid, parlayResult };
 }
@@ -30862,7 +30928,7 @@ async function refundSportsbookGameBets(guild, sportsbookGame, issuedByUserId, r
     .setFooter({ text: 'GG Sports • Sportsbook Refund' })
     .setTimestamp();
 
-  await postSportsbookFeed(guild, embed);
+  await postSportsbookFeed(guild, embed, sportsbookGame.league_id);
   return { refundedCount, refundedAmount };
 }
 
@@ -30890,7 +30956,7 @@ async function performSportsbookSettlement(guild, sportsbookGame, winner, actorU
       winners += 1;
       totalPaid += payout;
       const winSideLabel = bet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-      await postSportsbookFeed(guild, buildSportsbookWinAlertEmbed(settings, { ...bet, potential_payout: payout }, sportsbookGame, winSideLabel));
+      await postSportsbookFeed(guild, buildSportsbookWinAlertEmbed(settings, { ...bet, potential_payout: payout }, sportsbookGame, winSideLabel), sportsbookGame.league_id);
     } else {
       await incrementRecognitionStat(guild.id, bet.user_id, 'sportsbook_profit', -Number(bet.amount)).catch(() => null);
       lostBets.push(bet);
@@ -30910,21 +30976,21 @@ async function performSportsbookSettlement(guild, sportsbookGame, winner, actorU
 
   const winnerLabel = winner === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
   await updateSportsbookPanel(guild).catch(() => null);
-  await postSportsbookFeed(guild, buildSportsbookSettlementAlertEmbed(sportsbookGame, winnerLabel, winners, losers, totalPaid, parlayResult));
+  await postSportsbookFeed(guild, buildSportsbookSettlementAlertEmbed(sportsbookGame, winnerLabel, winners, losers, totalPaid, parlayResult), sportsbookGame.league_id);
 
   for (const wonParlay of parlayResult.wonParlays || []) {
-    await postSportsbookFeed(guild, buildParlayHitAlertEmbed(settings, wonParlay));
+    await postSportsbookFeed(guild, buildParlayHitAlertEmbed(settings, wonParlay), sportsbookGame.league_id);
   }
 
   const badBeatBet = getBadBeatBet(lostBets);
   if (badBeatBet) {
     const badBeatSideLabel = badBeatBet.side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-    await postSportsbookFeed(guild, buildBadBeatAlertEmbed(settings, badBeatBet, sportsbookGame, badBeatSideLabel));
+    await postSportsbookFeed(guild, buildBadBeatAlertEmbed(settings, badBeatBet, sportsbookGame, badBeatSideLabel), sportsbookGame.league_id);
   }
 
   const leaderboardSpotlight = await getSportsbookLeaderboardSpotlight(guild.id, [...winningUserIds]);
   if (leaderboardSpotlight) {
-    await postSportsbookFeed(guild, buildSportsbookLeaderboardAlertEmbed(settings, leaderboardSpotlight));
+    await postSportsbookFeed(guild, buildSportsbookLeaderboardAlertEmbed(settings, leaderboardSpotlight), sportsbookGame.league_id);
   }
 
   return { winners, losers, totalPaid, parlayResult, winnerLabel };
@@ -47365,7 +47431,7 @@ async function handleMaddenGameThreadButton(interaction) {
       .setTimestamp();
     await interaction.editReply({ embeds: [lockEmbed] });
     if (lockedGamesResult.rows.length) {
-      await postSportsbookFeed(interaction.guild, lockEmbed).catch(() => null);
+      await postSportsbookFeed(interaction.guild, lockEmbed, game.league_id).catch(() => null);
     }
 
     if (interaction.channel?.isThread?.()) {
@@ -65523,13 +65589,14 @@ async function sweepSportsbookBettingLocks(client) {
      WHERE status = 'open' AND bets_locked = FALSE AND bets_lock_at IS NOT NULL AND bets_lock_at <= NOW()`
   ).catch(error => console.error('[7J-48LOCK] Failed to finalize betting locks:', error?.message || error));
 
-  const byGuild = new Map();
+  const byGuildLeague = new Map();
   for (const row of dueResult.rows) {
-    if (!byGuild.has(row.guild_id)) byGuild.set(row.guild_id, []);
-    byGuild.get(row.guild_id).push(row);
+    const key = `${row.guild_id}:${row.league_id || ''}`;
+    if (!byGuildLeague.has(key)) byGuildLeague.set(key, { guildId: row.guild_id, leagueId: row.league_id || null, rows: [] });
+    byGuildLeague.get(key).rows.push(row);
   }
 
-  for (const [guildId, rows] of byGuild.entries()) {
+  for (const { guildId, leagueId, rows } of byGuildLeague.values()) {
     const guild = await client.guilds.fetch(guildId).catch(() => null);
     if (!guild) continue;
     const lines = rows.map(r => `🔒 ${r.game_label}`).join('\n');
@@ -65539,7 +65606,7 @@ async function sweepSportsbookBettingLocks(client) {
       .setDescription(lines.slice(0, 3900))
       .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
       .setTimestamp();
-    await postSportsbookFeed(guild, embed).catch(() => null);
+    await postSportsbookFeed(guild, embed, leagueId).catch(() => null);
   }
 }
 
