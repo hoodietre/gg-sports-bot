@@ -5644,7 +5644,7 @@ Thread: <#${data.thread_id}>` : '';
         `**Verdict:** ${verdict}`,
       ].join('\n'), 1024), inline: false },
       { name: '🤝 GM Confirmations', value: `✅ ${maddenTeamDisplayName(requestingTeam)} GM: <@${data.requesting_user_id || offer.sender_user_id}>
-✅ ${maddenTeamDisplayName(listingTeam)} GM: <@${data.listing_user_id || offer.target_owner_user_id}>`, inline: false },
+${(data.listing_user_id || offer.target_owner_user_id) ? `✅ ${maddenTeamDisplayName(listingTeam)} GM: <@${data.listing_user_id || offer.target_owner_user_id}>` : `🤖 ${maddenTeamDisplayName(listingTeam)}: CPU-controlled (no owner)`}`, inline: false },
       { name: 'Committee Vote', value: `Approve: **${approveCount}** / ${votesNeeded} needed
 Deny: **${denyCount}** / ${votesNeeded} needed
 Status: **${offer.status || 'pending_review'}**`, inline: true },
@@ -9646,9 +9646,10 @@ client.on(Events.MessageCreate, async (message) => {
         return;
       }
       const offerForEmbed = { id: offerId, sender_team: senderTeam.name, target_team: pendingData.targetTeamName, offer_details: '', screenshot_url: attachment.url, status: 'owner_accepted' };
+      const votesNeeded = Number(customSettings.trade_committee_votes_needed) || 3;
       const committeeMessage = await committeeChannel.send({
         content: `<@&${league?.committee_role_id}>`,
-        embeds: [buildCommitteeEmbed(offerForEmbed, 0, 0)],
+        embeds: [buildCommitteeEmbed(offerForEmbed, 0, 0, votesNeeded)],
         components: [buildCommitteeVoteButtons(offerId)],
         allowedMentions: { roles: [league?.committee_role_id], users: [] },
       });
@@ -14473,9 +14474,11 @@ if (interaction.commandName === 'avatar') {
           return;
         }
         const offerForEmbed = { id: offerId, sender_team: refreshed.sender_team_name, target_team: refreshed.target_team_name, offer_details: '', screenshot_url: refreshed.pending_screenshot_url, status: 'owner_accepted' };
+        const negotiationVoteSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+        const votesNeeded = Number(negotiationVoteSettings.trade_committee_votes_needed) || 3;
         const committeeMessage = await committeeChannel.send({
           content: `<@&${league?.committee_role_id}>`,
-          embeds: [buildCommitteeEmbed(offerForEmbed, 0, 0)],
+          embeds: [buildCommitteeEmbed(offerForEmbed, 0, 0, votesNeeded)],
           components: [buildCommitteeVoteButtons(offerId)],
           allowedMentions: { roles: [league?.committee_role_id], users: [] },
         });
@@ -14652,7 +14655,7 @@ if (interaction.commandName === 'avatar') {
         }
         const committeeMessage = await committeeChannel.send({
           content: `<@&${league?.committee_role_id}>`,
-          embeds: [buildCommitteeEmbed({ ...offer, status: 'owner_accepted' }, 0, 0)],
+          embeds: [buildCommitteeEmbed({ ...offer, status: 'owner_accepted' }, 0, 0, Number((await ensureLeagueCustomSettings(league).catch(() => ({}))).trade_committee_votes_needed) || 3)],
           components: [buildCommitteeVoteButtons(offerId)],
           allowedMentions: { roles: [league?.committee_role_id], users: [] },
         });
@@ -42175,9 +42178,11 @@ async function submitMaddenNegotiationPackageToCommittee(interaction, negotiatio
 
     let committeeMessage = null;
     try {
+      const committeeVoteSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const votesNeeded = Number(committeeVoteSettings.trade_committee_votes_needed) || 3;
       committeeMessage = await committeeChannel.send({
         content: committeeRoleId ? `<@&${committeeRoleId}>` : undefined,
-        embeds: [buildCommitteeEmbed(offerRow, 0, 0)],
+        embeds: [buildCommitteeEmbed(offerRow, 0, 0, votesNeeded)],
         components: [buildCommitteeVoteButtons(offerId)],
         allowedMentions: { roles: committeeRoleId ? [committeeRoleId] : [], users: [] },
       });
