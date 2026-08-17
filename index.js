@@ -5678,9 +5678,9 @@ function buildCommitteeEmbed(offer, approveCount, denyCount, votesNeeded = 3) {
   return embed;
 }
 
-function buildFinalTradeEmbed(title, color, offer) {
+function buildFinalTradeEmbed(title, color, offer, approveCount = 0, denyCount = 0, votesNeeded = 3) {
   if (parseMaddenNegotiationOfferDetails(offer.offer_details)) {
-    return buildMaddenNegotiationCommitteeEmbed(offer, 0, 0).setTitle(title).setColor(color).setFooter({ text: 'GG Sports • Trade Result' });
+    return buildMaddenNegotiationCommitteeEmbed(offer, approveCount, denyCount, votesNeeded).setTitle(title).setColor(color).setFooter({ text: 'GG Sports • Trade Result' });
   }
   const details = offer.offer_details || '';
   const hasScreenshot = Boolean(offer.screenshot_url);
@@ -5691,7 +5691,8 @@ function buildFinalTradeEmbed(title, color, offer) {
       { name: 'Offering Team', value: offer.sender_team || 'Unknown Team', inline: true },
       { name: 'Receiving Team', value: offer.target_team || 'Unknown Team', inline: true },
       { name: 'Sent By', value: `<@${offer.sender_user_id}>`, inline: true },
-      { name: 'Trade Details', value: maddenSafeEmbedText(details || 'No structured trade details were provided.', 1024), inline: false }
+      { name: 'Trade Details', value: maddenSafeEmbedText(details || 'No structured trade details were provided.', 1024), inline: false },
+      { name: 'Committee Vote', value: `Approve: ${approveCount} / ${votesNeeded} needed\nDeny: ${denyCount} / ${votesNeeded} needed`, inline: false }
     )
     .setFooter({ text: 'GG Sports • Trade Result' })
     .setTimestamp();
@@ -8443,21 +8444,35 @@ async function createMatchThreads(guild, tournament, matches) {
     if (!match.player1_user_id || !match.player2_user_id || match.status === 'final' || match.status === 'bye') continue;
     if (match.thread_id) continue;
 
-    const starter = await channel.send({
-      content: `<@${match.player1_user_id}> vs <@${match.player2_user_id}> — Tournament match created.`,
-      embeds: [buildTournamentMatchThreadEmbed(tournament, match)],
-      components: [buildMatchWinnerButtons(match)],
-      allowedMentions: { users: [match.player1_user_id, match.player2_user_id], roles: [] },
-    });
-
+    // 7J-MATCHTHREADDUP: per Hxxdie — a thread created FROM a channel
+    // message (message.startThread()) leaves that origin message visibly
+    // sitting in the parent channel *and* Discord's client also renders it
+    // (as a non-interactive reference) at the top of the thread itself —
+    // looking like two copies of the same matchup post, one with working
+    // buttons (the real message, in the channel) and one that looks
+    // greyed-out (the thread's read-only reference to it). Creating a
+    // standalone thread instead (not anchored to any channel message, same
+    // pattern already used for trade-negotiation threads elsewhere in this
+    // file) and posting the real interactive matchup message *inside* the
+    // thread avoids a parent-channel post entirely — the matchup now only
+    // ever lives in the thread, with one real, always-interactive copy of
+    // the winner buttons.
     const threadName = `${tournament.tournament_name} R${match.round_number} M${match.match_number}`.slice(0, 90);
-    const thread = await starter.startThread({
+    const thread = await channel.threads.create({
       name: threadName,
+      type: ChannelType.PublicThread,
       autoArchiveDuration: 1440,
       reason: 'Tournament match thread',
     }).catch(() => null);
 
     if (thread) {
+      await thread.send({
+        content: `<@${match.player1_user_id}> vs <@${match.player2_user_id}> — Tournament match created.`,
+        embeds: [buildTournamentMatchThreadEmbed(tournament, match)],
+        components: [buildMatchWinnerButtons(match)],
+        allowedMentions: { users: [match.player1_user_id, match.player2_user_id], roles: [] },
+      }).catch(() => null);
+
       await thread.send({
         content: `<@${match.player1_user_id}> <@${match.player2_user_id}> schedule/play your match here. Staff can click the winner button on the match post, or use Match ID: **${shortMatchId(match.id)}**`,
         allowedMentions: { users: [match.player1_user_id, match.player2_user_id], roles: [] },
@@ -9022,28 +9037,41 @@ async function updateTournamentPanel(guild, tournament) {
   if (!channel || !channel.isTextBased()) return;
 
   const message = await channel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
-  if (!message) return;
 
-  if (tournament.status === 'cancelled') {
-    await message.edit({ embeds: [buildTournamentCancelledEmbed(tournament)], components: [] });
-    return;
+  if (message) {
+    if (tournament.status === 'cancelled') {
+      await message.edit({ embeds: [buildTournamentCancelledEmbed(tournament)], components: [] });
+      return;
+    }
+
+    if (tournament.status === 'open') {
+      const entries = await getTournamentEntries(tournament.id);
+      await message.edit({ embeds: [buildTournamentRegistrationEmbed(tournament, entries)], components: buildTournamentRegistrationComponents(tournament) });
+      return;
+    }
+
+    const matches = await getTournamentMatches(tournament.id);
+    await message.edit({ embeds: [buildTournamentPanelEmbed(tournament, matches)], components: [] });
+  } else {
+    // 7J-BRACKETIMGDECOUPLE: per Hxxdie — the bracket image was previously
+    // only updated *after* successfully fetching and editing the
+    // registration panel message, so any hiccup fetching that unrelated
+    // message (deleted, permissions blip, whatever) silently skipped the
+    // bracket update too, with zero indication why. The bracket image only
+    // actually depends on the channel and its own tracked message ID —
+    // it doesn't need the registration panel message at all — so it no
+    // longer waits on that fetch succeeding.
+    console.warn(`[7J-BRACKETIMGDECOUPLE] Registration panel message ${panelResult.rows[0].message_id} not found for tournament ${tournament.id} — skipping its edit, still attempting the bracket image.`);
+    if (tournament.status === 'open' || tournament.status === 'cancelled') return;
   }
-
-  if (tournament.status === 'open') {
-    const entries = await getTournamentEntries(tournament.id);
-    await message.edit({ embeds: [buildTournamentRegistrationEmbed(tournament, entries)], components: buildTournamentRegistrationComponents(tournament) });
-    return;
-  }
-
-  const matches = await getTournamentMatches(tournament.id);
-  await message.edit({ embeds: [buildTournamentPanelEmbed(tournament, matches)], components: [] });
 
   // 7J-BRACKETIMG: per Hxxdie — an actual visual bracket graphic, not just
   // the round-by-round text embed above, auto-updating as rounds progress.
   // Lives in the same temp channel as the registration panel/match threads,
   // edited in place round over round rather than reposted each time.
-  await updateTournamentBracketImage(guild, tournament, channel, panelResult.rows[0].bracket_image_message_id, matches).catch(error => {
-    console.error('[7J-BRACKETIMG] bracket image update failed:', error?.message || error);
+  const bracketMatches = await getTournamentMatches(tournament.id);
+  await updateTournamentBracketImage(guild, tournament, channel, panelResult.rows[0].bracket_image_message_id, bracketMatches).catch(error => {
+    console.error('[7J-BRACKETIMG] bracket image update failed:', error?.stack || error?.message || error);
   });
 }
 
@@ -9279,7 +9307,7 @@ async function saveTradeHistory(guild, league, offer) {
   );
 }
 
-async function finalizeApprovedTrade(guild, offerId) {
+async function finalizeApprovedTrade(guild, offerId, voteCounts = { approve: 0, deny: 0 }, votesNeeded = 3) {
   const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
   if (result.rows.length === 0) return;
 
@@ -9298,7 +9326,7 @@ async function finalizeApprovedTrade(guild, offerId) {
   const approvedChannelId = league?.trade_decisions_channel_id || league?.approved_trades_channel_id || league?.approved_channel_id;
   const approvedChannel = await guild.channels.fetch(approvedChannelId).catch(() => null);
   if (approvedChannel && approvedChannel.isTextBased()) {
-    await approvedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Approved', 0x57F287, { ...offer, status: 'committee_approved' })] });
+    await approvedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Approved', 0x57F287, { ...offer, status: 'committee_approved' }, voteCounts.approve, voteCounts.deny, votesNeeded)] });
   }
 
   if (league?.league_id && offer.sender_team_role_id && offer.target_team_role_id) {
@@ -9338,7 +9366,7 @@ async function finalizeApprovedTrade(guild, offerId) {
   await updateTradeCountPanel(guild, league);
 }
 
-async function finalizeDeniedTrade(guild, offerId) {
+async function finalizeDeniedTrade(guild, offerId, voteCounts = { approve: 0, deny: 0 }, votesNeeded = 3) {
   const result = await pool.query('SELECT * FROM trade_offers WHERE id = $1', [offerId]);
   if (result.rows.length === 0) return;
 
@@ -9352,7 +9380,7 @@ async function finalizeDeniedTrade(guild, offerId) {
   const deniedChannelId = league?.trade_decisions_channel_id || league?.denied_trades_channel_id || league?.denied_channel_id;
   const deniedChannel = await guild.channels.fetch(deniedChannelId).catch(() => null);
   if (deniedChannel && deniedChannel.isTextBased()) {
-    await deniedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Denied', 0xED4245, { ...offer, status: 'committee_denied' })] });
+    await deniedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Denied', 0xED4245, { ...offer, status: 'committee_denied' }, voteCounts.approve, voteCounts.deny, votesNeeded)] });
   }
 
   await recordMaddenNewsEvent(guild, league, {
@@ -14741,12 +14769,12 @@ if (interaction.commandName === 'avatar') {
         const voteCommitteeSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
         const votesNeeded = Number(voteCommitteeSettings.trade_committee_votes_needed) || 3;
         if (counts.approve >= votesNeeded) {
-          await finalizeApprovedTrade(interaction.guild, offerId);
+          await finalizeApprovedTrade(interaction.guild, offerId, counts, votesNeeded);
           await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_approved' }, counts.approve, counts.deny, votesNeeded)], components: [buildCommitteeVoteButtons(offerId, true)] });
           return;
         }
         if (counts.deny >= votesNeeded) {
-          await finalizeDeniedTrade(interaction.guild, offerId);
+          await finalizeDeniedTrade(interaction.guild, offerId, counts, votesNeeded);
           await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_denied' }, counts.approve, counts.deny, votesNeeded)], components: [buildCommitteeVoteButtons(offerId, true)] });
           return;
         }
@@ -19130,7 +19158,24 @@ if (interaction.commandName === 'avatar') {
       const tournament = await findTournament(interaction.guild.id, tournamentId);
       if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
       const matches = await getTournamentMatches(tournamentId);
-      await interaction.reply({ embeds: [buildTournamentPanelEmbed(tournament, matches)], ephemeral: true });
+      await interaction.deferReply({ ephemeral: true });
+      // 7J-BRACKETVIEWFIX: per Hxxdie — clicking View Bracket produced
+      // nothing visible in some cases. This now always renders and attaches
+      // the actual visual bracket PNG here directly (independent of the
+      // separate auto-updating channel post from updateTournamentPanel), so
+      // a click is guaranteed to show *something* — and if the render
+      // itself fails, the reply says so explicitly instead of staying blank.
+      const files = [];
+      try {
+        const png = await renderTournamentBracketPng(interaction.guild, tournament, matches);
+        if (png) files.push(new AttachmentBuilder(png, { name: 'bracket.png' }));
+      } catch (error) {
+        console.error('[7J-BRACKETVIEWFIX] View Bracket render failed:', error?.stack || error?.message || error);
+      }
+      const content = files.length ? undefined : (tournament.format === 'round_robin'
+        ? 'Round robin tournaments don\'t have a bracket shape — see the round-by-round results below instead.'
+        : (matches.length ? 'Could not render the bracket image — see the round-by-round results below instead.' : undefined));
+      await interaction.editReply({ content, embeds: [buildTournamentPanelEmbed(tournament, matches)], files });
       return;
     }
 
@@ -21286,6 +21331,17 @@ if (interaction.commandName === 'avatar') {
       // ephemeral follow-up if the channel post didn't land.
       if (!result.ok || !channelPostOk) {
         await interaction.followUp({ content: result.message, ephemeral: true }).catch(() => null);
+      }
+      // 7J-140NEGOTIATIONPOLISH: per Hxxdie — the generic (non-Madden)
+      // negotiation flow already auto-archives its thread once both GMs
+      // confirm and the trade is sent to committee (the thread's job is
+      // done — the deal lives on in the committee channel/trade_offers row
+      // from here). The Madden negotiation hub never got the same
+      // treatment, leaving its threads sitting open indefinitely after
+      // submission. Only archives on an actual success, not a failed
+      // submission — a failed one still needs the thread open for a retry.
+      if (result.ok && interaction.channel?.isThread?.()) {
+        await interaction.channel.setArchived(true, 'Trade negotiation submitted to committee').catch(() => null);
       }
       return;
     }
@@ -41828,32 +41884,52 @@ function buildMaddenNegotiationOfferDetails(negotiation, pkg) {
 }
 
 async function getMaddenPlayerValueAsset(guildId, leagueId, playerName, teamName = null) {
-  const params = [guildId, leagueId, playerName];
+  // 7J-VALUESYNC: per Hxxdie — live testing surfaced the same player showing
+  // different overalls in different embeds (e.g. Target Player header: 81,
+  // Generated Trade Package: 70). Root cause: madden_player_values is a
+  // manual snapshot table that only ever gets refreshed when someone runs
+  // /maddenvalues — it is NOT kept in sync with madden_players, which is
+  // fed by the live EA Direct roster sync and updates continuously. Every
+  // trade tool that read from madden_player_values (this function,
+  // getMaddenNegotiationEditablePlayers below) was therefore showing
+  // whatever overall happened to be true whenever /maddenvalues was last
+  // run, not the player's current one. Switched to computing the value live
+  // from madden_players — the same source and calculation
+  // getMaddenPlayerValueRankings/Player Profile/the negotiation hub's
+  // "Target Player" header already use — so every trade-tool surface now
+  // agrees with each other and with the live roster.
+  const params = [guildId, String(leagueId), `%${String(playerName || '').trim()}%`];
   let teamSql = '';
   if (teamName) {
-    params.push(teamName, getMaddenTeamAbbrev(teamName) || teamName);
-    teamSql = ` AND (LOWER(COALESCE(team_name, '')) = LOWER($4::text) OR LOWER(COALESCE(team_name, '')) = LOWER($5::text) OR LOWER($4::text) LIKE LOWER('%' || COALESCE(team_name, '') || '%'))`;
+    params.push(`%${teamName}%`, getMaddenTeamAbbrev(teamName) || teamName);
+    teamSql = ` AND (LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER($4::text) OR LOWER(COALESCE(p.team_name, t.team_name, '')) = LOWER($5::text))`;
   }
   const result = await pool.query(
-    `SELECT player_id, player_name, team_name, position, overall, value_score, trade_tier
-     FROM madden_player_values
-     WHERE guild_id = $1::text AND league_id = $2::text
-       AND (LOWER(player_name) = LOWER($3::text) OR player_id = $3::text)
+    `SELECT p.*, COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
+            COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name
+     FROM madden_players p
+     LEFT JOIN madden_imported_team_stats t
+       ON t.guild_id = p.guild_id::text AND t.league_id::text = p.league_id::text
+      AND p.team_id IS NOT NULL AND t.external_team_id::text = p.team_id
+     WHERE p.guild_id = $1::text AND p.league_id::text = $2::text
+       AND (LOWER(COALESCE(CONCAT_WS(' ', p.first_name, p.last_name), '')) LIKE LOWER($3::text) OR LOWER(COALESCE(p.full_name, '')) LIKE LOWER($3::text) OR p.id::text = $3)
        ${teamSql}
-     ORDER BY value_score DESC NULLS LAST
+     ORDER BY p.overall DESC NULLS LAST
      LIMIT 1`,
     params
   );
   const p = result.rows?.[0];
-  return p ? {
-    player_id: p.player_id,
-    player_name: p.player_name,
-    team_name: p.team_name || teamName || null,
+  if (!p) return null;
+  const value = calculateMaddenPlayerValue(p);
+  return {
+    player_id: p.id || p.external_player_id || null,
+    player_name: p.player_name || playerName,
+    team_name: p.resolved_team_name || p.team_name || teamName || null,
     position: p.position,
     overall: p.overall,
-    value_score: Number(p.value_score || 0),
-    trade_tier: p.trade_tier,
-  } : null;
+    value_score: value.valueScore,
+    trade_tier: value.tradeTier,
+  };
 }
 
 async function hydrateMaddenNegotiationPackageTargetSide(guildId, league, negotiation, pkg) {
@@ -41916,19 +41992,24 @@ function recalculateMaddenNegotiationPackage(pkg) {
 }
 
 async function getMaddenNegotiationEditablePlayers(guildId, leagueId, teamName, existingNames = []) {
+  // 7J-VALUESYNC: same fix as getMaddenPlayerValueAsset above — this roster
+  // list (used to populate the Edit Package dropdowns) was pulling stale
+  // overalls from the manually-refreshed madden_player_values snapshot
+  // instead of the live madden_players roster.
   const existing = new Set((existingNames || []).map(v => String(v || '').toLowerCase()));
-  const result = await pool.query(
-    `SELECT player_id, player_name, team_name, position, overall, value_score, trade_tier
-     FROM madden_player_values
-     WHERE guild_id = $1::text
-       AND league_id = $2::text
-       AND LOWER(COALESCE(team_name, '')) = LOWER($3::text)
-       AND NOT (LOWER(player_name) = ANY($4::text[]))
-     ORDER BY value_score DESC NULLS LAST, overall DESC NULLS LAST, player_name ASC
-     LIMIT 250`,
-    [guildId, leagueId, teamName || '', Array.from(existing)]
-  );
-  return result.rows || [];
+  const rows = await getMaddenPlayerValueRankings(guildId, leagueId, { team: teamName, limit: 750 }).catch(() => []);
+  return rows
+    .filter(row => !existing.has(String(row.player_name || '').toLowerCase()))
+    .slice(0, 250)
+    .map(row => ({
+      player_id: row.id || row.external_player_id || null,
+      player_name: row.player_name,
+      team_name: row.resolved_team_name || row.team_name || teamName || null,
+      position: row.position,
+      overall: row.overall,
+      value_score: row.value?.valueScore || 0,
+      trade_tier: row.value?.tradeTier || null,
+    }));
 }
 
 function maddenNegotiationSideLabel(negotiation, side) {
