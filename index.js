@@ -18139,6 +18139,7 @@ if (interaction.commandName === 'avatar') {
     }
 
 
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('teamownerspanel_leave_pick:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
