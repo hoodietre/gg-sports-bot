@@ -2042,6 +2042,12 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE tournament_panels ADD COLUMN IF NOT EXISTS announcement_channel_id TEXT`);
   await pool.query(`ALTER TABLE tournament_panels ADD COLUMN IF NOT EXISTS announcement_message_id TEXT`);
+  // 7J-BRACKETIMG: tracks the auto-updating visual bracket image message so
+  // it can be edited in place as rounds progress, same pattern as the
+  // registration panel message itself.
+  await pool.query(`ALTER TABLE tournament_panels ADD COLUMN IF NOT EXISTS bracket_image_message_id TEXT`);
+
+  await pool.query(`ALTER TABLE tournament_history ADD COLUMN IF NOT EXISTS bracket_image_url TEXT`);
 
   await pool.query(`ALTER TABLE tournament_history ADD COLUMN IF NOT EXISTS mvp_user_id TEXT`);
   await pool.query(`ALTER TABLE tournament_history ADD COLUMN IF NOT EXISTS mvp_payout INTEGER NOT NULL DEFAULT 0`);
@@ -4115,7 +4121,6 @@ function buildCommands() {
         { name: 'NBA', value: 'nba' },
         { name: 'MLB', value: 'mlb' },
         { name: 'NHL', value: 'nhl' },
-        { name: 'CFB', value: 'cfb' },
         { name: 'FC (Soccer)', value: 'fc' },
         { name: 'General/Other', value: 'general' },
       )))
@@ -8308,25 +8313,32 @@ async function finalizeTournamentMatch(guild, match, winnerUserId, reportedByUse
       );
       await updateTournamentPanel(guild, { ...completedTournament, status: 'completed' });
 
-      // 7J-TOURNAMENTCATEGORY: per Hxxdie — champion + final bracket now
+      // 7J-TOURNAMENTCATEGORY / 7J-BRACKETIMG: champion + final bracket now
       // archived to the dedicated Tournament History channel instead of
       // wherever the tournament happened to be configured to announce.
-      // Note: this archives the existing bracket embed format (round-by-
-      // round text), not a rendered bracket image — a true visual bracket
-      // graphic would need its own image-rendering work, similar to the
-      // avatar renderer, and hasn't been built.
+      // Includes the actual rendered bracket graphic (not just the
+      // round-by-round text embed) as an attachment, and its resulting CDN
+      // URL is saved on the tournament_history row for permanence — same
+      // convention as trade_offers.screenshot_url elsewhere in this file.
       const historySettings = await pool.query(`SELECT tournament_history_channel_id FROM guild_tournament_settings WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
       const historyChannelId = historySettings.rows[0]?.tournament_history_channel_id;
       const historyChannel = historyChannelId ? await guild.channels.fetch(historyChannelId).catch(() => null) : null;
       if (historyChannel && historyChannel.isTextBased()) {
         const championSettings = await getCurrencySettings(guild.id);
         const finalMatches = await getTournamentMatches(match.tournament_id).catch(() => []);
-        await historyChannel.send({
+        const bracketPng = await renderTournamentBracketPng(guild, completedTournament, finalMatches).catch(() => null);
+        const files = bracketPng ? [new AttachmentBuilder(bracketPng, { name: 'final-bracket.png' })] : [];
+        const historyMessage = await historyChannel.send({
           embeds: [
             buildTournamentChampionEmbed(championSettings, completedTournament, winners[0].user_id, Number(match.prize_pool || 0)),
             buildTournamentPanelEmbed(completedTournament, finalMatches),
           ],
+          files,
         }).catch(() => null);
+        const bracketImageUrl = historyMessage?.attachments?.first()?.url || null;
+        if (bracketImageUrl) {
+          await pool.query(`UPDATE tournament_history SET bracket_image_url = $1 WHERE tournament_id = $2`, [bracketImageUrl, match.tournament_id]).catch(() => null);
+        }
       }
 
       // 7J-TOURNAMENTCATEGORY: temp channel (and every thread under it,
@@ -8355,32 +8367,43 @@ async function finalizeTournamentMatch(guild, match, winnerUserId, reportedByUse
   };
 }
 
+// 7J-TOURNEYREGCHAN: per Hxxdie — the tournament's dedicated temp channel is
+// now created immediately at tournament creation (finalizeTournamentCreation
+// calls this too), not lazily on the first round, so the registration panel
+// itself can live in that channel instead of requiring staff to hand-pick
+// one during creation. Idempotent/reusable: if the temp channel already
+// exists (registration already created it, or a later round is calling in),
+// just fetch and return it.
+async function ensureTournamentTempChannel(guild, tournament) {
+  let channel = tournament.temp_channel_id
+    ? await guild.channels.fetch(tournament.temp_channel_id).catch(() => null)
+    : null;
+  if (channel) return channel;
+
+  const tournamentSettings = await pool.query(`SELECT tournament_channel_id FROM guild_tournament_settings WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
+  const parentChannel = tournamentSettings.rows[0]?.tournament_channel_id
+    ? await guild.channels.fetch(tournamentSettings.rows[0].tournament_channel_id).catch(() => null)
+    : null;
+  const safeName = String(tournament.tournament_name || 'tournament').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || 'tournament';
+  channel = await guild.channels.create({
+    name: safeName,
+    type: ChannelType.GuildText,
+    parent: parentChannel?.parentId || undefined,
+  }).catch(() => null);
+  if (channel) {
+    await pool.query(`UPDATE tournaments SET temp_channel_id = $1, updated_at = NOW() WHERE id = $2`, [channel.id, tournament.id]).catch(() => null);
+  }
+  return channel;
+}
+
 async function createMatchThreads(guild, tournament, matches) {
   // 7J-TOURNAMENTCATEGORY: per Hxxdie — matches now live under a temporary
   // channel created for and named after this specific tournament, instead
   // of all sharing the one guild-wide Tournaments channel. Created once
-  // (on the first round) and reused for every subsequent round; deleted
-  // (along with all its threads) once the tournament completes.
-  let channel = tournament.temp_channel_id
-    ? await guild.channels.fetch(tournament.temp_channel_id).catch(() => null)
-    : null;
-
-  if (!channel) {
-    const tournamentSettings = await pool.query(`SELECT tournament_channel_id FROM guild_tournament_settings WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
-    const parentChannel = tournamentSettings.rows[0]?.tournament_channel_id
-      ? await guild.channels.fetch(tournamentSettings.rows[0].tournament_channel_id).catch(() => null)
-      : null;
-    const safeName = String(tournament.tournament_name || 'tournament').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || 'tournament';
-    channel = await guild.channels.create({
-      name: safeName,
-      type: ChannelType.GuildText,
-      parent: parentChannel?.parentId || undefined,
-    }).catch(() => null);
-    if (channel) {
-      await pool.query(`UPDATE tournaments SET temp_channel_id = $1, updated_at = NOW() WHERE id = $2`, [channel.id, tournament.id]).catch(() => null);
-    }
-  }
-
+  // (now at tournament creation, see ensureTournamentTempChannel/
+  // finalizeTournamentCreation) and reused for every subsequent round;
+  // deleted (along with all its threads) once the tournament completes.
+  const channel = await ensureTournamentTempChannel(guild, tournament);
   if (!channel || !channel.isTextBased()) return;
 
   for (const match of matches) {
@@ -8503,23 +8526,15 @@ async function buildTournamentManagerHomePayload(guild, { includeAdminBackButton
     components.push(new ActionRowBuilder().addComponents(menu));
   }
   components.push(new ActionRowBuilder().addComponents(
-    new ChannelSelectMenuBuilder()
-      .setCustomId('adminpanel_tournament_setchannel')
-      .setPlaceholder('Set default tournament channel')
-      .setChannelTypes(ChannelType.GuildText)
-      .setMinValues(1)
-      .setMaxValues(1)
-  ));
-  components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('tourneypanel_create').setLabel('Create Tournament').setEmoji('➕').setStyle(ButtonStyle.Success)
   ));
   // 7J-TOURNAMENTAUTOSETUP: this payload is now also posted as the public,
   // standing panel in the auto-created #tournaments channel (see
   // getMultiChannelPanelInfo) — "Back to Admin Panel" is meaningless there
   // since a regular member never came from the Admin Panel to begin with.
-  // Create Tournament and Set Channel stay visible either way since both
-  // are already staff-gated at click time, matching how Force Win/Reset
-  // Game buttons work elsewhere in this codebase.
+  // Create Tournament stays visible either way since it's already
+  // staff-gated at click time, matching how Force Win/Reset Game buttons
+  // work elsewhere in this codebase.
   if (includeAdminBackButton) {
     components.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Admin Panel').setStyle(ButtonStyle.Secondary)
@@ -8799,16 +8814,15 @@ function buildTournamentCreateStep1Payload(token, session) {
     .setCustomId(`tourneycreate_format:${token}`)
     .setPlaceholder('Choose a format')
     .addOptions(TOURNAMENT_FORMAT_OPTIONS.map(o => ({ label: o.label, value: o.value, default: session.format === o.value })));
-  const channelMenu = new ChannelSelectMenuBuilder()
-    .setCustomId(`tourneycreate_channel:${token}`)
-    .setPlaceholder('Choose a channel for the registration panel')
-    .setChannelTypes(ChannelType.GuildText);
   const continueRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`tourneycreate_continue1:${token}`).setLabel('Continue').setStyle(ButtonStyle.Primary)
   );
-  const channelText = session.channelId ? `<#${session.channelId}>` : 'not selected yet';
-  const content = `**Create Tournament — Step 1 of 3**\nFormat: **${TOURNAMENT_FORMAT_OPTIONS.find(o => o.value === session.format)?.label || 'not selected yet'}**\nChannel: ${channelText}`;
-  return { content, embeds: [], components: [new ActionRowBuilder().addComponents(formatMenu), new ActionRowBuilder().addComponents(channelMenu), continueRow] };
+  // 7J-TOURNEYREGCHAN: channel selection removed — the registration panel
+  // now always posts in a dedicated temp channel auto-created for this
+  // tournament (see ensureTournamentTempChannel), so there's nothing left
+  // to pick here.
+  const content = `**Create Tournament — Step 1 of 3**\nFormat: **${TOURNAMENT_FORMAT_OPTIONS.find(o => o.value === session.format)?.label || 'not selected yet'}**`;
+  return { content, embeds: [], components: [new ActionRowBuilder().addComponents(formatMenu), continueRow] };
 }
 
 function buildTournamentCreateModal1(session) {
@@ -8884,10 +8898,15 @@ async function finalizeTournamentCreation(guild, session) {
     [tournamentId, guild.id, session.name, session.game, session.format, session.maxEntries, session.buyIn, session.date || null, session.time || null, session.rules || null, session.startsAtEpoch || null, session.userId]
   );
   const tournament = await findTournament(guild.id, tournamentId);
-  const channel = await guild.channels.fetch(session.channelId).catch(() => null);
+
+  // 7J-TOURNEYREGCHAN: the registration panel now posts in this tournament's
+  // own dedicated temp channel (auto-created, named after the tournament),
+  // not a staff-picked channel — the same channel match threads will live
+  // under once the tournament starts.
+  const channel = await ensureTournamentTempChannel(guild, tournament);
 
   if (!channel?.isTextBased?.()) {
-    return { tournament, panelPosted: false, panelError: 'That channel could not be found or is not a text channel.' };
+    return { tournament, panelPosted: false, panelError: 'Could not create or access this tournament\'s channel.' };
   }
 
   const botMember = await guild.members.fetchMe();
@@ -8903,7 +8922,7 @@ async function finalizeTournamentCreation(guild, session) {
       components: buildTournamentRegistrationComponents(tournament),
     });
     await saveTournamentPanel(tournamentId, guild.id, channel.id, message.id);
-    return { tournament, panelPosted: true, panelError: null };
+    return { tournament, panelPosted: true, panelError: null, channelId: channel.id };
   } catch (err) {
     return { tournament, panelPosted: false, panelError: `Could not post the registration panel (${err?.message || 'unknown error'}). The tournament was still created — use Post Public Bracket Panel from the tournament view once the issue is fixed.` };
   }
@@ -8953,7 +8972,7 @@ function buildTournamentCancelledEmbed(tournament) {
 
 async function updateTournamentPanel(guild, tournament) {
   const panelResult = await pool.query(
-    `SELECT channel_id, message_id FROM tournament_panels WHERE tournament_id = $1`,
+    `SELECT channel_id, message_id, bracket_image_message_id FROM tournament_panels WHERE tournament_id = $1`,
     [tournament.id]
   );
 
@@ -8978,6 +8997,149 @@ async function updateTournamentPanel(guild, tournament) {
 
   const matches = await getTournamentMatches(tournament.id);
   await message.edit({ embeds: [buildTournamentPanelEmbed(tournament, matches)], components: [] });
+
+  // 7J-BRACKETIMG: per Hxxdie — an actual visual bracket graphic, not just
+  // the round-by-round text embed above, auto-updating as rounds progress.
+  // Lives in the same temp channel as the registration panel/match threads,
+  // edited in place round over round rather than reposted each time.
+  await updateTournamentBracketImage(guild, tournament, channel, panelResult.rows[0].bracket_image_message_id, matches).catch(error => {
+    console.error('[7J-BRACKETIMG] bracket image update failed:', error?.message || error);
+  });
+}
+
+// 7J-BRACKETIMG: renders a real bracket graphic (rounds as columns, matches
+// as connected boxes, winners highlighted) via sharp/SVG — same rendering
+// approach as the avatar renderer (buildAvatarAuraGlowBuffer etc.), rasterizing
+// an SVG string rather than a per-pixel canvas. Single/double elimination
+// only — round robin has no bracket shape, so this is skipped for that format
+// (the existing text embed already covers it fine).
+function tournamentBracketEscapeXml(text) {
+  return String(text == null ? '' : text).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[ch]));
+}
+
+function tournamentBracketRoundLabel(roundNumber, totalRounds, roundIndex) {
+  const fromEnd = totalRounds - roundIndex;
+  if (fromEnd === 1) return 'Final';
+  if (fromEnd === 2) return 'Semifinals';
+  if (fromEnd === 3) return 'Quarterfinals';
+  return `Round ${roundNumber}`;
+}
+
+async function renderTournamentBracketPng(guild, tournament, matches) {
+  const sharp = await getSharp();
+  if (!sharp) return null;
+  if (tournament.format === 'round_robin') return null;
+  if (!matches || !matches.length) return null;
+
+  const rounds = {};
+  for (const m of matches) {
+    const r = Number(m.round_number);
+    if (!rounds[r]) rounds[r] = [];
+    rounds[r].push(m);
+  }
+  const roundNumbers = Object.keys(rounds).map(Number).sort((a, b) => a - b);
+  if (!roundNumbers.length) return null;
+  for (const r of roundNumbers) rounds[r].sort((a, b) => a.match_number - b.match_number);
+
+  const nameFor = (userId, entryName) => {
+    if (!userId) return 'BYE';
+    if (entryName) return entryName;
+    const member = guild.members.cache.get(userId);
+    return member?.displayName || member?.user?.username || `Player ${String(userId).slice(-4)}`;
+  };
+
+  const boxW = 240;
+  const boxH = 64;
+  const roundGapX = 80;
+  const vGap = 28;
+  const marginTop = 56;
+  const marginLeft = 30;
+
+  const firstRoundCount = rounds[roundNumbers[0]].length;
+  const totalHeight = marginTop + firstRoundCount * (boxH + vGap);
+  const totalWidth = marginLeft * 2 + roundNumbers.length * boxW + (roundNumbers.length - 1) * roundGapX;
+
+  // Standard bracket layout: round 1 boxes evenly spaced, every later round's
+  // box vertically centered between the pair of boxes feeding into it.
+  const centers = {};
+  centers[roundNumbers[0]] = rounds[roundNumbers[0]].map((m, i) => marginTop + i * (boxH + vGap) + boxH / 2);
+  for (let ri = 1; ri < roundNumbers.length; ri++) {
+    const r = roundNumbers[ri];
+    const prev = centers[roundNumbers[ri - 1]];
+    centers[r] = rounds[r].map((m, i) => {
+      const c1 = prev[i * 2];
+      const c2 = prev[i * 2 + 1] !== undefined ? prev[i * 2 + 1] : c1;
+      return (c1 + c2) / 2;
+    });
+  }
+
+  const parts = [];
+
+  // Connector lines between rounds
+  for (let ri = 0; ri < roundNumbers.length - 1; ri++) {
+    const r = roundNumbers[ri];
+    const nr = roundNumbers[ri + 1];
+    const x1 = marginLeft + ri * (boxW + roundGapX) + boxW;
+    const xMid = x1 + roundGapX / 2;
+    const x2 = marginLeft + (ri + 1) * (boxW + roundGapX);
+    rounds[r].forEach((m, i) => {
+      const y1 = centers[r][i];
+      const yNext = centers[nr][Math.floor(i / 2)];
+      parts.push(`<path d="M ${x1} ${y1} H ${xMid} V ${yNext} H ${x2}" stroke="#4a4f57" stroke-width="2" fill="none"/>`);
+    });
+  }
+
+  // Round labels + match boxes
+  roundNumbers.forEach((r, ri) => {
+    const x = marginLeft + ri * (boxW + roundGapX);
+    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${tournamentBracketEscapeXml(tournamentBracketRoundLabel(r, roundNumbers.length, ri))}</text>`);
+    rounds[r].forEach((m, i) => {
+      const yCenter = centers[r][i];
+      const y = yCenter - boxH / 2;
+      const p1Name = nameFor(m.player1_user_id, m.player1_entry_name);
+      const p2Name = nameFor(m.player2_user_id, m.player2_entry_name);
+      const p1Won = Boolean(m.winner_user_id) && m.winner_user_id === m.player1_user_id;
+      const p2Won = Boolean(m.winner_user_id) && m.winner_user_id === m.player2_user_id;
+      parts.push(`
+        <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="8" fill="#2b2d31" stroke="#1e1f22" stroke-width="2"/>
+        <line x1="${x}" y1="${yCenter}" x2="${x + boxW}" y2="${yCenter}" stroke="#1e1f22" stroke-width="1"/>
+        <text x="${x + 12}" y="${yCenter - 12}" font-family="Arial, sans-serif" font-size="15" font-weight="${p1Won ? 'bold' : 'normal'}" fill="${p1Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p1Name).slice(0, 28)}</text>
+        <text x="${x + 12}" y="${yCenter + 20}" font-family="Arial, sans-serif" font-size="15" font-weight="${p2Won ? 'bold' : 'normal'}" fill="${p2Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p2Name).slice(0, 28)}</text>
+      `);
+    });
+  });
+
+  const svg = `<svg width="${totalWidth}" height="${totalHeight}" xmlns="http://www.w3.org/2000/svg">
+    <rect width="100%" height="100%" fill="#1e1f22"/>
+    ${parts.join('\n')}
+  </svg>`;
+
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+// 7J-BRACKETIMG: posts (first call) or edits in place (every later call) the
+// bracket image message in the same channel as the registration panel. Best
+// effort — a render/post failure here never blocks the panel/round logic
+// that called it, matching the .catch(() => null) pattern used throughout
+// the tournament system.
+async function updateTournamentBracketImage(guild, tournament, channel, existingMessageId, matches) {
+  const png = await renderTournamentBracketPng(guild, tournament, matches);
+  if (!png) return null;
+
+  const attachment = new AttachmentBuilder(png, { name: 'bracket.png' });
+  const content = `🏆 **${tournament.tournament_name}** — Live Bracket`;
+
+  let message = existingMessageId ? await channel.messages.fetch(existingMessageId).catch(() => null) : null;
+  if (message) {
+    message = await message.edit({ content, files: [attachment] }).catch(() => null);
+  }
+  if (!message) {
+    message = await channel.send({ content, files: [attachment] }).catch(() => null);
+    if (message) {
+      await pool.query(`UPDATE tournament_panels SET bracket_image_message_id = $1, updated_at = NOW() WHERE tournament_id = $2`, [message.id, tournament.id]).catch(() => null);
+    }
+  }
+  return message;
 }
 
 async function getTournamentMatches(tournamentId) {
@@ -12747,7 +12909,7 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('recruitmentpanel_apply_team_select:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('recruitmentpanel_apply_team_select')) {
       const leagueId = interaction.customId.split(':')[1];
       const teamRoleId = interaction.values[0];
       const modal = new ModalBuilder()
@@ -18257,13 +18419,23 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply({ ephemeral: true });
       const vacant = await getVacantLeagueTeams(interaction.guild, league);
       if (!vacant.length) { await interaction.editReply({ content: `No open teams in **${league.league_name}** right now — check back later or ask a commissioner about the waitlist.` }); return; }
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`recruitmentpanel_apply_team_select:${league.league_id}`)
-        .setPlaceholder('Pick a team to apply for')
-        .addOptions(vacant.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
+      // 7J-RECRUITPAGE: see runRecruitmentBrowse — same multi-menu split so
+      // leagues with 30+ open teams aren't silently truncated to 25 here either.
+      const applyRows = [];
+      for (let i = 0; i < vacant.length && applyRows.length < 5; i += 25) {
+        const chunk = vacant.slice(i, i + 25);
+        const menuIndex = applyRows.length;
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId(`recruitmentpanel_apply_team_select${menuIndex ? menuIndex : ''}:${league.league_id}`)
+          .setPlaceholder(applyRows.length === 0 && vacant.length <= 25
+            ? 'Pick a team to apply for'
+            : `Pick a team to apply for (${i + 1}-${Math.min(i + 25, vacant.length)})`)
+          .addOptions(chunk.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
+        applyRows.push(new ActionRowBuilder().addComponents(menu));
+      }
       await interaction.editReply({
         content: `**${vacant.length}** open team${vacant.length === 1 ? '' : 's'} in **${league.league_name}**. Pick one to apply:`,
-        components: [new ActionRowBuilder().addComponents(menu)],
+        components: applyRows,
       });
       return;
     }
@@ -18395,31 +18567,13 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    // 7J-86CHANSETUP: default tournament channel setter, relocated to the
-    // Admin Panel's Tournament category per Hxxdie. Same permission check as
-    // tourneypanel_create right below (guild-wide, no specific league), same
-    // guild_tournament_settings write the existing /settournamentchannel
-    // command already uses.
-    if (interaction.isChannelSelectMenu() && interaction.customId === 'adminpanel_tournament_setchannel') {
-      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to set the server tournament channel.', ephemeral: true }); return; }
-      const channel = interaction.channels.first();
-      const botMember = await interaction.guild.members.fetchMe();
-      const permissions = channel?.permissionsFor(botMember);
-      if (!channel || !channel.isTextBased() || !permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.SendMessages) || !permissions?.has(PermissionFlagsBits.EmbedLinks)) {
-        await interaction.reply({ content: 'I need View Channel, Send Messages, and Embed Links permissions in that tournament channel.', ephemeral: true });
-        return;
-      }
-      await pool.query(
-        `INSERT INTO guild_tournament_settings (guild_id, tournament_channel_id, updated_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (guild_id)
-         DO UPDATE SET tournament_channel_id = $2, updated_at = NOW()`,
-        [interaction.guild.id, channel.id]
-      );
-      const payload = await buildTournamentManagerHomePayload(interaction.guild);
-      await interaction.update({ content: 'Default server tournament channel set to ' + channel + '.', ...payload });
-      return;
-    }
+    // 7J-TOURNEYREGCHAN: the manual "Set default tournament channel" dropdown
+    // was removed from the Tournament Manager panel — registration channels
+    // are now fully automatic per tournament (ensureTournamentTempChannel).
+    // The underlying guild_tournament_settings.tournament_channel_id value
+    // itself is still set by auto-setup and still used as the category
+    // parent for new tournament channels; this handler is now unreachable
+    // dead code and was removed along with its dropdown.
 
     if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_edit:')) {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to edit tournaments.', ephemeral: true }); return; }
@@ -18573,7 +18727,7 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isButton() && interaction.customId === 'tourneypanel_create') {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to create tournaments.', ephemeral: true }); return; }
       const token = randomBytes(6).toString('hex');
-      const session = { token, userId: interaction.user.id, format: 'single_elim', channelId: null };
+      const session = { token, userId: interaction.user.id, format: 'single_elim' };
       tournamentCreateSessions.set(token, session);
       const payload = buildTournamentCreateStep1Payload(token, session);
       await interaction.reply({ ...payload, ephemeral: true });
@@ -18589,20 +18743,10 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('tourneycreate_channel:')) {
-      const token = interaction.customId.split(':')[1];
-      const session = tournamentCreateSessions.get(token);
-      if (!session) { await interaction.update({ content: 'This session expired. Click Create Tournament again.', components: [] }); return; }
-      session.channelId = interaction.values[0];
-      await interaction.update(buildTournamentCreateStep1Payload(token, session));
-      return;
-    }
-
     if (interaction.isButton() && interaction.customId.startsWith('tourneycreate_continue1:')) {
       const token = interaction.customId.split(':')[1];
       const session = tournamentCreateSessions.get(token);
       if (!session) { await interaction.reply({ content: 'This session expired. Click Create Tournament again.', ephemeral: true }); return; }
-      if (!session.channelId) { await interaction.reply({ content: 'Pick a channel before continuing.', ephemeral: true }); return; }
       await interaction.update(buildDateTimePickerStepA('tourneycreate', token, session));
       return;
     }
@@ -18718,11 +18862,11 @@ if (interaction.commandName === 'avatar') {
       if (!session) { await interaction.reply({ content: 'This session expired. Click Create Tournament again.', ephemeral: true }); return; }
       session.rules = interaction.fields.getTextInputValue('rules') || null;
       await interaction.deferReply({ ephemeral: true });
-      const { tournament, panelPosted, panelError } = await finalizeTournamentCreation(interaction.guild, session);
+      const { tournament, panelPosted, panelError, channelId } = await finalizeTournamentCreation(interaction.guild, session);
       tournamentCreateSessions.delete(token);
       const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
       const statusMessage = panelPosted
-        ? `Tournament **${tournament.tournament_name}** created and posted in <#${session.channelId}>.`
+        ? `Tournament **${tournament.tournament_name}** created and posted in <#${channelId}>.`
         : `Tournament **${tournament.tournament_name}** created, but the registration panel could not be posted: ${panelError}`;
       await interaction.editReply({ content: statusMessage, ...payload });
       return;
@@ -19449,7 +19593,6 @@ if (interaction.commandName === 'avatar') {
           { label: 'NBA', value: 'nba' },
           { label: 'MLB', value: 'mlb' },
           { label: 'NHL', value: 'nhl' },
-          { label: 'CFB', value: 'cfb' },
           { label: 'FC (Soccer)', value: 'fc' },
           { label: 'General/Other', value: 'general' },
         );
@@ -36814,13 +36957,26 @@ async function runRecruitmentLeagueInfo(interaction, league) {
 async function runRecruitmentBrowse(interaction, league) {
   const vacant = await getVacantLeagueTeams(interaction.guild, league);
   if (!vacant.length) { await interaction.editReply({ content: `No open teams in **${league.league_name}** right now — every team role has at least one member.` }); return; }
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`recruitmentpanel_apply_team_select:${league.league_id}`)
-    .setPlaceholder('Pick a team to apply for')
-    .addOptions(vacant.slice(0, 25).map(t => ({ label: t.role_name, value: t.role_id })));
+  // 7J-RECRUITPAGE: a single select menu hard-caps at 25 options, but a
+  // league can easily have 30+ team roles (e.g. a full 32-team NFL league).
+  // Split across up to 5 select menus (Discord's per-message action-row cap)
+  // instead of silently truncating to the first 25 — each menu shares the
+  // same customId prefix so the one handler below covers all of them.
+  const rows = [];
+  for (let i = 0; i < vacant.length && rows.length < 5; i += 25) {
+    const chunk = vacant.slice(i, i + 25);
+    const menuIndex = rows.length;
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`recruitmentpanel_apply_team_select${menuIndex ? menuIndex : ''}:${league.league_id}`)
+      .setPlaceholder(rows.length === 0 && vacant.length <= 25
+        ? 'Pick a team to apply for'
+        : `Pick a team to apply for (${i + 1}-${Math.min(i + 25, vacant.length)})`)
+      .addOptions(chunk.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
+    rows.push(new ActionRowBuilder().addComponents(menu));
+  }
   await interaction.editReply({
     content: `**${vacant.length}** open team${vacant.length === 1 ? '' : 's'} in **${league.league_name}**. Pick one to apply:`,
-    components: [new ActionRowBuilder().addComponents(menu)],
+    components: rows,
   });
 }
 
