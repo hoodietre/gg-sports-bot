@@ -8326,6 +8326,9 @@ async function finalizeTournamentMatch(guild, match, winnerUserId, reportedByUse
 
   if (winners.length === 1) {
     await pool.query(`UPDATE tournaments SET status = 'completed', updated_at = NOW() WHERE id = $1`, [match.tournament_id]);
+    // 7J-TOURNEYPANELREFRESH: completion drops this tournament out of the
+    // public panel's dropdown list — keep that panel in sync.
+    await refreshAllMultiChannelPanelPostings(guild, 'tournament').catch(() => null);
     const settings = await getCurrencySettings(guild.id);
     let payoutText = '';
 
@@ -8931,6 +8934,16 @@ async function finalizeTournamentCreation(guild, session) {
   // not a staff-picked channel — the same channel match threads will live
   // under once the tournament starts.
   const channel = await ensureTournamentTempChannel(guild, tournament);
+
+  // 7J-TOURNEYPANELREFRESH: per Hxxdie — the persistent public Tournament
+  // Manager panel in #tournaments was only ever posted once (at auto-setup
+  // time) and never refreshed after that, so its "choose a tournament to
+  // manage" dropdown never actually included tournaments created later —
+  // meaning dismissing the ephemeral management view left no way back in
+  // except re-running /adminpanel. Refreshing here (and at every other
+  // point a tournament's list-membership status changes — cancel, delete,
+  // completion) keeps that dropdown live.
+  await refreshAllMultiChannelPanelPostings(guild, 'tournament').catch(() => null);
 
   if (!channel?.isTextBased?.()) {
     return { tournament, panelPosted: false, panelError: 'Could not create or access this tournament\'s channel.' };
@@ -19256,6 +19269,9 @@ if (interaction.commandName === 'avatar') {
       }
       const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
       await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
+      // 7J-TOURNEYPANELREFRESH: cancellation drops this tournament out of
+      // the public panel's dropdown list — keep that panel in sync.
+      await refreshAllMultiChannelPanelPostings(interaction.guild, 'tournament').catch(() => null);
       const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
       const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament, { includeAdminBackButton });
       await interaction.editReply({ content: `**${tournament.tournament_name}** cancelled. ${entries.length ? 'Buy-ins refunded.' : ''}`, ...payload });
@@ -19314,6 +19330,9 @@ if (interaction.commandName === 'avatar') {
       }
 
       await pool.query(`DELETE FROM tournaments WHERE id = $1`, [tournamentId]);
+      // 7J-TOURNEYPANELREFRESH: deletion drops this tournament out of the
+      // public panel's dropdown list — keep that panel in sync.
+      await refreshAllMultiChannelPanelPostings(interaction.guild, 'tournament').catch(() => null);
       await interaction.editReply({ content: `**${tournament.tournament_name}** has been permanently deleted.`, components: [] });
       return;
     }
