@@ -8090,7 +8090,7 @@ function buildTournamentInfoEmbed(settings, tournament, entries, availability) {
   return embed.setFooter({ text: 'GG Sports • Tournament Manager' }).setTimestamp();
 }
 
-function buildTournamentActionRows(tournament, availability) {
+function buildTournamentActionRows(tournament, availability, includeAdminBackButton = true) {
   const btn = (key, emoji, style) => new ButtonBuilder()
     .setCustomId(`tourneypanel_${key}:${tournament.id}`)
     .setLabel(TOURNAMENT_ACTION_LABELS[key])
@@ -8105,6 +8105,19 @@ function buildTournamentActionRows(tournament, availability) {
     .setEmoji(toggle.emoji)
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(!toggle.enabled);
+
+  const lastRowButtons = [
+    new ButtonBuilder().setCustomId('tourneypanel_home').setLabel('Back to Tournaments').setStyle(ButtonStyle.Secondary),
+  ];
+  // 7J-TOURNEYADMINBACK: per Hxxdie — this per-tournament management view is
+  // reached two ways: through /adminpanel (where "Back to Admin Panel"
+  // makes sense) and through the publicly-posted Tournament Manager panel
+  // in #tournaments (where it doesn't — a regular staff member using the
+  // public panel never came from the Admin Panel to begin with). Same
+  // reasoning already applied to the Tournament Manager home payload.
+  if (includeAdminBackButton) {
+    lastRowButtons.push(new ButtonBuilder().setCustomId('adminpanel_back').setLabel('Back to Admin Panel').setStyle(ButtonStyle.Secondary));
+  }
 
   const rows = [
     new ActionRowBuilder().addComponents(
@@ -8125,12 +8138,19 @@ function buildTournamentActionRows(tournament, availability) {
       btn('cancel', '🚫', ButtonStyle.Danger),
       btn('delete', '🗑️', ButtonStyle.Danger),
     ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('tourneypanel_home').setLabel('Back to Tournaments').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('adminpanel_back').setLabel('Back to Admin Panel').setStyle(ButtonStyle.Secondary),
-    ),
+    new ActionRowBuilder().addComponents(...lastRowButtons),
   ];
   return rows;
+}
+
+// 7J-TOURNEYADMINBACK: same-channel heuristic as buildTournamentManagerHomePayload's
+// includeAdminBackButton — if this interaction is happening in the guild's
+// designated public tournament channel (where the standing Tournament
+// Manager panel lives), it did not originate from /adminpanel.
+async function tournamentManagerContextIncludesAdminBack(interaction) {
+  if (!interaction?.guild || !interaction?.channelId) return true;
+  const publicChannelId = await getGuildTournamentChannelId(interaction.guild.id).catch(() => null);
+  return !publicChannelId || String(interaction.channelId) !== String(publicChannelId);
 }
 
 function buildTournamentChampionEmbed(settings, tournament, championUserId, prizePaid = 0) {
@@ -8498,18 +8518,15 @@ async function buildTournamentManagerHomePayload(guild, { includeAdminBackButton
     `SELECT * FROM tournaments WHERE guild_id = $1 AND status IN ('open','closed','active') ORDER BY created_at DESC LIMIT 25`,
     [guild.id]
   );
-  // 7J-86CHANSETUP: default tournament channel setter relocated here from the
-  // per-league commissioner Setup Dashboard, per Hxxdie — tournaments are a
-  // guild-wide feature (the tournaments table is keyed by guild_id, not
-  // league_id), so a per-league setting was a mismatch to begin with. Writes
-  // to the same guild_tournament_settings table the existing
-  // /settournamentchannel command already uses.
-  const currentChannelId = await getGuildTournamentChannelId(guild.id);
+  // 7J-TOURNEYREGCHAN: per Hxxdie — the "Default Tournament Channel" field
+  // (and the dropdown that used to set it from this panel) was removed.
+  // Registration channels are fully automatic per tournament now
+  // (ensureTournamentTempChannel), so this field had nothing meaningful
+  // left to show here and was displaying a broken "#unknown" reference.
   const embed = new EmbedBuilder()
     .setTitle('🏆 Tournament Manager')
     .setColor(0xED4245)
     .setDescription(result.rows.length ? 'Pick a tournament to manage, or create a new one.' : 'No open tournaments. Create one to get started.')
-    .addFields({ name: 'Default Tournament Channel', value: currentChannelId ? `<#${currentChannelId}>` : 'Not set', inline: false })
     .setFooter({ text: 'GG Sports • Tournament Manager' })
     .setTimestamp();
 
@@ -8543,13 +8560,13 @@ async function buildTournamentManagerHomePayload(guild, { includeAdminBackButton
   return { embeds: [embed], components };
 }
 
-async function buildTournamentManagerViewPayload(guild, tournament) {
+async function buildTournamentManagerViewPayload(guild, tournament, { includeAdminBackButton = true } = {}) {
   const settings = await getCurrencySettings(guild.id);
   const entries = await getTournamentEntries(tournament.id);
   const matches = await getTournamentMatches(tournament.id);
   const availability = await getTournamentActionAvailability(tournament, entries, matches);
   const embed = buildTournamentInfoEmbed(settings, tournament, entries, availability);
-  const rows = buildTournamentActionRows(tournament, availability);
+  const rows = buildTournamentActionRows(tournament, availability, includeAdminBackButton);
   return { embeds: [embed], components: rows };
 }
 
@@ -18562,7 +18579,8 @@ if (interaction.commandName === 'avatar') {
       const tournamentId = interaction.values[0];
       const tournament = await findTournament(interaction.guild.id, tournamentId);
       if (!tournament) { await interaction.update({ content: 'Could not find that tournament.', embeds: [], components: [] }); return; }
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.update({ content: null, ...payload });
       return;
     }
@@ -18719,7 +18737,8 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply({ ephemeral: true });
       const tournament = await finalizeTournamentEdit(interaction.guild, session);
       tournamentEditSessions.delete(token);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.editReply({ content: `**${tournament.tournament_name}** updated.`, ...payload });
       return;
     }
@@ -18864,7 +18883,8 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply({ ephemeral: true });
       const { tournament, panelPosted, panelError, channelId } = await finalizeTournamentCreation(interaction.guild, session);
       tournamentCreateSessions.delete(token);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       const statusMessage = panelPosted
         ? `Tournament **${tournament.tournament_name}** created and posted in <#${channelId}>.`
         : `Tournament **${tournament.tournament_name}** created, but the registration panel could not be posted: ${panelError}`;
@@ -18932,7 +18952,8 @@ if (interaction.commandName === 'avatar') {
       await pool.query(`INSERT INTO tournament_entries (tournament_id, guild_id, user_id, paid_buy_in) VALUES ($1, $2, $3, $4)`, [tournamentId, interaction.guild.id, interaction.user.id, Number(tournament.buy_in) || 0]);
       const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
       await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament, { includeAdminBackButton });
       await interaction.reply({ content: `You're entered in **${tournament.tournament_name}**.`, ...payload, ephemeral: true });
       return;
     }
@@ -18942,7 +18963,8 @@ if (interaction.commandName === 'avatar') {
       const tournamentId = interaction.customId.split(':')[1];
       await pool.query(`UPDATE tournaments SET status = 'closed', updated_at = NOW() WHERE id = $1`, [tournamentId]);
       const tournament = await findTournament(interaction.guild.id, tournamentId);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.update({ content: 'Registration closed.', ...payload });
       return;
     }
@@ -18956,7 +18978,8 @@ if (interaction.commandName === 'avatar') {
       // Close button already writes to.
       await pool.query(`UPDATE tournaments SET status = 'open', updated_at = NOW() WHERE id = $1 AND status = 'closed'`, [tournamentId]);
       const tournament = await findTournament(interaction.guild.id, tournamentId);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.update({ content: 'Registration reopened.', ...payload });
       return;
     }
@@ -19003,7 +19026,8 @@ if (interaction.commandName === 'avatar') {
       if (!Number.isInteger(seed) || seed <= 0) { await interaction.reply({ content: 'Seed must be a whole number greater than 0.', ephemeral: true }); return; }
       await pool.query(`UPDATE tournament_entries SET seed = $3 WHERE tournament_id = $1 AND user_id = $2`, [tournamentId, targetUserId, seed]);
       await interaction.deferReply({ ephemeral: true });
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.editReply({ content: `Seed set to **${seed}** for <@${targetUserId}>.`, ...payload });
       return;
     }
@@ -19017,7 +19041,8 @@ if (interaction.commandName === 'avatar') {
         await pool.query(`UPDATE tournament_entries SET seed = $3 WHERE tournament_id = $1 AND user_id = $2`, [tournamentId, shuffled[i].user_id, i + 1]);
       }
       const tournament = await findTournament(interaction.guild.id, tournamentId);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.update({ content: 'Seeds shuffled.', ...payload });
       return;
     }
@@ -19036,7 +19061,8 @@ if (interaction.commandName === 'avatar') {
       const matches = await getTournamentMatches(tournamentId);
       await createMatchThreads(interaction.guild, refreshedTournament, matches).catch(() => null);
       await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament, { includeAdminBackButton });
       await interaction.editReply({ content: 'Tournament started. Round 1 bracket generated.', ...payload });
       return;
     }
@@ -19167,7 +19193,8 @@ if (interaction.commandName === 'avatar') {
       tournamentPostponeSessions.delete(token);
       const tournament = await findTournament(interaction.guild.id, session.tournamentId);
       await updateTournamentPanel(interaction.guild, tournament).catch(() => null);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.update({ content: `**${tournament.tournament_name}** rescheduled to ${session.date} at ${session.time}.`, ...payload });
       return;
     }
@@ -19194,7 +19221,8 @@ if (interaction.commandName === 'avatar') {
       }
       const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
       await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
-      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament, { includeAdminBackButton });
       await interaction.editReply({ content: `**${tournament.tournament_name}** cancelled. ${entries.length ? 'Buy-ins refunded.' : ''}`, ...payload });
       return;
     }
@@ -21183,10 +21211,16 @@ if (interaction.commandName === 'avatar') {
 
       await interaction.update({ embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)], components: [] });
       const result = await submitMaddenNegotiationPackageToCommittee(interaction, negotiation, league, pkg);
+      let channelPostOk = false;
       if (interaction.channel?.send) {
-        await interaction.channel.send({ content: result.ok ? `✅ Both GMs confirmed. ${result.message}` : `⚠️ ${result.message}` }).catch(() => null);
+        channelPostOk = Boolean(await interaction.channel.send({ content: result.ok ? `✅ Both GMs confirmed. ${result.message}` : `⚠️ ${result.message}` }).catch(() => null));
       }
-      if (!result.ok) {
+      // 7J-CPUCOMMITTEEFIX: previously only surfaced a follow-up on failure —
+      // if the in-thread post above silently failed too (e.g. an archived
+      // thread), a successful submission and a failed one looked identical
+      // from the user's side: nothing happened. Always confirm via an
+      // ephemeral follow-up if the channel post didn't land.
+      if (!result.ok || !channelPostOk) {
         await interaction.followUp({ content: result.message, ephemeral: true }).catch(() => null);
       }
       return;
@@ -25205,7 +25239,8 @@ if (shopSubcommand === 'view') {
           await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true });
           return;
         }
-        const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament);
+        const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+        const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
         await interaction.reply({ ...payload, ephemeral: true });
         return;
       }
@@ -36187,6 +36222,47 @@ async function notifyWaitlistForVacantTeam(guild, league, teamName) {
 async function autoCreateGuildMultiChannelPanels(guild) {
   const category = await guild.channels.create({ name: 'GG Sports', type: ChannelType.GuildCategory });
   const created = [];
+
+  // 7J-CHANORDER: per Hxxdie — channel creation order now matches the exact
+  // order Hxxdie manually arranged the GG Sports category into: Welcome &
+  // Goodbye first, then Recruitment, Member Profile, Avatar, Bank, Shop,
+  // Marketplace, Sportsbook Board, Support, Tickets. Previously this ran
+  // shop/sportsbook/marketplace/avatar/bank/profile/recruitment first and
+  // created Welcome/Leave dead last, which didn't match the order a fresh
+  // server actually wants these to land in.
+  // 7J-WELCOMEGOODBYE: renamed from "welcome-and-leave" to
+  // "welcome-and-goodbye" per Hxxdie — same channel, same
+  // welcome_channel_id/leave_channel_id dual-purpose behavior below, just a
+  // friendlier name.
+  const refreshedGuildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
+  const existingWelcomeChannel = refreshedGuildSettings?.welcome_channel_id
+    ? await guild.channels.fetch(refreshedGuildSettings.welcome_channel_id).catch(() => null)
+    : null;
+  const existingLeaveChannel = refreshedGuildSettings?.leave_channel_id
+    ? await guild.channels.fetch(refreshedGuildSettings.leave_channel_id).catch(() => null)
+    : null;
+  if (!existingWelcomeChannel && !existingLeaveChannel) {
+    const welcomeLeaveChannel = await guild.channels.create({ name: 'welcome-and-goodbye', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (welcomeLeaveChannel) {
+      await setGuildWelcomeChannel(guild.id, guild.name, welcomeLeaveChannel.id);
+      await setGuildLeaveChannel(guild.id, guild.name, welcomeLeaveChannel.id);
+      created.push(welcomeLeaveChannel);
+    }
+  } else if (!existingWelcomeChannel) {
+    const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (welcomeChannel) {
+      await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
+      created.push(welcomeChannel);
+    }
+  } else if (!existingLeaveChannel) {
+    const leaveChannel = await guild.channels.create({ name: 'goodbye', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (leaveChannel) {
+      await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
+      created.push(leaveChannel);
+    }
+  }
+  await setGuildWelcomeLeaveEnabled(guild.id, guild.name, true);
+
   // 7J-COMMANDHUB-PAYWALL: per Hxxdie's full free/premium breakdown —
   // shop/sportsbook/marketplace/avatar/bank/member-profile are all
   // Premium; recruitment (applications) stays free (only the cross-server
@@ -36198,13 +36274,13 @@ async function autoCreateGuildMultiChannelPanels(guild) {
   // sitting there.
   const isPremium = await isGuildPremiumActive(guild.id);
   const allPanelSpecs = [
-    ['shop', 'shop', true],
-    ['sportsbook', 'sportsbook-board', true],
-    ['marketplace', 'marketplace', true],
+    ['recruitment', 'recruitment', false],
+    ['profile', 'member-profile', true],
     ['avatar', 'avatar', true],
     ['bank', 'bank', true],
-    ['profile', 'member-profile', true],
-    ['recruitment', 'recruitment', false],
+    ['shop', 'shop', true],
+    ['marketplace', 'marketplace', true],
+    ['sportsbook', 'sportsbook-board', true],
   ];
   const panelSpecs = allPanelSpecs
     .filter(([, , premiumOnly]) => !premiumOnly || isPremium)
@@ -36247,7 +36323,7 @@ async function autoCreateGuildMultiChannelPanels(guild) {
   // (7J-111TICKETSCOPE), so they belong in this same guild-wide auto-setup
   // flow rather than needing to be configured by hand afterward. Only
   // creates whichever of the two isn't already set, same "don't clobber an
-  // existing setup" behavior as the Welcome/Leave block below.
+  // existing setup" behavior as the Welcome/Leave block above.
   // 7J-COMMANDHUB-PAYWALL: Tickets/Support are Premium (per Hxxdie's full
   // free/premium breakdown) — gated the same way as shop/sportsbook/etc.
   // above, so Free Tier doesn't get a channel for a feature it can't
@@ -36258,8 +36334,22 @@ async function autoCreateGuildMultiChannelPanels(guild) {
   // button-based panel — matches the existing distinction between
   // /ticket panel and /ticket supportpanel elsewhere in this codebase,
   // rather than posting the same content to both.
+  // 7J-CHANORDER: Support now created before Tickets (previously the
+  // reverse), matching Hxxdie's reordered category.
   const guildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
   if (isPremium) {
+    const existingSupportChannel = guildSettings?.support_channel_id
+      ? await guild.channels.fetch(guildSettings.support_channel_id).catch(() => null)
+      : null;
+    if (!existingSupportChannel) {
+      const supportChannel = await guild.channels.create({ name: 'support', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+      if (supportChannel) {
+        await setGuildTicketSettings(guild.id, guild.name, { supportChannelId: supportChannel.id });
+        await supportChannel.send({ embeds: [buildSupportPanelEmbed()], components: [buildSupportPanelButtons()] }).catch(() => null);
+        created.push(supportChannel);
+      }
+    }
+
     // 7J-STALECHANNELCHECK: per Hxxdie — Support channel wasn't getting
     // (re)created during auto-setup. Root cause: this only checked whether
     // a channel ID was *stored*, not whether that channel still actually
@@ -36309,65 +36399,12 @@ async function autoCreateGuildMultiChannelPanels(guild) {
         created.push(ticketChannel);
       }
     }
-    const existingSupportChannel = guildSettings?.support_channel_id
-      ? await guild.channels.fetch(guildSettings.support_channel_id).catch(() => null)
-      : null;
-    if (!existingSupportChannel) {
-      const supportChannel = await guild.channels.create({ name: 'support', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-      if (supportChannel) {
-        await setGuildTicketSettings(guild.id, guild.name, { supportChannelId: supportChannel.id });
-        await supportChannel.send({ embeds: [buildSupportPanelEmbed()], components: [buildSupportPanelButtons()] }).catch(() => null);
-        created.push(supportChannel);
-      }
-    }
     const ticketPanelResult = await createConfiguredPanelFromSetup({ guild, channel: null }, null, 'ticket_panel').catch(err => {
       console.error('[Auto Setup] Ticket dashboard post failed:', err?.message || err);
       return null;
     });
     console.log('[Auto Setup] Ticket dashboard result:', ticketPanelResult);
   }
-
-  // 7J-COMMANDHUB-WELCOMELEAVE: previously gated behind welcome_leave_enabled
-  // already being TRUE — but that defaults to FALSE for every fresh guild,
-  // so in practice these channels never got created via this button at all
-  // (confirmed by Hxxdie's live testing). Now creates them unconditionally
-  // (not Premium-gated — Welcome/Leave is basic onboarding utility, not a
-  // paywalled feature) and turns the feature on at the same time — no
-  // point creating the channels and leaving the feature off.
-  // 7J-WELCOMELEAVEMERGE: per Hxxdie — consolidated into one shared channel
-  // instead of two separate ones. Both welcome_channel_id and
-  // leave_channel_id get pointed at the same channel; the join/leave
-  // posting logic doesn't assume they're different channels, so this is a
-  // pure channel-count reduction with no behavior change to what actually
-  // gets posted.
-  const refreshedGuildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
-  const existingWelcomeChannel = refreshedGuildSettings?.welcome_channel_id
-    ? await guild.channels.fetch(refreshedGuildSettings.welcome_channel_id).catch(() => null)
-    : null;
-  const existingLeaveChannel = refreshedGuildSettings?.leave_channel_id
-    ? await guild.channels.fetch(refreshedGuildSettings.leave_channel_id).catch(() => null)
-    : null;
-  if (!existingWelcomeChannel && !existingLeaveChannel) {
-    const welcomeLeaveChannel = await guild.channels.create({ name: 'welcome-and-leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-    if (welcomeLeaveChannel) {
-      await setGuildWelcomeChannel(guild.id, guild.name, welcomeLeaveChannel.id);
-      await setGuildLeaveChannel(guild.id, guild.name, welcomeLeaveChannel.id);
-      created.push(welcomeLeaveChannel);
-    }
-  } else if (!existingWelcomeChannel) {
-    const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-    if (welcomeChannel) {
-      await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
-      created.push(welcomeChannel);
-    }
-  } else if (!existingLeaveChannel) {
-    const leaveChannel = await guild.channels.create({ name: 'leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
-    if (leaveChannel) {
-      await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
-      created.push(leaveChannel);
-    }
-  }
-  await setGuildWelcomeLeaveEnabled(guild.id, guild.name, true);
 
   return { category, channels: created };
 }
@@ -42018,88 +42055,124 @@ async function rebuildMaddenNegotiationPackageByIndex(guildId, league, negotiati
 }
 
 async function submitMaddenNegotiationPackageToCommittee(interaction, negotiation, league, pkg) {
-  const freshResult = await pool.query(`SELECT * FROM madden_trade_negotiations WHERE id = $1 LIMIT 1`, [negotiation.id]).catch(() => ({ rows: [] }));
-  negotiation = freshResult.rows?.[0] || negotiation;
-  if (negotiation.committee_offer_id) {
-    return { ok: true, message: `This negotiation has already been submitted to committee as trade offer **${shortGameId(negotiation.committee_offer_id)}**.` };
-  }
-
-  pkg = await hydrateMaddenNegotiationPackageTargetSide(interaction.guild.id, league, negotiation, pkg);
-  const committeeChannelIds = [
-    league?.trade_committee_channel_id,
-    league?.committee_channel_id,
-  ].filter(Boolean);
-  const committeeRoleId = league?.trade_committee_role_id || league?.committee_role_id;
-  let committeeChannel = null;
-  let lastError = null;
-  for (const channelId of [...new Set(committeeChannelIds)]) {
-    const candidate = await interaction.client.channels.fetch(channelId).catch(error => { lastError = error; return null; });
-    if (candidate && candidate.isTextBased?.()) {
-      committeeChannel = candidate;
-      break;
-    }
-  }
-  if (!committeeChannel) {
-    console.warn('[7J-10BX-G COMMITTEE SUBMIT] No committee channel', JSON.stringify({ committeeChannelIds, error: lastError?.message || null }));
-    return { ok: false, message: 'Committee channel not found or the bot cannot access it. Check the trade committee channel permissions.' };
-  }
-
-  const offerId = randomUUID();
-  const senderRoleId = await getMaddenLeagueTeamRoleIdByName(league?.league_id, negotiation.requesting_team);
-  const targetRoleId = await getMaddenLeagueTeamRoleIdByName(league?.league_id, negotiation.listing_team);
-  const details = buildMaddenNegotiationOfferDetails(negotiation, pkg);
-
-  await pool.query(
-    `INSERT INTO trade_offers (
-       id, guild_id, league_id, sender_user_id, sender_team, sender_team_role_id,
-       target_team, target_team_role_id, target_owner_user_id, offer_details, screenshot_url, status
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', 'owner_accepted')`,
-    [offerId, interaction.guild.id, league?.league_id || null, negotiation.requesting_user_id, negotiation.requesting_team || 'Offering Team', senderRoleId, negotiation.listing_team || 'Listing Team', targetRoleId, negotiation.listing_user_id, details]
-  );
-
-  const offerRow = {
-    id: offerId,
-    guild_id: interaction.guild.id,
-    league_id: league?.league_id || null,
-    sender_user_id: negotiation.requesting_user_id,
-    sender_team: negotiation.requesting_team || 'Offering Team',
-    sender_team_role_id: senderRoleId,
-    target_team: negotiation.listing_team || 'Listing Team',
-    target_team_role_id: targetRoleId,
-    target_owner_user_id: negotiation.listing_user_id,
-    offer_details: details,
-    screenshot_url: '',
-    status: 'owner_accepted',
-  };
-
-  let committeeMessage = null;
+  // 7J-CPUCOMMITTEEFIX: per Hxxdie — a CPU-target committee submission
+  // silently produced nothing (no committee post, no visible error). Root
+  // cause class matches the earlier Sportsbook freeze: a real Discord
+  // permission gap (bot could resolve the channel but not post/mention in
+  // it) that was previously only surfaced via a bare try/catch around the
+  // .send() call — anything that threw *before* that point (this whole
+  // function had no outer try/catch) propagated up to the button handler,
+  // which also has no try/catch around this call, so the failure never
+  // reached the user at all. Wrapping the whole function guarantees a
+  // clean {ok:false, message} comes back no matter where it fails, and an
+  // explicit permission check below catches the "found the channel but
+  // can't actually post" case before attempting the send.
   try {
-    committeeMessage = await committeeChannel.send({
-      content: committeeRoleId ? `<@&${committeeRoleId}>` : undefined,
-      embeds: [buildCommitteeEmbed(offerRow, 0, 0)],
-      components: [buildCommitteeVoteButtons(offerId)],
-      allowedMentions: { roles: committeeRoleId ? [committeeRoleId] : [], users: [] },
-    });
-  } catch (error) {
-    console.error('[7J-10BX-G COMMITTEE SUBMIT] Send failed:', error);
-    await pool.query(`DELETE FROM trade_offers WHERE id = $1`, [offerId]).catch(() => null);
-    return { ok: false, message: `Both GMs confirmed, but I could not post in <#${committeeChannel.id}>. Check bot permissions and committee role mention permissions.` };
-  }
+    const freshResult = await pool.query(`SELECT * FROM madden_trade_negotiations WHERE id = $1 LIMIT 1`, [negotiation.id]).catch(() => ({ rows: [] }));
+    negotiation = freshResult.rows?.[0] || negotiation;
+    if (negotiation.committee_offer_id) {
+      return { ok: true, message: `This negotiation has already been submitted to committee as trade offer **${shortGameId(negotiation.committee_offer_id)}**.` };
+    }
 
-  await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
-  await pool.query(`UPDATE madden_trade_negotiations SET committee_offer_id = $1, status = 'proposal_sent', updated_at = NOW() WHERE id = $2`, [offerId, negotiation.id]);
-  console.log('[7J-10BX-G COMMITTEE SUBMIT] Submitted ' + JSON.stringify({ offerId, channelId: committeeChannel.id, negotiationId: negotiation.id }));
-  await recordMaddenNewsEvent(interaction.guild, league, {
-    event_type: 'trade_committee_submitted',
-    player_name: negotiation.player_name,
-    team_name: negotiation.listing_team,
-    metadata: {
-      summary: `${maddenTeamDisplayName(negotiation.requesting_team || 'Offering Team')} and ${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')} sent a trade package to committee.`,
-      thread_id: negotiation.thread_id || null,
-      offer_id: offerId,
-    },
-  }).catch(error => console.warn('[7J-10BY-A NEWS] committee submission event failed:', error?.message || error));
-  return { ok: true, message: `Official trade submitted to committee in <#${committeeChannel.id}> as **${shortGameId(offerId)}**.` };
+    pkg = await hydrateMaddenNegotiationPackageTargetSide(interaction.guild.id, league, negotiation, pkg);
+    const committeeChannelIds = [
+      league?.trade_committee_channel_id,
+      league?.committee_channel_id,
+    ].filter(Boolean);
+    const committeeRoleId = league?.trade_committee_role_id || league?.committee_role_id;
+    let committeeChannel = null;
+    let lastError = null;
+    for (const channelId of [...new Set(committeeChannelIds)]) {
+      const candidate = await interaction.client.channels.fetch(channelId).catch(error => { lastError = error; return null; });
+      if (candidate && candidate.isTextBased?.()) {
+        committeeChannel = candidate;
+        break;
+      }
+    }
+    if (!committeeChannel) {
+      console.warn('[7J-10BX-G COMMITTEE SUBMIT] No committee channel', JSON.stringify({ committeeChannelIds, error: lastError?.message || null }));
+      return { ok: false, message: `Committee channel not found or the bot cannot access it (tried: ${committeeChannelIds.map(id => `<#${id}>`).join(', ') || 'none configured'}). Check the trade committee channel permissions, or use Admin Panel → Server Setup → Check Bot Permissions.` };
+    }
+
+    // 7J-CPUCOMMITTEEFIX: explicit permission check, not just "did fetch
+    // succeed" — a private channel the bot can see but not post/mention in
+    // (exactly the Sportsbook freeze's root cause) would otherwise only
+    // surface as a caught exception on .send() below, with no channel ID
+    // in the message. Checking first makes the failure specific and
+    // actionable instead of a generic "something broke."
+    const botMember = await interaction.guild.members.fetchMe();
+    const committeePermissions = committeeChannel.permissionsFor(botMember);
+    const missingPermissions = [
+      !committeePermissions?.has(PermissionFlagsBits.ViewChannel) && 'View Channel',
+      !committeePermissions?.has(PermissionFlagsBits.SendMessages) && 'Send Messages',
+      !committeePermissions?.has(PermissionFlagsBits.EmbedLinks) && 'Embed Links',
+      committeeRoleId && !committeePermissions?.has(PermissionFlagsBits.MentionEveryone) && !committeeChannel.guild.roles.cache.get(committeeRoleId)?.mentionable && 'Mention @everyone, @here, and All Roles',
+    ].filter(Boolean);
+    if (missingPermissions.length) {
+      console.warn('[7J-10BX-G COMMITTEE SUBMIT] Missing permissions', JSON.stringify({ channelId: committeeChannel.id, missingPermissions }));
+      return { ok: false, message: `Both GMs confirmed, but I'm missing **${missingPermissions.join(', ')}** in <#${committeeChannel.id}>. Grant those permissions, then try again from the negotiation hub.` };
+    }
+
+    const offerId = randomUUID();
+    const senderRoleId = await getMaddenLeagueTeamRoleIdByName(league?.league_id, negotiation.requesting_team);
+    const targetRoleId = await getMaddenLeagueTeamRoleIdByName(league?.league_id, negotiation.listing_team);
+    const details = buildMaddenNegotiationOfferDetails(negotiation, pkg);
+
+    await pool.query(
+      `INSERT INTO trade_offers (
+         id, guild_id, league_id, sender_user_id, sender_team, sender_team_role_id,
+         target_team, target_team_role_id, target_owner_user_id, offer_details, screenshot_url, status
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', 'owner_accepted')`,
+      [offerId, interaction.guild.id, league?.league_id || null, negotiation.requesting_user_id, negotiation.requesting_team || 'Offering Team', senderRoleId, negotiation.listing_team || 'Listing Team', targetRoleId, negotiation.listing_user_id, details]
+    );
+
+    const offerRow = {
+      id: offerId,
+      guild_id: interaction.guild.id,
+      league_id: league?.league_id || null,
+      sender_user_id: negotiation.requesting_user_id,
+      sender_team: negotiation.requesting_team || 'Offering Team',
+      sender_team_role_id: senderRoleId,
+      target_team: negotiation.listing_team || 'Listing Team',
+      target_team_role_id: targetRoleId,
+      target_owner_user_id: negotiation.listing_user_id,
+      offer_details: details,
+      screenshot_url: '',
+      status: 'owner_accepted',
+    };
+
+    let committeeMessage = null;
+    try {
+      committeeMessage = await committeeChannel.send({
+        content: committeeRoleId ? `<@&${committeeRoleId}>` : undefined,
+        embeds: [buildCommitteeEmbed(offerRow, 0, 0)],
+        components: [buildCommitteeVoteButtons(offerId)],
+        allowedMentions: { roles: committeeRoleId ? [committeeRoleId] : [], users: [] },
+      });
+    } catch (error) {
+      console.error('[7J-10BX-G COMMITTEE SUBMIT] Send failed:', error);
+      await pool.query(`DELETE FROM trade_offers WHERE id = $1`, [offerId]).catch(() => null);
+      return { ok: false, message: `Both GMs confirmed, but I could not post in <#${committeeChannel.id}>: ${error?.message || 'unknown error'}. Check bot permissions and committee role mention permissions.` };
+    }
+
+    await pool.query(`UPDATE trade_offers SET committee_message_id = $1 WHERE id = $2`, [committeeMessage.id, offerId]);
+    await pool.query(`UPDATE madden_trade_negotiations SET committee_offer_id = $1, status = 'proposal_sent', updated_at = NOW() WHERE id = $2`, [offerId, negotiation.id]);
+    console.log('[7J-10BX-G COMMITTEE SUBMIT] Submitted ' + JSON.stringify({ offerId, channelId: committeeChannel.id, negotiationId: negotiation.id }));
+    await recordMaddenNewsEvent(interaction.guild, league, {
+      event_type: 'trade_committee_submitted',
+      player_name: negotiation.player_name,
+      team_name: negotiation.listing_team,
+      metadata: {
+        summary: `${maddenTeamDisplayName(negotiation.requesting_team || 'Offering Team')} and ${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')} sent a trade package to committee.`,
+        thread_id: negotiation.thread_id || null,
+        offer_id: offerId,
+      },
+    }).catch(error => console.warn('[7J-10BY-A NEWS] committee submission event failed:', error?.message || error));
+    return { ok: true, message: `Official trade submitted to committee in <#${committeeChannel.id}> as **${shortGameId(offerId)}**.` };
+  } catch (error) {
+    console.error('[7J-CPUCOMMITTEEFIX] submitMaddenNegotiationPackageToCommittee threw:', error?.stack || error?.message || error);
+    return { ok: false, message: `Both GMs confirmed, but something went wrong submitting to committee: ${error?.message || 'unknown error'}. Check the console log for details.` };
+  }
 }
 
 async function cleanupMaddenTradeBlockAfterRosterSync(guildId, leagueId) {
