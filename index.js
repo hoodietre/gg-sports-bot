@@ -466,6 +466,13 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_committee_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS approved_trades_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS denied_trades_channel_id TEXT`);
+  // 7J-TRADEDECISIONS: per Hxxdie — approved-trades and denied-trades were
+  // two separate channels; merging into one "trade committee decisions"
+  // channel that gets both outcomes. Old columns kept (not dropped) so
+  // existing leagues that already had them configured keep working via
+  // fallback in finalizeApprovedTrade/finalizeDeniedTrade; new leagues get
+  // only the single unified channel going forward.
+  await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_decisions_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS trade_count_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS setup_ticket_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS setup_support_channel_id TEXT`);
@@ -664,6 +671,10 @@ async function initDatabase() {
   // thread feature (see maybePostGameThreadOwnersAvatar) — prevents re-posting on
   // every subsequent role change once it's already gone out for a given game.
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS owners_avatar_posted BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-GENERICAVATAR: per Hxxdie — only Madden game threads were posting
+  // the "both owners set" avatar showcase; every user-vs-user matchup
+  // thread should get it, not just Madden's.
+  await pool.query(`ALTER TABLE league_games ADD COLUMN IF NOT EXISTS owners_avatar_posted BOOLEAN NOT NULL DEFAULT FALSE`);
   // 7J-49MADDEN: Track H item 26 extension — per Hxxdie, Madden games get
   // the same "Game Started" mechanism as Game Center, even though Madden
   // settles automatically via sync rather than a manual Report Score click.
@@ -1594,6 +1605,21 @@ async function initDatabase() {
   // owners in a game thread, entirely separate from the sportsbook/
   // moneylines. See game_wagers table below.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS wagers_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-COMMITTEEVOTES: per Hxxdie — votes-needed for a trade committee
+  // decision was hardcoded to 3 for every league regardless of actual
+  // committee size. Adjustable per league now; default of 3 matches prior
+  // behavior exactly for leagues that never touch this setting.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS trade_committee_votes_needed INTEGER NOT NULL DEFAULT 3`);
+  // 7J-LEAGUERULESET: per Hxxdie — a way for prospective and current
+  // members to see what kind of league this actually is (quarter length,
+  // difficulty, sim vs. comp, etc.) before/after joining. Free-text rather
+  // than rigid enums since these vary a lot by sport and league culture —
+  // a commissioner describing "6 min quarters, All-Madden, mostly Sim with
+  // some Comp elements" doesn't fit cleanly into fixed dropdown options.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS quarter_length TEXT`);
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS game_difficulty TEXT`);
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS sim_or_comp TEXT`);
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS ruleset_notes TEXT`);
   // Same bug class as the schedule/current_round fix above — rules_text was
   // added to the CREATE TABLE literal but never backfilled for existing
   // tables. Root cause of the "column rules_text of relation
@@ -4963,7 +4989,7 @@ async function registerCommands() {
 // object anymore. Left in the SELECT rather than pulled back out — harmless,
 // and touching this shared list is exactly the kind of edit that caused the
 // bug this comment describes, so it's not worth the risk for a no-op cleanup.
-const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
+const LEAGUE_SETTINGS_JOIN_COLUMNS = `s.league_role_id, s.staff_role_id, s.team_owners_channel_id, s.trade_offer_channel_id, s.trade_committee_role_id, s.trade_committee_channel_id, s.approved_trades_channel_id, s.denied_trades_channel_id, s.trade_decisions_channel_id, s.trade_count_channel_id, s.committee_role_id, s.live_channel_id,
             s.trade_block_channel_id,
             s.offer_a_trade_channel_id, s.committee_channel_id, s.approved_channel_id, s.denied_channel_id,
             s.history_channel_id, s.standings_channel_id, s.tournament_channel_id, s.sportsbook_channel_id, s.madden_free_agents_channel_id, s.trade_negotiation_channel_id, s.player_search_channel_id, s.gm_panel_channel_id, s.league_announcement_channel_id, s.staff_channel_id, s.league_leaders_channel_id, s.award_race_channel_id, s.member_profile_channel_id, s.bank_channel_id, s.league_rules_channel_id, s.playoff_bracket_channel_id, s.sportsbook_feed_enabled, s.sportsbook_big_bet_threshold, s.sportsbook_monster_parlay_legs, s.playoff_team_count, s.game_threads_channel_id, s.madden_news_channel_id, s.madden_weekly_updates_channel_id, s.madden_standings_channel_id, s.madden_power_rankings_channel_id, s.madden_sportsbook_channel_id, s.game_center_channel_id, s.active_check_channel_id, s.draft_recap_channel_id, s.madden_season_year, s.madden_franchise_hub_channel_id, s.league_hof_channel_id, s.recruitment_discoverable, s.suspensions_channel_id, s.setup_ticket_channel_id, s.setup_support_channel_id,
@@ -5534,7 +5560,7 @@ function maddenCommitteeAssetLines(players = [], picks = []) {
   return lines.length ? lines.join('\n') : 'No assets listed.';
 }
 
-function buildMaddenNegotiationCommitteeEmbed(offer, approveCount, denyCount) {
+function buildMaddenNegotiationCommitteeEmbed(offer, approveCount, denyCount, votesNeeded = 3) {
   const data = parseMaddenNegotiationOfferDetails(offer.offer_details) || {};
   const pkg = data.package || {};
   const requestingTeam = data.requesting_team || offer.sender_team || 'Offering Team';
@@ -5564,8 +5590,8 @@ Thread: <#${data.thread_id}>` : '';
       ].join('\n'), 1024), inline: false },
       { name: '🤝 GM Confirmations', value: `✅ ${maddenTeamDisplayName(requestingTeam)} GM: <@${data.requesting_user_id || offer.sender_user_id}>
 ✅ ${maddenTeamDisplayName(listingTeam)} GM: <@${data.listing_user_id || offer.target_owner_user_id}>`, inline: false },
-      { name: 'Committee Vote', value: `Approve: **${approveCount}**
-Deny: **${denyCount}**
+      { name: 'Committee Vote', value: `Approve: **${approveCount}** / ${votesNeeded} needed
+Deny: **${denyCount}** / ${votesNeeded} needed
 Status: **${offer.status || 'pending_review'}**`, inline: true },
       { name: 'Submitted By', value: `<@${offer.sender_user_id}>`, inline: true }
     )
@@ -5573,9 +5599,9 @@ Status: **${offer.status || 'pending_review'}**`, inline: true },
     .setTimestamp();
 }
 
-function buildCommitteeEmbed(offer, approveCount, denyCount) {
+function buildCommitteeEmbed(offer, approveCount, denyCount, votesNeeded = 3) {
   if (parseMaddenNegotiationOfferDetails(offer.offer_details)) {
-    return buildMaddenNegotiationCommitteeEmbed(offer, approveCount, denyCount);
+    return buildMaddenNegotiationCommitteeEmbed(offer, approveCount, denyCount, votesNeeded);
   }
   const details = offer.offer_details || '';
   const hasScreenshot = Boolean(offer.screenshot_url);
@@ -5587,8 +5613,8 @@ function buildCommitteeEmbed(offer, approveCount, denyCount) {
       { name: 'Receiving Team', value: offer.target_team, inline: true },
       { name: 'Sent By', value: `<@${offer.sender_user_id}>`, inline: true },
       { name: 'Trade Details', value: maddenSafeEmbedText(details || 'No structured trade details were provided.', 1024), inline: false },
-      { name: 'Approve Votes', value: String(approveCount), inline: true },
-      { name: 'Deny Votes', value: String(denyCount), inline: true },
+      { name: 'Approve Votes', value: `${approveCount} / ${votesNeeded} needed`, inline: true },
+      { name: 'Deny Votes', value: `${denyCount} / ${votesNeeded} needed`, inline: true },
       { name: 'Status', value: offer.status || 'pending', inline: true }
     )
     .setFooter({ text: 'GG Sports • Trade Committee' })
@@ -5960,6 +5986,66 @@ function generateRoundRobinSchedule(teams, matchupFrequency = 1) {
     }
   }
   return rounds;
+}
+
+// 7J-TEAMSCHEDULE: per Hxxdie — a way to see a given team's full season
+// schedule in a structured league. Walks every round in the generated
+// schedule (same shape generateRoundRobinSchedule produces above), finds
+// this team's matchup in each one (or notes a BYE), and cross-references
+// league_games for the actual result if that round's game has already been
+// reported — so a past round shows the real score, not just "Scheduled."
+async function buildTeamScheduleEmbed(guild, league, customSettings, teamRoleId, teamRoleName) {
+  const schedule = Array.isArray(customSettings.schedule) ? customSettings.schedule : [];
+  const currentRound = Number(customSettings.current_round || 0);
+  const NL = String.fromCharCode(10);
+  const lines = [];
+
+  for (let i = 0; i < schedule.length; i++) {
+    const weekLabel = `Game ${i + 1}`;
+    const roundMatchups = schedule[i] || [];
+    const matchup = roundMatchups.find(m => m.home.role_id === teamRoleId || m.away.role_id === teamRoleId);
+    if (!matchup) {
+      lines.push(`**${weekLabel}** — BYE`);
+      continue;
+    }
+    const isHome = matchup.home.role_id === teamRoleId;
+    const opponentName = isHome ? matchup.away.role_name : matchup.home.role_name;
+    const sideLabel = isHome ? 'vs' : '@';
+
+    const reportedResult = await pool.query(
+      `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3
+       AND (home_team_role_id = $4 OR away_team_role_id = $4) LIMIT 1`,
+      [guild.id, league.league_id, weekLabel, teamRoleId]
+    ).catch(() => ({ rows: [] }));
+    const game = reportedResult.rows[0];
+
+    let statusText;
+    if (game?.status === 'final') {
+      if (game.home_score === null && game.away_score === null) {
+        const won = game.winner_team_role_id === teamRoleId;
+        statusText = won ? '🔨 Forced Win' : '🔨 Forced Loss';
+      } else {
+        const teamScore = isHome ? game.home_score : game.away_score;
+        const oppScore = isHome ? game.away_score : game.home_score;
+        const result = teamScore > oppScore ? 'W' : teamScore < oppScore ? 'L' : 'T';
+        statusText = `Final: ${teamScore}-${oppScore} (${result})`;
+      }
+    } else if (i < currentRound) {
+      statusText = 'Not yet reported';
+    } else {
+      statusText = 'Scheduled';
+    }
+
+    lines.push(`**${weekLabel}** — ${sideLabel} ${opponentName} — ${statusText}`);
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📅 Season Schedule • ${teamRoleName}`)
+    .setColor(0x5865F2)
+    .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'This league hasn\'t started its season yet — use Advance/Start League from the Commissioner Panel to generate the schedule.')
+    .setFooter({ text: `GG Sports • ${league.league_name}` })
+    .setTimestamp();
+  return embed;
 }
 
 // ---------------------------------------------------------------------------
@@ -6377,6 +6463,15 @@ function buildTeamOwnersPanelComponents(leagueId) {
     // team picker → modal flow as Browse Open Teams, just pre-scoped to
     // this league instead of asking which league first.
     new ButtonBuilder().setCustomId(`teamownerspanel_apply:${leagueId}`).setLabel('Apply to Join').setEmoji('🙋').setStyle(ButtonStyle.Primary),
+    // 7J-TEAMSCHEDULE: per Hxxdie — a way to see any team's full season
+    // schedule (structured leagues only — open-schedule has no fixed
+    // schedule to show). Always shown rather than conditionally hidden
+    // based on schedule style, since hiding it would require threading
+    // schedule_style through every caller of this function; the handler
+    // itself checks and gives a clear message if this league isn't
+    // structured, matching how Coin Toss/Who's Got Next already check
+    // their own preconditions at click time rather than in the button set.
+    new ButtonBuilder().setCustomId(`teamownerspanel_schedule:${leagueId}`).setLabel('Team Schedule').setEmoji('📅').setStyle(ButtonStyle.Secondary),
   )];
 }
 
@@ -6439,6 +6534,24 @@ async function performCommissionerRoleAction(guild, league, targetUserId, roleId
         for (const pendingGame of pendingGames.rows) {
           await maybePostGameThreadOwnersAvatar(guild, league, pendingGame).catch(error =>
             console.error('[Game Thread Owners Avatar] post-role-action check failed:', error));
+        }
+
+        // 7J-GENERICAVATAR: same retroactive check as above, generic
+        // (non-Madden) side — per Hxxdie, every UvU matchup thread should
+        // get the avatar showcase, not just Madden's. isTeamRole is
+        // already resolved generically above, so this runs for any league
+        // type; league_games rows simply won't exist for a Madden league,
+        // so this is a harmless no-op there.
+        const pendingLeagueGames = await pool.query(
+          `SELECT * FROM league_games
+           WHERE guild_id = $1 AND league_id = $2
+             AND thread_id IS NOT NULL AND owners_avatar_posted = FALSE
+             AND (away_team_role_id = $3 OR home_team_role_id = $3)`,
+          [guild.id, league.league_id, role.id]
+        ).catch(() => ({ rows: [] }));
+        for (const pendingGame of pendingLeagueGames.rows) {
+          await maybePostLeagueGameThreadOwnersAvatar(guild, pendingGame).catch(error =>
+            console.error('[Game Thread Owners Avatar] post-role-action check failed (generic):', error));
         }
       }
     }
@@ -8907,7 +9020,13 @@ async function finalizeApprovedTrade(guild, offerId) {
   await pool.query(`UPDATE trade_offers SET status = 'committee_approved' WHERE id = $1`, [offerId]);
   await saveTradeHistory(guild, league, offer);
 
-  const approvedChannelId = league?.approved_channel_id;
+  // 7J-TRADEDECISIONS: was reading league.approved_channel_id — a
+  // different, older column than the one auto-setup actually creates
+  // (approved_trades_channel_id) or the new unified one. Prioritizes the
+  // new merged channel, falls back to whichever legacy column an existing
+  // league already had configured so nothing silently breaks for leagues
+  // set up before this change.
+  const approvedChannelId = league?.trade_decisions_channel_id || league?.approved_trades_channel_id || league?.approved_channel_id;
   const approvedChannel = await guild.channels.fetch(approvedChannelId).catch(() => null);
   if (approvedChannel && approvedChannel.isTextBased()) {
     await approvedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Approved', 0x57F287, { ...offer, status: 'committee_approved' })] });
@@ -8959,7 +9078,9 @@ async function finalizeDeniedTrade(guild, offerId) {
 
   await pool.query(`UPDATE trade_offers SET status = 'committee_denied' WHERE id = $1`, [offerId]);
 
-  const deniedChannelId = league?.denied_channel_id;
+  // 7J-TRADEDECISIONS: same fix as finalizeApprovedTrade — posts to the
+  // same unified channel so approved and denied both land in one place.
+  const deniedChannelId = league?.trade_decisions_channel_id || league?.denied_trades_channel_id || league?.denied_channel_id;
   const deniedChannel = await guild.channels.fetch(deniedChannelId).catch(() => null);
   if (deniedChannel && deniedChannel.isTextBased()) {
     await deniedChannel.send({ embeds: [buildFinalTradeEmbed('Trade Denied', 0xED4245, { ...offer, status: 'committee_denied' })] });
@@ -12489,6 +12610,17 @@ if (interaction.commandName === 'avatar') {
       else if (actionKey === 'waitlist_join') await runRecruitmentWaitlistJoin(interaction, league);
       else if (actionKey === 'review') await runRecruitmentReview(interaction, league);
       else if (actionKey === 'discoverable') await runRecruitmentDiscoverableSettings(interaction, league);
+      else if (actionKey === 'leagueinfo') await runRecruitmentLeagueInfo(interaction, league);
+      return;
+    }
+
+    // 7J-LEAGUERULESET: public (any member) view of the league's info/
+    // ruleset — no staff gate, unlike everything else on this panel that
+    // touches settings.
+    if (interaction.isButton() && interaction.customId === 'recruitmentpanel_leagueinfo') {
+      await interaction.deferReply({ ephemeral: true });
+      const league = await resolveOrPickRecruitmentLeague(interaction, 'leagueinfo');
+      if (league) await runRecruitmentLeagueInfo(interaction, league);
       return;
     }
 
@@ -14296,17 +14428,21 @@ if (interaction.commandName === 'avatar') {
           [offerId, interaction.user.id, isApprove ? 'approve' : 'deny']
         );
         const counts = await getVoteCounts(offerId);
-        if (counts.approve >= 3) {
+        // 7J-COMMITTEEVOTES: per Hxxdie — was hardcoded to 3 regardless of
+        // league setting.
+        const voteCommitteeSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+        const votesNeeded = Number(voteCommitteeSettings.trade_committee_votes_needed) || 3;
+        if (counts.approve >= votesNeeded) {
           await finalizeApprovedTrade(interaction.guild, offerId);
-          await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_approved' }, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId, true)] });
+          await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_approved' }, counts.approve, counts.deny, votesNeeded)], components: [buildCommitteeVoteButtons(offerId, true)] });
           return;
         }
-        if (counts.deny >= 3) {
+        if (counts.deny >= votesNeeded) {
           await finalizeDeniedTrade(interaction.guild, offerId);
-          await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_denied' }, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId, true)] });
+          await interaction.update({ embeds: [buildCommitteeEmbed({ ...offer, status: 'committee_denied' }, counts.approve, counts.deny, votesNeeded)], components: [buildCommitteeVoteButtons(offerId, true)] });
           return;
         }
-        await interaction.update({ embeds: [buildCommitteeEmbed(offer, counts.approve, counts.deny)], components: [buildCommitteeVoteButtons(offerId)] });
+        await interaction.update({ embeds: [buildCommitteeEmbed(offer, counts.approve, counts.deny, votesNeeded)], components: [buildCommitteeVoteButtons(offerId)] });
         return;
       }
     }
@@ -16757,6 +16893,78 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-COMMITTEEVOTES: per Hxxdie — same modal pattern as trade limit
+    // above, adjustable votes-needed for a trade committee decision to
+    // pass instead of the previous hardcoded 3.
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_committeevotes_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_committeevotes_submit:' + leagueId)
+        .setTitle('Committee Votes Needed')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('votes_needed').setLabel('Votes needed to approve/deny a trade').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(customSettings.trade_committee_votes_needed || 3))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_committeevotes_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const raw = interaction.fields.getTextInputValue('votes_needed');
+      const value = Number.parseInt(raw, 10);
+      if (!Number.isInteger(value) || value < 1) {
+        await interaction.reply({ content: 'Votes needed must be a whole number of at least 1.', ephemeral: true });
+        return;
+      }
+      await pool.query(`UPDATE league_custom_settings SET trade_committee_votes_needed = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, value]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'trades', { update: false });
+      return;
+    }
+
+    // 7J-LEAGUERULESET: per Hxxdie — lets a commissioner describe what kind
+    // of league this actually is (quarter length, difficulty, sim/comp) so
+    // members and prospective applicants can see it before joining.
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_ruleset_modal:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_ruleset_submit:' + leagueId)
+        .setTitle('League Info / Ruleset')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('quarter_length').setLabel('Quarter length (e.g. 6 min)').setStyle(TextInputStyle.Short).setRequired(false).setValue(customSettings.quarter_length || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game_difficulty').setLabel('Difficulty (e.g. All-Madden)').setStyle(TextInputStyle.Short).setRequired(false).setValue(customSettings.game_difficulty || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('sim_or_comp').setLabel('Sim / Comp / Hybrid').setStyle(TextInputStyle.Short).setRequired(false).setValue(customSettings.sim_or_comp || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ruleset_notes').setLabel('Additional notes').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500).setValue(customSettings.ruleset_notes || '')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_ruleset_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const quarterLength = interaction.fields.getTextInputValue('quarter_length').trim() || null;
+      const gameDifficulty = interaction.fields.getTextInputValue('game_difficulty').trim() || null;
+      const simOrComp = interaction.fields.getTextInputValue('sim_or_comp').trim() || null;
+      const rulesetNotes = interaction.fields.getTextInputValue('ruleset_notes').trim() || null;
+      await pool.query(
+        `UPDATE league_custom_settings SET quarter_length = $2, game_difficulty = $3, sim_or_comp = $4, ruleset_notes = $5, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, quarterLength, gameDifficulty, simOrComp, rulesetNotes]
+      );
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'ruleset', { update: false });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_award_add:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -17882,7 +18090,45 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('teamownerspanel_leave_pick:')) {
+    // 7J-TEAMSCHEDULE: per Hxxdie — shows any team's full season schedule.
+    // Structured leagues only; checked at click time (matching the
+    // Coin Toss/Who's Got Next pattern) rather than hiding the button.
+    if (interaction.isButton() && interaction.customId.startsWith('teamownerspanel_schedule:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const scheduleCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      if (scheduleCustomSettings.schedule_style !== 'structured') {
+        await interaction.editReply({ content: 'This league uses an open schedule, not a structured one, so there\'s no fixed season schedule to show.' });
+        return;
+      }
+      const teams = await getLeagueTeamRoles(league.league_id);
+      if (!teams.length) {
+        await interaction.editReply({ content: 'No team roles are configured for this league yet.' });
+        return;
+      }
+      const rows = buildGameCenterTeamSelectRows(teams, `teamownerspanel_schedule_pick:${leagueId}`);
+      await interaction.editReply({ content: `Pick a team to see its schedule in **${league.league_name}**:`, components: rows });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('teamownerspanel_schedule_pick:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
+      await interaction.deferUpdate();
+      const teamRoleId = interaction.values[0];
+      const teams = await getLeagueTeamRoles(league.league_id);
+      const teamRole = teams.find(t => t.role_id === teamRoleId);
+      if (!teamRole) { await interaction.editReply({ content: 'That team could not be found.', components: [] }); return; }
+      const scheduleCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const embed = await buildTeamScheduleEmbed(interaction.guild, league, scheduleCustomSettings, teamRoleId, teamRole.role_name);
+      await interaction.editReply({ content: null, embeds: [embed], components: [] });
+      return;
+    }
+
+
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.update({ content: 'League not found.', components: [] }); return; }
@@ -30723,6 +30969,15 @@ async function createGameCenterThread(interaction, league, game, { channelIdOver
     allowedMentions: { users: [homeOwner?.id, awayOwner?.id].filter(Boolean), roles: [] },
   }).catch(() => null);
 
+  // 7J-GENERICAVATAR: per Hxxdie — only Madden threads were getting the
+  // "both owners set" avatar showcase. Both owners are already known here
+  // if the matchup was created with both teams already claimed; if one
+  // side is still unclaimed, this quietly no-ops and the retroactive check
+  // in performCommissionerRoleAction picks it up once the second owner is
+  // actually assigned.
+  await maybePostLeagueGameThreadOwnersAvatar(interaction.guild, { ...game, thread_id: thread.id, owners_avatar_posted: false }).catch(error =>
+    console.error('[Game Thread Owners Avatar] post-creation check failed:', error));
+
   return { ok: true, thread };
 }
 
@@ -34521,10 +34776,15 @@ function getTradeSetupColumn(type) {
     committee_channel: 'trade_committee_channel_id',
     committeechannel: 'trade_committee_channel_id',
     committee: 'trade_committee_channel_id',
-    approved: 'approved_trades_channel_id',
-    approved_trades: 'approved_trades_channel_id',
-    denied: 'denied_trades_channel_id',
-    denied_trades: 'denied_trades_channel_id',
+    // 7J-TRADEDECISIONS: approved/denied merged into one setting, per
+    // Hxxdie — old keys kept mapped to the same new column so any saved
+    // shortcut/muscle-memory command usage still resolves correctly.
+    approved: 'trade_decisions_channel_id',
+    approved_trades: 'trade_decisions_channel_id',
+    denied: 'trade_decisions_channel_id',
+    denied_trades: 'trade_decisions_channel_id',
+    decisions: 'trade_decisions_channel_id',
+    trade_decisions: 'trade_decisions_channel_id',
     count: 'trade_count_channel_id',
     counts: 'trade_count_channel_id',
     trade_count: 'trade_count_channel_id',
@@ -34539,8 +34799,7 @@ function getTradeSetupLabel(type) {
     trade_offer_channel_id: 'Trade Offer Channel',
     trade_committee_role_id: 'Trade Committee Role',
     trade_committee_channel_id: 'Trade Committee Channel',
-    approved_trades_channel_id: 'Approved Trades Channel',
-    denied_trades_channel_id: 'Denied Trades Channel',
+    trade_decisions_channel_id: 'Trade Committee Decisions Channel',
     trade_count_channel_id: 'Trade Count Channel',
   };
   return labels[column] || 'Trade Setting';
@@ -34555,8 +34814,7 @@ function buildTradeSettingsEmbed(league) {
       { name: 'Trade Offer Channel', value: league.trade_offer_channel_id ? '<#' + league.trade_offer_channel_id + '>' : 'Not set', inline: true },
       { name: 'Trade Committee Role', value: league.trade_committee_role_id ? '<@&' + league.trade_committee_role_id + '>' : 'Not set', inline: true },
       { name: 'Committee Channel', value: league.trade_committee_channel_id ? '<#' + league.trade_committee_channel_id + '>' : 'Not set', inline: true },
-      { name: 'Approved Trades', value: league.approved_trades_channel_id ? '<#' + league.approved_trades_channel_id + '>' : 'Not set', inline: true },
-      { name: 'Denied Trades', value: league.denied_trades_channel_id ? '<#' + league.denied_trades_channel_id + '>' : 'Not set', inline: true },
+      { name: 'Committee Decisions Channel', value: (league.trade_decisions_channel_id || league.approved_trades_channel_id) ? '<#' + (league.trade_decisions_channel_id || league.approved_trades_channel_id) + '>' : 'Not set', inline: true },
       { name: 'Trade Count Channel', value: league.trade_count_channel_id ? '<#' + league.trade_count_channel_id + '>' : 'Not set', inline: true }
     )
     .setFooter({ text: 'GG Sports • Trade Setup' })
@@ -35793,61 +36051,63 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
   const customSettings = !isMadden ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
   const isStructuredNonMadden = !isMadden && customSettings.schedule_style === 'structured';
 
-  // 7J-128CHANNELORDER: explicit order + explicit `position` on each create
-  // call below — per Hxxdie, the previous order came out jumbled in Discord
-  // (channel `position` isn't reliably inferred from creation order alone
-  // once several channels get created back-to-back), forcing an admin to
-  // manually drag everything into a sane order afterward. Grouped as: what
-  // members read first (rules/announcements/staff), the live game-day
-  // channels (standings/streaming/games), the trade cluster together, then
-  // admin/reference channels at the bottom.
+  // 7J-CHANNELREORDER: per Hxxdie — the previous order (rules,
+  // announcements, staff, standings, streaming, games...) didn't match what
+  // was actually wanted (team-owners/league-chat/league-news up near the
+  // top, staff near the bottom). Rebuilt as a straightforward sequence of
+  // conditional pushes in the exact desired final order, rather than
+  // splice-based insertion at fixed indices — splice-index math gets
+  // fragile to reason about once the order itself has this many
+  // sport-conditional branches.
   let singleChannelSpecs = [
     ['league_rules_channel_id', 'rules'],
     ['league_announcement_channel_id', 'announcements'],
-    ['staff_channel_id', 'staff'],
-    // 7J-COMMANDHUB-FULLCOVERAGE: generic 'standings' channel only for
-    // non-Madden now — Madden gets its own dedicated madden-standings
-    // channel/board below (real synced data), so both existing side by
-    // side would be redundant, confusing duplicates.
-    ...(isMadden ? [] : [['standings_channel_id', 'standings']]),
-    ['live_channel_id', 'streaming'],
-    // game-threads/game-center inserted here, sport-conditional, below
-    ['sportsbook_channel_id', 'sportsbook-feed', true],
-    ['trade_block_channel_id', 'trade-block'],
-    // 7J-COMMANDHUB-TRADESPLIT: per Hxxdie (live-tested) — Trade
-    // Negotiation Starter (buildMaddenTradeNegotiationStarterEmbed) is
-    // Madden-only; Trade Offer (buildOfferTradePanelEmbed, the generic
-    // system /league offerpanel also uses) is non-Madden-only. Was
-    // previously creating both channels unconditionally for every league
-    // and posting both starter panels regardless of sport — Madden
-    // leagues were getting the wrong (non-Madden) Trade Offer panel.
-    ...(isMadden ? [['trade_negotiation_channel_id', 'trade-negotiation']] : [['trade_offer_channel_id', 'trade-offer']]),
-    ['trade_committee_channel_id', 'trade-committee'],
-    ['approved_trades_channel_id', 'approved-trades'],
-    ['denied_trades_channel_id', 'denied-trades'],
-    ['trade_count_channel_id', 'trade-count'],
     ['team_owners_channel_id', 'team-owners'],
-    ['playoff_bracket_channel_id', 'playoff-bracket', true],
-    ['active_check_channel_id', 'active-check'],
-    ['history_channel_id', 'history', true],
-    // league-hof / madden-news / free-agents / etc. inserted here, sport-conditional, below
-    ['suspensions_channel_id', 'suspensions'],
+    ['league_chat_channel_id', 'league-chat'],
   ];
-  // 7J-125FULLCOVERAGE / 7J-145SCHEDULEFIX: "keep these custom to the
-  // league settings upon creation" — Game Center vs. Game Threads is
-  // exactly this, and it's a schedule-style decision, not a sport decision.
-  // Madden always uses Game Threads (EA-sync-driven). A non-Madden
-  // STRUCTURED league also uses Game Threads (Advance/Start League
-  // generates them) — the channel just sits empty until Start League is
-  // pressed, nothing gets posted into it at creation time. A non-Madden
-  // OPEN league uses Game Center instead (the manual "Add Game" flow,
-  // with a panel posted immediately). League HOF is explicitly the
-  // "generic, non-Madden" board, so it's conditional on sport only.
-  if (isMadden || isStructuredNonMadden) {
-    singleChannelSpecs.splice(5, 0, ['game_threads_channel_id', 'game-threads']);
+  if (isMadden) {
+    singleChannelSpecs.push(['madden_news_channel_id', 'madden-news', true]);
   } else {
-    singleChannelSpecs.splice(5, 0, ['game_center_channel_id', 'game-center']);
+    singleChannelSpecs.push(['league_news_channel_id', 'league-news', true]);
   }
+  if (isMadden || isStructuredNonMadden) {
+    singleChannelSpecs.push(['game_threads_channel_id', 'game-threads']);
+  } else {
+    singleChannelSpecs.push(['game_center_channel_id', 'game-center']);
+  }
+  singleChannelSpecs.push(['live_channel_id', 'streaming']);
+  singleChannelSpecs.push(['sportsbook_channel_id', 'sportsbook-feed', true]);
+  if (isMadden) {
+    singleChannelSpecs.push(['madden_standings_channel_id', 'madden-standings']);
+    singleChannelSpecs.push(['madden_power_rankings_channel_id', 'power-rankings', true]);
+  } else {
+    singleChannelSpecs.push(['standings_channel_id', 'standings']);
+    singleChannelSpecs.push(['league_power_rankings_channel_id', 'power-rankings', true]);
+  }
+  singleChannelSpecs.push(['trade_block_channel_id', 'trade-block']);
+  // 7J-COMMANDHUB-TRADESPLIT: per Hxxdie (live-tested) — Trade Negotiation
+  // Starter (buildMaddenTradeNegotiationStarterEmbed) is Madden-only; Trade
+  // Offer (buildOfferTradePanelEmbed, the generic system /league
+  // offerpanel also uses) is non-Madden-only. Was previously creating both
+  // channels unconditionally for every league and posting both starter
+  // panels regardless of sport — Madden leagues were getting the wrong
+  // (non-Madden) Trade Offer panel.
+  singleChannelSpecs.push(isMadden ? ['trade_negotiation_channel_id', 'trade-negotiation'] : ['trade_offer_channel_id', 'trade-offer']);
+  singleChannelSpecs.push(['trade_committee_channel_id', 'trade-committee']);
+  // 7J-TRADEDECISIONS: approved-trades and denied-trades merged into one
+  // channel, per Hxxdie — both outcomes post to the same place now instead
+  // of two separate channels.
+  singleChannelSpecs.push(['trade_decisions_channel_id', 'trade-committee-decisions']);
+  singleChannelSpecs.push(['trade_count_channel_id', 'trade-count']);
+  singleChannelSpecs.push(['suspensions_channel_id', 'suspensions']);
+  singleChannelSpecs.push(['active_check_channel_id', 'active-check']);
+  singleChannelSpecs.push(['playoff_bracket_channel_id', 'playoff-bracket', true]);
+  singleChannelSpecs.push(['history_channel_id', 'history', true]);
+  if (!isMadden) {
+    singleChannelSpecs.push(['league_hof_channel_id', 'league-hof', true]);
+  }
+  singleChannelSpecs.push(['staff_channel_id', 'staff']);
+
   if (isMadden) {
     // 7J-COMMANDHUB-AUTOSETUP: madden-gm and franchise-hub added per
     // Hxxdie — "no point in having a commissioner manually create and post
@@ -35858,33 +36118,18 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     // award-race, draft-recap, madden-sportsbook were all confirmed
     // missing entirely from auto-setup (live-tested by Hxxdie against a
     // Premium league — "still missing many major features") — added here.
-    // madden-standings is Free (standings itself is core/free even for
-    // Madden; only the manual standings_system *setting* doesn't apply to
-    // Madden, per the League Settings fix above — the board still should).
     singleChannelSpecs.push(
-      ['madden_news_channel_id', 'madden-news', true],
       ['madden_free_agents_channel_id', 'free-agents', true],
       ['gm_panel_channel_id', 'madden-gm', true],
       ['madden_franchise_hub_channel_id', 'franchise-hub', true],
       ['madden_weekly_updates_channel_id', 'weekly-updates'],
-      ['madden_standings_channel_id', 'madden-standings'],
       ['player_search_channel_id', 'player-search', true],
       ['league_leaders_channel_id', 'league-leaders', true],
       ['award_race_channel_id', 'award-race', true],
       ['draft_recap_channel_id', 'draft-recap', true],
       ['madden_sportsbook_channel_id', 'madden-sportsbook', true],
     );
-  } else {
-    // 7J-135GENERICNEWS: Power Rankings + News Feed, the generic non-Madden
-    // equivalents of Madden's power rankings board / ESPN news channel.
-    singleChannelSpecs.push(['league_hof_channel_id', 'league-hof', true], ['league_power_rankings_channel_id', 'power-rankings', true], ['league_news_channel_id', 'league-news', true]);
   }
-  // 7J-154WHOGOTNEXT: general chat channel for the Who's Got Next button —
-  // applies to every league regardless of sport, so it's an unconditional
-  // push after the sport-specific branches above rather than spliced in,
-  // which would've disturbed the splice(5, ...) index math for
-  // game-threads/game-center.
-  singleChannelSpecs.push(['league_chat_channel_id', 'league-chat']);
 
   if (!isPremiumLeague) {
     singleChannelSpecs = singleChannelSpecs.filter(([, , premiumOnly]) => !premiumOnly);
@@ -35962,7 +36207,7 @@ const LEAGUE_OWNED_CHANNEL_COLUMNS = [
   'league_announcement_channel_id', 'league_rules_channel_id', 'standings_channel_id',
   'trade_block_channel_id', 'sportsbook_channel_id', 'suspensions_channel_id',
   'team_owners_channel_id', 'trade_offer_channel_id', 'trade_committee_channel_id',
-  'approved_trades_channel_id', 'denied_trades_channel_id', 'trade_count_channel_id',
+  'approved_trades_channel_id', 'denied_trades_channel_id', 'trade_decisions_channel_id', 'trade_count_channel_id',
   'live_channel_id', 'history_channel_id', 'tournament_channel_id', 'league_hof_channel_id',
   'madden_free_agents_channel_id', 'trade_negotiation_channel_id', 'player_search_channel_id',
   'gm_panel_channel_id', 'staff_channel_id', 'league_leaders_channel_id', 'award_race_channel_id',
@@ -36175,6 +36420,12 @@ function buildRecruitmentStarterComponents() {
       new ButtonBuilder().setCustomId('recruitmentpanel_discover').setLabel('Discover Leagues').setEmoji('🌐').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('recruitmentpanel_myapplications').setLabel('My Applications').setEmoji('📄').setStyle(ButtonStyle.Secondary),
     ),
+    // 7J-LEAGUERULESET: per Hxxdie — any member (not just staff) should be
+    // able to see what kind of league this actually is before/after
+    // applying — quarter length, difficulty, sim/comp, etc.
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('recruitmentpanel_leagueinfo').setLabel('League Info').setEmoji('📝').setStyle(ButtonStyle.Secondary),
+    ),
     // 7J-98WAITLIST
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('recruitmentpanel_waitlist_join').setLabel('Join Waitlist').setEmoji('📋').setStyle(ButtonStyle.Primary),
@@ -36244,6 +36495,14 @@ async function notifyLeagueStaffOfNewApplication(guild, league, teamName, applic
   }
 }
 
+
+// 7J-LEAGUERULESET: public counterpart to the commissioner-editable
+// ruleset section — same shared embed builder, so what a prospective
+// member sees here always matches what's actually configured.
+async function runRecruitmentLeagueInfo(interaction, league) {
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  await interaction.editReply({ embeds: [buildLeagueRulesetEmbed(league, customSettings)] });
+}
 
 async function runRecruitmentBrowse(interaction, league) {
   const vacant = await getVacantLeagueTeams(interaction.guild, league);
@@ -36349,7 +36608,16 @@ async function buildDiscoverLeaguesPayload(page) {
     const guild = client.guilds.cache.get(league.guild_id);
     if (!guild) continue; // bot no longer in that server — skip silently
     const vacant = await getVacantLeagueTeams(guild, league);
-    lines.push(`**${league.league_name}** — ${guild.name} — ${vacant.length} open team${vacant.length === 1 ? '' : 's'}`);
+    // 7J-LEAGUERULESET: per Hxxdie — most players want to join a specific
+    // type of league, so showing quarter length/difficulty/sim-comp right
+    // here (before even opening a league) saves someone applying to a
+    // league that isn't what they're looking for. Only appended when at
+    // least one field is actually filled in, so leagues that haven't set
+    // this up yet don't get a line full of "Not set."
+    const rulesetSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+    const rulesetBits = [rulesetSettings.quarter_length, rulesetSettings.game_difficulty, rulesetSettings.sim_or_comp].filter(Boolean);
+    const rulesetTag = rulesetBits.length ? ` — ${rulesetBits.join(' • ')}` : '';
+    lines.push(`**${league.league_name}** — ${guild.name} — ${vacant.length} open team${vacant.length === 1 ? '' : 's'}${rulesetTag}`);
     if (vacant.length) openLeagues.push({ league_id: league.league_id, league_name: league.league_name, guildName: guild.name });
   }
 
@@ -36659,8 +36927,9 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'team_owners_channel', label: 'Team Owners Channel', description: 'Team owners panel channel', kind: 'channel' },
   { value: 'trade_offer_channel', label: 'Trade Offer Channel', description: 'Trade offer panel channel', kind: 'channel' },
   { value: 'trade_committee_channel', label: 'Trade Committee Channel', description: 'Trade voting channel', kind: 'channel' },
-  { value: 'approved_trades_channel', label: 'Approved Trades Channel', description: 'Approved trade announcements', kind: 'channel' },
-  { value: 'denied_trades_channel', label: 'Denied Trades Channel', description: 'Denied trade announcements', kind: 'channel' },
+  // 7J-TRADEDECISIONS: approved-trades/denied-trades merged into one
+  // channel, per Hxxdie — both outcomes post to the same place now.
+  { value: 'trade_decisions_channel', label: 'Trade Committee Decisions Channel', description: 'Approved + denied trade announcements', kind: 'channel' },
   { value: 'trade_count_channel', label: 'Trade Count Channel', description: 'Trade count panel channel', kind: 'channel' },
   // ticket_channel/support_channel removed 7J-111TICKETSCOPE — Tickets/Support
   // are guild-wide now (Admin Panel > Server Settings), not per-league. See
@@ -36812,8 +37081,11 @@ function setupDashboardColumn(settingKey) {
     team_owners_channel: 'team_owners_channel_id',
     trade_offer_channel: 'trade_offer_channel_id',
     trade_committee_channel: 'trade_committee_channel_id',
-    approved_trades_channel: 'approved_trades_channel_id',
-    denied_trades_channel: 'denied_trades_channel_id',
+    // 7J-TRADEDECISIONS: both old keys now resolve to the single merged
+    // decisions channel.
+    approved_trades_channel: 'trade_decisions_channel_id',
+    denied_trades_channel: 'trade_decisions_channel_id',
+    trade_decisions_channel: 'trade_decisions_channel_id',
     trade_count_channel: 'trade_count_channel_id',
     suspensions_channel: 'suspensions_channel_id',
   };
@@ -36892,8 +37164,7 @@ async function buildSetupDashboardEmbed(guild, league) {
     'Team Owners: ' + setupDashboardFormatValue(league, 'team_owners_channel'),
     'Trade Offer: ' + setupDashboardFormatValue(league, 'trade_offer_channel'),
     'Committee: ' + setupDashboardFormatValue(league, 'trade_committee_channel'),
-    'Approved: ' + setupDashboardFormatValue(league, 'approved_trades_channel'),
-    'Denied: ' + setupDashboardFormatValue(league, 'denied_trades_channel'),
+    'Decisions: ' + setupDashboardFormatValue(league, 'trade_decisions_channel'),
     'Count: ' + setupDashboardFormatValue(league, 'trade_count_channel'),
   ];
 
@@ -46670,6 +46941,47 @@ async function maybePostGameThreadOwnersAvatar(guild, league, game) {
   }).catch(error => console.error('[Game Thread Owners Avatar] post failed:', error));
 
   await pool.query(`UPDATE madden_imported_games SET owners_avatar_posted = TRUE WHERE id = $1`, [game.id]).catch(() => null);
+}
+
+// 7J-GENERICAVATAR: generic (non-Madden) counterpart to
+// maybePostGameThreadOwnersAvatar above — per Hxxdie, every user-vs-user
+// matchup thread should get the "both owners set" avatar showcase, not
+// just Madden's. Reuses the same schema-agnostic composite builder;
+// differs only in how owners get resolved (findTeamOwnerByRoleId instead
+// of the Madden-specific lookup) and which table tracks the dedup flag
+// (league_games instead of madden_imported_games).
+async function maybePostLeagueGameThreadOwnersAvatar(guild, game) {
+  if (!game?.thread_id || game.owners_avatar_posted) return;
+
+  const owners = {
+    away: await findTeamOwnerByRoleId(guild, game.away_team_role_id).catch(() => null),
+    home: await findTeamOwnerByRoleId(guild, game.home_team_role_id).catch(() => null),
+  };
+  if (!owners.away?.id || !owners.home?.id) return; // still waiting on one side
+
+  const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+  if (!thread?.isTextBased?.()) return;
+
+  const attachment = await buildGameThreadOwnersAvatarComposite(owners.away.id, owners.home.id).catch(error => {
+    console.error('[Game Thread Owners Avatar] composite failed:', error);
+    return null;
+  });
+  if (!attachment) return;
+
+  const label = `${game.away_team_name} @ ${game.home_team_name}`;
+  await thread.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(`🎮 Both Owners Set — ${label}`)
+        .setColor(0x5865F2)
+        .setImage('attachment://matchup_owners.png')
+        .setFooter({ text: 'GG Sports • Auto Game Threads' })
+        .setTimestamp(),
+    ],
+    files: [attachment],
+  }).catch(error => console.error('[Game Thread Owners Avatar] post failed:', error));
+
+  await pool.query(`UPDATE league_games SET owners_avatar_posted = TRUE WHERE id = $1`, [game.id]).catch(() => null);
 }
 
 function maddenGameHasRealScore(game) {
@@ -68627,6 +68939,33 @@ async function showCommissionerBrowse(interaction, leagueId) {
   }
 }
 
+// 7J-LEAGUERULESET: shared builder so the commissioner-editable view, the
+// public member-facing view, and (eventually) any recruitment/discovery
+// surface all render this identically instead of drifting apart.
+function buildLeagueRulesetEmbed(league, customSettings) {
+  const sportKey = getLeagueSportKey(league);
+  const isMadden = sportKey === 'madden';
+  const embed = new EmbedBuilder()
+    .setTitle(`📝 League Info • ${league.league_name}`)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'Sport', value: sportKey.toUpperCase(), inline: true },
+      { name: 'Season Length', value: league.season_length ? `${league.season_length} games` : 'Not set', inline: true },
+      { name: 'Quarter Length', value: customSettings.quarter_length || 'Not set', inline: true },
+      { name: 'Difficulty', value: customSettings.game_difficulty || 'Not set', inline: true },
+      { name: 'Sim / Comp', value: customSettings.sim_or_comp || 'Not set', inline: true },
+      { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
+    );
+  if (!isMadden) {
+    embed.addFields({ name: 'Schedule Style', value: customSettings.schedule_style === 'structured' ? 'Structured' : 'Open', inline: true });
+  }
+  if (customSettings.ruleset_notes) {
+    embed.addFields({ name: 'Additional Notes', value: customSettings.ruleset_notes.slice(0, 1024), inline: false });
+  }
+  embed.setFooter({ text: 'GG Sports • League Info' }).setTimestamp();
+  return embed;
+}
+
 const LEAGUE_CUSTOMIZATION_SECTIONS = [
   { value: 'season', label: 'Season & Schedule', description: 'Season length, schedule style, matchup frequency', emoji: '📅' },
   { value: 'standings', label: 'Standings', description: 'W/L, points system, ties', emoji: '📊' },
@@ -68635,6 +68974,11 @@ const LEAGUE_CUSTOMIZATION_SECTIONS = [
   { value: 'awards', label: 'Awards', description: 'Which awards this league tracks', emoji: '🎖️' },
   { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Turn conferences/divisions on/off, assign each team', emoji: '🗺️' },
   { value: 'wagers', label: 'Wagers', description: '1v1 game-thread wagers between owners, separate from the sportsbook', emoji: '💰' },
+  // 7J-LEAGUERULESET: not Madden-hidden like season/playoffs/standings —
+  // this is manually-entered descriptive info (quarter length, difficulty,
+  // sim/comp) that EA sync never provides regardless of sport, so it's
+  // just as relevant for a Madden league as any other.
+  { value: 'ruleset', label: 'League Info / Ruleset', description: 'Quarter length, difficulty, sim/comp — shown to prospective members', emoji: '📝' },
 ];
 
 // 7J-54LEAGUESETTINGS: per Hxxdie — Madden leagues follow EA's own sync
@@ -68805,6 +69149,16 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       buildLeagueCustomizationBackRow(leagueId),
     ];
   } else if (section === 'trades') {
+    // 7J-COMMITTEEVOTES: shows current committee role size alongside the
+    // votes-needed setting, per Hxxdie — a commissioner picking a
+    // threshold needs to know how many actual committee members there are
+    // to set a sensible number (e.g. don't require 5 votes with only 3
+    // members).
+    let committeeSize = 'Unknown';
+    if (league.trade_committee_role_id) {
+      const committeeRole = await interaction.guild.roles.fetch(league.trade_committee_role_id).catch(() => null);
+      if (committeeRole) committeeSize = String(committeeRole.members.filter(m => !m.user.bot).size);
+    }
     embed = new EmbedBuilder()
       .setTitle(`🔀 Trades • ${league.league_name}`)
       .setColor(0x5865F2)
@@ -68812,6 +69166,8 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
         { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
         { name: 'Trade Limit Per Season', value: customSettings.trade_limit_per_season ? `${customSettings.trade_limit_per_season} trades` : 'Unlimited', inline: true },
         { name: 'Team Rosters (Pro-Am/Club)', value: customSettings.use_team_roster ? 'On — owners can add players/coaches/GMs' : 'Off', inline: true },
+        { name: 'Committee Votes Needed', value: String(customSettings.trade_committee_votes_needed || 3), inline: true },
+        { name: 'Current Committee Size', value: committeeSize, inline: true },
       )
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
@@ -68820,6 +69176,9 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
         new ButtonBuilder().setCustomId('leaguecustom_toggle_cpu:' + leagueId).setLabel(customSettings.cpu_trades_allowed === false ? 'Allow CPU Trades' : 'Disallow CPU Trades').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('leaguecustom_tradelimit_modal:' + leagueId).setLabel('Edit Trade Limit').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('leaguecustom_toggle_roster:' + leagueId).setLabel(customSettings.use_team_roster ? 'Disable Team Rosters' : 'Enable Team Rosters').setStyle(ButtonStyle.Secondary),
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_committeevotes_modal:' + leagueId).setLabel('Edit Committee Votes Needed').setStyle(ButtonStyle.Primary),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
@@ -68836,6 +69195,14 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
     components = [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('leaguecustom_toggle_wagers:' + leagueId).setLabel(customSettings.wagers_enabled ? 'Disable Wagers' : 'Enable Wagers').setStyle(ButtonStyle.Secondary),
+      ),
+      buildLeagueCustomizationBackRow(leagueId),
+    ];
+  } else if (section === 'ruleset') {
+    embed = buildLeagueRulesetEmbed(league, customSettings);
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_ruleset_modal:' + leagueId).setLabel('Edit League Info').setStyle(ButtonStyle.Primary),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
