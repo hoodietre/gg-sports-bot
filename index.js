@@ -325,6 +325,16 @@ async function initDatabase() {
   await pool.query(`UPDATE trade_offers SET offer_details = '' WHERE offer_details IS NULL`);
   await pool.query(`ALTER TABLE trade_offers ALTER COLUMN offer_details DROP NOT NULL`);
   await pool.query(`UPDATE trade_offers SET screenshot_url = '' WHERE screenshot_url IS NULL`);
+  // 7J-CPUCOMMITTEEFIX: real bug found via live testing — target_owner_user_id
+  // was NOT NULL from before CPU-controlled-team trades existed as a
+  // supported case at all. A CPU team genuinely has no owner, so this
+  // column is legitimately NULL for exactly that case (both the generic
+  // trade-offer flow and the Madden negotiation hub already insert NULL
+  // here for a CPU target) — the NOT NULL constraint was silently blocking
+  // every single CPU trade from ever reaching the committee, throwing a
+  // raw Postgres constraint violation instead of a useful message. Same
+  // fix pattern as offer_details right above.
+  await pool.query(`ALTER TABLE trade_offers ALTER COLUMN target_owner_user_id DROP NOT NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trade_offer_votes (
@@ -18148,6 +18158,28 @@ if (interaction.commandName === 'avatar') {
       }
 
       const excludeFreeAgents = flow === 'neg';
+      // 7J-CPUTEAMSTOP: per Hxxdie — CPU trades being disallowed for a
+      // league needs to stop the human at team selection, not several
+      // clicks later after they've also picked a player. Only checked for
+      // the 'neg' (Start a Trade Negotiation) flow, since compareA/compareB/
+      // search aren't trade actions at all — picking a CPU-owned team there
+      // is fine.
+      if (flow === 'neg') {
+        const ownerUserId = await findMaddenOwnerForTeamName(interaction.guild.id, league.league_id, teamName).catch(() => null);
+        if (!ownerUserId) {
+          const cpuCheckSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+          if (cpuCheckSettings.cpu_trades_allowed === false) {
+            await interaction.update({
+              content: `**${maddenTeamDisplayName(teamName)}** has no owner, and **${league.league_name}** doesn't allow trades with CPU-controlled teams (League Customization → Trades). Pick a different team, or ask a commissioner to enable CPU trades.`,
+              embeds: [],
+              components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`madpick:backteam:${flow}:${idOrToken}`).setLabel('⬅ Change Team').setStyle(ButtonStyle.Secondary)
+              )],
+            });
+            return;
+          }
+        }
+      }
       const { rows, total } = await getMaddenTeamRosterPage(interaction.guild.id, league.league_id, teamName, { offset: 0, excludeFreeAgents });
       const label = flow === 'compareA' ? 'Compare Players — Player A' : flow === 'compareB' ? 'Compare Players — Player B' : (flow === 'neg' ? 'Start a Trade Negotiation' : 'Search for a Player');
       await interaction.update({
