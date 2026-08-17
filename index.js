@@ -8560,15 +8560,34 @@ async function buildTournamentManagerHomePayload(guild, { includeAdminBackButton
 
   const components = [];
   if (result.rows.length) {
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId('tourneypanel_select')
-      .setPlaceholder('Choose a tournament to manage')
-      .addOptions(result.rows.map(t => ({
-        label: (t.tournament_name || 'Unnamed').slice(0, 100),
-        value: t.id.slice(0, 100),
-        description: `${t.game || 'Game TBD'} • ${t.status}`.slice(0, 100),
-      })));
-    components.push(new ActionRowBuilder().addComponents(menu));
+    // 7J-TOURNEYDROPDOWNSTUCK: per Hxxdie — a Discord select menu whose only
+    // reachable option already matches what's showing as "selected" can
+    // fail to fire a fresh interaction at all when you click it again
+    // (nothing to actually change to, from the client's perspective). With
+    // exactly one tournament, that made the dropdown a permanent dead end —
+    // no way back to the control panel once dismissed. Buttons don't have
+    // this failure mode, so small lists (≤4, one action row) get direct
+    // per-tournament buttons instead of relying on the dropdown at all.
+    // Larger lists keep the dropdown, where this is far less likely to bite
+    // since picking a *different* tournament than last time is the norm.
+    if (result.rows.length <= 4) {
+      components.push(new ActionRowBuilder().addComponents(
+        result.rows.map(t => new ButtonBuilder()
+          .setCustomId(`tourneypanel_selectbtn:${t.id}`)
+          .setLabel((t.tournament_name || 'Unnamed').slice(0, 80))
+          .setStyle(ButtonStyle.Secondary))
+      ));
+    } else {
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('tourneypanel_select')
+        .setPlaceholder('Choose a tournament to manage')
+        .addOptions(result.rows.map(t => ({
+          label: (t.tournament_name || 'Unnamed').slice(0, 100),
+          value: t.id.slice(0, 100),
+          description: `${t.game || 'Game TBD'} • ${t.status}`.slice(0, 100),
+        })));
+      components.push(new ActionRowBuilder().addComponents(menu));
+    }
   }
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('tourneypanel_create').setLabel('Create Tournament').setEmoji('➕').setStyle(ButtonStyle.Success)
@@ -9160,7 +9179,7 @@ async function renderTournamentBracketPng(guild, tournament, matches) {
   // Round labels + match boxes
   roundNumbers.forEach((r, ri) => {
     const x = marginLeft + ri * (boxW + roundGapX);
-    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${tournamentBracketEscapeXml(tournamentBracketRoundLabel(r, roundNumbers.length, ri))}</text>`);
+    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans, Arial, sans-serif" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${tournamentBracketEscapeXml(tournamentBracketRoundLabel(r, roundNumbers.length, ri))}</text>`);
     rounds[r].forEach((m, i) => {
       const yCenter = centers[r][i];
       const y = yCenter - boxH / 2;
@@ -9171,8 +9190,8 @@ async function renderTournamentBracketPng(guild, tournament, matches) {
       parts.push(`
         <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="8" fill="#2b2d31" stroke="#1e1f22" stroke-width="2"/>
         <line x1="${x}" y1="${yCenter}" x2="${x + boxW}" y2="${yCenter}" stroke="#1e1f22" stroke-width="1"/>
-        <text x="${x + 12}" y="${yCenter - 12}" font-family="Arial, sans-serif" font-size="15" font-weight="${p1Won ? 'bold' : 'normal'}" fill="${p1Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p1Name).slice(0, 28)}</text>
-        <text x="${x + 12}" y="${yCenter + 20}" font-family="Arial, sans-serif" font-size="15" font-weight="${p2Won ? 'bold' : 'normal'}" fill="${p2Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p2Name).slice(0, 28)}</text>
+        <text x="${x + 12}" y="${yCenter - 12}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="${p1Won ? 'bold' : 'normal'}" fill="${p1Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p1Name).slice(0, 28)}</text>
+        <text x="${x + 12}" y="${yCenter + 20}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="${p2Won ? 'bold' : 'normal'}" fill="${p2Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p2Name).slice(0, 28)}</text>
       `);
     });
   });
@@ -18667,6 +18686,19 @@ if (interaction.commandName === 'avatar') {
       // was trying to prevent). Replying ephemeral instead leaves the
       // public panel untouched and gives only the clicking staff member
       // their own private management view.
+      await interaction.reply({ content: null, ...payload, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_selectbtn:')) {
+      // 7J-TOURNEYDROPDOWNSTUCK: button counterpart to tourneypanel_select
+      // above — see buildTournamentManagerHomePayload for why small
+      // tournament lists use buttons instead of a select menu.
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true }); return; }
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
       await interaction.reply({ content: null, ...payload, ephemeral: true });
       return;
     }
@@ -41562,9 +41594,28 @@ async function createMaddenTradeNegotiationThread(negotiation, discordClient, fa
   // CPU-controlled team — filtering it out here avoids a literal broken
   // "<@null>" mention appearing in the thread-opening message.
   const openingMentionIds = [negotiation.listing_user_id, negotiation.requesting_user_id].filter(Boolean);
+  // 7J-THREADHUBNA: per Hxxdie — this re-posted hub embed (inside the newly
+  // opened private thread) was hand-building a stripped-down listing object
+  // from only what's stored on the negotiation row (player_name, team,
+  // owner) — position/overall/value were never part of that row, so they
+  // always rendered "N/A" here even though the original hub message showed
+  // them correctly. Re-resolving via getMaddenPlayerValueAsset (same live
+  // madden_players-backed lookup used everywhere else in the trade tools
+  // after the 7J-VALUESYNC fix) fills them back in.
+  const threadListingAsset = await getMaddenPlayerValueAsset(negotiation.guild_id, negotiation.league_id, negotiation.player_name, negotiation.listing_team).catch(() => null);
+  const threadListing = {
+    player_name: negotiation.player_name,
+    team_name: negotiation.listing_team,
+    submitted_by: negotiation.listing_user_id,
+    seeking: 'See trade block listing',
+    notes: 'Private negotiation thread',
+    position: threadListingAsset?.position || null,
+    overall: threadListingAsset?.overall || null,
+    value_score: threadListingAsset?.value_score || 0,
+  };
   await thread.send({
     content: `${openingMentionIds.map(id => `<@${id}>`).join(' ')} private trade negotiation opened for **${negotiation.player_name}**${negotiation.cpu_target ? ' (CPU-controlled team, no owner to notify)' : ''}.`,
-    embeds: [buildMaddenTradeNegotiationHubEmbed(league, { player_name: negotiation.player_name, team_name: negotiation.listing_team, submitted_by: negotiation.listing_user_id, seeking: 'See trade block listing', notes: 'Private negotiation thread' }, negotiation, negotiation.requesting_user_id)],
+    embeds: [buildMaddenTradeNegotiationHubEmbed(league, threadListing, negotiation, negotiation.requesting_user_id)],
     components: buildMaddenTradeNegotiationThreadButtons(negotiation.id),
     allowedMentions: { users: openingMentionIds, roles: [] },
   }).catch(() => null);
@@ -47627,7 +47678,7 @@ async function buildGameThreadOwnersAvatarComposite(awayOwnerId, homeOwnerId) {
   const canvasWidth = panelWidth * 2 + gap;
 
   const vsBadgeSvg = `<svg width="${gap}" height="${panelHeight}" xmlns="http://www.w3.org/2000/svg">
-    <text x="50%" y="50%" font-family="sans-serif" font-size="34" font-weight="bold" fill="#FFFFFF"
+    <text x="50%" y="50%" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" font-weight="bold" fill="#FFFFFF"
       stroke="#000000" stroke-width="2" text-anchor="middle" dominant-baseline="middle">VS</text>
   </svg>`;
 

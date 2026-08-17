@@ -1,0 +1,18 @@
+# 7J-BRACKETFONT: per Hxxdie — the live tournament bracket image (and the
+# avatar-vs-avatar "VS" badge composite, which has the same latent issue)
+# renders text via sharp -> librsvg, which needs a real font installed to
+# lay out glyphs at all. Railway's default Nixpacks Node build has zero
+# fonts installed, so every character silently falls back to librsvg's
+# "tofu" placeholder box instead of failing loudly — this is *not* a bug in
+# the SVG generation itself, confirmed by rendering the exact same SVG in a
+# sandbox that does have fonts installed, where it renders correctly.
+#
+# fonts-dejavu-core installs DejaVu Sans/Serif/Mono, a solid, widely-
+# available, good-Unicode-coverage font family — index.js's SVG font-family
+# stacks now list "DejaVu Sans" first specifically to match this package.
+#
+# This file only takes effect on Railway's *next* build after it's added to
+# the repo — it isn't something index.js alone can fix, since it configures
+# the build environment itself, not application code.
+[phases.setup]
+aptPkgs = ["fonts-dejavu-core", "fontconfig"]
