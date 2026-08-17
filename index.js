@@ -35962,8 +35962,19 @@ async function autoCreateGuildMultiChannelPanels(guild) {
          WHERE l.guild_id = $1 AND l.is_active = TRUE AND s.staff_role_id IS NOT NULL`,
         [guild.id]
       ).catch(() => ({ rows: [] }));
+      // 7J-BOTLOCKOUT: real bug found and fixed — denying @everyone
+      // includes the bot itself unless explicitly granted back, and this
+      // never was. The bot silently lost View Channel on the very channel
+      // it had just created, so the dashboard post right after this
+      // (requireTextChannel checks the bot's own permissions) failed
+      // quietly — the auto-setup call site discards the result via
+      // .catch(() => null) with no logging, so nothing visible happened
+      // anywhere. Explicit bot-role grant added; also worth remembering
+      // for any future private-channel creation in this file.
+      const botMember = await guild.members.fetchMe();
       const permissionOverwrites = [
         { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: botMember.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks] },
         ...staffRoleRows.rows.map(row => ({ id: row.staff_role_id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] })),
       ];
       const ticketChannel = await guild.channels.create({ name: 'tickets', type: ChannelType.GuildText, parent: category.id, permissionOverwrites }).catch(() => null);
@@ -35983,7 +35994,11 @@ async function autoCreateGuildMultiChannelPanels(guild) {
         created.push(supportChannel);
       }
     }
-    await createConfiguredPanelFromSetup({ guild, channel: null }, null, 'ticket_panel').catch(() => null);
+    const ticketPanelResult = await createConfiguredPanelFromSetup({ guild, channel: null }, null, 'ticket_panel').catch(err => {
+      console.error('[Auto Setup] Ticket dashboard post failed:', err?.message || err);
+      return null;
+    });
+    console.log('[Auto Setup] Ticket dashboard result:', ticketPanelResult);
   }
 
   // 7J-COMMANDHUB-WELCOMELEAVE: previously gated behind welcome_leave_enabled
@@ -36225,9 +36240,28 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
     singleChannelSpecs = singleChannelSpecs.filter(([, , premiumOnly]) => !premiumOnly);
   }
 
+  // 7J-STAFFCHANNELPRIVATE: per Hxxdie — the per-league Staff channel was
+  // being created fully public, same gap as the guild-wide Tickets channel
+  // had. Fresh league fetch here in case the staff role was only just
+  // created moments earlier in the same setup flow (role creation and
+  // channel creation are separate steps with no guaranteed order). Bot's
+  // own role explicitly granted access too — the exact lockout mistake
+  // just found and fixed on the Tickets channel, not repeating it here.
+  const freshLeagueForStaffRole = await getLeagueById(league.league_id).catch(() => null);
+  const staffRoleId = freshLeagueForStaffRole?.staff_role_id || null;
+  const botMemberForChannels = await guild.members.fetchMe();
+
   for (let i = 0; i < singleChannelSpecs.length; i++) {
     const [column, channelName] = singleChannelSpecs[i];
-    const channel = await guild.channels.create({ name: channelName, type: ChannelType.GuildText, parent: category.id, position: i }).catch(() => null);
+    const createOptions = { name: channelName, type: ChannelType.GuildText, parent: category.id, position: i };
+    if (column === 'staff_channel_id') {
+      createOptions.permissionOverwrites = [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: botMemberForChannels.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks] },
+        ...(staffRoleId ? [{ id: staffRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }] : []),
+      ];
+    }
+    const channel = await guild.channels.create(createOptions).catch(() => null);
     if (!channel) continue;
     await pool.query(`UPDATE league_settings SET ${column} = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, channel.id]).catch(() => null);
     created.push(channel);
