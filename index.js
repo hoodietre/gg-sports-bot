@@ -10393,7 +10393,7 @@ function buildNewServerOwnerWelcomeEmbed(guild) {
       '**5.** Premium/trial servers: also run **Auto Setup Server Channels** from Admin Panel → Server Setup for the Economy/Shop/Sportsbook/Tickets category.' + String.fromCharCode(10) + String.fromCharCode(10) +
       "Worth checking too (easy to forget): onboarding DM toggle, Welcome/Leave, language, Wagers, and (Madden) auto-detect/ESPN news/auto-sportsbook — all in Admin Panel → Server Setup. `/setupguide` has the full written walkthrough with all of this in order, or `/quicksetup` for a short checklist. `/help` covers the basics for both staff and regular members." + String.fromCharCode(10) + String.fromCharCode(10) +
       '💎 **Free vs. Premium:** core league management (rosters, trades, standings, schedule, playoffs, staff tools) is free forever, no time limit. Premium unlocks GM analytics tools, the full Economy system (Shop/Sportsbook/Bank/Marketplace/Avatar), Tickets, Tournaments, and deeper Madden boards.' + String.fromCharCode(10) + String.fromCharCode(10) +
-      '`/premium trial` gets you **14 days of full Premium access, no card required** — the fastest way to see everything the bot can do before deciding.' + String.fromCharCode(10) + String.fromCharCode(10) +
+      '**Admin Panel → Premium & Billing → Start 14-Day Trial** gets you **14 days of full Premium access, no card required** — the fastest way to see everything the bot can do before deciding.' + String.fromCharCode(10) + String.fromCharCode(10) +
       `Questions or stuck on something? Join the support server: ${GG_SPORTS_SUPPORT_SERVER_URL}`
     )
     .setFooter({ text: 'GG Sports' })
@@ -11637,7 +11637,7 @@ if (interaction.commandName === 'avatar') {
 
         if (action === 'expire_trial_now') {
           if (entitlement.status !== 'trialing') {
-            await interaction.editReply({ content: `Guild is not currently trialing (status: ${entitlement.status}). Run \`/premium trial\` there first.` });
+            await interaction.editReply({ content: `Guild is not currently trialing (status: ${entitlement.status}). Run \`Admin Panel → Premium & Billing → Start 14-Day Trial\` there first.` });
             return;
           }
           await pool.query(`UPDATE premium_entitlements SET trial_ends_at = NOW() - INTERVAL '1 minute' WHERE guild_id = $1`, [guildId]);
@@ -11672,7 +11672,7 @@ if (interaction.commandName === 'avatar') {
         await runPremiumTrialSchedulerTick(client).catch(error => console.error('[7J-PREMIUM-DEBUG] trial tick error:', error));
         await runPremiumGraceNoticeTick(client).catch(error => console.error('[7J-PREMIUM-DEBUG] grace tick error:', error));
         await runPremiumPurgeTick(client).catch(error => console.error('[7J-PREMIUM-DEBUG] purge tick error:', error));
-        await interaction.editReply({ content: 'Ran trial, grace-notice, and purge ticks. Check DMs/announcements and `/premium status` on the guild(s) you backdated.' });
+        await interaction.editReply({ content: 'Ran trial, grace-notice, and purge ticks. Check DMs/announcements and **Admin Panel → Premium & Billing** on the guild(s) you backdated.' });
         return;
       }
 
@@ -12843,6 +12843,27 @@ if (interaction.commandName === 'avatar') {
     // from inside the game thread (the normal case — that's where the Report
     // Issue button lives), the ticket has to post in the thread's PARENT
     // channel instead, with a link back to the game thread for staff context.
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('maddengame_streamlink_modal:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await getMaddenImportedGameById(gameId);
+      const league = game?.league_id ? await getLeagueById(game.league_id) : null;
+      if (!game || !league) { await interaction.reply({ content: 'That Madden game could not be found.', ephemeral: true }); return; }
+      const url = interaction.fields.getTextInputValue('stream_url').trim();
+      await saveUserStreamLink(interaction.guild, interaction.user.id, url);
+
+      const streamChannel = await client.channels.fetch(league?.live_channel_id).catch(() => null);
+      if (!streamChannel) {
+        await interaction.reply({ content: 'Stream link saved. Could not find the connected streaming channel — ask a commissioner to check the streaming channel setup.', ephemeral: true });
+        return;
+      }
+      await streamChannel.send({
+        content: `<@&${league?.league_role_id}> **${interaction.user.username} is LIVE!** — ${game.away_team} @ ${game.home_team}\n${url}`,
+        allowedMentions: { roles: [league?.league_role_id], users: [] },
+      });
+      await interaction.reply({ content: `Stream link saved. 📺 Posted to <#${streamChannel.id}> — you're streaming this matchup!`, ephemeral: true });
+      return;
+    }
+
     if (interaction.isModalSubmit() && interaction.customId.startsWith('maddengame_issue_modal:')) {
       const [, requestAction, gameId] = interaction.customId.split(':');
       const game = await getMaddenImportedGameById(gameId);
@@ -13534,7 +13555,7 @@ if (interaction.commandName === 'avatar') {
         const confirmId = interaction.customId.split(':')[1];
         const pending = leagueKickConfirmations.get(confirmId);
         if (!pending) {
-          await interaction.update({ content: 'This confirmation has expired. Run `/league kick` again.', embeds: [], components: [] });
+          await interaction.update({ content: 'This confirmation has expired. Use **Operations → Kick** again.', embeds: [], components: [] });
           return;
         }
         if (interaction.user.id !== pending.requestedBy) {
@@ -13907,7 +13928,7 @@ if (interaction.commandName === 'avatar') {
           .setTitle('Sportsbook Profit Leaders')
           .setColor(0xFEE75C)
           .setDescription(rows.length ? rows.map((r, i) => `${i + 1}. <@${r.user_id}> — ${r.value}`).join(NL) : 'No leaderboard data yet.')
-          .setFooter({ text: 'GG Sports • Sportsbook — /sportsbook leaderboards for win-rate or parlay leaders' })
+          .setFooter({ text: 'GG Sports • Sportsbook — Leaderboards button for win-rate or parlay leaders' })
           .setTimestamp();
         await interaction.editReply({ embeds: [embed] });
         return;
@@ -15090,7 +15111,7 @@ if (interaction.commandName === 'avatar') {
       if (choice === 'txn_team' || choice === 'ret_team') {
         const teamNames = await getMaddenTeamNamesForLeague(interaction.guild.id, league.league_id);
         if (!teamNames.length) {
-          await interaction.update({ content: 'No teams found — run `/madden sync` first.', embeds: [], components: [buildCommissionerBrowseBackRow(leagueId)] });
+          await interaction.update({ content: 'No teams found — run **Operations → Run Sync** first.', embeds: [], components: [buildCommissionerBrowseBackRow(leagueId)] });
           return;
         }
         const rows = buildTeamNameSelectRows(teamNames, `commissioner_browse_team:${leagueId}:${choice}`);
@@ -15376,7 +15397,7 @@ if (interaction.commandName === 'avatar') {
         }
 
         if (currentRound >= schedule.length) {
-          await interaction.editReply({ content: `Season schedule complete — all ${schedule.length} game(s) have been played.\n\n**Next steps:**\n• Run \`/league seasonhistory\` to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)\n• Start a new season to generate a new schedule.` });
+          await interaction.editReply({ content: `Season schedule complete — all ${schedule.length} game(s) have been played.\n\n**Next steps:**\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)\n• Start a new season to generate a new schedule.` });
           return;
         }
 
@@ -15530,7 +15551,17 @@ if (interaction.commandName === 'avatar') {
       if (action === 'activecheck') {
         const existingCheck = await getOpenActiveCheck(interaction.guild.id, league.league_id);
         if (existingCheck) {
-          await interaction.reply({ content: `An active check is already running for **${league.league_name}**. End it first (\`/activecheck end\`) before starting a new one.`, ephemeral: true });
+          // 7J-BUTTONPATHS: was telling people to type `/activecheck end`
+          // with no button offered at all — added one directly here rather
+          // than just rewording the message, since the fix this deserves
+          // is closing the gap, not just describing it differently.
+          await interaction.reply({
+            content: `An active check is already running for **${league.league_name}**. End it before starting a new one.`,
+            components: [new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId('commissioner_activecheck_end:' + leagueId).setLabel('End Active Check').setEmoji('🛑').setStyle(ButtonStyle.Danger),
+            )],
+            ephemeral: true,
+          });
           return;
         }
         const modal = new ModalBuilder()
@@ -15638,6 +15669,17 @@ if (interaction.commandName === 'avatar') {
     // 7J-LEAGUECHANNELCONFIRM: same risk as the guild-wide Auto Setup
     // Server Channels button — creates a brand new category and full set
     // of channels every time, with no check for an existing setup.
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_activecheck_end:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to end an active check.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+      const result = await endActiveCheck(interaction, league);
+      await interaction.editReply({ content: result.message });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('setup_autocreate_channels:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -16577,6 +16619,28 @@ if (interaction.commandName === 'avatar') {
     // posts to the league's Streaming Channel using a link saved via
     // /streamlink set, so viewers watching that channel see the announcement
     // regardless of which specific matchup thread it came from.
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('gamecenter_streamlink_modal:')) {
+      const gameId = interaction.customId.split(':')[1];
+      const game = await findLeagueGameById(interaction.guild.id, gameId);
+      if (!game) { await interaction.reply({ content: 'Could not find that game.', ephemeral: true }); return; }
+      const league = await getLeagueById(game.league_id);
+      const url = interaction.fields.getTextInputValue('stream_url').trim();
+      await saveUserStreamLink(interaction.guild, interaction.user.id, url);
+
+      const streamChannelId = league?.live_channel_id;
+      const streamChannel = streamChannelId ? await interaction.guild.channels.fetch(streamChannelId).catch(() => null) : null;
+      if (!streamChannel) {
+        await interaction.reply({ content: 'Stream link saved. Could not find the connected Streaming Channel — ask a commissioner to set one from the Commissioner Panel.', ephemeral: true });
+        return;
+      }
+      await streamChannel.send({
+        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `**${interaction.user.username} is LIVE!** — ${game.away_team_name} @ ${game.home_team_name}\n${url}`,
+        allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
+      });
+      await interaction.reply({ content: `Stream link saved. 📺 Posted to <#${streamChannel.id}> — you're streaming this matchup!`, ephemeral: true });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('gamecenter_stream:')) {
       const gameId = interaction.customId.split(':')[1];
       const game = await findLeagueGameById(interaction.guild.id, gameId);
@@ -16586,7 +16650,15 @@ if (interaction.commandName === 'avatar') {
       const linkResult = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
       const url = linkResult.rows[0]?.stream_url;
       if (!url) {
-        await interaction.reply({ content: 'No saved stream link found. Save one with `/streamlink set url:<your stream link>`, then press **Stream Hub** again.', ephemeral: true });
+        // 7J-BUTTONPATHS: was telling people to type `/streamlink set` —
+        // added a real modal here instead, same fix class as Active Check.
+        const modal = new ModalBuilder()
+          .setCustomId('gamecenter_streamlink_modal:' + gameId)
+          .setTitle('Set Your Stream Link')
+          .addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stream_url').setLabel('Your stream URL').setStyle(TextInputStyle.Short).setRequired(true)),
+          );
+        await interaction.showModal(modal);
         return;
       }
 
@@ -17222,7 +17294,7 @@ if (interaction.commandName === 'avatar') {
           // Non-Madden leagues don't have an automatic year-end sync to hook into like
           // Madden does — the commissioner has to manually record season history and
           // hand out awards, so prompt them here rather than leaving it undiscoverable.
-          statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Run \`/league seasonhistory\` to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
+          statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
         } else {
           const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
           const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
@@ -18238,7 +18310,7 @@ if (interaction.commandName === 'avatar') {
       if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
       const team = await getMaddenTeamOwnedByUser(interaction.guild.id, league.league_id, interaction.user.id);
       if (!team) {
-        await interaction.reply({ content: "You don't own a team in this league yet. Ask your commissioner to assign you one, or use `/gm panel team:` to view a specific team.", ephemeral: true });
+        await interaction.reply({ content: "You don't own a team in this league yet. Ask your commissioner to assign you one, or check the **GM Panel** channel to view a specific team.", ephemeral: true });
         return;
       }
       await showMaddenGmPanelHome(interaction, leagueId, team.team_name, { update: false });
@@ -19276,7 +19348,7 @@ if (interaction.commandName === 'avatar') {
         const activeCount = await countActiveLeaguesForGuild(interaction.guild.id);
         if (activeCount >= FREE_TIER_LEAGUE_CAP) {
           await interaction.reply({
-            content: `This server is on the Free Tier (${FREE_TIER_LEAGUE_CAP} active league max) and is already at the cap. Try \`/premium trial\` for 14 days of unlimited leagues (no card required), \`/premium subscribe\` to go Premium, or delete an existing league to free up a slot.`,
+            content: `This server is on the Free Tier (${FREE_TIER_LEAGUE_CAP} active league max) and is already at the cap. Try \`Admin Panel → Premium & Billing → Start 14-Day Trial\` for 14 days of unlimited leagues (no card required), \`Admin Panel → Premium & Billing → Subscribe\` to go Premium, or delete an existing league to free up a slot.`,
             ephemeral: true,
           });
           return;
@@ -19455,7 +19527,7 @@ if (interaction.commandName === 'avatar') {
       const isPremiumGuild = await isGuildPremiumActive(interaction.guild.id);
       const panelSummary = isPremiumGuild
         ? 'posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Tournament/Recruitment/Tickets/Support panels'
-        : 'posted the Recruitment panel (Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Tournament/Tickets/Support are Premium — `/premium trial` unlocks them for 14 days, no card required)';
+        : 'posted the Recruitment panel (Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Tournament/Tickets/Support are Premium — **Admin Panel → Premium & Billing → Start 14-Day Trial** unlocks them for 14 days, no card required)';
       await interaction.editReply({
         content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and ${panelSummary}. Welcome/Leave channels included and enabled. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
         ...payload,
@@ -21914,7 +21986,7 @@ if (gameSubcommand === 'report') {
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
 
@@ -21978,7 +22050,7 @@ if (gameSubcommand === 'report') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+          await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
           return;
         }
 
@@ -22076,7 +22148,7 @@ if (gameSubcommand === 'report') {
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
 
@@ -22162,7 +22234,7 @@ if (gameSubcommand === 'report') {
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
@@ -22316,7 +22388,7 @@ if (gameSubcommand === 'report') {
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       await ensureMaddenNewsTables();
@@ -22389,7 +22461,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       await ensureMaddenChangeLogTables();
@@ -22423,7 +22495,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
@@ -22450,7 +22522,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       if (subcommand === 'player') {
@@ -22476,7 +22548,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       await backfillMaddenExpandedPlayerDataForLeague(interaction.guild.id, activeLeague.league_id).catch(() => null);
@@ -22508,7 +22580,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       if (subcommand === 'setup') {
@@ -22560,7 +22632,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       if (subcommand === 'recent') {
@@ -22598,7 +22670,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       if (subcommand === 'scan') {
@@ -22657,7 +22729,7 @@ History post: **${historyResult.posted ? `posted in <#${historyResult.channelId}
       const leagueName = interaction.options.getString('league');
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active Madden league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active Madden league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
       if (subcommand === 'readiness') {
@@ -22716,7 +22788,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
       const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
       if (!activeLeague) {
-        await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
+        await interaction.editReply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.' });
         return;
       }
 
@@ -22821,7 +22893,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
 
           await interaction.reply({ content: 'I sent you a DM to continue EA Direct setup for **' + activeLeague.league_name + '**.', ephemeral: true });
         } catch {
-          await interaction.reply({ content: 'I could not DM you. Please enable DMs from this server and run /madden connect again.', ephemeral: true });
+          await interaction.reply({ content: 'I could not DM you. Please enable DMs from this server and use **Operations → Connect to EA** again.', ephemeral: true });
         }
         return;
       }
@@ -22916,7 +22988,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -22938,7 +23010,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -22954,7 +23026,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -22980,7 +23052,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23010,14 +23082,14 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
         const game = await findMaddenGameCenterGame(interaction.guild.id, activeLeague.league_id, teamName, rawWeek, opponentName);
 
         if (!game) {
-          await interaction.reply({ content: 'No imported Madden game found for that team/week/opponent. Try `/madden schedule` or run `/madden sync` first.', ephemeral: true });
+          await interaction.reply({ content: 'No imported Madden game found for that team/week/opponent. Try `/madden schedule` or run Operations → Run Sync first.', ephemeral: true });
           return;
         }
 
@@ -23039,7 +23111,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23078,7 +23150,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23094,7 +23166,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23103,7 +23175,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
           player = await findMaddenPlayerFromWeeklyStats(interaction.guild.id, activeLeague.league_id, playerName, teamFilter);
         }
         if (!player) {
-          await interaction.reply({ content: `No imported Madden player found for "${playerName}". Try a last name, or run /madden sync first.`, ephemeral: true });
+          await interaction.reply({ content: `No imported Madden player found for "${playerName}". Try a last name, or run Operations → Run Sync first.`, ephemeral: true });
           return;
         }
 
@@ -23127,7 +23199,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23203,7 +23275,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23214,7 +23286,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
             || await findMaddenPlayerFromWeeklyStats(interaction.guild.id, activeLeague.league_id, second, null);
 
           if (!playerA || !playerB) {
-            await interaction.reply({ content: 'Could not find one or both players. Try autocomplete or run `/madden sync` first.', ephemeral: true });
+            await interaction.reply({ content: 'Could not find one or both players. Try autocomplete or run Operations → Run Sync first.', ephemeral: true });
             return;
           }
 
@@ -23235,7 +23307,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         ]);
 
         if (!teamA || !teamB) {
-          await interaction.reply({ content: 'Could not find one or both teams. Try autocomplete or run `/madden sync` first.', ephemeral: true });
+          await interaction.reply({ content: 'Could not find one or both teams. Try autocomplete or run Operations → Run Sync first.', ephemeral: true });
           return;
         }
 
@@ -23263,7 +23335,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23326,7 +23398,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23374,7 +23446,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23581,7 +23653,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23597,7 +23669,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23648,7 +23720,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23662,7 +23734,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23682,7 +23754,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
+          await interaction.editReply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.' });
           return;
         }
 
@@ -23737,7 +23809,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.editReply({ content: 'No active league found. Create one with /league create first.' });
+          await interaction.editReply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.' });
           return;
         }
 
@@ -23934,7 +24006,7 @@ if (interaction.commandName === 'commissioner') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23964,7 +24036,7 @@ if (interaction.commandName === 'commissioner') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -23972,7 +24044,7 @@ if (interaction.commandName === 'commissioner') {
         if (!teamName) {
           const owned = await getMaddenTeamOwnedByUser(interaction.guild.id, activeLeague.league_id, interaction.user.id);
           if (!owned) {
-            await interaction.reply({ content: "You don't own a team in this league yet. Specify one with `/gm panel team:`, or ask your commissioner to assign you a team.", ephemeral: true });
+            await interaction.reply({ content: "You don't own a team in this league yet. Check the **GM Panel** channel to view a specific team, or ask your commissioner to assign you a team.", ephemeral: true });
             return;
           }
           teamName = owned.team_name;
@@ -24016,7 +24088,7 @@ if (interaction.commandName === 'trade') {
         let activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -24071,7 +24143,7 @@ if (interaction.commandName === 'trade') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -24239,7 +24311,7 @@ if (interaction.commandName === 'trade') {
         // Anti-abuse: only the bot owner can grant currency. See adminpanel_econ:give
         // for the full reasoning — same restriction, different entry point.
         if (economySubcommand === 'give' && !isBotOwnerInteraction(interaction)) {
-          await interaction.reply({ content: 'Granting currency is restricted to the bot owner. You can still use /economy take.', ephemeral: true });
+          await interaction.reply({ content: 'Granting currency is restricted to the bot owner. You can still use Admin Panel → Economy → Take Currency.', ephemeral: true });
           return;
         }
 
@@ -24522,7 +24594,7 @@ if (interaction.commandName === 'trade') {
 
         const activeLeague = await resolveLeague(interaction);
         if (!activeLeague?.league_id) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -25433,7 +25505,7 @@ if (shopSubcommand === 'view') {
         let activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with /league create first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -25490,7 +25562,7 @@ if (shopSubcommand === 'view') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -25532,7 +25604,7 @@ if (shopSubcommand === 'view') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -25583,7 +25655,7 @@ if (shopSubcommand === 'view') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -25770,7 +25842,7 @@ if (shopSubcommand === 'view') {
           const activeCount = await countActiveLeaguesForGuild(interaction.guild.id);
           if (activeCount >= FREE_TIER_LEAGUE_CAP) {
             await interaction.reply({
-              content: `This server is on the Free Tier (${FREE_TIER_LEAGUE_CAP} active league max) and is already at the cap. Try \`/premium trial\` for 14 days of unlimited leagues (no card required), \`/premium subscribe\` to go Premium, or \`/league delete\` an existing league to free up a slot.`,
+              content: `This server is on the Free Tier (${FREE_TIER_LEAGUE_CAP} active league max) and is already at the cap. Try \`Admin Panel → Premium & Billing → Start 14-Day Trial\` for 14 days of unlimited leagues (no card required), \`Admin Panel → Premium & Billing → Subscribe\` to go Premium, or \`/league delete\` an existing league to free up a slot.`,
               ephemeral: true,
             });
             return;
@@ -25840,7 +25912,7 @@ if (shopSubcommand === 'view') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with `/league create`.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -25916,7 +25988,7 @@ if (shopSubcommand === 'view') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -25950,7 +26022,7 @@ if (shopSubcommand === 'view') {
         const activeLeague = leagueName ? await getLeagueByName(interaction.guild.id, leagueName) : await getDefaultLeague(interaction.guild.id);
 
         if (!activeLeague) {
-          await interaction.reply({ content: 'No active league found. Create one with `/league create` first.', ephemeral: true });
+          await interaction.reply({ content: 'No active league found. Create one first: Admin Panel → League Setup → Create League.', ephemeral: true });
           return;
         }
 
@@ -26223,13 +26295,13 @@ if (shopSubcommand === 'view') {
 
         const existingClaim = await pool.query(`SELECT * FROM premium_trial_claims WHERE owner_user_id = $1 LIMIT 1`, [interaction.user.id]);
         if (existingClaim.rows.length) {
-          await interaction.editReply({ content: 'You\'ve already claimed a GG Sports Premium trial on a different server — each Discord account gets one trial. `/premium subscribe` to go straight to a paid plan instead.' });
+          await interaction.editReply({ content: 'You\'ve already claimed a GG Sports Premium trial on a different server — each Discord account gets one trial. **Admin Panel → Premium & Billing → Subscribe** to go straight to a paid plan instead.' });
           return;
         }
 
         const entitlement = await getGuildEntitlement(interaction.guild.id);
         if (entitlement.status !== 'free') {
-          await interaction.editReply({ content: `This server already has a Premium status (${entitlement.status}) — check \`/premium status\`.` });
+          await interaction.editReply({ content: `This server already has a Premium status (${entitlement.status}) — check **Admin Panel → Premium & Billing**.` });
           return;
         }
 
@@ -26245,7 +26317,7 @@ if (shopSubcommand === 'view') {
           embeds: [new EmbedBuilder()
             .setTitle('🎉 GG Sports Premium Trial Started')
             .setColor(0x57F287)
-            .setDescription(`14 days of Premium access, no card required. Trial ends <t:${Math.floor(trialEndsAt.getTime() / 1000)}:F>. Subscribe any time before then with \`/premium subscribe\` to keep access without interruption.`)
+            .setDescription(`14 days of Premium access, no card required. Trial ends <t:${Math.floor(trialEndsAt.getTime() / 1000)}:F>. Subscribe any time before then with \`Admin Panel → Premium & Billing → Subscribe\` to keep access without interruption.`)
             .setFooter({ text: 'GG Sports • Premium' })
             .setTimestamp()],
         });
@@ -26587,7 +26659,7 @@ if (shopSubcommand === 'view') {
 
         await updateSportsbookPanel(interaction.guild).catch(() => null);
         await interaction.reply({
-          content: `Created stat prop: **${statLine}**. Short ID: \`${shortSportsbookId(sportsbookGameId)}\`. It'll auto-settle via /sportsbook settleprops once Week ${weekIndex} stats are synced — or settle it manually with /sportsbook settle at any time.`,
+          content: `Created stat prop: **${statLine}**. Short ID: \`${shortSportsbookId(sportsbookGameId)}\`. It'll auto-settle via /sportsbook settleprops once Week ${weekIndex} stats are synced — or settle it manually any time with Admin Panel → Sportsbook → Settle Game.`,
           ephemeral: true,
         });
         return;
@@ -28671,7 +28743,7 @@ function flattenStripeFormParams(params, parentKey = '') {
 async function ensureGuildEntitlementRow(guildId) {
   // premium_entitlements.guild_id has an FK to guilds(guild_id) — but a
   // guild otherwise only gets a guilds row when /league create runs, and
-  // someone can reasonably run /premium trial or /premium subscribe before
+  // someone can reasonably run Admin Panel → Premium & Billing → Start 14-Day Trial or Admin Panel → Premium & Billing → Subscribe before
   // ever creating a league. Upsert guilds first so that FK never fails.
   const guildName = client.guilds.cache.get(guildId)?.name || guildId;
   await pool.query(
@@ -28727,7 +28799,7 @@ async function isGuildPremiumActive(guildId) {
 async function requirePremiumFeature(interaction, featureName) {
   if (!interaction.guild) return true; // DM-context commands aren't guild-tiered
   if (await isGuildPremiumActive(interaction.guild.id)) return true;
-  const message = `**${featureName}** is a GG Sports Premium feature. This server hasn't unlocked it yet — a server admin can try \`/premium trial\` for 14 days of full access (no card required), or \`/premium subscribe\` to go Premium for the whole server.`;
+  const message = `**${featureName}** is a GG Sports Premium feature. This server hasn't unlocked it yet — a server admin can try \`Admin Panel → Premium & Billing → Start 14-Day Trial\` for 14 days of full access (no card required), or \`Admin Panel → Premium & Billing → Subscribe\` to go Premium for the whole server.`;
   if (interaction.deferred || interaction.replied) {
     await interaction.editReply({ content: message, embeds: [], components: [] }).catch(() => null);
   } else {
@@ -28882,7 +28954,7 @@ async function lapsePremiumGuild(client, guildId, reason) {
     .setTitle('⏬ GG Sports Premium — Downgraded to Free Tier')
     .setColor(0xED4245)
     .setDescription(
-      `${reasonText}${lockedNote}\n\nLocked data is retained for **${PREMIUM_GRACE_PERIOD_DAYS} days**. Reactivate any time within that window with \`/premium subscribe\` for full, instant restoration.`
+      `${reasonText}${lockedNote}\n\nLocked data is retained for **${PREMIUM_GRACE_PERIOD_DAYS} days**. Reactivate any time within that window with \`Admin Panel → Premium & Billing → Subscribe\` for full, instant restoration.`
     )
     .setFooter({ text: 'GG Sports • Premium' })
     .setTimestamp();
@@ -28892,7 +28964,7 @@ async function lapsePremiumGuild(client, guildId, reason) {
     .setTitle('GG Sports Premium has ended for this server')
     .setColor(0xED4245)
     .setDescription(
-      `This server's Premium subscription has ended, so some features/leagues are temporarily locked (not deleted) rather than the bot being broken. Server staff can reactivate any time with \`/premium subscribe\`.`
+      `This server's Premium subscription has ended, so some features/leagues are temporarily locked (not deleted) rather than the bot being broken. Server staff can reactivate any time with \`Admin Panel → Premium & Billing → Subscribe\`.`
     )
     .setTimestamp();
   await postPremiumGuildAnnouncement(guild, announceEmbed).catch(() => null);
@@ -29087,7 +29159,7 @@ async function handleStripeInvoicePaymentFailed(client, invoice) {
     .setColor(0xED4245)
     .setDescription(
       attemptCount >= PREMIUM_DUNNING_MAX_ATTEMPTS
-        ? `The ${attemptCount}${attemptCount === 3 ? 'rd' : 'th'} and final payment attempt failed. Premium access will lapse — update your payment method and reactivate with \`/premium subscribe\` to avoid any data lock.`
+        ? `The ${attemptCount}${attemptCount === 3 ? 'rd' : 'th'} and final payment attempt failed. Premium access will lapse — update your payment method and reactivate with \`Admin Panel → Premium & Billing → Subscribe\` to avoid any data lock.`
         : `A payment attempt failed (attempt ${attemptCount} of ${PREMIUM_DUNNING_MAX_ATTEMPTS}). Access is unaffected while retries continue, but please update your payment method to avoid a lapse.`
     )
     .setFooter({ text: 'GG Sports • Premium' })
@@ -29170,7 +29242,7 @@ async function runPremiumTrialSchedulerTick(client) {
         .setTitle('⚠️ ATTENTION REQUIRED — GG Sports Premium Trial Ending Soon')
         .setColor(0xED4245)
         .setDescription(
-          `Your 14-day Premium trial ends within the next ${PREMIUM_TRIAL_WARNING_HOURS_BEFORE} hours. Subscribe with \`/premium subscribe\` to keep Premium access — otherwise this server will drop to the Free Tier and any leagues beyond the ${FREE_TIER_LEAGUE_CAP}-league cap will be locked (not deleted).`
+          `Your 14-day Premium trial ends within the next ${PREMIUM_TRIAL_WARNING_HOURS_BEFORE} hours. Subscribe with \`Admin Panel → Premium & Billing → Subscribe\` to keep Premium access — otherwise this server will drop to the Free Tier and any leagues beyond the ${FREE_TIER_LEAGUE_CAP}-league cap will be locked (not deleted).`
         )
         .setFooter({ text: 'GG Sports • Premium' })
         .setTimestamp();
@@ -29265,7 +29337,7 @@ async function runPremiumGraceNoticeTick(client) {
           .setTitle('⚠️ FINAL NOTICE — GG Sports Premium Data Deletion')
           .setColor(0xED4245)
           .setDescription(
-            `The ${PREMIUM_GRACE_PERIOD_DAYS}-day grace period for this server's locked data has passed. **The following locked league(s) will be permanently deleted in ${PREMIUM_PURGE_BUFFER_HOURS / 24} days unless Premium is reactivated:** ${lockedNames.join(', ')}.\n\nReactivate any time before then with \`/premium subscribe\` to restore everything with no data loss. After deletion, this cannot be undone.`
+            `The ${PREMIUM_GRACE_PERIOD_DAYS}-day grace period for this server's locked data has passed. **The following locked league(s) will be permanently deleted in ${PREMIUM_PURGE_BUFFER_HOURS / 24} days unless Premium is reactivated:** ${lockedNames.join(', ')}.\n\nReactivate any time before then with \`Admin Panel → Premium & Billing → Subscribe\` to restore everything with no data loss. After deletion, this cannot be undone.`
           )
           .setFooter({ text: 'GG Sports • Premium' })
           .setTimestamp();
@@ -29415,7 +29487,7 @@ function buildPremiumFeaturesEmbed() {
     .setTitle('GG Sports Premium Features')
     .setColor(0xFEE75C)
     .setDescription(
-      `Core league management is free forever. Premium (${PREMIUM_MONTHLY_PRICE_DISPLAY} or ${PREMIUM_ANNUAL_PRICE_DISPLAY}) unlocks advanced tooling and removes the Free Tier's ${FREE_TIER_LEAGUE_CAP}-league cap. \`/premium trial\` gets you 14 days, no card required.`
+      `Core league management is free forever. Premium (${PREMIUM_MONTHLY_PRICE_DISPLAY} or ${PREMIUM_ANNUAL_PRICE_DISPLAY}) unlocks advanced tooling and removes the Free Tier's ${FREE_TIER_LEAGUE_CAP}-league cap. \`Admin Panel → Premium & Billing → Start 14-Day Trial\` gets you 14 days, no card required.`
     )
     .addFields(
       // 7J-PREMIUMLISTAUDIT: cross-checked against every requirePremiumFeature
@@ -29930,7 +30002,7 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
       { name: 'Game', value: label, inline: false },
       { name: leagueGame.home_team_name, value: 'ML ' + odds.homeOdds, inline: true },
       { name: leagueGame.away_team_name, value: 'ML ' + odds.awayOdds, inline: true },
-      { name: 'Source', value: 'Auto-generated from /game add', inline: false }
+      { name: 'Source', value: 'Auto-generated from Game Center → Add Game', inline: false }
     )
     .setFooter({ text: 'GG Sports • Auto Sportsbook' })
     .setTimestamp();
@@ -31129,7 +31201,7 @@ async function startActiveCheck(interaction, league, hours, channelOverride = nu
   const existing = await getOpenActiveCheck(interaction.guild.id, league.league_id);
   if (existing) {
     const startedUnix = Math.floor(new Date(existing.started_at).getTime() / 1000);
-    return { ok: false, message: `An active check is already running for **${league.league_name}** (started <t:${startedUnix}:R>). End it with \`/activecheck end\` before starting a new one.` };
+    return { ok: false, message: `An active check is already running for **${league.league_name}** (started <t:${startedUnix}:R>). End it first — Commissioner Panel → Operations → Active Check offers an End button, or run \`/activecheck end\`.` };
   }
 
   const teams = await getActiveCheckEligibleTeams(interaction.guild, league);
@@ -34539,7 +34611,7 @@ function buildMarketplaceBrowseEmbed(settings, rows, page, totalCount) {
     .setTimestamp();
 
   if (!rows.length) {
-    embed.setDescription('No active listings right now. List an owned item with `/marketplace list`.');
+    embed.setDescription('No active listings right now. List an owned item with the **List an Item** button on the Marketplace panel.');
     return embed;
   }
 
@@ -35165,8 +35237,8 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'Tracked Milestones', value: 'Games played: ' + String(recognition.games_played || 0) + ' • Tickets resolved: ' + String(recognition.tickets_resolved || 0) + ' • Championships: ' + String(recognition.championships || 0), inline: false },
       { name: '🌐 Universal Activity Grade', value: universalGradeDisplay, inline: false },
       { name: 'Badges', value: badgesDisplay.slice(0, 1024), inline: false },
-      { name: 'Stream', value: streamUrl || 'No stream linked. Use /streamlink set to add one.', inline: false },
-      { name: 'Avatar', value: 'Rendered below. Use `/avatar locker` to equip owned items, `/avatar shop` to buy more.', inline: false }
+      { name: 'Stream', value: streamUrl || 'No stream linked. Add one via the **Stream Hub** button in any game thread.', inline: false },
+      { name: 'Avatar', value: 'Rendered below. Use **Locker Room** on the Avatar Panel to equip owned items, **Go Shopping** to buy more.', inline: false }
     )
     .setFooter({ text: 'GG Sports • Member Profile' })
     .setTimestamp();
@@ -37539,7 +37611,7 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
       components: buildMaddenStandingsScopeComponents(league.league_id, scope),
     });
     await pool.query(`UPDATE madden_league_settings SET standings_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
-    return 'Madden Standings Board posted/refreshed in ' + channel.toString() + '.' + (standingsRows.length ? '' : ' (No imported standings yet — run /madden sync first.)');
+    return 'Madden Standings Board posted/refreshed in ' + channel.toString() + '.' + (standingsRows.length ? '' : ' (No imported standings yet — run Operations → Run Sync first.)');
   }
 
   if (panelType === 'madden_power_rankings_panel') {
@@ -37552,7 +37624,7 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const rankRows = await recalculateMaddenPowerRankings(interaction.guild.id, league.league_id).catch(() => []);
     const message = await channel.send({ embeds: [buildMaddenPowerRankingsEmbed(league, rankRows)] });
     await pool.query(`UPDATE madden_league_settings SET power_rankings_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
-    return 'Madden Power Rankings Board posted/refreshed in ' + channel.toString() + '.' + (rankRows.length ? '' : ' (No power rankings computed yet — run /madden sync first.)');
+    return 'Madden Power Rankings Board posted/refreshed in ' + channel.toString() + '.' + (rankRows.length ? '' : ' (No power rankings computed yet — run Operations → Run Sync first.)');
   }
 
   // 7J-60FRANCHISEHUB: per Hxxdie — gives the 8-view Franchise Hub the same
@@ -37568,7 +37640,7 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
       console.error(`[7J-62HUBDIAG] Franchise Hub manual post/refresh failed for league ${league.league_id}:`, error?.stack || error?.message || error);
       return null;
     });
-    if (!embed) return 'Could not build the Franchise Hub embed — run /madden sync first if this league is new.';
+    if (!embed) return 'Could not build the Franchise Hub embed — run Operations → Run Sync first if this league is new.';
     const teamOptions = currentView === 'hub' ? await getMaddenFranchiseHubTeamOptions(interaction.guild.id, league.league_id) : [];
     const message = await channel.send({ embeds: [embed], components: buildMaddenFranchiseHubBoardComponents(league.league_id, currentView, teamOptions) });
     await pool.query(`UPDATE madden_league_settings SET franchise_hub_message_id = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, message.id]).catch(() => null);
@@ -38028,7 +38100,7 @@ function buildMaddenPowerRankingsEmbed(league, rankings) {
     return new EmbedBuilder()
       .setTitle('🏆 Madden Power Rankings • ' + league.league_name)
       .setColor(0xFEE75C)
-      .setDescription('No imported Madden team stats found yet. Run `/madden sync` first, then try `/madden powerrankings`.')
+      .setDescription('No imported Madden team stats found yet. Run Operations → Run Sync first, then try `/madden powerrankings`.')
       .setFooter({ text: 'GG Sports • 7J-7ZQ-R Power Rankings' })
       .setTimestamp();
   }
@@ -38317,7 +38389,7 @@ function buildMaddenImportedStandingsEmbed(league, rows, scope = 'division') {
     return new EmbedBuilder()
       .setTitle(`${GG_EMOJI} Madden Standings • ${league.league_name}`)
       .setColor(0x57F287)
-      .setDescription('No imported Madden standings found yet. Use `/madden sync` first.')
+      .setDescription('No imported Madden standings found yet. Use Operations → Run Sync first.')
       .setFooter({ text: 'GG Sports • Madden Standings' })
       .setTimestamp();
   }
@@ -38384,7 +38456,7 @@ function buildMaddenScheduleUnavailableEmbed(league, requestedWeek, availableWee
     '**' + normalizedRequested + '** is not available from EA Direct yet.' + String.fromCharCode(10) + String.fromCharCode(10) +
     'EA Direct currently exposes the active/imported weekly schedule snapshot' +
     (availableWeek ? ', which is **' + availableWeek + '** right now.' : '.') + String.fromCharCode(10) +
-    'After the franchise advances and `/madden sync` is run, that new week will become available.';
+    'After the franchise advances and **Operations → Run Sync** is run, that new week will become available.';
 
   return new EmbedBuilder()
     .setTitle('Madden Schedule Not Available Yet • ' + league.league_name)
@@ -38806,7 +38878,7 @@ function buildMaddenImportedScheduleEmbed(league, rows, week = null) {
   return new EmbedBuilder()
     .setTitle('Madden Imported Schedule' + (week ? ' • ' + week : '') + ' • ' + league.league_name)
     .setColor(0x5865F2)
-    .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'No imported Madden games found yet. Use /madden importgames or /madden sync.')
+    .setDescription(lines.length ? lines.join(NL).slice(0, 4096) : 'No imported Madden games found yet. Use /madden importgames or Operations → Run Sync.')
     .setFooter({ text: 'GG Sports • Madden Schedule • EA Direct weekly snapshot' })
     .setTimestamp();
 }
@@ -39272,7 +39344,7 @@ async function showMaddenTeamPicker(interaction, flow, idOrToken, { update = fal
     : 'Search for a Player';
   const content = teams.length
     ? `**${label}** — pick a team, then pick a player. No typing needed.`
-    : 'No team rosters found yet. Run `/madden sync` first.';
+    : 'No team rosters found yet. Run Operations → Run Sync first.';
   const payload = { content, embeds: [], components: teams.length ? buildMaddenTeamPickerComponents(flow, idOrToken, teams) : [] };
   return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
 }
@@ -39458,7 +39530,7 @@ function buildMaddenBrowseEmbed(league, allRows, { page = 0, sort = 'overall', p
     .setTimestamp();
 
   if (!allRows.length) {
-    embed.setDescription('No players found. Run `/madden sync` first.');
+    embed.setDescription('No players found. Run Operations → Run Sync first.');
     return embed;
   }
 
@@ -39574,7 +39646,7 @@ function buildMaddenImportedPlayersEmbed(league, rows, filters = {}) {
   return new EmbedBuilder()
     .setTitle((hasTeamFilter ? 'Madden Roster' : 'Madden Imported Players') + ' • ' + league.league_name)
     .setColor(0xFEE75C)
-    .setDescription((filterText ? '_' + filterText + '_' + NL + NL : '') + (body || 'No imported Madden players found yet. Use /madden sync.'))
+    .setDescription((filterText ? '_' + filterText + '_' + NL + NL : '') + (body || 'No imported Madden players found yet. Use Operations → Run Sync.'))
     .setFooter({ text: `GG Sports • Madden Players • Dev-sorted • Showing ${Math.min(rows.length, 50)}` })
     .setTimestamp();
 }
@@ -44761,7 +44833,7 @@ async function exchangeEaAuthorizationCode(code) {
 
 async function refreshEaAccessToken(refreshToken) {
   if (!refreshToken) {
-    throw new Error('EA refresh token is missing. Run /madden connect again.');
+    throw new Error('EA refresh token is missing. Use Operations → Connect to EA again.');
   }
 
   if (!EA_DIRECT_CLIENT_SECRET) {
@@ -46735,7 +46807,7 @@ ${formatMaddenAwardStatLine(player, race.type)}${rookieText}`;
       }).join('\n\n')
     : (race.type.endsWith('_rookie')
         ? 'No rookie stat rows found for this award race yet. This command now requires a real rookie flag or 0 years pro from the imported EA roster data.'
-        : 'No imported stat rows found for this award race yet. Run `/madden sync` after games have been played.');
+        : 'No imported stat rows found for this award race yet. Run **Operations → Run Sync** after games have been played.');
 
   return new EmbedBuilder()
     .setTitle(`${race.emoji} Madden ${race.title} • ${league.league_name || 'Madden League'}`)
@@ -47858,7 +47930,15 @@ async function handleMaddenGameThreadButton(interaction) {
     const result = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
     const url = result.rows[0]?.stream_url;
     if (!url) {
-      await safeReply({ content: 'No saved stream link found. Save one with `/streamlink set url:<your stream link>`, then press **Stream Hub** again.', ephemeral: true });
+      // 7J-BUTTONPATHS: same fix as Game Center's Stream Hub — a real
+      // modal instead of telling the user to type a command.
+      const modal = new ModalBuilder()
+        .setCustomId('maddengame_streamlink_modal:' + gameId)
+        .setTitle('Set Your Stream Link')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stream_url').setLabel('Your stream URL').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
       return;
     }
     // Posts to the server's connected streaming channel (same destination as
@@ -49855,7 +49935,7 @@ function buildMaddenFreeAgentsEmbedFromRows(league, rows, options = {}) {
     .setFooter({ text: `GG Sports • 7J-10BY-EA5 Free Agency Board • Page ${safePage + 1}/${totalPages} • Sorted by OVR` })
     .setTimestamp();
   if (!rows.length) {
-    embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run `/madden sync`, then try again.');
+    embed.setDescription('No free agents found from the current imported payload yet. If Madden is in offseason, run **Operations → Run Sync**, then try again.');
     return embed;
   }
   const lines = pageRows.map((row, i) => formatMaddenFreeAgentLine(row, safePage * pageSize + i));
@@ -50937,7 +51017,7 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
 
   if (!rookies.length) {
     embed.setTitle(`📋 Draft Recap • ${league.league_name}${teamFilter ? ' • ' + teamFilter : ''}`);
-    embed.setDescription('No drafted rookies found for this league yet — run `/madden sync` after your draft completes.');
+    embed.setDescription('No drafted rookies found for this league yet — run **Operations → Run Sync** after your draft completes.');
     return embed;
   }
 
@@ -52080,7 +52160,7 @@ async function buildMaddenNewsFeedEmbed(guildId, league) {
 
   const description = uniqueHeadlines.length
     ? uniqueHeadlines.map((line, index) => `**${index + 1}.** ${line}`).join('\n\n')
-    : 'No Madden news is available yet. Run `/madden sync`, then use `/madden powerrankings` and `/madden awards` to generate league storylines.';
+    : 'No Madden news is available yet. Run **Operations → Run Sync**, then use `/madden powerrankings` and `/madden awards` to generate league storylines.';
 
   return new EmbedBuilder()
     .setTitle('📰 Madden News Feed • ' + (league.league_name || 'Madden League'))
@@ -52247,7 +52327,7 @@ function formatMaddenHallOfFameRow(row, index) {
 
 function formatMaddenHallOfFameList(rows, limit = 5) {
   const list = (rows || []).slice(0, limit);
-  if (!list.length) return 'No career foundation data yet. Run `/madden sync`, then open `/madden franchise view:League Records` once to refresh career records.';
+  if (!list.length) return 'No career foundation data yet. Run **Operations → Run Sync**, then open `/madden franchise view:League Records` once to refresh career records.';
   return list.map((row, index) => formatMaddenHallOfFameRow(row, index)).join('\n\n');
 }
 
@@ -52584,7 +52664,7 @@ async function buildMaddenChampionshipHistoryEmbed(guildId, league) {
     .addFields(
       { name: '🏆 Champions', value: championshipText.slice(0, 1024), inline: false },
       { name: '👑 Dynasty Leaders', value: dynastyText.slice(0, 1024), inline: false },
-      { name: '🔥 Current Title Picture', value: (currentContenders.join('\n') || 'Run `/madden powerrankings` and `/madden sync` to generate the current title picture.').slice(0, 1024), inline: false },
+      { name: '🔥 Current Title Picture', value: (currentContenders.join('\n') || 'Run `/madden powerrankings` and **Operations → Run Sync** to generate the current title picture.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Championship History`', inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-8C Championship History' })
@@ -53999,7 +54079,7 @@ async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
     return new EmbedBuilder()
       .setTitle('🧭 Madden Season Stage Probe • ' + (league.league_name || 'Madden League'))
       .setColor(0x95A5A6)
-      .setDescription('No stored league hub payload found yet. Run `/madden sync` (or wait for autosync), then try this view again.')
+      .setDescription('No stored league hub payload found yet. Run **Operations → Run Sync** (or wait for autosync), then try this view again.')
       .setFooter({ text: 'GG Sports • Season Stage Probe' })
       .setTimestamp();
   }
@@ -56903,7 +56983,7 @@ async function buildMaddenAwardHistoryEmbed(guildId, league) {
 
   const projectedText = projectedRows.length
     ? projectedRows.slice(0, 5).map((row, index) => formatMaddenAwardHistoryLine(row, index)).join('\n')
-    : 'No current award projections found yet. Run `/madden sync`, then check `/madden awards`.';
+    : 'No current award projections found yet. Run **Operations → Run Sync**, then check `/madden awards`.';
 
   return new EmbedBuilder()
     .setTitle('🏆 Madden Award History • ' + (league.league_name || 'Madden League'))
@@ -57010,7 +57090,7 @@ async function buildMaddenDynastyTrackerEmbed(guildId, league) {
       { name: '⚡ Longest Current Win Streak', value: streakText.slice(0, 1024), inline: false },
       { name: '🏈 Playoff History', value: playoffText.slice(0, 1024), inline: false },
       { name: '📊 Recent Form Source', value: usingGameHistory ? 'Using scored rows from `madden_imported_games`.' : 'No scored game rows found yet; using standings snapshot fallback.', inline: false },
-      { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run `/madden sync` and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
+      { name: '👀 Current Dynasty Watch', value: (watchLines.join('\n') || 'Run **Operations → Run Sync** and `/madden powerrankings` to generate dynasty watch storylines.').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:Dynasty Tracker`', inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-10D Dynasty Rebuild Engine' })
@@ -57414,7 +57494,7 @@ function buildMaddenLeagueLeadersEmbed(league, category, rows, options = {}) {
           : `${formatMaddenLeaderNumber(row.leader_value)} ${category.metricLabel}`;
         return `${rank} **${row.player_name}${team}**\n— ${statLine}`;
       }).join('\n')
-    : 'No imported stat rows found for this category yet. Run `/madden sync` after games have been played.';
+    : 'No imported stat rows found for this category yet. Run **Operations → Run Sync** after games have been played.';
 
   const embed = new EmbedBuilder()
     .setTitle(`Madden League Leaders • ${category.title}`)
@@ -58749,7 +58829,7 @@ function buildMaddenPlayerValueRankingsEmbed(league, rows = [], filters = {}) {
         const dev = maddenPlayerDevEmojiOnly(row.dev_trait) || '';
         return `${rank}. **${maddenValuePlayerName(row)}** — ${team} ${row.position || 'POS'} • ${row.overall || 'N/A'} OVR${dev ? ` • ${dev}` : ''} • Value **${Number(value.valueScore || 0).toFixed(1)}** • ${value.tradeTier}`;
       })
-    : ['No Madden players found. Run `/madden sync` first or adjust the filters.'];
+    : ['No Madden players found. Run Operations → Run Sync first or adjust the filters.'];
 
   const header = [
     `${league.league_name || 'Madden League'}`,
@@ -61618,7 +61698,7 @@ async function getConnectedEaTokenForLeague(leagueId) {
 
   const connection = result.rows[0];
   if (!connection) {
-    throw new Error('No connected EA Direct account found for this Madden league. Run /madden connect first.');
+    throw new Error('No connected EA Direct account found for this Madden league. Use Operations → Connect to EA first.');
   }
 
   let accessToken = decryptEaSecret(connection.access_token_encrypted);
@@ -61626,7 +61706,7 @@ async function getConnectedEaTokenForLeague(leagueId) {
   let expiry = connection.token_expires_at ? new Date(connection.token_expires_at) : new Date(Date.now() + 60 * 60 * 1000);
 
   if (!accessToken) {
-    throw new Error('Connected EA account is missing an access token. Run /madden connect again.');
+    throw new Error('Connected EA account is missing an access token. Use Operations → Connect to EA again.');
   }
 
   const expiresSoon = expiry && expiry.getTime && expiry.getTime() <= Date.now() + 2 * 60 * 1000;
@@ -65060,7 +65140,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       await checkAndAutoPostMaddenSeasonHistory(guild, league).catch(() => null);
     }
   } catch (error) {
-    const message = 'EA Direct sync failed: ' + (isEaExpiredTokenError(error) ? 'EA token expired and refresh failed. Run /madden connect again. Details: ' : isEaInvalidRequestTokenError(error) ? 'EA refreshed token was rejected by Blaze. Run /madden connect again if this persists. Details: ' : '') + (error?.message || error);
+    const message = 'EA Direct sync failed: ' + (isEaExpiredTokenError(error) ? 'EA token expired and refresh failed. Use Operations → Connect to EA again. Details: ' : isEaInvalidRequestTokenError(error) ? 'EA refreshed token was rejected by Blaze. Use Operations → Connect to EA again if this persists. Details: ' : '') + (error?.message || error);
     await pool.query(
       `UPDATE madden_sync_runs
        SET status = 'failed',
