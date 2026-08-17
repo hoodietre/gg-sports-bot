@@ -16,3 +16,16 @@
 # the build environment itself, not application code.
 [phases.setup]
 aptPkgs = ["fonts-dejavu-core", "fontconfig"]
+
+# 7J-BRACKETFONT-2: even with fontconfig installed via aptPkgs above,
+# Railway's Nixpacks runtime still failed to auto-locate fontconfig's own
+# config file at runtime ("Fontconfig error: Cannot load default config
+# file: No such file: (null)") — a known gap in how Nixpacks' apt-installed
+# packages interact with fontconfig's default path resolution inside a
+# Nix-based image (confirmed as a real recurring issue for exactly this
+# Railway + sharp + SVG-in-Discord-bot combination, not something specific
+# to this codebase). Explicitly pointing FONTCONFIG_FILE at the config file
+# apt's fontconfig package actually installs (/etc/fonts/fonts.conf on
+# Debian) sidesteps the broken auto-detection entirely.
+[variables]
+FONTCONFIG_FILE = "/etc/fonts/fonts.conf"

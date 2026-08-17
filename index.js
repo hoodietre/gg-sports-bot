@@ -32,6 +32,18 @@ import http from 'http';
 
 const { Pool } = pkg;
 
+// 7J-BRACKETFONT-2: belt-and-suspenders fallback for the fontconfig fix in
+// nixpacks.toml — sets the same FONTCONFIG_FILE value at runtime in case
+// Railway doesn't carry nixpacks.toml's [variables] section through to the
+// running container for some reason. Only sets it if it isn't already
+// present (never overrides an intentional operator-set value), and only
+// applies to Linux deploys — harmless no-op locally on other OSes since
+// this path won't exist there and sharp/librsvg will just fall back to
+// whatever font resolution already worked before.
+if (!process.env.FONTCONFIG_FILE && fs.existsSync('/etc/fonts/fonts.conf')) {
+  process.env.FONTCONFIG_FILE = '/etc/fonts/fonts.conf';
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -19193,9 +19205,8 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply({ ephemeral: true });
       // 7J-BRACKETVIEWFIX: per Hxxdie — clicking View Bracket produced
       // nothing visible in some cases. This now always renders and attaches
-      // the actual visual bracket PNG here directly (independent of the
-      // separate auto-updating channel post from updateTournamentPanel), so
-      // a click is guaranteed to show *something* — and if the render
+      // the actual visual bracket PNG here directly, so a click is
+      // guaranteed to show *something* to the clicker — and if the render
       // itself fails, the reply says so explicitly instead of staying blank.
       const files = [];
       try {
@@ -19204,6 +19215,17 @@ if (interaction.commandName === 'avatar') {
       } catch (error) {
         console.error('[7J-BRACKETVIEWFIX] View Bracket render failed:', error?.stack || error?.message || error);
       }
+      // 7J-BRACKETVIEWREFRESH: per Hxxdie — View Bracket was only ever
+      // showing a private ephemeral copy to the clicker; it never touched
+      // the channel's own standing "Live Bracket" post, so there was no way
+      // to force that public copy to catch up on demand (e.g. after a font
+      // fix redeploy, or if the automatic per-round update had silently
+      // failed). Reuses updateTournamentPanel — the same function every
+      // other round-progress trigger already calls — so View Bracket now
+      // also refreshes the public bracket image in place.
+      await updateTournamentPanel(interaction.guild, tournament).catch(error => {
+        console.error('[7J-BRACKETVIEWREFRESH] Failed to refresh the public bracket image:', error?.stack || error?.message || error);
+      });
       const content = files.length ? undefined : (tournament.format === 'round_robin'
         ? 'Round robin tournaments don\'t have a bracket shape — see the round-by-round results below instead.'
         : (matches.length ? 'Could not render the bracket image — see the round-by-round results below instead.' : undefined));
