@@ -9164,11 +9164,31 @@ async function renderTournamentBracketPng(guild, tournament, matches) {
   if (!roundNumbers.length) return null;
   for (const r of roundNumbers) rounds[r].sort((a, b) => a.match_number - b.match_number);
 
+  // 7J-BRACKETNAMEFIX: per Hxxdie's live testing — showed "Player 3897"
+  // (the raw fallback) instead of the real username. Root cause: this only
+  // ever checked guild.members.cache, which isn't guaranteed to already
+  // have every match participant cached (especially anyone who hasn't
+  // recently been active/mentioned) — it never actually fetched. Now
+  // resolves every unique player ID up front with a real fetch (falling
+  // back to cache first since that's free, and only hitting the API for
+  // whoever's actually missing), then uses that resolved map during SVG
+  // construction, which still has to be synchronous.
+  const uniquePlayerIds = [...new Set(matches.flatMap(m => [m.player1_user_id, m.player2_user_id]).filter(Boolean))];
+  const resolvedNames = new Map();
+  await Promise.all(uniquePlayerIds.map(async userId => {
+    const cached = guild.members.cache.get(userId);
+    if (cached) {
+      resolvedNames.set(userId, cached.displayName || cached.user?.username);
+      return;
+    }
+    const fetched = await guild.members.fetch(userId).catch(() => null);
+    resolvedNames.set(userId, fetched?.displayName || fetched?.user?.username || null);
+  }));
+
   const nameFor = (userId, entryName) => {
     if (!userId) return 'BYE';
     if (entryName) return entryName;
-    const member = guild.members.cache.get(userId);
-    return member?.displayName || member?.user?.username || `Player ${String(userId).slice(-4)}`;
+    return resolvedNames.get(userId) || `Player ${String(userId).slice(-4)}`;
   };
 
   const boxW = 240;
