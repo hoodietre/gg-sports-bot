@@ -15015,6 +15015,10 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      if (category === 'checklist') {
+        await showCommissionerSetupChecklist(interaction, leagueId);
+        return;
+      }
       if (category === 'setup') {
         const setupCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
         await interaction.update({
@@ -15639,6 +15643,26 @@ if (interaction.commandName === 'avatar') {
       const league = await getLeagueById(leagueId);
       if (!league) { await interaction.reply({ content: 'League not found.', ephemeral: true }); return; }
       if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to do this.', ephemeral: true }); return; }
+
+      // 7J-SETUPORDER: per Hxxdie — nothing was stopping a commissioner
+      // from running this before League Roles/Team Roles existed, which
+      // silently produces broken results (the Staff channel can't be
+      // locked down without a staff role to grant, boards/panels that
+      // reference team roles at posting time come out empty). Hard block
+      // matching the order /setupguide already documents: League Roles,
+      // then Team Roles, then Auto-Setup Channels.
+      const missingPrereqs = [];
+      if (!league.staff_role_id) missingPrereqs.push('**Auto Create League Roles** (League Setup)');
+      const teamRolesForGate = await getLeagueTeamRoles(league.league_id).catch(() => []);
+      if (teamRolesForGate.length < 2) missingPrereqs.push('**Auto Create Team Roles**, at least 2 teams (Channels & Roles)');
+      if (missingPrereqs.length) {
+        await interaction.reply({
+          content: `Hold on — **${league.league_name}** isn't ready for channel setup yet. Do these first, in order:\n${missingPrereqs.map((p, i) => `${i + 1}. ${p}`).join('\n')}\n\nSee \`/setupguide\` for the full walkthrough, or the **Setup Checklist** in the Commissioner Panel to track progress.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
       const configuredCount = LEAGUE_OWNED_CHANNEL_COLUMNS.filter(col => league[col]).length;
       const warning = configuredCount
         ? `\n\n⚠️ **${league.league_name}** already has **${configuredCount}** channel(s) configured. Running this again will create a **full second category** with duplicate channels — it does not detect or reuse what's already there.`
@@ -68810,6 +68834,7 @@ async function showCommissionerAutoDetectSettings(interaction, leagueId) {
 // Game Center, Madden = EA sync — get that right before touching channels),
 // then Channels & Roles, then Panels, then Operations, then Browse Data.
 const COMMISSIONER_CATEGORIES = [
+  { value: 'checklist', label: 'Setup Checklist', description: 'Track setup progress in the correct order', emoji: '✅' },
   { value: 'league', label: 'League Settings', description: 'Season length, schedule type, and other league-level settings', emoji: '📋' },
   { value: 'setup', label: 'Channels & Roles', description: 'Configure channels and roles', emoji: '🛠️' },
   { value: 'panels', label: 'Panels', description: 'Create/refresh live boards', emoji: '🖼️' },
@@ -69167,6 +69192,63 @@ function buildCommissionerLeagueComponents(leagueId, isMaddenLeague = false) {
     .setPlaceholder('Choose a section to configure')
     .addOptions(filterLeagueCustomizationSections(isMaddenLeague).map(s => ({ label: s.label, value: s.value, description: s.description, emoji: s.emoji })));
   return [new ActionRowBuilder().addComponents(menu), buildCommissionerBackRow(leagueId)];
+}
+
+// 7J-SETUPORDER: per Hxxdie — nothing was visually guiding a commissioner
+// toward the correct setup order, and nothing stopped them from doing
+// things out of sequence in ways that silently produce broken results
+// (Staff channel with no staff role to lock it to, boards that reference
+// team roles at posting time coming out empty). Order here matches
+// /setupguide exactly: League Roles before League Settings, League
+// Settings before Team Roles/Channels, Team Roles before Channels.
+async function showCommissionerSetupChecklist(interaction, leagueId) {
+  const league = await getLeagueById(leagueId);
+  if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  const teamRoles = await getLeagueTeamRoles(league.league_id).catch(() => []);
+  const isMadden = getLeagueSportKey(league) === 'madden';
+  const isPremiumGuild = await isGuildPremiumActive(interaction.guild.id).catch(() => false);
+  const guildPanelCount = await pool.query(`SELECT COUNT(*)::int AS n FROM multi_channel_panels WHERE guild_id = $1`, [interaction.guild.id])
+    .then(r => r.rows[0]?.n || 0).catch(() => 0);
+
+  const steps = [
+    { done: true, label: 'Create the League', note: '✅ done' },
+    { done: Boolean(league.staff_role_id && league.league_role_id && league.trade_committee_role_id), label: 'Auto Create League Roles', note: 'League Setup → Auto Create League Roles' },
+  ];
+  // League Settings has no clean "done" state (settings can always be
+  // adjusted), so it's shown as a recommended checkpoint rather than a
+  // pass/fail checkbox — schedule_style being set at all is used as a
+  // loose signal that this section has actually been visited.
+  if (!isMadden) {
+    steps.push({ done: customSettings.schedule_style !== null && customSettings.schedule_style !== undefined, label: 'League Settings (season length, schedule style, etc.)', note: 'Commissioner Panel → League Settings' });
+  }
+  steps.push({ done: teamRoles.length >= 2, label: 'Auto Create Team Roles (at least 2)', note: 'Channels & Roles → Auto Create Team Roles' });
+  steps.push({ done: Boolean(league.league_announcement_channel_id), label: 'Auto-Setup Channels', note: 'Channels & Roles → Auto-Setup Channels' });
+  if (isPremiumGuild) {
+    steps.push({ done: guildPanelCount > 0, label: 'Auto Setup Server Channels (Shop/Sportsbook/etc.)', note: 'Admin Panel → Server Setup — guild-wide, once per server' });
+  }
+  if (!isMadden && customSettings.schedule_style === 'structured') {
+    steps.push({ done: Number(customSettings.current_round || 0) > 0, label: 'Start League', note: 'Commissioner Panel → Operations → Advance' });
+  }
+
+  const NL = String.fromCharCode(10);
+  const lines = steps.map((s, i) => `${s.done ? '✅' : '⬜'} **${i + 1}. ${s.label}**${s.done ? '' : NL + `   ↳ ${s.note}`}`);
+  const nextStep = steps.find(s => !s.done);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`✅ Setup Checklist • ${league.league_name}`)
+    .setColor(nextStep ? 0xFEE75C : 0x57F287)
+    .setDescription(lines.join(NL) + NL + NL + (nextStep ? `**Next up:** ${nextStep.label}` : '**All core setup steps are done.**') + NL + NL + 'Full written walkthrough: `/setupguide`. Short version: `/quicksetup`.')
+    .setFooter({ text: 'GG Sports • Commissioner Panel' })
+    .setTimestamp();
+
+  const payload = { content: null, embeds: [embed], components: [buildCommissionerBackRow(leagueId)] };
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(payload);
+  } else {
+    await interaction.update(payload);
+  }
 }
 
 async function showCommissionerLeagueSettings(interaction, leagueId) {
