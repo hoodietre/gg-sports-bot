@@ -9596,6 +9596,16 @@ function getMultiChannelPanelInfo(panelType) {
       label: 'Recruitment',
       build: async () => ({ embeds: [buildRecruitmentStarterEmbed()], components: buildRecruitmentStarterComponents() }),
     },
+    // 7J-TOURNAMENTAUTOSETUP: per Hxxdie's discussion — tournaments are
+    // guild-wide (the tournaments table is keyed by guild_id, not
+    // league_id), so they belong in guild-wide Auto Setup Server Channels
+    // rather than per-league setup. Reuses the exact same home payload the
+    // manual /settournamentchannel flow already builds, so there's no
+    // behavior drift between the two paths.
+    tournament: {
+      label: 'Tournament Manager',
+      build: async (guild) => buildTournamentManagerHomePayload(guild),
+    },
   };
   return registry[panelType] || null;
 }
@@ -19406,12 +19416,12 @@ if (interaction.commandName === 'avatar') {
       const payload = await buildAdminServerSetupPayload(interaction.guild, await getEffectiveLanguage(interaction.guild.id, interaction.user.id));
       // 7J-COMMANDHUB-PAYWALL: message now reflects what actually got
       // created — Free Tier gets Recruitment + Welcome/Leave only; Premium
-      // adds Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile plus
-      // Tickets/Support.
+      // adds Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/
+      // Tournament plus Tickets/Support.
       const isPremiumGuild = await isGuildPremiumActive(interaction.guild.id);
       const panelSummary = isPremiumGuild
-        ? 'posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Recruitment/Tickets/Support panels'
-        : 'posted the Recruitment panel (Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Tickets/Support are Premium — `/premium trial` unlocks them for 14 days, no card required)';
+        ? 'posted the Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Tournament/Recruitment/Tickets/Support panels'
+        : 'posted the Recruitment panel (Shop/Sportsbook/Marketplace/Avatar/Bank/Member Profile/Tournament/Tickets/Support are Premium — `/premium trial` unlocks them for 14 days, no card required)';
       await interaction.editReply({
         content: `Created **${category.name}** with ${channels.length} channel${channels.length === 1 ? '' : 's'} and ${panelSummary}. Welcome/Leave channels included and enabled. Continue league-specific setup (core channels, roles, trade setup) from a league's Commissioner Panel.`,
         ...payload,
@@ -35868,6 +35878,10 @@ async function autoCreateGuildMultiChannelPanels(guild) {
     ['bank', 'bank', true],
     ['profile', 'member-profile', true],
     ['recruitment', 'recruitment', false],
+    // 7J-TOURNAMENTAUTOSETUP: per Hxxdie's discussion — Premium-gated like
+    // the other optional channels here, so a Free Tier guild doesn't get a
+    // channel created for a feature it can't use.
+    ['tournament', 'tournaments', true],
   ];
   const panelSpecs = allPanelSpecs
     .filter(([, , premiumOnly]) => !premiumOnly || isPremium)
@@ -35877,6 +35891,20 @@ async function autoCreateGuildMultiChannelPanels(guild) {
     if (!channel) continue;
     await postOrRefreshMultiChannelPanel(guild, panelType, channel).catch(() => null);
     created.push(channel);
+    // 7J-TOURNAMENTAUTOSETUP: the standard multi_channel_panels flow only
+    // tracks the panel message itself — /tournament actually reads its
+    // channel from guild_tournament_settings (same table the manual
+    // /settournamentchannel command writes to), so that needs setting
+    // explicitly here or the freshly-created channel wouldn't actually be
+    // used by anything.
+    if (panelType === 'tournament') {
+      await pool.query(
+        `INSERT INTO guild_tournament_settings (guild_id, tournament_channel_id, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (guild_id) DO UPDATE SET tournament_channel_id = $2, updated_at = NOW()`,
+        [guild.id, channel.id]
+      ).catch(() => null);
+    }
   }
 
   // 7J-149TICKETSAUTOSETUP: per Hxxdie — Tickets/Support are guild-wide
