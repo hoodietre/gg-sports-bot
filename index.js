@@ -35947,7 +35947,26 @@ async function autoCreateGuildMultiChannelPanels(guild) {
       ? await guild.channels.fetch(guildSettings.ticket_channel_id).catch(() => null)
       : null;
     if (!existingTicketChannel) {
-      const ticketChannel = await guild.channels.create({ name: 'tickets', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+      // 7J-TICKETPRIVATE: per Hxxdie — Tickets is a staff-only triage
+      // dashboard (Open/Urgent/Unclaimed/Reviewing filters), not something
+      // members should see or post in directly — Support is the actual
+      // member-facing entry point for that. Denies @everyone View Channel
+      // and explicitly grants every active league's staff role in this
+      // guild, since Tickets is guild-wide and there's no single "guild
+      // staff role" concept to target instead. Administrators/Manage
+      // Server holders can always see it regardless, per Discord's own
+      // permission model.
+      const staffRoleRows = await pool.query(
+        `SELECT DISTINCT s.staff_role_id FROM league_settings s
+         JOIN leagues l ON l.league_id = s.league_id
+         WHERE l.guild_id = $1 AND l.is_active = TRUE AND s.staff_role_id IS NOT NULL`,
+        [guild.id]
+      ).catch(() => ({ rows: [] }));
+      const permissionOverwrites = [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        ...staffRoleRows.rows.map(row => ({ id: row.staff_role_id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] })),
+      ];
+      const ticketChannel = await guild.channels.create({ name: 'tickets', type: ChannelType.GuildText, parent: category.id, permissionOverwrites }).catch(() => null);
       if (ticketChannel) {
         await setGuildTicketSettings(guild.id, guild.name, { ticketChannelId: ticketChannel.id });
         created.push(ticketChannel);
@@ -35974,21 +35993,33 @@ async function autoCreateGuildMultiChannelPanels(guild) {
   // (not Premium-gated — Welcome/Leave is basic onboarding utility, not a
   // paywalled feature) and turns the feature on at the same time — no
   // point creating the channels and leaving the feature off.
+  // 7J-WELCOMELEAVEMERGE: per Hxxdie — consolidated into one shared channel
+  // instead of two separate ones. Both welcome_channel_id and
+  // leave_channel_id get pointed at the same channel; the join/leave
+  // posting logic doesn't assume they're different channels, so this is a
+  // pure channel-count reduction with no behavior change to what actually
+  // gets posted.
   const refreshedGuildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
   const existingWelcomeChannel = refreshedGuildSettings?.welcome_channel_id
     ? await guild.channels.fetch(refreshedGuildSettings.welcome_channel_id).catch(() => null)
     : null;
-  if (!existingWelcomeChannel) {
+  const existingLeaveChannel = refreshedGuildSettings?.leave_channel_id
+    ? await guild.channels.fetch(refreshedGuildSettings.leave_channel_id).catch(() => null)
+    : null;
+  if (!existingWelcomeChannel && !existingLeaveChannel) {
+    const welcomeLeaveChannel = await guild.channels.create({ name: 'welcome-and-leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
+    if (welcomeLeaveChannel) {
+      await setGuildWelcomeChannel(guild.id, guild.name, welcomeLeaveChannel.id);
+      await setGuildLeaveChannel(guild.id, guild.name, welcomeLeaveChannel.id);
+      created.push(welcomeLeaveChannel);
+    }
+  } else if (!existingWelcomeChannel) {
     const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
     if (welcomeChannel) {
       await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
       created.push(welcomeChannel);
     }
-  }
-  const existingLeaveChannel = refreshedGuildSettings?.leave_channel_id
-    ? await guild.channels.fetch(refreshedGuildSettings.leave_channel_id).catch(() => null)
-    : null;
-  if (!existingLeaveChannel) {
+  } else if (!existingLeaveChannel) {
     const leaveChannel = await guild.channels.create({ name: 'leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
     if (leaveChannel) {
       await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
@@ -37671,15 +37702,17 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const { channel, error } = await requireTextChannel(channelId, interaction.channel, 'ticket/support channel');
     if (error) return error + ' Set the Ticket/Support channel from Admin Panel > Server Settings > Ticket Settings first.';
 
-    const embed = new EmbedBuilder()
-      .setTitle('Support Tickets')
-      .setDescription('Use /ticket open, /ticket dispute, or /ticket game to create a ticket.')
-      .setColor(0x5865F2)
-      .setFooter({ text: 'GG Sports • Tickets' })
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
-    return 'Ticket panel posted in ' + channel.toString() + '.';
+    // 7J-TICKETDASHBOARDFIX: per Hxxdie — this was posting a plain
+    // instructional embed with zero functionality, completely different
+    // from what /ticket panel (the manual staff command) actually posts —
+    // the real, live, filterable staff dashboard (buildTicketDashboardEmbed
+    // + buildTicketDashboardButtons). Auto-setup now posts the exact same
+    // thing /ticket panel does, and saves it via saveTicketPanel so
+    // updateTicketPanel can keep it live going forward, same as the manual
+    // path always could.
+    const message = await channel.send({ embeds: [await buildTicketDashboardEmbed(interaction.guild.id)], components: [buildTicketDashboardButtons()] });
+    await saveTicketPanel(interaction.guild.id, channel.id, message.id);
+    return 'Ticket dashboard posted in ' + channel.toString() + '.';
   }
 
   return 'Unknown panel type.';
@@ -69034,7 +69067,7 @@ const LEAGUE_CUSTOMIZATION_SECTIONS = [
   // the Trades section, which was an awkward fit — it's about who can help
   // manage a team's roster in Discord, nothing to do with trading. Split
   // into its own section.
-  { value: 'rosters', label: 'Team Rosters', description: 'Let team owners add players/coaches/GMs to help manage the team', emoji: '👥' },
+  { value: 'rosters', label: 'Team Rosters', description: 'Pro-Am/Club leagues — multiple players per team instead of 1 owner', emoji: '👥' },
   { value: 'awards', label: 'Awards', description: 'Which awards this league tracks', emoji: '🎖️' },
   { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Turn conferences/divisions on/off, assign each team', emoji: '🗺️' },
   { value: 'wagers', label: 'Wagers', description: '1v1 game-thread wagers between owners, separate from the sportsbook', emoji: '💰' },
@@ -69251,7 +69284,7 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
     embed = new EmbedBuilder()
       .setTitle(`👥 Team Rosters • ${league.league_name}`)
       .setColor(0x5865F2)
-      .setDescription('When enabled, a team owner can add other members as player/coach/GM to help manage their team. GM is treated as functionally equivalent to the owner for actions gated on "do you own this team" (score reporting, trades, etc.) — player/coach are organizational only.')
+      .setDescription('For Pro-Am/Club style leagues — where a "team" is a group of multiple players rather than one owner controlling the whole roster, unlike a typical 1-to-1 owner-to-team league. When enabled, a team owner can add other members as player/coach/GM to help manage their team. GM is treated as functionally equivalent to the owner for actions gated on "do you own this team" (score reporting, trades, etc.) — player/coach are organizational only.')
       .addFields(
         { name: 'Team Rosters', value: customSettings.use_team_roster ? 'On — owners can add players/coaches/GMs' : 'Off', inline: true },
       )
