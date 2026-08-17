@@ -69293,27 +69293,36 @@ async function showCommissionerSetupChecklist(interaction, leagueId) {
     .then(r => r.rows[0]?.n || 0).catch(() => 0);
 
   const steps = [
-    { done: true, label: 'Create the League', note: '✅ done' },
-    { done: Boolean(league.staff_role_id && league.league_role_id && league.trade_committee_role_id), label: 'Auto Create League Roles', note: 'League Setup → Auto Create League Roles' },
+    { done: true, label: 'Create the League', doneNote: 'Done.' },
+    { done: Boolean(league.staff_role_id && league.league_role_id && league.trade_committee_role_id), label: 'Auto Create League Roles', note: 'League Setup → Auto Create League Roles', doneNote: 'League/Staff/Trade Committee roles all exist.' },
   ];
   // League Settings has no clean "done" state (settings can always be
   // adjusted), so it's shown as a recommended checkpoint rather than a
   // pass/fail checkbox — schedule_style being set at all is used as a
   // loose signal that this section has actually been visited.
   if (!isMadden) {
-    steps.push({ done: customSettings.schedule_style !== null && customSettings.schedule_style !== undefined, label: 'League Settings (season length, schedule style, etc.)', note: 'Commissioner Panel → League Settings' });
+    steps.push({ done: customSettings.schedule_style !== null && customSettings.schedule_style !== undefined, label: 'League Settings (season length, schedule style, etc.)', note: 'Commissioner Panel → League Settings', doneNote: 'Schedule style has been set.' });
   }
-  steps.push({ done: teamRoles.length >= 2, label: 'Auto Create Team Roles (at least 2)', note: 'Channels & Roles → Auto Create Team Roles' });
-  steps.push({ done: Boolean(league.league_announcement_channel_id), label: 'Auto-Setup Channels', note: 'Channels & Roles → Auto-Setup Channels' });
+  // 7J-CHECKLISTREORDER: per Hxxdie — guild-wide Server Channels has no
+  // dependency on this specific league's roles/teams (it's one-time-per-
+  // server), so it doesn't actually need to wait for Team Roles the way
+  // Auto-Setup Channels genuinely does. Moved ahead of it.
   if (isPremiumGuild) {
-    steps.push({ done: guildPanelCount > 0, label: 'Auto Setup Server Channels (Shop/Sportsbook/etc.)', note: 'Admin Panel → Server Setup — guild-wide, once per server' });
+    steps.push({
+      done: guildPanelCount > 0,
+      label: 'Auto Setup Server Channels (Shop/Sportsbook/etc.)',
+      note: 'Admin Panel → Server Setup — guild-wide, once per server',
+      doneNote: 'Already set up for this server — this is a one-time, guild-wide step, not per-league, so there\'s nothing more to do here. Move on to the next step.',
+    });
   }
+  steps.push({ done: teamRoles.length >= 2, label: 'Auto Create Team Roles (at least 2)', note: 'Channels & Roles → Auto Create Team Roles', doneNote: `${teamRoles.length} team role(s) registered.` });
+  steps.push({ done: Boolean(league.league_announcement_channel_id), label: 'Auto-Setup Channels', note: 'Channels & Roles → Auto-Setup Channels', doneNote: 'Channels have been created for this league.' });
   if (!isMadden && customSettings.schedule_style === 'structured') {
-    steps.push({ done: Number(customSettings.current_round || 0) > 0, label: 'Start League', note: 'Commissioner Panel → Operations → Advance' });
+    steps.push({ done: Number(customSettings.current_round || 0) > 0, label: 'Start League', note: 'Commissioner Panel → Operations → Advance', doneNote: 'Season is underway.' });
   }
 
   const NL = String.fromCharCode(10);
-  const lines = steps.map((s, i) => `${s.done ? '✅' : '⬜'} **${i + 1}. ${s.label}**${s.done ? '' : NL + `   ↳ ${s.note}`}`);
+  const lines = steps.map((s, i) => `${s.done ? '✅' : '⬜'} **${i + 1}. ${s.label}**${NL}   ↳ ${s.done ? (s.doneNote || 'Done.') : s.note}`);
   const nextStep = steps.find(s => !s.done);
 
   const embed = new EmbedBuilder()
