@@ -1145,6 +1145,12 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS requesting_confirmed_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_by TEXT`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_at TIMESTAMPTZ`);
+  // 7J-CPUNEGOTIATION: per Hxxdie — a CPU-owned team has no real GM to
+  // confirm a dual-confirmation trade, so negotiations targeting one were
+  // silently waiting forever on a confirmation that could never happen.
+  // Flags a negotiation as CPU-targeted at creation time so the
+  // confirmation flow can treat that side as pre-confirmed instead.
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS cpu_target BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_negotiations_lookup ON madden_trade_negotiations (guild_id, league_id, status, player_name)`);
 
   // 7J-8A-B: Madden career records foundation. This is hidden for now and is refreshed idempotently from imported stats.
@@ -1949,6 +1955,10 @@ async function initDatabase() {
       updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  // 7J-TOURNAMENTCATEGORY: per Hxxdie — tournaments get their own category
+  // now (Tournaments + Tournament History channels), not folded into the
+  // shared "GG Sports" category.
+  await pool.query(`ALTER TABLE guild_tournament_settings ADD COLUMN IF NOT EXISTS tournament_history_channel_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournaments (
@@ -1975,6 +1985,12 @@ async function initDatabase() {
   // picked timezone — powers a <t:EPOCH:F> Discord timestamp tag, which
   // Discord's client auto-renders in each viewer's own local time/format.
   await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS starts_at_epoch BIGINT`);
+  // 7J-TOURNAMENTCATEGORY: per Hxxdie — a temporary channel gets created
+  // per tournament (named after it), with match threads living under it
+  // instead of the shared Tournaments channel. Deleted (along with all its
+  // threads, automatically, since Discord deletes threads when their
+  // parent channel is deleted) once the tournament completes.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS temp_channel_id TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_entries (
@@ -5065,14 +5081,22 @@ async function getLeagueTeamRoles(leagueId) {
 
 async function memberHasStaff(member, league) {
   if (!member) return false;
+  // 7J-OWNERCHECK: per Hxxdie — the guild owner was being denied staff
+  // actions unless they also happened to hold an explicit
+  // Administrator-granting role. Discord's actual permission model doesn't
+  // require that — the owner has full control of the server regardless of
+  // their roles — but member.permissions is purely role-computed and never
+  // accounted for guild.ownerId on its own. Checked explicitly now.
+  const isOwner = member.id === member.guild?.ownerId;
   const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
   const canManageServer = member.permissions.has(PermissionFlagsBits.ManageGuild);
   const hasStaffRole = league?.staff_role_id ? member.roles.cache.has(league.staff_role_id) : false;
-  return Boolean(isAdmin || canManageServer || hasStaffRole);
+  return Boolean(isOwner || isAdmin || canManageServer || hasStaffRole);
 }
 
 async function memberHasCommittee(member, league) {
   if (!member) return false;
+  const isOwner = member.id === member.guild?.ownerId;
   const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
   const canManageServer = member.permissions.has(PermissionFlagsBits.ManageGuild);
   const possibleRoleIds = [
@@ -5080,11 +5104,18 @@ async function memberHasCommittee(member, league) {
     league?.committee_role_id,
   ].filter(Boolean).map(String);
   const hasCommitteeRole = possibleRoleIds.some(roleId => member.roles.cache.has(roleId));
-  return Boolean(isAdmin || canManageServer || hasCommitteeRole);
+  return Boolean(isOwner || isAdmin || canManageServer || hasCommitteeRole);
 }
 
 async function userCanUseLeagueSetup(interaction, league = null) {
   if (!interaction.guild) return false;
+  // 7J-OWNERCHECK: same fix as memberHasStaff — the guild owner doesn't
+  // need an explicit Administrator-granting role for their real Discord
+  // privileges to work, but this check was purely role-computed and never
+  // accounted for guild.ownerId directly. This function gates nearly every
+  // staff/commissioner action in the bot, so this fix reaches far beyond
+  // just the tournament issue that surfaced it.
+  if (interaction.user.id === interaction.guild.ownerId) return true;
   const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
   const canManageServer = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
   if (isAdmin || canManageServer) return true;
@@ -5390,6 +5421,15 @@ function buildNegotiationConfirmRow(negotiationId, disabled = false) {
 }
 
 async function createGenericTradeNegotiationThread(guild, league, { senderUserId, senderTeamName, senderTeamRoleId, targetUserId, targetTeamName, targetTeamRoleId }) {
+  // 7J-NOSELFTRADE: per Hxxdie — nothing was stopping a user from
+  // negotiating a trade with their own team, or with themselves if they
+  // happen to control both sides (e.g. GM of multiple teams).
+  if (senderUserId && targetUserId && String(senderUserId) === String(targetUserId)) {
+    return { ok: false, message: "You can't start a trade negotiation with yourself." };
+  }
+  if (senderTeamRoleId && targetTeamRoleId && String(senderTeamRoleId) === String(targetTeamRoleId)) {
+    return { ok: false, message: "You can't start a trade negotiation with your own team." };
+  }
   const candidateChannelIds = [league?.trade_negotiation_channel_id, league?.offer_a_trade_channel_id, league?.trade_offer_channel_id].filter(Boolean);
   let channel = null;
   for (const channelId of candidateChannelIds) {
@@ -8268,24 +8308,33 @@ async function finalizeTournamentMatch(guild, match, winnerUserId, reportedByUse
       );
       await updateTournamentPanel(guild, { ...completedTournament, status: 'completed' });
 
-      let announceChannel = null;
-      if (completedTournament.league_id) {
-        const activeLeague = await getLeagueById(completedTournament.league_id);
-        if (activeLeague?.tournament_channel_id) {
-          announceChannel = await guild.channels.fetch(activeLeague.tournament_channel_id).catch(() => null);
-        }
-      }
-      if (!announceChannel) {
-        const guildTournamentChannelId = await getGuildTournamentChannelId(guild.id);
-        if (guildTournamentChannelId) {
-          announceChannel = await guild.channels.fetch(guildTournamentChannelId).catch(() => null);
-        }
-      }
-      if (announceChannel && announceChannel.isTextBased()) {
+      // 7J-TOURNAMENTCATEGORY: per Hxxdie — champion + final bracket now
+      // archived to the dedicated Tournament History channel instead of
+      // wherever the tournament happened to be configured to announce.
+      // Note: this archives the existing bracket embed format (round-by-
+      // round text), not a rendered bracket image — a true visual bracket
+      // graphic would need its own image-rendering work, similar to the
+      // avatar renderer, and hasn't been built.
+      const historySettings = await pool.query(`SELECT tournament_history_channel_id FROM guild_tournament_settings WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
+      const historyChannelId = historySettings.rows[0]?.tournament_history_channel_id;
+      const historyChannel = historyChannelId ? await guild.channels.fetch(historyChannelId).catch(() => null) : null;
+      if (historyChannel && historyChannel.isTextBased()) {
         const championSettings = await getCurrencySettings(guild.id);
-        await announceChannel.send({
-          embeds: [buildTournamentChampionEmbed(championSettings, completedTournament, winners[0].user_id, Number(match.prize_pool || 0))],
+        const finalMatches = await getTournamentMatches(match.tournament_id).catch(() => []);
+        await historyChannel.send({
+          embeds: [
+            buildTournamentChampionEmbed(championSettings, completedTournament, winners[0].user_id, Number(match.prize_pool || 0)),
+            buildTournamentPanelEmbed(completedTournament, finalMatches),
+          ],
         }).catch(() => null);
+      }
+
+      // 7J-TOURNAMENTCATEGORY: temp channel (and every thread under it,
+      // deleted automatically by Discord along with its parent channel)
+      // cleaned up now that the bracket's been archived to history.
+      if (completedTournament.temp_channel_id) {
+        const tempChannel = await guild.channels.fetch(completedTournament.temp_channel_id).catch(() => null);
+        if (tempChannel) await tempChannel.delete('Tournament completed — archived to history').catch(() => null);
       }
     }
 
@@ -8307,19 +8356,28 @@ async function finalizeTournamentMatch(guild, match, winnerUserId, reportedByUse
 }
 
 async function createMatchThreads(guild, tournament, matches) {
-  let channel = null;
-
-  if (tournament.league_id) {
-    const activeLeague = await getLeagueById(tournament.league_id);
-    if (activeLeague?.tournament_channel_id) {
-      channel = await guild.channels.fetch(activeLeague.tournament_channel_id).catch(() => null);
-    }
-  }
+  // 7J-TOURNAMENTCATEGORY: per Hxxdie — matches now live under a temporary
+  // channel created for and named after this specific tournament, instead
+  // of all sharing the one guild-wide Tournaments channel. Created once
+  // (on the first round) and reused for every subsequent round; deleted
+  // (along with all its threads) once the tournament completes.
+  let channel = tournament.temp_channel_id
+    ? await guild.channels.fetch(tournament.temp_channel_id).catch(() => null)
+    : null;
 
   if (!channel) {
-    const guildTournamentChannelId = await getGuildTournamentChannelId(guild.id);
-    if (guildTournamentChannelId) {
-      channel = await guild.channels.fetch(guildTournamentChannelId).catch(() => null);
+    const tournamentSettings = await pool.query(`SELECT tournament_channel_id FROM guild_tournament_settings WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
+    const parentChannel = tournamentSettings.rows[0]?.tournament_channel_id
+      ? await guild.channels.fetch(tournamentSettings.rows[0].tournament_channel_id).catch(() => null)
+      : null;
+    const safeName = String(tournament.tournament_name || 'tournament').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || 'tournament';
+    channel = await guild.channels.create({
+      name: safeName,
+      type: ChannelType.GuildText,
+      parent: parentChannel?.parentId || undefined,
+    }).catch(() => null);
+    if (channel) {
+      await pool.query(`UPDATE tournaments SET temp_channel_id = $1, updated_at = NOW() WHERE id = $2`, [channel.id, tournament.id]).catch(() => null);
     }
   }
 
@@ -13719,10 +13777,15 @@ if (interaction.commandName === 'avatar') {
 
         const match = matchResult.rows[0];
         const tournament = await findTournament(interaction.guild.id, match.tournament_name);
-        const activeLeague = tournament?.league_id ? await getLeagueById(tournament.league_id) : await resolveLeague(interaction);
-        const member = await interaction.guild.members.fetch(interaction.user.id);
-
-        if (!(await memberHasStaff(member, activeLeague))) {
+        // 7J-TOURNEYSTAFFSCOPE: per Hxxdie — tournaments are guild-wide,
+        // not scoped to one specific league, so gating this on a single
+        // resolved league's staff role never made sense (and produced the
+        // exact confusion Hxxdie hit — not obvious which league's staff
+        // would even apply). userCanUseLeagueSetup already correctly
+        // checks the guild owner, Administrator/Manage Server, and *any*
+        // active league's staff role in the guild — exactly "all league
+        // staff, guild admins, and guild owner" as asked for.
+        if (!(await userCanUseLeagueSetup(interaction, null))) {
           await interaction.reply({ content: 'Only staff/admins can confirm tournament match winners.', ephemeral: true });
           return;
         }
@@ -18978,6 +19041,13 @@ if (interaction.commandName === 'avatar') {
         }
       }
       await pool.query(`UPDATE tournaments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`, [tournamentId]);
+      // 7J-TOURNAMENTCATEGORY: cancellation is another way a tournament
+      // ends — clean up its temp channel here too, not just on normal
+      // completion.
+      if (tournament.temp_channel_id) {
+        const tempChannel = await interaction.guild.channels.fetch(tournament.temp_channel_id).catch(() => null);
+        if (tempChannel) await tempChannel.delete('Tournament cancelled').catch(() => null);
+      }
       const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
       await updateTournamentPanel(interaction.guild, refreshedTournament).catch(() => null);
       const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament);
@@ -19026,6 +19096,14 @@ if (interaction.commandName === 'avatar') {
           const panelMessage = await panelChannel.messages.fetch(panelResult.rows[0].message_id).catch(() => null);
           if (panelMessage) await panelMessage.delete().catch(() => null);
         }
+      }
+
+      // 7J-TOURNAMENTCATEGORY: catch-all cleanup in case a temp channel
+      // still exists (e.g. deleting a tournament that was never properly
+      // cancelled/completed first).
+      if (tournament.temp_channel_id) {
+        const tempChannel = await interaction.guild.channels.fetch(tournament.temp_channel_id).catch(() => null);
+        if (tempChannel) await tempChannel.delete('Tournament deleted').catch(() => null);
       }
 
       await pool.query(`DELETE FROM tournaments WHERE id = $1`, [tournamentId]);
@@ -35984,10 +36062,6 @@ async function autoCreateGuildMultiChannelPanels(guild) {
     ['bank', 'bank', true],
     ['profile', 'member-profile', true],
     ['recruitment', 'recruitment', false],
-    // 7J-TOURNAMENTAUTOSETUP: per Hxxdie's discussion — Premium-gated like
-    // the other optional channels here, so a Free Tier guild doesn't get a
-    // channel created for a feature it can't use.
-    ['tournament', 'tournaments', true],
   ];
   const panelSpecs = allPanelSpecs
     .filter(([, , premiumOnly]) => !premiumOnly || isPremium)
@@ -35997,18 +36071,31 @@ async function autoCreateGuildMultiChannelPanels(guild) {
     if (!channel) continue;
     await postOrRefreshMultiChannelPanel(guild, panelType, channel).catch(() => null);
     created.push(channel);
-    // 7J-TOURNAMENTAUTOSETUP: the standard multi_channel_panels flow only
-    // tracks the panel message itself — /tournament actually reads its
-    // channel from guild_tournament_settings (same table the manual
-    // /settournamentchannel command writes to), so that needs setting
-    // explicitly here or the freshly-created channel wouldn't actually be
-    // used by anything.
-    if (panelType === 'tournament') {
+  }
+
+  // 7J-TOURNAMENTCATEGORY: per Hxxdie — tournaments get their own category
+  // now, not folded into the shared "GG Sports" category. "Tournaments" is
+  // where staff create tournaments and the registration panel posts (same
+  // multi_channel_panel type as before, just relocated); "Tournament
+  // History" is a plain destination channel — past brackets and champions
+  // get archived there once a tournament completes and its temporary
+  // per-tournament channel gets deleted. Still Premium-gated like the
+  // other optional channels.
+  if (isPremium) {
+    const tournamentCategory = await guild.channels.create({ name: '🏆 Tournaments', type: ChannelType.GuildCategory }).catch(() => null);
+    if (tournamentCategory) {
+      const tournamentChannel = await guild.channels.create({ name: 'tournaments', type: ChannelType.GuildText, parent: tournamentCategory.id }).catch(() => null);
+      const tournamentHistoryChannel = await guild.channels.create({ name: 'tournament-history', type: ChannelType.GuildText, parent: tournamentCategory.id }).catch(() => null);
+      if (tournamentChannel) {
+        await postOrRefreshMultiChannelPanel(guild, 'tournament', tournamentChannel).catch(() => null);
+        created.push(tournamentChannel);
+      }
+      if (tournamentHistoryChannel) created.push(tournamentHistoryChannel);
       await pool.query(
-        `INSERT INTO guild_tournament_settings (guild_id, tournament_channel_id, updated_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (guild_id) DO UPDATE SET tournament_channel_id = $2, updated_at = NOW()`,
-        [guild.id, channel.id]
+        `INSERT INTO guild_tournament_settings (guild_id, tournament_channel_id, tournament_history_channel_id, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (guild_id) DO UPDATE SET tournament_channel_id = $2, tournament_history_channel_id = $3, updated_at = NOW()`,
+        [guild.id, tournamentChannel?.id || null, tournamentHistoryChannel?.id || null]
       ).catch(() => null);
     }
   }
@@ -41003,14 +41090,47 @@ async function createMaddenTradeNegotiationHub(guildId, league, member, userId, 
     };
   }
 
+  // 7J-NOSELFTRADE: per Hxxdie — same fix as the generic negotiation
+  // system. listing.submitted_by is the current owner of the player's
+  // team; if that's the same person opening the negotiation, they're
+  // trying to trade with their own team.
+  if (listing.submitted_by && String(listing.submitted_by) === String(userId)) {
+    return {
+      ok: false,
+      embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription("You can't start a trade negotiation with your own team.").setFooter({ text: 'GG Sports • 7J-10BX-G Private Negotiation Workflow' }).setTimestamp(),
+      components: [],
+    };
+  }
+
   const userTeam = member ? await getMemberTeamForLeague(member, league) : null;
+
+  // 7J-CPUNEGOTIATION: per Hxxdie — a CPU-owned team's listing.submitted_by
+  // is genuinely null (no real GM), so this negotiation would otherwise sit
+  // waiting forever on a dual confirmation that can never actually happen.
+  // Blocks outright if this league doesn't allow CPU trades at all
+  // (matches the generic, non-Madden negotiation system's existing
+  // behavior); otherwise proceeds but immediately marks the CPU side as
+  // confirmed, since requiring a button click from a user who doesn't
+  // exist was the actual bug.
+  const isCpuTarget = !listing.submitted_by;
+  if (isCpuTarget) {
+    const cpuCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+    if (cpuCustomSettings.cpu_trades_allowed === false) {
+      return {
+        ok: false,
+        embed: new EmbedBuilder().setTitle('Madden Trade Negotiation Hub').setColor(0xED4245).setDescription(`**${maddenTeamDisplayName(listing.team_name)}** does not currently have an owner assigned, and this league does not allow trades with CPU-controlled teams (League Customization → Trades).`).setFooter({ text: 'GG Sports • 7J-10BX-G Private Negotiation Workflow' }).setTimestamp(),
+        components: [],
+      };
+    }
+  }
+
   const negotiationId = randomUUID();
   await pool.query(
     `INSERT INTO madden_trade_negotiations (
        id, guild_id, league_id, player_key, player_name, listing_team, requesting_team,
-       listing_user_id, requesting_user_id, status, created_at, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', NOW(), NOW())`,
-    [negotiationId, guildId, league.league_id, listing.player_key || null, listing.player_name, listing.team_name, userTeam?.name || null, listing.submitted_by || null, userId]
+       listing_user_id, requesting_user_id, status, cpu_target, created_at, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', $10, NOW(), NOW())`,
+    [negotiationId, guildId, league.league_id, listing.player_key || null, listing.player_name, listing.team_name, userTeam?.name || null, listing.submitted_by || null, userId, isCpuTarget]
   );
   const negotiation = await getMaddenTradeNegotiationById(negotiationId);
   if (userTeam?.name && listing.team_name) {
@@ -41115,11 +41235,15 @@ async function createMaddenTradeNegotiationThread(negotiation, discordClient, fa
   await thread.members?.add?.(negotiation.listing_user_id).catch(() => null);
   await thread.members?.add?.(negotiation.requesting_user_id).catch(() => null);
   await pool.query(`UPDATE madden_trade_negotiations SET thread_id = $1, status = 'interested', updated_at = NOW() WHERE id = $2`, [thread.id, negotiation.id]);
+  // 7J-CPUNEGOTIATION: negotiation.listing_user_id is genuinely null for a
+  // CPU-controlled team — filtering it out here avoids a literal broken
+  // "<@null>" mention appearing in the thread-opening message.
+  const openingMentionIds = [negotiation.listing_user_id, negotiation.requesting_user_id].filter(Boolean);
   await thread.send({
-    content: `<@${negotiation.listing_user_id}> <@${negotiation.requesting_user_id}> private trade negotiation opened for **${negotiation.player_name}**.`,
+    content: `${openingMentionIds.map(id => `<@${id}>`).join(' ')} private trade negotiation opened for **${negotiation.player_name}**${negotiation.cpu_target ? ' (CPU-controlled team, no owner to notify)' : ''}.`,
     embeds: [buildMaddenTradeNegotiationHubEmbed(league, { player_name: negotiation.player_name, team_name: negotiation.listing_team, submitted_by: negotiation.listing_user_id, seeking: 'See trade block listing', notes: 'Private negotiation thread' }, negotiation, negotiation.requesting_user_id)],
     components: buildMaddenTradeNegotiationThreadButtons(negotiation.id),
-    allowedMentions: { users: [negotiation.listing_user_id, negotiation.requesting_user_id], roles: [] },
+    allowedMentions: { users: openingMentionIds, roles: [] },
   }).catch(() => null);
 
   console.log('[7J-10BX-A NEGOTIATION THREAD] ' + JSON.stringify({
@@ -41372,19 +41496,26 @@ async function analyzeMaddenNegotiationPackage(guildId, league, negotiation, pkg
 
 function buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg) {
   const requestingConfirmed = negotiation?.requesting_confirmed_by ? `✅ <@${negotiation.requesting_confirmed_by}>` : '⏳ Waiting';
-  const listingConfirmed = negotiation?.listing_confirmed_by ? `✅ <@${negotiation.listing_confirmed_by}>` : '⏳ Waiting';
+  // 7J-CPUNEGOTIATION: no real user to @-mention on a CPU-controlled team —
+  // show it as auto-approved instead of a broken mention or a permanent
+  // "Waiting" that could never resolve.
+  const listingConfirmed = negotiation?.cpu_target
+    ? '🤖 CPU-controlled (auto-approved)'
+    : (negotiation?.listing_confirmed_by ? `✅ <@${negotiation.listing_confirmed_by}>` : '⏳ Waiting');
   return new EmbedBuilder()
     .setTitle('Dual Confirmation Required')
     .setColor(0xED4245)
-    .setDescription('Both owners must confirm this package before it is sent to the trade committee. No screenshot will be requested because the negotiation hub already has the trade data.')
+    .setDescription(negotiation?.cpu_target
+      ? 'This team has no owner — only the requesting GM needs to confirm this package before it is sent to the trade committee. No screenshot will be requested because the negotiation hub already has the trade data.'
+      : 'Both owners must confirm this package before it is sent to the trade committee. No screenshot will be requested because the negotiation hub already has the trade data.')
     .addFields(
       { name: 'League', value: league?.league_name || 'Madden League', inline: true },
       { name: 'Target', value: `**${negotiation.player_name}**`, inline: true },
       { name: 'From', value: `${maddenTeamDisplayName(negotiation.requesting_team || 'Offering Team')} • <@${negotiation.requesting_user_id}>`, inline: false },
-      { name: 'To', value: `${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')} • <@${negotiation.listing_user_id}>`, inline: false },
+      { name: 'To', value: `${maddenTeamDisplayName(negotiation.listing_team || 'Listing Team')}${negotiation.listing_user_id ? ' • <@' + negotiation.listing_user_id + '>' : ' • No owner (CPU)'}`, inline: false },
       { name: 'Selected Package', value: maddenSafeEmbedText(maddenTradeNegotiationPackageTitle(pkg), 1024), inline: false },
       { name: 'Value Summary', value: `Package: **${Number(pkg.total || 0).toFixed(1)}** • Difference: **${Number(pkg.diff || 0).toFixed(1)}** • Fit: **${Number(pkg.fit_score || 0)}**`, inline: false },
-      { name: 'Confirmations', value: `Requesting Owner: ${requestingConfirmed}\nListing Owner: ${listingConfirmed}`, inline: false }
+      { name: 'Confirmations', value: `From (${maddenTeamDisplayName(negotiation.requesting_team || 'Offering Team')}): ${requestingConfirmed}\nTo (${maddenTeamDisplayName(negotiation.listing_team || 'Other Team')}): ${listingConfirmed}`, inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-10BX-F Dual Confirmation' })
     .setTimestamp();
@@ -41688,6 +41819,9 @@ async function recordMaddenNegotiationConfirmation(negotiation, userId) {
 }
 
 function maddenNegotiationBothConfirmed(negotiation) {
+  // 7J-CPUNEGOTIATION: a CPU-targeted negotiation only ever needs the
+  // requesting side to confirm — there's no real GM on the other side.
+  if (negotiation?.cpu_target) return Boolean(negotiation?.requesting_confirmed_by);
   return Boolean(negotiation?.requesting_confirmed_by && negotiation?.listing_confirmed_by);
 }
 
