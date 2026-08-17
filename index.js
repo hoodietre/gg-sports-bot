@@ -37511,6 +37511,16 @@ const MULTI_CHANNEL_DASHBOARD_MAP = {
   bank_panel_channels: 'bank',
   profile_panel_channels: 'profile',
   recruitment_panel_channels: 'recruitment',
+  // 7J-TOURNEYPANELREFRESH: per Hxxdie — Tournament Manager is a registered
+  // multi-channel panel type (getMultiChannelPanelInfo already has a
+  // 'tournament' entry, and it's posted via the same
+  // postOrRefreshMultiChannelPanel path as the other 7) but was never added
+  // to this map, so it silently never showed up as an option in the
+  // Multi-Channel Panels refresh menu — the only way to fix a stale posted
+  // copy was to trigger one of the code paths that calls
+  // refreshAllMultiChannelPanelPostings indirectly (create/cancel/delete/
+  // complete a tournament), with no direct manual way to do it on demand.
+  tournament_panel_channels: 'tournament',
 };
 
 // 7J-112SERVERSETUP: sentinel passed as "leagueId" to buildMultiChannelPanelManagerPayload
