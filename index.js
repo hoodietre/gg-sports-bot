@@ -8412,7 +8412,7 @@ async function saveTournamentPanel(tournamentId, guildId, channelId, messageId) 
 // is the actual entry point for that engine rather than a wrapper around
 // working commands.
 // ---------------------------------------------------------------------------
-async function buildTournamentManagerHomePayload(guild) {
+async function buildTournamentManagerHomePayload(guild, { includeAdminBackButton = true } = {}) {
   const result = await pool.query(
     `SELECT * FROM tournaments WHERE guild_id = $1 AND status IN ('open','closed','active') ORDER BY created_at DESC LIMIT 25`,
     [guild.id]
@@ -8455,9 +8455,18 @@ async function buildTournamentManagerHomePayload(guild) {
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('tourneypanel_create').setLabel('Create Tournament').setEmoji('➕').setStyle(ButtonStyle.Success)
   ));
-  components.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Admin Panel').setStyle(ButtonStyle.Secondary)
-  ));
+  // 7J-TOURNAMENTAUTOSETUP: this payload is now also posted as the public,
+  // standing panel in the auto-created #tournaments channel (see
+  // getMultiChannelPanelInfo) — "Back to Admin Panel" is meaningless there
+  // since a regular member never came from the Admin Panel to begin with.
+  // Create Tournament and Set Channel stay visible either way since both
+  // are already staff-gated at click time, matching how Force Win/Reset
+  // Game buttons work elsewhere in this codebase.
+  if (includeAdminBackButton) {
+    components.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Admin Panel').setStyle(ButtonStyle.Secondary)
+    ));
+  }
   return { embeds: [embed], components };
 }
 
@@ -9604,7 +9613,7 @@ function getMultiChannelPanelInfo(panelType) {
     // behavior drift between the two paths.
     tournament: {
       label: 'Tournament Manager',
-      build: async (guild) => buildTournamentManagerHomePayload(guild),
+      build: async (guild) => buildTournamentManagerHomePayload(guild, { includeAdminBackButton: false }),
     },
   };
   return registry[panelType] || null;
@@ -35925,14 +35934,29 @@ async function autoCreateGuildMultiChannelPanels(guild) {
   // rather than posting the same content to both.
   const guildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
   if (isPremium) {
-    if (!guildSettings?.ticket_channel_id) {
+    // 7J-STALECHANNELCHECK: per Hxxdie — Support channel wasn't getting
+    // (re)created during auto-setup. Root cause: this only checked whether
+    // a channel ID was *stored*, not whether that channel still actually
+    // exists — if it was deleted at some point (manually, or during
+    // testing cleanup) without the stored ID ever being cleared, this
+    // silently treated it as "already set up" forever. Now verifies the
+    // channel genuinely resolves before trusting it, same fix class as the
+    // Check Bot Permissions audit elsewhere in this file. Applied to both
+    // Tickets and Support since both share the identical risk.
+    const existingTicketChannel = guildSettings?.ticket_channel_id
+      ? await guild.channels.fetch(guildSettings.ticket_channel_id).catch(() => null)
+      : null;
+    if (!existingTicketChannel) {
       const ticketChannel = await guild.channels.create({ name: 'tickets', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
       if (ticketChannel) {
         await setGuildTicketSettings(guild.id, guild.name, { ticketChannelId: ticketChannel.id });
         created.push(ticketChannel);
       }
     }
-    if (!guildSettings?.support_channel_id) {
+    const existingSupportChannel = guildSettings?.support_channel_id
+      ? await guild.channels.fetch(guildSettings.support_channel_id).catch(() => null)
+      : null;
+    if (!existingSupportChannel) {
       const supportChannel = await guild.channels.create({ name: 'support', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
       if (supportChannel) {
         await setGuildTicketSettings(guild.id, guild.name, { supportChannelId: supportChannel.id });
@@ -35951,14 +35975,20 @@ async function autoCreateGuildMultiChannelPanels(guild) {
   // paywalled feature) and turns the feature on at the same time — no
   // point creating the channels and leaving the feature off.
   const refreshedGuildSettings = await getGuildSettings(guild.id, guild.name).catch(() => null);
-  if (!refreshedGuildSettings?.welcome_channel_id) {
+  const existingWelcomeChannel = refreshedGuildSettings?.welcome_channel_id
+    ? await guild.channels.fetch(refreshedGuildSettings.welcome_channel_id).catch(() => null)
+    : null;
+  if (!existingWelcomeChannel) {
     const welcomeChannel = await guild.channels.create({ name: 'welcome', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
     if (welcomeChannel) {
       await setGuildWelcomeChannel(guild.id, guild.name, welcomeChannel.id);
       created.push(welcomeChannel);
     }
   }
-  if (!refreshedGuildSettings?.leave_channel_id) {
+  const existingLeaveChannel = refreshedGuildSettings?.leave_channel_id
+    ? await guild.channels.fetch(refreshedGuildSettings.leave_channel_id).catch(() => null)
+    : null;
+  if (!existingLeaveChannel) {
     const leaveChannel = await guild.channels.create({ name: 'leave', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
     if (leaveChannel) {
       await setGuildLeaveChannel(guild.id, guild.name, leaveChannel.id);
@@ -69000,6 +69030,11 @@ const LEAGUE_CUSTOMIZATION_SECTIONS = [
   { value: 'standings', label: 'Standings', description: 'W/L, points system, ties', emoji: '📊' },
   { value: 'playoffs', label: 'Playoffs', description: 'Team count, seeding, series length per round', emoji: '🏆' },
   { value: 'trades', label: 'Trades', description: 'CPU trades, trade limit per season', emoji: '🔀' },
+  // 7J-ROSTERSECTION: per Hxxdie — Team Rosters (Pro-Am/Club) was living in
+  // the Trades section, which was an awkward fit — it's about who can help
+  // manage a team's roster in Discord, nothing to do with trading. Split
+  // into its own section.
+  { value: 'rosters', label: 'Team Rosters', description: 'Let team owners add players/coaches/GMs to help manage the team', emoji: '👥' },
   { value: 'awards', label: 'Awards', description: 'Which awards this league tracks', emoji: '🎖️' },
   { value: 'conferences', label: 'Team Conferences/Divisions', description: 'Turn conferences/divisions on/off, assign each team', emoji: '🗺️' },
   { value: 'wagers', label: 'Wagers', description: '1v1 game-thread wagers between owners, separate from the sportsbook', emoji: '💰' },
@@ -69194,7 +69229,6 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       .addFields(
         { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
         { name: 'Trade Limit Per Season', value: customSettings.trade_limit_per_season ? `${customSettings.trade_limit_per_season} trades` : 'Unlimited', inline: true },
-        { name: 'Team Rosters (Pro-Am/Club)', value: customSettings.use_team_roster ? 'On — owners can add players/coaches/GMs' : 'Off', inline: true },
         { name: 'Committee Votes Needed', value: String(customSettings.trade_committee_votes_needed || 3), inline: true },
         { name: 'Current Committee Size', value: committeeSize, inline: true },
       )
@@ -69204,10 +69238,28 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('leaguecustom_toggle_cpu:' + leagueId).setLabel(customSettings.cpu_trades_allowed === false ? 'Allow CPU Trades' : 'Disallow CPU Trades').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('leaguecustom_tradelimit_modal:' + leagueId).setLabel('Edit Trade Limit').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId('leaguecustom_toggle_roster:' + leagueId).setLabel(customSettings.use_team_roster ? 'Disable Team Rosters' : 'Enable Team Rosters').setStyle(ButtonStyle.Secondary),
       ),
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('leaguecustom_committeevotes_modal:' + leagueId).setLabel('Edit Committee Votes Needed').setStyle(ButtonStyle.Primary),
+      ),
+      buildLeagueCustomizationBackRow(leagueId),
+    ];
+  } else if (section === 'rosters') {
+    // 7J-ROSTERSECTION: relocated out of Trades, per Hxxdie — this is about
+    // who can help manage a team's roster in Discord (Pro-Am/Club style),
+    // unrelated to trading.
+    embed = new EmbedBuilder()
+      .setTitle(`👥 Team Rosters • ${league.league_name}`)
+      .setColor(0x5865F2)
+      .setDescription('When enabled, a team owner can add other members as player/coach/GM to help manage their team. GM is treated as functionally equivalent to the owner for actions gated on "do you own this team" (score reporting, trades, etc.) — player/coach are organizational only.')
+      .addFields(
+        { name: 'Team Rosters', value: customSettings.use_team_roster ? 'On — owners can add players/coaches/GMs' : 'Off', inline: true },
+      )
+      .setFooter({ text: 'GG Sports • League Customization' })
+      .setTimestamp();
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_roster:' + leagueId).setLabel(customSettings.use_team_roster ? 'Disable Team Rosters' : 'Enable Team Rosters').setStyle(ButtonStyle.Secondary),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
