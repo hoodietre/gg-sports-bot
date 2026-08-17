@@ -3,29 +3,20 @@
 # renders text via sharp -> librsvg, which needs a real font installed to
 # lay out glyphs at all. Railway's default Nixpacks Node build has zero
 # fonts installed, so every character silently falls back to librsvg's
-# "tofu" placeholder box instead of failing loudly — this is *not* a bug in
-# the SVG generation itself, confirmed by rendering the exact same SVG in a
-# sandbox that does have fonts installed, where it renders correctly.
+# "tofu" placeholder box instead of failing loudly.
 #
-# fonts-dejavu-core installs DejaVu Sans/Serif/Mono, a solid, widely-
-# available, good-Unicode-coverage font family — index.js's SVG font-family
-# stacks now list "DejaVu Sans" first specifically to match this package.
-#
-# This file only takes effect on Railway's *next* build after it's added to
-# the repo — it isn't something index.js alone can fix, since it configures
-# the build environment itself, not application code.
+# 7J-BRACKETFONT-3: aptPkgs + FONTCONFIG_FILE alone (see below) turned out
+# not to be reliable on Railway's Nixpacks image in practice — confirmed by
+# live testing, still tofu boxes on a fresh redeploy. The real fix now lives
+# in index.js: it bundles its own font files (assets/fonts/DejaVuSans.ttf +
+# DejaVuSans-Bold.ttf — add these two files to the repo root) and generates
+# a minimal, fully self-contained fontconfig config pointed only at that
+# bundled directory, with no dependency on aptPkgs succeeding or the
+# system's default fontconfig resolution working at all. This block is kept
+# as a harmless secondary safety net in case it does end up helping, but
+# the bundled-font path in index.js is what actually matters now.
 [phases.setup]
 aptPkgs = ["fonts-dejavu-core", "fontconfig"]
 
-# 7J-BRACKETFONT-2: even with fontconfig installed via aptPkgs above,
-# Railway's Nixpacks runtime still failed to auto-locate fontconfig's own
-# config file at runtime ("Fontconfig error: Cannot load default config
-# file: No such file: (null)") — a known gap in how Nixpacks' apt-installed
-# packages interact with fontconfig's default path resolution inside a
-# Nix-based image (confirmed as a real recurring issue for exactly this
-# Railway + sharp + SVG-in-Discord-bot combination, not something specific
-# to this codebase). Explicitly pointing FONTCONFIG_FILE at the config file
-# apt's fontconfig package actually installs (/etc/fonts/fonts.conf on
-# Debian) sidesteps the broken auto-detection entirely.
 [variables]
 FONTCONFIG_FILE = "/etc/fonts/fonts.conf"

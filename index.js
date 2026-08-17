@@ -28,20 +28,44 @@ import zlib from 'zlib';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import http from 'http';
 
 const { Pool } = pkg;
 
-// 7J-BRACKETFONT-2: belt-and-suspenders fallback for the fontconfig fix in
-// nixpacks.toml — sets the same FONTCONFIG_FILE value at runtime in case
-// Railway doesn't carry nixpacks.toml's [variables] section through to the
-// running container for some reason. Only sets it if it isn't already
-// present (never overrides an intentional operator-set value), and only
-// applies to Linux deploys — harmless no-op locally on other OSes since
-// this path won't exist there and sharp/librsvg will just fall back to
-// whatever font resolution already worked before.
-if (!process.env.FONTCONFIG_FILE && fs.existsSync('/etc/fonts/fonts.conf')) {
-  process.env.FONTCONFIG_FILE = '/etc/fonts/fonts.conf';
+// 7J-BRACKETFONT-3: per Hxxdie's live testing — the aptPkgs + FONTCONFIG_FILE
+// fix in nixpacks.toml still produced tofu boxes on a fresh redeploy, so
+// Railway's Nixpacks environment is not reliably wiring up the system
+// fontconfig install the way it should. Rather than keep chasing that
+// (apt/Nix package availability on Railway's build image is outside this
+// codebase's control), this bundles the font directly in the repo
+// (assets/fonts/DejaVuSans.ttf + DejaVuSans-Bold.ttf — add these two files
+// to the repo alongside index.js) and generates a minimal, self-contained
+// fontconfig config that points ONLY at that bundled directory — no
+// dependency on aptPkgs succeeding, no dependency on the system's default
+// fontconfig resolution working at all. If the bundled font files aren't
+// present (e.g. not yet added to the repo), this falls back to the
+// previous best-effort system-fontconfig path.
+try {
+  const bundledFontDir = path.join(process.cwd(), 'assets', 'fonts');
+  if (fs.existsSync(path.join(bundledFontDir, 'DejaVuSans.ttf'))) {
+    const fontCacheDir = path.join(os.tmpdir(), 'gg-sports-fontcache');
+    fs.mkdirSync(fontCacheDir, { recursive: true });
+    const generatedFontsConf = path.join(os.tmpdir(), 'gg-sports-fonts.conf');
+    fs.writeFileSync(generatedFontsConf, `<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>${bundledFontDir}</dir>
+  <cachedir>${fontCacheDir}</cachedir>
+</fontconfig>
+`);
+    process.env.FONTCONFIG_FILE = generatedFontsConf;
+    console.log('[7J-BRACKETFONT-3] Using bundled font config:', generatedFontsConf, '-> font dir:', bundledFontDir);
+  } else if (!process.env.FONTCONFIG_FILE && fs.existsSync('/etc/fonts/fonts.conf')) {
+    process.env.FONTCONFIG_FILE = '/etc/fonts/fonts.conf';
+  }
+} catch (error) {
+  console.error('[7J-BRACKETFONT-3] Bundled font config setup failed, falling back to system default:', error?.message || error);
 }
 
 const client = new Client({
@@ -9191,7 +9215,7 @@ async function renderTournamentBracketPng(guild, tournament, matches) {
   // Round labels + match boxes
   roundNumbers.forEach((r, ri) => {
     const x = marginLeft + ri * (boxW + roundGapX);
-    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans, Arial, sans-serif" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${tournamentBracketEscapeXml(tournamentBracketRoundLabel(r, roundNumbers.length, ri))}</text>`);
+    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${tournamentBracketEscapeXml(tournamentBracketRoundLabel(r, roundNumbers.length, ri))}</text>`);
     rounds[r].forEach((m, i) => {
       const yCenter = centers[r][i];
       const y = yCenter - boxH / 2;
@@ -9202,8 +9226,8 @@ async function renderTournamentBracketPng(guild, tournament, matches) {
       parts.push(`
         <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="8" fill="#2b2d31" stroke="#1e1f22" stroke-width="2"/>
         <line x1="${x}" y1="${yCenter}" x2="${x + boxW}" y2="${yCenter}" stroke="#1e1f22" stroke-width="1"/>
-        <text x="${x + 12}" y="${yCenter - 12}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="${p1Won ? 'bold' : 'normal'}" fill="${p1Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p1Name).slice(0, 28)}</text>
-        <text x="${x + 12}" y="${yCenter + 20}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="${p2Won ? 'bold' : 'normal'}" fill="${p2Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p2Name).slice(0, 28)}</text>
+        <text x="${x + 12}" y="${yCenter - 12}" font-family="DejaVu Sans" font-size="15" font-weight="${p1Won ? 'bold' : 'normal'}" fill="${p1Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p1Name).slice(0, 28)}</text>
+        <text x="${x + 12}" y="${yCenter + 20}" font-family="DejaVu Sans" font-size="15" font-weight="${p2Won ? 'bold' : 'normal'}" fill="${p2Won ? '#3ba55d' : '#dcddde'}">${tournamentBracketEscapeXml(p2Name).slice(0, 28)}</text>
       `);
     });
   });
@@ -47700,7 +47724,7 @@ async function buildGameThreadOwnersAvatarComposite(awayOwnerId, homeOwnerId) {
   const canvasWidth = panelWidth * 2 + gap;
 
   const vsBadgeSvg = `<svg width="${gap}" height="${panelHeight}" xmlns="http://www.w3.org/2000/svg">
-    <text x="50%" y="50%" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" font-weight="bold" fill="#FFFFFF"
+    <text x="50%" y="50%" font-family="DejaVu Sans" font-size="34" font-weight="bold" fill="#FFFFFF"
       stroke="#000000" stroke-width="2" text-anchor="middle" dominant-baseline="middle">VS</text>
   </svg>`;
 
