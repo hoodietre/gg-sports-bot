@@ -10236,8 +10236,23 @@ async function refreshAllMultiChannelPanelPostings(guild, panelType) {
         notifyOwnerOfBotPermissionIssue(guild, `panel:${panelType}:${row.channel_id}`, row.channel_id,
           `I can't see the channel your **${info.label}** is posted in, so it hasn't been updating.`).catch(() => null);
       }
-      return null;
+      return { __error: err };
     });
+    // 7J-PERMAUDITCLEANUP: per Hxxdie — a deleted channel (Discord error
+    // 10003, "Unknown Channel") was getting retried by this exact function
+    // on every future refresh, forever, since nothing ever cleared the
+    // stale multi_channel_panels row — pure background noise with no path
+    // to resolution short of manually running the Bot Permission Check
+    // audit. This is the actual place that noise was coming from, so the
+    // cleanup belongs here too, not just in the on-demand audit.
+    if (channel?.__error) {
+      if ((channel.__error?.code ?? channel.__error?.rawError?.code) === 10003) {
+        await pool.query(`DELETE FROM multi_channel_panels WHERE guild_id = $1 AND panel_type = $2 AND channel_id = $3`, [guild.id, panelType, row.channel_id]).catch(() => null);
+        console.warn(`[PANEL REFRESH] ${panelType} channel ${row.channel_id} no longer exists — stale reference cleared, will not be retried.`);
+      }
+      failed++;
+      continue;
+    }
     if (!channel || !channel.isTextBased()) { failed++; continue; }
 
     const message = await channel.messages.fetch(row.message_id).catch(err => {
@@ -20174,9 +20189,16 @@ if (interaction.commandName === 'avatar') {
         embed.addFields({ name: `⚠️ Permission issues (${permIssues.length})`, value: formatList(permIssues, 15) });
       }
       if (deleted.length) {
-        embed.addFields({ name: `🗑️ Deleted channels, need reconfiguring (${deleted.length})`, value: formatList(deleted, 15) });
+        // 7J-PERMAUDITCLEANUP: the label text below now matches what
+        // auditGuildChannelPermissions actually does — the stale reference
+        // is already cleared by the time this embed renders, not something
+        // staff still need to go fix manually.
+        embed.addFields({ name: `🗑️ Deleted channels, references cleared (${deleted.length})`, value: formatList(deleted, 15) });
       }
       embed.addFields({ name: 'For permission issues', value: 'Edit that channel and make sure the GG Sports bot role has View Channel, Send Messages, Embed Links, and Read Message History.' });
+      if (deleted.length) {
+        embed.addFields({ name: 'For deleted channels', value: 'These were already using a deleted channel, so the reference has been cleared automatically — no more repeated background failures. Reconfigure a new channel for any of these in Server Setup / Commissioner Panel whenever you\'re ready.' });
+      }
 
       await interaction.editReply({ content: null, embeds: [embed] });
       return;
@@ -37082,29 +37104,49 @@ const LEAGUE_OWNED_ROLE_COLUMNS = ['league_role_id', 'staff_role_id', 'trade_com
 // configured channel across every league in the guild (plus the 7 guild-wide
 // multi-channel panels) in one pass, so a commissioner can catch a broken
 // permission before it silently breaks something for weeks, per Hxxdie's ask.
+//
+// 7J-PERMAUDITCLEANUP: per Hxxdie — a deleted channel was being reported
+// every single time this ran, forever, because nothing ever cleared the
+// stale reference — the audit was purely diagnostic, not self-healing. Worse,
+// every OTHER feature that tries to post to that same stale channel_id
+// (panel refreshes, history posts, etc.) was silently failing against it in
+// the background continuously, since those all just .catch(() => null) a
+// dead channel fetch with no cleanup either. Now genuinely deleted channels
+// (Discord error code 10003 specifically — not a permissions issue, which
+// stays reportable-but-not-auto-fixed since that's something staff need to
+// actually go grant, not something this bot can clear its way out of) get
+// their stale reference cleaned up automatically: multi_channel_panels rows
+// get deleted outright (nothing left to edit), league_settings columns get
+// nulled back to "not configured" so features correctly detect that instead
+// of retrying a dead ID forever.
 async function auditGuildChannelPermissions(guild) {
   const REQUIRED_PERMS = ['ViewChannel', 'SendMessages', 'EmbedLinks', 'ReadMessageHistory'];
   const problems = [];
   const checked = new Set();
 
   async function checkOne(channelId, label) {
-    if (!channelId || checked.has(channelId)) return;
+    if (!channelId || checked.has(channelId)) return null;
     checked.add(channelId);
     const channel = await guild.channels.fetch(channelId).catch(err => ({ __error: err }));
     if (!channel || channel.__error) {
       const code = channel?.__error?.code;
-      if (code === 10003) problems.push({ channelId, label, issue: 'Channel no longer exists (deleted) — reconfigure this in setup.' });
-      else problems.push({ channelId, label, issue: `Could not access this channel (${channel?.__error?.message || 'unknown error'}).` });
-      return;
+      if (code === 10003) {
+        const problem = { channelId, label, issue: 'Channel no longer exists (deleted) — reference cleared automatically.', deleted: true };
+        problems.push(problem);
+        return problem;
+      }
+      problems.push({ channelId, label, issue: `Could not access this channel (${channel?.__error?.message || 'unknown error'}).` });
+      return null;
     }
-    if (!channel.isTextBased?.()) return;
+    if (!channel.isTextBased?.()) return null;
     const me = await guild.members.fetchMe().catch(() => null);
-    if (!me) return;
+    if (!me) return null;
     const perms = channel.permissionsFor(me);
     const missing = REQUIRED_PERMS.filter(p => !perms?.has(PermissionFlagsBits[p]));
     if (missing.length) {
       problems.push({ channelId, label, issue: `Missing: ${missing.join(', ')}` });
     }
+    return null;
   }
 
   const leaguesResult = await pool.query(`SELECT league_id FROM leagues WHERE guild_id = $1 AND is_active = TRUE`, [guild.id]).catch(() => ({ rows: [] }));
@@ -37112,14 +37154,25 @@ async function auditGuildChannelPermissions(guild) {
     const league = await getLeagueById(row.league_id).catch(() => null);
     if (!league) continue;
     for (const col of LEAGUE_OWNED_CHANNEL_COLUMNS) {
-      if (league[col]) await checkOne(league[col], `${league.league_name} — ${col.replace(/_channel_id$/, '').replace(/_/g, ' ')}`);
+      if (!league[col]) continue;
+      const deletedProblem = await checkOne(league[col], `${league.league_name} — ${col.replace(/_channel_id$/, '').replace(/_/g, ' ')}`);
+      if (deletedProblem) {
+        await pool.query(`UPDATE league_settings SET ${col} = NULL WHERE league_id = $1`, [league.league_id]).catch(error => {
+          console.error(`[7J-PERMAUDITCLEANUP] Failed to clear ${col} for league ${league.league_id}:`, error?.message || error);
+        });
+      }
     }
   }
 
   const panelRows = await pool.query(`SELECT DISTINCT channel_id, panel_type FROM multi_channel_panels WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
   for (const row of panelRows.rows || []) {
     const info = getMultiChannelPanelInfo(row.panel_type);
-    await checkOne(row.channel_id, info?.label || row.panel_type);
+    const deletedProblem = await checkOne(row.channel_id, info?.label || row.panel_type);
+    if (deletedProblem) {
+      await pool.query(`DELETE FROM multi_channel_panels WHERE guild_id = $1 AND channel_id = $2`, [guild.id, row.channel_id]).catch(error => {
+        console.error(`[7J-PERMAUDITCLEANUP] Failed to remove stale multi_channel_panels row for channel ${row.channel_id}:`, error?.message || error);
+      });
+    }
   }
 
   return problems;
