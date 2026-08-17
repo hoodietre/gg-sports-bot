@@ -1022,6 +1022,11 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // 7J-LEAGUEBRACKETIMG: per Hxxdie — same visual bracket treatment the
+  // standalone Tournaments feature now has, applied to league playoffs too.
+  // Tracks the auto-updating bracket image message the same way
+  // tournament_panels.bracket_image_message_id does.
+  await pool.query(`ALTER TABLE league_playoff_brackets ADD COLUMN IF NOT EXISTS bracket_image_message_id TEXT`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_rules_panels (
       league_id UUID PRIMARY KEY REFERENCES leagues(league_id) ON DELETE CASCADE,
@@ -6240,8 +6245,134 @@ async function refreshPlayoffBracketPanel(guild, league) {
   const channel = await guild.channels.fetch(bracketState.channel_id).catch(() => null);
   if (!channel?.isTextBased?.()) return null;
   const message = await channel.messages.fetch(bracketState.message_id).catch(() => null);
-  if (!message) return null;
-  await message.edit({ embeds: [buildLivePlayoffBracketEmbed(league, bracketState)] }).catch(() => null);
+  if (message) {
+    await message.edit({ embeds: [buildLivePlayoffBracketEmbed(league, bracketState)] }).catch(() => null);
+  }
+  // 7J-LEAGUEBRACKETIMG: per Hxxdie — same visual bracket treatment the
+  // standalone Tournaments feature has (7J-BRACKETIMG), applied to league
+  // playoffs too. Same decouple-from-the-text-message-fetch reasoning as
+  // 7J-BRACKETIMGDECOUPLE: the image only actually needs the channel and
+  // its own tracked message ID, so it still attempts even if the text
+  // embed's message somehow failed to fetch/edit above.
+  await updateLeaguePlayoffBracketImage(guild, league, channel, bracketState.bracket_image_message_id, bracketState).catch(error => {
+    console.error('[7J-LEAGUEBRACKETIMG] bracket image update failed:', error?.stack || error?.message || error);
+  });
+  return message;
+}
+
+// 7J-LEAGUEBRACKETIMG: renders a real bracket graphic for league playoffs —
+// same sharp/SVG rendering approach as renderTournamentBracketPng (see
+// 7J-BRACKETIMG), adapted for playoff "series" (team vs team, best-of-N,
+// win counts) instead of tournament matches (player vs player, single
+// game). No Discord member lookups needed here — playoff bracket entries
+// are plain team-name strings already, not user IDs, so unlike the
+// tournament renderer this needs no guild member resolution at all.
+function leaguePlayoffBracketEscapeXml(text) {
+  return tournamentBracketEscapeXml(text);
+}
+
+async function renderLeaguePlayoffBracketPng(league, bracketState) {
+  const sharp = await getSharp();
+  if (!sharp) return null;
+  const bracket = Array.isArray(bracketState?.bracket) ? bracketState.bracket : [];
+  if (!bracket.length) return null;
+
+  const roundNumbers = bracket.map((_, i) => i);
+  const rounds = {};
+  roundNumbers.forEach(i => { rounds[i] = bracket[i] || []; });
+
+  const nameFor = (series, side) => {
+    const team = side === 'A' ? series.teamA : series.teamB;
+    if (!team) return series.bye ? '' : 'TBD';
+    const wins = side === 'A' ? series.winsA : series.winsB;
+    const label = team.name || 'Team';
+    return Number.isFinite(Number(wins)) ? `${label} (${wins})` : label;
+  };
+
+  const boxW = 260;
+  const boxH = 64;
+  const roundGapX = 80;
+  const vGap = 28;
+  const marginTop = 56;
+  const marginLeft = 30;
+
+  const firstRoundCount = rounds[roundNumbers[0]].length;
+  const totalHeight = marginTop + firstRoundCount * (boxH + vGap);
+  const totalWidth = marginLeft * 2 + roundNumbers.length * boxW + (roundNumbers.length - 1) * roundGapX;
+
+  const centers = {};
+  centers[roundNumbers[0]] = rounds[roundNumbers[0]].map((s, i) => marginTop + i * (boxH + vGap) + boxH / 2);
+  for (let ri = 1; ri < roundNumbers.length; ri++) {
+    const r = roundNumbers[ri];
+    const prev = centers[roundNumbers[ri - 1]];
+    centers[r] = rounds[r].map((s, i) => {
+      const c1 = prev[i * 2];
+      const c2 = prev[i * 2 + 1] !== undefined ? prev[i * 2 + 1] : c1;
+      return (c1 + c2) / 2;
+    });
+  }
+
+  const parts = [];
+
+  for (let ri = 0; ri < roundNumbers.length - 1; ri++) {
+    const r = roundNumbers[ri];
+    const nr = roundNumbers[ri + 1];
+    if (!rounds[nr].length) continue;
+    const x1 = marginLeft + ri * (boxW + roundGapX) + boxW;
+    const xMid = x1 + roundGapX / 2;
+    const x2 = marginLeft + (ri + 1) * (boxW + roundGapX);
+    rounds[r].forEach((s, i) => {
+      const y1 = centers[r][i];
+      const yNext = centers[nr][Math.floor(i / 2)];
+      if (yNext === undefined) return;
+      parts.push(`<path d="M ${x1} ${y1} H ${xMid} V ${yNext} H ${x2}" stroke="#4a4f57" stroke-width="2" fill="none"/>`);
+    });
+  }
+
+  roundNumbers.forEach((r, ri) => {
+    const x = marginLeft + ri * (boxW + roundGapX);
+    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${leaguePlayoffBracketEscapeXml(tournamentBracketRoundLabel(r + 1, roundNumbers.length, ri))}</text>`);
+    rounds[r].forEach((series, i) => {
+      const yCenter = centers[r][i];
+      const y = yCenter - boxH / 2;
+      const aName = nameFor(series, 'A');
+      const bName = series.bye ? 'BYE' : nameFor(series, 'B');
+      const aWon = Boolean(series.winner) && series.winner === series.teamA?.name;
+      const bWon = Boolean(series.winner) && series.teamB && series.winner === series.teamB.name;
+      parts.push(`
+        <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="8" fill="#2b2d31" stroke="#1e1f22" stroke-width="2"/>
+        <line x1="${x}" y1="${yCenter}" x2="${x + boxW}" y2="${yCenter}" stroke="#1e1f22" stroke-width="1"/>
+        <text x="${x + 12}" y="${yCenter - 12}" font-family="DejaVu Sans" font-size="15" font-weight="${aWon ? 'bold' : 'normal'}" fill="${aWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(aName).slice(0, 30)}</text>
+        <text x="${x + 12}" y="${yCenter + 20}" font-family="DejaVu Sans" font-size="15" font-weight="${bWon ? 'bold' : 'normal'}" fill="${bWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(bName).slice(0, 30)}</text>
+      `);
+    });
+  });
+
+  const svg = `<svg width="${totalWidth}" height="${totalHeight}" xmlns="http://www.w3.org/2000/svg">
+    <rect width="100%" height="100%" fill="#1e1f22"/>
+    ${parts.join('\n')}
+  </svg>`;
+
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+async function updateLeaguePlayoffBracketImage(guild, league, channel, existingMessageId, bracketState) {
+  const png = await renderLeaguePlayoffBracketPng(league, bracketState);
+  if (!png) return null;
+
+  const attachment = new AttachmentBuilder(png, { name: 'playoff-bracket.png' });
+  const content = `🏆 **${league.league_name}** — Live Playoff Bracket`;
+
+  let message = existingMessageId ? await channel.messages.fetch(existingMessageId).catch(() => null) : null;
+  if (message) {
+    message = await message.edit({ content, files: [attachment] }).catch(() => null);
+  }
+  if (!message) {
+    message = await channel.send({ content, files: [attachment] }).catch(() => null);
+    if (message) {
+      await pool.query(`UPDATE league_playoff_brackets SET bracket_image_message_id = $1, updated_at = NOW() WHERE league_id = $2`, [message.id, league.league_id]).catch(() => null);
+    }
+  }
   return message;
 }
 
@@ -35553,7 +35684,22 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
   }
 
   const embed = buildSeasonHistoryEmbed(activeLeague, data);
-  const postedMessage = await historyChannel.send({ embeds: [embed] });
+  // 7J-LEAGUEBRACKETIMG: per Hxxdie — the final playoff bracket image now
+  // gets archived here too, same idea as the Tournament History archival
+  // (7J-BRACKETIMG). Only attaches if a completed bracket actually exists
+  // for this league — a season-history post without playoffs having run at
+  // all (e.g. a league that skips playoffs) just has no bracket to attach.
+  const bracketRow = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1 AND status = 'completed'`, [activeLeague.league_id]).catch(() => ({ rows: [] }));
+  const bracketState = bracketRow.rows?.[0];
+  const files = [];
+  if (bracketState) {
+    const bracketPng = await renderLeaguePlayoffBracketPng(activeLeague, bracketState).catch(error => {
+      console.error('[7J-LEAGUEBRACKETIMG] Season history bracket render failed:', error?.stack || error?.message || error);
+      return null;
+    });
+    if (bracketPng) files.push(new AttachmentBuilder(bracketPng, { name: 'final-playoff-bracket.png' }));
+  }
+  const postedMessage = await historyChannel.send({ embeds: [embed], files });
 
   await pool.query(
     `INSERT INTO season_history (id, guild_id, league_id, season_label, champion, runner_up, mvp, awards, notes, posted_channel_id, posted_message_id, created_by_user_id)
