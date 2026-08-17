@@ -18618,7 +18618,8 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'tourneypanel_home') {
-      const payload = await buildTournamentManagerHomePayload(interaction.guild);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerHomePayload(interaction.guild, { includeAdminBackButton });
       await interaction.update({ content: null, ...payload });
       return;
     }
@@ -18626,10 +18627,19 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isStringSelectMenu() && interaction.customId === 'tourneypanel_select') {
       const tournamentId = interaction.values[0];
       const tournament = await findTournament(interaction.guild.id, tournamentId);
-      if (!tournament) { await interaction.update({ content: 'Could not find that tournament.', embeds: [], components: [] }); return; }
+      if (!tournament) { await interaction.reply({ content: 'Could not find that tournament.', ephemeral: true }); return; }
       const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
       const payload = await buildTournamentManagerViewPayload(interaction.guild, tournament, { includeAdminBackButton });
-      await interaction.update({ content: null, ...payload });
+      // 7J-TOURNEYPANELPRIVATE: per Hxxdie — this dropdown lives on the
+      // persistent, publicly-posted Tournament Manager panel in
+      // #tournaments. interaction.update() edits that same public message
+      // in place, which means picking a tournament to manage overwrote the
+      // standing panel for everyone (including wiping its own "choose a
+      // tournament" dropdown, the exact regression 7J-TOURNEYPANELREFRESH
+      // was trying to prevent). Replying ephemeral instead leaves the
+      // public panel untouched and gives only the clicking staff member
+      // their own private management view.
+      await interaction.reply({ content: null, ...payload, ephemeral: true });
       return;
     }
 
