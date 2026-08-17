@@ -126,12 +126,7 @@ secure, and we cannot guarantee absolute security.
 
 ## 8. International Data Transfers
 
-GG Sports' infrastructure, including our database, is hosted through
-Railway, a cloud hosting provider. Depending on deployment configuration,
-your information may be processed and stored in the United States or other
-countries outside of Canada. By using GG Sports, you consent to this
-transfer, processing, and storage of your information outside of your
-country of residence.
+GG Sports' infrastructure, including our database, is hosted through Railway, a cloud hosting provider. Our servers are located in the European Union (EU West — Amsterdam, Netherlands). Depending on your country of residence, this means your information is processed and stored outside of your home country, within the European Union. By using GG Sports, you consent to this transfer, processing, and storage of your information outside of your country of residence.
 
 ## 9. Changes to This Policy
 
