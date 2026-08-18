@@ -4279,7 +4279,11 @@ function buildCommands() {
           { name: 'Expire grace period now (guild must be lapsed)', value: 'expire_grace_now' },
           { name: 'Make purge due now (grace notice must already be sent)', value: 'make_purge_due_now' },
         )))
-      .addSubcommand(sc => sc.setName('premiumticks').setDescription('DEBUG: force all Premium scheduler ticks (trial/grace/purge) to run right now, instead of waiting')),
+      .addSubcommand(sc => sc.setName('premiumticks').setDescription('DEBUG: force all Premium scheduler ticks (trial/grace/purge) to run right now, instead of waiting'))
+      .addSubcommand(sc => sc
+        .setName('factoryresetall')
+        .setDescription('DESTRUCTIVE: wipe all gameplay data + Discord infrastructure in every server, for pre-launch reset')
+        .addStringOption(o => o.setName('confirm').setDescription('Type exactly: WIPE ALL DATA').setRequired(true))),
 
     new SlashCommandBuilder()
       .setName('teamroster')
@@ -12186,6 +12190,74 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      // 7J-FACTORYRESET: per Hxxdie — a one-time, pre-launch "everyone
+      // starts from zero" reset across every server the bot is in, so
+      // testers don't carry a head start into real subscriber launch.
+      // Extremely destructive and irreversible, so this is gated harder
+      // than any other bot-owner command: the typed confirmation phrase
+      // below is only the first layer — it does not execute the wipe by
+      // itself, only unlocks a second, explicit button click (see the
+      // 'factoryresetall_confirm'/'factoryresetall_cancel' handlers).
+      // Billing/subscription tables (premium_memberships,
+      // premium_entitlements, premium_billing_events) and the guilds row
+      // itself are deliberately never touched — this is a gameplay-data
+      // reset, not a billing reset, and deleting the guilds row would
+      // CASCADE-delete premium_entitlements (its FK references
+      // guilds(guild_id) ON DELETE CASCADE) even if premium_entitlements
+      // were otherwise excluded.
+      if (subcommand === 'factoryresetall') {
+        const confirmText = interaction.options.getString('confirm');
+        if (confirmText !== 'WIPE ALL DATA') {
+          await interaction.reply({ content: 'Confirmation phrase did not match exactly. Must type: `WIPE ALL DATA` (case-sensitive). Nothing was touched.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const guildCount = client.guilds.cache.size;
+        const embed = new EmbedBuilder()
+          .setTitle('⚠️ FINAL CONFIRMATION — Factory Reset ALL Servers')
+          .setColor(0xED4245)
+          .setDescription(
+            `This will permanently delete **every league, tournament, currency balance, trade, avatar, ticket, sportsbook bet, and all other gameplay data** across **all ${guildCount} server(s)** this bot is currently in.\n\n` +
+            `It will also delete every Discord channel/role/category this bot auto-created (leagues, GG Sports, Tournaments).\n\n` +
+            `**Premium subscriptions and billing records are NOT affected.**\n\n` +
+            `**This cannot be undone.** Click below only if you are certain.`
+          )
+          .setFooter({ text: 'GG Sports • Bot Owner • Factory Reset' });
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`factoryresetall_confirm:${interaction.user.id}`).setLabel('Yes, Wipe Everything Permanently').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('factoryresetall_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+        );
+        await interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'factoryresetall_cancel') {
+      await interaction.update({ content: 'Cancelled. Nothing was touched.', embeds: [], components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('factoryresetall_confirm:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This action is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const requestingUserId = interaction.customId.split(':')[1];
+      if (interaction.user.id !== requestingUserId) {
+        await interaction.reply({ content: 'Only the person who ran the command can confirm this.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.update({ content: '🔄 Factory reset in progress — this will take a while across all servers. I will post a summary here when done.', embeds: [], components: [] });
+      const summary = await runFactoryResetAllGuilds(client).catch(error => {
+        console.error('[7J-FACTORYRESET] Top-level failure:', error?.stack || error?.message || error);
+        return { error: error?.message || 'unknown error' };
+      });
+      if (summary?.error) {
+        await interaction.followUp({ content: `❌ Factory reset failed before completing: ${summary.error}. Check the logs — some servers may be partially reset.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.followUp({
+        content: `✅ Factory reset complete.\n**Servers processed:** ${summary.guildsProcessed}\n**Leagues removed:** ${summary.leaguesRemoved}\n**Rows deleted:** ${summary.rowsDeleted} across ${summary.tablesWiped} tables\n${summary.errors.length ? `\n⚠️ **${summary.errors.length} non-fatal error(s)** (logged to console):\n${summary.errors.slice(0, 10).join('\n')}` : 'No errors.'}`,
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
 
@@ -37230,6 +37302,130 @@ async function deleteLeagueDiscordInfrastructure(guild, league) {
   await pool.query(`UPDATE league_settings SET ${nullColumns}, updated_at = NOW() WHERE league_id = $1`, [league.league_id]).catch(() => null);
 
   return { deletedRoles, deletedChannels, deletedCategory };
+}
+
+// 7J-FACTORYRESET: tables deliberately never touched by the factory reset —
+// billing/subscription records (Stripe-tied, not "gameplay" data — see
+// premium_entitlements.guild_id ... REFERENCES guilds(guild_id) ON DELETE
+// CASCADE, which is exactly why `guilds` itself is also excluded: deleting
+// that row would cascade-delete premium_entitlements regardless of this
+// list) and premium_trial_claims (keyed by owner_user_id, not guild_id, so
+// it's naturally untouched by a guild_id-scoped wipe anyway).
+const FACTORY_RESET_EXCLUDED_TABLES = new Set([
+  'guilds', 'premium_memberships', 'premium_entitlements', 'premium_billing_events',
+]);
+
+// 7J-FACTORYRESET: discovers every table with a guild_id column via
+// information_schema rather than hand-maintaining a list — on a codebase
+// this size (100+ tables), a hand-maintained list is guaranteed to drift
+// out of date and silently miss newly-added tables. This stays correct by
+// construction as the schema grows.
+async function getFactoryResetTargetTables() {
+  const result = await pool.query(
+    `SELECT DISTINCT table_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND column_name = 'guild_id'`
+  );
+  return (result.rows || [])
+    .map(r => r.table_name)
+    .filter(name => !FACTORY_RESET_EXCLUDED_TABLES.has(name));
+}
+
+// 7J-FACTORYRESET: per Hxxdie — one-time pre-launch reset so testers don't
+// carry a head start into real subscriber launch. Wipes every guild the bot
+// is currently in: deletes all bot-created Discord infrastructure (league
+// channels/roles via the existing per-league cleanup, plus the guild-wide
+// GG Sports and Tournaments categories from auto-setup), then wipes every
+// guild-scoped data table (see getFactoryResetTargetTables). Billing data
+// is never touched. Best-effort per guild — one guild's failure doesn't
+// abort the rest, since a partial reset finished for every OTHER guild is
+// far better than one bad guild blocking the whole operation.
+async function factoryResetOneGuild(guild, targetTables) {
+  const errors = [];
+  let leaguesRemoved = 0;
+  let rowsDeleted = 0;
+
+  const leaguesResult = await pool.query(`SELECT league_id FROM leagues WHERE guild_id = $1`, [guild.id]).catch(() => ({ rows: [] }));
+  for (const row of leaguesResult.rows || []) {
+    const league = await getLeagueById(row.league_id).catch(() => null);
+    if (!league) continue;
+    await deleteLeagueDiscordInfrastructure(guild, league).catch(error => {
+      errors.push(`${guild.name} — league infra cleanup failed for ${league.league_name}: ${error?.message || error}`);
+    });
+    leaguesRemoved++;
+  }
+
+  // Guild-wide auto-setup categories aren't league-owned, so they need
+  // their own cleanup — matched by the exact names autoCreateGuildMultiChannelPanels
+  // uses when creating them.
+  for (const categoryName of ['GG Sports', '🏆 Tournaments']) {
+    const category = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === categoryName);
+    if (!category) continue;
+    const children = guild.channels.cache.filter(c => c.parentId === category.id);
+    for (const child of children.values()) {
+      await child.delete('Factory reset').catch(error => {
+        errors.push(`${guild.name} — failed to delete channel #${child.name}: ${error?.message || error}`);
+      });
+    }
+    await category.delete('Factory reset').catch(error => {
+      errors.push(`${guild.name} — failed to delete category ${categoryName}: ${error?.message || error}`);
+    });
+  }
+
+  // Data wipe — one DELETE per discovered table, wrapped in a transaction
+  // so a mid-wipe failure doesn't leave this guild in a half-wiped state.
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query('BEGIN');
+    for (const table of targetTables) {
+      const result = await dbClient.query(`DELETE FROM "${table}" WHERE guild_id = $1`, [guild.id]).catch(error => {
+        errors.push(`${guild.name} — wipe failed for table ${table}: ${error?.message || error}`);
+        return { rowCount: 0 };
+      });
+      rowsDeleted += result.rowCount || 0;
+    }
+    await dbClient.query('COMMIT');
+  } catch (error) {
+    await dbClient.query('ROLLBACK').catch(() => null);
+    errors.push(`${guild.name} — transaction rolled back: ${error?.message || error}`);
+  } finally {
+    dbClient.release();
+  }
+
+  // guilds row itself is preserved (see FACTORY_RESET_EXCLUDED_TABLES
+  // comment above) — just reset the specific columns that matter for a
+  // clean re-run of Auto Setup Server Channels.
+  await pool.query(
+    `UPDATE guilds SET ticket_channel_id = NULL, support_channel_id = NULL, welcome_channel_id = NULL, leave_channel_id = NULL, welcome_leave_enabled = FALSE WHERE guild_id = $1`,
+    [guild.id]
+  ).catch(error => {
+    errors.push(`${guild.name} — failed to reset guilds row: ${error?.message || error}`);
+  });
+
+  return { leaguesRemoved, rowsDeleted, errors };
+}
+
+async function runFactoryResetAllGuilds(client) {
+  const targetTables = await getFactoryResetTargetTables();
+  let guildsProcessed = 0;
+  let leaguesRemoved = 0;
+  let rowsDeleted = 0;
+  const errors = [];
+
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const result = await factoryResetOneGuild(guild, targetTables);
+      leaguesRemoved += result.leaguesRemoved;
+      rowsDeleted += result.rowsDeleted;
+      errors.push(...result.errors);
+    } catch (error) {
+      errors.push(`${guild.name} (${guild.id}) — guild-level failure, skipped: ${error?.message || error}`);
+      console.error('[7J-FACTORYRESET] Guild-level failure:', guild.id, error?.stack || error?.message || error);
+    }
+    guildsProcessed++;
+  }
+
+  console.log(`[7J-FACTORYRESET] Complete. Guilds: ${guildsProcessed}, leagues removed: ${leaguesRemoved}, rows deleted: ${rowsDeleted}, tables: ${targetTables.length}, errors: ${errors.length}`);
+  return { guildsProcessed, leaguesRemoved, rowsDeleted, tablesWiped: targetTables.length, errors };
 }
 
 // 7J-100AUTOSETUP: real team names for madden(NFL)/nba/nhl/mlb (REAL_TEAM_NAMES),
