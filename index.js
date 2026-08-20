@@ -15221,6 +15221,20 @@ if (interaction.commandName === 'avatar') {
       }
       clearParlayDraft(interaction.guild.id, interaction.user.id);
 
+      // 7J-PARLAYFEEDFIX: per Hxxdie — buildParlayCreatedAlertEmbed already
+      // existed but was never actually called anywhere, so parlays never
+      // posted to the Sportsbook Feed at all (only a parlay that later hit
+      // did, via buildParlayHitAlertEmbed). Posts to the first leg's
+      // league feed channel — a parlay spanning multiple leagues doesn't
+      // have one obviously "correct" channel, and defaulting to the first
+      // leg is simple and predictable rather than posting the same parlay
+      // to every league's feed it touches.
+      await postSportsbookFeed(
+        interaction.guild,
+        buildParlayCreatedAlertEmbed(settings, interaction.user, parlayId, amount, payoutData.payout, legs.length),
+        legs[0]?.sportsbookGame?.league_id
+      ).catch(() => null);
+
       const NL = String.fromCharCode(10);
       const legText = legs.map((leg, index) => {
         const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
@@ -27590,6 +27604,14 @@ if (shopSubcommand === 'view') {
           );
         }
 
+        // 7J-PARLAYFEEDFIX: see the matching fix in the panel-based parlay
+        // flow above — same missing feed post, same fix.
+        await postSportsbookFeed(
+          interaction.guild,
+          buildParlayCreatedAlertEmbed(settings, interaction.user, parlayId, amount, payoutData.payout, legs.length),
+          legs[0]?.sportsbookGame?.league_id
+        ).catch(() => null);
+
         const NL = String.fromCharCode(10);
         const legText = legs.map((leg, index) => {
           const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
@@ -28687,10 +28709,18 @@ async function buildSportsbookPanelEmbed(guildId) {
     for (const group of groupBySport(playerProps)) {
       addCappedField(
         `🎯 PLAYER PROPS — ${group.label}`,
-        group.rows.slice(0, 8).map(row =>
-          `**${leaguePrefix(group, row)}${row.subject_display_name}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}${NL}` +
-          `↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`
-        ).join(NL).slice(0, 1024)
+        group.rows.slice(0, 8).map(row => {
+          const isStandardVig = Number(row.home_odds) === -110 && Number(row.away_odds) === -110;
+          // 7J-PROPODDSCLUTTER: per Hxxdie — every prop showing "Over -110 •
+          // Under -110" underneath it was pure repetition when that's the
+          // standard default for every prop anyway. Only shown now when a
+          // prop's odds were actually customized away from that default
+          // (staff can set custom odds per prop via /sportsbook createprop)
+          // — real information stays visible, the redundant common case
+          // doesn't.
+          return `**${leaguePrefix(group, row)}${row.subject_display_name}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}` +
+            (isStandardVig ? '' : `${NL}↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`);
+        }).join(NL).slice(0, 1024)
       );
     }
   }
@@ -68909,6 +68939,21 @@ async function autoSettleMaddenSportsbookBet(guild, league, maddenGame) {
   const settings = await getCurrencySettings(guild.id);
   await performSportsbookSettlement(guild, sportsbookGame, winnerSide, 'system', settings).catch(err =>
     console.error('[MADDEN SPORTSBOOK SETTLE]', err?.message));
+
+  // 7J-PROPSTUCKFIX: per Hxxdie — a player prop tied to this exact game
+  // (T. Benson rushing yards, etc.) was staying listed on the board
+  // indefinitely. Root cause: this function settles the game's moneyline
+  // line the moment its score comes in via sync, individually, mid-week —
+  // but player props for that same game only ever got swept by
+  // autoSettleOpenStatProps as part of the *full week advancing*
+  // (7J-26STORY's 4b step). If the week never advances again after this
+  // game (end of season, or simply no further games synced), that prop
+  // stays 'open' forever with nothing left to ever settle it. Running the
+  // same idempotent stat-prop sweep here too closes that gap — it only
+  // settles a prop where the matching stat data actually already exists,
+  // so calling it opportunistically like this is safe to repeat.
+  await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true }).catch(err =>
+    console.error('[MADDEN SPORTSBOOK SETTLE] Stat prop sweep for this game failed:', err?.message));
 }
 
 
