@@ -70660,6 +70660,6 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
 
   const payload = { content: null, embeds: [embed], components };
   return update ? interaction.update(payload) : interaction.editReply(payload);
-}
+} 
 
 // 7J-10AX Madden Compare Value + Trade Foundation
