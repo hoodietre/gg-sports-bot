@@ -6718,6 +6718,34 @@ async function buildStandingsEmbed(league, rows) {
   return embed;
 }
 
+// 7J-STANDINGSLOGOCONF: per Hxxdie — split the standings logo strip into
+// conference/division sections so it visually lines up with the standings
+// embed's own grouped fields, instead of one flat ranked strip. Mirrors the
+// exact same grouping logic buildStandingsEmbed uses just above (same
+// conference/division lookup, same "Unassigned ..." fallback key, same
+// group order via Map insertion order) so the embed and the image never
+// disagree on how teams are grouped. Returns null when the league doesn't
+// use conferences/divisions, so callers fall back to the flat strip.
+async function getStandingsLogoGroups(guildId, league, rows) {
+  const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
+  const useConferences = customSettings.use_conferences ?? isNbaLeague(league);
+  const useDivisions = customSettings.use_divisions ?? false;
+  if (!useConferences && !useDivisions) return null;
+
+  const grouped = new Map();
+  for (const row of rows) {
+    const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, row.team_name, league).catch(() => ({ conference: null, division: null }));
+    const key = (useConferences ? conference : division) || `Unassigned ${useConferences ? 'Conference' : 'Division'}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row.team_name);
+  }
+
+  return [...grouped.entries()].map(([label, teamNames]) => ({
+    label,
+    teams: teamNames.map((name, i) => ({ name, rank: i + 1 })),
+  }));
+}
+
 function buildUserProfileEmbed(league, user, data) {
   const embed = new EmbedBuilder()
     .setTitle(`${league?.league_name || 'League'} • ${user.username} Profile`)
@@ -7044,7 +7072,8 @@ async function updateStandingsPanel(guild, league) {
   // is mentioned." Standings order (rows) is already the correct order for
   // the logo strip, so no re-sorting needed here.
   const files = [];
-  const logoPng = await renderTeamLogoStripPng(league, rows.map(r => r.team_name)).catch(error => {
+  const logoGroups = await getStandingsLogoGroups(guild.id, league, rows).catch(() => null);
+  const logoPng = await renderTeamLogoStripPng(league, rows.map(r => r.team_name), logoGroups ? { groups: logoGroups } : {}).catch(error => {
     console.error('[7J-MULTISPORTLOGO-EVERYWHERE] Standings logo strip render failed:', error?.message || error);
     return null;
   });
@@ -38861,7 +38890,8 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     const rows = await getStandingsRows(interaction.guild.id, league.league_id);
     const initEmbed = await buildStandingsEmbed(league, rows);
     const initFiles = [];
-    const initLogoPng = await renderTeamLogoStripPng(league, rows.map(r => r.team_name)).catch(() => null);
+    const initLogoGroups = await getStandingsLogoGroups(interaction.guild.id, league, rows).catch(() => null);
+    const initLogoPng = await renderTeamLogoStripPng(league, rows.map(r => r.team_name), initLogoGroups ? { groups: initLogoGroups } : {}).catch(() => null);
     if (initLogoPng) {
       initFiles.push(new AttachmentBuilder(initLogoPng, { name: 'standings-logos.png' }));
       initEmbed.setImage('attachment://standings-logos.png');
@@ -39611,16 +39641,34 @@ function getGenericTeamLogoUrl(teamName, league) {
 // grid, applied to an ORDERED list (standings/power-ranking position
 // matters here, unlike Active Check's two unordered groups). Wraps to
 // multiple rows for a full 30+ team league instead of one very wide image.
-async function renderTeamLogoStripPng(league, orderedTeamNames = []) {
+// 7J-STANDINGSLOGOCONF: now accepts an optional third `options.groups` param
+// — an array of { label, teams: [{ name, rank }] } — to render separate
+// labeled sections (e.g. Eastern/Western Conference) side by side
+// horizontally, each independently wrapped and ranked, so the image stays a
+// compact strip instead of growing tall. When omitted, behavior is
+// unchanged: `orderedTeamNames` renders as a single unlabeled group ranked
+// 1..N in the order given (existing Power Rankings/Active-Check-adjacent
+// callers are untouched).
+async function renderTeamLogoStripPng(league, orderedTeamNames = [], options = {}) {
   const sharp = await getSharp();
   if (!sharp) return null;
-  if (!orderedTeamNames.length) return null;
+
+  const rawGroups = options.groups && options.groups.length
+    ? options.groups
+    : (orderedTeamNames.length ? [{ label: null, teams: orderedTeamNames.slice(0, 30).map((name, i) => ({ name, rank: i + 1 })) }] : []);
+  if (!rawGroups.length) return null;
 
   const logoSize = 44;
   const gap = 14;
   const marginLeft = 16;
   const marginTop = 28;
-  const perRow = 10;
+  const groupLabelHeight = 30;
+  const groupGapX = 28;
+  // Side-by-side groups get a tighter per-group wrap (fewer columns each)
+  // so multiple conferences/divisions fit next to each other instead of
+  // stacking the image tall — a single ungrouped strip keeps the wider
+  // 10-per-row layout it always had.
+  const perRow = rawGroups.length > 1 ? 8 : 10;
   const cellW = logoSize + gap;
   const cellH = logoSize + 22;
 
@@ -39637,29 +39685,55 @@ async function renderTeamLogoStripPng(league, orderedTeamNames = []) {
     }
   }
 
-  const capped = orderedTeamNames.slice(0, 30);
-  const logos = await Promise.all(capped.map(fetchLogoBuffer));
-  const present = logos.map((buf, i) => (buf ? { buf, rank: i + 1 } : null)).filter(Boolean);
-  if (!present.length) return null;
+  const resolvedGroups = await Promise.all(rawGroups.map(async group => {
+    const capped = (group.teams || []).slice(0, 30);
+    const logos = await Promise.all(capped.map(t => fetchLogoBuffer(t.name)));
+    const present = logos.map((buf, i) => (buf ? { buf, rank: capped[i].rank } : null)).filter(Boolean);
+    return { label: group.label, present };
+  }));
+  const nonEmptyGroups = resolvedGroups.filter(g => g.present.length);
+  if (!nonEmptyGroups.length) return null;
 
-  const rowCount = Math.ceil(present.length / perRow);
-  const colsInLastRow = present.length - (rowCount - 1) * perRow;
-  const cols = rowCount > 1 ? perRow : colsInLastRow;
-  const width = marginLeft * 2 + cols * cellW;
-  const height = marginTop + rowCount * cellH;
+  const showLabels = nonEmptyGroups.some(g => g.label);
 
-  const rankSvgParts = [];
-  const composites = [];
-  present.forEach((entry, i) => {
-    const col = i % perRow;
-    const row = Math.floor(i / perRow);
-    const x = marginLeft + col * cellW;
-    const y = marginTop + row * cellH;
-    rankSvgParts.push(`<text x="${x + logoSize / 2}" y="${y - 8}" font-family="DejaVu Sans" font-size="13" font-weight="bold" fill="#949ba4" text-anchor="middle">#${entry.rank}</text>`);
-    composites.push({ input: entry.buf, left: x, top: y });
+  // Lay groups out left to right. Each group's own width is driven by its
+  // own column count (capped at perRow); each group's own height is driven
+  // by its own row count — the overall canvas height is just the tallest
+  // group, so adding a second conference widens the image, not heightens it.
+  const groupLayouts = nonEmptyGroups.map(group => {
+    const cols = Math.min(perRow, group.present.length);
+    const rowCount = Math.ceil(group.present.length / perRow);
+    const blockWidth = marginLeft * 2 + cols * cellW;
+    const blockHeight = (showLabels && group.label ? groupLabelHeight : 0) + marginTop + rowCount * cellH;
+    return { ...group, cols, rowCount, blockWidth, blockHeight };
   });
 
-  const labelSvg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">${rankSvgParts.join('')}</svg>`;
+  const width = groupLayouts.reduce((w, g, i) => w + g.blockWidth + (i > 0 ? groupGapX : 0), 0);
+  const height = Math.max(...groupLayouts.map(g => g.blockHeight));
+
+  const svgParts = [];
+  const composites = [];
+  let x0 = 0;
+  groupLayouts.forEach((group, gi) => {
+    if (gi > 0) x0 += groupGapX;
+    let y0 = 0;
+    if (showLabels) {
+      const labelText = group.label || 'Other';
+      svgParts.push(`<text x="${x0 + marginLeft}" y="${y0 + 20}" font-family="DejaVu Sans" font-size="16" font-weight="bold" fill="#dcddde">${tournamentBracketEscapeXml(labelText)}</text>`);
+      y0 += groupLabelHeight;
+    }
+    group.present.forEach((entry, i) => {
+      const col = i % perRow;
+      const row = Math.floor(i / perRow);
+      const x = x0 + marginLeft + col * cellW;
+      const y = y0 + marginTop + row * cellH;
+      svgParts.push(`<text x="${x + logoSize / 2}" y="${y - 8}" font-family="DejaVu Sans" font-size="13" font-weight="bold" fill="#949ba4" text-anchor="middle">#${entry.rank}</text>`);
+      composites.push({ input: entry.buf, left: x, top: y });
+    });
+    x0 += group.blockWidth;
+  });
+
+  const labelSvg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">${svgParts.join('')}</svg>`;
 
   return sharp({ create: { width, height, channels: 4, background: { r: 30, g: 31, b: 34, alpha: 1 } } })
     .composite([{ input: Buffer.from(labelSvg) }, ...composites])
