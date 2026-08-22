@@ -6835,7 +6835,7 @@ async function refreshLeagueHofBoard(guild, league) {
     (settings) => buildLeagueHofBoardComponents(league.league_id, (settings && settings.league_hof_current_view) || 'legacy'));
 }
 
-async function updatePanel(guild, league, panelKey, embed, components = []) {
+async function updatePanel(guild, league, panelKey, embed, components = [], files = []) {
   const result = league?.league_id
     ? await pool.query('SELECT channel_id, message_id FROM league_panels WHERE league_id = $1 AND panel_key = $2', [league.league_id, panelKey])
     : await pool.query('SELECT channel_id, message_id FROM bot_panels WHERE panel_key = $1', [panelKey]);
@@ -6844,7 +6844,7 @@ async function updatePanel(guild, league, panelKey, embed, components = []) {
   const channel = await guild.channels.fetch(result.rows[0].channel_id).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
   const message = await channel.messages.fetch(result.rows[0].message_id).catch(() => null);
-  if (message) await message.edit({ embeds: [embed], components });
+  if (message) await message.edit({ embeds: [embed], components, files });
 }
 
 function buildTeamOwnersPanelComponents(leagueId) {
@@ -7039,7 +7039,20 @@ async function selectPlayoffTeamsForLeague(guildId, league) {
 async function updateStandingsPanel(guild, league) {
   if (!guild || !league?.league_id) return;
   const rows = await getStandingsRows(guild.id, league.league_id);
-  await updatePanel(guild, league, 'standings', await buildStandingsEmbed(league, rows));
+  const embed = await buildStandingsEmbed(league, rows);
+  // 7J-MULTISPORTLOGO-EVERYWHERE: per Hxxdie — logos "anywhere a team name
+  // is mentioned." Standings order (rows) is already the correct order for
+  // the logo strip, so no re-sorting needed here.
+  const files = [];
+  const logoPng = await renderTeamLogoStripPng(league, rows.map(r => r.team_name)).catch(error => {
+    console.error('[7J-MULTISPORTLOGO-EVERYWHERE] Standings logo strip render failed:', error?.message || error);
+    return null;
+  });
+  if (logoPng) {
+    files.push(new AttachmentBuilder(logoPng, { name: 'standings-logos.png' }));
+    embed.setImage('attachment://standings-logos.png');
+  }
+  await updatePanel(guild, league, 'standings', embed, [], files);
 }
 
 // 7J-135GENERICNEWS: Power Rankings for non-Madden leagues — Madden's
@@ -7152,7 +7165,18 @@ async function computeAndPostLeaguePowerRankings(guild, league) {
   if (!guild || !league?.league_id) return;
   const ranked = await computeLeaguePowerRankingRows(guild, league);
   if (!ranked.length) return;
-  await updatePanel(guild, league, 'league_power_rankings', buildLeaguePowerRankingsEmbed(league, ranked));
+  const embed = buildLeaguePowerRankingsEmbed(league, ranked);
+  // 7J-MULTISPORTLOGO-EVERYWHERE: ranked is already in power-ranking order.
+  const files = [];
+  const logoPng = await renderTeamLogoStripPng(league, ranked.map(r => r.team_name)).catch(error => {
+    console.error('[7J-MULTISPORTLOGO-EVERYWHERE] Power rankings logo strip render failed:', error?.message || error);
+    return null;
+  });
+  if (logoPng) {
+    files.push(new AttachmentBuilder(logoPng, { name: 'power-rankings-logos.png' }));
+    embed.setImage('attachment://power-rankings-logos.png');
+  }
+  await updatePanel(guild, league, 'league_power_rankings', embed, [], files);
 }
 
 // 7J-136NEWSEVENTS: per Hxxdie — "feed the news system with all the same
@@ -7229,6 +7253,16 @@ async function generateAndPostLeagueNewsEvent(guild, league, eventType, context)
     .setDescription(blurb || '')
     .setFooter({ text: 'GG Sports • League News' })
     .setTimestamp();
+  // 7J-MULTISPORTLOGO-EVERYWHERE: per Hxxdie — news posts are usually
+  // "about" one specific team, so a thumbnail (not a multi-team composite)
+  // is the right fit here, same reasoning as the game thread embeds.
+  // Context shape varies by event type, so this checks every field name
+  // that could plausibly hold the primary team across all the EVENT_PROMPTS
+  // types above, in priority order — silently omitted if none resolve to a
+  // team this league's sport has logo coverage for.
+  const primaryTeamName = context.winner || context.team || context.champion || context.homeTeam || context.awayTeam || null;
+  const newsLogoUrl = primaryTeamName ? getGenericTeamLogoUrl(primaryTeamName, league) : null;
+  if (newsLogoUrl) embed.setThumbnail(newsLogoUrl);
   await newsChannel.send({ embeds: [embed] }).catch(() => null);
 }
 
@@ -17100,6 +17134,18 @@ if (interaction.commandName === 'avatar') {
         .addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('home_score').setLabel(`${game.home_team_name} score (home)`.slice(0, 45)).setStyle(TextInputStyle.Short).setRequired(true)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('away_score').setLabel(`${game.away_team_name} score (away)`.slice(0, 45)).setStyle(TextInputStyle.Short).setRequired(true)),
+          // 7J-OTLREPORT: per Hxxdie — a league with OTL (overtime loss)
+          // enabled in League Customization → Standings had no way to
+          // actually record one; this modal only ever captured a plain
+          // win/loss. reportLeagueGameCore already fully supports an
+          // overtimeLoss flag (it's what feeds the 4th win-loss-tie-OTL
+          // standings column) — nothing was ever calling it with one.
+          // Always included (harmless no-op for leagues without OTL —
+          // reportLeagueGameCore already treats an OTL flag on a league
+          // that doesn't allow it as a silent no-op, noted in the
+          // response message) rather than conditionally shown, so the
+          // modal's field layout never has to vary per league.
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('overtime_loss').setLabel('Overtime/Shootout loss? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('Leave blank if not applicable')),
         );
       await interaction.showModal(modal);
       return;
@@ -17171,9 +17217,15 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: 'Scores must be whole numbers 0 or greater.', ephemeral: true });
         return;
       }
+      // 7J-OTLREPORT: see the modal comment above — parses the new
+      // optional field into the boolean reportLeagueGameCore already
+      // expects. Blank/no/anything else is treated as "not an OTL," same
+      // as before this field existed.
+      const overtimeLossInput = interaction.fields.fields.has('overtime_loss') ? interaction.fields.getTextInputValue('overtime_loss') : '';
+      const overtimeLoss = /^y(es)?$/i.test(String(overtimeLossInput || '').trim());
 
       await interaction.deferReply();
-      const result = await reportLeagueGameCore(interaction, game, homeScore, awayScore);
+      const result = await reportLeagueGameCore(interaction, game, homeScore, awayScore, overtimeLoss);
       await interaction.editReply({ content: result.message });
 
       if (result.ok) {
@@ -31334,7 +31386,20 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
   // for Madden leagues entirely — they already have both, EA-sync-driven.
   if (getLeagueSportKey(activeLeague) !== 'madden') {
     const rankedRows = await computeLeaguePowerRankingRows(interaction.guild, activeLeague);
-    if (rankedRows.length) await updatePanel(interaction.guild, activeLeague, 'league_power_rankings', buildLeaguePowerRankingsEmbed(activeLeague, rankedRows));
+    if (rankedRows.length) {
+      // 7J-MULTISPORTLOGO-EVERYWHERE: same treatment as
+      // computeAndPostLeaguePowerRankings — this call site bypasses that
+      // wrapper (it already has rankedRows computed for the news-event
+      // logic just above), so the logo strip needs building here too.
+      const rankEmbed = buildLeaguePowerRankingsEmbed(activeLeague, rankedRows);
+      const rankFiles = [];
+      const rankLogoPng = await renderTeamLogoStripPng(activeLeague, rankedRows.map(r => r.team_name)).catch(() => null);
+      if (rankLogoPng) {
+        rankFiles.push(new AttachmentBuilder(rankLogoPng, { name: 'power-rankings-logos.png' }));
+        rankEmbed.setImage('attachment://power-rankings-logos.png');
+      }
+      await updatePanel(interaction.guild, activeLeague, 'league_power_rankings', rankEmbed, [], rankFiles);
+    }
 
     const gameNewsContext = {
       homeTeam: game.home_team_name, awayTeam: game.away_team_name, homeScore, awayScore, isTie,
@@ -31856,6 +31921,11 @@ async function buildGameCenterMatchupInfoEmbed(guildId, league, game, homeOwnerI
       { name: `${game.home_team_name} (Home)`, value: `Record: ${homeStanding.wins}-${homeStanding.losses}\nRecent: ${streakText(homeForm)}\n${confDivText(homeConfDiv)}`, inline: true },
       { name: `${game.away_team_name} (Away)`, value: `Record: ${awayStanding.wins}-${awayStanding.losses}\nRecent: ${streakText(awayForm)}\n${confDivText(awayConfDiv)}`, inline: true },
     );
+  // 7J-MULTISPORTLOGO-EVERYWHERE: same treatment as buildGameCenterMatchupEmbed.
+  const infoAwayLogoUrl = getGenericTeamLogoUrl(game.away_team_name, league);
+  const infoHomeLogoUrl = getGenericTeamLogoUrl(game.home_team_name, league);
+  if (infoAwayLogoUrl) embed.setAuthor({ name: `${game.away_team_name} @ ${game.home_team_name}`, iconURL: infoAwayLogoUrl });
+  if (infoHomeLogoUrl) embed.setThumbnail(infoHomeLogoUrl);
 
   embed.addFields({
     name: 'Head-to-Head (this season)',
@@ -31877,6 +31947,19 @@ function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
       { name: 'Home', value: game.home_team_name + (homeOwnerId ? ' — <@' + homeOwnerId + '>' : ''), inline: true },
       { name: 'Away', value: game.away_team_name + (awayOwnerId ? ' — <@' + awayOwnerId + '>' : ''), inline: true },
     );
+  // 7J-MULTISPORTLOGO-EVERYWHERE: per Hxxdie — team logos "anywhere a team
+  // name is mentioned," matching Madden's look. Two of Discord's three
+  // per-embed image slots (author icon + thumbnail) can hotlink an
+  // external URL directly with zero fetch/render work on our end — no
+  // compositing needed here, unlike the multi-team grid images (Active
+  // Check, standings) which genuinely need more logos than embed image
+  // slots exist for. Author icon carries the away team, thumbnail the
+  // home team — silently omitted (not a broken-image icon) for any team
+  // this league's sport doesn't have logo coverage for yet (MLS/EPL).
+  const awayLogoUrl = getGenericTeamLogoUrl(game.away_team_name, league);
+  const homeLogoUrl = getGenericTeamLogoUrl(game.home_team_name, league);
+  if (awayLogoUrl) embed.setAuthor({ name: `${game.away_team_name} @ ${game.home_team_name}`, iconURL: awayLogoUrl });
+  if (homeLogoUrl) embed.setThumbnail(homeLogoUrl);
   const scheduleText = [game.week_label, game.scheduled_for].filter(Boolean).join(' • ');
   if (scheduleText) embed.addFields({ name: 'Scheduled', value: scheduleText, inline: true });
   if (game.status === 'final' && game.home_score === null && game.away_score === null) {
@@ -32128,7 +32211,6 @@ function buildActiveCheckEmbed(league, check, teams, responses) {
   const respondedIds = new Set(responses.map(r => r.team_role_id));
   const responded = teams.filter(t => respondedIds.has(t.role_id));
   const pending = teams.filter(t => !respondedIds.has(t.role_id));
-  const emojiLine = (list) => list.length ? list.map(t => activeCheckTeamEmoji(t.role_name)).join(' ') : '—';
 
   const startedUnix = Math.floor(new Date(check.started_at).getTime() / 1000);
   const expiresUnix = Math.floor(new Date(check.expires_at).getTime() / 1000);
@@ -32138,12 +32220,20 @@ function buildActiveCheckEmbed(league, check, teams, responses) {
     ? `Started <t:${startedUnix}:R>${NL}Expires <t:${expiresUnix}:R> (<t:${expiresUnix}:t>)`
     : `Started <t:${startedUnix}:R>${NL}**Closed**`;
 
+  // 7J-MULTISPORTLOGO: per Hxxdie — the real logo grid image
+  // (renderTeamLogoGridPng, attached separately by callers) replaced the
+  // need for this. The old per-team emoji line here fell back to a plain
+  // white flag for any team without a real uploaded custom Discord emoji
+  // (i.e. every non-NFL team), which now just duplicated the same
+  // "Responded"/"Still to check in" grouping the image already shows
+  // properly — worse, not better. Just the counts here now; the image
+  // carries the actual per-team detail.
   return new EmbedBuilder()
     .setTitle('Active Check')
     .setColor(isOpen ? 0x57F287 : 0x99AAB5)
     .addFields(
-      { name: `✅ Responded (${responded.length})`, value: emojiLine(responded), inline: false },
-      { name: `⏳ Still to check in (${pending.length})`, value: emojiLine(pending), inline: false },
+      { name: `✅ Responded (${responded.length})`, value: responded.length ? '\u200b' : 'None yet', inline: false },
+      { name: `⏳ Still to check in (${pending.length})`, value: pending.length ? '\u200b' : 'Everyone has responded!', inline: false },
       { name: 'Window', value: windowText, inline: false },
     )
     .setFooter({ text: `Active Check • ${league.league_name}` })
@@ -38769,7 +38859,14 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     if (error) return error;
 
     const rows = await getStandingsRows(interaction.guild.id, league.league_id);
-    const message = await channel.send({ embeds: [await buildStandingsEmbed(league, rows)] });
+    const initEmbed = await buildStandingsEmbed(league, rows);
+    const initFiles = [];
+    const initLogoPng = await renderTeamLogoStripPng(league, rows.map(r => r.team_name)).catch(() => null);
+    if (initLogoPng) {
+      initFiles.push(new AttachmentBuilder(initLogoPng, { name: 'standings-logos.png' }));
+      initEmbed.setImage('attachment://standings-logos.png');
+    }
+    const message = await channel.send({ embeds: [initEmbed], files: initFiles });
     await savePanel(league, 'standings', channel.id, message.id);
     return 'Standings panel created/refreshed in ' + channel.toString() + '.';
   }
@@ -38860,7 +38957,14 @@ async function createConfiguredPanelFromSetup(interaction, league, panelType) {
     if (error) return error + ' Set **Power Rankings Board** from this setup dashboard first.';
 
     const ranked = await computeLeaguePowerRankingRows(interaction.guild, league);
-    const message = await channel.send({ embeds: [buildLeaguePowerRankingsEmbed(league, ranked)] });
+    const rankEmbedInit = buildLeaguePowerRankingsEmbed(league, ranked);
+    const rankFilesInit = [];
+    const rankLogoPngInit = await renderTeamLogoStripPng(league, ranked.map(r => r.team_name)).catch(() => null);
+    if (rankLogoPngInit) {
+      rankFilesInit.push(new AttachmentBuilder(rankLogoPngInit, { name: 'power-rankings-logos.png' }));
+      rankEmbedInit.setImage('attachment://power-rankings-logos.png');
+    }
+    const message = await channel.send({ embeds: [rankEmbedInit], files: rankFilesInit });
     await savePanel(league, 'league_power_rankings', channel.id, message.id);
     return 'Power Rankings Board posted/refreshed in ' + channel.toString() + (ranked.length ? '.' : ' — will populate once games have been reported.');
   }
@@ -39503,6 +39607,66 @@ function getGenericTeamLogoUrl(teamName, league) {
 // does not attempt) — rendering a real image instead sidesteps that
 // limitation and works immediately for any team in any of these leagues,
 // no per-server emoji setup required.
+// 7J-MULTISPORTLOGO-EVERYWHERE: per Hxxdie — same idea as the Active Check
+// grid, applied to an ORDERED list (standings/power-ranking position
+// matters here, unlike Active Check's two unordered groups). Wraps to
+// multiple rows for a full 30+ team league instead of one very wide image.
+async function renderTeamLogoStripPng(league, orderedTeamNames = []) {
+  const sharp = await getSharp();
+  if (!sharp) return null;
+  if (!orderedTeamNames.length) return null;
+
+  const logoSize = 44;
+  const gap = 14;
+  const marginLeft = 16;
+  const marginTop = 28;
+  const perRow = 10;
+  const cellW = logoSize + gap;
+  const cellH = logoSize + 22;
+
+  async function fetchLogoBuffer(teamName) {
+    const url = getGenericTeamLogoUrl(teamName, league);
+    if (!url) return null;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const arrayBuffer = await res.arrayBuffer();
+      return await sharp(Buffer.from(arrayBuffer)).resize(logoSize, logoSize, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).png().toBuffer();
+    } catch {
+      return null;
+    }
+  }
+
+  const capped = orderedTeamNames.slice(0, 30);
+  const logos = await Promise.all(capped.map(fetchLogoBuffer));
+  const present = logos.map((buf, i) => (buf ? { buf, rank: i + 1 } : null)).filter(Boolean);
+  if (!present.length) return null;
+
+  const rowCount = Math.ceil(present.length / perRow);
+  const colsInLastRow = present.length - (rowCount - 1) * perRow;
+  const cols = rowCount > 1 ? perRow : colsInLastRow;
+  const width = marginLeft * 2 + cols * cellW;
+  const height = marginTop + rowCount * cellH;
+
+  const rankSvgParts = [];
+  const composites = [];
+  present.forEach((entry, i) => {
+    const col = i % perRow;
+    const row = Math.floor(i / perRow);
+    const x = marginLeft + col * cellW;
+    const y = marginTop + row * cellH;
+    rankSvgParts.push(`<text x="${x + logoSize / 2}" y="${y - 8}" font-family="DejaVu Sans" font-size="13" font-weight="bold" fill="#949ba4" text-anchor="middle">#${entry.rank}</text>`);
+    composites.push({ input: entry.buf, left: x, top: y });
+  });
+
+  const labelSvg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">${rankSvgParts.join('')}</svg>`;
+
+  return sharp({ create: { width, height, channels: 4, background: { r: 30, g: 31, b: 34, alpha: 1 } } })
+    .composite([{ input: Buffer.from(labelSvg) }, ...composites])
+    .png()
+    .toBuffer();
+}
+
 async function renderTeamLogoGridPng(league, respondedTeams = [], pendingTeams = []) {
   const sharp = await getSharp();
   if (!sharp) return null;
