@@ -5879,6 +5879,25 @@ function isNhlLeague(league) {
   return key.includes('nhl') || key.includes('hockey') || key.includes('chel');
 }
 
+// 7J-ALLLEAGUECONF: per Hxxdie — the NBA conference auto-detect existed but
+// nothing else did, so every other league (NHL, NFL, MLB, MLS) had no
+// fallback at all and showed every team as unassigned until a commissioner
+// manually set each one by hand. Adding the same real-world structure for
+// the other major leagues with fixed, well-established alignments.
+// Deliberately uses EXACT (normalized, full-name) matching, not substring
+// matching — the earlier NBA table used substring matching and it silently
+// mis-assigned NHL's Chicago Blackhawks/Los Angeles Kings via accidental
+// nickname collisions (see 7J-CONFCOLLISION). Never repeat that here.
+function isNflLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return (key.includes('nfl') || key.includes('madden') || key.includes('football')) && !key.includes('cfb') && !key.includes('college');
+}
+
+function isMlsLeague(league) {
+  const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
+  return key.includes('mls') || key.includes('fifa') || key.includes('soccer') || key.includes('fc ');
+}
+
 function isCfbLeague(league) {
   const key = normalizeLeagueGameKey(league?.game_key || league?.game || league?.league_name);
   return key.includes('cfb') || key.includes('ncaa') || key.includes('college football');
@@ -6418,16 +6437,163 @@ function getTeamConference(teamName = '') {
   return 'Unassigned Conference';
 }
 
-async function getTeamConferenceDivisionForLeague(guildId, leagueId, teamName) {
+// 7J-ALLLEAGUECONF: per Hxxdie — real-world conference/division alignments
+// for NHL, NFL, and MLB, matching the same auto-detect NBA already had.
+// Deliberately keyed by full, EXACT team name (normalized lowercase/
+// trimmed) — never substring matching, which is exactly what caused
+// 7J-CONFCOLLISION (Chicago "Blackhawks" silently matching NBA's "Hawks").
+// A couple of alternate/historical names are included per team where a
+// rename happened recently enough that a league's stored team name could
+// plausibly still be the old one (e.g. Utah's 2024 relocation, then 2025
+// rename). MLS is deliberately NOT included here — conference assignment
+// realigns almost every year with expansion teams, and getting it wrong
+// silently is worse than leaving it manual for that one league; revisit
+// with a verified current-season list rather than guessing.
+function buildExactTeamLookup(entries) {
+  const map = new Map();
+  for (const [names, conference, division] of entries) {
+    for (const name of names) map.set(name.toLowerCase(), { conference, division });
+  }
+  return map;
+}
+
+const NHL_TEAM_CONF_DIV = buildExactTeamLookup([
+  [['Boston Bruins'], 'Eastern Conference', 'Atlantic Division'],
+  [['Buffalo Sabres'], 'Eastern Conference', 'Atlantic Division'],
+  [['Detroit Red Wings'], 'Eastern Conference', 'Atlantic Division'],
+  [['Florida Panthers'], 'Eastern Conference', 'Atlantic Division'],
+  [['Montreal Canadiens', 'Montréal Canadiens'], 'Eastern Conference', 'Atlantic Division'],
+  [['Ottawa Senators'], 'Eastern Conference', 'Atlantic Division'],
+  [['Tampa Bay Lightning'], 'Eastern Conference', 'Atlantic Division'],
+  [['Toronto Maple Leafs'], 'Eastern Conference', 'Atlantic Division'],
+  [['Carolina Hurricanes'], 'Eastern Conference', 'Metropolitan Division'],
+  [['Columbus Blue Jackets'], 'Eastern Conference', 'Metropolitan Division'],
+  [['New Jersey Devils'], 'Eastern Conference', 'Metropolitan Division'],
+  [['New York Islanders'], 'Eastern Conference', 'Metropolitan Division'],
+  [['New York Rangers'], 'Eastern Conference', 'Metropolitan Division'],
+  [['Philadelphia Flyers'], 'Eastern Conference', 'Metropolitan Division'],
+  [['Pittsburgh Penguins'], 'Eastern Conference', 'Metropolitan Division'],
+  [['Washington Capitals'], 'Eastern Conference', 'Metropolitan Division'],
+  [['Chicago Blackhawks'], 'Western Conference', 'Central Division'],
+  [['Colorado Avalanche'], 'Western Conference', 'Central Division'],
+  [['Dallas Stars'], 'Western Conference', 'Central Division'],
+  [['Minnesota Wild'], 'Western Conference', 'Central Division'],
+  [['Nashville Predators'], 'Western Conference', 'Central Division'],
+  [['St. Louis Blues', 'St Louis Blues'], 'Western Conference', 'Central Division'],
+  [['Utah Mammoth', 'Utah Hockey Club'], 'Western Conference', 'Central Division'],
+  [['Winnipeg Jets'], 'Western Conference', 'Central Division'],
+  [['Anaheim Ducks'], 'Western Conference', 'Pacific Division'],
+  [['Calgary Flames'], 'Western Conference', 'Pacific Division'],
+  [['Edmonton Oilers'], 'Western Conference', 'Pacific Division'],
+  [['Los Angeles Kings'], 'Western Conference', 'Pacific Division'],
+  [['San Jose Sharks'], 'Western Conference', 'Pacific Division'],
+  [['Seattle Kraken'], 'Western Conference', 'Pacific Division'],
+  [['Vancouver Canucks'], 'Western Conference', 'Pacific Division'],
+  [['Vegas Golden Knights'], 'Western Conference', 'Pacific Division'],
+]);
+
+const NFL_TEAM_CONF_DIV = buildExactTeamLookup([
+  [['Buffalo Bills'], 'AFC', 'AFC East'],
+  [['Miami Dolphins'], 'AFC', 'AFC East'],
+  [['New England Patriots'], 'AFC', 'AFC East'],
+  [['New York Jets'], 'AFC', 'AFC East'],
+  [['Baltimore Ravens'], 'AFC', 'AFC North'],
+  [['Cincinnati Bengals'], 'AFC', 'AFC North'],
+  [['Cleveland Browns'], 'AFC', 'AFC North'],
+  [['Pittsburgh Steelers'], 'AFC', 'AFC North'],
+  [['Houston Texans'], 'AFC', 'AFC South'],
+  [['Indianapolis Colts'], 'AFC', 'AFC South'],
+  [['Jacksonville Jaguars'], 'AFC', 'AFC South'],
+  [['Tennessee Titans'], 'AFC', 'AFC South'],
+  [['Denver Broncos'], 'AFC', 'AFC West'],
+  [['Kansas City Chiefs'], 'AFC', 'AFC West'],
+  [['Las Vegas Raiders'], 'AFC', 'AFC West'],
+  [['Los Angeles Chargers'], 'AFC', 'AFC West'],
+  [['Dallas Cowboys'], 'NFC', 'NFC East'],
+  [['New York Giants'], 'NFC', 'NFC East'],
+  [['Philadelphia Eagles'], 'NFC', 'NFC East'],
+  [['Washington Commanders'], 'NFC', 'NFC East'],
+  [['Chicago Bears'], 'NFC', 'NFC North'],
+  [['Detroit Lions'], 'NFC', 'NFC North'],
+  [['Green Bay Packers'], 'NFC', 'NFC North'],
+  [['Minnesota Vikings'], 'NFC', 'NFC North'],
+  [['Atlanta Falcons'], 'NFC', 'NFC South'],
+  [['Carolina Panthers'], 'NFC', 'NFC South'],
+  [['New Orleans Saints'], 'NFC', 'NFC South'],
+  [['Tampa Bay Buccaneers'], 'NFC', 'NFC South'],
+  [['Arizona Cardinals'], 'NFC', 'NFC West'],
+  [['Los Angeles Rams'], 'NFC', 'NFC West'],
+  [['San Francisco 49ers'], 'NFC', 'NFC West'],
+  [['Seattle Seahawks'], 'NFC', 'NFC West'],
+]);
+
+const MLB_TEAM_CONF_DIV = buildExactTeamLookup([
+  [['Baltimore Orioles'], 'American League', 'AL East'],
+  [['Boston Red Sox'], 'American League', 'AL East'],
+  [['New York Yankees'], 'American League', 'AL East'],
+  [['Tampa Bay Rays'], 'American League', 'AL East'],
+  [['Toronto Blue Jays'], 'American League', 'AL East'],
+  [['Chicago White Sox'], 'American League', 'AL Central'],
+  [['Cleveland Guardians'], 'American League', 'AL Central'],
+  [['Detroit Tigers'], 'American League', 'AL Central'],
+  [['Kansas City Royals'], 'American League', 'AL Central'],
+  [['Minnesota Twins'], 'American League', 'AL Central'],
+  [['Athletics', 'Oakland Athletics'], 'American League', 'AL West'],
+  [['Houston Astros'], 'American League', 'AL West'],
+  [['Los Angeles Angels'], 'American League', 'AL West'],
+  [['Seattle Mariners'], 'American League', 'AL West'],
+  [['Texas Rangers'], 'American League', 'AL West'],
+  [['Atlanta Braves'], 'National League', 'NL East'],
+  [['Miami Marlins'], 'National League', 'NL East'],
+  [['New York Mets'], 'National League', 'NL East'],
+  [['Philadelphia Phillies'], 'National League', 'NL East'],
+  [['Washington Nationals'], 'National League', 'NL East'],
+  [['Chicago Cubs'], 'National League', 'NL Central'],
+  [['Cincinnati Reds'], 'National League', 'NL Central'],
+  [['Milwaukee Brewers'], 'National League', 'NL Central'],
+  [['Pittsburgh Pirates'], 'National League', 'NL Central'],
+  [['St. Louis Cardinals', 'St Louis Cardinals'], 'National League', 'NL Central'],
+  [['Arizona Diamondbacks'], 'National League', 'NL West'],
+  [['Colorado Rockies'], 'National League', 'NL West'],
+  [['Los Angeles Dodgers'], 'National League', 'NL West'],
+  [['San Diego Padres'], 'National League', 'NL West'],
+  [['San Francisco Giants'], 'National League', 'NL West'],
+]);
+
+async function getTeamConferenceDivisionForLeague(guildId, leagueId, teamName, league = null) {
   const result = await pool.query(
     `SELECT conference, division FROM league_team_roles WHERE league_id::text = $1::text AND LOWER(role_name) = LOWER($2) LIMIT 1`,
     [String(leagueId), teamName]
   ).catch(() => ({ rows: [] }));
   const row = result.rows?.[0];
   if (row && (row.conference || row.division)) return { conference: row.conference || null, division: row.division || null };
-  // Fall back to the old hardcoded NBA lookup for leagues that haven't assigned
-  // conferences/divisions through the new settings panel yet.
-  return { conference: getTeamConference(teamName), division: null };
+  // 7J-CONFCOLLISION: per Hxxdie — the old hardcoded NBA name-substring
+  // fallback ran for every league regardless of sport, not just NBA. NHL's
+  // Chicago Blackhawks ("...Hawks") and Los Angeles Kings ("...Kings") both
+  // happen to contain an NBA team nickname (Atlanta Hawks, Sacramento
+  // Kings) as a literal substring, so they were silently getting
+  // auto-assigned to Eastern/Western conference before anyone had touched
+  // conference assignment at all.
+  // 7J-ALLLEAGUECONF: extended the same auto-detect idea to NHL, NFL, and
+  // MLB (their conference/division structure is fixed and well known,
+  // unlike MLS which realigns yearly and is deliberately left out — see
+  // the table comments above). Every lookup here is EXACT full-name
+  // matching only, never substring, to make sure the Blackhawks/Kings bug
+  // class can't happen again for any of these.
+  const normalizedName = String(teamName || '').trim().toLowerCase();
+  if (league && isNbaLeague(league)) {
+    return { conference: getTeamConference(teamName), division: null };
+  }
+  if (league && isNhlLeague(league) && NHL_TEAM_CONF_DIV.has(normalizedName)) {
+    return NHL_TEAM_CONF_DIV.get(normalizedName);
+  }
+  if (league && isNflLeague(league) && NFL_TEAM_CONF_DIV.has(normalizedName)) {
+    return NFL_TEAM_CONF_DIV.get(normalizedName);
+  }
+  if (league && isMlbLeague(league) && MLB_TEAM_CONF_DIV.has(normalizedName)) {
+    return MLB_TEAM_CONF_DIV.get(normalizedName);
+  }
+  return { conference: null, division: null };
 }
 
 function calculateStandingsPointsForLeague(league, wins, losses, ties = 0, customSettings = null, otl = 0) {
@@ -6537,7 +6703,7 @@ async function buildStandingsEmbed(league, rows) {
     const groupKey = useConferences ? 'conference' : 'division';
     const grouped = new Map();
     for (const row of rows) {
-      const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, row.team_name).catch(() => ({ conference: null, division: null }));
+      const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, row.team_name, league).catch(() => ({ conference: null, division: null }));
       const key = (useConferences ? conference : division) || `Unassigned ${useConferences ? 'Conference' : 'Division'}`;
       if (!grouped.has(key)) grouped.set(key, []);
       grouped.get(key).push(row);
@@ -6822,7 +6988,7 @@ async function selectPlayoffTeamsForLeague(guildId, league) {
 
   if (seedingMethod === 'conference') {
     const withConference = await Promise.all(standingsRows.map(async team => {
-      const { conference } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name);
+      const { conference } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league);
       return { ...team, resolvedConference: conference || 'Unassigned Conference' };
     }));
     const conferences = [...new Set(withConference.map(t => t.resolvedConference).filter(c => c && c !== 'Unassigned Conference'))];
@@ -6841,7 +7007,7 @@ async function selectPlayoffTeamsForLeague(guildId, league) {
 
   if (seedingMethod === 'division') {
     const withDivision = await Promise.all(standingsRows.map(async team => {
-      const { division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name);
+      const { division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league);
       return { ...team, resolvedDivision: division || 'Unassigned Division' };
     }));
     const divisions = [...new Set(withDivision.map(t => t.resolvedDivision).filter(d => d && d !== 'Unassigned Division'))];
@@ -6858,11 +7024,16 @@ async function selectPlayoffTeamsForLeague(guildId, league) {
   }
 
   // overall_record (default)
-  return standingsRows.slice(0, teamCount).map((team, index) => ({
-    ...team,
-    seed: index + 1,
-    conference: isNbaLeague(league) ? getTeamConference(team.team_name) : null,
+  // 7J-ALLLEAGUECONF: this label is informational only (seeding here is by
+  // overall record regardless of conference), but now uses the same
+  // generalized exact-match lookup as everywhere else instead of being
+  // NBA-only, for consistency with the conference/division seeding
+  // branches above.
+  const withOverallConference = await Promise.all(standingsRows.slice(0, teamCount).map(async (team, index) => {
+    const { conference } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league).catch(() => ({ conference: null }));
+    return { ...team, seed: index + 1, conference };
   }));
+  return withOverallConference;
 }
 
 async function updateStandingsPanel(guild, league) {
@@ -14715,9 +14886,18 @@ if (interaction.commandName === 'avatar') {
       if (interaction.customId.startsWith('offer_trade_panel_button')) {
         const [, leagueId] = interaction.customId.split(':');
         const league = leagueId && leagueId !== 'legacy' ? await getLeagueById(leagueId) : await resolveLeague(interaction);
-        const teamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
+        const allTeamRoles = league?.league_id ? await getLeagueTeamRoles(league.league_id) : [];
+        // 7J-SELFTRADE: per Hxxdie — someone whose only team role was, say,
+        // the Ducks could still pick "Anaheim Ducks" as the team they're
+        // sending an offer *to*, which makes no sense — you can't trade
+        // with yourself. Excludes any team role the requesting member
+        // already holds before the list is even built.
+        const memberRoleIds = new Set(interaction.member?.roles?.cache?.keys?.() || []);
+        const teamRoles = allTeamRoles.filter(t => !memberRoleIds.has(t.role_id));
         if (!teamRoles.length) {
-          await interaction.reply({ content: 'No team roles are configured for this league yet — a commissioner needs to run **Auto-Create Team Roles** (or `/league teamrole`) before trades can be offered.', ephemeral: true });
+          await interaction.reply({ content: allTeamRoles.length
+            ? 'There are no other teams to trade with — every team role in this league belongs to you.'
+            : 'No team roles are configured for this league yet — a commissioner needs to run **Auto-Create Team Roles** (or `/league teamrole`) before trades can be offered.', ephemeral: true });
           return;
         }
         await interaction.reply({ content: 'Choose the team you are sending the offer to.', components: buildTeamSelectMenus(teamRoles, league?.league_id || 'legacy'), ephemeral: true });
@@ -17727,7 +17907,7 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguecustom_team_select:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leaguecustom_team_select')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
@@ -22227,7 +22407,10 @@ if (interaction.commandName === 'avatar') {
         check = await closeExpiredActiveCheck(check);
         const teams = await getActiveCheckEligibleTeams(interaction.guild, activeLeague);
         const responses = await getActiveCheckResponses(check.id);
-        await interaction.editReply({ embeds: [buildActiveCheckEmbed(activeLeague, check, teams, responses)] });
+        const files = await buildActiveCheckImageFiles(activeLeague, teams, responses);
+        const embed = buildActiveCheckEmbed(activeLeague, check, teams, responses);
+        if (files.length) embed.setImage('attachment://active-check-teams.png');
+        await interaction.editReply({ embeds: [embed], files });
         return;
       }
 
@@ -31083,8 +31266,8 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
     [homeScore, awayScore, winnerRoleId, interaction.user.id, game.id]
   );
 
-  const { conference: homeConference, division: homeDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.home_team_name).catch(() => ({ conference: null, division: null }));
-  const { conference: awayConference, division: awayDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.away_team_name).catch(() => ({ conference: null, division: null }));
+  const { conference: homeConference, division: homeDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.home_team_name, activeLeague).catch(() => ({ conference: null, division: null }));
+  const { conference: awayConference, division: awayDivision } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, game.away_team_name, activeLeague).catch(() => ({ conference: null, division: null }));
 
   const homeWL = isTie ? { w: 0, l: 0, t: 1, otl: 0 } : homeWins ? { w: 1, l: 0, t: 0, otl: 0 } : useOtl ? { w: 0, l: 0, t: 0, otl: 1 } : { w: 0, l: 1, t: 0, otl: 0 };
   const awayWL = isTie ? { w: 0, l: 0, t: 1, otl: 0 } : awayWins ? { w: 1, l: 0, t: 0, otl: 0 } : useOtl ? { w: 0, l: 0, t: 0, otl: 1 } : { w: 0, l: 1, t: 0, otl: 0 };
@@ -31332,8 +31515,8 @@ async function forceLeagueGameResult(interaction, game, winnerSide) {
   const customSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
   const winnerStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 1, 0, 0, customSettings);
   const loserStandingsPoints = calculateStandingsPointsForLeague(activeLeague, 0, 1, 0, customSettings);
-  const { conference: winnerConf, division: winnerDiv } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, winnerName).catch(() => ({ conference: null, division: null }));
-  const { conference: loserConf, division: loserDiv } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, loserName).catch(() => ({ conference: null, division: null }));
+  const { conference: winnerConf, division: winnerDiv } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, winnerName, activeLeague).catch(() => ({ conference: null, division: null }));
+  const { conference: loserConf, division: loserDiv } = await getTeamConferenceDivisionForLeague(interaction.guild.id, activeLeague.league_id, loserName, activeLeague).catch(() => ({ conference: null, division: null }));
 
   // Deliberately no points_for/points_against change — there's no real score
   // to attribute, and adding zeros either way would still skew games-played
@@ -31872,6 +32055,22 @@ function activeCheckTeamEmoji(teamName) {
   return getMaddenTeamEmoji(teamName) || '🏳️';
 }
 
+// 7J-MULTISPORTLOGO: builds the real-logo grid image attachment for an
+// Active Check embed (see renderTeamLogoGridPng above). Shared across every
+// place an Active Check gets posted/refreshed so they all stay consistent.
+// Best-effort — a render/fetch failure here just means no image attaches,
+// never blocks the Active Check itself from posting or updating.
+async function buildActiveCheckImageFiles(league, teams, responses) {
+  const respondedIds = new Set(responses.map(r => r.team_role_id));
+  const respondedNames = teams.filter(t => respondedIds.has(t.role_id)).map(t => t.role_name);
+  const pendingNames = teams.filter(t => !respondedIds.has(t.role_id)).map(t => t.role_name);
+  const png = await renderTeamLogoGridPng(league, respondedNames, pendingNames).catch(error => {
+    console.error('[7J-MULTISPORTLOGO] Active Check logo grid render failed:', error?.message || error);
+    return null;
+  });
+  return png ? [new AttachmentBuilder(png, { name: 'active-check-teams.png' })] : [];
+}
+
 function buildActiveCheckEmbed(league, check, teams, responses) {
   const NL = String.fromCharCode(10);
   const respondedIds = new Set(responses.map(r => r.team_role_id));
@@ -31920,9 +32119,13 @@ async function refreshActiveCheckMessage(guild, league, check) {
   if (!message) return;
   const teams = await getActiveCheckEligibleTeams(guild, league);
   const responses = await getActiveCheckResponses(check.id);
+  const files = await buildActiveCheckImageFiles(league, teams, responses);
+  const embed = buildActiveCheckEmbed(league, check, teams, responses);
+  if (files.length) embed.setImage('attachment://active-check-teams.png');
   await message.edit({
-    embeds: [buildActiveCheckEmbed(league, check, teams, responses)],
+    embeds: [embed],
     components: buildActiveCheckComponents(check.id, check.status === 'open'),
+    files,
   }).catch(() => null);
 }
 
@@ -31959,10 +32162,14 @@ async function startActiveCheck(interaction, league, hours, channelOverride = nu
 
   let posted;
   try {
+    const files = await buildActiveCheckImageFiles(league, teams, []);
+    const embed = buildActiveCheckEmbed(league, check, teams, []);
+    if (files.length) embed.setImage('attachment://active-check-teams.png');
     posted = await channel.send({
       content: leagueRoleId ? `<@&${leagueRoleId}>` : undefined,
-      embeds: [buildActiveCheckEmbed(league, check, teams, [])],
+      embeds: [embed],
       components: buildActiveCheckComponents(checkId, true),
+      files,
       allowedMentions: leagueRoleId ? { roles: [leagueRoleId] } : { roles: [], users: [] },
     });
   } catch (err) {
@@ -39123,6 +39330,145 @@ function formatMaddenMatchupLeader(row, statLabel = 'Yards', fallback = 'No data
   return `**${row.player_name || 'Unknown'}**${meta ? ` (${meta})` : ''}\n${value}`;
 }
 
+// 7J-MULTISPORTLOGO: per Hxxdie — team logos for every league type, not
+// just NFL/Madden. Uses ESPN's public CDN (a.espncdn.com/i/teamlogos/...),
+// the exact same source the existing NFL logo function already relies on —
+// no new infrastructure, no image hosting of our own, just the equivalent
+// slug table for each additional sport. Slugs verified against ESPN's own
+// current team pages/CSV exports where possible; NHL's Utah entry in
+// particular reflects the 2025 Mammoth rebrand (was Utah Hockey Club).
+// MLS deliberately NOT included — conference/roster churn is too high
+// year over year to hardcode with confidence; same reasoning as
+// 7J-ALLLEAGUECONF leaving MLS out of the conference tables.
+const NHL_TEAM_LOGO_SLUGS = {
+  'Anaheim Ducks': 'ana', 'Boston Bruins': 'bos', 'Buffalo Sabres': 'buf', 'Calgary Flames': 'cgy',
+  'Carolina Hurricanes': 'car', 'Chicago Blackhawks': 'chi', 'Colorado Avalanche': 'col', 'Columbus Blue Jackets': 'cbj',
+  'Dallas Stars': 'dal', 'Detroit Red Wings': 'det', 'Edmonton Oilers': 'edm', 'Florida Panthers': 'fla',
+  'Los Angeles Kings': 'la', 'Minnesota Wild': 'min', 'Montreal Canadiens': 'mtl', 'Montréal Canadiens': 'mtl',
+  'Nashville Predators': 'nsh', 'New Jersey Devils': 'nj', 'New York Islanders': 'nyi', 'New York Rangers': 'nyr',
+  'Ottawa Senators': 'ott', 'Philadelphia Flyers': 'phi', 'Pittsburgh Penguins': 'pit', 'San Jose Sharks': 'sj',
+  'Seattle Kraken': 'sea', 'St. Louis Blues': 'stl', 'St Louis Blues': 'stl', 'Tampa Bay Lightning': 'tb',
+  'Toronto Maple Leafs': 'tor', 'Utah Mammoth': 'uta', 'Utah Hockey Club': 'uta', 'Vancouver Canucks': 'van',
+  'Vegas Golden Knights': 'vgk', 'Washington Capitals': 'wsh', 'Winnipeg Jets': 'wpg',
+};
+
+const NBA_TEAM_LOGO_SLUGS = {
+  'Atlanta Hawks': 'atl', 'Boston Celtics': 'bos', 'Brooklyn Nets': 'bkn', 'Charlotte Hornets': 'cha',
+  'Chicago Bulls': 'chi', 'Cleveland Cavaliers': 'cle', 'Dallas Mavericks': 'dal', 'Denver Nuggets': 'den',
+  'Detroit Pistons': 'det', 'Golden State Warriors': 'gs', 'Houston Rockets': 'hou', 'Indiana Pacers': 'ind',
+  'LA Clippers': 'lac', 'Los Angeles Clippers': 'lac', 'Los Angeles Lakers': 'lal', 'Memphis Grizzlies': 'mem',
+  'Miami Heat': 'mia', 'Milwaukee Bucks': 'mil', 'Minnesota Timberwolves': 'min', 'New Orleans Pelicans': 'no',
+  'New York Knicks': 'ny', 'Oklahoma City Thunder': 'okc', 'Orlando Magic': 'orl', 'Philadelphia 76ers': 'phi',
+  'Phoenix Suns': 'phx', 'Portland Trail Blazers': 'por', 'Sacramento Kings': 'sac', 'San Antonio Spurs': 'sa',
+  'Toronto Raptors': 'tor', 'Utah Jazz': 'utah', 'Washington Wizards': 'wsh',
+};
+
+const MLB_TEAM_LOGO_SLUGS = {
+  'Arizona Diamondbacks': 'ari', 'Athletics': 'oak', 'Oakland Athletics': 'oak', 'Atlanta Braves': 'atl',
+  'Baltimore Orioles': 'bal', 'Boston Red Sox': 'bos', 'Chicago Cubs': 'chc', 'Chicago White Sox': 'chw',
+  'Cincinnati Reds': 'cin', 'Cleveland Guardians': 'cle', 'Colorado Rockies': 'col', 'Detroit Tigers': 'det',
+  'Houston Astros': 'hou', 'Kansas City Royals': 'kc', 'Los Angeles Angels': 'laa', 'Los Angeles Dodgers': 'lad',
+  'Miami Marlins': 'mia', 'Milwaukee Brewers': 'mil', 'Minnesota Twins': 'min', 'New York Mets': 'nym',
+  'New York Yankees': 'nyy', 'Philadelphia Phillies': 'phi', 'Pittsburgh Pirates': 'pit', 'San Diego Padres': 'sd',
+  'San Francisco Giants': 'sf', 'Seattle Mariners': 'sea', 'St. Louis Cardinals': 'stl', 'St Louis Cardinals': 'stl',
+  'Tampa Bay Rays': 'tb', 'Texas Rangers': 'tex', 'Toronto Blue Jays': 'tor', 'Washington Nationals': 'wsh',
+};
+
+// 7J-MULTISPORTLOGO: single dispatcher used by the rest of the codebase —
+// picks the right slug table by league sport (falling back through Madden's
+// existing NFL table for non-Madden NFL-style leagues too) so callers don't
+// need to know which table to use themselves.
+function getGenericTeamLogoUrl(teamName, league) {
+  if (!teamName) return null;
+  if (isNhlLeague(league)) {
+    const slug = NHL_TEAM_LOGO_SLUGS[teamName];
+    return slug ? `https://a.espncdn.com/i/teamlogos/nhl/500/${slug}.png` : null;
+  }
+  if (isNbaLeague(league)) {
+    const slug = NBA_TEAM_LOGO_SLUGS[teamName];
+    return slug ? `https://a.espncdn.com/i/teamlogos/nba/500/${slug}.png` : null;
+  }
+  if (isMlbLeague(league)) {
+    const slug = MLB_TEAM_LOGO_SLUGS[teamName];
+    return slug ? `https://a.espncdn.com/i/teamlogos/mlb/500/${slug}.png` : null;
+  }
+  if (isNflLeague(league)) {
+    return getMaddenTeamLogoUrl(teamName);
+  }
+  return null;
+}
+
+// 7J-MULTISPORTLOGO: composites real team logos (fetched live from ESPN's
+// CDN at render time — this bot already makes outbound fetch() calls
+// elsewhere, e.g. Stripe/EA Direct, so this is the same kind of network
+// access, not new infrastructure) into a single labeled grid image via
+// sharp, the same rendering approach as the tournament/playoff brackets.
+// Built specifically to solve the Active Check "logos" gap: Discord embed
+// fields can only hold text, and true inline emoji-logos would require
+// actually uploading each one as a real custom Discord emoji to the guild
+// (an entirely separate, one-time asset-provisioning step this function
+// does not attempt) — rendering a real image instead sidesteps that
+// limitation and works immediately for any team in any of these leagues,
+// no per-server emoji setup required.
+async function renderTeamLogoGridPng(league, respondedTeams = [], pendingTeams = []) {
+  const sharp = await getSharp();
+  if (!sharp) return null;
+
+  const logoSize = 48;
+  const gap = 10;
+  const marginLeft = 16;
+  const rowLabelHeight = 26;
+  const rowGap = 20;
+
+  async function fetchLogoBuffer(teamName) {
+    const url = getGenericTeamLogoUrl(teamName, league);
+    if (!url) return null;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const arrayBuffer = await res.arrayBuffer();
+      return await sharp(Buffer.from(arrayBuffer)).resize(logoSize, logoSize, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).png().toBuffer();
+    } catch {
+      return null;
+    }
+  }
+
+  async function buildRow(teams) {
+    const buffers = await Promise.all(teams.slice(0, 20).map(fetchLogoBuffer));
+    return buffers.filter(Boolean);
+  }
+
+  const [respondedLogos, pendingLogos] = await Promise.all([buildRow(respondedTeams), buildRow(pendingTeams)]);
+  if (!respondedLogos.length && !pendingLogos.length) return null;
+
+  const maxPerRow = Math.max(1, respondedLogos.length, pendingLogos.length);
+  const width = marginLeft * 2 + maxPerRow * logoSize + Math.max(0, maxPerRow - 1) * gap;
+  const rows = [
+    { label: `Responded (${respondedLogos.length})`, logos: respondedLogos },
+    { label: `Still to check in (${pendingLogos.length})`, logos: pendingLogos },
+  ].filter(r => r.logos.length);
+  const height = rows.reduce((h, r) => h + rowLabelHeight + logoSize, 0) + Math.max(0, rows.length - 1) * rowGap + 12;
+
+  const labelSvgParts = [];
+  let y = 12;
+  const composites = [];
+  for (const row of rows) {
+    labelSvgParts.push(`<text x="${marginLeft}" y="${y + 16}" font-family="DejaVu Sans" font-size="15" font-weight="bold" fill="#dcddde">${tournamentBracketEscapeXml(row.label)}</text>`);
+    const logoY = y + rowLabelHeight;
+    row.logos.forEach((logoBuf, i) => {
+      composites.push({ input: logoBuf, left: marginLeft + i * (logoSize + gap), top: logoY });
+    });
+    y += rowLabelHeight + logoSize + rowGap;
+  }
+
+  const labelSvg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">${labelSvgParts.join('')}</svg>`;
+
+  return sharp({ create: { width, height, channels: 4, background: { r: 30, g: 31, b: 34, alpha: 1 } } })
+    .composite([{ input: Buffer.from(labelSvg) }, ...composites])
+    .png()
+    .toBuffer();
+}
+
 const NFL_TEAM_LOGO_SLUGS = {
   SF: 'sf', CHI: 'chi', CIN: 'cin', BUF: 'buf', DEN: 'den', CLE: 'cle', TB: 'tb', ARI: 'ari',
   LAC: 'lac', KC: 'kc', IND: 'ind', WAS: 'wsh', DAL: 'dal', MIA: 'mia', PHI: 'phi', ATL: 'atl',
@@ -40267,7 +40613,14 @@ async function showMaddenTeamPicker(interaction, flow, idOrToken, { update = fal
     return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
   }
   const excludeFreeAgents = flow === 'neg';
-  const excludeTeam = (flow === 'wizardB' && maddenTradeWizardSessions.get(idOrToken)?.sideA?.team) || null;
+  const excludeTeam = (flow === 'wizardB' && maddenTradeWizardSessions.get(idOrToken)?.sideA?.team)
+    // 7J-SELFTRADE: per Hxxdie — the same self-trade gap fixed on the
+    // generic (non-Madden) offer flow existed here too. "Start a Trade
+    // Negotiation" never excluded the requesting GM's own team from the
+    // team picker, so someone who owns the Ducks could pick "Ducks" as the
+    // team they're negotiating a trade with.
+    || (flow === 'neg' ? (await getMaddenTeamOwnedByUser(interaction.guild.id, league.league_id, interaction.user.id))?.team_name : null)
+    || null;
   const teams = await getMaddenLeagueTeamNames(interaction.guild.id, league.league_id, { excludeFreeAgents, excludeTeam });
   const label = flow === 'compareA' ? 'Compare Players — Player A'
     : flow === 'compareB' ? 'Compare Players — Player B'
@@ -69197,7 +69550,7 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   ).catch(() => ({ rows: [] }));
   const byDivision = new Map();
   for (const row of divisionRecordsResult.rows || []) {
-    const { division } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, row.team_name).catch(() => ({ division: null }));
+    const { division } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, row.team_name, league).catch(() => ({ division: null }));
     if (!division) continue;
     if (!byDivision.has(division)) byDivision.set(division, []);
     byDivision.get(division).push(row);
@@ -70624,7 +70977,14 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
     rows.push(buildLeagueCustomizationBackRow(leagueId));
     components = rows;
   } else if (section === 'conferences') {
-    const teamsResult = await pool.query(`SELECT * FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC LIMIT 25`, [leagueId]);
+    // 7J-CONFTEAMCAP: per Hxxdie — this LIMIT 25 silently capped both the
+    // team list shown here AND the assignment dropdown at 25 teams, so any
+    // league with more than that (NHL's 32, for example) could never fully
+    // set up conferences/divisions — the remaining teams were never even
+    // visible, let alone assignable. Same root cause class as the
+    // recruitment/tournament dropdown caps fixed earlier; every menu like
+    // this needs every team reachable or league setup can't ever finish.
+    const teamsResult = await pool.query(`SELECT * FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC`, [leagueId]);
     const confUseConferences = customSettings.use_conferences ?? isNbaLeague(league);
     const confUseDivisions = customSettings.use_divisions ?? false;
     embed = new EmbedBuilder()
@@ -70635,7 +70995,7 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
         { name: 'Divisions', value: confUseDivisions ? '✅ On — grouped in standings/playoffs' : '❌ Off', inline: true },
       )
       .setDescription(teamsResult.rows.length
-        ? teamsResult.rows.map(t => `**${t.role_name}** — ${t.conference || 'No conference'}${t.division ? ' / ' + t.division : ''}`).join('\n')
+        ? teamsResult.rows.map(t => `**${t.role_name}** — ${t.conference || 'No conference'}${t.division ? ' / ' + t.division : ''}`).join('\n').slice(0, 4096)
         : 'No team roles found for this league yet.')
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
@@ -70646,11 +71006,18 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       ),
     ];
     if (teamsResult.rows.length) {
-      const teamMenu = new StringSelectMenuBuilder()
-        .setCustomId('leaguecustom_team_select:' + leagueId)
-        .setPlaceholder('Choose a team to assign conference/division')
-        .addOptions(teamsResult.rows.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id.slice(0, 100) })));
-      components.push(new ActionRowBuilder().addComponents(teamMenu));
+      // 7J-CONFTEAMCAP: split across up to 5 select menus (125 teams) same
+      // as the recruitment/tournament dropdown fixes, instead of a single
+      // menu silently truncating at Discord's 25-option cap.
+      for (let i = 0; i < teamsResult.rows.length && i < 125; i += 25) {
+        const chunk = teamsResult.rows.slice(i, i + 25);
+        const menuIndex = i / 25;
+        const teamMenu = new StringSelectMenuBuilder()
+          .setCustomId(`leaguecustom_team_select${menuIndex ? menuIndex : ''}:${leagueId}`)
+          .setPlaceholder(teamsResult.rows.length <= 25 ? 'Choose a team to assign conference/division' : `Choose a team (${i + 1}-${Math.min(i + 25, teamsResult.rows.length)})`)
+          .addOptions(chunk.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id.slice(0, 100) })));
+        components.push(new ActionRowBuilder().addComponents(teamMenu));
+      }
     }
     components.push(buildLeagueCustomizationBackRow(leagueId));
   } else {
