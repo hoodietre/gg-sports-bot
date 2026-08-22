@@ -17272,7 +17272,12 @@ if (interaction.commandName === 'avatar') {
       const league = await getLeagueById(game.league_id);
       const homeOwner = await findTeamOwnerByRoleId(interaction.guild, game.home_team_role_id);
       const awayOwner = await findTeamOwnerByRoleId(interaction.guild, game.away_team_role_id);
-      await interaction.reply({ embeds: [buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id)], ephemeral: true });
+      await interaction.deferReply({ ephemeral: true });
+      const infoEmbed = await buildGameCenterMatchupInfoEmbed(interaction.guild.id, league, game, homeOwner?.id, awayOwner?.id).catch(error => {
+        console.error('[7J-MATCHUPINFOFIX] Failed to build matchup info embed:', error?.stack || error?.message || error);
+        return buildGameCenterMatchupEmbed(league, game, homeOwner?.id, awayOwner?.id);
+      });
+      await interaction.editReply({ embeds: [infoEmbed] });
       return;
     }
 
@@ -31817,6 +31822,53 @@ async function updateGameCenterPanel(guild, league) {
   await updatePanel(guild, league, 'game_center', buildGameCenterPanelEmbed(league, openGames), buildGameCenterPanelComponents(league.league_id, panelCustomSettings.schedule_style !== 'structured'));
 }
 
+// 7J-MATCHUPINFOFIX: per Hxxdie — this button was calling the exact same
+// embed builder already posted as the thread's own starter message, so
+// clicking it just showed an identical copy of what was already right
+// there. Built a genuinely different embed instead — records, recent form/
+// streak, conference-division context, and head-to-head history this
+// season — reusing getTeamStandingsSnapshot/getTeamRecentForm/
+// getHeadToHeadSnapshot, which already existed (previously only feeding
+// sportsbook odds calculation) rather than anything new. Any of these come
+// back empty/zero for a brand-new league with no games played yet — the
+// fields just say so rather than showing misleading zeros with no context.
+async function buildGameCenterMatchupInfoEmbed(guildId, league, game, homeOwnerId, awayOwnerId) {
+  const [homeStanding, awayStanding, homeForm, awayForm, headToHead, homeConfDiv, awayConfDiv] = await Promise.all([
+    getTeamStandingsSnapshot(guildId, league.league_id, game.home_team_role_id),
+    getTeamStandingsSnapshot(guildId, league.league_id, game.away_team_role_id),
+    getTeamRecentForm(guildId, league.league_id, game.home_team_role_id),
+    getTeamRecentForm(guildId, league.league_id, game.away_team_role_id),
+    getHeadToHeadSnapshot(guildId, league.league_id, game.home_team_role_id, game.away_team_role_id),
+    getTeamConferenceDivisionForLeague(guildId, league.league_id, game.home_team_name, league),
+    getTeamConferenceDivisionForLeague(guildId, league.league_id, game.away_team_name, league),
+  ]);
+
+  const streakText = (form) => {
+    if (!form.streak) return 'No results yet';
+    return form.streak > 0 ? `W${form.streak}` : `L${Math.abs(form.streak)}`;
+  };
+  const confDivText = (cd) => [cd.conference, cd.division].filter(Boolean).join(' — ') || 'Not assigned';
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📊 Matchup Info — ${game.away_team_name} @ ${game.home_team_name}`)
+    .setColor(0x5865F2)
+    .addFields(
+      { name: `${game.home_team_name} (Home)`, value: `Record: ${homeStanding.wins}-${homeStanding.losses}\nRecent: ${streakText(homeForm)}\n${confDivText(homeConfDiv)}`, inline: true },
+      { name: `${game.away_team_name} (Away)`, value: `Record: ${awayStanding.wins}-${awayStanding.losses}\nRecent: ${streakText(awayForm)}\n${confDivText(awayConfDiv)}`, inline: true },
+    );
+
+  embed.addFields({
+    name: 'Head-to-Head (this season)',
+    value: headToHead.games
+      ? `${game.home_team_name} ${headToHead.homeWins} - ${headToHead.awayWins} ${game.away_team_name} (last ${headToHead.games} meeting${headToHead.games === 1 ? '' : 's'})`
+      : 'No previous meetings this season.',
+    inline: false,
+  });
+
+  embed.setFooter({ text: `GG Sports • Game Center • ${league.league_name} • ID ${shortGameId(game.id)}` }).setTimestamp();
+  return embed;
+}
+
 function buildGameCenterMatchupEmbed(league, game, homeOwnerId, awayOwnerId) {
   const embed = new EmbedBuilder()
     .setTitle(`🎮 ${game.away_team_name} @ ${game.home_team_name}`)
@@ -39362,6 +39414,47 @@ const NBA_TEAM_LOGO_SLUGS = {
   'Phoenix Suns': 'phx', 'Portland Trail Blazers': 'por', 'Sacramento Kings': 'sac', 'San Antonio Spurs': 'sa',
   'Toronto Raptors': 'tor', 'Utah Jazz': 'utah', 'Washington Wizards': 'wsh',
 };
+
+// 7J-MULTISPORTLOGO-INTL: per Hxxdie — international/country competitions
+// use flags, not club-style team logos, and flags are a MUCH safer thing
+// to hardcode than soccer club logos: ISO 3166-1 alpha-2 codes are a
+// long-stable, well-known standard (unlike ESPN's opaque numeric soccer
+// team IDs — MLS and Premier League were deliberately left out of this
+// pass; ESPN's soccer logo URLs use per-team numeric IDs with no reliable
+// abbreviation pattern, e.g. Arsenal = 359, and getting the other ~49 MLS/
+// EPL team IDs right would need that same per-team verification I don't
+// have the budget to do reliably in one pass — worth its own dedicated,
+// carefully-verified follow-up rather than guessing). Uses flagcdn.com, a
+// stable public flag CDN, keyed by common country-name variants.
+const COUNTRY_FLAG_ISO_CODES = {
+  'United States': 'us', 'USA': 'us', 'United States of America': 'us',
+  'England': 'gb-eng', 'Scotland': 'gb-sct', 'Wales': 'gb-wls', 'Northern Ireland': 'gb-nir',
+  'United Kingdom': 'gb', 'Great Britain': 'gb',
+  'Canada': 'ca', 'Mexico': 'mx', 'Brazil': 'br', 'Argentina': 'ar', 'France': 'fr',
+  'Germany': 'de', 'Spain': 'es', 'Italy': 'it', 'Portugal': 'pt', 'Netherlands': 'nl',
+  'Belgium': 'be', 'Croatia': 'hr', 'Switzerland': 'ch', 'Poland': 'pl', 'Austria': 'at',
+  'Sweden': 'se', 'Norway': 'no', 'Denmark': 'dk', 'Finland': 'fi', 'Iceland': 'is',
+  'Ireland': 'ie', 'Republic of Ireland': 'ie', 'Ukraine': 'ua', 'Russia': 'ru',
+  'Turkey': 'tr', 'Greece': 'gr', 'Serbia': 'rs', 'Czech Republic': 'cz', 'Czechia': 'cz',
+  'Slovakia': 'sk', 'Hungary': 'hu', 'Romania': 'ro', 'Slovenia': 'si', 'Wales ': 'gb-wls',
+  'Japan': 'jp', 'South Korea': 'kr', 'Korea Republic': 'kr', 'China': 'cn', 'Australia': 'au',
+  'New Zealand': 'nz', 'Saudi Arabia': 'sa', 'Qatar': 'qa', 'Iran': 'ir', 'Iraq': 'iq',
+  'Morocco': 'ma', 'Algeria': 'dz', 'Tunisia': 'tn', 'Egypt': 'eg', 'Nigeria': 'ng',
+  'Senegal': 'sn', 'Ghana': 'gh', 'Cameroon': 'cm', 'Ivory Coast': 'ci', "Côte d'Ivoire": 'ci',
+  'South Africa': 'za', 'Colombia': 'co', 'Uruguay': 'uy', 'Chile': 'cl', 'Peru': 'pe',
+  'Ecuador': 'ec', 'Paraguay': 'py', 'Venezuela': 've', 'Bolivia': 'bo', 'Costa Rica': 'cr',
+  'Jamaica': 'jm', 'Panama': 'pa', 'Honduras': 'hn', 'India': 'in', 'Pakistan': 'pk',
+  'Bangladesh': 'bd', 'Indonesia': 'id', 'Philippines': 'ph', 'Vietnam': 'vn', 'Thailand': 'th',
+  'Israel': 'il', 'United Arab Emirates': 'ae', 'Jordan': 'jo', 'Kenya': 'ke', 'Ethiopia': 'et',
+};
+
+// 7J-MULTISPORTLOGO-INTL: flagcdn.com serves flags at fixed widths (w320
+// etc.) rather than arbitrary sizes like ESPN's /500/ logos — 160px is
+// plenty for the same grid use case renderTeamLogoGridPng already covers.
+function getCountryFlagUrl(countryName) {
+  const code = COUNTRY_FLAG_ISO_CODES[countryName] || COUNTRY_FLAG_ISO_CODES[String(countryName || '').trim()];
+  return code ? `https://flagcdn.com/w160/${code}.png` : null;
+}
 
 const MLB_TEAM_LOGO_SLUGS = {
   'Arizona Diamondbacks': 'ari', 'Athletics': 'oak', 'Oakland Athletics': 'oak', 'Atlanta Braves': 'atl',
@@ -49251,10 +49344,34 @@ async function getMaddenImportedGameById(gameId) {
 async function handleMaddenGameThreadButton(interaction) {
   if (!interaction.guild) return;
 
+  const parts = String(interaction.customId || '').split(':');
+  const action = parts[0].replace('maddengame_thread_', '');
+  const gameId = parts[1];
+
+  // 7J-MADDENINFOTIMEOUT: per Hxxdie — "Matchup Info" (and other buttons
+  // routed through here) was intermittently failing with Discord's "didn't
+  // respond in time" error. Root cause: nothing deferred the interaction
+  // before a chain of awaits that includes two *sequential* live Discord
+  // API calls (getMaddenTeamOwnerForGameThread -> guild.members.fetch,
+  // once each for away/home) plus multiple DB queries, all before any
+  // reply was ever sent — comfortably capable of exceeding Discord's
+  // 3-second ACK window under any real latency, even though it usually
+  // completed in time. Deferring immediately, before any of that work
+  // starts, buys the full 15-minute follow-up window instead.
+  // Deliberately NOT deferring for wager/stream/forcewin — each of those
+  // can call interaction.showModal() further down, and Discord rejects
+  // showModal() on an interaction that's already been deferred/replied to.
+  const modalCapableActions = new Set(['wager', 'stream', 'forcewin']);
+  if (!modalCapableActions.has(action)) {
+    await interaction.deferReply({ ephemeral: true }).catch(() => null);
+  }
+
   // Guard against expired interactions (Discord error 10062 — token > 15min old or post-restart)
   const safeReply = async (options) => {
     try {
-      if (interaction.replied || interaction.deferred) {
+      if (interaction.deferred && !interaction.replied) {
+        await interaction.editReply(options);
+      } else if (interaction.replied || interaction.deferred) {
         await interaction.followUp(options).catch(() => null);
       } else {
         await interaction.reply(options);
@@ -49265,19 +49382,20 @@ async function handleMaddenGameThreadButton(interaction) {
     }
   };
 
-  const parts = String(interaction.customId || '').split(':');
-  const action = parts[0].replace('maddengame_thread_', '');
-  const gameId = parts[1];
   const game = await getMaddenImportedGameById(gameId);
   const league = game?.league_id ? await getLeagueById(game.league_id) : null;
   if (!game || !league) {
     await safeReply({ content: 'That Madden game could not be found.', ephemeral: true });
     return;
   }
-  const owners = {
-    away: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.away_team, game.away_team_role_id),
-    home: await getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id),
-  };
+  // 7J-MADDENINFOTIMEOUT: these two were sequential awaits (away, then
+  // home) — parallelizing cuts the live-API portion of this handler's
+  // total latency roughly in half on top of the defer fix above.
+  const [awayOwner, homeOwner] = await Promise.all([
+    getMaddenTeamOwnerForGameThread(interaction.guild, league, game.away_team, game.away_team_role_id),
+    getMaddenTeamOwnerForGameThread(interaction.guild, league, game.home_team, game.home_team_role_id),
+  ]);
+  const owners = { away: awayOwner, home: homeOwner };
   const matchup = await getMaddenMatchupPreviewData(interaction.guild.id, league.league_id, game.home_team, game.away_team).catch(() => null);
   if (action === 'game') {
     await safeReply({ embeds: [buildMaddenGameThreadCenterEmbed(league, game, matchup, owners)], ephemeral: true });
