@@ -7212,6 +7212,39 @@ async function getTeamResultStreak(guildId, leagueId, teamRoleId) {
   return { type: firstType, length };
 }
 
+// 7J-NEWSVARIETY: same logic as getTeamResultStreak, but excludes the game
+// that was just reported — used to check what a team's streak looked like
+// going INTO their latest result, so a win right after a real losing skid
+// (or a loss right after a perfect run) can be recognized as its own story,
+// distinct from the plain per-game result and the "riding a streak"
+// milestone posts.
+async function getPriorTeamResultStreak(guildId, leagueId, teamRoleId, excludeGameId) {
+  const result = await pool.query(
+    `SELECT home_team_role_id, away_team_role_id, winner_team_role_id, home_score, away_score
+     FROM league_games
+     WHERE guild_id = $1 AND league_id = $2 AND status = 'final' AND id != $4
+       AND (home_team_role_id = $3 OR away_team_role_id = $3)
+     ORDER BY updated_at DESC
+     LIMIT 10`,
+    [guildId, leagueId, teamRoleId, excludeGameId]
+  ).catch(() => ({ rows: [] }));
+
+  if (!result.rows.length) return { type: null, length: 0 };
+
+  const isTieRow = row => row.winner_team_role_id === null && row.home_score !== null && row.away_score !== null && row.home_score === row.away_score;
+  const firstType = isTieRow(result.rows[0]) ? null : (result.rows[0].winner_team_role_id === teamRoleId ? 'win' : 'loss');
+  if (!firstType) return { type: null, length: 0 };
+
+  let length = 0;
+  for (const row of result.rows) {
+    if (isTieRow(row)) break;
+    const rowType = row.winner_team_role_id === teamRoleId ? 'win' : 'loss';
+    if (rowType !== firstType) break;
+    length++;
+  }
+  return { type: firstType, length };
+}
+
 async function computeLeaguePowerRankingRows(guild, league) {
   const standingsResult = await pool.query(
     `SELECT * FROM league_standings WHERE guild_id = $1 AND league_id = $2`,
@@ -7265,6 +7298,53 @@ async function computeAndPostLeaguePowerRankings(guild, league) {
   await updatePanel(guild, league, 'league_power_rankings', embed, [], files);
 }
 
+// 7J-STRUCTUREDPRBATCH: per Hxxdie — structured leagues were recomputing
+// Power Rankings (and firing "climbs to #1" movers news) after EVERY
+// individual game report within a round, not once per round. Since
+// computeLeaguePowerRankingRows diffs against whatever it last stored as
+// previous_rank — i.e. the immediately-prior computation, not the state as
+// of the last Advance — several games reported back-to-back within the same
+// round could each nudge the standings and cascade through #1 in sequence:
+// three different teams all "climbing to #1" the same week, none of it
+// technically wrong, just misleadingly granular. Real power rankings are a
+// weekly snapshot, not a live-updating leaderboard mid-round. This computes
+// exactly once per round, called from the Advance flow after that round's
+// games are locked in, comparing against rank as of the PREVIOUS Advance.
+// Open-schedule leagues have no such round boundary at all and explicitly
+// keep the existing per-game behavior — not touched here, per Hxxdie.
+async function computeAndPostStructuredRoundPowerRankings(guild, league) {
+  if (!guild || !league?.league_id) return;
+  const rankedRows = await computeLeaguePowerRankingRows(guild, league);
+  if (!rankedRows.length) return;
+
+  const embed = buildLeaguePowerRankingsEmbed(league, rankedRows);
+  const files = [];
+  const logoPng = await renderTeamLogoStripPng(league, rankedRows.map(r => r.team_name)).catch(error => {
+    console.error('[7J-MULTISPORTLOGO-EVERYWHERE] Power rankings logo strip render failed:', error?.message || error);
+    return null;
+  });
+  if (logoPng) {
+    files.push(new AttachmentBuilder(logoPng, { name: 'power-rankings-logos.png' }));
+    embed.setImage('attachment://power-rankings-logos.png');
+  }
+  await updatePanel(guild, league, 'league_power_rankings', embed, [], files);
+
+  for (const row of rankedRows) {
+    const newRank = rankedRows.indexOf(row) + 1;
+    if (row.previous_rank === null || row.previous_rank === undefined) continue;
+    const delta = row.previous_rank - newRank;
+    if (delta >= 3 || (newRank === 1 && row.previous_rank !== 1)) {
+      await generateAndPostLeagueNewsEvent(guild, league, 'power_ranking_movers', {
+        team: row.team_name, direction: 'up', oldRank: row.previous_rank, newRank,
+      }).catch(() => null);
+    } else if (delta <= -3) {
+      await generateAndPostLeagueNewsEvent(guild, league, 'power_ranking_movers', {
+        team: row.team_name, direction: 'down', oldRank: row.previous_rank, newRank,
+      }).catch(() => null);
+    }
+  }
+}
+
 // 7J-136NEWSEVENTS: per Hxxdie — "feed the news system with all the same
 // information Madden gets, minus sync data, using generic events off the
 // same kinds of triggers: trade rumors, power ranking movement, win
@@ -7299,6 +7379,13 @@ async function generateAndPostLeagueNewsEvent(guild, league, eventType, context)
     trade_official: `Write a headline and blurb reporting a trade that has just been OFFICIALLY approved between two teams. This is a real, finalized trade — write it with the weight of a real trade-reaction piece, not a rumor.`,
     award_winner: `Write a headline and blurb celebrating a player who just won a league award. Genuine, celebratory tone — this is a real accomplishment.`,
     league_champion: `Write a headline and blurb crowning this season's league champion. This is the biggest story of the season — write it with real weight and celebration.`,
+    // 7J-NEWSVARIETY: three new event types, per Hxxdie's call that the
+    // News feed felt repetitive with only game_result/streaks/power-ranking
+    // movers in rotation all season. All three reuse data already tracked
+    // (league_games results, league_standings win totals) — no new schema.
+    bounce_back_win: `Write a headline and blurb about a team snapping a real losing streak with this win — or, if they'd been winless all season, finally breaking through for their first win. Genuine feel-good redemption-story energy, warm and triumphant — the opposite of the concern/pressure framing used for a losing skid.`,
+    unbeaten_streak_ends: `Write a headline and blurb about a team's perfect, undefeated season coming to an end with this loss. Frame it as a real "the streak is over" moment — genuine surprise/weight, not just a routine loss recap.`,
+    win_milestone: `Write a headline and blurb marking a team reaching a real win-total milestone this season. Treat it as a genuine "state of the season" accomplishment, not just another game result.`,
   };
   const promptInstruction = EVENT_PROMPTS[eventType];
   if (!promptInstruction) return;
@@ -7375,6 +7462,14 @@ function buildLeagueNewsFallbackTemplate(eventType, context) {
       return { headline: `${context.playerName} wins ${context.awardName}`, blurb: `${context.playerName} takes home the ${context.awardName} for ${context.leagueName}.` };
     case 'league_champion':
       return { headline: `${context.championTeam} are your league champions!`, blurb: `${context.championTeam} closed out the season on top.` };
+    case 'bounce_back_win':
+      return context.snappedStreakLength
+        ? { headline: `${context.team} snaps a ${context.snappedStreakLength}-game skid`, blurb: `${context.team} finally got back in the win column.` }
+        : { headline: `${context.team} picks up their first win of the season`, blurb: `${context.team} breaks through after a winless start.` };
+    case 'unbeaten_streak_ends':
+      return { headline: `${context.team}'s perfect season is over`, blurb: `${context.team} drops their first game after starting ${context.priorWins}-0.` };
+    case 'win_milestone':
+      return { headline: `${context.team} reaches ${context.winCount} wins`, blurb: `${context.team} hits the ${context.winCount}-win mark this season.` };
     default:
       return null;
   }
@@ -16348,6 +16443,17 @@ if (interaction.commandName === 'avatar') {
         if (previousRoundLabel) {
           unscoredCleanup = await refundUnscoredStructuredGamesForRound(interaction.guild, league, previousRoundLabel)
             .catch(err => { console.error('[Structured Advance] Unscored game cleanup failed:', err?.message || err); return { checked: 0, refunded: 0 }; });
+        }
+
+        // 7J-STRUCTUREDPRBATCH: Power Rankings + movers news for the round
+        // that just concluded — computed exactly once here, now that every
+        // game in that round is either scored or refunded-as-unscored above,
+        // rather than once per individual game report during the round.
+        // Guarded by previousRoundLabel so the very first Start League press
+        // (no prior round to snapshot) doesn't fire on an empty round.
+        if (previousRoundLabel) {
+          await computeAndPostStructuredRoundPowerRankings(interaction.guild, league)
+            .catch(err => console.error('[Structured Advance] Power rankings batch failed:', err?.message || err));
         }
 
         // Delete the previous round's game threads before creating the new
@@ -31560,20 +31666,32 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
   // separate trigger wired into each schedule style individually. Skipped
   // for Madden leagues entirely — they already have both, EA-sync-driven.
   if (getLeagueSportKey(activeLeague) !== 'madden') {
-    const rankedRows = await computeLeaguePowerRankingRows(interaction.guild, activeLeague);
-    if (rankedRows.length) {
-      // 7J-MULTISPORTLOGO-EVERYWHERE: same treatment as
-      // computeAndPostLeaguePowerRankings — this call site bypasses that
-      // wrapper (it already has rankedRows computed for the news-event
-      // logic just above), so the logo strip needs building here too.
-      const rankEmbed = buildLeaguePowerRankingsEmbed(activeLeague, rankedRows);
-      const rankFiles = [];
-      const rankLogoPng = await renderTeamLogoStripPng(activeLeague, rankedRows.map(r => r.team_name)).catch(() => null);
-      if (rankLogoPng) {
-        rankFiles.push(new AttachmentBuilder(rankLogoPng, { name: 'power-rankings-logos.png' }));
-        rankEmbed.setImage('attachment://power-rankings-logos.png');
+    // 7J-STRUCTUREDPRBATCH: per Hxxdie — for structured leagues, Power
+    // Rankings board updates and "climbs/slides" movers news now happen
+    // once per round (computeAndPostStructuredRoundPowerRankings, called
+    // from Advance) instead of once per individual game report. Explicitly
+    // NOT applied to open-schedule leagues, which have no round boundary to
+    // batch against and keep the original per-game behavior below.
+    const reportScheduleSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+    const isStructuredLeagueReport = reportScheduleSettings.schedule_style === 'structured';
+
+    let rankedRows = [];
+    if (!isStructuredLeagueReport) {
+      rankedRows = await computeLeaguePowerRankingRows(interaction.guild, activeLeague);
+      if (rankedRows.length) {
+        // 7J-MULTISPORTLOGO-EVERYWHERE: same treatment as
+        // computeAndPostLeaguePowerRankings — this call site bypasses that
+        // wrapper (it already has rankedRows computed for the news-event
+        // logic just above), so the logo strip needs building here too.
+        const rankEmbed = buildLeaguePowerRankingsEmbed(activeLeague, rankedRows);
+        const rankFiles = [];
+        const rankLogoPng = await renderTeamLogoStripPng(activeLeague, rankedRows.map(r => r.team_name)).catch(() => null);
+        if (rankLogoPng) {
+          rankFiles.push(new AttachmentBuilder(rankLogoPng, { name: 'power-rankings-logos.png' }));
+          rankEmbed.setImage('attachment://power-rankings-logos.png');
+        }
+        await updatePanel(interaction.guild, activeLeague, 'league_power_rankings', rankEmbed, [], rankFiles);
       }
-      await updatePanel(interaction.guild, activeLeague, 'league_power_rankings', rankEmbed, [], rankFiles);
     }
 
     const gameNewsContext = {
@@ -31588,18 +31706,22 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
     // OWN previous_rank (already tracked by computeLeaguePowerRankingRows),
     // not just this game's two participants, since a team can move in the
     // rankings without having played today (opponents' results shift it).
-    for (const row of rankedRows) {
-      const newRank = rankedRows.indexOf(row) + 1;
-      if (row.previous_rank === null || row.previous_rank === undefined) continue;
-      const delta = row.previous_rank - newRank;
-      if (delta >= 3 || (newRank === 1 && row.previous_rank !== 1)) {
-        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'power_ranking_movers', {
-          team: row.team_name, direction: 'up', oldRank: row.previous_rank, newRank,
-        }).catch(() => null);
-      } else if (delta <= -3) {
-        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'power_ranking_movers', {
-          team: row.team_name, direction: 'down', oldRank: row.previous_rank, newRank,
-        }).catch(() => null);
+    // Structured leagues skip this here entirely — see the batched
+    // per-round equivalent in computeAndPostStructuredRoundPowerRankings.
+    if (!isStructuredLeagueReport) {
+      for (const row of rankedRows) {
+        const newRank = rankedRows.indexOf(row) + 1;
+        if (row.previous_rank === null || row.previous_rank === undefined) continue;
+        const delta = row.previous_rank - newRank;
+        if (delta >= 3 || (newRank === 1 && row.previous_rank !== 1)) {
+          await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'power_ranking_movers', {
+            team: row.team_name, direction: 'up', oldRank: row.previous_rank, newRank,
+          }).catch(() => null);
+        } else if (delta <= -3) {
+          await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'power_ranking_movers', {
+            team: row.team_name, direction: 'down', oldRank: row.previous_rank, newRank,
+          }).catch(() => null);
+        }
       }
     }
 
@@ -31614,6 +31736,50 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
       if ([3, 5, 7, 10].includes(streak.length)) {
         await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, streak.type === 'win' ? 'win_streak' : 'losing_skid', {
           team: teamName, streakLength: streak.length,
+        }).catch(() => null);
+      }
+    }
+
+    // 7J-NEWSVARIETY: three more angles beyond streaks/power-rankings/game
+    // results, per Hxxdie's call that the News feed was too repetitive.
+    // Ties are skipped entirely — none of these three make sense without a
+    // real winner and loser.
+    if (!isTie) {
+      const loserRoleId = winnerRoleId === game.home_team_role_id ? game.away_team_role_id : game.home_team_role_id;
+      const loserTeamName = winnerRoleId === game.home_team_role_id ? game.away_team_name : game.home_team_name;
+
+      // Bounce-back win: this win snapped a real (2+) losing streak the
+      // winner was on going INTO this game — including a still-winless
+      // team's first-ever win, which naturally shows up as a long prior
+      // losing streak. Genuinely different framing from "riding a streak,"
+      // and from the plain game_result recap.
+      const priorWinnerStreak = await getPriorTeamResultStreak(interaction.guild.id, game.league_id, winnerRoleId, game.id);
+      if (priorWinnerStreak.type === 'loss' && priorWinnerStreak.length >= 2) {
+        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'bounce_back_win', {
+          team: winnerName, snappedStreakLength: priorWinnerStreak.length,
+        }).catch(() => null);
+      }
+
+      // Perfect season ends: the loser had a spotless record (no losses, no
+      // ties, at least 3 wins already banked — so this is a real run, not
+      // just game one) before this result.
+      const involvedStandingsResult = await pool.query(
+        `SELECT team_role_id, wins, losses, ties FROM league_standings WHERE guild_id = $1 AND league_id = $2 AND team_role_id IN ($3, $4)`,
+        [interaction.guild.id, game.league_id, game.home_team_role_id, game.away_team_role_id]
+      ).catch(() => ({ rows: [] }));
+      const loserStandingsRow = involvedStandingsResult.rows.find(r => r.team_role_id === loserRoleId);
+      if (loserStandingsRow && Number(loserStandingsRow.losses) === 1 && Number(loserStandingsRow.ties) === 0 && Number(loserStandingsRow.wins) >= 3) {
+        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'unbeaten_streak_ends', {
+          team: loserTeamName, priorWins: loserStandingsRow.wins,
+        }).catch(() => null);
+      }
+
+      // Win-total milestone — a clean round number is worth its own
+      // headline regardless of streak state.
+      const winnerStandingsRow = involvedStandingsResult.rows.find(r => r.team_role_id === winnerRoleId);
+      if (winnerStandingsRow && [5, 10, 15, 20, 25, 30].includes(Number(winnerStandingsRow.wins))) {
+        await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'win_milestone', {
+          team: winnerName, winCount: winnerStandingsRow.wins,
         }).catch(() => null);
       }
     }
@@ -31792,8 +31958,16 @@ async function forceLeagueGameResult(interaction, game, winnerSide) {
   // 7J-135GENERICNEWS: Power Rankings only here, no News item — a forced
   // win has no real score to recap, and "X wins by forfeit" isn't the kind
   // of thing this feature is meant to cover.
+  // 7J-STRUCTUREDPRBATCH: structured leagues skip this too, for the same
+  // reason as the normal score-report path — a mid-round Force Win
+  // shouldn't trigger its own immediate rankings snapshot; it'll be picked
+  // up in the next Advance's batched computation along with everything
+  // else from that round.
   if (getLeagueSportKey(activeLeague) !== 'madden') {
-    await computeAndPostLeaguePowerRankings(interaction.guild, activeLeague).catch(() => null);
+    const forceWinScheduleSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+    if (forceWinScheduleSettings.schedule_style !== 'structured') {
+      await computeAndPostLeaguePowerRankings(interaction.guild, activeLeague).catch(() => null);
+    }
   }
 
   // No currency payout here on purpose — a forced win means no game was
