@@ -1702,6 +1702,14 @@ async function initDatabase() {
   // per-league toggle, not sport-gated, same as ties_allowed.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS otl_allowed BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS otl_points INTEGER NOT NULL DEFAULT 1`);
+  // 7J-SUDDENDEATH: per Hxxdie — a sport using true sudden-death overtime
+  // (first score wins, game ends immediately) can never have a real OTL
+  // final score with a margin bigger than 1 — that would mean the game kept
+  // going after someone scored, which isn't how sudden death works. Opt-in
+  // per league (off by default, only meaningful for leagues that also have
+  // OTL enabled) so leagues using a non-sudden-death OT format (multiple
+  // extra frames, running clock, etc.) aren't wrongly blocked.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS sudden_death_ot BOOLEAN NOT NULL DEFAULT FALSE`);
   // 7J-99WAGER: opt-in, defaults off — a straight 1v1 bet between the two
   // owners in a game thread, entirely separate from the sportsbook/
   // moneylines. See game_wagers table below.
@@ -17047,6 +17055,23 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-SUDDENDEATH: per Hxxdie — separate opt-in toggle from OTL itself,
+    // since not every league running OTL uses a true sudden-death format.
+    // Turning OTL off elsewhere doesn't auto-disable this (so re-enabling
+    // OTL later remembers the prior choice), but the button is disabled in
+    // the UI above whenever OTL is off, and the report-time validation
+    // below only ever checks this flag when otl_allowed is also true.
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_toggle_suddendeath:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      await pool.query(`UPDATE league_custom_settings SET sudden_death_ot = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, !customSettings.sudden_death_ot]);
+      await logLeagueSettingChange(league, interaction.user.id, 'Sudden Death OT', customSettings.sudden_death_ot ? 'Yes' : 'No', !customSettings.sudden_death_ot ? 'Yes' : 'No');
+      await showLeagueCustomizationSection(interaction, leagueId, 'standings', { update: true });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_otlpoints_modal:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -31586,6 +31611,20 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
     return { ok: false, message: 'Ties are not supported for standings in this league. Enable ties in League Customization → Standings, or enter a winning score.' };
   }
 
+  // 7J-SUDDENDEATH: per Hxxdie — in a true sudden-death OT format, the game
+  // ends the instant someone scores, so a real OTL final can never have a
+  // margin bigger than 1. Checked here (the one shared choke point for both
+  // the Report Score modal and /game report) so neither entry point can be
+  // used to slip through a sudden-death-impossible score. Only applies when
+  // both otl_allowed AND sudden_death_ot are on — off by default, and the
+  // UI disables the Sudden Death toggle whenever OTL itself is off.
+  if (!isTie && overtimeLoss && customSettings.otl_allowed && customSettings.sudden_death_ot) {
+    const margin = Math.abs(homeScore - awayScore);
+    if (margin !== 1) {
+      return { ok: false, message: `This league has Sudden Death OT enabled, so an overtime/shootout loss can only be reported with a 1-goal margin — got a ${margin}-goal difference. Double-check the score, or uncheck overtime loss if this wasn't decided in OT/SO.` };
+    }
+  }
+
   const homeWins = homeScore > awayScore;
   const awayWins = awayScore > homeScore;
   const winnerRoleId = isTie ? null : homeWins ? game.home_team_role_id : game.away_team_role_id;
@@ -31791,7 +31830,17 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
   const winnerOwner = await findTeamOwnerByRoleId(interaction.guild, winnerRoleId);
   const payoutLines = [];
 
-  if (Number(settings.game_played_payout) > 0) {
+  // 7J-USERVSUSERPAYOUTS: per Hxxdie — game-played and win payouts (plus the
+  // activity/participation credit that rides along with them) were only
+  // gated on each individual owner existing, not on BOTH teams having a real
+  // owner. A human vs. a CPU/unclaimed team would still pay the human side
+  // for "playing" and, if they won, for winning too — free currency for a
+  // game with no actual opposing stakes. Mirrors the same user-vs-user
+  // requirement already enforced for auto sportsbook lines
+  // (createAutoSportsbookForLeagueGame).
+  const isUserVsUserGame = Boolean(homeOwner && awayOwner);
+
+  if (isUserVsUserGame && Number(settings.game_played_payout) > 0) {
     const paidOwners = new Set();
     for (const owner of [homeOwner, awayOwner]) {
       if (owner && !paidOwners.has(owner.id)) {
@@ -31822,7 +31871,7 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
   const suspensionsLeague = await getLeagueById(game.league_id).catch(() => null);
   if (suspensionsLeague) await refreshSuspensionsBoard(interaction.guild, suspensionsLeague).catch(() => null);
 
-  if (winnerOwner && Number(settings.win_payout) > 0) {
+  if (isUserVsUserGame && winnerOwner && Number(settings.win_payout) > 0) {
     await addCurrency(
       interaction.guild.id,
       winnerOwner.id,
@@ -31887,8 +31936,8 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
   const sportsbookText = sportsbookSettlement
     ? String.fromCharCode(10) + 'Sportsbook auto-settled: **' + sportsbookSettlement.winners + '** winning bets, **' + sportsbookSettlement.losers + '** losing bets, paid **' + settings.currency_icon + ' ' + sportsbookSettlement.totalPaid + '**.'
     : '';
-  if (!homeOwner || !awayOwner) {
-    payoutLines.push('Note: one or more team owners were not cached, so owner payout may be skipped. Have the owner run any command or retry later if needed.');
+  if (!isUserVsUserGame) {
+    payoutLines.push('Note: game-played/win payouts were skipped — one or both teams have no owner on file. If this is a real user-vs-user game and an owner just wasn\'t cached yet, have them run any command and report/reset this game to pay out; if one side is CPU/unclaimed, this is expected.');
   }
 
   const payoutText = payoutLines.length ? String.fromCharCode(10) + payoutLines.join(String.fromCharCode(10)) : '';
@@ -35109,7 +35158,13 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
   // 'footwear' is excluded from the heel-lift shift below — it has to stay planted at
   // the true ground line, since it IS the thing creating the lift. Pet is handled
   // separately after this loop — see PET_POSITIONS below.
-  const wearableLayerOrder = ['footwear', 'bottom', 'top', 'hair', 'headwear'];
+  // 7J-SHOESUNDERPANTS: this local order previously started with 'footwear'
+  // (drawn first, i.e. UNDERNEATH bottom/top), directly contradicting the
+  // canonical AVATAR_LAYER_RENDER_ORDER constant above (which correctly
+  // puts footwear after bottom/top) — pant legs were compositing straight
+  // over the shoes on every avatar. Reordered to match that canonical
+  // order: footwear now draws after both bottom and top.
+  const wearableLayerOrder = ['hair', 'bottom', 'top', 'footwear', 'headwear'];
   for (const slot of wearableLayerOrder) {
     if (slot === 'hair' && equipped.headwear?.art_asset_key) continue;
 
@@ -69854,22 +69909,30 @@ async function distributeMaddenGameCompletionReward(guild, league, game) {
   // no win bonus paid, game_played still pays to both owners below.
   const winnerOwner = homeScore > awayScore ? homeOwner : awayScore > homeScore ? awayOwner : null;
 
+  // 7J-USERVSUSERPAYOUTS: same requirement as the generic Game Center path
+  // (reportLeagueGameCore) — a CPU/unclaimed opponent means no real
+  // opposing stakes, so neither game-played nor win payouts should fire,
+  // even for whichever side does have a real owner.
+  const isUserVsUserMaddenGame = Boolean(homeOwner && awayOwner);
+
   const paidOwners = new Set();
-  for (const owner of [homeOwner, awayOwner]) {
-    if (owner && !paidOwners.has(owner.id)) {
-      paidOwners.add(owner.id);
-      if (Number(settings.game_played_payout) > 0) {
-        await addCurrency(
-          guild.id,
-          owner.id,
-          Number(settings.game_played_payout),
-          'game_played',
-          `Game played: ${game.away_team} @ ${game.home_team}`,
-          'system'
-        ).catch(() => null);
+  if (isUserVsUserMaddenGame) {
+    for (const owner of [homeOwner, awayOwner]) {
+      if (owner && !paidOwners.has(owner.id)) {
+        paidOwners.add(owner.id);
+        if (Number(settings.game_played_payout) > 0) {
+          await addCurrency(
+            guild.id,
+            owner.id,
+            Number(settings.game_played_payout),
+            'game_played',
+            `Game played: ${game.away_team} @ ${game.home_team}`,
+            'system'
+          ).catch(() => null);
+        }
+        await addActivityPoints(guild.id, owner.id, 3, 0, league.league_id).catch(() => null);
+        await addParticipationScore(guild.id, owner.id, 1, league.league_id).catch(() => null);
       }
-      await addActivityPoints(guild.id, owner.id, 3, 0, league.league_id).catch(() => null);
-      await addParticipationScore(guild.id, owner.id, 1, league.league_id).catch(() => null);
     }
   }
   // 7J-97SUSPEND: same decrement as the other game-played path.
@@ -69880,7 +69943,7 @@ async function distributeMaddenGameCompletionReward(guild, league, game) {
   // a real final score.
   await settleGameWager(guild, game).catch(err => console.error('[Wager] Settlement failed:', err?.message));
 
-  if (winnerOwner) {
+  if (isUserVsUserMaddenGame && winnerOwner) {
     if (Number(settings.win_payout) > 0) {
       await addCurrency(
         guild.id,
@@ -71508,6 +71571,7 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
         { name: 'Win / Loss / Tie Points', value: `${customSettings.win_points ?? 2} / ${customSettings.loss_points ?? 0} / ${customSettings.tie_points ?? 1}`, inline: true },
         { name: 'Ties Allowed', value: customSettings.ties_allowed ? 'Yes' : 'No', inline: true },
         { name: 'OTL Allowed', value: customSettings.otl_allowed ? `Yes (${customSettings.otl_points ?? 1} pts)` : 'No', inline: true },
+        { name: 'Sudden Death OT', value: customSettings.sudden_death_ot ? 'Yes — OT/SO losses must be by exactly 1' : 'No', inline: true },
       )
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
@@ -71528,6 +71592,9 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('leaguecustom_toggle_otl:' + leagueId).setLabel(customSettings.otl_allowed ? 'Disable OTL' : 'Enable OTL').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('leaguecustom_otlpoints_modal:' + leagueId).setLabel('Edit OTL Points').setStyle(ButtonStyle.Primary).setDisabled(!customSettings.otl_allowed),
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('leaguecustom_toggle_suddendeath:' + leagueId).setLabel(customSettings.sudden_death_ot ? 'Disable Sudden Death OT' : 'Enable Sudden Death OT').setStyle(ButtonStyle.Secondary).setDisabled(!customSettings.otl_allowed),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
