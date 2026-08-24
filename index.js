@@ -144,6 +144,50 @@ const STRIPE_PRICE_ID_ANNUAL = process.env.STRIPE_PRICE_ID_ANNUAL || '';
 const STRIPE_API_BASE = 'https://api.stripe.com/v1';
 const STRIPE_IS_LIVE_MODE = STRIPE_SECRET_KEY.startsWith('sk_live_');
 
+// 7J-NEWSAUTHFIX: the League News / Madden ESPN News Claude API calls were
+// missing auth entirely (no x-api-key, no anthropic-version header) — every
+// call was silently 401ing, landing in the catch, and falling back to the
+// plain-text templates 100% of the time. That's the actual reason the news
+// feed read as bland/repetitive; the creative system prompts were never
+// once reaching the model. Fixed via callClaudeNewsApi() below, which both
+// call sites now route through.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_API_VERSION = '2023-06-01';
+
+// 7J-NEWSAUTHFIX: single shared helper for both news-writing call sites
+// (generic League News and Madden ESPN News) — sends real auth headers,
+// treats a non-2xx response as a real thrown error (instead of silently
+// becoming `null` and producing the misleading "Unexpected end of JSON
+// input" downstream), and returns the parsed {headline, blurb} JSON body
+// straight from the model's text content. Callers still wrap this in their
+// own try/catch and fall back to templates on any failure — this only
+// fixes *why* it was always failing, not the fallback behavior itself,
+// which is still a reasonable safety net for genuine outages.
+async function callClaudeNewsApi(system, userContent, maxTokens = 300) {
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not set');
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: userContent }],
+    }),
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`Claude API returned ${res.status}: ${errBody.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = data?.content?.map(c => c.text || '').join('') || '';
+  return JSON.parse(text.replace(/```json|```/g, '').trim());
+}
+
 // 7J-PREMIUM: refuse to boot in a production configuration with non-live
 // Stripe keys — a broken prod webhook silently pointed at test keys (or
 // vice versa) is exactly the kind of thing that should fail loudly at
@@ -5480,6 +5524,19 @@ function buildNegotiationConfirmRow(negotiationId, disabled = false) {
   );
 }
 
+// 7J-ENDNEGOTIATION: per Hxxdie — not every non-Madden negotiation ends
+// with a screenshot going to committee; plenty just fall through (talks
+// stall, one side backs out, they agree not to do it). There was no way to
+// close one out other than letting it sit there indefinitely. Either owner
+// in the thread can end it at any point in the flow — this row is appended
+// alongside whichever state row (Submit or Confirm) is currently showing,
+// so it's always available regardless of where the negotiation is.
+function buildNegotiationEndRow(negotiationId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('negotiation_end:' + negotiationId).setLabel('End Negotiation').setEmoji('🛑').setStyle(ButtonStyle.Secondary).setDisabled(disabled)
+  );
+}
+
 async function createGenericTradeNegotiationThread(guild, league, { senderUserId, senderTeamName, senderTeamRoleId, targetUserId, targetTeamName, targetTeamRoleId }) {
   // 7J-NOSELFTRADE: per Hxxdie — nothing was stopping a user from
   // negotiating a trade with their own team, or with themselves if they
@@ -5527,7 +5584,7 @@ async function createGenericTradeNegotiationThread(guild, league, { senderUserId
   const starterMessage = await thread.send({
     content: `<@${senderUserId}> <@${targetUserId}> private trade negotiation opened.`,
     embeds: [embed],
-    components: [buildNegotiationSubmitRow(negotiationId)],
+    components: [buildNegotiationSubmitRow(negotiationId), buildNegotiationEndRow(negotiationId)],
     allowedMentions: { users: [senderUserId, targetUserId], roles: [] },
   }).catch(() => null);
 
@@ -7251,18 +7308,11 @@ async function generateAndPostLeagueNewsEvent(guild, league, eventType, context)
 
   if (useClaudeApi) {
     try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 300,
-          system: `You are a sports journalist covering a fan-run online league called "${league.league_name}". ${promptInstruction} Sound like a real beat writer, not a bot. Never invent facts not present in the data given. Return ONLY valid JSON: {"headline": "...", "blurb": "..."}. No markdown, no preamble.`,
-          messages: [{ role: 'user', content: JSON.stringify({ leagueName: league.league_name, ...context }) }],
-        }),
-      }).then(r => r.json()).catch(() => null);
-      const text = response?.content?.map(c => c.text || '').join('') || '';
-      const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+      const parsed = await callClaudeNewsApi(
+        `You are a sports journalist covering a fan-run online league called "${league.league_name}". ${promptInstruction} Sound like a real beat writer, not a bot. Never invent facts not present in the data given. Return ONLY valid JSON: {"headline": "...", "blurb": "..."}. No markdown, no preamble.`,
+        JSON.stringify({ leagueName: league.league_name, ...context }),
+        300
+      );
       if (parsed?.headline) { headline = parsed.headline; blurb = parsed.blurb || ''; }
     } catch (err) {
       console.warn(`[LEAGUE NEWS] Claude API failed for ${eventType}, falling back to template:`, err?.message);
@@ -10044,7 +10094,7 @@ client.on(Events.MessageCreate, async (message) => {
         await message.channel.send({
           content: `<@${otherOwner}> please confirm or cancel this screenshot.`,
           embeds: [embed],
-          components: [buildNegotiationConfirmRow(negotiation.id)],
+          components: [buildNegotiationConfirmRow(negotiation.id), buildNegotiationEndRow(negotiation.id)],
           allowedMentions: { users: [otherOwner], roles: [] },
         }).catch(() => null);
 
@@ -10055,7 +10105,7 @@ client.on(Events.MessageCreate, async (message) => {
         if (negotiation.starter_message_id) {
           const starterMessage = await message.channel.messages.fetch(negotiation.starter_message_id).catch(() => null);
           if (starterMessage) {
-            await starterMessage.edit({ components: [buildNegotiationSubmitRow(negotiation.id, true)] }).catch(() => null);
+            await starterMessage.edit({ components: [buildNegotiationSubmitRow(negotiation.id, true), buildNegotiationEndRow(negotiation.id)] }).catch(() => null);
           }
         }
       }
@@ -14313,7 +14363,8 @@ if (interaction.commandName === 'avatar') {
           sportsbookGame.league_id
         );
         const sideLabel = side === 'home' ? sportsbookGame.home_label : sportsbookGame.away_label;
-        await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
+        const { payout: netPayoutReply, feeAmount: feeAmountReply } = computeSportsbookNetPayout(payout, amount);
+        await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + netPayoutReply + '** (after 10% house fee on winnings, ' + settings.currency_icon + ' ' + feeAmountReply + ').', ephemeral: true });
         return;
       }
       if (interaction.customId.startsWith('tradeblock_modal:')) {
@@ -14984,6 +15035,32 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      // 7J-ENDNEGOTIATION: either owner can close this out at any point —
+      // talks stalling out or one side backing out doesn't have to mean the
+      // thread just sits there forever. Confirms before deleting (a thread
+      // delete can't be undone), and only the two owners in the negotiation
+      // (not staff, not anyone else in the thread) can trigger it, matching
+      // every other negotiation button's permission check.
+      if (interaction.customId.startsWith('negotiation_end:')) {
+        const negotiationId = interaction.customId.split(':')[1];
+        const negResult = await pool.query(`SELECT * FROM league_trade_negotiations WHERE id = $1`, [negotiationId]);
+        const negotiation = negResult.rows[0];
+        if (!negotiation) { await interaction.reply({ content: 'This negotiation could not be found.', ephemeral: true }); return; }
+        if (![negotiation.sender_user_id, negotiation.target_user_id].includes(interaction.user.id)) {
+          await interaction.reply({ content: 'Only the two owners in this negotiation can do that.', ephemeral: true });
+          return;
+        }
+        if (negotiation.status !== 'negotiating') {
+          await interaction.reply({ content: 'This negotiation has already been closed out.', ephemeral: true });
+          return;
+        }
+        await pool.query(`UPDATE league_trade_negotiations SET status = 'ended', updated_at = NOW() WHERE id = $1`, [negotiationId]);
+        await interaction.reply({ content: `<@${interaction.user.id}> ended this negotiation. This thread will be deleted shortly.` });
+        const thread = interaction.channel?.isThread?.() ? interaction.channel : await interaction.guild.channels.fetch(negotiation.thread_id).catch(() => null);
+        if (thread) await thread.delete('GG Sports: trade negotiation ended by an owner').catch(() => null);
+        return;
+      }
+
       // 7J-138NEGOTIATION: dual confirmation — records whichever owner
       // clicked, then checks if BOTH have now confirmed before actually
       // sending anything to committee. Per Hxxdie: "make sure both users
@@ -15014,7 +15091,7 @@ if (interaction.commandName === 'avatar') {
           // a replacement.
           if (negotiation.starter_message_id) {
             const starterMessage = await interaction.channel.messages.fetch(negotiation.starter_message_id).catch(() => null);
-            if (starterMessage) await starterMessage.edit({ components: [buildNegotiationSubmitRow(negotiationId, false)] }).catch(() => null);
+            if (starterMessage) await starterMessage.edit({ components: [buildNegotiationSubmitRow(negotiationId, false), buildNegotiationEndRow(negotiationId)] }).catch(() => null);
           }
           await interaction.update({ content: `<@${interaction.user.id}> cancelled this screenshot. Post a new one whenever you're ready.`, embeds: [], components: [] });
           return;
@@ -15027,7 +15104,7 @@ if (interaction.commandName === 'avatar') {
 
         if (!refreshed.sender_confirmed || !refreshed.target_confirmed) {
           const waitingOn = !refreshed.sender_confirmed ? refreshed.sender_user_id : refreshed.target_user_id;
-          await interaction.update({ content: `<@${interaction.user.id}> confirmed. Waiting on <@${waitingOn}> to confirm too.`, components: [buildNegotiationConfirmRow(negotiationId)] });
+          await interaction.update({ content: `<@${interaction.user.id}> confirmed. Waiting on <@${waitingOn}> to confirm too.`, components: [buildNegotiationConfirmRow(negotiationId), buildNegotiationEndRow(negotiationId)] });
           return;
         }
 
@@ -15483,7 +15560,8 @@ if (interaction.commandName === 'avatar') {
         const sideLabel = leg.side === 'home' ? leg.sportsbookGame.home_label : leg.sportsbookGame.away_label;
         return (index + 1) + '. ' + sideLabel + ' ' + formatAmericanOdds(leg.odds) + ' — ' + leg.sportsbookGame.game_label;
       }).join(NL);
-      await interaction.editReply({ content: 'Parlay placed! 🎫' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**' });
+      const { payout: netParlayPayout, feeAmount: parlayFeeAmount } = computeSportsbookNetPayout(payoutData.payout, amount);
+      await interaction.editReply({ content: 'Parlay placed! 🎫' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + netParlayPayout + '** (after 10% house fee on winnings, ' + settings.currency_icon + ' ' + parlayFeeAmount + ')' });
       return;
     }
 
@@ -17122,6 +17200,28 @@ if (interaction.commandName === 'avatar') {
           await interaction.editReply({ content: `**${blockedTeamName}** still has an unreported game (**${blocker.away_team_name} @ ${blocker.home_team_name}**) — report that score first before scheduling a new one.` });
           return;
         }
+
+        // 7J-OPENGAMECLEANUP: a team shouldn't sit with multiple game
+        // threads at once — per Hxxdie, once the block above confirms
+        // there's no *unreported* game in the way, any already-reported
+        // ('final') game thread still lingering for either team is done
+        // and just clutter, so clear it out here rather than leaving it to
+        // pile up indefinitely (open-schedule has no round-advance
+        // checkpoint to do this automatically, unlike structured leagues).
+        // Only the Discord thread is deleted — the league_games row and its
+        // standings/score history are untouched, same as the structured
+        // equivalent (deleteLeagueGameThreadsForWeekSilent).
+        const staleFinalGames = await pool.query(
+          `SELECT id, thread_id FROM league_games
+           WHERE guild_id = $1 AND league_id = $2 AND status = 'final' AND thread_id IS NOT NULL
+             AND (home_team_role_id = $3 OR away_team_role_id = $3 OR home_team_role_id = $4 OR away_team_role_id = $4)`,
+          [interaction.guild.id, leagueId, homeRoleId, awayRoleId]
+        ).catch(() => ({ rows: [] }));
+        for (const staleGame of staleFinalGames.rows || []) {
+          const staleThread = await interaction.guild.channels.fetch(staleGame.thread_id).catch(() => null);
+          if (staleThread) await staleThread.delete('GG Sports: team started a new game, prior reported game thread cleared').catch(() => null);
+          await pool.query(`UPDATE league_games SET thread_id = NULL WHERE id = $1`, [staleGame.id]).catch(() => null);
+        }
       }
 
       const createResult = await createLeagueGameCore(interaction, league, homeTeamObj, awayTeamObj, {});
@@ -17327,7 +17427,20 @@ if (interaction.commandName === 'avatar') {
       await interaction.editReply({ embeds: [lockEmbed] });
 
       if (lockedGamesResult.rows.length) {
-        await postSportsbookFeed(interaction.guild, lockEmbed, game.league_id).catch(() => null);
+        // 7J-GSFEEDGAME: the thread reply above doesn't need a "Game" field
+        // — the thread itself makes that obvious — but the sportsbook feed
+        // channel has bets locking across every game in the league at once,
+        // so it needs its own embed that actually says which matchup this
+        // is. Was posting the exact same gameless embed to both.
+        const feedGameLabel = `${game.away_team_name} @ ${game.home_team_name}`;
+        const feedLockEmbed = new EmbedBuilder()
+          .setTitle('🔒 Game Started')
+          .setColor(0xFEE75C)
+          .addFields({ name: 'Game', value: feedGameLabel, inline: false })
+          .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **5 minutes**.`)
+          .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
+          .setTimestamp();
+        await postSportsbookFeed(interaction.guild, feedLockEmbed, game.league_id).catch(() => null);
       }
 
       const updatedGame = await findLeagueGameById(interaction.guild.id, gameId);
@@ -27750,7 +27863,8 @@ if (shopSubcommand === 'view') {
           sportsbookGame.league_id
         );
 
-        await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + payout + '**.', ephemeral: true });
+        const { payout: netPayoutReplyMadden, feeAmount: feeAmountReplyMadden } = computeSportsbookNetPayout(payout, amount);
+        await interaction.reply({ content: 'Bet placed: **' + settings.currency_icon + ' ' + amount + '** on **' + sideLabel + ' ML ' + odds + '**. Potential payout: **' + settings.currency_icon + ' ' + netPayoutReplyMadden + '** (after 10% house fee on winnings, ' + settings.currency_icon + ' ' + feeAmountReplyMadden + ').', ephemeral: true });
         return;
       }
 
@@ -27887,7 +28001,8 @@ if (shopSubcommand === 'view') {
           return (index + 1) + '. ' + sideLabel + ' ML ' + leg.odds + ' — ' + leg.sportsbookGame.game_label;
         }).join(NL);
 
-        await interaction.reply({ content: 'Parlay created: **' + shortSportsbookId(parlayId) + '**' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + payoutData.payout + '**', ephemeral: true });
+        const { payout: netParlayPayoutMadden, feeAmount: parlayFeeAmountMadden } = computeSportsbookNetPayout(payoutData.payout, amount);
+        await interaction.reply({ content: 'Parlay created: **' + shortSportsbookId(parlayId) + '**' + NL + legText + NL + 'Stake: **' + settings.currency_icon + ' ' + amount + '** • Potential payout: **' + settings.currency_icon + ' ' + netParlayPayoutMadden + '** (after 10% house fee on winnings, ' + settings.currency_icon + ' ' + parlayFeeAmountMadden + ')', ephemeral: true });
         return;
       }
     }
@@ -30676,8 +30791,17 @@ async function postSportsbookFeed(guild, embed, leagueId = null) {
   });
 }
 
+// 7J-PAYOUTDISCLOSURE: "Potential Payout" was showing the pre-fee gross
+// figure (calculateAmericanOddsPayout's raw output) at bet-placement time,
+// but settlement always pays out net of the 10% booking fee on winnings
+// (computeSportsbookNetPayout, above). A bettor advertised 116 and actually
+// paid 107 has no way to know that gap is an intentional, disclosed fee
+// rather than a bug — so this now shows the real number they'll get if they
+// win, and states the fee explicitly rather than leaving it to be inferred
+// after the fact.
 function buildSportsbookBetAlertEmbed(settings, user, game, side, amount, odds, payout, isBigBet = false) {
   const sideLabel = side === 'home' ? game.home_label : game.away_label;
+  const { payout: netPayout, feeAmount } = computeSportsbookNetPayout(payout, amount);
   return new EmbedBuilder()
     .setTitle(isBigBet ? '🚨 Big Bet Alert' : '🎟️ Bet Placed')
     .setColor(isBigBet ? 0xED4245 : 0x5865F2)
@@ -30686,7 +30810,7 @@ function buildSportsbookBetAlertEmbed(settings, user, game, side, amount, odds, 
       { name: 'Pick', value: sideLabel + ' ML ' + odds, inline: true },
       { name: 'Stake', value: settings.currency_icon + ' ' + amount, inline: true },
       { name: 'Game', value: game.game_label, inline: false },
-      { name: 'Potential Payout', value: settings.currency_icon + ' ' + payout, inline: true }
+      { name: 'Potential Payout', value: settings.currency_icon + ' ' + netPayout + ` (after 10% house fee on winnings — ${settings.currency_icon} ${feeAmount})`, inline: true }
     )
     .setFooter({ text: 'GG Sports • Sportsbook Feed' })
     .setTimestamp();
@@ -30741,7 +30865,12 @@ function buildParlayHitAlertEmbed(settings, parlay) {
     .setTimestamp();
 }
 
+// 7J-PAYOUTDISCLOSURE: same fix as buildSportsbookBetAlertEmbed — parlay
+// payouts also get the 10% booking fee taken out of net winnings at
+// settlement (see settleParlaysForSportsbookGame), but were shown here at
+// their pre-fee gross value with no disclosure. Now shows the real number.
 function buildParlayCreatedAlertEmbed(settings, user, parlayId, amount, payout, legCount) {
+  const { payout: netPayout, feeAmount } = computeSportsbookNetPayout(payout, amount);
   return new EmbedBuilder()
     .setTitle(legCount >= 4 ? '🔥 Monster Parlay Placed' : '🎲 Parlay Placed')
     .setColor(0xFEE75C)
@@ -30750,7 +30879,7 @@ function buildParlayCreatedAlertEmbed(settings, user, parlayId, amount, payout, 
       { name: 'Parlay ID', value: shortSportsbookId(parlayId), inline: true },
       { name: 'Legs', value: String(legCount), inline: true },
       { name: 'Stake', value: settings.currency_icon + ' ' + amount, inline: true },
-      { name: 'Potential Payout', value: settings.currency_icon + ' ' + payout, inline: true }
+      { name: 'Potential Payout', value: settings.currency_icon + ' ' + netPayout + ` (after 10% house fee on winnings — ${settings.currency_icon} ${feeAmount})`, inline: true }
     )
     .setFooter({ text: 'GG Sports • Sportsbook Feed' })
     .setTimestamp();
@@ -31000,13 +31129,30 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
       { name: 'Game', value: label, inline: false },
       { name: leagueGame.home_team_name, value: 'ML ' + odds.homeOdds, inline: true },
       { name: leagueGame.away_team_name, value: 'ML ' + odds.awayOdds, inline: true },
-      { name: 'Source', value: 'Auto-generated from Game Center → Add Game', inline: false }
+      { name: 'Source', value: await describeAutoSportsbookSource(league), inline: false }
     )
     .setFooter({ text: 'GG Sports • Auto Sportsbook' })
     .setTimestamp();
 
   await postSportsbookFeed(interaction.guild, feedEmbed, leagueGame.league_id);
   return sportsbookGame;
+}
+
+// 7J-SPORTSBOOKSOURCETEXT: the "Source" line on an auto-generated
+// sportsbook line was hardcoded to "Auto-generated from Game Center → Add
+// Game" regardless of which schedule style actually created it. That's
+// wrong for structured-schedule leagues (no Game Center, no Add Game button
+// — matchups are auto-created when the commissioner advances the round),
+// and it also named the "/game add" slash command directly for open-
+// schedule leagues, per Hxxdie's "we do not want to reference slash
+// commands" — Game Center only exposes this via the Add Game button.
+async function describeAutoSportsbookSource(league) {
+  const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
+  const isMadden = getLeagueSportKey(league) === 'madden';
+  if (!isMadden && customSettings.schedule_style === 'structured') {
+    return 'Auto-generated when the round was advanced';
+  }
+  return 'Auto-generated from Game Center → Add Game';
 }
 
 
@@ -49778,7 +49924,7 @@ async function handleMaddenGameThreadButton(interaction) {
     const lockedGamesResult = await pool.query(
       `UPDATE sportsbook_games SET game_started_at = NOW(), game_started_by_user_id = $2, bets_lock_at = $3
        WHERE (id = $1 OR league_game_id = $4) AND status = 'open'
-       RETURNING id`,
+       RETURNING id, game_label`,
       [game.sportsbook_game_id, interaction.user.id, lockAt, game.id]
     ).catch(() => ({ rows: [] }));
 
@@ -49790,7 +49936,19 @@ async function handleMaddenGameThreadButton(interaction) {
       .setTimestamp();
     await interaction.editReply({ embeds: [lockEmbed] });
     if (lockedGamesResult.rows.length) {
-      await postSportsbookFeed(interaction.guild, lockEmbed, game.league_id).catch(() => null);
+      // 7J-GSFEEDGAME: same fix as the generic/structured Game Started
+      // handler — the sportsbook feed channel isn't scoped to one game, so
+      // it needs the matchup named explicitly instead of reusing the
+      // thread-only embed that has no "Game" field.
+      const feedGameLabel = `${game.away_team} @ ${game.home_team}`;
+      const feedLockEmbed = new EmbedBuilder()
+        .setTitle('🔒 Game Started')
+        .setColor(0xFEE75C)
+        .addFields({ name: 'Game', value: feedGameLabel, inline: false })
+        .setDescription(`<@${interaction.user.id}> marked this game as started. Betting on this matchup closes in **5 minutes**.`)
+        .setFooter({ text: 'GG Sports • Anti-Late-Betting Protection' })
+        .setTimestamp();
+      await postSportsbookFeed(interaction.guild, feedLockEmbed, game.league_id).catch(() => null);
     }
 
     if (interaction.channel?.isThread?.()) {
@@ -70163,13 +70321,8 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
         } : null,
       };
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 1000,
-          system: `You are an ESPN sports journalist covering a Madden NFL franchise league called "${league.league_name}". 
+      const parsed = await callClaudeNewsApi(
+        `You are an ESPN sports journalist covering a Madden NFL franchise league called "${league.league_name}". 
 Write punchy, authentic sports news headlines and one-line blurbs for this week's results. 
 Rules:
 - Each item: a headline (under 80 chars) and a blurb (1-2 sentences, under 150 chars).
@@ -70188,13 +70341,9 @@ Rules:
 - Sound like a real ESPN writer, not a bot. Use sports vernacular naturally.
 - Return ONLY valid JSON: array of objects with "headline" and "blurb" keys. No markdown, no preamble.
 - Max 5 items. Pick the most compelling stories.`,
-          messages: [{ role: 'user', content: JSON.stringify(context) }],
-        }),
-      }).then(r => r.json()).catch(() => null);
-
-      const text = response?.content?.map(c => c.text || '').join('') || '';
-      const clean = text.replace(/```json|```/g, '').trim();
-      const parsed = JSON.parse(clean);
+        JSON.stringify(context),
+        1000
+      );
       if (Array.isArray(parsed)) newsItems = parsed.slice(0, 5);
     } catch (err) {
       console.warn('[MADDEN ESPN NEWS] Claude API failed, falling back to templates:', err?.message);
