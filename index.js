@@ -33787,7 +33787,9 @@ const ACCESSORY_EQUIP_CAP = 4;
 // covers/replaces it; the renderer additionally skips the hair layer outright whenever
 // headwear is equipped (see buildAvatarProfileAttachment) rather than relying on draw
 // order alone, since some headwear art may not fully occlude hair drawn beneath it.
-const AVATAR_LAYER_RENDER_ORDER = ['background', 'pet', 'body', 'hair', 'bottom', 'top', 'footwear', 'headwear', 'accessory', 'effect'];
+// Hair is drawn after top (not before) — per Hxxdie, longer hairstyles are designed to
+// flow down over a top/shirt, so hair needs to composite on top of it, not underneath.
+const AVATAR_LAYER_RENDER_ORDER = ['background', 'pet', 'body', 'bottom', 'top', 'hair', 'footwear', 'headwear', 'accessory', 'effect'];
 
 // Short, human-typeable lookup code for a purchased/awarded inventory item (e.g.
 // "GG-7F3K9Q"), surfaced in the Locker Room so a player can pull up an item's full
@@ -35164,7 +35166,11 @@ async function renderAvatarProfilePngRealArt(profile, equipped, options = {}) {
   // puts footwear after bottom/top) — pant legs were compositing straight
   // over the shoes on every avatar. Reordered to match that canonical
   // order: footwear now draws after both bottom and top.
-  const wearableLayerOrder = ['hair', 'bottom', 'top', 'footwear', 'headwear'];
+  // 7J-HAIROVERTOP: hair moved after top (not before) — per Hxxdie, longer
+  // hairstyles are designed to flow down over a top/shirt, so hair needs to
+  // draw on top of it, not get covered by it. Still drawn before footwear/
+  // headwear as before.
+  const wearableLayerOrder = ['bottom', 'top', 'hair', 'footwear', 'headwear'];
   for (const slot of wearableLayerOrder) {
     if (slot === 'hair' && equipped.headwear?.art_asset_key) continue;
 
