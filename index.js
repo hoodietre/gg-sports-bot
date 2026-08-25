@@ -11890,12 +11890,22 @@ if (interaction.commandName === 'avatar') {
       if (!interaction.guild) return;
       const scope = interaction.customId.split(':')[1] === 'global' ? 'global' : 'server';
       const isSwitchingFromEphemeral = interaction.message?.flags?.has?.(MessageFlags.Ephemeral);
+      // 7J-AVATARSHOPHUB: per Hxxdie — "Avatar Shop" (and "Switch to Avatar
+      // Shop," which shares this same handler) should land on the category
+      // hub (Tops/Bottoms/Shoes/Hats/...), the same place the Avatar
+      // Panel's own "Go Shopping" button opens — not a flat, unfiltered,
+      // price-sorted list of every avatar item in the shop. Server scope is
+      // unaffected; it never had a category hub to begin with, and What's
+      // New still takes priority over either destination when there's
+      // something new to show.
       const items = await getRecentShopArrivals(interaction.guild.id, scope);
       const payload = items.length
         ? { embeds: [buildShopWhatsNewEmbed(items, scope)], components: [new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`shop_whatsnew_continue:${scope}`).setLabel('Continue to Shop').setEmoji('➡️').setStyle(ButtonStyle.Primary)
           )] }
-        : await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
+        : scope === 'global'
+          ? await buildAvatarShopHomePayload(interaction.user)
+          : await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
       // The persistent Shop panel is shared/visible to the whole channel —
       // clicking it there must open a fresh ephemeral reply, never edit the
       // shared message itself. The "Switch to X Shop" button that appears
@@ -11913,7 +11923,9 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isButton() && interaction.customId.startsWith('shop_whatsnew_continue:')) {
       if (!interaction.guild) return;
       const scope = interaction.customId.split(':')[1] === 'global' ? 'global' : 'server';
-      const payload = await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
+      const payload = scope === 'global'
+        ? await buildAvatarShopHomePayload(interaction.user)
+        : await ggBuildPermanentShopPayload(interaction.guild.id, 0, 'price_asc', scope);
       await interaction.update(payload).catch(() => null);
       return;
     }
@@ -31859,6 +31871,12 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
         // the sync-time hook) is the dominant participation source; this is
         // the supplementary per-game piece.
         await addParticipationScore(interaction.guild.id, owner.id, 1, game.league_id).catch(() => null);
+        // 7J-GAMESPLAYEDMILESTONE: user_recognition.games_played was
+        // already a real column, already shown on Member Profile under
+        // "Tracked Milestones," and incrementRecognitionStat already
+        // supported it — it was just never actually called anywhere, so
+        // every profile showed 0 regardless of games actually played.
+        await incrementRecognitionStat(interaction.guild.id, owner.id, 'games_played', 1).catch(() => null);
         payoutLines.push(settings.currency_icon + ' <@' + owner.id + '> earned **' + settings.game_played_payout + ' ' + settings.currency_name + '** for playing.');
       }
     }
@@ -35746,15 +35764,19 @@ async function openAvatarLockerPanel(interaction) {
   });
 }
 
-async function openAvatarShopPanel(interaction) {
-  const { profile, equipped } = await getAvatarProfileWithEquipment(interaction.user.id);
+async function buildAvatarShopHomePayload(user) {
+  const { profile, equipped } = await getAvatarProfileWithEquipment(user.id);
   const attachment = await buildAvatarProfileAttachment(profile, equipped);
-  await interaction.reply({
-    embeds: [buildAvatarShopHomeEmbed(interaction.user)],
+  return {
+    embeds: [buildAvatarShopHomeEmbed(user)],
     files: [attachment],
     components: buildAvatarShopHomeComponents(),
-    ephemeral: true,
-  });
+  };
+}
+
+async function openAvatarShopPanel(interaction) {
+  const payload = await buildAvatarShopHomePayload(interaction.user);
+  await interaction.reply({ ...payload, ephemeral: true });
 }
 
 // Starter panel — same lightweight pattern as Bank/Member Profile/Marketplace: a
@@ -69938,6 +69960,9 @@ async function distributeMaddenGameCompletionReward(guild, league, game) {
         }
         await addActivityPoints(guild.id, owner.id, 3, 0, league.league_id).catch(() => null);
         await addParticipationScore(guild.id, owner.id, 1, league.league_id).catch(() => null);
+        // 7J-GAMESPLAYEDMILESTONE: same fix as the generic Game Center
+        // path — see comment there.
+        await incrementRecognitionStat(guild.id, owner.id, 'games_played', 1).catch(() => null);
       }
     }
   }
