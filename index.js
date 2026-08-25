@@ -1779,6 +1779,15 @@ async function initDatabase() {
   // OTL enabled) so leagues using a non-sudden-death OT format (multiple
   // extra frames, running clock, etc.) aren't wrongly blocked.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS sudden_death_ot BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-NBAPLAYIN: per Hxxdie — real NBA play-in tournament, opt-in per
+  // league. Off by default so leagues that started playoffs before this
+  // existed aren't suddenly surprised by an extra stage.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS play_in_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-NBAPLAYIN: snapshot of seeds 1-10 per conference at the moment
+  // playoffs start — the "real" bracket's seeds 1-6 aren't known as
+  // finished series until the play-in stage resolves seeds 7-8, so this is
+  // what lets the main bracket get built correctly once it does.
+  await pool.query(`ALTER TABLE league_playoff_brackets ADD COLUMN IF NOT EXISTS play_in_seeds JSONB`);
   // 7J-99WAGER: opt-in, defaults off — a straight 1v1 bet between the two
   // owners in a game thread, entirely separate from the sportsbook/
   // moneylines. See game_wagers table below.
@@ -6533,6 +6542,76 @@ function buildNextPlayoffRound(previousRound, seriesLengths, roundIndex, formatK
   return series;
 }
 
+// 7J-NBAPLAYIN: real NBA play-in tournament, opt-in per league. Three
+// single-elimination games per conference, in two dependent stages —
+// Game 3's participants aren't known until Games 1 and 2 both finish, so
+// this can't be one flat round like everything else here. Modeled as two
+// bracket rounds: round A (Game 1 + Game 2, playable in parallel) and round
+// B (Game 3 alone, once round A is fully decided) — then a THIRD
+// transition builds the real main bracket from seeds 1-6 (frozen at
+// tournament start) plus the two play-in winners. See
+// buildNbaGame3Round/buildNbaMainBracketFromPlayIn below and their call
+// sites in recordPlayoffGameResult.
+//
+// seededTeams here must be the full top-10-per-conference list (not the
+// top-8 selectTopRecordPlayoffTeams normally returns) — seeds 7-10 play
+// in, seeds 1-6 wait.
+function buildNbaPlayInRound(seededTeams) {
+  const conferences = [...new Set(seededTeams.map(t => t.conference).filter(Boolean))];
+  const byConference = conferences.length ? conferences : [null];
+  const series = [];
+  for (const conference of byConference) {
+    const teams = seededTeams.filter(t => t.conference === conference).sort((a, b) => (a.seed || 0) - (b.seed || 0));
+    const seed7 = teams.find(t => t.seed === 7);
+    const seed8 = teams.find(t => t.seed === 8);
+    const seed9 = teams.find(t => t.seed === 9);
+    const seed10 = teams.find(t => t.seed === 10);
+    if (seed7 && seed8) { const s = makePlayoffSeries(seed7, seed8, 1, conference); s.playInStage = 'game1'; series.push(s); }
+    if (seed9 && seed10) { const s = makePlayoffSeries(seed9, seed10, 1, conference); s.playInStage = 'game2'; series.push(s); }
+  }
+  return series;
+}
+
+// Game 3: the LOSER of Game 1 (7v8) hosts the WINNER of Game 2 (9v10) for
+// the conference's final 8-seed. The winner of Game 1 is already locked in
+// as the 7-seed and doesn't play again until the real bracket.
+function buildNbaGame3Round(game1And2Round) {
+  const conferences = [...new Set(game1And2Round.map(s => s.conference).filter(Boolean))];
+  const series = [];
+  for (const conference of conferences) {
+    const game1 = game1And2Round.find(s => s.conference === conference && s.playInStage === 'game1');
+    const game2 = game1And2Round.find(s => s.conference === conference && s.playInStage === 'game2');
+    if (!game1?.winner || !game2?.winner) continue;
+    const game1LoserName = game1.teamA.name === game1.winner ? game1.teamB.name : game1.teamA.name;
+    const game1LoserSeed = game1.teamA.name === game1LoserName ? game1.teamA.seed : game1.teamB.seed;
+    const game2WinnerSeed = game2.teamA.name === game2.winner ? game2.teamA.seed : game2.teamB.seed;
+    const s = makePlayoffSeries({ team_name: game1LoserName, seed: game1LoserSeed }, { team_name: game2.winner, seed: game2WinnerSeed }, 1, conference);
+    s.playInStage = 'game3';
+    series.push(s);
+  }
+  return series;
+}
+
+// Builds the REAL main-bracket Round 1 (standard 1v8/2v7/3v6/4v5) from the
+// frozen seeds 1-6 snapshot plus the play-in's two outputs: Game 1's
+// winner is the 7-seed, Game 3's winner is the 8-seed.
+function buildNbaMainBracketFromPlayIn(playInSeedsSnapshot, game1And2Round, game3Round, seriesLengths) {
+  const seriesLength = seriesLengths?.[0] || 1;
+  const conferences = Object.keys(playInSeedsSnapshot || {});
+  const series = [];
+  for (const conference of conferences) {
+    const seeds1to6 = (playInSeedsSnapshot[conference] || []).filter(t => t.seed <= 6);
+    const game1 = game1And2Round.find(s => s.conference === conference && s.playInStage === 'game1');
+    const game3 = game3Round.find(s => s.conference === conference && s.playInStage === 'game3');
+    if (!game1?.winner || !game3?.winner) continue;
+    const seed7 = { team_name: game1.winner, seed: 7 };
+    const seed8 = { team_name: game3.winner, seed: 8 };
+    const fullEight = [...seeds1to6.map(t => ({ team_name: t.team_name, seed: t.seed })), seed7, seed8].sort((a, b) => a.seed - b.seed);
+    series.push(...buildStandardBracketSeriesForConference(fullEight, seriesLength, conference));
+  }
+  return series;
+}
+
 
 // 7J-PLAYOFFROUNDTHREADS: self-serve playoff reporting, per Hxxdie — a
 // whole series (which may run up to Bo-7+) now plays out inside ONE thread
@@ -6738,27 +6817,64 @@ async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winner
   let statusNote = `Recorded: ${winnerSide === 'A' ? series.teamA.name : series.teamB.name} wins Game ${series.games.length} (${series.winsA}-${series.winsB}).`;
 
   if (roundComplete) {
-    const isFinalRound = roundSeries.length === 1;
-    if (isFinalRound) {
-      const champion = roundSeries[0].winner;
+    const playInStage = roundSeries[0]?.playInStage || null;
+
+    // 7J-NBAPLAYIN: play-in rounds cascade differently from every other
+    // round here — Game1+Game2 lead into a Game3-only round (not the real
+    // bracket yet), and Game3 leads into the real Round 1 built fresh from
+    // the frozen seeds 1-6 snapshot rather than from generic adjacent
+    // pairing. Checked before the normal isFinalRound/next-round logic so
+    // neither of those misfires on a play-in round.
+    if (playInStage === 'game1') {
+      const game3Round = buildNbaGame3Round(roundSeries);
+      const unlocksAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      game3Round.forEach(s => { if (!s.bye) { s.unlocksAt = unlocksAt; s.disputed = false; } });
+      await createPlayoffSeriesThreads(guild, league, game3Round, 0).catch(err => console.error('[Playoffs] Play-in Game 3 thread creation failed:', err?.message || err));
       bracket[roundIndex] = roundSeries;
-      await pool.query(
-        `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
-        [leagueId, JSON.stringify(bracket), champion]
-      );
-      statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
-    } else {
-      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
-      const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
-      const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1, getPlayoffFormatKey(league));
-      await createPlayoffSeriesThreads(guild, league, nextRound, roundIndex + 2).catch(err => console.error('[Playoffs] Next round thread creation failed:', err?.message || err));
-      bracket[roundIndex] = roundSeries;
-      bracket.push(nextRound);
+      bracket.push(game3Round);
       await pool.query(
         `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
         [leagueId, JSON.stringify(bracket), bracketState.current_round + 1]
       );
-      statusNote += `\n\nRound complete — Round ${bracketState.current_round + 1} bracket generated. It unlocks in 15 minutes to leave room for a dispute on this round.`;
+      statusNote += `\n\nPlay-In Games 1 & 2 complete — Game 3 (Game 1 loser vs. Game 2 winner) is ready for the final 7/8 seed.`;
+    } else if (playInStage === 'game3') {
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
+      const game1And2Round = bracket[roundIndex - 1] || [];
+      const mainBracketRound1 = buildNbaMainBracketFromPlayIn(bracketState.play_in_seeds, game1And2Round, roundSeries, seriesLengths);
+      const unlocksAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      mainBracketRound1.forEach(s => { if (!s.bye) { s.unlocksAt = unlocksAt; s.disputed = false; } });
+      await createPlayoffSeriesThreads(guild, league, mainBracketRound1, 1).catch(err => console.error('[Playoffs] Main bracket Round 1 thread creation failed:', err?.message || err));
+      bracket[roundIndex] = roundSeries;
+      bracket.push(mainBracketRound1);
+      await pool.query(
+        `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, JSON.stringify(bracket), bracketState.current_round + 1]
+      );
+      statusNote += `\n\n🏀 Play-In Tournament complete — seeds locked in, Round 1 of the main bracket is ready.`;
+    } else {
+      const isFinalRound = roundSeries.length === 1;
+      if (isFinalRound) {
+        const champion = roundSeries[0].winner;
+        bracket[roundIndex] = roundSeries;
+        await pool.query(
+          `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
+          [leagueId, JSON.stringify(bracket), champion]
+        );
+        statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
+      } else {
+        const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+        const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
+        const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1, getPlayoffFormatKey(league));
+        await createPlayoffSeriesThreads(guild, league, nextRound, roundIndex + 2).catch(err => console.error('[Playoffs] Next round thread creation failed:', err?.message || err));
+        bracket[roundIndex] = roundSeries;
+        bracket.push(nextRound);
+        await pool.query(
+          `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
+          [leagueId, JSON.stringify(bracket), bracketState.current_round + 1]
+        );
+        statusNote += `\n\nRound complete — Round ${bracketState.current_round + 1} bracket generated. It unlocks in 15 minutes to leave room for a dispute on this round.`;
+      }
     }
   } else {
     bracket[roundIndex] = roundSeries;
@@ -7019,6 +7135,16 @@ async function buildPlayoffsOpsPayload(guild, league) {
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_playoffs_start:' + league.league_id).setLabel(bracketState.status === 'completed' ? 'Start New Playoffs' : 'Start Playoffs').setEmoji('🚀').setStyle(ButtonStyle.Success)
     ));
+    // 7J-NBAPLAYIN: per Hxxdie — real play-in tournament, toggle-only since
+    // not every NBA-format league wants the extra stage. Only shown before
+    // playoffs are running (changing it mid-playoffs would be meaningless —
+    // the seeding/threads for the current bracket are already locked in).
+    if (getPlayoffFormatKey(league) === 'nba') {
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      rows.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('commissioner_playoffs_toggle_playin:' + league.league_id).setLabel(customSettings.play_in_enabled ? 'Disable Play-In Tournament' : 'Enable Play-In Tournament').setEmoji('🎟️').setStyle(ButtonStyle.Secondary)
+      ));
+    }
   } else {
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_playoffs_report:' + league.league_id).setLabel('Report Result').setEmoji('📋').setStyle(ButtonStyle.Primary),
@@ -18976,6 +19102,20 @@ if (interaction.commandName === 'avatar') {
     // Wording differs depending on whether the regular season is actually
     // done, since starting early has a real, different consequence (skips
     // remaining scheduled games entirely) vs. starting on time.
+    // 7J-NBAPLAYIN: simple toggle, no confirm needed — flipping it before
+    // playoffs start has no destructive consequence, it just changes what
+    // Start Playoffs will do next.
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_playoffs_toggle_playin:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage playoffs.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      await pool.query(`UPDATE league_custom_settings SET play_in_enabled = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, !customSettings.play_in_enabled]);
+      const payload = await buildPlayoffsOpsPayload(interaction.guild, league);
+      await interaction.update(payload);
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('commissioner_playoffs_start:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -18985,9 +19125,12 @@ if (interaction.commandName === 'avatar') {
       const currentRound = Number(customSettings.current_round || 0);
       const seasonComplete = !schedule.length || currentRound >= schedule.length;
       const remainingGames = Math.max(0, schedule.length - currentRound);
+      const playInNote = (getPlayoffFormatKey(league) === 'nba' && customSettings.play_in_enabled)
+        ? ' The Play-In Tournament is enabled — seeds 7-10 in each conference will play in first to decide the final two bracket spots.'
+        : '';
       const warning = seasonComplete
-        ? 'This will seed and start the playoff bracket from the final regular-season standings. This locks in the bracket — continue?'
-        : `**The regular season isn't finished yet** — ${remainingGames} game(s) are still left on the schedule. Starting playoffs now will end the regular season immediately: those remaining games will never be played, and the bracket will be seeded from the standings as they stand right now, not the final record. This can't be undone. Continue anyway?`;
+        ? `This will seed and start the playoff bracket from the final regular-season standings.${playInNote} This locks in the bracket — continue?`
+        : `**The regular season isn't finished yet** — ${remainingGames} game(s) are still left on the schedule. Starting playoffs now will end the regular season immediately: those remaining games will never be played, and the bracket will be seeded from the standings as they stand right now, not the final record.${playInNote} This can't be undone. Continue anyway?`;
       await interaction.reply({
         content: warning,
         components: [new ActionRowBuilder().addComponents(
@@ -19125,14 +19268,51 @@ if (interaction.commandName === 'avatar') {
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage playoffs.', ephemeral: true }); return; }
       await interaction.deferUpdate();
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
+      const playoffFormatKey = getPlayoffFormatKey(league);
+
+      // 7J-NBAPLAYIN: opt-in real play-in tournament — needs the top 10 per
+      // conference (not the normal top-8), and a frozen snapshot of seeds
+      // 1-6 so the real bracket can be built correctly once the play-in
+      // resolves seeds 7-8 (see buildNbaMainBracketFromPlayIn).
+      if (playoffFormatKey === 'nba' && customSettings.play_in_enabled) {
+        const standingsRows = await getStandingsRows(interaction.guild.id, leagueId).catch(() => []);
+        const seededTeams = await selectTopRecordPlayoffTeams(interaction.guild.id, league, standingsRows, 10).catch(() => []);
+        if (seededTeams.length < 4) {
+          await interaction.editReply({ content: 'Need at least 4 teams per conference in the standings to start a play-in tournament.', embeds: [], components: [buildPlayoffsOpsBackRow(leagueId)] });
+          return;
+        }
+        const playInSeeds = {};
+        for (const team of seededTeams) {
+          const conf = team.conference || 'Conference';
+          if (!playInSeeds[conf]) playInSeeds[conf] = [];
+          playInSeeds[conf].push({ team_name: team.team_name, seed: team.seed });
+        }
+        const playInRound = buildNbaPlayInRound(seededTeams);
+        if (!playInRound.length) {
+          await interaction.editReply({ content: 'Need at least seeds 7-10 in each conference to start a play-in tournament.', embeds: [], components: [buildPlayoffsOpsBackRow(leagueId)] });
+          return;
+        }
+        await createPlayoffSeriesThreads(interaction.guild, league, playInRound, 0).catch(err => console.error('[Playoffs] Play-in Round thread creation failed:', err?.message || err));
+        const bracket = [playInRound];
+        await pool.query(
+          `INSERT INTO league_playoff_brackets (league_id, bracket, current_round, status, champion_team, play_in_seeds, updated_at)
+           VALUES ($1, $2, 1, 'in_progress', NULL, $3, NOW())
+           ON CONFLICT (league_id) DO UPDATE SET bracket = $2, current_round = 1, status = 'in_progress', champion_team = NULL, play_in_seeds = $3, channel_id = league_playoff_brackets.channel_id, message_id = league_playoff_brackets.message_id, updated_at = NOW()`,
+          [leagueId, JSON.stringify(bracket), JSON.stringify(playInSeeds)]
+        );
+        await refreshPlayoffBracketPanel(interaction.guild, league).catch(() => null);
+        const payload = await buildPlayoffsOpsPayload(interaction.guild, league);
+        await interaction.editReply({ content: '🏀 Play-In Tournament started — Games 1 & 2 are ready.', ...payload });
+        return;
+      }
+
       const seededTeams = await selectPlayoffTeamsForLeague(interaction.guild.id, league).catch(() => []);
       if (seededTeams.length < 2) {
         await interaction.editReply({ content: 'Need at least 2 teams in the standings to start playoffs.', embeds: [], components: [buildPlayoffsOpsBackRow(leagueId)] });
         return;
       }
-      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
-      const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
-      const playoffFormatKey = getPlayoffFormatKey(league);
       const firstRound = buildInitialPlayoffRound(seededTeams, seriesLengths, playoffFormatKey);
       // 7J-PLAYOFFGAMETHREADS: create threads (mutates firstRound entries
       // with .thread_id) BEFORE the bracket is inserted, so the thread ids
