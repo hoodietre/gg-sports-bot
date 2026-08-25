@@ -1630,6 +1630,75 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS otl INTEGER NOT NULL DEFAULT 0`); // overtime losses — 4th record type (W-L-T-OTL), see league_custom_settings.otl_allowed
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS conference TEXT`);
   await pool.query(`ALTER TABLE league_standings ADD COLUMN IF NOT EXISTS division TEXT`);
+
+  // 7J-SEASONHISTORY: per Hxxdie — "Start New Season" needs to reset
+  // current standings but keep every prior season's results as real,
+  // permanent history, both at the team level (trophy case, career team
+  // record) and the individual level (a person's record follows them even
+  // if they take over a different team next season). One row per
+  // team/owner per completed season, written once at archival time —
+  // never updated afterward, since a completed season is exactly that.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS team_season_history (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      season_label TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      ties INTEGER NOT NULL DEFAULT 0,
+      otl INTEGER NOT NULL DEFAULT 0,
+      points_for INTEGER NOT NULL DEFAULT 0,
+      points_against INTEGER NOT NULL DEFAULT 0,
+      final_rank INTEGER,
+      playoff_result TEXT,
+      champion BOOLEAN NOT NULL DEFAULT FALSE,
+      archived_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_team_season_history_lookup ON team_season_history (guild_id, league_id, team_name)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_season_history (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL REFERENCES leagues(league_id) ON DELETE CASCADE,
+      season_label TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      wins INTEGER NOT NULL DEFAULT 0,
+      losses INTEGER NOT NULL DEFAULT 0,
+      ties INTEGER NOT NULL DEFAULT 0,
+      champion BOOLEAN NOT NULL DEFAULT FALSE,
+      archived_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_season_history_lookup ON user_season_history (guild_id, user_id)`);
+
+  // 7J-USERHEADTOHEAD: distinct from the team-level head-to-head that
+  // already fed sportsbook odds (getHeadToHeadSnapshot, keyed by team
+  // role_id, sourced from league_games) — that one resets its meaning every
+  // time a team changes hands. This tracks the two PEOPLE, server-wide,
+  // across every league/team/season they've ever played each other in, so
+  // "these two have a real rivalry" survives roster changes, team
+  // reassignments, and new seasons entirely. Normalized so user_a_id is
+  // always the lexicographically smaller id — callers reorient results to
+  // whichever perspective they asked for (see getUserHeadToHeadSnapshot).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_head_to_head (
+      guild_id TEXT NOT NULL,
+      user_a_id TEXT NOT NULL,
+      user_b_id TEXT NOT NULL,
+      user_a_wins INTEGER NOT NULL DEFAULT 0,
+      user_b_wins INTEGER NOT NULL DEFAULT 0,
+      ties INTEGER NOT NULL DEFAULT 0,
+      last_played_at TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_a_id, user_b_id)
+    )
+  `);
+
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS playoff_team_count INTEGER NOT NULL DEFAULT 8`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS active_check_channel_id TEXT`);
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS draft_recap_channel_id TEXT`);
@@ -3364,6 +3433,15 @@ function buildCommands() {
     new SlashCommandBuilder().setName('commands').setDescription('Show available GG Sports commands'),
     new SlashCommandBuilder().setName('setupguide').setDescription('Show the full GG Sports server owner setup guide'),
     new SlashCommandBuilder().setName('quicksetup').setDescription('Show the quick GG Sports setup checklist'),
+    // 7J-USERHEADTOHEAD: per Hxxdie — the two owners' personal rivalry is
+    // tracked server-wide now (see user_head_to_head), but nothing surfaced
+    // it anywhere. This is the direct lookup; Career Record on Member
+    // Profile is the season-archival counterpart.
+    new SlashCommandBuilder()
+      .setName('headtohead')
+      .setDescription('See your (or another pair of users\') personal head-to-head record')
+      .addUserOption(o => o.setName('opponent').setDescription('The user to compare against').setRequired(true))
+      .addUserOption(o => o.setName('user').setDescription('First user (defaults to you)').setRequired(false)),
     new SlashCommandBuilder()
       .setName('madden')
       .setDescription('Madden franchise and league commands')
@@ -6253,6 +6331,10 @@ function buildInitialPlayoffRound(seededTeams, seriesLengths) {
       winsA: 0,
       winsB: 0,
       winner: null,
+      games: [],
+      // Round 1 has no prior round to wait on — reportable immediately.
+      unlocksAt: null,
+      disputed: false,
     });
     i += 1;
     j -= 1;
@@ -6267,20 +6349,28 @@ function buildInitialPlayoffRound(seededTeams, seriesLengths) {
       winsA: 1,
       winsB: 0,
       winner: teams[i].team_name,
+      games: [],
       bye: true,
     });
   }
   return series;
 }
 
+// 7J-PLAYOFFROUNDTHREADS: per Hxxdie — every series in a freshly generated
+// round (round 2+) gets a 15-minute unlocksAt cushion from the moment the
+// PREVIOUS round finished, before its own Game 1 can be reported. Gives
+// people time to raise a dispute on the game that just eliminated them
+// without staff ever having to untangle a next-round game that was already
+// being played when the dispute came in.
 function buildNextPlayoffRound(previousRound, seriesLengths, roundIndex) {
   const winners = previousRound.map(s => s.winner).filter(Boolean);
   const seriesLength = seriesLengths?.[roundIndex] || 1;
+  const unlocksAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
   const series = [];
   for (let i = 0; i < winners.length; i += 2) {
     if (i + 1 >= winners.length) {
       // Odd winner count (shouldn't normally happen past round 1) - bye through.
-      series.push({ id: randomUUID(), teamA: { name: winners[i], seed: null }, teamB: null, seriesLength, winsA: 1, winsB: 0, winner: winners[i], bye: true });
+      series.push({ id: randomUUID(), teamA: { name: winners[i], seed: null }, teamB: null, seriesLength, winsA: 1, winsB: 0, winner: winners[i], games: [], bye: true });
       continue;
     }
     series.push({
@@ -6291,9 +6381,313 @@ function buildNextPlayoffRound(previousRound, seriesLengths, roundIndex) {
       winsA: 0,
       winsB: 0,
       winner: null,
+      games: [],
+      unlocksAt,
+      disputed: false,
     });
   }
   return series;
+}
+
+// 7J-PLAYOFFROUNDTHREADS: self-serve playoff reporting, per Hxxdie — a
+// whole series (which may run up to Bo-7+) now plays out inside ONE thread
+// instead of being a commissioner-only dropdown with nowhere for the teams
+// to actually play. Mutates each series object in place (adds .thread_id
+// and .status_message_id) — callers build the round array, call this, THEN
+// INSERT/UPDATE the bracket JSON, so both ids land in the same write.
+// Skips bye series (no real opponent to thread against) and fails soft
+// per-thread, since one bad create shouldn't block the rest of the round.
+async function createPlayoffSeriesThreads(guild, league, roundSeries, roundNumber) {
+  const channelId = league.game_threads_channel_id;
+  if (!channelId) return { created: 0, skipped: roundSeries.length };
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased?.()) return { created: 0, skipped: roundSeries.length };
+
+  let created = 0;
+  for (const series of roundSeries) {
+    if (series.bye || !series.teamB) continue;
+    try {
+      const [roleAResult, roleBResult] = await Promise.all([
+        pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamA.name]).catch(() => ({ rows: [] })),
+        pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamB.name]).catch(() => ({ rows: [] })),
+      ]);
+      const roleA = roleAResult.rows[0]?.role_id;
+      const roleB = roleBResult.rows[0]?.role_id;
+      const threadName = `playoffs-r${roundNumber}-${series.teamA.name}-vs-${series.teamB.name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90);
+      const thread = await channel.threads.create({
+        name: threadName || `playoffs-round-${roundNumber}-series`,
+        autoArchiveDuration: 10080,
+        reason: `GG Sports: playoff series thread for Round ${roundNumber}`,
+      });
+      const mentionA = roleA ? `<@&${roleA}>` : `**${series.teamA.name}**`;
+      const mentionB = roleB ? `<@&${roleB}>` : `**${series.teamB.name}**`;
+      const payload = buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB);
+      const statusMessage = await thread.send({ content: `${mentionA} ${mentionB}`, ...payload }).catch(() => null);
+      series.thread_id = thread.id;
+      series.status_message_id = statusMessage?.id || null;
+      created += 1;
+    } catch (err) {
+      console.error(`[Playoffs] Thread creation failed for ${series.teamA?.name} vs ${series.teamB?.name}:`, err?.message || err);
+    }
+  }
+  return { created, skipped: roundSeries.length - created };
+}
+
+// 7J-PLAYOFFROUNDTHREADS: builds the persistent, repeatedly-edited status
+// message for a series thread — series score, whose turn it is to report,
+// the Report Score button (label auto-advances: "Report Score — Game 2"
+// once Game 1 is in, exactly per Hxxdie's third option), and an always-
+// available Report Issue button so a dispute can be raised on any game in
+// the series, not just after it's decided.
+function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB) {
+  const nextGameNumber = series.games.length + 1;
+  const isComplete = Boolean(series.winner);
+  const now = Date.now();
+  const stillLocked = !isComplete && series.unlocksAt && new Date(series.unlocksAt).getTime() > now;
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 Playoff Series — Round ${roundNumber}`)
+    .setColor(isComplete ? 0x57F287 : 0xED4245)
+    .setDescription(`${mentionA} vs ${mentionB} — Best of ${series.seriesLength}`)
+    .addFields({ name: 'Series Score', value: `${series.teamA.name} ${series.winsA} — ${series.winsB} ${series.teamB.name}`, inline: false });
+
+  if (isComplete) {
+    embed.addFields({ name: 'Result', value: `🏆 **${series.winner}** win the series.`, inline: false });
+  } else if (stillLocked) {
+    embed.addFields({ name: 'Status', value: `🔒 Locked until <t:${Math.floor(new Date(series.unlocksAt).getTime() / 1000)}:t> — dispute window from the previous round.`, inline: false });
+  } else if (series.disputed) {
+    embed.addFields({ name: 'Status', value: '⚠️ A dispute is open on this series. Waiting on staff to resolve it before further games can be reported.', inline: false });
+  } else {
+    embed.addFields({ name: 'Status', value: `Ready — either team owner (or staff) can report Game ${nextGameNumber}.`, inline: false });
+  }
+  embed.setFooter({ text: 'GG Sports • Playoffs' }).setTimestamp();
+
+  const buttons = [
+    new ButtonBuilder()
+      .setCustomId(`playoffseries_reportscore:${series.id}`)
+      .setLabel(isComplete ? 'Series Complete' : `Report Score — Game ${nextGameNumber}`)
+      .setEmoji('📋')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(isComplete || stillLocked || Boolean(series.disputed)),
+    new ButtonBuilder()
+      .setCustomId(`playoffseries_dispute:${series.id}`)
+      .setLabel('Report Issue')
+      .setEmoji('🚩')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(Boolean(series.disputed)),
+  ];
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(buttons)] };
+}
+
+// 7J-PLAYOFFROUNDTHREADS: finds a series by id anywhere in a league's
+// current bracket, searching every round rather than assuming it's in
+// current_round — a series' own thread buttons should keep working even if
+// current_round has since moved past it (e.g. re-checking an older,
+// already-decided series to raise a dispute). Returns everything a caller
+// typically needs in one shot to avoid three separate re-lookups.
+async function findPlayoffSeriesById(guildId, seriesId) {
+  const bracketResult = await pool.query(
+    `SELECT b.* FROM league_playoff_brackets b WHERE b.league_id IN (SELECT league_id FROM leagues WHERE guild_id = $1)`,
+    [guildId]
+  ).catch(() => ({ rows: [] }));
+  for (const row of bracketResult.rows) {
+    const bracket = Array.isArray(row.bracket) ? row.bracket : [];
+    for (let roundIndex = 0; roundIndex < bracket.length; roundIndex++) {
+      const series = (bracket[roundIndex] || []).find(s => s.id === seriesId);
+      if (series) {
+        const league = await getLeagueById(row.league_id);
+        return { league, bracketState: row, bracket, roundIndex, roundSeries: bracket[roundIndex], series };
+      }
+    }
+  }
+  return null;
+}
+
+// Either team's owner, or staff, can act on a series.
+async function canReportPlayoffSeries(interaction, league, series) {
+  if (await userCanUseLeagueSetup(interaction, league)) return { ok: true };
+  const [roleA, roleB] = await Promise.all([
+    pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamA?.name]).then(r => r.rows[0]?.role_id).catch(() => null),
+    series.teamB ? pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamB.name]).then(r => r.rows[0]?.role_id).catch(() => null) : null,
+  ]);
+  const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  const isInvolved = member && ((roleA && member.roles.cache.has(roleA)) || (roleB && member.roles.cache.has(roleB)));
+  if (!isInvolved) return { ok: false, message: 'Only the two teams in this series (or staff) can do that.' };
+  return { ok: true };
+}
+
+async function resolveSeriesTeamMentions(leagueId, series) {
+  const [roleAResult, roleBResult] = await Promise.all([
+    pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, series.teamA?.name]).catch(() => ({ rows: [] })),
+    series.teamB ? pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, series.teamB.name]).catch(() => ({ rows: [] })) : { rows: [] },
+  ]);
+  const roleA = roleAResult.rows[0]?.role_id;
+  const roleB = roleBResult.rows[0]?.role_id;
+  return {
+    mentionA: roleA ? `<@&${roleA}>` : `**${series.teamA?.name}**`,
+    mentionB: roleB ? `<@&${roleB}>` : `**${series.teamB?.name || ''}**`,
+  };
+}
+
+// 7J-PLAYOFFROUNDTHREADS: re-renders a series' persistent thread message in
+// place after any state change (a game recorded, a dispute raised/resolved)
+// so the thread is always showing accurate, current state rather than a
+// stale snapshot from when it was first created.
+async function refreshPlayoffSeriesThreadMessage(guild, league, series, roundNumber) {
+  if (!series.thread_id || !series.status_message_id) return;
+  const thread = await guild.channels.fetch(series.thread_id).catch(() => null);
+  if (!thread?.isThread?.()) return;
+  const message = await thread.messages.fetch(series.status_message_id).catch(() => null);
+  if (!message) return;
+  const { mentionA, mentionB } = await resolveSeriesTeamMentions(league.league_id, series);
+  const payload = buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB);
+  await message.edit(payload).catch(() => null);
+}
+
+// 7J-PLAYOFFROUNDTHREADS: the single shared core for recording a playoff
+// game result — both the self-serve thread button (playoffseries_gamewinner)
+// and the staff dropdown fallback (commissioner_playoffs_report_winner)
+// call this, so there's exactly one place that knows how to advance a
+// series, cascade into the next round, and keep every surface (thread,
+// bracket panel, standings) in sync.
+async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winnerSide) {
+  const bracketResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]);
+  const bracketState = bracketResult.rows[0];
+  if (!bracketState) return { ok: false, message: 'No playoff bracket found for this league.' };
+  const bracket = bracketState.bracket;
+  let roundIndex = -1;
+  let series = null;
+  for (let i = 0; i < bracket.length; i++) {
+    const found = (bracket[i] || []).find(s => s.id === seriesId);
+    if (found) { roundIndex = i; series = found; break; }
+  }
+  if (!series) return { ok: false, message: 'That series could not be found.' };
+  if (series.winner) return { ok: false, message: 'This series is already complete.' };
+  if (series.disputed) return { ok: false, message: 'A dispute is open on this series — staff need to resolve it first.' };
+  if (series.unlocksAt && new Date(series.unlocksAt).getTime() > Date.now()) {
+    return { ok: false, message: `This round isn't reportable yet — unlocks <t:${Math.floor(new Date(series.unlocksAt).getTime() / 1000)}:R>.` };
+  }
+
+  const roundSeries = bracket[roundIndex];
+  series.games = Array.isArray(series.games) ? series.games : [];
+  series.games.push(winnerSide);
+  if (winnerSide === 'A') series.winsA += 1; else series.winsB += 1;
+  const winThreshold = Math.ceil(series.seriesLength / 2);
+  if (series.winsA >= winThreshold) { series.winner = series.teamA.name; series.completedAt = new Date().toISOString(); }
+  else if (series.winsB >= winThreshold) { series.winner = series.teamB.name; series.completedAt = new Date().toISOString(); }
+
+  // 7J-USERHEADTOHEAD: playoff games count too — resolved by team name
+  // since series objects only ever store names, not role ids.
+  const [roleAForH2h, roleBForH2h] = await Promise.all([
+    pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, series.teamA.name]).then(r => r.rows[0]?.role_id).catch(() => null),
+    pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, series.teamB.name]).then(r => r.rows[0]?.role_id).catch(() => null),
+  ]);
+  const ownerA = roleAForH2h ? await findTeamOwnerByRoleId(guild, roleAForH2h).catch(() => null) : null;
+  const ownerB = roleBForH2h ? await findTeamOwnerByRoleId(guild, roleBForH2h).catch(() => null) : null;
+  if (ownerA && ownerB) {
+    const gameWinnerOwnerId = winnerSide === 'A' ? ownerA.id : ownerB.id;
+    await recordUserHeadToHead(guild.id, ownerA.id, ownerB.id, gameWinnerOwnerId);
+  }
+
+  const roundComplete = roundSeries.every(s => s.winner);
+  let statusNote = `Recorded: ${winnerSide === 'A' ? series.teamA.name : series.teamB.name} wins Game ${series.games.length} (${series.winsA}-${series.winsB}).`;
+
+  if (roundComplete) {
+    const isFinalRound = roundSeries.length === 1;
+    if (isFinalRound) {
+      const champion = roundSeries[0].winner;
+      bracket[roundIndex] = roundSeries;
+      await pool.query(
+        `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, JSON.stringify(bracket), champion]
+      );
+      statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
+    } else {
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
+      const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1);
+      await createPlayoffSeriesThreads(guild, league, nextRound, roundIndex + 2).catch(err => console.error('[Playoffs] Next round thread creation failed:', err?.message || err));
+      bracket[roundIndex] = roundSeries;
+      bracket.push(nextRound);
+      await pool.query(
+        `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId, JSON.stringify(bracket), bracketState.current_round + 1]
+      );
+      statusNote += `\n\nRound complete — Round ${bracketState.current_round + 1} bracket generated. It unlocks in 15 minutes to leave room for a dispute on this round.`;
+    }
+  } else {
+    bracket[roundIndex] = roundSeries;
+    await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, JSON.stringify(bracket)]);
+  }
+
+  // 7J-PLAYOFFROUNDTHREADS: refresh THIS series' own thread status message
+  // (score, next-game label, or final result) regardless of round outcome,
+  // and the bracket panel image on every single game — per Hxxdie, not just
+  // at round completion.
+  await refreshPlayoffSeriesThreadMessage(guild, league, series, roundIndex + 1);
+  await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+
+  return { ok: true, message: statusNote, series, roundComplete };
+}
+
+// 7J-PLAYOFFROUNDTHREADS: staff dispute resolution. "Rollback" undoes the
+// single most recently reported game in the disputed series — safe and
+// well-defined because the 15-minute + dispute gate guarantees nothing in
+// the NEXT round has been played yet if this series fed into one. If that
+// next round somehow already has a real recorded game in it (edge case:
+// dispute raised well after the fact, past the point staff would normally
+// catch it), this refuses to auto-cascade and asks for manual handling
+// instead of silently deleting real results.
+async function resolvePlayoffDispute(guild, league, seriesId, resolution) {
+  const lookup = await findPlayoffSeriesById(guild.id, seriesId);
+  if (!lookup) return { message: 'That series could not be found.' };
+  const { bracketState, bracket, roundIndex, series } = lookup;
+
+  if (resolution === 'allow') {
+    series.disputed = false;
+    bracket[roundIndex] = bracket[roundIndex].map(s => (s.id === series.id ? series : s));
+    await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]);
+    await refreshPlayoffSeriesThreadMessage(guild, league, series, roundIndex + 1);
+    return { message: `✅ Dispute dismissed — no changes made. The series (and next round, if applicable) can proceed normally.` };
+  }
+
+  // Rollback path.
+  if (!series.games.length) return { message: 'No games recorded on this series yet — nothing to roll back.' };
+
+  const nextRound = bracket[roundIndex + 1];
+  if (nextRound && nextRound.some(s => Array.isArray(s.games) && s.games.length > 0)) {
+    return { message: `⚠️ Round ${roundIndex + 2} already has real results recorded — this needs manual staff handling rather than an automatic rollback. No changes were made.` };
+  }
+
+  const lastWinnerSide = series.games.pop();
+  if (lastWinnerSide === 'A') series.winsA = Math.max(0, series.winsA - 1); else series.winsB = Math.max(0, series.winsB - 1);
+  const wasComplete = Boolean(series.winner);
+  series.winner = null;
+  series.completedAt = null;
+  series.disputed = false;
+
+  bracket[roundIndex] = bracket[roundIndex].map(s => (s.id === series.id ? series : s));
+  let currentRound = bracketState.current_round;
+  if (nextRound) {
+    // Delete that now-invalid next round entirely — safe because we just
+    // confirmed above it has zero recorded games in it.
+    for (const s of nextRound) {
+      if (s.thread_id) {
+        const thread = await guild.channels.fetch(s.thread_id).catch(() => null);
+        if (thread?.isThread?.()) await thread.delete('GG Sports: playoff dispute rollback — next round invalidated').catch(() => null);
+      }
+    }
+    bracket.splice(roundIndex + 1, 1);
+    currentRound = roundIndex + 1;
+  }
+  await pool.query(
+    `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, status = 'in_progress', champion_team = NULL, updated_at = NOW() WHERE league_id = $1`,
+    [league.league_id, JSON.stringify(bracket), currentRound]
+  );
+  await refreshPlayoffSeriesThreadMessage(guild, league, series, roundIndex + 1);
+  await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+
+  return { message: `↩️ Rolled back Game ${series.games.length + 1} of this series.${wasComplete && nextRound ? ' The next round (which had no games played yet) was cleared — it will regenerate once this series is decided again.' : ''}` };
 }
 
 function buildLivePlayoffBracketEmbed(league, bracketState) {
@@ -16436,7 +16830,21 @@ if (interaction.commandName === 'avatar') {
         }
 
         if (currentRound >= schedule.length) {
-          await interaction.editReply({ content: `Season schedule complete — all ${schedule.length} game(s) have been played.\n\n**Next steps:**\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)\n• Start a new season to generate a new schedule.` });
+          // 7J-SEASONCOMPLETEFLOW: per Hxxdie — this used to be a dead-end
+          // wall of text (no actual button, and a "start a new season"
+          // bullet promising a feature that doesn't exist yet — pressing
+          // Advance again here is a genuine no-op, it doesn't reset
+          // anything). If the developer didn't know what to press next, a
+          // new commissioner never would either. Now gives a direct button
+          // straight into Playoffs, and stops promising the unbuilt
+          // new-season reset.
+          await interaction.editReply({
+            content: `**Regular season complete** — all ${schedule.length} game(s) have been played.\n\nWhen you're ready, head to Playoffs to seed and start the bracket from final standings. Pressing Advance again won't do anything further until playoffs are complete.\n\nOnce a champion is crowned, use **Season History** to record it and \`/shop grantaward\` for any award cosmetics — or use **Start New Season** below once playoffs wrap up to archive this season and reset for the next one.`,
+            components: [new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Go to Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId('commissioner_newseason_start:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger),
+            )],
+          });
           return;
         }
 
@@ -18286,7 +18694,159 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-PLAYOFFSTARTCONFIRM: per Hxxdie — leagues should keep the freedom
+    // to head to playoffs early if they want to, so this doesn't block
+    // early starts, only makes sure nobody does it by accident. Two-step:
+    // this shows the warning, commissioner_playoffs_start_confirm actually
+    // does the seeding (the exact logic that used to live directly here).
+    // Wording differs depending on whether the regular season is actually
+    // done, since starting early has a real, different consequence (skips
+    // remaining scheduled games entirely) vs. starting on time.
     if (interaction.isButton() && interaction.customId.startsWith('commissioner_playoffs_start:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage playoffs.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const schedule = Array.isArray(customSettings.schedule) ? customSettings.schedule : [];
+      const currentRound = Number(customSettings.current_round || 0);
+      const seasonComplete = !schedule.length || currentRound >= schedule.length;
+      const remainingGames = Math.max(0, schedule.length - currentRound);
+      const warning = seasonComplete
+        ? 'This will seed and start the playoff bracket from the final regular-season standings. This locks in the bracket — continue?'
+        : `**The regular season isn't finished yet** — ${remainingGames} game(s) are still left on the schedule. Starting playoffs now will end the regular season immediately: those remaining games will never be played, and the bracket will be seeded from the standings as they stand right now, not the final record. This can't be undone. Continue anyway?`;
+      await interaction.reply({
+        content: warning,
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('commissioner_playoffs_start_confirm:' + leagueId).setLabel(seasonComplete ? 'Start Playoffs' : 'End Season Early & Start Playoffs').setEmoji('🚀').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId('commissioner_playoffs_start_cancel:' + leagueId).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+        )],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // 7J-NEWSEASONFLOW: per Hxxdie — closes the loop the season-complete
+    // message used to promise but never actually built. Two-step confirm,
+    // same spirit as Start Playoffs: never block a commissioner from doing
+    // this whenever they want (including mid-season, if they genuinely want
+    // a do-over), just make sure they can't do it by accident, and warn
+    // extra hard if playoffs are currently in progress since that bracket
+    // would be abandoned without a recorded champion.
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_newseason_start:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true }); return; }
+      const bracketResult = await pool.query(`SELECT status FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [] }));
+      const playoffsInProgress = bracketResult.rows[0]?.status === 'in_progress';
+      const warning = `Starting a new season will:\n• Archive every team's current record and final standing into permanent history (Season History → Team/Career records)\n• Reset every team's record to 0-0 for the new season\n• Clear the schedule so the next **Advance** generates a fresh one${playoffsInProgress ? '\n\n⚠️ **Playoffs are currently in progress.** The bracket will be abandoned with no champion recorded unless you finish it first.' : ''}\n\nThis can\'t be undone. Continue?`;
+      await interaction.reply({
+        content: warning,
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('commissioner_newseason_confirm:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('commissioner_newseason_cancel:' + leagueId).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+        )],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_newseason_cancel:')) {
+      await interaction.update({ content: 'Cancelled — no changes made.', components: [] }).catch(() => null);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_newseason_confirm:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true }); return; }
+      await interaction.deferUpdate();
+
+      const standingsRows = await getStandingsRows(interaction.guild.id, leagueId).catch(() => []);
+      if (!standingsRows.length) {
+        await interaction.editReply({ content: 'No standings found for this league — nothing to archive.', components: [] });
+        return;
+      }
+
+      const bracketResult = await pool.query(`SELECT bracket, status, champion_team FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [] }));
+      const bracketState = bracketResult.rows[0] || null;
+      const bracket = bracketState?.bracket || [];
+      const championTeam = bracketState?.status === 'completed' ? bracketState.champion_team : null;
+
+      const seasonCountResult = await pool.query(`SELECT COUNT(DISTINCT season_label)::int AS n FROM team_season_history WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [{ n: 0 }] }));
+      const seasonLabel = `Season ${Number(seasonCountResult.rows[0]?.n || 0) + 1}`;
+
+      let teamsArchived = 0;
+      let ownersArchived = 0;
+      for (const row of standingsRows) {
+        const playoffResult = getTeamPlayoffResultFromBracket(bracket, row.team_name);
+        const isChampion = championTeam && row.team_name === championTeam;
+        await pool.query(
+          `INSERT INTO team_season_history (id, guild_id, league_id, season_label, team_name, wins, losses, ties, otl, points_for, points_against, final_rank, playoff_result, champion)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+          [randomUUID(), interaction.guild.id, leagueId, seasonLabel, row.team_name, row.wins || 0, row.losses || 0, row.ties || 0, row.otl || 0, row.points_for || 0, row.points_against || 0, teamsArchived + 1, playoffResult, Boolean(isChampion)]
+        ).catch(() => null);
+        teamsArchived += 1;
+
+        const owner = await findTeamOwnerByRoleId(interaction.guild, row.team_role_id).catch(() => null);
+        if (owner) {
+          await pool.query(
+            `INSERT INTO user_season_history (id, guild_id, league_id, season_label, user_id, team_name, wins, losses, ties, champion)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [randomUUID(), interaction.guild.id, leagueId, seasonLabel, owner.id, row.team_name, row.wins || 0, row.losses || 0, row.ties || 0, Boolean(isChampion)]
+          ).catch(() => null);
+          // 7J-92LEGACYFLOOR: a completed season is exactly the kind of
+          // real, substantial participation the floor exists for — bigger
+          // than the small per-game trickle, and increments seasons_completed
+          // (already-existing legacy infrastructure this simply hooks into).
+          await addParticipationScore(interaction.guild.id, owner.id, 5, leagueId, 1).catch(() => null);
+          ownersArchived += 1;
+        }
+      }
+
+      if (championTeam) {
+        await pool.query(
+          `INSERT INTO season_history (id, guild_id, league_id, season_label, champion, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [randomUUID(), interaction.guild.id, leagueId, seasonLabel, championTeam, interaction.user.id]
+        ).catch(() => null);
+      }
+
+      await pool.query(
+        `UPDATE league_standings SET wins = 0, losses = 0, ties = 0, otl = 0, points_for = 0, points_against = 0, standings_points = 0, updated_at = NOW()
+         WHERE guild_id = $1 AND league_id = $2`,
+        [interaction.guild.id, leagueId]
+      );
+      await pool.query(
+        `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId]
+      );
+      await pool.query(
+        `UPDATE league_playoff_brackets SET bracket = '[]', current_round = 0, status = 'not_started', champion_team = NULL, updated_at = NOW() WHERE league_id = $1`,
+        [leagueId]
+      ).catch(() => null);
+
+      await updateStandingsPanel(interaction.guild, league).catch(() => null);
+      await computeAndPostLeaguePowerRankings(interaction.guild, league).catch(() => null);
+      await refreshPlayoffBracketPanel(interaction.guild, league).catch(() => null);
+
+      const championNote = championTeam ? `\n🏆 **${championTeam}** archived as ${seasonLabel}'s champion.` : '';
+      await interaction.editReply({
+        content: `**${seasonLabel} archived.** ${teamsArchived} team(s) and ${ownersArchived} owner(s) recorded to history.${championNote}\n\nStandings reset to 0-0. Press **Advance** to generate a fresh schedule when you're ready.`,
+        components: [],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_playoffs_start_cancel:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league) { await interaction.update({ content: 'League not found.', embeds: [], components: [] }); return; }
+      const payload = await buildPlayoffsOpsPayload(interaction.guild, league);
+      await interaction.update({ content: null, ...payload });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('commissioner_playoffs_start_confirm:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage playoffs.', ephemeral: true }); return; }
@@ -18299,6 +18859,11 @@ if (interaction.commandName === 'avatar') {
       const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
       const firstRound = buildInitialPlayoffRound(seededTeams, seriesLengths);
+      // 7J-PLAYOFFGAMETHREADS: create threads (mutates firstRound entries
+      // with .thread_id) BEFORE the bracket is inserted, so the thread ids
+      // are captured in the very first write rather than needing a second
+      // round-trip to attach them after the fact.
+      await createPlayoffSeriesThreads(interaction.guild, league, firstRound, 1).catch(err => console.error('[Playoffs] Round 1 thread creation failed:', err?.message || err));
       const bracket = [firstRound];
       await pool.query(
         `INSERT INTO league_playoff_brackets (league_id, bracket, current_round, status, champion_team, updated_at)
@@ -18384,62 +18949,108 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-PLAYOFFROUNDTHREADS: staff-only fallback — the self-serve
+    // Report Score button in each series thread (playoffseries_gamewinner
+    // below) is the primary path now, but this dropdown still works
+    // (useful if a thread got deleted, or staff need to override) and both
+    // paths share the exact same core logic via recordPlayoffGameResult.
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('commissioner_playoffs_report_winner:')) {
       const [, leagueId, seriesId] = interaction.customId.split(':');
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to report playoff results.', ephemeral: true }); return; }
       await interaction.deferUpdate();
 
-      const bracketResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]);
-      const bracketState = bracketResult.rows[0];
-      const bracket = bracketState.bracket;
-      const roundIndex = bracketState.current_round - 1;
-      const roundSeries = bracket[roundIndex] || [];
-      const series = roundSeries.find(s => s.id === seriesId);
-      if (!series) { await interaction.editReply({ content: 'That series could not be found.', components: [] }); return; }
+      const result = await recordPlayoffGameResult(interaction.guild, league, leagueId, seriesId, interaction.values[0]);
+      if (!result.ok) { await interaction.editReply({ content: result.message, components: [] }); return; }
 
-      const gameWinner = interaction.values[0];
-      if (gameWinner === 'A') series.winsA += 1; else series.winsB += 1;
-      const winThreshold = Math.ceil(series.seriesLength / 2);
-      if (series.winsA >= winThreshold) series.winner = series.teamA.name;
-      else if (series.winsB >= winThreshold) series.winner = series.teamB.name;
-
-      const roundComplete = roundSeries.every(s => s.winner);
-      let statusNote = `Recorded: ${gameWinner === 'A' ? series.teamA.name : series.teamB.name} wins a game (${series.winsA}-${series.winsB}).`;
-
-      if (roundComplete) {
-        const isFinalRound = roundSeries.length === 1;
-        if (isFinalRound) {
-          const champion = roundSeries[0].winner;
-          bracket[roundIndex] = roundSeries;
-          await pool.query(
-            `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
-            [leagueId, JSON.stringify(bracket), champion]
-          );
-          // Non-Madden leagues don't have an automatic year-end sync to hook into like
-          // Madden does — the commissioner has to manually record season history and
-          // hand out awards, so prompt them here rather than leaving it undiscoverable.
-          statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
-        } else {
-          const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
-          const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
-          const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1);
-          bracket[roundIndex] = roundSeries;
-          bracket.push(nextRound);
-          await pool.query(
-            `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
-            [leagueId, JSON.stringify(bracket), bracketState.current_round + 1]
-          );
-          statusNote += `\n\nRound complete — Round ${bracketState.current_round + 1} bracket generated.`;
-        }
-      } else {
-        bracket[roundIndex] = roundSeries;
-        await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, JSON.stringify(bracket)]);
-      }
-
-      await refreshPlayoffBracketPanel(interaction.guild, league).catch(() => null);
       const payload = await buildPlayoffsOpsPayload(interaction.guild, league);
-      await interaction.editReply({ content: statusNote, ...payload });
+      await interaction.editReply({ content: result.message, ...payload });
+      return;
+    }
+
+    // 7J-PLAYOFFROUNDTHREADS: entry point from a series thread's Report
+    // Score button — shows a quick "which team won Game N" pick rather than
+    // recording anything itself, so a misclick doesn't silently record the
+    // wrong team's win.
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_reportscore:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, series } = lookup;
+      const permCheck = await canReportPlayoffSeries(interaction, league, series);
+      if (!permCheck.ok) { await interaction.reply({ content: permCheck.message, ephemeral: true }); return; }
+      if (series.winner) { await interaction.reply({ content: 'This series is already complete.', ephemeral: true }); return; }
+      if (series.disputed) { await interaction.reply({ content: 'A dispute is open on this series — staff need to resolve it before the next game can be reported.', ephemeral: true }); return; }
+      if (series.unlocksAt && new Date(series.unlocksAt).getTime() > Date.now()) {
+        await interaction.reply({ content: `This round isn't reportable yet — unlocks <t:${Math.floor(new Date(series.unlocksAt).getTime() / 1000)}:R>.`, ephemeral: true });
+        return;
+      }
+      const nextGameNumber = series.games.length + 1;
+      await interaction.reply({
+        content: `Who won Game ${nextGameNumber}?`,
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`playoffseries_gamewinner:${series.id}:A`).setLabel(series.teamA.name).setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`playoffseries_gamewinner:${series.id}:B`).setLabel(series.teamB.name).setStyle(ButtonStyle.Success),
+        )],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_gamewinner:')) {
+      const [, seriesId, side] = interaction.customId.split(':');
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.update({ content: 'That series could not be found.', components: [] }); return; }
+      const { league, series } = lookup;
+      const permCheck = await canReportPlayoffSeries(interaction, league, series);
+      if (!permCheck.ok) { await interaction.update({ content: permCheck.message, components: [] }); return; }
+      await interaction.update({ content: 'Recording...', components: [] });
+
+      const result = await recordPlayoffGameResult(interaction.guild, league, league.league_id, seriesId, side);
+      await interaction.editReply({ content: result.message });
+      return;
+    }
+
+    // 7J-PLAYOFFROUNDTHREADS: raises a dispute on this series — valid at
+    // any point in its life, not just after it's decided, per Hxxdie
+    // (someone might want to dispute Game 2 of a still-open series just as
+    // much as the elimination game). Blocks the NEXT round's Game 1 for
+    // every series that came out of this round until staff resolve it.
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_dispute:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, bracketState, bracket, roundIndex, series } = lookup;
+      const permCheck = await canReportPlayoffSeries(interaction, league, series);
+      if (!permCheck.ok) { await interaction.reply({ content: permCheck.message, ephemeral: true }); return; }
+      if (series.disputed) { await interaction.reply({ content: 'A dispute is already open on this series.', ephemeral: true }); return; }
+
+      series.disputed = true;
+      bracket[roundIndex] = bracket[roundIndex].map(s => (s.id === series.id ? series : s));
+      await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]);
+      await refreshPlayoffSeriesThreadMessage(interaction.guild, league, series, roundIndex + 1);
+
+      await interaction.reply({ content: `🚩 <@${interaction.user.id}> raised a dispute on this series. A staff member needs to resolve it below before the next round can begin.` });
+      await interaction.channel.send({
+        content: 'Staff: resolve this dispute when ready.',
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`playoffseries_disputeresolve:${series.id}:rollback`).setLabel('Rollback Last Game').setEmoji('↩️').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId(`playoffseries_disputeresolve:${series.id}:allow`).setLabel('Dismiss — No Action').setEmoji('✅').setStyle(ButtonStyle.Secondary),
+        )],
+      }).catch(() => null);
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_disputeresolve:')) {
+      const [, seriesId, resolution] = interaction.customId.split(':');
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league } = lookup;
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'Only staff can resolve a dispute.', ephemeral: true }); return; }
+      await interaction.deferUpdate();
+
+      const result = await resolvePlayoffDispute(interaction.guild, league, seriesId, resolution);
+      await interaction.followUp({ content: result.message });
       return;
     }
 
@@ -22671,6 +23282,26 @@ if (interaction.commandName === 'avatar') {
 
     if (interaction.commandName === 'ping') {
       await interaction.reply({ content: 'GG Sports is live.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (interaction.commandName === 'headtohead') {
+      const opponent = interaction.options.getUser('opponent');
+      const user = interaction.options.getUser('user') || interaction.user;
+      if (user.id === opponent.id) {
+        await interaction.reply({ content: 'Pick two different users.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const snapshot = await getUserHeadToHeadSnapshot(interaction.guild.id, user.id, opponent.id);
+      const embed = new EmbedBuilder()
+        .setTitle('⚔️ Head-to-Head')
+        .setColor(0xED4245)
+        .setDescription(snapshot.games
+          ? `**<@${user.id}>** ${snapshot.aWins} — ${snapshot.bWins} **<@${opponent.id}>**${snapshot.ties ? ` (${snapshot.ties} tie${snapshot.ties === 1 ? '' : 's'})` : ''}\n\n${snapshot.games} game(s) played across every league, team, and season.`
+          : `<@${user.id}> and <@${opponent.id}> haven't played each other yet.`)
+        .setFooter({ text: 'GG Sports • Head-to-Head' })
+        .setTimestamp();
+      await interaction.reply({ embeds: [embed] });
       return;
     }
 
@@ -31173,13 +31804,77 @@ async function getHeadToHeadSnapshot(guildId, leagueId, homeRoleId, awayRoleId) 
   return { homeWins, awayWins, games: result.rows.length };
 }
 
+// 7J-USERHEADTOHEAD: per Hxxdie — records who beat whom, as PEOPLE, not
+// teams, so a rivalry between two owners survives them swapping teams or
+// starting a new season. Records every reported result between two real
+// owners (ties included) — winnerId null means a tie. Fails soft; a
+// head-to-head miss should never block a score report from completing.
+async function recordUserHeadToHead(guildId, userAId, userBId, winnerId) {
+  if (!userAId || !userBId || userAId === userBId) return;
+  const [lowId, highId] = [userAId, userBId].sort();
+  const lowWon = winnerId === lowId;
+  const highWon = winnerId === highId;
+  await pool.query(
+    `INSERT INTO user_head_to_head (guild_id, user_a_id, user_b_id, user_a_wins, user_b_wins, ties, last_played_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+     ON CONFLICT (guild_id, user_a_id, user_b_id) DO UPDATE SET
+       user_a_wins = user_head_to_head.user_a_wins + $4,
+       user_b_wins = user_head_to_head.user_b_wins + $5,
+       ties = user_head_to_head.ties + $6,
+       last_played_at = NOW(),
+       updated_at = NOW()`,
+    [guildId, lowId, highId, lowWon ? 1 : 0, highWon ? 1 : 0, winnerId ? 0 : 1]
+  ).catch(err => console.error('[UserH2H] Record failed:', err?.message || err));
+}
+
+// Returns the record oriented to (userAId vs userBId) regardless of how it's
+// stored internally, so callers never have to think about the normalization.
+async function getUserHeadToHeadSnapshot(guildId, userAId, userBId) {
+  if (!userAId || !userBId || userAId === userBId) return { aWins: 0, bWins: 0, ties: 0, games: 0 };
+  const [lowId, highId] = [userAId, userBId].sort();
+  const result = await pool.query(
+    `SELECT user_a_wins, user_b_wins, ties FROM user_head_to_head WHERE guild_id = $1 AND user_a_id = $2 AND user_b_id = $3`,
+    [guildId, lowId, highId]
+  ).catch(() => ({ rows: [] }));
+  const row = result.rows[0];
+  if (!row) return { aWins: 0, bWins: 0, ties: 0, games: 0 };
+  const lowWins = Number(row.user_a_wins || 0);
+  const highWins = Number(row.user_b_wins || 0);
+  const ties = Number(row.ties || 0);
+  const aWins = userAId === lowId ? lowWins : highWins;
+  const bWins = userAId === lowId ? highWins : lowWins;
+  return { aWins, bWins, ties, games: aWins + bWins + ties };
+}
+
+// 7J-NEWSEASONFLOW: reads a team's furthest point in the playoff bracket —
+// used purely for the archived team_season_history.playoff_result label, so
+// "made it to the final and lost" reads differently than "lost round one."
+function getTeamPlayoffResultFromBracket(bracket, teamName) {
+  if (!Array.isArray(bracket) || !bracket.length || !teamName) return null;
+  let lastRoundIndex = -1;
+  let wonLastRound = false;
+  bracket.forEach((round, idx) => {
+    const series = (round || []).find(s => s.teamA?.name === teamName || s.teamB?.name === teamName);
+    if (series) {
+      lastRoundIndex = idx;
+      wonLastRound = series.winner === teamName;
+    }
+  });
+  if (lastRoundIndex === -1) return null;
+  const isLastRound = lastRoundIndex === bracket.length - 1;
+  const isFinalSeries = bracket[lastRoundIndex]?.length === 1;
+  if (isLastRound && isFinalSeries && wonLastRound) return 'Champion';
+  if (isLastRound && isFinalSeries && !wonLastRound) return 'Runner-up';
+  return wonLastRound ? `Advanced past Round ${lastRoundIndex + 1}` : `Eliminated Round ${lastRoundIndex + 1}`;
+}
+
 function probabilityToAmericanOdds(probability) {
   const p = Math.max(0.15, Math.min(0.85, Number(probability) || 0.5));
   if (p >= 0.5) return -Math.round((p / (1 - p)) * 100);
   return Math.round(((1 - p) / p) * 100);
 }
 
-async function generateAutoSportsbookOdds(guildId, leagueId, homeRoleId, awayRoleId) {
+async function generateAutoSportsbookOdds(guildId, leagueId, homeRoleId, awayRoleId, homeOwnerId = null, awayOwnerId = null) {
   const home = await getTeamStandingsSnapshot(guildId, leagueId, homeRoleId);
   const away = await getTeamStandingsSnapshot(guildId, leagueId, awayRoleId);
   const homeForm = await getTeamRecentForm(guildId, leagueId, homeRoleId);
@@ -31193,6 +31888,21 @@ async function generateAutoSportsbookOdds(guildId, leagueId, homeRoleId, awayRol
   homeScore += (homeForm.streak - awayForm.streak) * 1.5;
   homeScore += (h2h.homeWins - h2h.awayWins) * 2;
   homeScore += 3; // home-field/home-court advantage
+
+  // 7J-USERHEADTOHEAD: per Hxxdie — "if 2 users have faced off 10 times and
+  // one has won 8, the line should reflect that." Team h2h just above
+  // already covers team-vs-team; this adds the person-vs-person layer on
+  // top, since the two team owners' personal rivalry is a real, separate
+  // signal from which teams they currently happen to be piloting. Takes
+  // already-resolved owner ids from the caller (this function has no guild
+  // object to look members up with itself). Gated to a minimum 3-game
+  // sample so a single earlier blowout can't swing a fresh line hard.
+  if (homeOwnerId && awayOwnerId) {
+    const ownerH2h = await getUserHeadToHeadSnapshot(guildId, homeOwnerId, awayOwnerId);
+    if (ownerH2h.games >= 3) {
+      homeScore += (ownerH2h.aWins - ownerH2h.bWins) * 1.5;
+    }
+  }
 
   const homeProbability = Math.max(0.2, Math.min(0.8, homeScore / 100));
   const awayProbability = 1 - homeProbability;
@@ -31227,7 +31937,9 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
     interaction.guild.id,
     league.league_id,
     leagueGame.home_team_role_id,
-    leagueGame.away_team_role_id
+    leagueGame.away_team_role_id,
+    homeOwner.id,
+    awayOwner.id
   );
 
   const sportsbookGameId = randomUUID();
@@ -31851,6 +32563,14 @@ async function reportLeagueGameCore(interaction, game, homeScore, awayScore, ove
   // requirement already enforced for auto sportsbook lines
   // (createAutoSportsbookForLeagueGame).
   const isUserVsUserGame = Boolean(homeOwner && awayOwner);
+
+  // 7J-USERHEADTOHEAD: record the two owners' personal head-to-head here —
+  // same user-vs-user gate as payouts, and fires on ties too (winnerOwner
+  // is null for a tie, which recordUserHeadToHead treats correctly as a
+  // tie rather than a win for either side).
+  if (isUserVsUserGame) {
+    await recordUserHeadToHead(interaction.guild.id, homeOwner.id, awayOwner.id, winnerOwner?.id || null);
+  }
 
   if (isUserVsUserGame && Number(settings.game_played_payout) > 0) {
     const paidOwners = new Set();
@@ -36743,6 +37463,28 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
   const memberSinceDate = await guild.members.fetch(targetUser.id).then(m => m.joinedAt).catch(() => null);
   const memberSinceDisplay = memberSinceDate ? `<t:${Math.floor(memberSinceDate.getTime() / 1000)}:D>` : 'Unknown';
 
+  // 7J-NEWSEASONFLOW: career record across every archived season this user
+  // owned a team in — built up automatically as leagues run Start New
+  // Season, so this only reflects fully completed seasons, not the current
+  // in-progress one (which is what the live Standings board is for).
+  const careerResult = activeLeague
+    ? await pool.query(
+        `SELECT COALESCE(SUM(wins),0) AS wins, COALESCE(SUM(losses),0) AS losses, COALESCE(SUM(ties),0) AS ties,
+                COUNT(*)::int AS seasons, COUNT(*) FILTER (WHERE champion)::int AS championships
+         FROM user_season_history WHERE guild_id = $1 AND user_id = $2 AND league_id = $3`,
+        [guild.id, targetUser.id, activeLeague.league_id]
+      )
+    : await pool.query(
+        `SELECT COALESCE(SUM(wins),0) AS wins, COALESCE(SUM(losses),0) AS losses, COALESCE(SUM(ties),0) AS ties,
+                COUNT(*)::int AS seasons, COUNT(*) FILTER (WHERE champion)::int AS championships
+         FROM user_season_history WHERE guild_id = $1 AND user_id = $2`,
+        [guild.id, targetUser.id]
+      );
+  const career = careerResult.rows[0] || {};
+  const careerDisplay = Number(career.seasons || 0) > 0
+    ? `${career.wins}-${career.losses}${Number(career.ties) ? `-${career.ties}` : ''} across ${career.seasons} completed season(s) • ${career.championships} title(s)`
+    : 'No completed seasons yet — builds up as leagues archive seasons via Start New Season.';
+
   const embed = new EmbedBuilder()
     .setTitle('Member Profile • ' + targetUser.username)
     .setColor(0xFEE75C)
@@ -36756,6 +37498,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'Balance', value: settings.currency_icon + ' ' + balance.balance, inline: true },
       { name: 'All-Time Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
       { name: 'All-Time Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
+      { name: 'Career Record', value: careerDisplay, inline: false },
       { name: 'Sportsbook Record', value: String(bets.won_bets || 0) + '-' + String(bets.lost_bets || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(bets.net_profit || 0), inline: false },
       { name: 'Parlays', value: 'Won: ' + String(parlays.won_parlays || 0) + ' • Settled: ' + String(parlays.settled_parlays || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(parlays.parlay_profit || 0), inline: false },
       { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
@@ -69943,6 +70686,11 @@ async function distributeMaddenGameCompletionReward(guild, league, game) {
   // even for whichever side does have a real owner.
   const isUserVsUserMaddenGame = Boolean(homeOwner && awayOwner);
 
+  // 7J-USERHEADTOHEAD: same recording as the generic path.
+  if (isUserVsUserMaddenGame) {
+    await recordUserHeadToHead(guild.id, homeOwner.id, awayOwner.id, winnerOwner?.id || null);
+  }
+
   const paidOwners = new Set();
   if (isUserVsUserMaddenGame) {
     for (const owner of [homeOwner, awayOwner]) {
@@ -71210,6 +71958,18 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     if (isStructured) {
       rows.push(new ActionRowBuilder().addComponents(advanceButton()));
     }
+    // 7J-NEWSEASONFLOW: per Hxxdie — leagues need a real way to close out a
+    // season (archive standings/playoff result into permanent history,
+    // reset current standings to 0-0, generate a fresh schedule next
+    // Advance) rather than the prior dead end where the season-complete
+    // message promised "start a new season" with no button anywhere that
+    // actually did it. Available any time, not just at season-end — a
+    // commissioner might reasonably want to reset mid-season for a do-over;
+    // the confirm step (see commissioner_newseason_start handler) is what
+    // actually protects against doing this by accident.
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('commissioner_newseason_start:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger),
+    ));
     // 7J-97SUSPEND
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_op:suspensions:' + leagueId).setLabel('Suspensions').setEmoji('🚫').setStyle(ButtonStyle.Danger),
