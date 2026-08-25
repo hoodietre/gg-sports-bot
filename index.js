@@ -6316,63 +6316,206 @@ async function buildTeamScheduleEmbed(guild, league, customSettings, teamRoleId,
 // second-lowest, etc.), best-of-X per round from the league's configured
 // playoff_series_lengths, byes auto-advance when the field isn't a power of 2.
 // ---------------------------------------------------------------------------
-function buildInitialPlayoffRound(seededTeams, seriesLengths) {
-  const teams = [...seededTeams].sort((a, b) => (a.seed || 0) - (b.seed || 0));
-  const seriesLength = seriesLengths?.[0] || 1;
+// 7J-SPORTPLAYOFFFORMAT: shared series constructor. teamA/teamB are
+// standings-row-shaped objects ({team_name, seed, ...}); teamB === null
+// produces a bye (auto-advances with no series played). conference is
+// carried through purely for grouping in later rounds (NFL's reseed step
+// needs it; everything else just uses it for display/organization).
+function makePlayoffSeries(teamA, teamB, seriesLength, conference = null) {
+  if (!teamB) {
+    return { id: randomUUID(), teamA: { name: teamA.team_name, seed: teamA.seed }, teamB: null, seriesLength, winsA: 1, winsB: 0, winner: teamA.team_name, games: [], bye: true, conference };
+  }
+  return {
+    id: randomUUID(),
+    teamA: { name: teamA.team_name, seed: teamA.seed },
+    teamB: { name: teamB.team_name, seed: teamB.seed },
+    seriesLength,
+    winsA: 0,
+    winsB: 0,
+    winner: null,
+    games: [],
+    unlocksAt: null,
+    disputed: false,
+    conference,
+  };
+}
+
+// Standard "1v8, 2v7, 3v6, 4v5"-style fixed bracket within one conference —
+// shared by NBA, MLS, and the generic fallback, all of which use this exact
+// shape once seeding is settled.
+function buildStandardBracketSeriesForConference(teamsSortedBySeed, seriesLength, conference) {
   const series = [];
   let i = 0;
-  let j = teams.length - 1;
+  let j = teamsSortedBySeed.length - 1;
   while (i < j) {
-    series.push({
-      id: randomUUID(),
-      teamA: { name: teams[i].team_name, seed: teams[i].seed },
-      teamB: { name: teams[j].team_name, seed: teams[j].seed },
-      seriesLength,
-      winsA: 0,
-      winsB: 0,
-      winner: null,
-      games: [],
-      // Round 1 has no prior round to wait on — reportable immediately.
-      unlocksAt: null,
-      disputed: false,
-    });
+    series.push(makePlayoffSeries(teamsSortedBySeed[i], teamsSortedBySeed[j], seriesLength, conference));
     i += 1;
     j -= 1;
   }
-  // Odd team out gets a bye - auto-advances with no series played.
-  if (i === j) {
-    series.push({
-      id: randomUUID(),
-      teamA: { name: teams[i].team_name, seed: teams[i].seed },
-      teamB: null,
-      seriesLength,
-      winsA: 1,
-      winsB: 0,
-      winner: teams[i].team_name,
-      games: [],
-      bye: true,
-    });
+  if (i === j) series.push(makePlayoffSeries(teamsSortedBySeed[i], null, seriesLength, conference));
+  return series;
+}
+
+// A crude points-equivalent for ranking two teams when a league isn't
+// necessarily using a points-based standings system (2 per win, 1 per tie —
+// standard hockey scoring) — falls back to this only when standings_points
+// itself isn't populated.
+function playoffPointsMetric(team) {
+  return Number(team.standings_points || 0) || (Number(team.wins || 0) * 2 + Number(team.ties || 0));
+}
+
+// 7J-SPORTPLAYOFFFORMAT: per Hxxdie — round 1 pairing now matches each real
+// league's actual format, not a generic "top vs bottom" bracket. Ordering
+// within a conference is deliberate for NHL/MLB specifically: the generic
+// adjacent-pairing that buildNextPlayoffRound already does for every later
+// round produces the CORRECT next round automatically as long as round 1 is
+// grouped/ordered right here — no special-casing needed past round 1 for
+// those two. NFL is the one exception (see buildNextPlayoffRound) since it
+// genuinely reseeds based on who wins, which can't be baked into a fixed
+// ordering.
+function buildInitialPlayoffRound(seededTeams, seriesLengths, formatKey = 'generic') {
+  const seriesLength = seriesLengths?.[0] || 1;
+  const conferences = [...new Set(seededTeams.map(t => t.conference).filter(Boolean))];
+  const byConference = conferences.length ? conferences : [null];
+
+  if (formatKey === 'nfl') {
+    // 4 division winners (seeds 1-4) + 3 wildcards (seeds 5-7). #1 seed
+    // byes; Wild Card round is 2v7, 3v6, 4v5.
+    const series = [];
+    for (const conference of byConference) {
+      const teams = seededTeams.filter(t => t.conference === conference).sort((a, b) => (a.seed || 0) - (b.seed || 0));
+      const [seed1, seed2, seed3, seed4, seed5, seed6, seed7] = teams;
+      if (!seed1) continue;
+      series.push(makePlayoffSeries(seed1, null, seriesLength, conference));
+      if (seed2 && seed7) series.push(makePlayoffSeries(seed2, seed7, seriesLength, conference));
+      if (seed3 && seed6) series.push(makePlayoffSeries(seed3, seed6, seriesLength, conference));
+      if (seed4 && seed5) series.push(makePlayoffSeries(seed4, seed5, seriesLength, conference));
+    }
+    return series;
+  }
+
+  if (formatKey === 'nhl') {
+    // Division winner with the better record faces the WORSE wild card;
+    // the other division winner faces the BETTER wild card. Each
+    // division's #2 vs #3 plays separately. Ordered [betterLeader-half,
+    // worseLeader-half] so round 2 (each division's own two round-1
+    // winners meeting) falls out of the existing generic pairing logic.
+    const series = [];
+    for (const conference of byConference) {
+      const teams = seededTeams.filter(t => t.conference === conference);
+      const divisions = [...new Set(teams.map(t => t.division).filter(Boolean))].slice(0, 2);
+      const fallbackToStandard = () => series.push(...buildStandardBracketSeriesForConference([...teams].sort((a, b) => (a.seed || 0) - (b.seed || 0)), seriesLength, conference));
+      if (divisions.length < 2) { fallbackToStandard(); continue; }
+
+      const [divA, divB] = divisions;
+      const divATeams = teams.filter(t => t.division === divA).sort((a, b) => (a.divisionRank || 0) - (b.divisionRank || 0));
+      const divBTeams = teams.filter(t => t.division === divB).sort((a, b) => (a.divisionRank || 0) - (b.divisionRank || 0));
+      const wildcards = teams.filter(t => t.qualifyType === 'wildcard').sort((a, b) => (a.wildcardRank || 0) - (b.wildcardRank || 0));
+      const [wcBetter, wcWorse] = wildcards;
+      const divALeader = divATeams[0];
+      const divBLeader = divBTeams[0];
+      if (!divALeader || !divBLeader || !wcBetter || !wcWorse) { fallbackToStandard(); continue; }
+
+      const divALeaderIsBetter = playoffPointsMetric(divALeader) >= playoffPointsMetric(divBLeader);
+      const betterLeader = divALeaderIsBetter ? divALeader : divBLeader;
+      const worseLeader = divALeaderIsBetter ? divBLeader : divALeader;
+      const betterLeaderDivTeams = divALeaderIsBetter ? divATeams : divBTeams;
+      const worseLeaderDivTeams = divALeaderIsBetter ? divBTeams : divATeams;
+
+      series.push(makePlayoffSeries(betterLeader, wcWorse, seriesLength, conference));
+      if (betterLeaderDivTeams[1] && betterLeaderDivTeams[2]) series.push(makePlayoffSeries(betterLeaderDivTeams[1], betterLeaderDivTeams[2], seriesLength, conference));
+      series.push(makePlayoffSeries(worseLeader, wcBetter, seriesLength, conference));
+      if (worseLeaderDivTeams[1] && worseLeaderDivTeams[2]) series.push(makePlayoffSeries(worseLeaderDivTeams[1], worseLeaderDivTeams[2], seriesLength, conference));
+    }
+    return series;
+  }
+
+  if (formatKey === 'mlb') {
+    // Seeds 1-2 bye straight to the Division Series. Wild Card round is
+    // 3v6, 4v5. Ordered [bye1, 4v5, bye2, 3v6] so round 2 (1 vs winner of
+    // 4v5, 2 vs winner of 3v6) falls out of the existing generic pairing.
+    const series = [];
+    for (const conference of byConference) {
+      const teams = seededTeams.filter(t => t.conference === conference).sort((a, b) => (a.seed || 0) - (b.seed || 0));
+      const [seed1, seed2, seed3, seed4, seed5, seed6] = teams;
+      if (!seed1 || !seed2) continue;
+      series.push(makePlayoffSeries(seed1, null, seriesLength, conference));
+      if (seed4 && seed5) series.push(makePlayoffSeries(seed4, seed5, seriesLength, conference));
+      series.push(makePlayoffSeries(seed2, null, seriesLength, conference));
+      if (seed3 && seed6) series.push(makePlayoffSeries(seed3, seed6, seriesLength, conference));
+    }
+    return series;
+  }
+
+  // NBA/MLS/generic — standard fixed bracket, no reseeding. NBA/MLS are
+  // seeded top-N by conference record here (their real play-in/wild-card
+  // mini-tournaments for the final spot(s) aren't modeled — see
+  // selectTopRecordPlayoffTeams).
+  const series = [];
+  for (const conference of byConference) {
+    const teams = seededTeams.filter(t => t.conference === conference).sort((a, b) => (a.seed || 0) - (b.seed || 0));
+    series.push(...buildStandardBracketSeriesForConference(teams, seriesLength, conference));
   }
   return series;
 }
 
-// 7J-PLAYOFFROUNDTHREADS: per Hxxdie — every series in a freshly generated
-// round (round 2+) gets a 15-minute unlocksAt cushion from the moment the
+// 7J-PLAYOFFROUNDTHREADS: every series in a freshly generated round
+// (round 2+) gets a 15-minute unlocksAt cushion from the moment the
 // PREVIOUS round finished, before its own Game 1 can be reported. Gives
 // people time to raise a dispute on the game that just eliminated them
 // without staff ever having to untangle a next-round game that was already
 // being played when the dispute came in.
-function buildNextPlayoffRound(previousRound, seriesLengths, roundIndex) {
-  const winners = previousRound.map(s => s.winner).filter(Boolean);
+//
+// 7J-SPORTPLAYOFFFORMAT: NFL is the one format that reseeds BETWEEN
+// rounds — the #1 seed always plays whichever surviving team has the worst
+// remaining seed, and the other survivors play each other, regardless of
+// which bracket "slot" they came from. That can only happen once, moving
+// from the Wild Card round (index 0) to the Divisional round (index 1);
+// every later round only ever has 2 survivors per conference left, so
+// there's no real reseeding decision left to make. Every other format here
+// (NHL, MLB, NBA, MLS, generic) uses a genuinely fixed bracket and just
+// pairs adjacent winners, which produces the correct next round on its own
+// as long as buildInitialPlayoffRound grouped/ordered round 1 correctly.
+function buildNextPlayoffRound(previousRound, seriesLengths, roundIndex, formatKey = 'generic') {
   const seriesLength = seriesLengths?.[roundIndex] || 1;
   const unlocksAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  if (formatKey === 'nfl' && roundIndex === 1) {
+    const survivorsByConference = new Map();
+    for (const series of previousRound) {
+      if (!series.winner) continue;
+      const winnerTeam = series.teamA?.name === series.winner ? series.teamA : series.teamB;
+      if (!winnerTeam) continue;
+      const conf = series.conference || 'Conference';
+      if (!survivorsByConference.has(conf)) survivorsByConference.set(conf, []);
+      survivorsByConference.get(conf).push({ team_name: series.winner, seed: winnerTeam.seed });
+    }
+    const series = [];
+    for (const [conference, survivors] of survivorsByConference) {
+      const sorted = [...survivors].sort((a, b) => (a.seed || 99) - (b.seed || 99));
+      if (sorted.length < 2) continue;
+      const topSeed = sorted[0];
+      const lowestRemaining = sorted[sorted.length - 1];
+      const middleTeams = sorted.slice(1, sorted.length - 1);
+      series.push(makePlayoffSeries(topSeed, lowestRemaining, seriesLength, conference));
+      for (let i = 0; i < middleTeams.length; i += 2) {
+        if (i + 1 < middleTeams.length) series.push(makePlayoffSeries(middleTeams[i], middleTeams[i + 1], seriesLength, conference));
+      }
+    }
+    series.forEach(s => { if (!s.bye) { s.unlocksAt = unlocksAt; s.disputed = false; } });
+    return series;
+  }
+
+  const winners = previousRound.map(s => s.winner).filter(Boolean);
+  const conferenceByWinner = new Map(previousRound.filter(s => s.winner).map(s => [s.winner, s.conference]));
   const series = [];
   for (let i = 0; i < winners.length; i += 2) {
     if (i + 1 >= winners.length) {
-      // Odd winner count (shouldn't normally happen past round 1) - bye through.
-      series.push({ id: randomUUID(), teamA: { name: winners[i], seed: null }, teamB: null, seriesLength, winsA: 1, winsB: 0, winner: winners[i], games: [], bye: true });
+      series.push({ id: randomUUID(), teamA: { name: winners[i], seed: null }, teamB: null, seriesLength, winsA: 1, winsB: 0, winner: winners[i], games: [], bye: true, conference: conferenceByWinner.get(winners[i]) || null });
       continue;
     }
+    const confA = conferenceByWinner.get(winners[i]);
+    const confB = conferenceByWinner.get(winners[i + 1]);
     series.push({
       id: randomUUID(),
       teamA: { name: winners[i], seed: null },
@@ -6384,10 +6527,12 @@ function buildNextPlayoffRound(previousRound, seriesLengths, roundIndex) {
       games: [],
       unlocksAt,
       disputed: false,
+      conference: confA === confB ? confA : null,
     });
   }
   return series;
 }
+
 
 // 7J-PLAYOFFROUNDTHREADS: self-serve playoff reporting, per Hxxdie — a
 // whole series (which may run up to Bo-7+) now plays out inside ONE thread
@@ -6605,7 +6750,7 @@ async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winner
     } else {
       const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
-      const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1);
+      const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1, getPlayoffFormatKey(league));
       await createPlayoffSeriesThreads(guild, league, nextRound, roundIndex + 2).catch(err => console.error('[Playoffs] Next round thread creation failed:', err?.message || err));
       bracket[roundIndex] = roundSeries;
       bracket.push(nextRound);
@@ -7467,11 +7612,145 @@ async function getStandingsRows(guildId, leagueId) {
   return result.rows;
 }
 
+// 7J-SPORTPLAYOFFFORMAT: per Hxxdie — every major league seeds its playoffs
+// differently, and the generic conference/division/overall_record system
+// below doesn't match any of them exactly. This classifies a league into a
+// known real-world format so selectPlayoffTeamsForLeague and
+// buildInitialPlayoffRound can each use the actual rules for that sport.
+// Checked in a specific order since some game_key substrings overlap (e.g.
+// 'football' could mean Madden/NFL or a generic label) — falls through to
+// 'generic' (existing conference/division/overall_record behavior,
+// untouched) for anything unrecognized. Real-world EPL has no playoff at
+// all (the table itself decides the champion), so it intentionally has no
+// dedicated case here — a league using this feature for a soccer league
+// anyway gets the generic system, which is an optional add-on, not a claim
+// that real EPL works this way.
+function getPlayoffFormatKey(league) {
+  if (isMlbLeague(league)) return 'mlb';
+  if (isNhlLeague(league)) return 'nhl';
+  if (isNbaLeague(league)) return 'nba';
+  if (isMlsLeague(league)) return 'mls';
+  if (isNflLeague(league) || isMaddenLeague(league)) return 'nfl';
+  return 'generic';
+}
+
+// 7J-SPORTPLAYOFFFORMAT: NFL — 7 per conference. The 4 division winners
+// take seeds 1-4 (ranked among themselves by record), the next 3 best
+// records in the conference (regardless of division) take seeds 5-7. Real
+// rule, deliberately preserved even though it can feel odd: a wildcard
+// team can never outrank a division winner in seeding no matter their
+// record — matches confirmed against current-season sourcing.
+async function selectNflPlayoffTeams(guildId, league, standingsRows) {
+  const withMeta = await Promise.all(standingsRows.map(async team => {
+    const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league).catch(() => ({}));
+    return { ...team, resolvedConference: conference || 'Conference', resolvedDivision: division || 'Division' };
+  }));
+  const conferences = [...new Set(withMeta.map(t => t.resolvedConference))];
+  const seeded = [];
+  for (const conference of conferences) {
+    const inConf = withMeta.filter(t => t.resolvedConference === conference);
+    const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
+    const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean);
+    const winnerNames = new Set(divisionWinners.map(t => t.team_name));
+    const wildcards = inConf.filter(t => !winnerNames.has(t.team_name)).slice(0, 3);
+    [...divisionWinners.slice(0, 4), ...wildcards].forEach((team, index) => {
+      seeded.push({ ...team, seed: index + 1, conference, byeRound1: index === 0 });
+    });
+  }
+  return seeded;
+}
+
+// 7J-SPORTPLAYOFFFORMAT: NHL — top 3 per division (2 divisions per
+// conference) auto-qualify (6 of 8 spots), plus the next 2 best conference
+// records outside those top-3s fill the wildcard spots. Seed numbers here
+// are informational; buildInitialPlayoffRound uses qualifyType/division
+// directly since NHL's actual round-1 pairing isn't simple seed-vs-seed.
+async function selectNhlPlayoffTeams(guildId, league, standingsRows) {
+  const withMeta = await Promise.all(standingsRows.map(async team => {
+    const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league).catch(() => ({}));
+    return { ...team, resolvedConference: conference || 'Conference', resolvedDivision: division || 'Division' };
+  }));
+  const conferences = [...new Set(withMeta.map(t => t.resolvedConference))];
+  const seeded = [];
+  for (const conference of conferences) {
+    const inConf = withMeta.filter(t => t.resolvedConference === conference);
+    const divisions = [...new Set(inConf.map(t => t.resolvedDivision))].slice(0, 2);
+    const divisionTop3 = divisions.map(d => inConf.filter(t => t.resolvedDivision === d).slice(0, 3));
+    const autoQualifiers = divisionTop3.flat();
+    const autoNames = new Set(autoQualifiers.map(t => t.team_name));
+    const wildcards = inConf.filter(t => !autoNames.has(t.team_name)).slice(0, 2);
+    let seed = 1;
+    divisionTop3.forEach((teams, divIndex) => {
+      teams.forEach((team, i) => seeded.push({ ...team, seed: seed++, conference, division: divisions[divIndex], qualifyType: i === 0 ? 'division-leader' : 'division-rank', divisionRank: i + 1 }));
+    });
+    wildcards.forEach((team, i) => seeded.push({ ...team, seed: seed++, conference, qualifyType: 'wildcard', wildcardRank: i + 1 }));
+  }
+  return seeded;
+}
+
+// 7J-SPORTPLAYOFFFORMAT: MLB — 3 division winners per league take seeds
+// 1-3 (ranked among themselves by record), next 3 best records
+// (regardless of division) take seeds 4-6. Seeds 1-2 get a bye straight to
+// the Division Series; the Wild Card round is 3v6, 4v5.
+async function selectMlbPlayoffTeams(guildId, league, standingsRows) {
+  const withMeta = await Promise.all(standingsRows.map(async team => {
+    const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league).catch(() => ({}));
+    return { ...team, resolvedConference: conference || 'League', resolvedDivision: division || 'Division' };
+  }));
+  const conferences = [...new Set(withMeta.map(t => t.resolvedConference))];
+  const seeded = [];
+  for (const conference of conferences) {
+    const inConf = withMeta.filter(t => t.resolvedConference === conference);
+    const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
+    const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean);
+    const winnerNames = new Set(divisionWinners.map(t => t.team_name));
+    const wildcards = inConf.filter(t => !winnerNames.has(t.team_name)).slice(0, 3);
+    [...divisionWinners.slice(0, 3), ...wildcards].forEach((team, index) => {
+      seeded.push({ ...team, seed: index + 1, conference, byeRound1: index < 2 });
+    });
+  }
+  return seeded;
+}
+
+// 7J-SPORTPLAYOFFFORMAT: NBA/MLS both run a real play-in/wild-card
+// mini-tournament before their main bracket (NBA: 7-8-9-10 double-elim
+// mini-bracket; MLS: single-elimination 8-vs-9 game) — genuinely separate
+// features from bracket seeding itself, not built here. This approximates
+// both as straight top-N by conference record, which gets seeds 1-6/7
+// exactly right but doesn't model the play-in games themselves for the
+// final spot(s). Flagged clearly wherever this is surfaced to a
+// commissioner.
+async function selectTopRecordPlayoffTeams(guildId, league, standingsRows, teamCount) {
+  const withConference = await Promise.all(standingsRows.map(async team => {
+    const { conference } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league).catch(() => ({}));
+    return { ...team, resolvedConference: conference || 'Conference' };
+  }));
+  const conferences = [...new Set(withConference.map(t => t.resolvedConference))];
+  const seeded = [];
+  for (const conference of conferences) {
+    const inConf = withConference.filter(t => t.resolvedConference === conference).slice(0, teamCount);
+    inConf.forEach((team, index) => seeded.push({ ...team, seed: index + 1, conference }));
+  }
+  return seeded;
+}
+
 async function selectPlayoffTeamsForLeague(guildId, league) {
   const standingsRows = await getStandingsRows(guildId, league.league_id);
+  const formatKey = getPlayoffFormatKey(league);
+
+  if (formatKey === 'nfl') return selectNflPlayoffTeams(guildId, league, standingsRows);
+  if (formatKey === 'nhl') return selectNhlPlayoffTeams(guildId, league, standingsRows);
+  if (formatKey === 'mlb') return selectMlbPlayoffTeams(guildId, league, standingsRows);
+  if (formatKey === 'nba') return selectTopRecordPlayoffTeams(guildId, league, standingsRows, 8);
+  if (formatKey === 'mls') return selectTopRecordPlayoffTeams(guildId, league, standingsRows, 8);
+
+  // 7J-SPORTPLAYOFFFORMAT: unrecognized sport (includes soccer/EPL-style
+  // leagues, which have no real-world playoff at all) — untouched original
+  // generic behavior, driven by the league's own playoff_seeding_method
+  // setting rather than a hardcoded real-world format.
   const customSettings = await ensureLeagueCustomSettings(league).catch(() => null);
-  const seedingMethod = customSettings?.playoff_seeding_method || (isNbaLeague(league) ? 'conference' : 'overall_record');
-  const teamCount = isMlbLeague(league) ? 8 : Number(league.playoff_team_count || 8);
+  const seedingMethod = customSettings?.playoff_seeding_method || 'overall_record';
+  const teamCount = Number(league.playoff_team_count || 8);
 
   if (seedingMethod === 'conference') {
     const withConference = await Promise.all(standingsRows.map(async team => {
@@ -7511,11 +7790,6 @@ async function selectPlayoffTeamsForLeague(guildId, league) {
   }
 
   // overall_record (default)
-  // 7J-ALLLEAGUECONF: this label is informational only (seeding here is by
-  // overall record regardless of conference), but now uses the same
-  // generalized exact-match lookup as everywhere else instead of being
-  // NBA-only, for consistency with the conference/division seeding
-  // branches above.
   const withOverallConference = await Promise.all(standingsRows.slice(0, teamCount).map(async (team, index) => {
     const { conference } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league).catch(() => ({ conference: null }));
     return { ...team, seed: index + 1, conference };
@@ -18858,7 +19132,8 @@ if (interaction.commandName === 'avatar') {
       }
       const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
-      const firstRound = buildInitialPlayoffRound(seededTeams, seriesLengths);
+      const playoffFormatKey = getPlayoffFormatKey(league);
+      const firstRound = buildInitialPlayoffRound(seededTeams, seriesLengths, playoffFormatKey);
       // 7J-PLAYOFFGAMETHREADS: create threads (mutates firstRound entries
       // with .thread_id) BEFORE the bracket is inserted, so the thread ids
       // are captured in the very first write rather than needing a second
