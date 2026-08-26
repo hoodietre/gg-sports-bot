@@ -6595,20 +6595,31 @@ function buildNextPlayoffRound(previousRound, seriesLengths, roundIndex, formatK
     return series;
   }
 
+  // 7J-SEEDPROPAGATE: per Hxxdie — every format (not just NFL's dynamic
+  // reseed above) should carry a team's original seed forward once they
+  // win a round, not drop it back to null. Looks up each winner's seed
+  // from the series they just won, same technique NFL's reseed already
+  // uses just above.
+  const winnerSeedByName = new Map();
+  for (const s of previousRound) {
+    if (!s.winner) continue;
+    const winnerTeam = s.teamA?.name === s.winner ? s.teamA : s.teamB;
+    winnerSeedByName.set(s.winner, winnerTeam?.seed ?? null);
+  }
   const winners = previousRound.map(s => s.winner).filter(Boolean);
   const conferenceByWinner = new Map(previousRound.filter(s => s.winner).map(s => [s.winner, s.conference]));
   const series = [];
   for (let i = 0; i < winners.length; i += 2) {
     if (i + 1 >= winners.length) {
-      series.push({ id: randomUUID(), teamA: { name: winners[i], seed: null }, teamB: null, seriesLength, winsA: 1, winsB: 0, winner: winners[i], games: [], bye: true, conference: conferenceByWinner.get(winners[i]) || null });
+      series.push({ id: randomUUID(), teamA: { name: winners[i], seed: winnerSeedByName.get(winners[i]) ?? null }, teamB: null, seriesLength, winsA: 1, winsB: 0, winner: winners[i], games: [], bye: true, conference: conferenceByWinner.get(winners[i]) || null });
       continue;
     }
     const confA = conferenceByWinner.get(winners[i]);
     const confB = conferenceByWinner.get(winners[i + 1]);
     series.push({
       id: randomUUID(),
-      teamA: { name: winners[i], seed: null },
-      teamB: { name: winners[i + 1], seed: null },
+      teamA: { name: winners[i], seed: winnerSeedByName.get(winners[i]) ?? null },
+      teamB: { name: winners[i + 1], seed: winnerSeedByName.get(winners[i + 1]) ?? null },
       seriesLength,
       winsA: 0,
       winsB: 0,
@@ -6718,11 +6729,26 @@ async function createPlayoffSeriesThreads(guild, league, roundSeries, roundNumbe
       const roleA = roleAResult.rows[0]?.role_id;
       const roleB = roleBResult.rows[0]?.role_id;
       const threadName = `playoffs-r${roundNumber}-${series.teamA.name}-vs-${series.teamB.name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90);
+      // 7J-PLAYOFFPRIVATETHREAD: per Hxxdie — these were being created as
+      // public threads; regular season Game Center threads have always
+      // been private (invitable: false). Matches that exact pattern,
+      // including the same fallback-to-public if the channel/plan doesn't
+      // support private threads, rather than failing the whole creation.
       const thread = await channel.threads.create({
+        name: threadName || `playoffs-round-${roundNumber}-series`,
+        type: ChannelType.PrivateThread,
+        invitable: false,
+        autoArchiveDuration: 10080,
+        reason: `GG Sports: playoff series thread for Round ${roundNumber}`,
+      }).catch(async () => channel.threads.create({
         name: threadName || `playoffs-round-${roundNumber}-series`,
         autoArchiveDuration: 10080,
         reason: `GG Sports: playoff series thread for Round ${roundNumber}`,
-      });
+      }).catch(() => null));
+      if (!thread) {
+        console.error(`[Playoffs] Thread creation failed for ${series.teamA?.name} vs ${series.teamB?.name}: could not create thread (check View Channel / Create Private Threads permissions).`);
+        continue;
+      }
       const mentionA = roleA ? `<@&${roleA}>` : `**${series.teamA.name}**`;
       const mentionB = roleB ? `<@&${roleB}>` : `**${series.teamB.name}**`;
       const payload = buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB, league);
@@ -6734,6 +6760,34 @@ async function createPlayoffSeriesThreads(guild, league, roundSeries, roundNumbe
       // thread does — same timing regular season lines open at (Add Game),
       // well before any "Game Started" lock would apply.
       await createAutoSportsbookForPlayoffGame(guild, league, series, 1, roundNumber).catch(err => console.error('[Playoffs] Sportsbook line creation failed:', err?.message || err));
+      // 7J-PLAYOFFAVATARVS: per Hxxdie — the "both owners set" avatar
+      // showcase regular season Game Center threads get was missing here.
+      // Playoff team ownership is already established (these are existing
+      // teams mid-season, not freshly-claimed ones), so both owners can
+      // usually resolve immediately — no need for the polling/dedup-flag
+      // dance the Madden/regular-season version needs while waiting on a
+      // still-unclaimed side.
+      const [ownerA, ownerB] = await Promise.all([
+        roleA ? findTeamOwnerByRoleId(guild, roleA).catch(() => null) : null,
+        roleB ? findTeamOwnerByRoleId(guild, roleB).catch(() => null) : null,
+      ]);
+      if (ownerA?.id && ownerB?.id) {
+        const vsAttachment = await buildGameThreadOwnersAvatarComposite(ownerA.id, ownerB.id).catch(error => {
+          console.error('[Playoffs] Owners avatar composite failed:', error?.message || error);
+          return null;
+        });
+        if (vsAttachment) {
+          await thread.send({
+            embeds: [new EmbedBuilder()
+              .setTitle(`🎮 Both Owners Set — ${series.teamA.name} vs ${series.teamB.name}`)
+              .setColor(0x5865F2)
+              .setImage('attachment://matchup_owners.png')
+              .setFooter({ text: 'GG Sports • Playoffs' })
+              .setTimestamp()],
+            files: [vsAttachment],
+          }).catch(() => null);
+        }
+      }
     } catch (err) {
       console.error(`[Playoffs] Thread creation failed for ${series.teamA?.name} vs ${series.teamB?.name}:`, err?.message || err);
     }
@@ -6811,6 +6865,12 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
       .setEmoji('📊')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
+      .setCustomId(`playoffseries_wager:${series.id}`)
+      .setLabel('Wager')
+      .setEmoji('💰')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(isComplete),
+    new ButtonBuilder()
       .setCustomId(`playoffseries_gamestarted:${series.id}`)
       .setLabel('Game Started')
       .setEmoji('🔒')
@@ -6823,11 +6883,10 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(isComplete),
     new ButtonBuilder()
-      .setCustomId(`playoffseries_wager:${series.id}`)
-      .setLabel('Wager')
-      .setEmoji('💰')
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(isComplete),
+      .setCustomId(`playoffseries_stream:${series.id}`)
+      .setLabel('Stream Hub')
+      .setEmoji('📺')
+      .setStyle(ButtonStyle.Secondary),
   ];
   return { embeds: [embed], components: [new ActionRowBuilder().addComponents(row1), new ActionRowBuilder().addComponents(row2)] };
 }
@@ -7225,7 +7284,7 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
     const team = side === 'A' ? series.teamA : series.teamB;
     if (!team) return series.bye ? '' : 'TBD';
     const wins = side === 'A' ? series.winsA : series.winsB;
-    const seedPrefix = Number.isFinite(Number(team.seed)) ? `#${team.seed} ` : '';
+    const seedPrefix = typeof team.seed === 'number' && Number.isFinite(team.seed) ? `#${team.seed} ` : '';
     const label = `${seedPrefix}${team.name || 'Team'}`;
     return Number.isFinite(Number(wins)) ? `${label} (${wins})` : label;
   };
@@ -11227,6 +11286,8 @@ client.once(Events.ClientReady, async () => {
     console.log('Trade negotiation thread cleanup loop started.');
     startSportsbookBettingLockLoop(client);
     console.log('Sportsbook betting-lock sweep loop started.');
+    startPlayoffThreadCleanupLoop(client);
+    console.log('Playoff round thread cleanup loop started.');
     startExclusiveWindowSchedulerLoop();
     console.log('Exclusive window scheduler loop started.');
     startBirthdayChristmasGiftSchedulerLoop(client);
@@ -19874,6 +19935,66 @@ if (interaction.commandName === 'avatar') {
         return new EmbedBuilder().setTitle('Matchup Info').setDescription('Could not load matchup info right now.').setColor(0xED4245);
       });
       await interaction.editReply({ embeds: [infoEmbed] });
+      return;
+    }
+
+    // 7J-PLAYOFFTHREADBUTTONS: Stream Hub — same behavior as regular
+    // season's gamecenter_stream, posting to the league's configured
+    // Streaming Channel using a link saved via /streamlink set.
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_stream:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, series } = lookup;
+
+      const linkResult = await pool.query(`SELECT stream_url FROM guild_stream_links WHERE guild_id = $1 AND user_id = $2`, [interaction.guild.id, interaction.user.id]).catch(() => ({ rows: [] }));
+      const url = linkResult.rows[0]?.stream_url;
+      if (!url) {
+        const modal = new ModalBuilder()
+          .setCustomId('playoffseries_streamlink_modal:' + seriesId)
+          .setTitle('Set Your Stream Link')
+          .addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('stream_url').setLabel('Your stream URL').setStyle(TextInputStyle.Short).setRequired(true)),
+          );
+        await interaction.showModal(modal);
+        return;
+      }
+
+      const streamChannelId = league?.live_channel_id;
+      const streamChannel = streamChannelId ? await interaction.guild.channels.fetch(streamChannelId).catch(() => null) : null;
+      if (!streamChannel) {
+        await interaction.reply({ content: 'Could not find the connected Streaming Channel — ask a commissioner to set one from the Commissioner Panel.', ephemeral: true });
+        return;
+      }
+
+      await streamChannel.send({
+        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `**${interaction.user.username} is LIVE!** — Playoff Series: ${series.teamA.name} vs ${series.teamB.name}\n${url}`,
+        allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
+      });
+      await interaction.reply({ content: `📺 Posted to <#${streamChannel.id}> — you're streaming this series!`, ephemeral: true });
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('playoffseries_streamlink_modal:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, series } = lookup;
+      const url = interaction.fields.getTextInputValue('stream_url').trim();
+
+      await saveUserStreamLink(interaction.guild, interaction.user.id, url);
+
+      const streamChannelId = league?.live_channel_id;
+      const streamChannel = streamChannelId ? await interaction.guild.channels.fetch(streamChannelId).catch(() => null) : null;
+      if (!streamChannel) {
+        await interaction.reply({ content: `✅ Stream link saved. Could not find the connected Streaming Channel — ask a commissioner to set one from the Commissioner Panel.`, ephemeral: true });
+        return;
+      }
+      await streamChannel.send({
+        content: (league?.league_role_id ? `<@&${league.league_role_id}> ` : '') + `**${interaction.user.username} is LIVE!** — Playoff Series: ${series.teamA.name} vs ${series.teamB.name}\n${url}`,
+        allowedMentions: { roles: league?.league_role_id ? [league.league_role_id] : [], users: [] },
+      });
+      await interaction.reply({ content: `✅ Stream link saved and posted to <#${streamChannel.id}>!`, ephemeral: true });
       return;
     }
 
@@ -70395,6 +70516,64 @@ function startSportsbookBettingLockLoop(client) {
     sweepSportsbookBettingLocks(client).catch(error => console.error('[7J-48LOCK] sweep tick failed:', error?.message || error));
   }, 60 * 1000); // Every minute — this IS time-sensitive, unlike the 6-hour housekeeping loop above.
   setTimeout(() => sweepSportsbookBettingLocks(client).catch(() => null), 15 * 1000);
+}
+
+// 7J-PLAYOFFTHREADCLEANUP: per Hxxdie — once the 15-minute dispute window
+// for a completed round closes (the next round's unlocksAt passes), that
+// completed round's threads should delete themselves automatically, the
+// same way regular season's round-to-round cleanup already works on
+// Advance. This is genuinely time-based (checking against a clock, not
+// reacting to an event), so it needs its own sweep — same once-a-minute
+// cadence as the sportsbook lock sweep above, for the same reason.
+// Skips any round with an active dispute (never delete a thread staff might
+// still need to review) and tracks per-series threadDeleted so a sweep tick
+// never re-attempts a thread that's already gone.
+async function sweepPlayoffRoundThreadCleanup(client) {
+  const bracketsResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE status = 'in_progress'`).catch(() => ({ rows: [] }));
+  for (const bracketState of bracketsResult.rows) {
+    const bracket = Array.isArray(bracketState.bracket) ? bracketState.bracket : [];
+    if (bracket.length < 2) continue; // no next round exists yet — nothing to clean up
+
+    const league = await getLeagueById(bracketState.league_id).catch(() => null);
+    if (!league) continue;
+    const guild = await client.guilds.fetch(league.guild_id).catch(() => null);
+    if (!guild) continue;
+
+    let bracketMutated = false;
+    for (let ri = 0; ri < bracket.length - 1; ri++) {
+      const round = bracket[ri];
+      const nextRound = bracket[ri + 1];
+      if (!round?.length || !nextRound?.length) continue;
+      if (!round.every(s => s.winner)) continue; // round isn't actually complete
+      if (round.some(s => s.disputed)) continue; // active dispute — leave the thread alone
+      if (round.every(s => s.bye || s.threadDeleted)) continue; // already cleaned up
+
+      const nextUnlocksAt = nextRound.find(s => s.unlocksAt)?.unlocksAt;
+      if (!nextUnlocksAt || new Date(nextUnlocksAt).getTime() > Date.now()) continue; // window still open
+
+      for (const series of round) {
+        if (series.bye || series.threadDeleted) { series.threadDeleted = true; continue; }
+        if (series.thread_id) {
+          const thread = await guild.channels.fetch(series.thread_id).catch(() => null);
+          if (thread?.isThread?.()) await thread.delete('GG Sports: playoff dispute window closed, round thread cleanup').catch(() => null);
+        }
+        series.threadDeleted = true;
+        bracketMutated = true;
+      }
+    }
+    if (bracketMutated) {
+      await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [bracketState.league_id, JSON.stringify(bracket)]).catch(() => null);
+    }
+  }
+}
+
+let playoffThreadCleanupTimer = null;
+function startPlayoffThreadCleanupLoop(client) {
+  if (playoffThreadCleanupTimer) clearInterval(playoffThreadCleanupTimer);
+  playoffThreadCleanupTimer = setInterval(() => {
+    sweepPlayoffRoundThreadCleanup(client).catch(error => console.error('[Playoffs] Thread cleanup sweep tick failed:', error?.message || error));
+  }, 60 * 1000);
+  setTimeout(() => sweepPlayoffRoundThreadCleanup(client).catch(() => null), 20 * 1000);
 }
 
 // ---------------------------------------------------------------------------
