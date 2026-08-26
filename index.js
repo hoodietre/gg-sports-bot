@@ -442,6 +442,76 @@ async function initDatabase() {
   // prompt) sent on GuildMemberAdd. Does not affect the one-time new-server-owner DM
   // sent on GuildCreate, since that fires before any admin has had a chance to toggle it.
   await pool.query(`ALTER TABLE guilds ADD COLUMN IF NOT EXISTS onboarding_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
+
+  // 7J-SCHEDULING: per Hxxdie — timezone + rough weekly availability, saved
+  // once per user per server (not per-league — a person's real-life
+  // schedule doesn't change based on which league they're in). Block-based
+  // (day + morning/afternoon/evening/night) rather than exact hour ranges —
+  // trades precision for something actually fast to fill out in a Discord
+  // UI, which matters more than exact granularity for "find a rough shared
+  // window" purposes.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_availability (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      timezone TEXT NOT NULL,
+      available_days TEXT[] NOT NULL DEFAULT '{}',
+      available_blocks TEXT[] NOT NULL DEFAULT '{}',
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, user_id)
+    )
+  `);
+
+  // 7J-SCHEDULING: one row per proposed game time, forming the actual
+  // history a commissioner needs when a dispute reaches them — who
+  // proposed what, who responded how, and when, instead of "I messaged
+  // him." game_ref + game_source together identify the game, since
+  // regular season (league_games) and Madden (madden_imported_games) are
+  // two different tables with two different id spaces.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_schedule_proposals (
+      id UUID PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id UUID,
+      game_ref TEXT NOT NULL,
+      game_source TEXT NOT NULL DEFAULT 'generic',
+      thread_id TEXT,
+      proposer_user_id TEXT NOT NULL,
+      responder_user_id TEXT,
+      proposed_at_epoch BIGINT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      responded_at TIMESTAMP,
+      superseded_by UUID,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_game_schedule_proposals_game ON game_schedule_proposals (game_source, game_ref)`);
+  // 7J-ENGAGEMENT: per Hxxdie — "all engagement data metrics possible" for
+  // bot-owner use. This is the foundational piece: a lightweight, universal
+  // log of every real interaction (command, button, select, modal) across
+  // the whole bot, hooked in ONE place (the top of the InteractionCreate
+  // handler, right after autocomplete is filtered out) rather than
+  // retrofitting hundreds of individual handlers. customId/command name is
+  // truncated to its first meaningful segment (the prefix before the first
+  // ':') so this stays a feature-usage log, not a raw dump of every unique
+  // entity id ever clicked — "gamecenter_wager" is a useful metric bucket,
+  // "gamecenter_wager:a1b2c3-uuid" is not. Deliberately fire-and-forget
+  // (never awaited on the critical path, never blocks or fails a real
+  // interaction) — see logEngagementEvent.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS engagement_events (
+      id BIGSERIAL PRIMARY KEY,
+      guild_id TEXT,
+      user_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      feature_key TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_engagement_events_created_at ON engagement_events (created_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_engagement_events_user ON engagement_events (user_id, created_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_engagement_events_guild ON engagement_events (guild_id, created_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_engagement_events_feature ON engagement_events (feature_key, created_at)`);
   // 7J-96WELCOMER: public welcome/leave channel announcements — distinct
   // from the private onboarding DM (onboarding_enabled above). Defaults
   // OFF, unlike onboarding, since it's new and posts publicly rather than
@@ -2227,6 +2297,11 @@ async function initDatabase() {
   // threads, automatically, since Discord deletes threads when their
   // parent channel is deleted) once the tournament completes.
   await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS temp_channel_id TEXT`);
+  // 7J-TOURNEYDISCOVERY: per Hxxdie — same cross-server discoverability
+  // concept as league_settings.recruitment_discoverable, scoped per-
+  // tournament rather than per-league since a tournament is a one-off
+  // event, not an ongoing thing a server opts into once. Off by default.
+  await pool.query(`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS discoverable BOOLEAN NOT NULL DEFAULT FALSE`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tournament_entries (
@@ -4438,6 +4513,7 @@ function buildCommands() {
       .setDescription('Bot owner only: monitoring and health')
       .addSubcommand(sc => sc.setName('status').setDescription('Uptime, database health, memory, and background job status'))
       .addSubcommand(sc => sc.setName('guilds').setDescription('List servers the bot is currently in'))
+      .addSubcommand(sc => sc.setName('engagement').setDescription('Full engagement metrics dashboard — DAU/WAU/MAU, retention, feature usage, guild activity'))
       .addSubcommand(sc => sc
         .setName('currencyidentity')
         .setDescription('Set the global currency name/icon (applies to every server immediately)')
@@ -9911,6 +9987,11 @@ function buildTournamentActionRows(tournament, availability, includeAdminBackBut
       btn('postpanel', '📣', ButtonStyle.Secondary),
       btn('cancel', '🚫', ButtonStyle.Danger),
       btn('delete', '🗑️', ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`tourneypanel_discoverable:${tournament.id}`)
+        .setLabel(tournament.discoverable ? 'Remove from Discovery' : 'Make Discoverable')
+        .setEmoji('🌐')
+        .setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(...lastRowButtons),
   ];
@@ -10572,6 +10653,246 @@ function finalizeTournamentDateTime(session) {
   session.time = `${session.hour}:${String(session.minute).padStart(2, '0')} ${session.ampm} ${session.timezone}`;
   session.startsAtEpoch = tournamentDiscordTimestamp(session);
 }
+// ---------------------------------------------------------------------------
+// Scheduling — timezone + rough weekly availability, per Hxxdie. Reuses
+// TOURNAMENT_TIMEZONE_IANA and tournamentWallClockToUtcEpoch above rather
+// than a second timezone system; this is purely the availability/shared-
+// window layer on top of that same proven conversion.
+// ---------------------------------------------------------------------------
+const SCHEDULING_DAY_LABELS = { sun: 'Sunday', mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday' };
+const SCHEDULING_DAY_ORDER = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const SCHEDULING_DAY_INDEX = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+// [startHour, endHour) in the user's own local time. "night" wraps past
+// midnight (21 -> 25, i.e. 9pm-1am) — handled by the mod-10080 wraparound
+// in userAvailabilityToUtcIntervals below, not a special case here.
+const SCHEDULING_BLOCKS = { morning: [6, 12], afternoon: [12, 17], evening: [17, 21], night: [21, 25] };
+const SCHEDULING_BLOCK_LABELS = { morning: 'Morning (6am-12pm)', afternoon: 'Afternoon (12-5pm)', evening: 'Evening (5-9pm)', night: 'Night (9pm-1am)' };
+
+// Current UTC offset (minutes) for an IANA zone — "current" rather than
+// date-specific, since availability is a recurring weekly pattern, not tied
+// to one calendar date. Trades perfect DST-transition-week accuracy for
+// simplicity; acceptable at block-level (not minute-level) granularity.
+function getCurrentUtcOffsetMinutes(ianaZone) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: ianaZone, timeZoneName: 'shortOffset' }).formatToParts(new Date());
+    const offsetPart = parts.find(p => p.type === 'timeZoneName')?.value || 'GMT+0';
+    const match = offsetPart.match(/GMT([+-]\d+)(?::(\d+))?/);
+    if (!match) return 0;
+    const hours = Number(match[1]);
+    const minutes = Number(match[2] || 0) * (hours < 0 ? -1 : 1);
+    return hours * 60 + minutes;
+  } catch {
+    return 0;
+  }
+}
+
+// Converts a saved availability row into UTC-based [start, end) intervals on
+// a 0-10079 "minutes since Sunday 00:00 UTC" weekly timeline. Each interval
+// is duplicated shifted ±10080 so overlap checks against another user's
+// intervals correctly catch wraparound (e.g. a "night" block local to one
+// user landing on the NEXT UTC day).
+function userAvailabilityToUtcIntervals(availability) {
+  if (!availability?.timezone) return [];
+  const offsetMinutes = getCurrentUtcOffsetMinutes(availability.timezone);
+  const intervals = [];
+  for (const day of availability.available_days || []) {
+    const dayIndex = SCHEDULING_DAY_INDEX[day];
+    if (dayIndex === undefined) continue;
+    for (const block of availability.available_blocks || []) {
+      const range = SCHEDULING_BLOCKS[block];
+      if (!range) continue;
+      const localStart = dayIndex * 1440 + range[0] * 60;
+      const localEnd = dayIndex * 1440 + range[1] * 60;
+      const utcStart = localStart - offsetMinutes;
+      const utcEnd = localEnd - offsetMinutes;
+      for (const shift of [-10080, 0, 10080]) {
+        intervals.push([utcStart + shift, utcEnd + shift]);
+      }
+    }
+  }
+  return intervals;
+}
+
+// Returns overlapping windows between two users' availability, each as
+// { dayIndex, startMinuteOfDay, endMinuteOfDay } clipped to a single UTC day
+// (a window spanning midnight is split into two entries) — display-ready.
+function computeSharedAvailabilityWindows(availabilityA, availabilityB) {
+  const intervalsA = userAvailabilityToUtcIntervals(availabilityA);
+  const intervalsB = userAvailabilityToUtcIntervals(availabilityB);
+  const overlaps = [];
+  for (const [aStart, aEnd] of intervalsA) {
+    for (const [bStart, bEnd] of intervalsB) {
+      const start = Math.max(aStart, bStart);
+      const end = Math.min(aEnd, bEnd);
+      if (start < end && start >= 0 && start < 10080) {
+        overlaps.push([start, Math.min(end, 10080)]);
+      }
+    }
+  }
+  // Split anything crossing a day boundary, dedupe near-identical windows.
+  const split = [];
+  for (const [start, end] of overlaps) {
+    const startDay = Math.floor(start / 1440);
+    const endDay = Math.floor((end - 1) / 1440);
+    if (startDay === endDay) {
+      split.push({ dayIndex: startDay, startMinuteOfDay: start - startDay * 1440, endMinuteOfDay: end - startDay * 1440 });
+    } else {
+      split.push({ dayIndex: startDay, startMinuteOfDay: start - startDay * 1440, endMinuteOfDay: 1440 });
+      split.push({ dayIndex: endDay, startMinuteOfDay: 0, endMinuteOfDay: end - endDay * 1440 });
+    }
+  }
+  const seen = new Set();
+  const deduped = split.filter(w => {
+    const key = `${w.dayIndex}:${w.startMinuteOfDay}:${w.endMinuteOfDay}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  deduped.sort((a, b) => a.dayIndex - b.dayIndex || a.startMinuteOfDay - b.startMinuteOfDay);
+  return deduped;
+}
+
+function formatSchedulingMinuteOfDay(minuteOfDay) {
+  const hour24 = Math.floor(minuteOfDay / 60) % 24;
+  const minute = minuteOfDay % 60;
+  const ampm = hour24 < 12 ? 'AM' : 'PM';
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  return `${hour12}${minute ? ':' + String(minute).padStart(2, '0') : ''}${ampm}`;
+}
+
+function formatSharedAvailabilityWindow(window) {
+  const dayLabel = SCHEDULING_DAY_LABELS[SCHEDULING_DAY_ORDER[window.dayIndex]] || 'Day';
+  return `${dayLabel} ${formatSchedulingMinuteOfDay(window.startMinuteOfDay)}-${formatSchedulingMinuteOfDay(window.endMinuteOfDay)} UTC`;
+}
+
+async function getUserAvailability(guildId, userId) {
+  const result = await pool.query(`SELECT * FROM user_availability WHERE guild_id = $1 AND user_id = $2`, [guildId, userId]).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
+// 7J-SCHEDULING: in-memory session accumulating picks across the 3 select
+// menus below before a final Save — same pattern as tournament creation's
+// own session maps just above.
+const availabilitySessions = new Map();
+
+function buildAvailabilityEditorPayload(userId) {
+  const session = availabilitySessions.get(userId) || { timezone: null, days: [], blocks: [] };
+  const timezoneMenu = new StringSelectMenuBuilder()
+    .setCustomId('availability_timezone_select')
+    .setPlaceholder('Your timezone')
+    .addOptions(Object.entries(TOURNAMENT_TIMEZONE_IANA).map(([code, iana]) => ({ label: `${code} (${iana.replace('_', ' ')})`, value: code, default: session.timezone === code })));
+  const daysMenu = new StringSelectMenuBuilder()
+    .setCustomId('availability_days_select')
+    .setPlaceholder('Which days are you usually available?')
+    .setMinValues(1)
+    .setMaxValues(7)
+    .addOptions(SCHEDULING_DAY_ORDER.map(day => ({ label: SCHEDULING_DAY_LABELS[day], value: day, default: session.days.includes(day) })));
+  const blocksMenu = new StringSelectMenuBuilder()
+    .setCustomId('availability_blocks_select')
+    .setPlaceholder('What time of day usually works?')
+    .setMinValues(1)
+    .setMaxValues(4)
+    .addOptions(Object.entries(SCHEDULING_BLOCK_LABELS).map(([key, label]) => ({ label, value: key, default: session.blocks.includes(key) })));
+
+  const summaryLines = [
+    `**Timezone:** ${session.timezone || 'Not set'}`,
+    `**Days:** ${session.days.length ? session.days.map(d => SCHEDULING_DAY_LABELS[d]).join(', ') : 'Not set'}`,
+    `**Times:** ${session.blocks.length ? session.blocks.map(b => SCHEDULING_BLOCK_LABELS[b]).join(', ') : 'Not set'}`,
+  ];
+  const embed = new EmbedBuilder()
+    .setTitle('🗓️ Set Your Availability')
+    .setColor(0x5865F2)
+    .setDescription(`This is a rough weekly pattern, not exact scheduling — when you get a new game thread, GG Sports compares your availability with your opponent's and suggests shared windows to help you agree on a time faster.\n\n${summaryLines.join('\n')}`)
+    .setFooter({ text: 'GG Sports • Member Profile' });
+
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(timezoneMenu),
+      new ActionRowBuilder().addComponents(daysMenu),
+      new ActionRowBuilder().addComponents(blocksMenu),
+      new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('availability_save').setLabel('Save Availability').setEmoji('✅').setStyle(ButtonStyle.Success)),
+    ],
+  };
+}
+
+// 7J-SCHEDULING: resolves a game (either a regular-season league_games row
+// or a Madden madden_imported_games row — two different tables, hence
+// gameSource) into the pieces the propose/accept flow needs: which league,
+// who owns each side, and a display label.
+async function findGameForScheduling(guild, gameSource, gameRef) {
+  if (gameSource === 'madden') {
+    const gameResult = await pool.query(`SELECT * FROM madden_imported_games WHERE id = $1`, [gameRef]);
+    const game = gameResult.rows[0];
+    if (!game) return null;
+    const league = await getLeagueById(game.league_id).catch(() => null);
+    const homeOwner = await getMaddenTeamOwnerForGameThread(guild, league, game.home_team, game.home_team_role_id).catch(() => null);
+    const awayOwner = await getMaddenTeamOwnerForGameThread(guild, league, game.away_team, game.away_team_role_id).catch(() => null);
+    return { league, homeOwner, awayOwner, label: `${maddenTeamDisplayName(game.away_team)} @ ${maddenTeamDisplayName(game.home_team)}` };
+  }
+  const gameResult = await pool.query(`SELECT * FROM league_games WHERE id = $1`, [gameRef]);
+  const game = gameResult.rows[0];
+  if (!game) return null;
+  const league = await getLeagueById(game.league_id).catch(() => null);
+  const homeOwner = await findTeamOwnerByRoleId(guild, game.home_team_role_id).catch(() => null);
+  const awayOwner = await findTeamOwnerByRoleId(guild, game.away_team_role_id).catch(() => null);
+  return { league, homeOwner, awayOwner, label: `${game.away_team_name} @ ${game.home_team_name}` };
+}
+
+// 7J-SCHEDULING: figures out the two owners of whichever game this thread
+// belongs to (checking both possible tables by thread_id), then returns a
+// short note listing shared availability windows if both have saved
+// availability — used as a hint right before the Propose Time modal opens.
+async function buildSchedulingSharedWindowsNote(guildId, channel) {
+  if (!channel?.id) return '';
+  const genericResult = await pool.query(`SELECT * FROM league_games WHERE thread_id = $1`, [channel.id]).catch(() => ({ rows: [] }));
+  let homeOwnerId = null, awayOwnerId = null;
+  if (genericResult.rows.length) {
+    const game = genericResult.rows[0];
+    const homeOwner = await findTeamOwnerByRoleId(channel.guild, game.home_team_role_id).catch(() => null);
+    const awayOwner = await findTeamOwnerByRoleId(channel.guild, game.away_team_role_id).catch(() => null);
+    homeOwnerId = homeOwner?.id; awayOwnerId = awayOwner?.id;
+  } else {
+    const maddenResult = await pool.query(`SELECT * FROM madden_imported_games WHERE thread_id = $1`, [channel.id]).catch(() => ({ rows: [] }));
+    if (maddenResult.rows.length) {
+      const game = maddenResult.rows[0];
+      const league = await getLeagueById(game.league_id).catch(() => null);
+      const homeOwner = await getMaddenTeamOwnerForGameThread(channel.guild, league, game.home_team, game.home_team_role_id).catch(() => null);
+      const awayOwner = await getMaddenTeamOwnerForGameThread(channel.guild, league, game.away_team, game.away_team_role_id).catch(() => null);
+      homeOwnerId = homeOwner?.id; awayOwnerId = awayOwner?.id;
+    }
+  }
+  if (!homeOwnerId || !awayOwnerId) return '';
+  const [availA, availB] = await Promise.all([getUserAvailability(guildId, homeOwnerId), getUserAvailability(guildId, awayOwnerId)]);
+  if (!availA || !availB) return "💡 Tip: both of you can save your availability on your Member Profile (**Set Availability**) so GG Sports can suggest shared windows here next time.";
+  const windows = computeSharedAvailabilityWindows(availA, availB);
+  if (!windows.length) return '⚠️ No obvious shared windows found based on saved availability — you may need to work out a one-off time.';
+  return `💡 Shared availability windows: ${windows.slice(0, 5).map(formatSharedAvailabilityWindow).join(', ')}`;
+}
+
+// 7J-SCHEDULING: per Hxxdie — real information for a commissioner resolving
+// a scheduling dispute, not "I messaged him." Every proposal + response,
+// in order, with who and when.
+async function buildSchedulingHistoryEmbed(guildId, gameSource, gameRef) {
+  const result = await pool.query(
+    `SELECT * FROM game_schedule_proposals WHERE guild_id = $1 AND game_source = $2 AND game_ref = $3 ORDER BY created_at ASC`,
+    [guildId, gameSource, gameRef]
+  ).catch(() => ({ rows: [] }));
+  const NL = String.fromCharCode(10);
+  const STATUS_LABELS = { pending: '🕐 Pending', accepted: '✅ Accepted', declined: '❌ Declined', countered: '🔁 Countered', superseded: '⏭️ Superseded' };
+  const lines = result.rows.map(row => {
+    const parts = [`<t:${row.proposed_at_epoch}:f>`, `proposed by <@${row.proposer_user_id}>`, STATUS_LABELS[row.status] || row.status];
+    if (row.responded_at) parts.push(`responded <t:${Math.floor(new Date(row.responded_at).getTime() / 1000)}:R>`);
+    return `• ${parts.join(' — ')}`;
+  });
+  return new EmbedBuilder()
+    .setTitle('🗓️ Scheduling History')
+    .setColor(0x5865F2)
+    .setDescription(lines.length ? lines.join(NL) : 'No scheduling proposals recorded for this game yet.')
+    .setFooter({ text: 'GG Sports • Scheduling' })
+    .setTimestamp();
+}
+
 const tournamentCreateSessions = new Map();
 const tournamentEditSessions = new Map();
 const tournamentPostponeSessions = new Map();
@@ -12568,6 +12889,41 @@ client.on(Events.GuildCreate, async (guild) => {
   await sendNewServerOwnerOnboardingDM(guild).catch(err => console.error('New server owner onboarding DM failed:', err?.message));
 });
 
+// 7J-ENGAGEMENT: per Hxxdie — the actual write side of engagement_events.
+// feature_key is the customId/command name truncated to its first
+// meaningful segment, so this stays a "which FEATURES get used" log, not a
+// raw dump of every unique button-instance id ever clicked. Deliberately
+// never awaited by its caller and swallows its own errors — logging must
+// never be able to slow down or break a real interaction.
+function logEngagementEvent(interaction) {
+  try {
+    if (!interaction?.user?.id) return;
+    let eventType = 'other';
+    let featureKey = null;
+    if (interaction.isChatInputCommand()) {
+      eventType = 'command';
+      featureKey = interaction.commandName + (interaction.options?.getSubcommand?.(false) ? ':' + interaction.options.getSubcommand(false) : '');
+    } else if (interaction.isButton()) {
+      eventType = 'button';
+      featureKey = String(interaction.customId || '').split(':')[0];
+    } else if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu() || interaction.isRoleSelectMenu() || interaction.isChannelSelectMenu()) {
+      eventType = 'select';
+      featureKey = String(interaction.customId || '').split(':')[0];
+    } else if (interaction.isModalSubmit()) {
+      eventType = 'modal';
+      featureKey = String(interaction.customId || '').split(':')[0];
+    } else {
+      return; // Autocomplete is filtered out before this ever runs; anything else isn't worth logging.
+    }
+    pool.query(
+      `INSERT INTO engagement_events (guild_id, user_id, event_type, feature_key) VALUES ($1, $2, $3, $4)`,
+      [interaction.guild?.id || null, interaction.user.id, eventType, featureKey]
+    ).catch(() => null);
+  } catch {
+    // Never let a logging bug touch the real interaction.
+  }
+}
+
 client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isAutocomplete()) {
@@ -13025,6 +13381,13 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
 
 
   try {
+    // 7J-ENGAGEMENT: fire-and-forget — every real (non-autocomplete)
+    // interaction logs here before any actual handling happens. Never
+    // awaited, wrapped in its own try/catch inside the function itself, so
+    // a logging failure (or even the query just being slow) can never
+    // delay or break a real user-facing interaction.
+    logEngagementEvent(interaction);
+
     // 7J-COMMANDHUB-PAYWALL: centralized gate for every button/select/modal
     // belonging to a Premium-only system — catches them by customId prefix
     // in ONE place, before any real handler runs. This is what actually
@@ -13614,6 +13977,13 @@ if (interaction.commandName === 'avatar') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const embed = buildBotOwnerGuildsEmbed(client);
         await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (subcommand === 'engagement') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const embeds = await buildBotOwnerEngagementEmbeds(client);
+        await interaction.editReply({ embeds });
         return;
       }
 
@@ -14909,6 +15279,19 @@ if (interaction.commandName === 'avatar') {
       else await interaction.deferReply({ ephemeral: true });
       const page = interaction.customId.startsWith('recruitmentpanel_discover_page:') ? Number.parseInt(interaction.customId.split(':')[1], 10) || 0 : 0;
       const payload = await buildDiscoverLeaguesPayload(page);
+      await interaction.editReply({ content: null, ...payload });
+      return;
+    }
+
+    // 7J-TOURNEYDISCOVERY: same isDM/defer handling as Discover Leagues
+    // just above, for the same reason — reachable from a DM copy of the
+    // Recruitment panel, not just in-guild.
+    if (interaction.isButton() && interaction.customId.startsWith('recruitmentpanel_discovertourney_page:')) {
+      const isDM = !interaction.guild;
+      if (isDM) await interaction.deferUpdate().catch(() => interaction.deferReply());
+      else await interaction.deferReply({ ephemeral: true });
+      const page = Number.parseInt(interaction.customId.split(':')[1], 10) || 0;
+      const payload = await buildDiscoverTournamentsPayload(page);
       await interaction.editReply({ content: null, ...payload });
       return;
     }
@@ -22101,6 +22484,20 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_discoverable:')) {
+      if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
+      const tournamentId = interaction.customId.split(':')[1];
+      const tournament = await findTournament(interaction.guild.id, tournamentId);
+      if (!tournament) { await interaction.reply({ content: 'Tournament not found.', ephemeral: true }); return; }
+      await interaction.deferUpdate();
+      await pool.query(`UPDATE tournaments SET discoverable = $2, updated_at = NOW() WHERE id = $1`, [tournamentId, !tournament.discoverable]);
+      const refreshedTournament = await findTournament(interaction.guild.id, tournamentId);
+      const includeAdminBackButton = await tournamentManagerContextIncludesAdminBack(interaction);
+      const payload = await buildTournamentManagerViewPayload(interaction.guild, refreshedTournament, { includeAdminBackButton });
+      await interaction.editReply({ content: `**${tournament.tournament_name}** is now ${refreshedTournament.discoverable ? '**discoverable**' : '**not discoverable**'} on the cross-server Discover Tournaments board.`, ...payload });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('tourneypanel_delete:')) {
       if (!(await userCanUseLeagueSetup(interaction, null))) { await interaction.reply({ content: 'You do not have permission to manage tournaments.', ephemeral: true }); return; }
       const tournamentId = interaction.customId.split(':')[1];
@@ -22427,6 +22824,209 @@ if (interaction.commandName === 'avatar') {
         ));
       }
       await interaction.reply({ components, ephemeral: true });
+      return;
+    }
+
+    // 7J-SCHEDULING: per Hxxdie — timezone + rough weekly availability,
+    // captured via a small in-memory session (same pattern as tournament
+    // creation) accumulated across three select menus before saving. Only
+    // ever affects this one user's own row in user_availability.
+    if (interaction.isButton() && interaction.customId === 'memberprofile_availability') {
+      const existing = await getUserAvailability(interaction.guild?.id || 'dm', interaction.user.id);
+      availabilitySessions.set(interaction.user.id, {
+        timezone: existing?.timezone || null,
+        days: existing?.available_days || [],
+        blocks: existing?.available_blocks || [],
+      });
+      await interaction.reply({ ...buildAvailabilityEditorPayload(interaction.user.id), ephemeral: true });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'availability_timezone_select') {
+      const session = availabilitySessions.get(interaction.user.id) || { timezone: null, days: [], blocks: [] };
+      session.timezone = interaction.values[0];
+      availabilitySessions.set(interaction.user.id, session);
+      await interaction.update(buildAvailabilityEditorPayload(interaction.user.id));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'availability_days_select') {
+      const session = availabilitySessions.get(interaction.user.id) || { timezone: null, days: [], blocks: [] };
+      session.days = interaction.values;
+      availabilitySessions.set(interaction.user.id, session);
+      await interaction.update(buildAvailabilityEditorPayload(interaction.user.id));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'availability_blocks_select') {
+      const session = availabilitySessions.get(interaction.user.id) || { timezone: null, days: [], blocks: [] };
+      session.blocks = interaction.values;
+      availabilitySessions.set(interaction.user.id, session);
+      await interaction.update(buildAvailabilityEditorPayload(interaction.user.id));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'availability_save') {
+      const session = availabilitySessions.get(interaction.user.id);
+      if (!session?.timezone || !session.days.length || !session.blocks.length) {
+        await interaction.reply({ content: 'Pick a timezone, at least one day, and at least one time block before saving.', ephemeral: true });
+        return;
+      }
+      await pool.query(
+        `INSERT INTO user_availability (guild_id, user_id, timezone, available_days, available_blocks, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET timezone = $3, available_days = $4, available_blocks = $5, updated_at = NOW()`,
+        [interaction.guild?.id || 'dm', interaction.user.id, session.timezone, session.days, session.blocks]
+      );
+      availabilitySessions.delete(interaction.user.id);
+      await interaction.update({ content: '✅ Your availability is saved. When you get a new game thread, GG Sports will compare your availability with your opponent\'s and suggest shared windows.', embeds: [], components: [] });
+      return;
+    }
+
+    // 7J-SCHEDULING: per Hxxdie — propose/accept/decline/counter, living
+    // inside the game thread itself since that's naturally where two owners
+    // already are together. customId carries gameSource (generic|madden)
+    // and gameRef (league_games.id or madden_imported_games.id) so this one
+    // set of handlers works for both thread types.
+    if (interaction.isButton() && interaction.customId.startsWith('schedpropose:')) {
+      const [, gameSource, gameRef] = interaction.customId.split(':');
+      const sharedNote = await buildSchedulingSharedWindowsNote(interaction.guild.id, interaction.channel).catch(() => '');
+      const modal = new ModalBuilder()
+        .setCustomId(`schedpropose_modal:${gameSource}:${gameRef}`)
+        .setTitle('Propose a Game Time')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('month_day').setLabel('Date (Month Day, e.g. "March 14")').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('Time (e.g. "7:30 PM")').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('timezone').setLabel('Your Timezone (ET, CT, MT, PT, UTC, etc.)').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      if (sharedNote) {
+        await interaction.reply({ content: sharedNote, ephemeral: true });
+      }
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('schedpropose_modal:')) {
+      await interaction.deferReply();
+      const [, gameSource, gameRef] = interaction.customId.split(':');
+      const monthDayRaw = interaction.fields.getTextInputValue('month_day').trim();
+      const timeRaw = interaction.fields.getTextInputValue('time').trim();
+      const timezoneRaw = interaction.fields.getTextInputValue('timezone').trim().toUpperCase();
+
+      const ianaZone = TOURNAMENT_TIMEZONE_IANA[TOURNAMENT_TIMEZONE_ALIASES[timezoneRaw] || timezoneRaw];
+      const timeMatch = /(\d{1,2}):?(\d{2})?\s*(AM|PM)/i.exec(timeRaw);
+      const monthMatch = TOURNAMENT_MONTH_NAMES.findIndex(m => monthDayRaw.toLowerCase().includes(m.toLowerCase())) + 1;
+      const dayMatch = monthDayRaw.match(/\b(\d{1,2})\b/);
+      if (!ianaZone || !timeMatch || !monthMatch || !dayMatch) {
+        await interaction.editReply({ content: 'Could not parse that date/time. Try again like: Date "March 14", Time "7:30 PM", Timezone "ET".' });
+        return;
+      }
+      const hour24 = timeMatch[3].toUpperCase() === 'PM' ? (Number(timeMatch[1]) % 12) + 12 : Number(timeMatch[1]) % 12;
+      const minute = timeMatch[2] ? Number(timeMatch[2]) : 0;
+      const day = Number(dayMatch[1]);
+      const year = inferTournamentYear(monthMatch, day);
+      const epochMs = tournamentWallClockToUtcEpoch(year, monthMatch, day, hour24, minute, ianaZone);
+      const proposedEpoch = Math.floor(epochMs / 1000);
+
+      const lookup = await findGameForScheduling(interaction.guild, gameSource, gameRef).catch(() => null);
+      if (!lookup) { await interaction.editReply({ content: 'Could not find this game anymore.' }); return; }
+      const { league, homeOwner, awayOwner, label } = lookup;
+      if (![homeOwner?.id, awayOwner?.id].includes(interaction.user.id) && !(await userCanUseLeagueSetup(interaction, league))) {
+        await interaction.editReply({ content: 'Only the two teams in this game (or staff) can propose a time.' });
+        return;
+      }
+      const opponentId = interaction.user.id === homeOwner?.id ? awayOwner?.id : homeOwner?.id;
+
+      // Supersede any still-pending proposal for this game before creating a new one.
+      await pool.query(`UPDATE game_schedule_proposals SET status = 'superseded' WHERE game_source = $1 AND game_ref = $2 AND status = 'pending'`, [gameSource, gameRef]).catch(() => null);
+
+      const proposalId = randomUUID();
+      await pool.query(
+        `INSERT INTO game_schedule_proposals (id, guild_id, league_id, game_ref, game_source, thread_id, proposer_user_id, responder_user_id, proposed_at_epoch, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')`,
+        [proposalId, interaction.guild.id, league?.league_id || null, gameRef, gameSource, interaction.channelId, interaction.user.id, opponentId || null, proposedEpoch]
+      );
+
+      const embed = new EmbedBuilder()
+        .setTitle('🗓️ Game Time Proposed')
+        .setColor(0xFEE75C)
+        .setDescription(`<@${interaction.user.id}> proposed a time for **${label}**:\n<t:${proposedEpoch}:F> (<t:${proposedEpoch}:R>)`)
+        .setFooter({ text: 'GG Sports • Scheduling' })
+        .setTimestamp();
+      const buttons = [
+        new ButtonBuilder().setCustomId(`schedaccept:${proposalId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`scheddecline:${proposalId}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`schedcounter:${proposalId}`).setLabel('Counter').setEmoji('🔁').setStyle(ButtonStyle.Secondary),
+      ];
+      await interaction.editReply({
+        content: opponentId ? `<@${opponentId}>` : undefined,
+        embeds: [embed],
+        components: [new ActionRowBuilder().addComponents(buttons)],
+        allowedMentions: { users: opponentId ? [opponentId] : [] },
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('schedaccept:')) {
+      const proposalId = interaction.customId.split(':')[1];
+      const proposalResult = await pool.query(`SELECT * FROM game_schedule_proposals WHERE id = $1`, [proposalId]);
+      const proposal = proposalResult.rows[0];
+      if (!proposal) { await interaction.reply({ content: 'This proposal could not be found anymore.', ephemeral: true }); return; }
+      if (proposal.status !== 'pending') { await interaction.reply({ content: `This proposal is no longer pending (status: ${proposal.status}).`, ephemeral: true }); return; }
+      if (interaction.user.id !== proposal.responder_user_id) { await interaction.reply({ content: 'Only the other team can accept this proposal.', ephemeral: true }); return; }
+      await pool.query(`UPDATE game_schedule_proposals SET status = 'accepted', responded_at = NOW() WHERE id = $1`, [proposalId]);
+      await interaction.update({
+        content: `✅ <@${interaction.user.id}> accepted. Game time confirmed: <t:${proposal.proposed_at_epoch}:F> (<t:${proposal.proposed_at_epoch}:R>)`,
+        embeds: [], components: [],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('scheddecline:')) {
+      const proposalId = interaction.customId.split(':')[1];
+      const proposalResult = await pool.query(`SELECT * FROM game_schedule_proposals WHERE id = $1`, [proposalId]);
+      const proposal = proposalResult.rows[0];
+      if (!proposal) { await interaction.reply({ content: 'This proposal could not be found anymore.', ephemeral: true }); return; }
+      if (proposal.status !== 'pending') { await interaction.reply({ content: `This proposal is no longer pending (status: ${proposal.status}).`, ephemeral: true }); return; }
+      if (interaction.user.id !== proposal.responder_user_id) { await interaction.reply({ content: 'Only the other team can decline this proposal.', ephemeral: true }); return; }
+      await pool.query(`UPDATE game_schedule_proposals SET status = 'declined', responded_at = NOW() WHERE id = $1`, [proposalId]);
+      await interaction.update({
+        content: `❌ <@${interaction.user.id}> declined that time. Either team can use **Propose Time** again to suggest a new one.`,
+        embeds: [], components: [],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('schedcounter:')) {
+      const proposalId = interaction.customId.split(':')[1];
+      const proposalResult = await pool.query(`SELECT * FROM game_schedule_proposals WHERE id = $1`, [proposalId]);
+      const proposal = proposalResult.rows[0];
+      if (!proposal) { await interaction.reply({ content: 'This proposal could not be found anymore.', ephemeral: true }); return; }
+      if (proposal.status !== 'pending') { await interaction.reply({ content: `This proposal is no longer pending (status: ${proposal.status}).`, ephemeral: true }); return; }
+      if (interaction.user.id !== proposal.responder_user_id) { await interaction.reply({ content: 'Only the other team can counter this proposal.', ephemeral: true }); return; }
+      await pool.query(`UPDATE game_schedule_proposals SET status = 'countered', responded_at = NOW() WHERE id = $1`, [proposalId]);
+      const modal = new ModalBuilder()
+        .setCustomId(`schedpropose_modal:${proposal.game_source}:${proposal.game_ref}`)
+        .setTitle('Counter-Propose a Time')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('month_day').setLabel('Date (Month Day, e.g. "March 14")').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('Time (e.g. "7:30 PM")').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('timezone').setLabel('Your Timezone (ET, CT, MT, PT, UTC, etc.)').setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // 7J-SCHEDULING: per Hxxdie — "when a dispute reaches the commissioner,
+    // there is actual information, not just 'I messaged him.'" This is that
+    // information — the full, timestamped history of every proposal and
+    // response for this game, available to anyone (most usefully staff)
+    // right in the thread.
+    if (interaction.isButton() && interaction.customId.startsWith('schedhistory:')) {
+      const [, gameSource, gameRef] = interaction.customId.split(':');
+      await interaction.deferReply({ ephemeral: true });
+      const embed = await buildSchedulingHistoryEmbed(interaction.guild.id, gameSource, gameRef);
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 
@@ -34667,6 +35267,25 @@ async function createGameCenterThread(interaction, league, game, { channelIdOver
   await maybePostLeagueGameThreadOwnersAvatar(interaction.guild, { ...game, thread_id: thread.id, owners_avatar_posted: false }).catch(error =>
     console.error('[Game Thread Owners Avatar] post-creation check failed:', error));
 
+  // 7J-SCHEDULING: per Hxxdie — game threads are naturally where two owners
+  // already are together, so that's where this lives. Explicitly
+  // structured-only — open-schedule leagues don't get this, since a team
+  // there adds its own game whenever it wants to play, unlike a structured
+  // league's schedule pairing two teams up in advance who then need to
+  // actually agree on a time. Posted as its own follow-up message rather
+  // than folded into the buttons above, to avoid any risk to that button
+  // row's existing layout.
+  if (createThreadCustomSettings.schedule_style === 'structured') {
+    const sharedNote = await buildSchedulingSharedWindowsNote(interaction.guild.id, thread).catch(() => '');
+    await thread.send({
+      content: sharedNote || 'Use **Propose Time** below to suggest when to play this game.',
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`schedpropose:generic:${game.id}`).setLabel('Propose Time').setEmoji('🗓️').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`schedhistory:generic:${game.id}`).setLabel('Scheduling History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+      )],
+    }).catch(() => null);
+  }
+
   return { ok: true, thread };
 }
 
@@ -36482,6 +37101,26 @@ async function autoGrantTieredAward(guild, league, ownerId, teamName, triggerTyp
   const awardTypeLabel = triggerType === 'champion' ? `Champion (Tier ${targetTier})` : `MVP (Tier ${targetTier})`;
   const grantResult = await grantAwardItem(guild.id, ownerId, item.id, awardTypeLabel);
   if (!grantResult.ok) return null;
+
+  // 7J-AWARDDM: per Hxxdie — congratulate the recipient directly, not just
+  // a note in a thread they may not even be in. DMs closed just means this
+  // silently skips, same as every other DM in the bot — the grant itself
+  // already happened regardless.
+  const dmMember = await guild.members.fetch(ownerId).catch(() => null);
+  if (dmMember) {
+    const dmEmbed = new EmbedBuilder()
+      .setTitle(triggerType === 'champion' ? '🏆 Congratulations, Champion!' : '⭐ Congratulations!')
+      .setColor(0xFEE75C)
+      .setDescription(
+        triggerType === 'champion'
+          ? `You led **${teamName}** to the **${league.league_name}** championship!`
+          : `You were named **MVP** of **${league.league_name}**!`
+      )
+      .addFields({ name: 'Reward', value: `**${item.item_name}**${targetTier > 1 ? ` (Tier ${targetTier})` : ''} — already added to your inventory.`, inline: false })
+      .setFooter({ text: 'GG Sports' })
+      .setTimestamp();
+    await dmMember.send({ embeds: [dmEmbed] }).catch(() => null); // DMs closed — skip silently, same as everywhere else.
+  }
 
   // 7J-AUTOAWARDS: deliberately does NOT post a news event here —
   // postLeagueSeasonHistory (Season History) already posts league_champion
@@ -38853,6 +39492,19 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
         autoAwardNote += `\n💰 <@${winnerUserId}> was paid **${settingsForAwardPayout.currency_icon || ''} ${otherAwardPayout}** for **${award.name}**.`;
       }
       await addRecognitionPoints(interaction.guild.id, winnerUserId, 10, 25, activeLeague.league_id).catch(() => null);
+      // 7J-AWARDDM: per Hxxdie — same congratulations DM as the tiered
+      // champion/MVP cosmetics, for every "other" award too.
+      const otherAwardDmMember = await interaction.guild.members.fetch(winnerUserId).catch(() => null);
+      if (otherAwardDmMember) {
+        const otherAwardDmEmbed = new EmbedBuilder()
+          .setTitle('⭐ Congratulations!')
+          .setColor(0xFEE75C)
+          .setDescription(`You won **${award.name}** in **${activeLeague.league_name}** — ${data.seasonLabel}!`)
+          .addFields({ name: 'Reward', value: otherAwardPayout > 0 ? `${settingsForAwardPayout.currency_icon || ''} ${otherAwardPayout} — already added to your balance.` : 'Recorded to league history.', inline: false })
+          .setFooter({ text: 'GG Sports' })
+          .setTimestamp();
+        await otherAwardDmMember.send({ embeds: [otherAwardDmEmbed] }).catch(() => null);
+      }
     }
   }
   if (incompleteAwardNames.length) {
@@ -39509,6 +40161,7 @@ function buildMemberProfileHomeComponents(lang = 'en', targetUserId = null, view
       new ButtonBuilder().setCustomId('memberprofile_stream').setLabel('Connect Stream').setEmoji('📺').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('memberprofile_birthday').setLabel('Set Birthday').setEmoji('🎂').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('memberprofile_language').setLabel(t(lang, 'memberprofile_language_button')).setEmoji('🌐').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('memberprofile_availability').setLabel('Set Availability').setEmoji('🗓️').setStyle(ButtonStyle.Secondary),
     ));
   }
   return rows;
@@ -40572,6 +41225,7 @@ function buildRecruitmentStarterComponents() {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('recruitmentpanel_browse').setLabel('Browse Open Teams').setEmoji('🔍').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('recruitmentpanel_discover').setLabel('Discover Leagues').setEmoji('🌐').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('recruitmentpanel_discovertourney_page:0').setLabel('Discover Tournaments').setEmoji('🏆').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('recruitmentpanel_myapplications').setLabel('My Applications').setEmoji('📄').setStyle(ButtonStyle.Secondary),
     ),
     // 7J-LEAGUERULESET: per Hxxdie — any member (not just staff) should be
@@ -40808,6 +41462,55 @@ async function buildDiscoverLeaguesPayload(page) {
     new ButtonBuilder().setCustomId(`recruitmentpanel_discover_page:${Math.max(0, page - 1)}`).setLabel('◀ Back').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
     new ButtonBuilder().setCustomId(`recruitmentpanel_discover_page:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled((page + 1) * pageSize >= totalLeagues),
   ));
+
+  return { embeds: [embed], components: rows };
+}
+
+// 7J-TOURNEYDISCOVERY: per Hxxdie — same shape as buildDiscoverLeaguesPayload
+// just above, deliberately: same Premium gate, same pagination, same
+// "informational, not an instant cross-server join" approach. A tournament's
+// buy-in/prize economy lives in that server's own currency, so joining still
+// has to happen there — this is about being found, not about registering
+// without ever visiting that server.
+async function buildDiscoverTournamentsPayload(page) {
+  const pageSize = 5;
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM tournaments t
+     JOIN premium_entitlements p ON p.guild_id = t.guild_id
+     WHERE t.status = 'open' AND t.discoverable = TRUE AND p.status IN ('active', 'trialing', 'past_due')`
+  );
+  const totalTournaments = countResult.rows[0]?.count || 0;
+  const tournamentsResult = await pool.query(
+    `SELECT t.* FROM tournaments t
+     JOIN premium_entitlements p ON p.guild_id = t.guild_id
+     WHERE t.status = 'open' AND t.discoverable = TRUE AND p.status IN ('active', 'trialing', 'past_due')
+     ORDER BY t.starts_at_epoch ASC NULLS LAST, t.created_at DESC LIMIT $1 OFFSET $2`,
+    [pageSize, page * pageSize]
+  );
+
+  const NL = String.fromCharCode(10);
+  const lines = [];
+  for (const tournament of tournamentsResult.rows) {
+    const guild = client.guilds.cache.get(tournament.guild_id);
+    if (!guild) continue; // bot no longer in that server — skip silently
+    const entryCount = await pool.query(`SELECT COUNT(*)::int AS n FROM tournament_entries WHERE tournament_id = $1`, [tournament.id]).then(r => r.rows[0]?.n || 0).catch(() => 0);
+    const slotsBit = tournament.max_entries ? `${entryCount}/${tournament.max_entries} entered` : `${entryCount} entered`;
+    const buyInBit = tournament.buy_in > 0 ? `Buy-in ${tournament.buy_in}` : 'Free entry';
+    const startBit = tournament.starts_at_epoch ? `<t:${tournament.starts_at_epoch}:R>` : 'Start time TBD';
+    lines.push(`**${tournament.tournament_name}** — ${guild.name} — ${slotsBit} • ${buyInBit} • ${startBit}`);
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🌐 Discover Tournaments')
+    .setColor(0x57F287)
+    .setDescription(lines.length ? lines.join(NL) : 'No open, discoverable tournaments to show on this page.')
+    .setFooter({ text: `GG Sports • Recruitment • Page ${page + 1} of ${Math.max(1, Math.ceil(totalTournaments / pageSize))}` })
+    .setTimestamp();
+
+  const rows = [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`recruitmentpanel_discovertourney_page:${Math.max(0, page - 1)}`).setLabel('◀ Back').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+    new ButtonBuilder().setCustomId(`recruitmentpanel_discovertourney_page:${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary).setDisabled((page + 1) * pageSize >= totalTournaments),
+  )];
 
   return { embeds: [embed], components: rows };
 }
@@ -52039,6 +52742,18 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
       out.created.push({ label, threadId: thread.id });
       await maybePostGameThreadOwnersAvatar(guild, league, { ...game, thread_id: thread.id, owners_avatar_posted: false }).catch(error =>
         console.error('[Game Thread Owners Avatar] post-creation check failed:', error));
+
+      // 7J-SCHEDULING: per Hxxdie — Madden is explicitly in scope alongside
+      // structured leagues (only open-schedule is excluded), so this is
+      // unconditional here, unlike the generic path's schedule_style check.
+      const maddenSharedNote = await buildSchedulingSharedWindowsNote(guild.id, thread).catch(() => '');
+      await thread.send({
+        content: maddenSharedNote || 'Use **Propose Time** below to suggest when to play this game.',
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`schedpropose:madden:${game.id}`).setLabel('Propose Time').setEmoji('🗓️').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`schedhistory:madden:${game.id}`).setLabel('Scheduling History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+        )],
+      }).catch(() => null);
     } catch (error) {
       console.error('[7J-10BY-GT GAME THREAD] create failed:', error?.stack || error?.message || error);
       out.failed.push({ label, reason: String(error?.message || error).slice(0, 140) });
@@ -70799,6 +71514,147 @@ function buildBotOwnerGuildsEmbed(client) {
     .setTimestamp();
 }
 
+// 7J-ENGAGEMENT: per Hxxdie — "all engagement data metrics possible," for
+// bot-owner use in future development decisions. Reads entirely from
+// engagement_events (see logEngagementEvent/the universal InteractionCreate
+// hook) plus guilds/premium_entitlements for server-side context. Returns
+// an array of embeds (Discord allows up to 10 per message) rather than one
+// giant embed, since there's genuinely a lot here — Users, Guilds, Feature
+// Usage, and Top Active Guilds each get their own.
+async function buildBotOwnerEngagementEmbeds(client) {
+  const NL = String.fromCharCode(10);
+
+  // --- Users: DAU/WAU/MAU, new users, retention, depth ---
+  const activeUsersResult = await pool.query(`
+    SELECT
+      COUNT(DISTINCT user_id) FILTER (WHERE created_at > NOW() - INTERVAL '1 day') AS dau,
+      COUNT(DISTINCT user_id) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS wau,
+      COUNT(DISTINCT user_id) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') AS mau,
+      COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 day') AS interactions_today,
+      COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS interactions_week,
+      COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') AS interactions_month
+    FROM engagement_events
+  `).catch(() => ({ rows: [{}] }));
+  const u = activeUsersResult.rows[0] || {};
+
+  // First-ever engagement_events row per user = their signup date, for "new users."
+  const newUsersResult = await pool.query(`
+    WITH first_seen AS (SELECT user_id, MIN(created_at) AS first_at FROM engagement_events GROUP BY user_id)
+    SELECT
+      COUNT(*) FILTER (WHERE first_at > NOW() - INTERVAL '1 day') AS new_today,
+      COUNT(*) FILTER (WHERE first_at > NOW() - INTERVAL '7 days') AS new_week,
+      COUNT(*) FILTER (WHERE first_at > NOW() - INTERVAL '30 days') AS new_month,
+      COUNT(*) AS all_time_users
+    FROM first_seen
+  `).catch(() => ({ rows: [{}] }));
+  const nu = newUsersResult.rows[0] || {};
+
+  // Week-over-week retention: of the users active in the PRIOR 7-day window
+  // (days 8-14 ago), what fraction also show up in the CURRENT 7-day window?
+  const retentionResult = await pool.query(`
+    WITH prior_week AS (
+      SELECT DISTINCT user_id FROM engagement_events
+      WHERE created_at > NOW() - INTERVAL '14 days' AND created_at <= NOW() - INTERVAL '7 days'
+    ),
+    current_week AS (
+      SELECT DISTINCT user_id FROM engagement_events WHERE created_at > NOW() - INTERVAL '7 days'
+    )
+    SELECT
+      (SELECT COUNT(*) FROM prior_week) AS prior_week_users,
+      (SELECT COUNT(*) FROM prior_week p WHERE EXISTS (SELECT 1 FROM current_week c WHERE c.user_id = p.user_id)) AS retained_users
+  `).catch(() => ({ rows: [{}] }));
+  const r = retentionResult.rows[0] || {};
+  const retentionPct = Number(r.prior_week_users) > 0 ? Math.round((Number(r.retained_users) / Number(r.prior_week_users)) * 100) : null;
+  const avgInteractionsPerWau = Number(u.wau) > 0 ? (Number(u.interactions_week) / Number(u.wau)).toFixed(1) : '0';
+
+  const usersEmbed = new EmbedBuilder()
+    .setTitle('📊 Engagement — Users')
+    .setColor(0x5865F2)
+    .addFields(
+      { name: 'DAU', value: String(u.dau || 0), inline: true },
+      { name: 'WAU', value: String(u.wau || 0), inline: true },
+      { name: 'MAU', value: String(u.mau || 0), inline: true },
+      { name: 'New Users (Today / Week / Month)', value: `${nu.new_today || 0} / ${nu.new_week || 0} / ${nu.new_month || 0}`, inline: false },
+      { name: 'All-Time Tracked Users', value: String(nu.all_time_users || 0), inline: true },
+      { name: 'Week-over-Week Retention', value: retentionPct === null ? 'Not enough data yet' : `${retentionPct}% (${r.retained_users || 0}/${r.prior_week_users || 0})`, inline: true },
+      { name: 'Avg Interactions per WAU', value: avgInteractionsPerWau, inline: true },
+      { name: 'Total Interactions (Today / Week / Month)', value: `${u.interactions_today || 0} / ${u.interactions_week || 0} / ${u.interactions_month || 0}`, inline: false },
+    )
+    .setFooter({ text: 'GG Sports • Engagement Dashboard' })
+    .setTimestamp();
+
+  // --- Guilds: total, active, premium mix, growth ---
+  const totalGuilds = client.guilds.cache.size;
+  const activeGuildsResult = await pool.query(`SELECT COUNT(DISTINCT guild_id)::int AS n FROM engagement_events WHERE guild_id IS NOT NULL AND created_at > NOW() - INTERVAL '7 days'`).catch(() => ({ rows: [{ n: 0 }] }));
+  const premiumMixResult = await pool.query(`SELECT status, COUNT(*)::int AS n FROM premium_entitlements GROUP BY status`).catch(() => ({ rows: [] }));
+  const premiumMixLines = premiumMixResult.rows.map(row => `${row.status}: ${row.n}`).join(' • ') || 'No premium data yet';
+  const guildGrowthResult = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS new_week,
+      COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') AS new_month
+    FROM guilds
+  `).catch(() => ({ rows: [{}] }));
+  const gg = guildGrowthResult.rows[0] || {};
+
+  const guildsEmbed = new EmbedBuilder()
+    .setTitle('📊 Engagement — Guilds')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Total Guilds', value: String(totalGuilds), inline: true },
+      { name: 'Active Guilds (7d)', value: String(activeGuildsResult.rows[0]?.n || 0), inline: true },
+      { name: 'New Guilds (Week / Month)', value: `${gg.new_week || 0} / ${gg.new_month || 0}`, inline: true },
+      { name: 'Premium Mix', value: premiumMixLines.slice(0, 1024), inline: false },
+    )
+    .setFooter({ text: 'GG Sports • Engagement Dashboard' })
+    .setTimestamp();
+
+  // --- Feature usage: top features by volume (30d), split by event type ---
+  const topFeaturesResult = await pool.query(`
+    SELECT feature_key, event_type, COUNT(*)::int AS n
+    FROM engagement_events
+    WHERE created_at > NOW() - INTERVAL '30 days' AND feature_key IS NOT NULL
+    GROUP BY feature_key, event_type
+    ORDER BY n DESC
+    LIMIT 20
+  `).catch(() => ({ rows: [] }));
+  const featureLines = topFeaturesResult.rows.map((row, i) => `${i + 1}. \`${row.feature_key}\` (${row.event_type}) — ${row.n}`);
+  const eventTypeMixResult = await pool.query(`
+    SELECT event_type, COUNT(*)::int AS n FROM engagement_events
+    WHERE created_at > NOW() - INTERVAL '30 days'
+    GROUP BY event_type ORDER BY n DESC
+  `).catch(() => ({ rows: [] }));
+  const eventTypeMixLine = eventTypeMixResult.rows.map(row => `${row.event_type}: ${row.n}`).join(' • ') || 'No data yet';
+
+  const featuresEmbed = new EmbedBuilder()
+    .setTitle('📊 Engagement — Feature Usage (30d)')
+    .setColor(0xFEE75C)
+    .setDescription(featureLines.length ? featureLines.join(NL) : 'No feature usage data yet.')
+    .addFields({ name: 'Interaction Type Mix', value: eventTypeMixLine, inline: false })
+    .setFooter({ text: 'GG Sports • Engagement Dashboard' })
+    .setTimestamp();
+
+  // --- Top active guilds (7d) ---
+  const topGuildsResult = await pool.query(`
+    SELECT guild_id, COUNT(*)::int AS n, COUNT(DISTINCT user_id)::int AS unique_users
+    FROM engagement_events
+    WHERE guild_id IS NOT NULL AND created_at > NOW() - INTERVAL '7 days'
+    GROUP BY guild_id ORDER BY n DESC LIMIT 10
+  `).catch(() => ({ rows: [] }));
+  const topGuildLines = topGuildsResult.rows.map((row, i) => {
+    const guildObj = client.guilds.cache.get(row.guild_id);
+    return `${i + 1}. **${guildObj?.name || row.guild_id}** — ${row.n} interactions, ${row.unique_users} unique users`;
+  });
+
+  const topGuildsEmbed = new EmbedBuilder()
+    .setTitle('📊 Engagement — Top Active Guilds (7d)')
+    .setColor(0xED4245)
+    .setDescription(topGuildLines.length ? topGuildLines.join(NL) : 'No guild activity data yet.')
+    .setFooter({ text: 'GG Sports • Engagement Dashboard' })
+    .setTimestamp();
+
+  return [usersEmbed, guildsEmbed, featuresEmbed, topGuildsEmbed];
+}
+
 // ---------------------------------------------------------------------------
 // Bot Owner Panel — button/modal-driven front end over the /botowner
 // subcommands above, so the bot owner doesn't have to retype full slash
@@ -73536,8 +74392,6 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     const rows = [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_op:announce:' + leagueId).setLabel('League Announcement').setEmoji('📣').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('commissioner_op:rules:' + leagueId).setLabel('Rules').setEmoji('📖').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('commissioner_op:seasonhistory:' + leagueId).setLabel('Season History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
     )];
     // 7J-5ROWFIX: Discord caps a message at 5 action rows total. Advance
@@ -73555,9 +74409,18 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     // commissioner might reasonably want to reset mid-season for a do-over;
     // the confirm step (see commissioner_newseason_start handler) is what
     // actually protects against doing this by accident.
+    // 7J-OPSROWREORDER: per Hxxdie — Playoffs and Season History moved onto
+    // this same row, between Advance and Start New Season, since all four
+    // are part of the same season-progression story (advance the season →
+    // run playoffs → record history → start fresh) and reads more
+    // naturally grouped together than split across two rows.
     const seasonRowButtons = [];
     if (isStructured) seasonRowButtons.push(advanceButton());
-    seasonRowButtons.push(new ButtonBuilder().setCustomId('commissioner_newseason_start:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger));
+    seasonRowButtons.push(
+      new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('commissioner_op:seasonhistory:' + leagueId).setLabel('Season History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('commissioner_newseason_start:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger),
+    );
     rows.push(new ActionRowBuilder().addComponents(seasonRowButtons));
     // 7J-97SUSPEND
     rows.push(new ActionRowBuilder().addComponents(
