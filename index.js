@@ -1608,6 +1608,14 @@ async function initDatabase() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  // 7J-AWARDPLAYERTEAM: per Hxxdie — staff need to enter the team AND the
+  // player's name AND their real @mention for player-level awards
+  // (MVP, Cy Young, Vezina, etc.), not just a name typed into one field —
+  // a player's name alone can't be reliably tied to a specific Discord
+  // account or team, and a mistyped/misspelled name meant the currency
+  // payout and cosmetic grant would silently go to nobody.
+  await pool.query(`ALTER TABLE award_history ADD COLUMN IF NOT EXISTS team_name TEXT`);
+  await pool.query(`ALTER TABLE award_history ADD COLUMN IF NOT EXISTS player_name TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_standings (
@@ -1675,6 +1683,12 @@ async function initDatabase() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_season_history_lookup ON user_season_history (guild_id, user_id)`);
+  // 7J-AUTOAWARDS: MVP alongside champion — no player-stat tracking exists
+  // for generic (non-Madden) leagues, so the bot can't derive who the MVP
+  // is on its own the way it can derive the champion from the bracket. A
+  // human still has to designate WHO; this just records it once they do, so
+  // the automated tiered-item grant has something to key off going forward.
+  await pool.query(`ALTER TABLE user_season_history ADD COLUMN IF NOT EXISTS mvp BOOLEAN NOT NULL DEFAULT FALSE`);
 
   // 7J-USERHEADTOHEAD: distinct from the team-level head-to-head that
   // already fed sportsbook odds (getHeadToHeadSnapshot, keyed by team
@@ -1783,6 +1797,11 @@ async function initDatabase() {
   // league. Off by default so leagues that started playoffs before this
   // existed aren't suddenly surprised by an extra stage.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS play_in_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-AUTOAWARDS: holds the current season's designated MVP until Start
+  // New Season archives it into user_season_history.mvp and clears this
+  // back out. Champion doesn't need an equivalent — that's derived
+  // automatically from the bracket, not designated by a human.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS current_season_mvp_user_id TEXT`);
   // 7J-NBAPLAYIN: snapshot of seeds 1-10 per conference at the moment
   // playoffs start — the "real" bracket's seeds 1-6 aren't known as
   // finished series until the play-in stage resolves seeds 7-8, so this is
@@ -2112,6 +2131,42 @@ async function initDatabase() {
   // drop/set (e.g. "Summer 2026 Collection"). Purely descriptive — shown on Item Info
   // when set, no other code currently filters or groups by it.
   await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS release_package TEXT`);
+  // 7J-AUTOAWARDS: per Hxxdie — commissioners granting arbitrary cosmetic
+  // items by hand is a real abuse vector (nothing stops a commissioner from
+  // just handing themselves or a friend a "Champion" item without actually
+  // winning). award_trigger tags an item as bot-managed for a specific
+  // milestone ('champion' or 'mvp') — once tagged, /shop grantaward refuses
+  // to touch it; only the automated grant path (autoGrantTieredAward) can.
+  // award_trigger_tier lets a server set up escalating items for repeat
+  // winners (a 3rd-time champion gets a different item than a 1st-timer)
+  // without repeat wins just handing out the same thing over and over.
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS award_trigger TEXT`);
+  await pool.query(`ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS award_trigger_tier INTEGER NOT NULL DEFAULT 1`);
+
+  // 7J-AUTOAWARDS: starter tiered items so the automated award system has
+  // real content immediately instead of requiring the bot owner to build
+  // every tier from scratch before it does anything. Universal (guild_id
+  // NULL), inserted only if an item with that exact name doesn't already
+  // exist — never touches or duplicates anything a server already set up.
+  // art_asset_key intentionally left unset; these render as a placeholder
+  // until real art is linked via the bot-owner edit panel.
+  const starterAwardItems = [
+    ['Championship Ring', 'Awarded automatically to a first-time league champion.', 'accessory', 'legendary', 'champion', 1],
+    ['Golden Championship Ring', 'Awarded automatically to a two-time league champion.', 'accessory', 'legendary', 'champion', 2],
+    ['Diamond Dynasty Ring', 'Awarded automatically to a three-time league champion.', 'accessory', 'legendary', 'champion', 3],
+    ['Legendary Dynasty Crown', 'Awarded automatically to a four-or-more-time league champion.', 'headwear', 'legendary', 'champion', 4],
+    ['MVP Trophy', 'Awarded automatically to a first-time season MVP.', 'accessory', 'epic', 'mvp', 1],
+    ['Golden MVP Trophy', 'Awarded automatically to a two-time season MVP.', 'accessory', 'legendary', 'mvp', 2],
+    ['Hall of Fame MVP Trophy', 'Awarded automatically to a three-or-more-time season MVP.', 'headwear', 'legendary', 'mvp', 3],
+  ];
+  for (const [name, description, slot, rarity, trigger, tier] of starterAwardItems) {
+    await pool.query(
+      `INSERT INTO shop_items (id, guild_id, item_name, description, price, stock, is_active, item_category, avatar_slot, rarity, is_cosmetic, is_award_only, award_trigger, award_trigger_tier, created_by_user_id)
+       SELECT $1, NULL, $2, $3, 0, NULL, TRUE, 'avatar', $4, $5, TRUE, TRUE, $6, $7, 'system'
+       WHERE NOT EXISTS (SELECT 1 FROM shop_items WHERE guild_id IS NULL AND item_name = $2)`,
+      [randomUUID(), name, description, slot, rarity, trigger, tier]
+    ).catch(err => console.error('[7J-AUTOAWARDS] Starter item seed failed for', name, err?.message || err));
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_inventory (
@@ -2534,6 +2589,9 @@ async function initDatabase() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  // 7J-AWARDPLAYERTEAM: matches award_history's team_name/player_name.
+  await pool.query(`ALTER TABLE league_awards ADD COLUMN IF NOT EXISTS team_name TEXT`);
+  await pool.query(`ALTER TABLE league_awards ADD COLUMN IF NOT EXISTS player_name TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS championship_history (
@@ -5513,19 +5571,32 @@ async function getMemberTeamForLeague(member, league) {
   return null;
 }
 
+// 7J-AWARDPLAYERTEAM: per Hxxdie — a player-level award (MVP, Cy Young,
+// Vezina, etc.) needs the TEAM, the PLAYER'S NAME, and a real @mention, not
+// just a name typed into one field with no reliable way to tie it to a
+// specific team or Discord account. Format is one award per line:
+// "Award Name: Team | Player Name | @User" — the old single-`|`-separates-
+// awards format is gone (that same character is now the field separator
+// within a line), so this is a real format change, not just stricter
+// validation of the old one. Lines missing the 3-part structure or a
+// resolvable mention are returned with `incomplete: true` rather than
+// silently dropped, so the caller can tell the commissioner exactly which
+// award didn't get granted instead of it quietly going to nobody.
 function parseCustomAwards(awardsText) {
   if (!awardsText) return [];
   return awardsText
-    .split('|')
-    .map(item => item.trim())
+    .split(/\r?\n/)
+    .map(line => line.trim())
     .filter(Boolean)
-    .map(item => {
-      const separatorIndex = item.indexOf(':');
-      if (separatorIndex === -1) return { name: 'Award', value: item };
-      return {
-        name: item.slice(0, separatorIndex).trim() || 'Award',
-        value: item.slice(separatorIndex + 1).trim() || 'Not listed',
-      };
+    .map(line => {
+      const colonIndex = line.indexOf(':');
+      const name = colonIndex === -1 ? 'Award' : line.slice(0, colonIndex).trim() || 'Award';
+      const rest = colonIndex === -1 ? line.trim() : line.slice(colonIndex + 1).trim();
+      const parts = rest.split('|').map(p => p.trim());
+      if (parts.length < 3 || !parts[0] || !parts[1] || !parts[2]) {
+        return { name, team: null, player: null, mentionText: rest, incomplete: true };
+      }
+      return { name, team: parts[0], player: parts[1], mentionText: parts[2], incomplete: false };
     });
 }
 
@@ -5928,13 +5999,22 @@ function buildSeasonHistoryEmbed(league, data) {
     .setTimestamp();
 
   if (data.runnerUp) embed.addFields({ name: 'Runner-Up', value: data.runnerUp, inline: true });
-  if (data.mvp) embed.addFields({ name: 'MVP / Top Player', value: data.mvp, inline: false });
+  // 7J-AWARDPLAYERTEAM: MVP is now also Team | Player | @User — parsed the
+  // same way as every other award line, so display it the same way too.
+  if (data.mvp) {
+    const [mvpParsed] = parseCustomAwards('MVP: ' + data.mvp);
+    embed.addFields({
+      name: 'MVP / Top Player',
+      value: mvpParsed && !mvpParsed.incomplete ? `${mvpParsed.player} (${mvpParsed.team})` : data.mvp,
+      inline: false,
+    });
+  }
 
   const customAwards = parseCustomAwards(data.awards);
   if (customAwards.length > 0) {
     embed.addFields({ name: 'Award Winners', value: '━━━━━━━━━━━━━━', inline: false });
     for (const award of customAwards.slice(0, 20)) {
-      embed.addFields({ name: award.name, value: award.value, inline: true });
+      embed.addFields({ name: award.name, value: award.incomplete ? `⚠️ Incomplete (missing team/player/@mention): ${award.mentionText || 'not provided'}` : `${award.player} (${award.team})`, inline: true });
     }
   }
 
@@ -6650,6 +6730,10 @@ async function createPlayoffSeriesThreads(guild, league, roundSeries, roundNumbe
       series.thread_id = thread.id;
       series.status_message_id = statusMessage?.id || null;
       created += 1;
+      // 7J-PLAYOFFSPORTSBOOK: Game 1's line opens the moment the series
+      // thread does — same timing regular season lines open at (Add Game),
+      // well before any "Game Started" lock would apply.
+      await createAutoSportsbookForPlayoffGame(guild, league, series, 1, roundNumber).catch(err => console.error('[Playoffs] Sportsbook line creation failed:', err?.message || err));
     } catch (err) {
       console.error(`[Playoffs] Thread creation failed for ${series.teamA?.name} vs ${series.teamB?.name}:`, err?.message || err);
     }
@@ -6668,6 +6752,11 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
   const isComplete = Boolean(series.winner);
   const now = Date.now();
   const stillLocked = !isComplete && series.unlocksAt && new Date(series.unlocksAt).getTime() > now;
+  // 7J-PLAYOFFTHREADBUTTONS: mirrors regular season's "Game Started" —
+  // locks betting on the currently-active playoff game once it's actually
+  // being played, rather than leaving the line open the whole time the
+  // game is technically reportable.
+  const gameStarted = Boolean(series.currentGameStartedAt) && !isComplete;
 
   const embed = new EmbedBuilder()
     .setTitle(`🏆 Playoff Series — Round ${roundNumber}`)
@@ -6681,12 +6770,14 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
     embed.addFields({ name: 'Status', value: `🔒 Locked until <t:${Math.floor(new Date(series.unlocksAt).getTime() / 1000)}:t> — dispute window from the previous round.`, inline: false });
   } else if (series.disputed) {
     embed.addFields({ name: 'Status', value: '⚠️ A dispute is open on this series. Waiting on staff to resolve it before further games can be reported.', inline: false });
+  } else if (gameStarted) {
+    embed.addFields({ name: 'Status', value: `🔒 Game ${nextGameNumber} is underway — betting on this game is locked. Report the score once it's finished.`, inline: false });
   } else {
     embed.addFields({ name: 'Status', value: `Ready — either team owner (or staff) can report Game ${nextGameNumber}.`, inline: false });
   }
   embed.setFooter({ text: 'GG Sports • Playoffs' }).setTimestamp();
 
-  const buttons = [
+  const row1 = [
     new ButtonBuilder()
       .setCustomId(`playoffseries_reportscore:${series.id}`)
       .setLabel(isComplete ? 'Series Complete' : `Report Score — Game ${nextGameNumber}`)
@@ -6700,7 +6791,26 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
       .setStyle(ButtonStyle.Danger)
       .setDisabled(Boolean(series.disputed)),
   ];
-  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(buttons)] };
+  const row2 = [
+    new ButtonBuilder()
+      .setCustomId(`playoffseries_info:${series.id}`)
+      .setLabel('Matchup Info')
+      .setEmoji('📊')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`playoffseries_gamestarted:${series.id}`)
+      .setLabel('Game Started')
+      .setEmoji('🔒')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(isComplete || stillLocked || Boolean(series.disputed) || gameStarted),
+    new ButtonBuilder()
+      .setCustomId(`playoffseries_forcewin:${series.id}`)
+      .setLabel('Force Win (Staff)')
+      .setEmoji('🔨')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(isComplete),
+  ];
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(row1), new ActionRowBuilder().addComponents(row2)] };
 }
 
 // 7J-PLAYOFFROUNDTHREADS: finds a series by id anywhere in a league's
@@ -6774,7 +6884,7 @@ async function refreshPlayoffSeriesThreadMessage(guild, league, series, roundNum
 // call this, so there's exactly one place that knows how to advance a
 // series, cascade into the next round, and keep every surface (thread,
 // bracket panel, standings) in sync.
-async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winnerSide) {
+async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winnerSide, options = {}) {
   const bracketResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]);
   const bracketState = bracketResult.rows[0];
   if (!bracketState) return { ok: false, message: 'No playoff bracket found for this league.' };
@@ -6787,15 +6897,23 @@ async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winner
   }
   if (!series) return { ok: false, message: 'That series could not be found.' };
   if (series.winner) return { ok: false, message: 'This series is already complete.' };
-  if (series.disputed) return { ok: false, message: 'A dispute is open on this series — staff need to resolve it first.' };
-  if (series.unlocksAt && new Date(series.unlocksAt).getTime() > Date.now()) {
-    return { ok: false, message: `This round isn't reportable yet — unlocks <t:${Math.floor(new Date(series.unlocksAt).getTime() / 1000)}:R>.` };
+  // 7J-PLAYOFFTHREADBUTTONS: Force Win intentionally bypasses these two
+  // gates — that's its entire purpose, a staff override for exactly the
+  // cases where normal reporting is blocked.
+  if (!options.force) {
+    if (series.disputed) return { ok: false, message: 'A dispute is open on this series — staff need to resolve it first.' };
+    if (series.unlocksAt && new Date(series.unlocksAt).getTime() > Date.now()) {
+      return { ok: false, message: `This round isn't reportable yet — unlocks <t:${Math.floor(new Date(series.unlocksAt).getTime() / 1000)}:R>.` };
+    }
   }
 
   const roundSeries = bracket[roundIndex];
   series.games = Array.isArray(series.games) ? series.games : [];
   series.games.push(winnerSide);
   if (winnerSide === 'A') series.winsA += 1; else series.winsB += 1;
+  // 7J-PLAYOFFTHREADBUTTONS: reset so the next game's "Game Started" button
+  // starts fresh rather than staying locked from the game that just ended.
+  series.currentGameStartedAt = null;
   const winThreshold = Math.ceil(series.seriesLength / 2);
   if (series.winsA >= winThreshold) { series.winner = series.teamA.name; series.completedAt = new Date().toISOString(); }
   else if (series.winsB >= winThreshold) { series.winner = series.teamB.name; series.completedAt = new Date().toISOString(); }
@@ -6811,6 +6929,19 @@ async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winner
   if (ownerA && ownerB) {
     const gameWinnerOwnerId = winnerSide === 'A' ? ownerA.id : ownerB.id;
     await recordUserHeadToHead(guild.id, ownerA.id, ownerB.id, gameWinnerOwnerId);
+  }
+
+  // 7J-PLAYOFFSPORTSBOOK: settle this game's line (relies on
+  // autoSettleSportsbookForLeagueGame's existing home/away-label fallback
+  // matching, since playoff games have no real league_games row to key
+  // off), then open a fresh line for the next game if the series isn't
+  // over — same one-line-per-individual-game model as creation.
+  const pseudoInteraction = { guild, user: { id: 'system' } };
+  await autoSettleSportsbookForLeagueGame(pseudoInteraction, { id: null, league_id: leagueId, home_team_name: series.teamA.name, away_team_name: series.teamB.name }, winnerSide === 'A' ? 'home' : 'away')
+    .catch(err => console.error('[Playoffs] Sportsbook settlement failed:', err?.message || err));
+  if (!series.winner) {
+    await createAutoSportsbookForPlayoffGame(guild, league, series, series.games.length + 1, roundIndex + 1)
+      .catch(err => console.error('[Playoffs] Next-game sportsbook line creation failed:', err?.message || err));
   }
 
   const roundComplete = roundSeries.every(s => s.winner);
@@ -6979,6 +7110,40 @@ function buildLivePlayoffBracketEmbed(league, bracketState) {
   });
 
   return embed;
+}
+
+// 7J-PLAYOFFBRACKETIMGFIX: per Hxxdie — the bracket panel used to require a
+// commissioner to manually press "Post/Refresh Bracket Panel" at least once
+// before it ever appeared anywhere; refreshPlayoffBracketPanel only ever
+// UPDATES an already-posted message; it does nothing on a brand new
+// bracket. This actually posts the initial message (text always, image too
+// if the server has Premium) the moment playoffs start, so "an actual
+// visual bracket that auto updates as games are played" is true from the
+// very first round, not just from the second update onward. Silently does
+// nothing if no playoff_bracket_channel_id is configured — there's no
+// interaction context here to fall back to "wherever this was run," unlike
+// the manual button.
+async function autoPostPlayoffBracketPanel(guild, league) {
+  const channelId = league.playoff_bracket_channel_id;
+  if (!channelId) return;
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased?.()) return;
+  const bracketResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1`, [league.league_id]).catch(() => ({ rows: [] }));
+  const bracketState = bracketResult.rows[0];
+  if (!bracketState) return;
+  // Already has a tracked panel (e.g. "Start New Playoffs" reusing a prior
+  // season's message) — refreshPlayoffBracketPanel (already called before
+  // this in every caller) already handles updating it. Posting again here
+  // would just duplicate the panel.
+  if (bracketState.channel_id && bracketState.message_id) return;
+  const message = await channel.send({ embeds: [buildLivePlayoffBracketEmbed(league, bracketState)] }).catch(() => null);
+  if (!message) return;
+  await pool.query(`UPDATE league_playoff_brackets SET channel_id = $2, message_id = $3, updated_at = NOW() WHERE league_id = $1`, [league.league_id, channel.id, message.id]).catch(() => null);
+  if (await isGuildPremiumActive(guild.id).catch(() => false)) {
+    await updateLeaguePlayoffBracketImage(guild, league, channel, bracketState.bracket_image_message_id, bracketState).catch(error => {
+      console.error('[Playoffs] Initial bracket image post failed:', error?.message || error);
+    });
+  }
 }
 
 async function refreshPlayoffBracketPanel(guild, league) {
@@ -13780,6 +13945,13 @@ if (interaction.commandName === 'avatar') {
       if (slotFieldsApply) {
         buttons.push(new ButtonBuilder().setCustomId(`botownerpanel_edititem_slotfields:${itemId}`).setLabel(`Slot-Specific (${item.avatar_slot})`).setEmoji('🔧').setStyle(ButtonStyle.Secondary));
       }
+      // 7J-AUTOAWARDS: only offered once an item is already marked
+      // award-only (set via the Cosmetic modal above) — this is where
+      // champion/MVP auto-granting gets wired up, still bot-owner-only like
+      // everything else on this panel.
+      if (item.is_award_only) {
+        buttons.push(new ButtonBuilder().setCustomId(`botownerpanel_edititem_awardtrigger:${itemId}`).setLabel('Award Trigger (auto-grant)').setEmoji('🏆').setStyle(ButtonStyle.Secondary));
+      }
       await interaction.reply({
         content: `**Edit ${item.item_name}** — which fields?\nSlot: \`${item.avatar_slot}\` (not editable — recreate the cosmetic if this needs to change)`,
         components: [new ActionRowBuilder().addComponents(...buttons)],
@@ -13856,6 +14028,56 @@ if (interaction.commandName === 'avatar') {
       const artNote = interaction.fields.getTextInputValue('art_key') && !artAssetExists ? ' ⚠️ No art found at that key — cleared, will render as a placeholder until fixed.' : '';
       const giftNote = giftType ? `, gift **${giftType} ${giftYear}**` : '';
       await interaction.editReply({ content: `Updated cosmetic details for **${item.item_name}**: rarity **${rarity}**, colorable **${isColorable ? 'yes' : 'no'}**, award-only **${isAwardOnly ? 'yes' : 'no'}**${giftNote}.${artNote}` });
+      return;
+    }
+
+    // 7J-AUTOAWARDS: bot-owner-only, same as every other item-editing path
+    // on this panel. This is what tags an award-only item as champion/MVP-
+    // triggered, which is what makes autoGrantTieredAward pick it up
+    // automatically — and what makes /shop grantaward refuse to touch it
+    // manually once tagged (see the grantaward handler's award_trigger
+    // check).
+    if (interaction.isButton() && interaction.customId.startsWith('botownerpanel_edititem_awardtrigger:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      const itemId = interaction.customId.split(':')[1];
+      const result = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!result.rows.length) { await interaction.reply({ content: 'Could not find that universal shop item.', flags: MessageFlags.Ephemeral }); return; }
+      const item = result.rows[0];
+      const modal = new ModalBuilder()
+        .setCustomId(`botownerpanel_edititem_awardtrigger_modal:${itemId}`)
+        .setTitle('Edit Award Trigger')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_trigger').setLabel('Trigger (blank / champion / mvp)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.award_trigger || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_trigger_tier').setLabel('Tier (1 = first win, 2 = second win, etc.)').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(item.award_trigger_tier || 1))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('botownerpanel_edititem_awardtrigger_modal:')) {
+      if (!isBotOwnerInteraction(interaction)) { await interaction.reply({ content: 'This panel is restricted to the bot owner.', flags: MessageFlags.Ephemeral }); return; }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const itemId = interaction.customId.split(':')[1];
+      const existing = await pool.query(`SELECT * FROM shop_items WHERE id = $1 AND guild_id IS NULL`, [itemId]);
+      if (!existing.rows.length) { await interaction.editReply({ content: 'Could not find that universal shop item — it may have been removed.' }); return; }
+      const item = existing.rows[0];
+
+      const triggerRaw = interaction.fields.getTextInputValue('award_trigger').toLowerCase().trim();
+      if (triggerRaw && !['champion', 'mvp'].includes(triggerRaw)) {
+        await interaction.editReply({ content: 'Invalid trigger. Use blank, "champion", or "mvp".' });
+        return;
+      }
+      const tierRaw = Number.parseInt(interaction.fields.getTextInputValue('award_trigger_tier'), 10);
+      if (!Number.isFinite(tierRaw) || tierRaw < 1) {
+        await interaction.editReply({ content: 'Tier must be a whole number of 1 or higher.' });
+        return;
+      }
+
+      await pool.query(
+        `UPDATE shop_items SET award_trigger = $1, award_trigger_tier = $2, updated_at = NOW() WHERE id = $3`,
+        [triggerRaw || null, tierRaw, itemId]
+      );
+      await interaction.editReply({ content: triggerRaw ? `**${item.item_name}** now auto-grants for **${triggerRaw}**, tier **${tierRaw}**.` : `**${item.item_name}** is no longer tied to an automated award trigger.` });
       return;
     }
 
@@ -15129,56 +15351,54 @@ if (interaction.commandName === 'avatar') {
           return;
         }
 
-        const awardLines = awardsText
-          .split(/\n|\|/)
-          .map(line => line.trim())
-          .filter(Boolean)
-          .slice(0, 20);
-
-        if (!awardLines.length) {
-          await interaction.reply({ content: 'Please enter at least one award line, like `MVP: @User`.', ephemeral: true });
+        // 7J-AWARDPLAYERTEAM: per Hxxdie — reuses the exact same parser
+        // Season History uses, instead of this command's own separate
+        // regex-based line parser. Both now require the same
+        // "Award: Team | Player | @User" structure and agree on what
+        // counts as a valid line.
+        const parsedAwards = parseCustomAwards(awardsText).slice(0, 20);
+        if (!parsedAwards.length) {
+          await interaction.reply({ content: 'Please enter at least one award line, like `MVP: Team Name | Player Name | @User`.', ephemeral: true });
           return;
         }
 
         const settings = await getCurrencySettings(interaction.guild.id);
         const awardPayout = Number(settings.award_payout || 50);
         const savedAwards = [];
+        const incompleteAwards = [];
 
-        for (const line of awardLines) {
-          const separatorMatch = line.match(/[:=—–-]/);
-          const separatorIndex = separatorMatch ? line.indexOf(separatorMatch[0]) : -1;
-          const awardName = separatorIndex === -1 ? 'Award' : line.slice(0, separatorIndex).trim();
-          const winnerText = separatorIndex === -1 ? line.trim() : line.slice(separatorIndex + 1).trim();
-
-          if (!awardName || !winnerText) continue;
-
-          await pool.query(
-            `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, created_by_user_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [randomUUID(), interaction.guild.id, activeLeague.league_id, seasonLabel, awardName, winnerText, interaction.user.id]
-          );
-
-          const winnerUserId = await resolveAwardWinnerUserId(interaction.guild, winnerText);
-
-          if (winnerUserId) {
-            await pool.query(
-              `INSERT INTO league_awards (id, guild_id, league_id, season_label, award_name, user_id, created_by_user_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-              [randomUUID(), interaction.guild.id, activeLeague.league_id, seasonLabel, awardName, winnerUserId, interaction.user.id]
-            );
-
-            if (awardPayout > 0) {
-              await addCurrency(interaction.guild.id, winnerUserId, awardPayout, 'league_award', awardName + ' • ' + seasonLabel, interaction.user.id);
-            }
-
-            await addRecognitionPoints(interaction.guild.id, winnerUserId, 10, 25, activeLeague.league_id).catch(() => null);
+        for (const award of parsedAwards) {
+          if (award.incomplete) {
+            incompleteAwards.push(award.name);
+            continue;
+          }
+          const winnerUserId = await resolveAwardWinnerUserId(interaction.guild, award.mentionText);
+          if (!winnerUserId) {
+            incompleteAwards.push(award.name);
+            continue;
           }
 
-          savedAwards.push({ awardName, winnerText });
+          await pool.query(
+            `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, team_name, player_name, created_by_user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [randomUUID(), interaction.guild.id, activeLeague.league_id, seasonLabel, award.name, `${award.player} (${award.team})`, award.team, award.player, interaction.user.id]
+          );
+          await pool.query(
+            `INSERT INTO league_awards (id, guild_id, league_id, season_label, award_name, user_id, team_name, player_name, created_by_user_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [randomUUID(), interaction.guild.id, activeLeague.league_id, seasonLabel, award.name, winnerUserId, award.team, award.player, interaction.user.id]
+          );
+          if (awardPayout > 0) {
+            await addCurrency(interaction.guild.id, winnerUserId, awardPayout, 'league_award', award.name + ' • ' + seasonLabel, interaction.user.id);
+          }
+          await addRecognitionPoints(interaction.guild.id, winnerUserId, 10, 25, activeLeague.league_id).catch(() => null);
+
+          savedAwards.push({ awardName: award.name, team: award.team, player: award.player, userId: winnerUserId });
         }
 
         if (!savedAwards.length) {
-          await interaction.reply({ content: 'No valid awards were submitted. Use lines like `MVP: @User`.', ephemeral: true });
+          const incompleteNote = incompleteAwards.length ? ` These lines were missing the team, player name, or a real @mention: ${incompleteAwards.join(', ')}.` : '';
+          await interaction.reply({ content: `No valid awards were submitted. Use lines like \`MVP: Team Name | Player Name | @User\`.${incompleteNote}`, ephemeral: true });
           return;
         }
 
@@ -15186,7 +15406,7 @@ if (interaction.commandName === 'avatar') {
         const embed = new EmbedBuilder()
           .setTitle(activeLeague.league_name + ' • ' + seasonLabel + ' Awards')
           .setColor(0xFEE75C)
-          .setDescription(savedAwards.map(award => '**' + award.awardName + '** — ' + award.winnerText).join(NL))
+          .setDescription(savedAwards.map(award => `**${award.awardName}** — ${award.player} (${award.team}) <@${award.userId}>`).join(NL))
           .setFooter({ text: 'GG Sports • Awards 2.0' })
           .setTimestamp();
 
@@ -15204,7 +15424,14 @@ if (interaction.commandName === 'avatar') {
         // real write path into award_history besides season history posting.
         await refreshLeagueHofBoard(interaction.guild, activeLeague).catch(() => null);
 
-        await interaction.reply({ content: 'Saved **' + savedAwards.length + '** award(s) for **' + activeLeague.league_name + '**.', embeds: [embed], ephemeral: true });
+        // 7J-AWARDPLAYERTEAM: per Hxxdie — no user should be able to go
+        // un-awarded because a line was missing the team/player/mention.
+        // Surfaced loudly here instead of silently dropped, so staff can
+        // immediately re-submit the fixed line(s).
+        const incompleteNote = incompleteAwards.length
+          ? `\n⚠️ Skipped — missing team, player name, or a real @mention: ${incompleteAwards.join(', ')}. Re-submit these with the full \`Team | Player | @User\` format.`
+          : '';
+        await interaction.reply({ content: 'Saved **' + savedAwards.length + '** award(s) for **' + activeLeague.league_name + '**.' + incompleteNote, embeds: [embed], ephemeral: true });
         return;
       }
 
@@ -19149,6 +19376,8 @@ if (interaction.commandName === 'avatar') {
     // a do-over), just make sure they can't do it by accident, and warn
     // extra hard if playoffs are currently in progress since that bracket
     // would be abandoned without a recorded champion.
+
+
     if (interaction.isButton() && interaction.customId.startsWith('commissioner_newseason_start:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -19188,6 +19417,12 @@ if (interaction.commandName === 'avatar') {
       const bracketState = bracketResult.rows[0] || null;
       const bracket = bracketState?.bracket || [];
       const championTeam = bracketState?.status === 'completed' ? bracketState.champion_team : null;
+      // 7J-AUTOAWARDS: whoever was designated MVP this season (via
+      // Designate MVP — the item itself was already auto-granted the
+      // moment they were designated; this just archives the record so
+      // future tier counts stay accurate).
+      const archivalCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const mvpUserId = archivalCustomSettings.current_season_mvp_user_id || null;
 
       const seasonCountResult = await pool.query(`SELECT COUNT(DISTINCT season_label)::int AS n FROM team_season_history WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [{ n: 0 }] }));
       const seasonLabel = `Season ${Number(seasonCountResult.rows[0]?.n || 0) + 1}`;
@@ -19207,9 +19442,9 @@ if (interaction.commandName === 'avatar') {
         const owner = await findTeamOwnerByRoleId(interaction.guild, row.team_role_id).catch(() => null);
         if (owner) {
           await pool.query(
-            `INSERT INTO user_season_history (id, guild_id, league_id, season_label, user_id, team_name, wins, losses, ties, champion)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-            [randomUUID(), interaction.guild.id, leagueId, seasonLabel, owner.id, row.team_name, row.wins || 0, row.losses || 0, row.ties || 0, Boolean(isChampion)]
+            `INSERT INTO user_season_history (id, guild_id, league_id, season_label, user_id, team_name, wins, losses, ties, champion, mvp)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [randomUUID(), interaction.guild.id, leagueId, seasonLabel, owner.id, row.team_name, row.wins || 0, row.losses || 0, row.ties || 0, Boolean(isChampion), owner.id === mvpUserId]
           ).catch(() => null);
           // 7J-92LEGACYFLOOR: a completed season is exactly the kind of
           // real, substantial participation the floor exists for — bigger
@@ -19220,11 +19455,12 @@ if (interaction.commandName === 'avatar') {
         }
       }
 
-      if (championTeam) {
+      if (championTeam || mvpUserId) {
+        const mvpMember = mvpUserId ? await interaction.guild.members.fetch(mvpUserId).catch(() => null) : null;
         await pool.query(
-          `INSERT INTO season_history (id, guild_id, league_id, season_label, champion, created_by_user_id)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [randomUUID(), interaction.guild.id, leagueId, seasonLabel, championTeam, interaction.user.id]
+          `INSERT INTO season_history (id, guild_id, league_id, season_label, champion, mvp, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [randomUUID(), interaction.guild.id, leagueId, seasonLabel, championTeam || 'Not recorded', mvpMember?.displayName || mvpMember?.user?.username || null, interaction.user.id]
         ).catch(() => null);
       }
 
@@ -19234,7 +19470,7 @@ if (interaction.commandName === 'avatar') {
         [interaction.guild.id, leagueId]
       );
       await pool.query(
-        `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, updated_at = NOW() WHERE league_id = $1`,
+        `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, current_season_mvp_user_id = NULL, updated_at = NOW() WHERE league_id = $1`,
         [leagueId]
       );
       await pool.query(
@@ -19272,6 +19508,20 @@ if (interaction.commandName === 'avatar') {
       const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
       const playoffFormatKey = getPlayoffFormatKey(league);
 
+      // 7J-PLAYOFFTHREADCLEANUP: per Hxxdie — starting playoffs used to
+      // leave the final regular-season round's game threads sitting there
+      // forever, since deleteLeagueGameThreadsForWeekSilent only ever ran
+      // as part of a normal Advance, and Start Playoffs is a different
+      // code path. Matches the exact same cleanup every other round
+      // transition already gets. Only meaningful for structured leagues
+      // (open-schedule game threads are cleared on their own schedule, not
+      // tied to a round number) and only fires if a schedule actually
+      // exists — a league using Start Playoffs without ever running a
+      // structured season has nothing to clean up.
+      if (customSettings.schedule_style === 'structured' && Array.isArray(customSettings.schedule) && customSettings.schedule.length) {
+        await deleteLeagueGameThreadsForWeekSilent(interaction.guild, league, `Game ${customSettings.schedule.length}`).catch(() => null);
+      }
+
       // 7J-NBAPLAYIN: opt-in real play-in tournament — needs the top 10 per
       // conference (not the normal top-8), and a frozen snapshot of seeds
       // 1-6 so the real bracket can be built correctly once the play-in
@@ -19303,6 +19553,7 @@ if (interaction.commandName === 'avatar') {
           [leagueId, JSON.stringify(bracket), JSON.stringify(playInSeeds)]
         );
         await refreshPlayoffBracketPanel(interaction.guild, league).catch(() => null);
+        await autoPostPlayoffBracketPanel(interaction.guild, league).catch(() => null);
         const payload = await buildPlayoffsOpsPayload(interaction.guild, league);
         await interaction.editReply({ content: '🏀 Play-In Tournament started — Games 1 & 2 are ready.', ...payload });
         return;
@@ -19327,6 +19578,7 @@ if (interaction.commandName === 'avatar') {
         [leagueId, JSON.stringify(bracket)]
       );
       await refreshPlayoffBracketPanel(interaction.guild, league).catch(() => null);
+      await autoPostPlayoffBracketPanel(interaction.guild, league).catch(() => null);
       const payload = await buildPlayoffsOpsPayload(interaction.guild, league);
       await interaction.editReply({ content: 'Playoffs started — Round 1 bracket generated.', ...payload });
       return;
@@ -19357,6 +19609,15 @@ if (interaction.commandName === 'avatar') {
       const targetChannel = channel?.isTextBased?.() ? channel : interaction.channel;
       const message = await targetChannel.send({ embeds: [buildLivePlayoffBracketEmbed(league, bracketState)] });
       await pool.query(`UPDATE league_playoff_brackets SET channel_id = $2, message_id = $3, updated_at = NOW() WHERE league_id = $1`, [leagueId, targetChannel.id, message.id]);
+      // 7J-PLAYOFFBRACKETIMGFIX: this button previously only ever posted the
+      // text embed — the visual bracket image (the whole point of this
+      // being a Premium feature) never actually got attached here, only on
+      // whatever the NEXT game-report-triggered refresh happened to be.
+      // Since this button already passed the premium gate above, post the
+      // image right alongside the text now, not on a delay.
+      await updateLeaguePlayoffBracketImage(interaction.guild, league, targetChannel, bracketState.bracket_image_message_id, bracketState).catch(error => {
+        console.error('[Playoffs] Bracket image post failed:', error?.message || error);
+      });
       await interaction.reply({ content: `Bracket panel posted/refreshed in ${targetChannel.toString()}.`, ephemeral: true });
       return;
     }
@@ -19427,6 +19688,111 @@ if (interaction.commandName === 'avatar') {
     // Score button — shows a quick "which team won Game N" pick rather than
     // recording anything itself, so a misclick doesn't silently record the
     // wrong team's win.
+    // 7J-PLAYOFFTHREADBUTTONS: per Hxxdie — playoff threads were missing
+    // the same buttons regular season Game Center threads already have.
+    // Matchup Info reuses the exact same embed builder as regular season by
+    // constructing a synthetic "game" object from the series + resolved
+    // role ids — that function only ever reads role_id/team_name/id fields,
+    // never actually touches a real league_games row.
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_info:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, series } = lookup;
+      await interaction.deferReply({ ephemeral: true });
+      const [roleAResult, roleBResult] = await Promise.all([
+        pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamA.name]).catch(() => ({ rows: [] })),
+        pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamB.name]).catch(() => ({ rows: [] })),
+      ]);
+      const pseudoGame = {
+        id: series.id,
+        home_team_role_id: roleAResult.rows[0]?.role_id || null,
+        away_team_role_id: roleBResult.rows[0]?.role_id || null,
+        home_team_name: series.teamA.name,
+        away_team_name: series.teamB.name,
+      };
+      const [ownerA, ownerB] = await Promise.all([
+        pseudoGame.home_team_role_id ? findTeamOwnerByRoleId(interaction.guild, pseudoGame.home_team_role_id).catch(() => null) : null,
+        pseudoGame.away_team_role_id ? findTeamOwnerByRoleId(interaction.guild, pseudoGame.away_team_role_id).catch(() => null) : null,
+      ]);
+      const infoEmbed = await buildGameCenterMatchupInfoEmbed(interaction.guild.id, league, pseudoGame, ownerA?.id, ownerB?.id).catch(error => {
+        console.error('[Playoffs] Matchup info build failed:', error?.message || error);
+        return new EmbedBuilder().setTitle('Matchup Info').setDescription('Could not load matchup info right now.').setColor(0xED4245);
+      });
+      await interaction.editReply({ embeds: [infoEmbed] });
+      return;
+    }
+
+    // 7J-PLAYOFFTHREADBUTTONS: locks the CURRENT active game's sportsbook
+    // line — same anti-late-betting intent as regular season's Game
+    // Started, scoped to whichever individual game within the series is
+    // next up (series.currentGameStartedAt), not the whole series.
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_gamestarted:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, bracket, roundIndex, series } = lookup;
+      const permCheck = await canReportPlayoffSeries(interaction, league, series);
+      if (!permCheck.ok) { await interaction.reply({ content: permCheck.message, ephemeral: true }); return; }
+      if (series.winner) { await interaction.reply({ content: 'This series is already complete.', ephemeral: true }); return; }
+      if (series.disputed) { await interaction.reply({ content: 'A dispute is open on this series.', ephemeral: true }); return; }
+      if (series.unlocksAt && new Date(series.unlocksAt).getTime() > Date.now()) { await interaction.reply({ content: 'This round isn\'t reportable yet.', ephemeral: true }); return; }
+      if (series.currentGameStartedAt) { await interaction.reply({ content: 'This game has already been marked as started.', ephemeral: true }); return; }
+
+      series.currentGameStartedAt = new Date().toISOString();
+      bracket[roundIndex] = bracket[roundIndex].map(s => (s.id === series.id ? series : s));
+      await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]);
+
+      // Lock the currently-open line for this game (label-matched, same
+      // fallback used everywhere else for playoff sportsbook games).
+      await pool.query(
+        `UPDATE sportsbook_games SET status = 'locked', updated_at = NOW()
+         WHERE guild_id = $1 AND status = 'open' AND source = 'playoffs'
+           AND LOWER(home_label) = LOWER($2) AND LOWER(away_label) = LOWER($3)`,
+        [interaction.guild.id, series.teamA.name, series.teamB.name]
+      ).catch(() => null);
+
+      await refreshPlayoffSeriesThreadMessage(interaction.guild, league, series, roundIndex + 1);
+      await interaction.reply({ content: `🔒 <@${interaction.user.id}> marked Game ${series.games.length + 1} as started. Betting on this game is now locked.` });
+      return;
+    }
+
+    // 7J-PLAYOFFTHREADBUTTONS: Force Win — staff-only, and unlike the
+    // normal Report Score flow (which staff can already use), this
+    // deliberately bypasses the dispute and cooldown gates too. That's the
+    // actual point of it: a staff override for exactly the situations where
+    // normal reporting is blocked and waiting isn't practical.
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_forcewin:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, series } = lookup;
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'Only staff can force a win.', ephemeral: true }); return; }
+      if (series.winner) { await interaction.reply({ content: 'This series is already complete.', ephemeral: true }); return; }
+      await interaction.reply({
+        content: `Force which team to win Game ${series.games.length + 1}?`,
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`playoffseries_forcewinconfirm:${series.id}:A`).setLabel(series.teamA.name).setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId(`playoffseries_forcewinconfirm:${series.id}:B`).setLabel(series.teamB.name).setStyle(ButtonStyle.Danger),
+        )],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_forcewinconfirm:')) {
+      const [, seriesId, side] = interaction.customId.split(':');
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.update({ content: 'That series could not be found.', components: [] }); return; }
+      const { league } = lookup;
+      if (!(await userCanUseLeagueSetup(interaction, league))) { await interaction.update({ content: 'Only staff can force a win.', components: [] }); return; }
+      await interaction.update({ content: 'Recording...', components: [] });
+      const result = await recordPlayoffGameResult(interaction.guild, league, league.league_id, seriesId, side, { force: true });
+      await interaction.editReply({ content: (result.ok ? '🔨 ' : '') + result.message });
+      return;
+    }
+
+
     if (interaction.isButton() && interaction.customId.startsWith('playoffseries_reportscore:')) {
       const seriesId = interaction.customId.split(':')[1];
       const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
@@ -19564,8 +19930,8 @@ if (interaction.commandName === 'avatar') {
         .setCustomId('commissioner_seasonhistory_modal2:' + token)
         .setTitle('Season History (2 of 2)')
         .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('mvp').setLabel('MVP (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('awards').setLabel('Other awards (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('e.g. 6th Man: PlayerName, Cy Young: PlayerName')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('mvp').setLabel('MVP: Team | Player | @User (optional)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('Anaheim Ducks | John Smith | @johnsmith')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('awards').setLabel('Other awards (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('One per line: Award: Team | Player | @User\n6th Man: Vegas Golden Knights | Jane Doe | @janedoe')),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Season notes (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
         );
       await interaction.showModal(modal);
@@ -27227,7 +27593,18 @@ if (shopSubcommand === 'view') {
         );
         const awardItem = itemResult.rows[0];
         if (!awardItem) {
-          await interaction.reply({ content: 'Could not find an award-only item with that name/ID. Create one with `/shop createcosmetic award_only:True`.', ephemeral: true });
+          await interaction.reply({ content: 'Could not find an award-only item with that name/ID.', ephemeral: true });
+          return;
+        }
+        // 7J-AUTOAWARDS: per Hxxdie — commissioners granting cosmetic items
+        // by hand is a real abuse vector (nothing stops a commissioner from
+        // just handing a "Champion" item to themselves or a friend without
+        // actually winning). Championship/MVP items are now bot-managed
+        // once tagged — this command can still grant genuinely one-off,
+        // untagged awards (Most Improved, a custom shoutout item, etc.),
+        // but never one of the automated ones.
+        if (awardItem.award_trigger) {
+          await interaction.reply({ content: `**${awardItem.item_name}** is tied to the automated ${awardItem.award_trigger} award system and can't be granted manually — it's given out automatically when someone actually earns it.`, ephemeral: true });
           return;
         }
 
@@ -28001,7 +28378,7 @@ if (shopSubcommand === 'view') {
               .setCustomId('awards_entries')
               .setLabel('Awards')
               .setStyle(TextInputStyle.Paragraph)
-              .setPlaceholder('MVP: @User\nDPOY: @User\nBest Streamer: @User')
+              .setPlaceholder('One per line: Award: Team | Player Name | @User\nMVP: Anaheim Ducks | John Smith | @johnsmith\nDPOY: Vegas Golden Knights | Jane Doe | @janedoe')
               .setRequired(true)
           ),
           new ActionRowBuilder().addComponents(
@@ -32448,6 +32825,59 @@ async function createAutoSportsbookForLeagueGame(interaction, leagueGame, league
   return sportsbookGame;
 }
 
+// 7J-PLAYOFFSPORTSBOOK: per Hxxdie — user-vs-user playoff games weren't
+// getting sportsbook lines at all, since createAutoSportsbookForLeagueGame
+// requires a real league_games row and playoff series only ever exist as
+// JSON inside the bracket. One line per INDIVIDUAL game within a series
+// (not one line for the whole series) — matches how betting already works
+// everywhere else in the bot. Deliberately leaves league_game_id NULL and
+// relies on autoSettleSportsbookForLeagueGame's existing home/away-label
+// fallback matching to find and settle it — that fallback already exists
+// for exactly this kind of case, no schema change needed. Same user-vs-user
+// requirement as every other sportsbook/payout path.
+async function createAutoSportsbookForPlayoffGame(guild, league, series, gameNumber, roundNumber) {
+  if (!guild || !series?.teamA || !series?.teamB) return null;
+
+  const [roleAResult, roleBResult] = await Promise.all([
+    pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamA.name]).catch(() => ({ rows: [] })),
+    pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamB.name]).catch(() => ({ rows: [] })),
+  ]);
+  const roleA = roleAResult.rows[0]?.role_id;
+  const roleB = roleBResult.rows[0]?.role_id;
+  const [ownerA, ownerB] = await Promise.all([
+    roleA ? findTeamOwnerByRoleId(guild, roleA).catch(() => null) : null,
+    roleB ? findTeamOwnerByRoleId(guild, roleB).catch(() => null) : null,
+  ]);
+  if (!ownerA || !ownerB) return null;
+
+  const odds = await generateAutoSportsbookOdds(guild.id, league.league_id, roleA, roleB, ownerA.id, ownerB.id);
+  const sportsbookGameId = randomUUID();
+  const label = `${series.teamA.name} vs ${series.teamB.name} (Playoff Game ${gameNumber})`;
+
+  await pool.query(
+    `INSERT INTO sportsbook_games
+      (id, guild_id, league_id, league_game_id, game_label, home_label, away_label, home_odds, away_odds, source, auto_generated, created_by_user_id)
+     VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, 'playoffs', TRUE, $9)`,
+    [sportsbookGameId, guild.id, league.league_id, label, series.teamA.name, series.teamB.name, odds.homeOdds, odds.awayOdds, 'system']
+  );
+  await updateSportsbookPanel(guild).catch(() => null);
+
+  const feedEmbed = new EmbedBuilder()
+    .setTitle('📈 Sportsbook Line Opened')
+    .setColor(0x57F287)
+    .addFields(
+      { name: 'Game', value: label, inline: false },
+      { name: series.teamA.name, value: 'ML ' + odds.homeOdds, inline: true },
+      { name: series.teamB.name, value: 'ML ' + odds.awayOdds, inline: true },
+      { name: 'Source', value: `Auto-generated — Playoff Round ${roundNumber}`, inline: false }
+    )
+    .setFooter({ text: 'GG Sports • Auto Sportsbook' })
+    .setTimestamp();
+  await postSportsbookFeed(guild, feedEmbed, league.league_id).catch(() => null);
+
+  return sportsbookGameId;
+}
+
 // 7J-SPORTSBOOKSOURCETEXT: the "Source" line on an auto-generated
 // sportsbook line was hardcoded to "Auto-generated from Game Center → Add
 // Game" regardless of which schedule style actually created it. That's
@@ -35517,6 +35947,44 @@ async function grantAwardItem(guildId, userId, itemId, awardType) {
   return { ok: true, item, inventoryId };
 }
 
+// 7J-AUTOAWARDS: per Hxxdie — replaces commissioners hand-picking which
+// cosmetic to grant. Counts how many times this person has already won
+// this exact milestone (champion or MVP), picks the highest tier item
+// they've earned (an item tagged tier 3 requires 3 prior wins — "prior"
+// because the current win, if this is being called for the win that just
+// happened, hasn't been archived to user_season_history yet), and grants
+// it automatically. Falls back to the highest tier that actually exists if
+// the server hasn't set up every tier yet, so a repeat winner still gets
+// SOMETHING rather than nothing just because tier 4 doesn't exist.
+async function autoGrantTieredAward(guild, league, ownerId, teamName, triggerType) {
+  if (!guild || !ownerId || !['champion', 'mvp'].includes(triggerType)) return null;
+
+  const priorWinsResult = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM user_season_history WHERE guild_id = $1 AND user_id = $2 AND ${triggerType === 'champion' ? 'champion' : 'mvp'} = TRUE`,
+    [guild.id, ownerId]
+  ).catch(() => ({ rows: [{ n: 0 }] }));
+  const targetTier = Number(priorWinsResult.rows[0]?.n || 0) + 1;
+
+  const itemResult = await pool.query(
+    `SELECT * FROM shop_items
+     WHERE (guild_id = $1 OR guild_id IS NULL) AND is_award_only = TRUE AND award_trigger = $2 AND award_trigger_tier <= $3
+     ORDER BY award_trigger_tier DESC LIMIT 1`,
+    [guild.id, triggerType, targetTier]
+  );
+  const item = itemResult.rows[0];
+  if (!item) return null; // No item tagged for this trigger yet — nothing to grant, not an error.
+
+  const awardTypeLabel = triggerType === 'champion' ? `Champion (Tier ${targetTier})` : `MVP (Tier ${targetTier})`;
+  const grantResult = await grantAwardItem(guild.id, ownerId, item.id, awardTypeLabel);
+  if (!grantResult.ok) return null;
+
+  // 7J-AUTOAWARDS: deliberately does NOT post a news event here —
+  // postLeagueSeasonHistory (Season History) already posts league_champion
+  // and award_winner news for every award, MVP included. Posting again here
+  // would duplicate it. This function's only job is the item grant itself.
+  return { item, tier: targetTier };
+}
+
 // Grants a specific gift item to a specific user, once. Dedupes by checking whether
 // this user already owns THIS item row — safe to call every scheduler tick without
 // re-granting, since each year's gift is a distinct shop_items row (this year's
@@ -37805,14 +38273,81 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
     );
   }
 
+  // 7J-AWARDPLAYERTEAM: MVP now goes through the exact same parser as every
+  // other award — "MVP: " + the field's text — so a plain "MVP (optional)"
+  // field that's really just Team | Player | @User behaves identically to
+  // every other award line instead of being a slightly different format.
   const awardRows = [];
-  if (data.mvp) awardRows.push({ name: 'MVP / Top Player', value: data.mvp });
-  for (const award of parseCustomAwards(data.awards)) awardRows.push(award);
+  if (data.mvp) awardRows.push({ ...parseCustomAwards('MVP: ' + data.mvp)[0], isMvp: true });
+  for (const award of parseCustomAwards(data.awards)) awardRows.push({ ...award, isMvp: false });
+
+  // 7J-AUTOAWARDS: per Hxxdie — Season History (this function) is the
+  // actual, established place a commissioner tells the bot who won what, so
+  // it's the real hook point for granting awards — not a separate button
+  // (that was a parallel system doing the same job and has been removed).
+  // Winner resolution reuses resolveAwardWinnerUserId — the same resolver
+  // /league awards already uses (mention, raw ID, or a fuzzy username/
+  // display-name match against the guild's member list) — rather than a
+  // narrower mention-only regex, so this behaves identically to that
+  // existing command instead of being a slightly different dialect of it.
+  let autoAwardNote = '';
+  const incompleteAwardNames = [];
   for (const award of awardRows) {
+    // 7J-AWARDPLAYERTEAM: per Hxxdie — a player-level award needs the
+    // team, the player's name, AND a real @mention; a name alone can't be
+    // reliably tied to a team or Discord account. Incomplete lines are
+    // recorded (so there's still a paper trail of who staff meant) but
+    // never silently treated as "done" — flagged loudly in the reply
+    // instead, so nobody goes un-awarded because of a typo or a missing
+    // mention.
+    const winnerUserId = award.incomplete ? null : await resolveAwardWinnerUserId(interaction.guild, award.mentionText).catch(() => null);
+    const winnerDisplay = award.incomplete || !award.player
+      ? (award.mentionText || 'Not listed')
+      : `${award.player} (${award.team})`;
+
     await pool.query(
-      `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, created_by_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, award.name, award.value, interaction.user.id]
+      `INSERT INTO award_history (id, guild_id, league_id, season_label, award_name, winner, team_name, player_name, created_by_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, award.name, winnerDisplay, award.team, award.player, interaction.user.id]
     );
+
+    if (!winnerUserId) {
+      incompleteAwardNames.push(award.name);
+      continue;
+    }
+
+    if (award.isMvp) {
+      // MVP gets the tiered cosmetic instead of the flat currency payout
+      // every other award gets below — a real, escalating recognition
+      // rather than the same small currency amount as a lesser award.
+      await pool.query(`UPDATE league_custom_settings SET current_season_mvp_user_id = $2, updated_at = NOW() WHERE league_id = $1`, [activeLeague.league_id, winnerUserId]).catch(() => null);
+      const mvpAwardResult = await autoGrantTieredAward(interaction.guild, activeLeague, winnerUserId, null, 'mvp').catch(() => null);
+      if (mvpAwardResult) {
+        autoAwardNote += `\n🎁 <@${winnerUserId}> was automatically granted **${mvpAwardResult.item.item_name}** (MVP Tier ${mvpAwardResult.tier}).`;
+      }
+    } else {
+      // 7J-AUTOAWARDS: "other" awards (6th Man, Cy Young, Most Improved,
+      // etc. — anything besides MVP) grant the currency payout instead of
+      // a cosmetic, per Hxxdie — there's no scalable way to have a unique
+      // cosmetic item for every possible sport-specific award name, but a
+      // currency payout works for all of them uniformly. Mirrors /league
+      // awards' exact same league_awards insert + payout + recognition
+      // points, not a fourth reimplementation of the same thing.
+      await pool.query(
+        `INSERT INTO league_awards (id, guild_id, league_id, season_label, award_name, user_id, team_name, player_name, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [randomUUID(), interaction.guild.id, activeLeague.league_id, data.seasonLabel, award.name, winnerUserId, award.team, award.player, interaction.user.id]
+      ).catch(() => null);
+      const settingsForAwardPayout = await getCurrencySettings(interaction.guild.id).catch(() => ({}));
+      const otherAwardPayout = Number(settingsForAwardPayout.award_payout || 50);
+      if (otherAwardPayout > 0) {
+        await addCurrency(interaction.guild.id, winnerUserId, otherAwardPayout, 'league_award', award.name + ' • ' + data.seasonLabel, interaction.user.id).catch(() => null);
+        autoAwardNote += `\n💰 <@${winnerUserId}> was paid **${settingsForAwardPayout.currency_icon || ''} ${otherAwardPayout}** for **${award.name}**.`;
+      }
+      await addRecognitionPoints(interaction.guild.id, winnerUserId, 10, 25, activeLeague.league_id).catch(() => null);
+    }
+  }
+  if (incompleteAwardNames.length) {
+    autoAwardNote += `\n⚠️ Missing team, player name, or a real @mention — nothing was granted for: ${incompleteAwardNames.join(', ')}. Use the format \`Team | Player Name | @User\`.`;
   }
 
   // 7J-61LEAGUEHOF: this is the single function where every franchise_legacy/
@@ -37830,13 +38365,14 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
       championTeam: data.champion, seasonLabel: data.seasonLabel,
     }).catch(() => null);
     for (const award of awardRows) {
+      if (award.incomplete) continue;
       await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'award_winner', {
-        playerName: award.value, awardName: award.name, leagueName: activeLeague.league_name,
+        playerName: `${award.player} (${award.team})`, awardName: award.name, leagueName: activeLeague.league_name,
       }).catch(() => null);
     }
   }
 
-  return { ok: true, message: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.` };
+  return { ok: true, message: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.${autoAwardNote}` };
 }
 
 async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) {
