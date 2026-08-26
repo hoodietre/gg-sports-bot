@@ -6725,7 +6725,7 @@ async function createPlayoffSeriesThreads(guild, league, roundSeries, roundNumbe
       });
       const mentionA = roleA ? `<@&${roleA}>` : `**${series.teamA.name}**`;
       const mentionB = roleB ? `<@&${roleB}>` : `**${series.teamB.name}**`;
-      const payload = buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB);
+      const payload = buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB, league);
       const statusMessage = await thread.send({ content: `${mentionA} ${mentionB}`, ...payload }).catch(() => null);
       series.thread_id = thread.id;
       series.status_message_id = statusMessage?.id || null;
@@ -6747,7 +6747,7 @@ async function createPlayoffSeriesThreads(guild, league, roundSeries, roundNumbe
 // once Game 1 is in, exactly per Hxxdie's third option), and an always-
 // available Report Issue button so a dispute can be raised on any game in
 // the series, not just after it's decided.
-function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB) {
+function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB, league) {
   const nextGameNumber = series.games.length + 1;
   const isComplete = Boolean(series.winner);
   const now = Date.now();
@@ -6763,6 +6763,19 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
     .setColor(isComplete ? 0x57F287 : 0xED4245)
     .setDescription(`${mentionA} vs ${mentionB} — Best of ${series.seriesLength}`)
     .addFields({ name: 'Series Score', value: `${series.teamA.name} ${series.winsA} — ${series.winsB} ${series.teamB.name}`, inline: false });
+
+  // 7J-PLAYOFFLOGOS: per Hxxdie — playoff threads had no team logos at
+  // all, unlike regular season Game Center threads. Same pattern as those:
+  // author icon carries team A, thumbnail carries team B — silently
+  // omitted (not a broken-image icon) for any team this league's sport
+  // doesn't have logo coverage for yet (MLS/EPL), matching every other
+  // logo call site in the bot.
+  if (league) {
+    const teamALogoUrl = getGenericTeamLogoUrl(series.teamA?.name, league);
+    const teamBLogoUrl = series.teamB ? getGenericTeamLogoUrl(series.teamB.name, league) : null;
+    if (teamALogoUrl) embed.setAuthor({ name: `${series.teamA?.name || ''} vs ${series.teamB?.name || 'BYE'}`, iconURL: teamALogoUrl });
+    if (teamBLogoUrl) embed.setThumbnail(teamBLogoUrl);
+  }
 
   if (isComplete) {
     embed.addFields({ name: 'Result', value: `🏆 **${series.winner}** win the series.`, inline: false });
@@ -6874,7 +6887,7 @@ async function refreshPlayoffSeriesThreadMessage(guild, league, series, roundNum
   const message = await thread.messages.fetch(series.status_message_id).catch(() => null);
   if (!message) return;
   const { mentionA, mentionB } = await resolveSeriesTeamMentions(league.league_id, series);
-  const payload = buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB);
+  const payload = buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB, league);
   await message.edit(payload).catch(() => null);
 }
 
@@ -7203,6 +7216,9 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
   const vGap = 28;
   const marginTop = 56;
   const marginLeft = 30;
+  // 7J-PLAYOFFBRACKETLOGOS: per Hxxdie.
+  const logoSize = 28;
+  const logoGap = 8;
 
   const firstRoundCount = rounds[roundNumbers[0]].length;
   const totalHeight = marginTop + firstRoundCount * (boxH + vGap);
@@ -7220,7 +7236,36 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
     });
   }
 
+  // 7J-PLAYOFFBRACKETLOGOS: fetch each unique team's logo once — the same
+  // team shows up in multiple rounds as it advances, so this avoids
+  // re-fetching the same image repeatedly. Same fetch-resize-cache pattern
+  // as renderTeamLogoStripPng; silently skipped (not a broken-image icon)
+  // for any team this league's sport doesn't have logo coverage for yet.
+  const uniqueTeamNames = new Set();
+  roundNumbers.forEach(r => rounds[r].forEach(s => {
+    if (s.teamA?.name) uniqueTeamNames.add(s.teamA.name);
+    if (s.teamB?.name) uniqueTeamNames.add(s.teamB.name);
+  }));
+  const logoBuffers = new Map();
+  await Promise.all([...uniqueTeamNames].map(async name => {
+    const url = getGenericTeamLogoUrl(name, league);
+    if (!url) return;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const arrayBuffer = await res.arrayBuffer();
+      const buf = await sharp(Buffer.from(arrayBuffer))
+        .resize(logoSize, logoSize, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .png()
+        .toBuffer();
+      logoBuffers.set(name, buf);
+    } catch {
+      // No logo for this team — box just renders text-only, same as before.
+    }
+  }));
+
   const parts = [];
+  const composites = [];
 
   for (let ri = 0; ri < roundNumbers.length - 1; ri++) {
     const r = roundNumbers[ri];
@@ -7247,12 +7292,18 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
       const bName = series.bye ? 'BYE' : nameFor(series, 'B');
       const aWon = Boolean(series.winner) && series.winner === series.teamA?.name;
       const bWon = Boolean(series.winner) && series.teamB && series.winner === series.teamB.name;
+      const aLogo = series.teamA ? logoBuffers.get(series.teamA.name) : null;
+      const bLogo = series.teamB ? logoBuffers.get(series.teamB.name) : null;
+      const aTextX = x + 12 + (aLogo ? logoSize + logoGap : 0);
+      const bTextX = x + 12 + (bLogo ? logoSize + logoGap : 0);
       parts.push(`
         <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="8" fill="#2b2d31" stroke="#1e1f22" stroke-width="2"/>
         <line x1="${x}" y1="${yCenter}" x2="${x + boxW}" y2="${yCenter}" stroke="#1e1f22" stroke-width="1"/>
-        <text x="${x + 12}" y="${yCenter - 12}" font-family="DejaVu Sans" font-size="15" font-weight="${aWon ? 'bold' : 'normal'}" fill="${aWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(aName).slice(0, 30)}</text>
-        <text x="${x + 12}" y="${yCenter + 20}" font-family="DejaVu Sans" font-size="15" font-weight="${bWon ? 'bold' : 'normal'}" fill="${bWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(bName).slice(0, 30)}</text>
+        <text x="${aTextX}" y="${yCenter - 12}" font-family="DejaVu Sans" font-size="15" font-weight="${aWon ? 'bold' : 'normal'}" fill="${aWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(aName).slice(0, 30)}</text>
+        <text x="${bTextX}" y="${yCenter + 20}" font-family="DejaVu Sans" font-size="15" font-weight="${bWon ? 'bold' : 'normal'}" fill="${bWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(bName).slice(0, 30)}</text>
       `);
+      if (aLogo) composites.push({ input: aLogo, left: x + 8, top: Math.round(yCenter - 16 - logoSize / 2) });
+      if (bLogo) composites.push({ input: bLogo, left: x + 8, top: Math.round(yCenter + 16 - logoSize / 2) });
     });
   });
 
@@ -7261,7 +7312,10 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
     ${parts.join('\n')}
   </svg>`;
 
-  return sharp(Buffer.from(svg)).png().toBuffer();
+  return sharp({ create: { width: totalWidth, height: totalHeight, channels: 4, background: { r: 30, g: 31, b: 34, alpha: 1 } } })
+    .composite([{ input: Buffer.from(svg) }, ...composites])
+    .png()
+    .toBuffer();
 }
 
 async function updateLeaguePlayoffBracketImage(guild, league, channel, existingMessageId, bracketState) {
