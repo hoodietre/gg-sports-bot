@@ -8067,9 +8067,19 @@ async function selectNflPlayoffTeams(guildId, league, standingsRows) {
   const conferences = [...new Set(withMeta.map(t => t.resolvedConference))];
   const seeded = [];
   for (const conference of conferences) {
+    // 7J-SEEDRANKFIX: per Hxxdie — standingsRows (and therefore inConf,
+    // since filter preserves order) is already sorted by actual record.
+    // Division winners MUST be seeded 1-4 by their OWN record relative to
+    // each other — pulling them via `divisions.map(d => ...)` and seeding
+    // in THAT order instead seeds them by whatever arbitrary order their
+    // divisions happen to appear in this list, which has zero relationship
+    // to who actually has the better record. Re-sorting by their position
+    // in inConf (true rank order) before seeding fixes that; wildcards
+    // were already fine since a plain filter() preserves relative order.
     const inConf = withMeta.filter(t => t.resolvedConference === conference);
     const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
-    const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean);
+    const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean)
+      .sort((a, b) => inConf.indexOf(a) - inConf.indexOf(b));
     const winnerNames = new Set(divisionWinners.map(t => t.team_name));
     const wildcards = inConf.filter(t => !winnerNames.has(t.team_name)).slice(0, 3);
     [...divisionWinners.slice(0, 4), ...wildcards].forEach((team, index) => {
@@ -8081,9 +8091,16 @@ async function selectNflPlayoffTeams(guildId, league, standingsRows) {
 
 // 7J-SPORTPLAYOFFFORMAT: NHL — top 3 per division (2 divisions per
 // conference) auto-qualify (6 of 8 spots), plus the next 2 best conference
-// records outside those top-3s fill the wildcard spots. Seed numbers here
-// are informational; buildInitialPlayoffRound uses qualifyType/division
-// directly since NHL's actual round-1 pairing isn't simple seed-vs-seed.
+// records outside those top-3s fill the wildcard spots.
+// 7J-SEEDRANKFIX: the displayed/returned .seed is the team's TRUE overall
+// rank among all 8 conference qualifiers by actual record — NOT the order
+// they get visited in while building division-then-wildcard groups
+// internally (that grouping order is what qualifyType/divisionRank/
+// wildcardRank exist for, and buildInitialPlayoffRound's NHL branch uses
+// exactly those fields for pairing, never .seed). Conflating the two used
+// to make a team's displayed seed jump around based on which division
+// group it happened to be gathered from, completely disconnected from the
+// Standings panel sitting right next to it.
 async function selectNhlPlayoffTeams(guildId, league, standingsRows) {
   const withMeta = await Promise.all(standingsRows.map(async team => {
     const { conference, division } = await getTeamConferenceDivisionForLeague(guildId, league.league_id, team.team_name, league).catch(() => ({}));
@@ -8098,11 +8115,17 @@ async function selectNhlPlayoffTeams(guildId, league, standingsRows) {
     const autoQualifiers = divisionTop3.flat();
     const autoNames = new Set(autoQualifiers.map(t => t.team_name));
     const wildcards = inConf.filter(t => !autoNames.has(t.team_name)).slice(0, 2);
-    let seed = 1;
+
+    const trueSeedByName = new Map(
+      [...autoQualifiers, ...wildcards]
+        .sort((a, b) => inConf.indexOf(a) - inConf.indexOf(b))
+        .map((t, i) => [t.team_name, i + 1])
+    );
+
     divisionTop3.forEach((teams, divIndex) => {
-      teams.forEach((team, i) => seeded.push({ ...team, seed: seed++, conference, division: divisions[divIndex], qualifyType: i === 0 ? 'division-leader' : 'division-rank', divisionRank: i + 1 }));
+      teams.forEach((team, i) => seeded.push({ ...team, seed: trueSeedByName.get(team.team_name), conference, division: divisions[divIndex], qualifyType: i === 0 ? 'division-leader' : 'division-rank', divisionRank: i + 1 }));
     });
-    wildcards.forEach((team, i) => seeded.push({ ...team, seed: seed++, conference, qualifyType: 'wildcard', wildcardRank: i + 1 }));
+    wildcards.forEach((team, i) => seeded.push({ ...team, seed: trueSeedByName.get(team.team_name), conference, qualifyType: 'wildcard', wildcardRank: i + 1 }));
   }
   return seeded;
 }
@@ -8119,9 +8142,12 @@ async function selectMlbPlayoffTeams(guildId, league, standingsRows) {
   const conferences = [...new Set(withMeta.map(t => t.resolvedConference))];
   const seeded = [];
   for (const conference of conferences) {
+    // 7J-SEEDRANKFIX: same fix as NFL above — division winners re-sorted by
+    // their own position in inConf (true record order) before seeding.
     const inConf = withMeta.filter(t => t.resolvedConference === conference);
     const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
-    const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean);
+    const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean)
+      .sort((a, b) => inConf.indexOf(a) - inConf.indexOf(b));
     const winnerNames = new Set(divisionWinners.map(t => t.team_name));
     const wildcards = inConf.filter(t => !winnerNames.has(t.team_name)).slice(0, 3);
     [...divisionWinners.slice(0, 3), ...wildcards].forEach((team, index) => {
