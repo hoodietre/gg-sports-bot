@@ -72410,9 +72410,12 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
       new ButtonBuilder().setCustomId('commissioner_op:seasonhistory:' + leagueId).setLabel('Season History').setEmoji('📜').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('commissioner_op:activecheck:' + leagueId).setLabel('Active Check').setEmoji('✅').setStyle(ButtonStyle.Success),
     )];
-    if (isStructured) {
-      rows.push(new ActionRowBuilder().addComponents(advanceButton()));
-    }
+    // 7J-5ROWFIX: Discord caps a message at 5 action rows total. Advance
+    // and Start New Season used to each get their own row, which — for a
+    // structured league (row1 + advance + new-season + suspensions/kick +
+    // recruit + back) — added up to 6 and made the whole panel fail to
+    // open at all ("Must be 5 or fewer in length"). Merged onto one shared
+    // row; both are single buttons, plenty of room.
     // 7J-NEWSEASONFLOW: per Hxxdie — leagues need a real way to close out a
     // season (archive standings/playoff result into permanent history,
     // reset current standings to 0-0, generate a fresh schedule next
@@ -72422,9 +72425,10 @@ function buildCommissionerOperationsComponents(leagueId, isMaddenLeague = true, 
     // commissioner might reasonably want to reset mid-season for a do-over;
     // the confirm step (see commissioner_newseason_start handler) is what
     // actually protects against doing this by accident.
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('commissioner_newseason_start:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger),
-    ));
+    const seasonRowButtons = [];
+    if (isStructured) seasonRowButtons.push(advanceButton());
+    seasonRowButtons.push(new ButtonBuilder().setCustomId('commissioner_newseason_start:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger));
+    rows.push(new ActionRowBuilder().addComponents(seasonRowButtons));
     // 7J-97SUSPEND
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('commissioner_op:suspensions:' + leagueId).setLabel('Suspensions').setEmoji('🚫').setStyle(ButtonStyle.Danger),
