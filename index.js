@@ -7072,12 +7072,31 @@ async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winner
       const isFinalRound = roundSeries.length === 1;
       if (isFinalRound) {
         const champion = roundSeries[0].winner;
+        // 7J-AUTOAWARDS: per Hxxdie — championship award grants are fully
+        // automated the instant a champion is decided, not something a
+        // commissioner hand-picks after the fact. Counts prior
+        // championships for whichever owner controls the winning team and
+        // grants the tier they've actually earned.
+        const championRoleResult = await pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, champion]).catch(() => ({ rows: [] }));
+        const championOwner = championRoleResult.rows[0]?.role_id ? await findTeamOwnerByRoleId(guild, championRoleResult.rows[0].role_id).catch(() => null) : null;
+        const awardResult = championOwner ? await autoGrantTieredAward(guild, league, championOwner.id, champion, 'champion').catch(() => null) : null;
+        // 7J-CHAMPIONROLLBACK: per Hxxdie — if a dispute later rolls this
+        // exact result back and the series is replayed with a different
+        // winner, resolvePlayoffDispute needs to know exactly which grant
+        // to revoke so two different owners never end up holding the same
+        // championship item for one title. Stored on the series itself so
+        // it travels with the bracket JSON, no separate table needed.
+        if (awardResult) {
+          roundSeries[0].championAwardInventoryId = awardResult.inventoryId || null;
+          roundSeries[0].championAwardOwnerId = championOwner?.id || null;
+        }
         bracket[roundIndex] = roundSeries;
         await pool.query(
           `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
           [leagueId, JSON.stringify(bracket), champion]
         );
-        statusNote += `\n\n🏆 **${champion}** win the championship!\n\n**Playoffs are complete.** Next steps:\n• Use **Operations → Season History** to record the champion/MVP/awards for this season\n• Use \`/shop grantaward\` to hand out any award cosmetic items (MVP, Champion, Rookie of the Year, etc.)`;
+        const awardNote = awardResult ? `\n🎁 <@${championOwner.id}> was automatically granted **${awardResult.item.item_name}** (Championship Tier ${awardResult.tier}).` : '';
+        statusNote += `\n\n🏆 **${champion}** win the championship!${awardNote}\n\n**Playoffs are complete.** Next steps:\n• Use **Operations → Season History** to record the champion/MVP/other awards for this season — @mentioning the MVP there automatically grants the matching tiered item\n• Use **Start New Season** once you're ready to archive this season and reset for the next one`;
       } else {
         const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
         const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length ? customSettings.playoff_series_lengths : [1];
@@ -7143,6 +7162,20 @@ async function resolvePlayoffDispute(guild, league, seriesId, resolution) {
   series.completedAt = null;
   series.disputed = false;
 
+  // 7J-CHAMPIONROLLBACK: per Hxxdie — if this game had already decided the
+  // championship, the item that was auto-granted for it needs to be
+  // revoked here, before the series gets replayed and (possibly) a
+  // different owner wins the title. Without this, a disputed championship
+  // game with a different outcome the second time around would leave TWO
+  // owners holding the same championship item.
+  let revokedAwardNote = '';
+  if (series.championAwardInventoryId) {
+    await pool.query(`DELETE FROM user_inventory WHERE id = $1`, [series.championAwardInventoryId]).catch(() => null);
+    revokedAwardNote = ` The previously auto-granted championship item for <@${series.championAwardOwnerId}> has been revoked, since this game will be replayed.`;
+    series.championAwardInventoryId = null;
+    series.championAwardOwnerId = null;
+  }
+
   bracket[roundIndex] = bracket[roundIndex].map(s => (s.id === series.id ? series : s));
   let currentRound = bracketState.current_round;
   if (nextRound) {
@@ -7164,7 +7197,7 @@ async function resolvePlayoffDispute(guild, league, seriesId, resolution) {
   await refreshPlayoffSeriesThreadMessage(guild, league, series, roundIndex + 1);
   await refreshPlayoffBracketPanel(guild, league).catch(() => null);
 
-  return { message: `↩️ Rolled back Game ${series.games.length + 1} of this series.${wasComplete && nextRound ? ' The next round (which had no games played yet) was cleared — it will regenerate once this series is decided again.' : ''}` };
+  return { message: `↩️ Rolled back Game ${series.games.length + 1} of this series.${wasComplete && nextRound ? ' The next round (which had no games played yet) was cleared — it will regenerate once this series is decided again.' : ''}${revokedAwardNote}` };
 }
 
 function buildLivePlayoffBracketEmbed(league, bracketState) {
@@ -17681,7 +17714,7 @@ if (interaction.commandName === 'avatar') {
           // straight into Playoffs, and stops promising the unbuilt
           // new-season reset.
           await interaction.editReply({
-            content: `**Regular season complete** — all ${schedule.length} game(s) have been played.\n\nWhen you're ready, head to Playoffs to seed and start the bracket from final standings. Pressing Advance again won't do anything further until playoffs are complete.\n\nOnce a champion is crowned, use **Season History** to record it and \`/shop grantaward\` for any award cosmetics — or use **Start New Season** below once playoffs wrap up to archive this season and reset for the next one.`,
+            content: `**Regular season complete** — all ${schedule.length} game(s) have been played.\n\nWhen you're ready, head to Playoffs to seed and start the bracket from final standings. Pressing Advance again won't do anything further until playoffs are complete.\n\nOnce a champion is crowned, use **Season History** to record it — @mentioning the MVP there automatically grants the matching award — or use **Start New Season** below once playoffs wrap up to archive this season and reset for the next one.`,
             components: [new ActionRowBuilder().addComponents(
               new ButtonBuilder().setCustomId('commissioner_op:playoffs:' + leagueId).setLabel('Go to Playoffs').setEmoji('🏆').setStyle(ButtonStyle.Success),
               new ButtonBuilder().setCustomId('commissioner_newseason_start:' + leagueId).setLabel('Start New Season').setEmoji('🔄').setStyle(ButtonStyle.Danger),
@@ -17813,6 +17846,26 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (action === 'playoffs') {
+        // 7J-MADDENPLAYOFFROUTE: per Hxxdie — Madden leagues already have
+        // their own real, EA-sync-driven end-of-season/playoffs/offseason
+        // flow (/maddenseason yearend, offseasonlock, and the playoff
+        // audits). This button was pointing Madden commissioners at the
+        // exact same generic self-serve bracket/thread/dispute/wager
+        // system built for non-Madden leagues this session — never meant
+        // for Madden at all, since there's no need for self-serve score
+        // reporting when EA sync already provides the real results. Shows
+        // the actual Madden offseason readiness check instead — the real
+        // equivalent of "where do things stand with playoffs" for a
+        // synced league.
+        if (isMaddenLeague(league)) {
+          const readinessEmbed = await buildMaddenOffseasonReadinessEmbed(interaction.guild.id, league).catch(() => null);
+          if (readinessEmbed) {
+            await interaction.reply({ embeds: [readinessEmbed], ephemeral: true });
+          } else {
+            await interaction.reply({ content: 'Madden playoffs and the season-to-offseason transition are tracked automatically through EA sync, not this panel. Once your Super Bowl is final and synced, use `/maddenseason offseasonreadiness` to check status, then `/maddenseason yearend confirm:true` followed by `/maddenseason offseasonlock confirm:true` to move into the new season.', ephemeral: true });
+          }
+          return;
+        }
         const payload = await buildPlayoffsOpsPayload(interaction.guild, league);
         await interaction.reply({ ...payload, ephemeral: true });
         return;
@@ -19599,7 +19652,31 @@ if (interaction.commandName === 'avatar') {
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true }); return; }
       const bracketResult = await pool.query(`SELECT status FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [] }));
       const playoffsInProgress = bracketResult.rows[0]?.status === 'in_progress';
-      const warning = `Starting a new season will:\n• Archive every team's current record and final standing into permanent history (Season History → Team/Career records)\n• Reset every team's record to 0-0 for the new season\n• Clear the schedule so the next **Advance** generates a fresh one${playoffsInProgress ? '\n\n⚠️ **Playoffs are currently in progress.** The bracket will be abandoned with no champion recorded unless you finish it first.' : ''}\n\nThis can\'t be undone. Continue?`;
+      const playoffsCompleted = bracketResult.rows[0]?.status === 'completed';
+
+      // 7J-SEASONHISTORYNUDGE: per Hxxdie — nothing was actually pointing a
+      // commissioner toward Season History before they reset everything;
+      // it only ever showed up as a line of text in a status message they
+      // may have scrolled past weeks earlier. Checked by recency (has a
+      // Season History post happened since the last time this league
+      // archived a season?) rather than matching season_label text exactly
+      // — that label is freeform in the Season History modal and won't
+      // necessarily match the auto-generated "Season N" archival uses.
+      // Only shown once playoffs have actually produced a champion —
+      // skipped while playoffs are still in progress, where the separate
+      // "playoffs will be abandoned" warning already covers it.
+      let missingSeasonHistoryWarning = '';
+      if (playoffsCompleted) {
+        const historyCheck = await pool.query(
+          `SELECT COUNT(*)::int AS n FROM season_history WHERE league_id = $1 AND created_at > COALESCE((SELECT MAX(archived_at) FROM team_season_history WHERE league_id = $1), '1970-01-01'::timestamp)`,
+          [leagueId]
+        ).catch(() => ({ rows: [{ n: 0 }] }));
+        if (!Number(historyCheck.rows[0]?.n || 0)) {
+          missingSeasonHistoryWarning = `\n\n⚠️ **You haven't posted Season History for this season yet.** The champion is archived automatically either way, but MVP and any other awards only get recorded if you do that first — they won't be preserved once you continue. Consider doing that now instead.`;
+        }
+      }
+
+      const warning = `Starting a new season will:\n• Archive every team's current record and final standing into permanent history (Season History → Team/Career records)\n• Reset every team's record to 0-0 for the new season\n• Clear the schedule so the next **Advance** generates a fresh one${playoffsInProgress ? '\n\n⚠️ **Playoffs are currently in progress.** The bracket will be abandoned with no champion recorded unless you finish it first.' : ''}${missingSeasonHistoryWarning}\n\nThis can\'t be undone. Continue?`;
       await interaction.reply({
         content: warning,
         components: [new ActionRowBuilder().addComponents(
@@ -19632,10 +19709,25 @@ if (interaction.commandName === 'avatar') {
       const bracketState = bracketResult.rows[0] || null;
       const bracket = bracketState?.bracket || [];
       const championTeam = bracketState?.status === 'completed' ? bracketState.champion_team : null;
-      // 7J-AUTOAWARDS: whoever was designated MVP this season (via
-      // Designate MVP — the item itself was already auto-granted the
-      // moment they were designated; this just archives the record so
-      // future tier counts stay accurate).
+
+      // 7J-CHAMPIONTHREADCLEANUP: per Hxxdie — the championship-deciding
+      // thread is the one round the normal sweep (completed round + a
+      // NEXT round that's unlocked) never reaches, since there's no round
+      // after the final. Starting a new season is the natural point to
+      // finally clear it out — the whole season it belonged to is being
+      // archived right here anyway.
+      if (bracket.length) {
+        const finalRound = bracket[bracket.length - 1];
+        for (const series of finalRound || []) {
+          if (series.bye || !series.thread_id) continue;
+          const thread = await interaction.guild.channels.fetch(series.thread_id).catch(() => null);
+          if (thread?.isThread?.()) await thread.delete('GG Sports: new season started, championship thread cleanup').catch(() => null);
+        }
+      }
+      // 7J-AUTOAWARDS: whoever was designated MVP this season (via the
+      // MVP field in Season History — the item itself was already
+      // auto-granted the moment that was submitted; this just archives
+      // the record so future tier counts stay accurate).
       const archivalCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const mvpUserId = archivalCustomSettings.current_season_mvp_user_id || null;
 
@@ -36395,7 +36487,11 @@ async function autoGrantTieredAward(guild, league, ownerId, teamName, triggerTyp
   // postLeagueSeasonHistory (Season History) already posts league_champion
   // and award_winner news for every award, MVP included. Posting again here
   // would duplicate it. This function's only job is the item grant itself.
-  return { item, tier: targetTier };
+  // 7J-CHAMPIONROLLBACK: inventoryId is returned so the champion-decided
+  // branch in recordPlayoffGameResult can track exactly which grant to
+  // revoke if a dispute later rolls back this result with a different
+  // winner — see resolvePlayoffDispute.
+  return { item, tier: targetTier, inventoryId: grantResult.inventoryId };
 }
 
 // Grants a specific gift item to a specific user, once. Dedupes by checking whether
