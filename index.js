@@ -6871,6 +6871,11 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
       .setStyle(ButtonStyle.Success)
       .setDisabled(isComplete),
     new ButtonBuilder()
+      .setCustomId(`playoffseries_stream:${series.id}`)
+      .setLabel('Stream Hub')
+      .setEmoji('📺')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
       .setCustomId(`playoffseries_gamestarted:${series.id}`)
       .setLabel('Game Started')
       .setEmoji('🔒')
@@ -6882,11 +6887,6 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
       .setEmoji('🔨')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(isComplete),
-    new ButtonBuilder()
-      .setCustomId(`playoffseries_stream:${series.id}`)
-      .setLabel('Stream Hub')
-      .setEmoji('📺')
-      .setStyle(ButtonStyle.Secondary),
   ];
   return { embeds: [embed], components: [new ActionRowBuilder().addComponents(row1), new ActionRowBuilder().addComponents(row2)] };
 }
