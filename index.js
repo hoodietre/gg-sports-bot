@@ -34340,11 +34340,32 @@ async function buildGameCenterMatchupInfoEmbed(guildId, league, game, homeOwnerI
   if (infoAwayLogoUrl) embed.setAuthor({ name: `${game.away_team_name} @ ${game.home_team_name}`, iconURL: infoAwayLogoUrl });
   if (infoHomeLogoUrl) embed.setThumbnail(infoHomeLogoUrl);
 
+  // 7J-H2HSCHEDULEDCHECK: per Hxxdie — "No previous meetings this season"
+  // was showing even when these two teams WERE scheduled to play and it
+  // just never got reported (Reset Game, or simply never scored) — a real,
+  // meaningfully different situation from never having been matched up at
+  // all. A full round-robin schedule guarantees every pair meets exactly
+  // once, so zero 'final' results doesn't mean zero scheduled games.
+  let scheduledUnreportedLabel = null;
+  if (!headToHead.games) {
+    const scheduleCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+    const schedule = Array.isArray(scheduleCustomSettings.schedule) ? scheduleCustomSettings.schedule : [];
+    for (let i = 0; i < schedule.length; i++) {
+      const matchup = (schedule[i] || []).find(m =>
+        (m.home?.role_id === game.home_team_role_id && m.away?.role_id === game.away_team_role_id) ||
+        (m.home?.role_id === game.away_team_role_id && m.away?.role_id === game.home_team_role_id)
+      );
+      if (matchup) { scheduledUnreportedLabel = `Game ${i + 1}`; break; }
+    }
+  }
+
   embed.addFields({
     name: 'Head-to-Head (this season)',
     value: headToHead.games
       ? `${game.home_team_name} ${headToHead.homeWins} - ${headToHead.awayWins} ${game.away_team_name} (last ${headToHead.games} meeting${headToHead.games === 1 ? '' : 's'})`
-      : 'No previous meetings this season.',
+      : scheduledUnreportedLabel
+        ? `Scheduled for **${scheduledUnreportedLabel}** — no score reported yet.`
+        : 'Not on the schedule this season.',
     inline: false,
   });
 
@@ -70528,11 +70549,20 @@ function startSportsbookBettingLockLoop(client) {
 // Skips any round with an active dispute (never delete a thread staff might
 // still need to review) and tracks per-series threadDeleted so a sweep tick
 // never re-attempts a thread that's already gone.
+//
+// 7J-PLAYOFFUNLOCKREFRESH: also handles a separate, real bug — a series'
+// Report Score button disabled state is baked into the message at
+// send/edit time. Nothing was ever re-editing that message purely because
+// the clock passed unlocksAt (only an actual game report or dispute
+// triggered a re-render), so the button stayed visibly — and actually —
+// unclickable well past its real unlock time, even though the server-side
+// check would have allowed it. Tracks series.unlockRefreshed so this only
+// ever re-renders the message once per series, not every tick forever.
 async function sweepPlayoffRoundThreadCleanup(client) {
   const bracketsResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE status = 'in_progress'`).catch(() => ({ rows: [] }));
   for (const bracketState of bracketsResult.rows) {
     const bracket = Array.isArray(bracketState.bracket) ? bracketState.bracket : [];
-    if (bracket.length < 2) continue; // no next round exists yet — nothing to clean up
+    if (!bracket.length) continue;
 
     const league = await getLeagueById(bracketState.league_id).catch(() => null);
     if (!league) continue;
@@ -70540,27 +70570,45 @@ async function sweepPlayoffRoundThreadCleanup(client) {
     if (!guild) continue;
 
     let bracketMutated = false;
-    for (let ri = 0; ri < bracket.length - 1; ri++) {
+
+    // Unlock refresh — every round, not just ones with a "next round"
+    // after them, since this just fixes stale button state.
+    for (let ri = 0; ri < bracket.length; ri++) {
       const round = bracket[ri];
-      const nextRound = bracket[ri + 1];
-      if (!round?.length || !nextRound?.length) continue;
-      if (!round.every(s => s.winner)) continue; // round isn't actually complete
-      if (round.some(s => s.disputed)) continue; // active dispute — leave the thread alone
-      if (round.every(s => s.bye || s.threadDeleted)) continue; // already cleaned up
-
-      const nextUnlocksAt = nextRound.find(s => s.unlocksAt)?.unlocksAt;
-      if (!nextUnlocksAt || new Date(nextUnlocksAt).getTime() > Date.now()) continue; // window still open
-
+      if (!round?.length) continue;
       for (const series of round) {
-        if (series.bye || series.threadDeleted) { series.threadDeleted = true; continue; }
-        if (series.thread_id) {
-          const thread = await guild.channels.fetch(series.thread_id).catch(() => null);
-          if (thread?.isThread?.()) await thread.delete('GG Sports: playoff dispute window closed, round thread cleanup').catch(() => null);
-        }
-        series.threadDeleted = true;
+        if (series.bye || series.winner || series.unlockRefreshed || !series.unlocksAt) continue;
+        if (new Date(series.unlocksAt).getTime() > Date.now()) continue; // still actually locked
+        await refreshPlayoffSeriesThreadMessage(guild, league, series, ri + 1).catch(() => null);
+        series.unlockRefreshed = true;
         bracketMutated = true;
       }
     }
+
+    if (bracket.length >= 2) {
+      for (let ri = 0; ri < bracket.length - 1; ri++) {
+        const round = bracket[ri];
+        const nextRound = bracket[ri + 1];
+        if (!round?.length || !nextRound?.length) continue;
+        if (!round.every(s => s.winner)) continue; // round isn't actually complete
+        if (round.some(s => s.disputed)) continue; // active dispute — leave the thread alone
+        if (round.every(s => s.bye || s.threadDeleted)) continue; // already cleaned up
+
+        const nextUnlocksAt = nextRound.find(s => s.unlocksAt)?.unlocksAt;
+        if (!nextUnlocksAt || new Date(nextUnlocksAt).getTime() > Date.now()) continue; // window still open
+
+        for (const series of round) {
+          if (series.bye || series.threadDeleted) { series.threadDeleted = true; continue; }
+          if (series.thread_id) {
+            const thread = await guild.channels.fetch(series.thread_id).catch(() => null);
+            if (thread?.isThread?.()) await thread.delete('GG Sports: playoff dispute window closed, round thread cleanup').catch(() => null);
+          }
+          series.threadDeleted = true;
+          bracketMutated = true;
+        }
+      }
+    }
+
     if (bracketMutated) {
       await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [bracketState.league_id, JSON.stringify(bracket)]).catch(() => null);
     }
