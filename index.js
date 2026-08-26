@@ -7515,34 +7515,53 @@ async function getTeamConferenceDivisionForLeague(guildId, leagueId, teamName, l
     [String(leagueId), teamName]
   ).catch(() => ({ rows: [] }));
   const row = result.rows?.[0];
-  if (row && (row.conference || row.division)) return { conference: row.conference || null, division: row.division || null };
-  // 7J-CONFCOLLISION: per Hxxdie — the old hardcoded NBA name-substring
-  // fallback ran for every league regardless of sport, not just NBA. NHL's
-  // Chicago Blackhawks ("...Hawks") and Los Angeles Kings ("...Kings") both
-  // happen to contain an NBA team nickname (Atlanta Hawks, Sacramento
-  // Kings) as a literal substring, so they were silently getting
-  // auto-assigned to Eastern/Western conference before anyone had touched
-  // conference assignment at all.
-  // 7J-ALLLEAGUECONF: extended the same auto-detect idea to NHL, NFL, and
-  // MLB (their conference/division structure is fixed and well known,
-  // unlike MLS which realigns yearly and is deliberately left out — see
-  // the table comments above). Every lookup here is EXACT full-name
-  // matching only, never substring, to make sure the Blackhawks/Kings bug
-  // class can't happen again for any of these.
-  const normalizedName = String(teamName || '').trim().toLowerCase();
-  if (league && isNbaLeague(league)) {
-    return { conference: getTeamConference(teamName), division: null };
+  let conference = row?.conference || null;
+  let division = row?.division || null;
+
+  // 7J-CONFDIVMERGE: per Hxxdie — this used to return as soon as EITHER
+  // field was set manually, which meant a league with conference assigned
+  // but division never touched (a very normal partial setup — conference
+  // has its own UI, division doesn't) permanently blocked the real-world
+  // auto-detect table below from ever filling in the missing division.
+  // Playoff seeding for NHL/NFL/MLB specifically needs BOTH pieces to build
+  // the real divisional bracket; a bracket that silently fell back to a
+  // generic pairing because only division was missing (conference was
+  // already right) was confusing — the bracket LOOKED conference-correct,
+  // which hid that anything was wrong at all. Now fills in just the gap,
+  // not an all-or-nothing choice between "trust the manual data" and
+  // "trust the auto-detect table."
+  if (!conference || !division) {
+    // 7J-CONFCOLLISION: per Hxxdie — the old hardcoded NBA name-substring
+    // fallback ran for every league regardless of sport, not just NBA. NHL's
+    // Chicago Blackhawks ("...Hawks") and Los Angeles Kings ("...Kings") both
+    // happen to contain an NBA team nickname (Atlanta Hawks, Sacramento
+    // Kings) as a literal substring, so they were silently getting
+    // auto-assigned to Eastern/Western conference before anyone had touched
+    // conference assignment at all.
+    // 7J-ALLLEAGUECONF: extended the same auto-detect idea to NHL, NFL, and
+    // MLB (their conference/division structure is fixed and well known,
+    // unlike MLS which realigns yearly and is deliberately left out — see
+    // the table comments above). Every lookup here is EXACT full-name
+    // matching only, never substring, to make sure the Blackhawks/Kings bug
+    // class can't happen again for any of these.
+    const normalizedName = String(teamName || '').trim().toLowerCase();
+    let autoDetected = null;
+    if (league && isNbaLeague(league)) {
+      autoDetected = { conference: getTeamConference(teamName), division: null };
+    } else if (league && isNhlLeague(league) && NHL_TEAM_CONF_DIV.has(normalizedName)) {
+      autoDetected = NHL_TEAM_CONF_DIV.get(normalizedName);
+    } else if (league && isNflLeague(league) && NFL_TEAM_CONF_DIV.has(normalizedName)) {
+      autoDetected = NFL_TEAM_CONF_DIV.get(normalizedName);
+    } else if (league && isMlbLeague(league) && MLB_TEAM_CONF_DIV.has(normalizedName)) {
+      autoDetected = MLB_TEAM_CONF_DIV.get(normalizedName);
+    }
+    if (autoDetected) {
+      conference = conference || autoDetected.conference || null;
+      division = division || autoDetected.division || null;
+    }
   }
-  if (league && isNhlLeague(league) && NHL_TEAM_CONF_DIV.has(normalizedName)) {
-    return NHL_TEAM_CONF_DIV.get(normalizedName);
-  }
-  if (league && isNflLeague(league) && NFL_TEAM_CONF_DIV.has(normalizedName)) {
-    return NFL_TEAM_CONF_DIV.get(normalizedName);
-  }
-  if (league && isMlbLeague(league) && MLB_TEAM_CONF_DIV.has(normalizedName)) {
-    return MLB_TEAM_CONF_DIV.get(normalizedName);
-  }
-  return { conference: null, division: null };
+
+  return { conference, division };
 }
 
 function calculateStandingsPointsForLeague(league, wins, losses, ties = 0, customSettings = null, otl = 0) {
