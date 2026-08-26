@@ -6822,6 +6822,12 @@ function buildPlayoffSeriesStatusPayload(series, roundNumber, mentionA, mentionB
       .setEmoji('🔨')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(isComplete),
+    new ButtonBuilder()
+      .setCustomId(`playoffseries_wager:${series.id}`)
+      .setLabel('Wager')
+      .setEmoji('💰')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(isComplete),
   ];
   return { embeds: [embed], components: [new ActionRowBuilder().addComponents(row1), new ActionRowBuilder().addComponents(row2)] };
 }
@@ -6943,6 +6949,13 @@ async function recordPlayoffGameResult(guild, league, leagueId, seriesId, winner
     const gameWinnerOwnerId = winnerSide === 'A' ? ownerA.id : ownerB.id;
     await recordUserHeadToHead(guild.id, ownerA.id, ownerB.id, gameWinnerOwnerId);
   }
+
+  // 7J-PLAYOFFWAGER: settle any accepted wager tied to this specific game —
+  // reuses settleGameWager's forced-winner path (playoff games are win/loss
+  // only, no numeric score to compare the way regular season does).
+  const winningTeamName = winnerSide === 'A' ? series.teamA.name : series.teamB.name;
+  await settleGameWager(guild, { id: seriesId, home_team: series.teamA.name, away_team: series.teamB.name }, winningTeamName)
+    .catch(err => console.error('[Playoffs] Wager settlement failed:', err?.message || err));
 
   // 7J-PLAYOFFSPORTSBOOK: settle this game's line (relies on
   // autoSettleSportsbookForLeagueGame's existing home/away-label fallback
@@ -7202,11 +7215,18 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
   const rounds = {};
   roundNumbers.forEach(i => { rounds[i] = bracket[i] || []; });
 
+  // 7J-PLAYOFFBRACKETSEEDS: per Hxxdie — show each team's seed next to
+  // their name. Only ever populated on the objects that actually carry it
+  // (round 1 always does; later rounds only do for NFL's reseed step,
+  // which is the one format where seed stays relevant past round 1) — a
+  // team with no seed on record just renders without the prefix, same
+  // graceful fallback as the logo.
   const nameFor = (series, side) => {
     const team = side === 'A' ? series.teamA : series.teamB;
     if (!team) return series.bye ? '' : 'TBD';
     const wins = side === 'A' ? series.winsA : series.winsB;
-    const label = team.name || 'Team';
+    const seedPrefix = Number.isFinite(Number(team.seed)) ? `#${team.seed} ` : '';
+    const label = `${seedPrefix}${team.name || 'Team'}`;
     return Number.isFinite(Number(wins)) ? `${label} (${wins})` : label;
   };
 
@@ -7219,13 +7239,48 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
   // 7J-PLAYOFFBRACKETLOGOS: per Hxxdie.
   const logoSize = 28;
   const logoGap = 8;
+  // 7J-PLAYOFFBRACKETCONF: per Hxxdie — round 1 series are already ordered
+  // conference-by-conference (see buildInitialPlayoffRound), so grouping
+  // them visually is purely a layout question, not a data question. Extra
+  // vertical gap + a label wherever the conference changes; later rounds
+  // inherit correct spacing automatically since their Y positions are just
+  // the average of their two round-1-descended parents.
+  const conferenceGapExtra = 40;
+  const conferenceLabelHeight = 24;
 
-  const firstRoundCount = rounds[roundNumbers[0]].length;
-  const totalHeight = marginTop + firstRoundCount * (boxH + vGap);
+  const round1Series = rounds[roundNumbers[0]];
+  const hasConferenceLabels = new Set(round1Series.map(s => s.conference).filter(Boolean)).size > 1;
+
+  let cursorY = marginTop;
+  const round1Centers = [];
+  const conferenceLabelParts = [];
+  let lastConference;
+  round1Series.forEach((s, i) => {
+    const conf = s.conference || null;
+    if (hasConferenceLabels && conf !== lastConference) {
+      if (i > 0) cursorY += conferenceGapExtra;
+      conferenceLabelParts.push(`<text x="${marginLeft}" y="${cursorY + 16}" font-family="DejaVu Sans" font-size="14" font-weight="bold" fill="#5865F2">${leaguePlayoffBracketEscapeXml(conf || 'Other')}</text>`);
+      cursorY += conferenceLabelHeight;
+      lastConference = conf;
+    }
+    round1Centers.push(cursorY + boxH / 2);
+    cursorY += boxH + vGap;
+  });
+  const totalHeight = cursorY - vGap;
+  // 7J-PLAYOFFBRACKETROUNDLABEL: per Hxxdie — "Final" was showing on
+  // Round 1 of a 16-team bracket because the label was computed off how
+  // many rounds exist IN THE DATA SO FAR (just 1, since later rounds
+  // haven't been generated yet), not how many rounds this bracket will
+  // actually take to reach a champion. A single-elimination bracket from N
+  // round-1 teams always needs ceil(log2(N)) rounds regardless of internal
+  // conference/division structure, so this derives the real total up front
+  // instead of waiting for every round to exist first.
+  const round1TeamCount = round1Series.reduce((sum, s) => sum + (s.teamB ? 2 : 1), 0);
+  const trueTotalRounds = Math.max(roundNumbers.length, Math.ceil(Math.log2(Math.max(2, round1TeamCount))));
+
   const totalWidth = marginLeft * 2 + roundNumbers.length * boxW + (roundNumbers.length - 1) * roundGapX;
 
-  const centers = {};
-  centers[roundNumbers[0]] = rounds[roundNumbers[0]].map((s, i) => marginTop + i * (boxH + vGap) + boxH / 2);
+  const centers = { [roundNumbers[0]]: round1Centers };
   for (let ri = 1; ri < roundNumbers.length; ri++) {
     const r = roundNumbers[ri];
     const prev = centers[roundNumbers[ri - 1]];
@@ -7264,7 +7319,7 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
     }
   }));
 
-  const parts = [];
+  const parts = [...conferenceLabelParts];
   const composites = [];
 
   for (let ri = 0; ri < roundNumbers.length - 1; ri++) {
@@ -7284,7 +7339,7 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
 
   roundNumbers.forEach((r, ri) => {
     const x = marginLeft + ri * (boxW + roundGapX);
-    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${leaguePlayoffBracketEscapeXml(tournamentBracketRoundLabel(r + 1, roundNumbers.length, ri))}</text>`);
+    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${leaguePlayoffBracketEscapeXml(tournamentBracketRoundLabel(r + 1, trueTotalRounds, ri))}</text>`);
     rounds[r].forEach((series, i) => {
       const yCenter = centers[r][i];
       const y = yCenter - boxH / 2;
@@ -7299,8 +7354,8 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
       parts.push(`
         <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="8" fill="#2b2d31" stroke="#1e1f22" stroke-width="2"/>
         <line x1="${x}" y1="${yCenter}" x2="${x + boxW}" y2="${yCenter}" stroke="#1e1f22" stroke-width="1"/>
-        <text x="${aTextX}" y="${yCenter - 12}" font-family="DejaVu Sans" font-size="15" font-weight="${aWon ? 'bold' : 'normal'}" fill="${aWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(aName).slice(0, 30)}</text>
-        <text x="${bTextX}" y="${yCenter + 20}" font-family="DejaVu Sans" font-size="15" font-weight="${bWon ? 'bold' : 'normal'}" fill="${bWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(bName).slice(0, 30)}</text>
+        <text x="${aTextX}" y="${yCenter - 12}" font-family="DejaVu Sans" font-size="15" font-weight="${aWon ? 'bold' : 'normal'}" fill="${aWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(aName).slice(0, 34)}</text>
+        <text x="${bTextX}" y="${yCenter + 20}" font-family="DejaVu Sans" font-size="15" font-weight="${bWon ? 'bold' : 'normal'}" fill="${bWon ? '#3ba55d' : '#dcddde'}">${leaguePlayoffBracketEscapeXml(bName).slice(0, 34)}</text>
       `);
       if (aLogo) composites.push({ input: aLogo, left: x + 8, top: Math.round(yCenter - 16 - logoSize / 2) });
       if (bLogo) composites.push({ input: bLogo, left: x + 8, top: Math.round(yCenter + 16 - logoSize / 2) });
@@ -19862,6 +19917,123 @@ if (interaction.commandName === 'avatar') {
       await interaction.update({ content: 'Recording...', components: [] });
       const result = await recordPlayoffGameResult(interaction.guild, league, league.league_id, seriesId, side, { force: true });
       await interaction.editReply({ content: (result.ok ? '🔨 ' : '') + result.message });
+      return;
+    }
+
+    // 7J-PLAYOFFWAGER: per Hxxdie — playoff threads were missing Wager.
+    // game_wagers.game_id isn't actually a foreign key into league_games
+    // (just a bare UUID), so a playoff series id works as the "game" this
+    // wager is tied to without needing any schema change — settlement (see
+    // recordPlayoffGameResult) reuses the exact same settleGameWager
+    // function regular season uses, just always via its forced-winner path
+    // since playoff games are win/loss only, no numeric score to compare.
+    // gamewager_accept:/gamewager_decline: are already generic (keyed by
+    // wager id, not game id) and need no changes at all.
+    if (interaction.isButton() && interaction.customId.startsWith('playoffseries_wager:')) {
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.reply({ content: 'That series could not be found.', ephemeral: true }); return; }
+      const { league, series } = lookup;
+      if (series.winner) { await interaction.reply({ content: 'This series is already complete.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      if (!customSettings.wagers_enabled) {
+        await interaction.reply({ content: 'Wagers are not enabled for this league — a commissioner can turn them on under League Settings → Wagers.', ephemeral: true });
+        return;
+      }
+      const [roleAResult, roleBResult] = await Promise.all([
+        pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamA.name]).catch(() => ({ rows: [] })),
+        series.teamB ? pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamB.name]).catch(() => ({ rows: [] })) : { rows: [] },
+      ]);
+      const roleA = roleAResult.rows[0]?.role_id;
+      const roleB = roleBResult.rows[0]?.role_id;
+      const [ownerA, ownerB] = await Promise.all([
+        roleA ? findTeamOwnerByRoleId(interaction.guild, roleA).catch(() => null) : null,
+        roleB ? findTeamOwnerByRoleId(interaction.guild, roleB).catch(() => null) : null,
+      ]);
+      const userId = interaction.user.id;
+      const isA = ownerA?.id === userId;
+      const isB = ownerB?.id === userId;
+      if (!isA && !isB) {
+        await interaction.reply({ content: 'Only the two teams in this series can propose a wager.', ephemeral: true });
+        return;
+      }
+      const opponent = isA ? ownerB : ownerA;
+      if (!opponent) {
+        await interaction.reply({ content: 'The other team doesn\'t have an assigned owner yet — a wager needs both sides.', ephemeral: true });
+        return;
+      }
+      const existing = await pool.query(`SELECT id FROM game_wagers WHERE game_id = $1 AND status IN ('pending','accepted') LIMIT 1`, [seriesId]);
+      if (existing.rows.length) {
+        await interaction.reply({ content: 'There\'s already a pending or accepted wager for this series.', ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder()
+        .setCustomId(`playoffseries_wager_modal:${seriesId}`)
+        .setTitle('Propose a Wager')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Wager amount').setStyle(TextInputStyle.Short).setRequired(true))
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('playoffseries_wager_modal:')) {
+      await interaction.deferReply();
+      const seriesId = interaction.customId.split(':')[1];
+      const lookup = await findPlayoffSeriesById(interaction.guild.id, seriesId);
+      if (!lookup) { await interaction.editReply({ content: 'That series could not be found anymore.' }); return; }
+      const { league, series } = lookup;
+      const [roleAResult, roleBResult] = await Promise.all([
+        pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamA.name]).catch(() => ({ rows: [] })),
+        series.teamB ? pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [league.league_id, series.teamB.name]).catch(() => ({ rows: [] })) : { rows: [] },
+      ]);
+      const roleA = roleAResult.rows[0]?.role_id;
+      const roleB = roleBResult.rows[0]?.role_id;
+      const [ownerA, ownerB] = await Promise.all([
+        roleA ? findTeamOwnerByRoleId(interaction.guild, roleA).catch(() => null) : null,
+        roleB ? findTeamOwnerByRoleId(interaction.guild, roleB).catch(() => null) : null,
+      ]);
+      const userId = interaction.user.id;
+      const isA = ownerA?.id === userId;
+      const proposer = isA ? ownerA : ownerB;
+      const opponent = isA ? ownerB : ownerA;
+      if (!proposer || !opponent) { await interaction.editReply({ content: 'Could not resolve both owners for this series anymore.' }); return; }
+
+      const amount = Number.parseInt(interaction.fields.getTextInputValue('amount'), 10);
+      if (!Number.isInteger(amount) || amount <= 0) {
+        await interaction.editReply({ content: 'Wager amount must be a positive whole number.' });
+        return;
+      }
+      const proposerBalance = await getBalance(interaction.guild.id, userId);
+      const maxAllowed = Math.floor(Number(proposerBalance.balance || 0) / 2);
+      if (amount > maxAllowed) {
+        await interaction.editReply({ content: `You can't wager more than 50% of your balance (max **${maxAllowed}** — you have **${proposerBalance.balance}**).` });
+        return;
+      }
+
+      const wagerId = randomUUID();
+      await pool.query(
+        `INSERT INTO game_wagers (id, guild_id, league_id, game_id, proposer_user_id, proposer_team, opponent_user_id, opponent_team, amount)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [wagerId, interaction.guild.id, league.league_id, seriesId, userId, isA ? series.teamA.name : series.teamB.name, opponent.id, isA ? series.teamB.name : series.teamA.name, amount]
+      );
+
+      const settings = await getCurrencySettings(interaction.guild.id).catch(() => ({ currency_icon: '🪙' }));
+      const embed = new EmbedBuilder()
+        .setTitle('💰 Wager Proposed')
+        .setColor(0xFEE75C)
+        .setDescription(`<@${userId}> is proposing a wager against <@${opponent.id}>.`)
+        .addFields(
+          { name: 'Amount (each)', value: `${settings.currency_icon} ${amount}`, inline: true },
+          { name: 'Winner Takes', value: `${settings.currency_icon} ${amount * 2}`, inline: true },
+        )
+        .setFooter({ text: 'GG Sports • Nothing to do with the sportsbook — just between these two owners' })
+        .setTimestamp();
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`gamewager_accept:${wagerId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`gamewager_decline:${wagerId}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
+      );
+      await interaction.editReply({ content: `<@${opponent.id}>`, embeds: [embed], components: [buttons] });
       return;
     }
 
