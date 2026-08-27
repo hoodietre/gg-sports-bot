@@ -10983,6 +10983,40 @@ function seasonHistoryTargetLabel(session) {
   return configured?.label || session.pendingTarget;
 }
 
+// 7J-SEASONHISTORYTEAMSEARCH: per Hxxdie — a StringSelectMenu hard-caps at
+// 25 options, so a league with more teams than that was silently losing
+// every team past the 25th alphabetically. Search Teams is always offered
+// alongside the dropdown (not just as a >25 fallback) so it's consistently
+// available regardless of league size.
+async function buildSeasonHistoryTeamPickerPayload(token, session, query = null) {
+  const params = [session.leagueId];
+  let whereClause = 'league_id = $1';
+  if (query) {
+    whereClause += ' AND role_name ILIKE $2';
+    params.push(`%${query}%`);
+  }
+  const teams = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE ${whereClause} ORDER BY role_name ASC LIMIT 25`, params).catch(() => ({ rows: [] }));
+
+  const components = [];
+  if (teams.rows.length) {
+    const teamMenu = new StringSelectMenuBuilder()
+      .setCustomId('seasonhistory_pick_team:' + token)
+      .setPlaceholder(query ? `Results for "${query}"` : 'Which team?')
+      .addOptions(teams.rows.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
+    components.push(new ActionRowBuilder().addComponents(teamMenu));
+  }
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('seasonhistory_teamsearch:' + token).setLabel(query ? 'Search Again' : 'Search Teams').setEmoji('🔍').setStyle(ButtonStyle.Secondary)
+  ));
+
+  let content = `Setting: **${seasonHistoryTargetLabel(session)}** — `;
+  if (query && !teams.rows.length) content += `no teams matched "${query}". Try a different search.`;
+  else if (query) content += `results for "${query}" — pick the team below, or search again.`;
+  else content += `pick the team below, or use **Search Teams** if you don't see it (this league may have more teams than fit in one list).`;
+
+  return { content, embeds: [], components };
+}
+
 // 7J-SEASONHISTORYV2: the wizard's home screen — shows current progress
 // (champion set/not, each configured award set/not) and a select menu to
 // pick what to fill in next. Re-shown after every pick completes, same
@@ -20912,17 +20946,47 @@ if (interaction.commandName === 'avatar') {
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to add season history.', ephemeral: true }); return; }
       const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const token = randomBytes(6).toString('hex');
+
+      // 7J-SEASONHISTORYAUTOFILL: per Hxxdie — the bot already knows the
+      // champion and runner-up from the completed playoff bracket, so ask
+      // instead of making the commissioner re-enter data that's already on
+      // record. Still fully editable afterward through the normal pick
+      // flow, in case the bracket data is wrong or the league wants to
+      // override it.
+      let autoFilledChampion = null;
+      let autoFilledRunnerUp = null;
+      let autoFillNote = '';
+      const bracketResult = await pool.query(`SELECT bracket, status FROM league_playoff_brackets WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [] }));
+      const bracketState = bracketResult.rows[0];
+      if (bracketState?.status === 'completed' && Array.isArray(bracketState.bracket) && bracketState.bracket.length) {
+        const finalSeries = bracketState.bracket[bracketState.bracket.length - 1]?.[0];
+        if (finalSeries?.winner) {
+          const championTeamName = finalSeries.winner;
+          autoFilledRunnerUp = finalSeries.teamA?.name === championTeamName ? finalSeries.teamB?.name : finalSeries.teamA?.name;
+          const roleResult = await pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, championTeamName]).catch(() => ({ rows: [] }));
+          const owner = roleResult.rows[0]?.role_id ? await findTeamOwnerByRoleId(interaction.guild, roleResult.rows[0].role_id).catch(() => null) : null;
+          if (owner) {
+            autoFilledChampion = { team: championTeamName, userId: owner.id };
+            autoFillNote = '\n✅ Champion and Runner-Up were auto-filled from the completed playoff bracket — review and change below if needed.';
+          } else if (autoFilledRunnerUp) {
+            autoFillNote = `\n✅ Runner-Up was auto-filled from the bracket. Champion team is **${championTeamName}** but no owner could be resolved for it — set the champion manually.`;
+          }
+        }
+      }
+
       commissionerSeasonHistorySessions.set(token, {
         leagueId,
         seasonLabel: interaction.fields.getTextInputValue('season'),
         trophyName: getChampionshipTrophyName(league, customSettings),
         leagueAwardsConfig: Array.isArray(customSettings.awards) ? customSettings.awards : [],
-        champion: null, // { team, userId }
+        champion: autoFilledChampion, // { team, userId }
+        runnerUp: autoFilledRunnerUp,
         awards: {}, // key -> { label, team, player, userId }
         notes: null,
-        pendingTarget: null, // 'champion' | award key — what team/user select is currently filling in
+        pendingTarget: null, // 'champion' | 'runnerup' | award key — what team/user select is currently filling in
       });
-      await interaction.reply({ ...buildSeasonHistoryWizardPayload(token), ephemeral: true });
+      const payload = buildSeasonHistoryWizardPayload(token);
+      await interaction.reply({ ...payload, content: (payload.content || '') + autoFillNote, ephemeral: true });
       return;
     }
 
@@ -20931,15 +20995,35 @@ if (interaction.commandName === 'avatar') {
       const session = commissionerSeasonHistorySessions.get(token);
       if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
       session.pendingTarget = interaction.values[0];
-      const teams = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC LIMIT 25`, [session.leagueId]).catch(() => ({ rows: [] }));
-      const teamMenu = new StringSelectMenuBuilder()
-        .setCustomId('seasonhistory_pick_team:' + token)
-        .setPlaceholder('Which team?')
-        .addOptions(teams.rows.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
-      await interaction.update({
-        content: `Setting: **${seasonHistoryTargetLabel(session)}** — pick the team.`,
-        embeds: [], components: [new ActionRowBuilder().addComponents(teamMenu)],
-      });
+      const payload = await buildSeasonHistoryTeamPickerPayload(token, session);
+      await interaction.update(payload);
+      return;
+    }
+
+    // 7J-SEASONHISTORYTEAMSEARCH: per Hxxdie — a select menu hard-caps at
+    // 25 options; a league with more teams than that (e.g. a 32-team NHL
+    // league) was silently losing every team past the 25th alphabetically,
+    // so "Tampa Bay Lightning" never even appeared as a choice. Search
+    // narrows the list instead of truncating it.
+    if (interaction.isButton() && interaction.customId.startsWith('seasonhistory_teamsearch:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('seasonhistory_teamsearch_modal:' + token)
+        .setTitle('Search Teams')
+        .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('query').setLabel('Team name (or part of it)').setStyle(TextInputStyle.Short).setRequired(true)));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('seasonhistory_teamsearch_modal:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      const query = interaction.fields.getTextInputValue('query').trim();
+      const payload = await buildSeasonHistoryTeamPickerPayload(token, session, query);
+      await interaction.reply({ ...payload, ephemeral: true });
       return;
     }
 
