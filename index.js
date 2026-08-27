@@ -1872,6 +1872,10 @@ async function initDatabase() {
   // back out. Champion doesn't need an equivalent — that's derived
   // automatically from the bracket, not designated by a human.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS current_season_mvp_user_id TEXT`);
+  // 7J-SEASONHISTORYV2: per Hxxdie — league-specific championship name
+  // ("Stanley Cup Champion" instead of a generic "Champion"). NULL means
+  // "use the sport-appropriate default" — see getChampionshipTrophyName.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS championship_trophy_name TEXT`);
   // 7J-NBAPLAYIN: snapshot of seeds 1-10 per conference at the moment
   // playoffs start — the "real" bracket's seeds 1-6 aren't known as
   // finished series until the play-in stage resolves seeds 7-8, so this is
@@ -8221,6 +8225,23 @@ function getPlayoffFormatKey(league) {
   return 'generic';
 }
 
+// 7J-SEASONHISTORYV2: per Hxxdie — "Champion" should read as the real
+// trophy name (Stanley Cup Champion, not just "Champion"). Suggested
+// default per sport, overridable per-league via the Awards customization
+// panel — commissioners running an unusual league setup aren't stuck with
+// a suggestion that doesn't fit.
+const DEFAULT_CHAMPIONSHIP_TROPHY_NAME = {
+  nfl: 'Super Bowl Champion',
+  nhl: 'Stanley Cup Champion',
+  mlb: 'World Series Champion',
+  nba: 'NBA Finals Champion',
+  mls: 'MLS Cup Champion',
+  generic: 'League Champion',
+};
+function getChampionshipTrophyName(league, customSettings) {
+  return customSettings?.championship_trophy_name || DEFAULT_CHAMPIONSHIP_TROPHY_NAME[getPlayoffFormatKey(league)] || 'League Champion';
+}
+
 // 7J-SPORTPLAYOFFFORMAT: NFL — 7 per conference. The 4 division winners
 // take seeds 1-4 (ranked among themselves by record), the next 3 best
 // records in the conference (regardless of division) take seeds 5-7. Real
@@ -10951,6 +10972,74 @@ function presentLeagueRoleRemoval(interaction, { league, targetUser, teamRoleIds
 // leagueKickConfirmations above.
 const pendingPanelLeagueCreations = new Map();
 const commissionerSeasonHistorySessions = new Map();
+
+// 7J-SEASONHISTORYV2: resolves the display label for whatever the wizard is
+// currently filling in — the trophy name for "champion", or the configured
+// award's real label (not just its internal key) for anything else.
+function seasonHistoryTargetLabel(session) {
+  if (session.pendingTarget === 'champion') return session.trophyName;
+  if (session.pendingTarget === 'runnerup') return 'Runner-Up';
+  const configured = (session.leagueAwardsConfig || []).find(a => a.key === session.pendingTarget);
+  return configured?.label || session.pendingTarget;
+}
+
+// 7J-SEASONHISTORYV2: the wizard's home screen — shows current progress
+// (champion set/not, each configured award set/not) and a select menu to
+// pick what to fill in next. Re-shown after every pick completes, same
+// "persistent builder screen" pattern as the tournament creation flow.
+function buildSeasonHistoryWizardPayload(token) {
+  const session = commissionerSeasonHistorySessions.get(token);
+  if (!session) return { content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] };
+
+  const lines = [
+    `**Season:** ${session.seasonLabel}`,
+    `**${session.trophyName}:** ${session.champion ? `${session.champion.team} — <@${session.champion.userId}>` : '_Not set_'}`,
+    `**Runner-Up:** ${session.runnerUp || '_Not set_'}`,
+  ];
+  const awardEntries = Object.entries(session.awards).filter(([, a]) => a);
+  if (awardEntries.length) {
+    lines.push('', '**Awards set so far:**');
+    for (const [, a] of awardEntries) lines.push(`• ${a.label}: ${a.player} (${a.team}) — <@${a.userId}>`);
+  }
+  if (session.notes) lines.push('', `**Notes:** ${session.notes}`);
+
+  const embed = new EmbedBuilder()
+    .setTitle('📜 Season History Builder')
+    .setColor(0xFEE75C)
+    .setDescription(lines.join('\n'))
+    .setFooter({ text: 'GG Sports • Season History' });
+
+  const options = [
+    { label: session.trophyName, value: 'champion', emoji: '🏆' },
+    { label: 'Runner-Up (optional)', value: 'runnerup', emoji: '🥈', description: session.runnerUp ? `Currently: ${session.runnerUp}` : undefined },
+  ];
+  for (const award of session.leagueAwardsConfig || []) {
+    options.push({ label: award.label.slice(0, 100), value: award.key, emoji: award.tieredCosmetic ? '🎁' : undefined, description: session.awards[award.key] ? 'Already set — pick to change' : undefined });
+  }
+  const targetMenu = new StringSelectMenuBuilder()
+    .setCustomId('seasonhistory_pick_target:' + token)
+    .setPlaceholder('Pick what to set next')
+    .addOptions(options.slice(0, 25));
+
+  // 7J-SEASONHISTORYV2: content explicitly cleared here (not just omitted)
+  // — the intermediate "Setting: X — pick the team/user" prompts set real
+  // content text via interaction.update(), and Discord's update() only
+  // changes fields you actually pass. Without this, that prompt text would
+  // stay stuck above the embed forever after the first pick completes.
+  return {
+    content: null,
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(targetMenu),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('seasonhistory_notes:' + token).setLabel('Add Notes').setEmoji('📝').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('seasonhistory_submit:' + token).setLabel('Submit').setEmoji('✅').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('seasonhistory_cancel:' + token).setLabel('Cancel').setStyle(ButtonStyle.Danger),
+      ),
+    ],
+  };
+}
+
 const TOURNAMENT_FORMAT_OPTIONS = [
   { value: 'single_elim', label: 'Single Elimination' },
   { value: 'double_elim', label: 'Double Elimination' },
@@ -18255,13 +18344,15 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (action === 'seasonhistory') {
+        // 7J-SEASONHISTORYV2: per Hxxdie — season label still needs typing
+        // (no structured source for it), but champion/award team+user
+        // selection now happens via real pickers in the wizard this opens
+        // into, not typed text. See commissioner_seasonhistory_label_submit.
         const modal = new ModalBuilder()
-          .setCustomId('commissioner_seasonhistory_modal1:' + leagueId)
-          .setTitle('Season History (1 of 2)')
+          .setCustomId('commissioner_seasonhistory_label_submit:' + leagueId)
+          .setTitle('Season History')
           .addComponents(
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('season').setLabel('Season label').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('e.g. Season 3')),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('champion').setLabel('Champion').setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('runner_up').setLabel('Runner-up (optional)').setStyle(TextInputStyle.Short).setRequired(false)),
           );
         await interaction.showModal(modal);
         return;
@@ -19891,6 +19982,32 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_trophyname:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_trophyname_submit:' + leagueId)
+        .setTitle('Championship Trophy Name')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('trophy_name').setLabel('Trophy name (e.g. "Stanley Cup Champion")').setStyle(TextInputStyle.Short).setRequired(true).setValue(getChampionshipTrophyName(league, customSettings))),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_trophyname_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const trophyName = interaction.fields.getTextInputValue('trophy_name').trim();
+      await pool.query(`UPDATE league_custom_settings SET championship_trophy_name = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, trophyName || null]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'awards', { update: false });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_award_add:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -19900,6 +20017,12 @@ if (interaction.commandName === 'avatar') {
         .setTitle('Add Award')
         .addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_label').setLabel('Award name').setStyle(TextInputStyle.Short).setRequired(true)),
+          // 7J-SEASONHISTORYV2: per Hxxdie — a commissioner explicitly
+          // marks which award (usually just their MVP-equivalent) should
+          // trigger the automated tiered cosmetic system, rather than
+          // guessing from the label text. Every other award still gets the
+          // existing currency payout in Season History either way.
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tiered_cosmetic').setLabel('Grant a tiered cosmetic item? (yes/no)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('yes = this is the MVP-equivalent award')),
         );
       await interaction.showModal(modal);
       return;
@@ -19910,6 +20033,7 @@ if (interaction.commandName === 'avatar') {
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
       const label = interaction.fields.getTextInputValue('award_label');
+      const tieredCosmetic = (interaction.fields.getTextInputValue('tiered_cosmetic') || '').trim().toLowerCase().startsWith('y');
       const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const awards = Array.isArray(customSettings.awards) ? customSettings.awards : [];
       const key = label.toLowerCase().replace(/[^a-z0-9]+/g, '_');
@@ -19917,7 +20041,7 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: 'That award already exists.', ephemeral: true });
         return;
       }
-      awards.push({ key, label });
+      awards.push({ key, label, tieredCosmetic });
       await pool.query(`UPDATE league_custom_settings SET awards = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, JSON.stringify(awards)]);
       await interaction.deferUpdate();
       await showLeagueCustomizationSection(interaction, leagueId, 'awards', { update: false });
@@ -20771,58 +20895,171 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_seasonhistory_modal1:')) {
+    // 7J-SEASONHISTORYV2: per Hxxdie — champion and every player award now
+    // get their team + user via real Discord pickers (StringSelectMenu for
+    // team, UserSelectMenu for user) instead of typed text, and the award
+    // list itself is pulled from the league's own configured awards
+    // (League Customization → Awards) instead of a generic "MVP" field the
+    // commissioner had to remember to fill in correctly. Player NAME still
+    // needs a tiny one-field modal — no structured source for that exists
+    // for non-Madden leagues. Once a target is fully filled in, this
+    // assembles it into the exact "Team | Player | @User" string
+    // postLeagueSeasonHistory already parses, reusing 100% of that
+    // existing grant/DM/news logic rather than duplicating it.
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_seasonhistory_label_submit:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to add season history.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const token = randomBytes(6).toString('hex');
       commissionerSeasonHistorySessions.set(token, {
         leagueId,
         seasonLabel: interaction.fields.getTextInputValue('season'),
-        champion: interaction.fields.getTextInputValue('champion'),
-        runnerUp: interaction.fields.getTextInputValue('runner_up') || null,
+        trophyName: getChampionshipTrophyName(league, customSettings),
+        leagueAwardsConfig: Array.isArray(customSettings.awards) ? customSettings.awards : [],
+        champion: null, // { team, userId }
+        awards: {}, // key -> { label, team, player, userId }
+        notes: null,
+        pendingTarget: null, // 'champion' | award key — what team/user select is currently filling in
       });
-      const continueRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('commissioner_seasonhistory_continue:' + token).setLabel('Continue to MVP/Awards/Notes').setStyle(ButtonStyle.Primary)
-      );
-      await interaction.reply({ content: '**Season History (1 of 2) complete.** Click below to finish.', components: [continueRow], ephemeral: true });
+      await interaction.reply({ ...buildSeasonHistoryWizardPayload(token), ephemeral: true });
       return;
     }
 
-    if (interaction.isButton() && interaction.customId.startsWith('commissioner_seasonhistory_continue:')) {
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('seasonhistory_pick_target:')) {
       const token = interaction.customId.split(':')[1];
       const session = commissionerSeasonHistorySessions.get(token);
-      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
+      session.pendingTarget = interaction.values[0];
+      const teams = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC LIMIT 25`, [session.leagueId]).catch(() => ({ rows: [] }));
+      const teamMenu = new StringSelectMenuBuilder()
+        .setCustomId('seasonhistory_pick_team:' + token)
+        .setPlaceholder('Which team?')
+        .addOptions(teams.rows.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
+      await interaction.update({
+        content: `Setting: **${seasonHistoryTargetLabel(session)}** — pick the team.`,
+        embeds: [], components: [new ActionRowBuilder().addComponents(teamMenu)],
+      });
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('seasonhistory_pick_team:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
+      const teamResult = await pool.query(`SELECT role_name FROM league_team_roles WHERE league_id = $1 AND role_id = $2`, [session.leagueId, interaction.values[0]]);
+      session.pendingTeam = teamResult.rows[0]?.role_name || 'Unknown Team';
+      // 7J-SEASONHISTORYV2: Runner-Up is team-only — franchise_legacy only
+      // ever tracked a team name for it, no associated user — so this
+      // finalizes right here instead of continuing to a user select.
+      if (session.pendingTarget === 'runnerup') {
+        session.runnerUp = session.pendingTeam;
+        session.pendingTarget = null; session.pendingTeam = null;
+        await interaction.update(buildSeasonHistoryWizardPayload(token));
+        return;
+      }
+      const userMenu = new UserSelectMenuBuilder().setCustomId('seasonhistory_pick_user:' + token).setPlaceholder('Which user?');
+      await interaction.update({
+        content: `Setting: **${seasonHistoryTargetLabel(session)}** — **${session.pendingTeam}** — now pick the user.`,
+        embeds: [], components: [new ActionRowBuilder().addComponents(userMenu)],
+      });
+      return;
+    }
+
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('seasonhistory_pick_user:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
+      session.pendingUserId = interaction.values[0];
+      if (session.pendingTarget === 'champion') {
+        session.champion = { team: session.pendingTeam, userId: session.pendingUserId };
+        session.pendingTarget = null; session.pendingTeam = null; session.pendingUserId = null;
+        await interaction.update(buildSeasonHistoryWizardPayload(token));
+        return;
+      }
+      // Player award — still need the player's name, no structured source for it.
       const modal = new ModalBuilder()
-        .setCustomId('commissioner_seasonhistory_modal2:' + token)
-        .setTitle('Season History (2 of 2)')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('mvp').setLabel('MVP: Team | Player | @User (optional)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('Anaheim Ducks | John Smith | @johnsmith')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('awards').setLabel('Other awards (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('One per line: Award: Team | Player | @User\n6th Man: Vegas Golden Knights | Jane Doe | @janedoe')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Season notes (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false)),
-        );
+        .setCustomId('seasonhistory_player_modal:' + token)
+        .setTitle('Player Name')
+        .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('player_name').setLabel('Player name').setStyle(TextInputStyle.Short).setRequired(true)));
       await interaction.showModal(modal);
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('commissioner_seasonhistory_modal2:')) {
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('seasonhistory_player_modal:')) {
       const token = interaction.customId.split(':')[1];
       const session = commissionerSeasonHistorySessions.get(token);
       if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      const awardKey = session.pendingTarget;
+      const existingLabel = (session.leagueAwardsConfig || []).find(a => a.key === awardKey)?.label || awardKey;
+      session.awards[awardKey] = { label: existingLabel, team: session.pendingTeam, player: interaction.fields.getTextInputValue('player_name'), userId: session.pendingUserId };
+      session.pendingTarget = null; session.pendingTeam = null; session.pendingUserId = null;
+      await interaction.reply({ ...buildSeasonHistoryWizardPayload(token), ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('seasonhistory_notes:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      const modal = new ModalBuilder()
+        .setCustomId('seasonhistory_notes_modal:' + token)
+        .setTitle('Season Notes')
+        .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Season notes (optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(session.notes || '')));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('seasonhistory_notes_modal:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
+      session.notes = interaction.fields.getTextInputValue('notes') || null;
+      await interaction.reply({ ...buildSeasonHistoryWizardPayload(token), ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('seasonhistory_cancel:')) {
+      const token = interaction.customId.split(':')[1];
+      commissionerSeasonHistorySessions.delete(token);
+      await interaction.update({ content: 'Cancelled — nothing was submitted.', embeds: [], components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('seasonhistory_submit:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
+      if (!session.champion) { await interaction.reply({ content: `Set the ${session.trophyName} before submitting.`, ephemeral: true }); return; }
       const league = await getLeagueById(session.leagueId);
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to add season history.', ephemeral: true }); return; }
+      await interaction.update({ content: 'Submitting...', embeds: [], components: [] });
+
+      const awardLines = Object.entries(session.awards).map(([key, a]) => `${a.label}: ${a.team} | ${a.player} | <@${a.userId}>`).join('\n');
       const data = {
         seasonLabel: session.seasonLabel,
-        champion: session.champion,
-        runnerUp: session.runnerUp,
-        mvp: interaction.fields.getTextInputValue('mvp') || null,
-        awards: interaction.fields.getTextInputValue('awards') || null,
-        notes: interaction.fields.getTextInputValue('notes') || null,
+        champion: session.champion.team,
+        runnerUp: session.runnerUp || null,
+        mvp: null, // no generic MVP field anymore — the awards list covers it, tagged tieredCosmetic per-award
+        awards: awardLines || null,
+        notes: session.notes,
       };
-      commissionerSeasonHistorySessions.delete(token);
-      await interaction.deferReply({ ephemeral: true });
+      // Champion doesn't go through the mvp/awards text path (it has no
+      // "player" concept — just team + user) — handled directly here,
+      // including the tiered cosmetic grant for leagues that manually
+      // declare a champion without ever running the playoff bracket
+      // feature (the bracket-completion path already grants it when a
+      // bracket IS used; this skips re-granting in that case).
+      const bracketResult = await pool.query(`SELECT status, champion_team FROM league_playoff_brackets WHERE league_id = $1`, [session.leagueId]).catch(() => ({ rows: [] }));
+      const alreadyGrantedByBracket = bracketResult.rows[0]?.status === 'completed' && bracketResult.rows[0]?.champion_team === session.champion.team;
+      let championAwardNote = '';
+      if (!alreadyGrantedByBracket) {
+        const champAward = await autoGrantTieredAward(interaction.guild, league, session.champion.userId, session.champion.team, 'champion').catch(() => null);
+        if (champAward) championAwardNote = `\n🎁 <@${session.champion.userId}> was automatically granted **${champAward.item.item_name}** (Championship Tier ${champAward.tier}).`;
+      }
       const result = await postLeagueSeasonHistory(interaction, league, data);
-      await interaction.editReply({ content: result.message });
+      commissionerSeasonHistorySessions.delete(token);
+      await interaction.followUp({ content: result.message + championAwardNote, ephemeral: true });
       return;
     }
 
@@ -39421,13 +39658,20 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
     );
   }
 
-  // 7J-AWARDPLAYERTEAM: MVP now goes through the exact same parser as every
-  // other award — "MVP: " + the field's text — so a plain "MVP (optional)"
-  // field that's really just Team | Player | @User behaves identically to
-  // every other award line instead of being a slightly different format.
+  // 7J-SEASONHISTORYV2: whether an award triggers the tiered cosmetic is
+  // now genuinely configurable per-award (League Customization → Awards →
+  // the 🎁 flag set when the award was created), not a hardcoded single
+  // "MVP" field — matched by label against the league's configured awards
+  // list. data.mvp is still supported for any caller not going through the
+  // new wizard (keeps this function's contract backward compatible).
+  const seasonHistoryCustomSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
+  const configuredAwardsForTiering = Array.isArray(seasonHistoryCustomSettings.awards) ? seasonHistoryCustomSettings.awards : [];
   const awardRows = [];
   if (data.mvp) awardRows.push({ ...parseCustomAwards('MVP: ' + data.mvp)[0], isMvp: true });
-  for (const award of parseCustomAwards(data.awards)) awardRows.push({ ...award, isMvp: false });
+  for (const award of parseCustomAwards(data.awards)) {
+    const configured = configuredAwardsForTiering.find(a => a.label.toLowerCase() === award.name.toLowerCase());
+    awardRows.push({ ...award, isMvp: Boolean(configured?.tieredCosmetic) });
+  }
 
   // 7J-AUTOAWARDS: per Hxxdie — Season History (this function) is the
   // actual, established place a commissioner tells the bot who won what, so
@@ -39637,6 +39881,34 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
     ? `${career.wins}-${career.losses}${Number(career.ties) ? `-${career.ties}` : ''} across ${career.seasons} completed season(s) • ${career.championships} title(s)`
     : 'No completed seasons yet — builds up as leagues archive seasons via Start New Season.';
 
+  // 7J-SEASONHISTORYV2: per Hxxdie — awards won now surface directly on
+  // Member Profile. Championships/MVPs are tallied from the same
+  // user_season_history rows Career Record already reads (a title is a
+  // title regardless of which specific award recognized it); every other
+  // named award (Vezina, Norris, Cy Young, whatever a league configured)
+  // comes from league_awards, which already carries user_id + award_name +
+  // season_label from the Season History wizard and /league awards alike.
+  const awardsScopeClause = activeLeague ? 'AND league_id = $3' : '';
+  const awardsScopeParams = activeLeague ? [guild.id, targetUser.id, activeLeague.league_id] : [guild.id, targetUser.id];
+  const [titleCountsResult, namedAwardsResult] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*) FILTER (WHERE champion)::int AS championships, COUNT(*) FILTER (WHERE mvp)::int AS mvps
+       FROM user_season_history WHERE guild_id = $1 AND user_id = $2 ${awardsScopeClause}`,
+      awardsScopeParams
+    ).catch(() => ({ rows: [{ championships: 0, mvps: 0 }] })),
+    pool.query(
+      `SELECT award_name, season_label, league_id FROM league_awards WHERE guild_id = $1 AND user_id = $2 ${awardsScopeClause} ORDER BY created_at DESC LIMIT 10`,
+      awardsScopeParams
+    ).catch(() => ({ rows: [] })),
+  ]);
+  const titleCounts = titleCountsResult.rows[0] || {};
+  const NL = String.fromCharCode(10);
+  const awardsLines = [];
+  if (Number(titleCounts.championships)) awardsLines.push(`🏆 ${titleCounts.championships}x Champion`);
+  if (Number(titleCounts.mvps)) awardsLines.push(`⭐ ${titleCounts.mvps}x MVP`);
+  for (const row of namedAwardsResult.rows) awardsLines.push(`🎖️ ${row.award_name} — ${row.season_label}`);
+  const awardsDisplay = awardsLines.length ? awardsLines.join(NL).slice(0, 1024) : 'No awards recorded yet.';
+
   const embed = new EmbedBuilder()
     .setTitle('Member Profile • ' + targetUser.username)
     .setColor(0xFEE75C)
@@ -39651,6 +39923,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
       { name: 'All-Time Earned', value: settings.currency_icon + ' ' + balance.lifetime_earned, inline: true },
       { name: 'All-Time Spent', value: settings.currency_icon + ' ' + balance.lifetime_spent, inline: true },
       { name: 'Career Record', value: careerDisplay, inline: false },
+      { name: 'Awards Won', value: awardsDisplay, inline: false },
       { name: 'Sportsbook Record', value: String(bets.won_bets || 0) + '-' + String(bets.lost_bets || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(bets.net_profit || 0), inline: false },
       { name: 'Parlays', value: 'Won: ' + String(parlays.won_parlays || 0) + ' • Settled: ' + String(parlays.settled_parlays || 0) + ' • Profit: ' + settings.currency_icon + ' ' + String(parlays.parlay_profit || 0), inline: false },
       { name: 'Tournament Success', value: 'Titles: ' + String(tournaments.tournament_titles || 0) + ' • Prizes: ' + settings.currency_icon + ' ' + (Number(tournaments.tournament_prizes || 0) + Number(tournaments.mvp_prizes || 0)), inline: false },
@@ -74946,15 +75219,19 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
     ];
   } else if (section === 'awards') {
     const awards = Array.isArray(customSettings.awards) ? customSettings.awards : [];
+    const trophyName = getChampionshipTrophyName(league, customSettings);
     embed = new EmbedBuilder()
       .setTitle(`🎖️ Awards • ${league.league_name}`)
       .setColor(0x5865F2)
-      .setDescription((awards.length ? awards.map((a, i) => `${i + 1}. ${a.label}`).join('\n') : 'No awards configured yet.')
-        + '\n\nThis is the list of awards this league recognizes. There\'s no live stat-driven race for non-Madden leagues — record each season\'s winners with `/addseasonhistory` at season end, which posts them in the League History channel and updates franchise legacy.')
+      .addFields({ name: 'Championship Trophy Name', value: trophyName, inline: false })
+      .setDescription((awards.length ? awards.map((a, i) => `${i + 1}. ${a.label}${a.tieredCosmetic ? ' 🎁' : ''}`).join('\n') : 'No awards configured yet.')
+        + '\n\n🎁 = grants an automated tiered cosmetic item (usually the MVP-equivalent award); every other award pays currency instead.'
+        + '\n\nThis is the list of awards this league recognizes. There\'s no live stat-driven race for non-Madden leagues — record each season\'s winners from **Operations → Season History** at season end, which walks through the champion and each configured award with team/user pickers, posts everything in the League History channel, and updates franchise legacy.')
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
     const rows = [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('leaguecustom_award_add:' + leagueId).setLabel('Add Award').setEmoji('➕').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('leaguecustom_trophyname:' + leagueId).setLabel('Edit Trophy Name').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
     )];
     if (awards.length) {
       const removeMenu = new StringSelectMenuBuilder()
