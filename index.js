@@ -11005,8 +11005,15 @@ async function buildSeasonHistoryTeamPickerPayload(token, session) {
     const chunk = teams.rows.slice(i, i + 25);
     const chunkNumber = Math.floor(i / 25) + 1;
     const label = chunk[0].role_name.slice(0, 1).toUpperCase() + '-' + chunk[chunk.length - 1].role_name.slice(0, 1).toUpperCase();
+    // 7J-SEASONHISTORYTEAMPICKER-FIX: per Hxxdie — every chunk's dropdown
+    // was reusing the exact same customId ('seasonhistory_pick_team:' +
+    // token) with no per-chunk suffix, which Discord rejects outright
+    // (component custom ids must be unique within a single message) —
+    // this was breaking the picker completely for any league with more
+    // than 25 teams. The pick_team handler already extracts the token via
+    // split(':')[1], which still works correctly with this extra suffix.
     const teamMenu = new StringSelectMenuBuilder()
-      .setCustomId('seasonhistory_pick_team:' + token)
+      .setCustomId('seasonhistory_pick_team:' + token + ':' + chunkNumber)
       .setPlaceholder(teams.rows.length > 25 ? `Teams ${label} (${chunkNumber} of ${Math.ceil(teams.rows.length / 25)})` : 'Which team?')
       .addOptions(chunk.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
     components.push(new ActionRowBuilder().addComponents(teamMenu));
