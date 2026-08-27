@@ -1759,6 +1759,10 @@ async function initDatabase() {
   // human still has to designate WHO; this just records it once they do, so
   // the automated tiered-item grant has something to key off going forward.
   await pool.query(`ALTER TABLE user_season_history ADD COLUMN IF NOT EXISTS mvp BOOLEAN NOT NULL DEFAULT FALSE`);
+  // 7J-RUNNERUPRECOGNITION: per Hxxdie — runner-up gets no award/currency,
+  // but should still be recognized in the history books alongside
+  // champion/MVP.
+  await pool.query(`ALTER TABLE user_season_history ADD COLUMN IF NOT EXISTS runner_up BOOLEAN NOT NULL DEFAULT FALSE`);
 
   // 7J-USERHEADTOHEAD: distinct from the team-level head-to-head that
   // already fed sportsbook odds (getHeadToHeadSnapshot, keyed by team
@@ -1872,6 +1876,10 @@ async function initDatabase() {
   // back out. Champion doesn't need an equivalent — that's derived
   // automatically from the bracket, not designated by a human.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS current_season_mvp_user_id TEXT`);
+  // 7J-RUNNERUPRECOGNITION: mirrors current_season_mvp_user_id — holds the
+  // designated runner-up until Start New Season archives it into
+  // user_season_history.runner_up and clears this back out.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS current_season_runnerup_user_id TEXT`);
   // 7J-SEASONHISTORYV2: per Hxxdie — league-specific championship name
   // ("Stanley Cup Champion" instead of a generic "Champion"). NULL means
   // "use the sport-appropriate default" — see getChampionshipTrophyName.
@@ -10983,36 +10991,28 @@ function seasonHistoryTargetLabel(session) {
   return configured?.label || session.pendingTarget;
 }
 
-// 7J-SEASONHISTORYTEAMSEARCH: per Hxxdie — a StringSelectMenu hard-caps at
+// 7J-SEASONHISTORYTEAMPICKER: per Hxxdie — a StringSelectMenu hard-caps at
 // 25 options, so a league with more teams than that was silently losing
-// every team past the 25th alphabetically. Search Teams is always offered
-// alongside the dropdown (not just as a >25 fallback) so it's consistently
-// available regardless of league size.
-async function buildSeasonHistoryTeamPickerPayload(token, session, query = null) {
-  const params = [session.leagueId];
-  let whereClause = 'league_id = $1';
-  if (query) {
-    whereClause += ' AND role_name ILIKE $2';
-    params.push(`%${query}%`);
-  }
-  const teams = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE ${whereClause} ORDER BY role_name ASC LIMIT 25`, params).catch(() => ({ rows: [] }));
+// every team past the 25th alphabetically. Rather than a search step,
+// multiple dropdowns cover the full list directly — up to 4 menus (100
+// teams), each routed through the exact same seasonhistory_pick_team
+// handler regardless of which menu the pick came from.
+async function buildSeasonHistoryTeamPickerPayload(token, session) {
+  const teams = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 ORDER BY role_name ASC LIMIT 100`, [session.leagueId]).catch(() => ({ rows: [] }));
 
   const components = [];
-  if (teams.rows.length) {
+  for (let i = 0; i < teams.rows.length; i += 25) {
+    const chunk = teams.rows.slice(i, i + 25);
+    const chunkNumber = Math.floor(i / 25) + 1;
+    const label = chunk[0].role_name.slice(0, 1).toUpperCase() + '-' + chunk[chunk.length - 1].role_name.slice(0, 1).toUpperCase();
     const teamMenu = new StringSelectMenuBuilder()
       .setCustomId('seasonhistory_pick_team:' + token)
-      .setPlaceholder(query ? `Results for "${query}"` : 'Which team?')
-      .addOptions(teams.rows.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
+      .setPlaceholder(teams.rows.length > 25 ? `Teams ${label} (${chunkNumber} of ${Math.ceil(teams.rows.length / 25)})` : 'Which team?')
+      .addOptions(chunk.map(t => ({ label: t.role_name.slice(0, 100), value: t.role_id })));
     components.push(new ActionRowBuilder().addComponents(teamMenu));
   }
-  components.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('seasonhistory_teamsearch:' + token).setLabel(query ? 'Search Again' : 'Search Teams').setEmoji('🔍').setStyle(ButtonStyle.Secondary)
-  ));
 
-  let content = `Setting: **${seasonHistoryTargetLabel(session)}** — `;
-  if (query && !teams.rows.length) content += `no teams matched "${query}". Try a different search.`;
-  else if (query) content += `results for "${query}" — pick the team below, or search again.`;
-  else content += `pick the team below, or use **Search Teams** if you don't see it (this league may have more teams than fit in one list).`;
+  const content = `Setting: **${seasonHistoryTargetLabel(session)}** — pick the team below${components.length > 1 ? ' (split across multiple dropdowns since this league has more than 25 teams)' : ''}.`;
 
   return { content, embeds: [], components };
 }
@@ -11028,7 +11028,7 @@ function buildSeasonHistoryWizardPayload(token) {
   const lines = [
     `**Season:** ${session.seasonLabel}`,
     `**${session.trophyName}:** ${session.champion ? `${session.champion.team} — <@${session.champion.userId}>` : '_Not set_'}`,
-    `**Runner-Up:** ${session.runnerUp || '_Not set_'}`,
+    `**Runner-Up:** ${session.runnerUp ? `${session.runnerUp.team} — <@${session.runnerUp.userId}>` : '_Not set_'}`,
   ];
   const awardEntries = Object.entries(session.awards).filter(([, a]) => a);
   if (awardEntries.length) {
@@ -11045,7 +11045,7 @@ function buildSeasonHistoryWizardPayload(token) {
 
   const options = [
     { label: session.trophyName, value: 'champion', emoji: '🏆' },
-    { label: 'Runner-Up (optional)', value: 'runnerup', emoji: '🥈', description: session.runnerUp ? `Currently: ${session.runnerUp}` : undefined },
+    { label: 'Runner-Up (optional)', value: 'runnerup', emoji: '🥈', description: session.runnerUp ? `Currently: ${session.runnerUp.team}` : undefined },
   ];
   for (const award of session.leagueAwardsConfig || []) {
     options.push({ label: award.label.slice(0, 100), value: award.key, emoji: award.tieredCosmetic ? '🎁' : undefined, description: session.awards[award.key] ? 'Already set — pick to change' : undefined });
@@ -20269,8 +20269,11 @@ if (interaction.commandName === 'avatar') {
       // MVP field in Season History — the item itself was already
       // auto-granted the moment that was submitted; this just archives
       // the record so future tier counts stay accurate).
+      // 7J-RUNNERUPRECOGNITION: same transient-field pattern for runner-up
+      // — no award/currency, just recorded so it shows up in history.
       const archivalCustomSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
       const mvpUserId = archivalCustomSettings.current_season_mvp_user_id || null;
+      const runnerUpUserId = archivalCustomSettings.current_season_runnerup_user_id || null;
 
       const seasonCountResult = await pool.query(`SELECT COUNT(DISTINCT season_label)::int AS n FROM team_season_history WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [{ n: 0 }] }));
       const seasonLabel = `Season ${Number(seasonCountResult.rows[0]?.n || 0) + 1}`;
@@ -20290,9 +20293,9 @@ if (interaction.commandName === 'avatar') {
         const owner = await findTeamOwnerByRoleId(interaction.guild, row.team_role_id).catch(() => null);
         if (owner) {
           await pool.query(
-            `INSERT INTO user_season_history (id, guild_id, league_id, season_label, user_id, team_name, wins, losses, ties, champion, mvp)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-            [randomUUID(), interaction.guild.id, leagueId, seasonLabel, owner.id, row.team_name, row.wins || 0, row.losses || 0, row.ties || 0, Boolean(isChampion), owner.id === mvpUserId]
+            `INSERT INTO user_season_history (id, guild_id, league_id, season_label, user_id, team_name, wins, losses, ties, champion, mvp, runner_up)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            [randomUUID(), interaction.guild.id, leagueId, seasonLabel, owner.id, row.team_name, row.wins || 0, row.losses || 0, row.ties || 0, Boolean(isChampion), owner.id === mvpUserId, owner.id === runnerUpUserId]
           ).catch(() => null);
           // 7J-92LEGACYFLOOR: a completed season is exactly the kind of
           // real, substantial participation the floor exists for — bigger
@@ -20318,7 +20321,7 @@ if (interaction.commandName === 'avatar') {
         [interaction.guild.id, leagueId]
       );
       await pool.query(
-        `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, current_season_mvp_user_id = NULL, updated_at = NOW() WHERE league_id = $1`,
+        `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, current_season_mvp_user_id = NULL, current_season_runnerup_user_id = NULL, updated_at = NOW() WHERE league_id = $1`,
         [leagueId]
       );
       await pool.query(
@@ -20962,15 +20965,19 @@ if (interaction.commandName === 'avatar') {
         const finalSeries = bracketState.bracket[bracketState.bracket.length - 1]?.[0];
         if (finalSeries?.winner) {
           const championTeamName = finalSeries.winner;
-          autoFilledRunnerUp = finalSeries.teamA?.name === championTeamName ? finalSeries.teamB?.name : finalSeries.teamA?.name;
-          const roleResult = await pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, championTeamName]).catch(() => ({ rows: [] }));
-          const owner = roleResult.rows[0]?.role_id ? await findTeamOwnerByRoleId(interaction.guild, roleResult.rows[0].role_id).catch(() => null) : null;
-          if (owner) {
-            autoFilledChampion = { team: championTeamName, userId: owner.id };
-            autoFillNote = '\n✅ Champion and Runner-Up were auto-filled from the completed playoff bracket — review and change below if needed.';
-          } else if (autoFilledRunnerUp) {
-            autoFillNote = `\n✅ Runner-Up was auto-filled from the bracket. Champion team is **${championTeamName}** but no owner could be resolved for it — set the champion manually.`;
-          }
+          const runnerUpTeamName = finalSeries.teamA?.name === championTeamName ? finalSeries.teamB?.name : finalSeries.teamA?.name;
+          const [championRoleResult, runnerUpRoleResult] = await Promise.all([
+            pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, championTeamName]).catch(() => ({ rows: [] })),
+            runnerUpTeamName ? pool.query(`SELECT role_id FROM league_team_roles WHERE league_id = $1 AND role_name = $2`, [leagueId, runnerUpTeamName]).catch(() => ({ rows: [] })) : Promise.resolve({ rows: [] }),
+          ]);
+          const [championOwner, runnerUpOwner] = await Promise.all([
+            championRoleResult.rows[0]?.role_id ? findTeamOwnerByRoleId(interaction.guild, championRoleResult.rows[0].role_id).catch(() => null) : null,
+            runnerUpRoleResult.rows[0]?.role_id ? findTeamOwnerByRoleId(interaction.guild, runnerUpRoleResult.rows[0].role_id).catch(() => null) : null,
+          ]);
+          if (championOwner) autoFilledChampion = { team: championTeamName, userId: championOwner.id };
+          if (runnerUpTeamName && runnerUpOwner) autoFilledRunnerUp = { team: runnerUpTeamName, userId: runnerUpOwner.id };
+          if (autoFilledChampion && autoFilledRunnerUp) autoFillNote = '\n✅ Champion and Runner-Up were auto-filled from the completed playoff bracket — review and change below if needed.';
+          else if (autoFilledChampion || autoFilledRunnerUp) autoFillNote = '\n✅ Partially auto-filled from the completed playoff bracket — an owner couldn\'t be resolved for one side, set it manually below.';
         }
       }
 
@@ -20980,7 +20987,7 @@ if (interaction.commandName === 'avatar') {
         trophyName: getChampionshipTrophyName(league, customSettings),
         leagueAwardsConfig: Array.isArray(customSettings.awards) ? customSettings.awards : [],
         champion: autoFilledChampion, // { team, userId }
-        runnerUp: autoFilledRunnerUp,
+        runnerUp: autoFilledRunnerUp, // { team, userId }
         awards: {}, // key -> { label, team, player, userId }
         notes: null,
         pendingTarget: null, // 'champion' | 'runnerup' | award key — what team/user select is currently filling in
@@ -21000,48 +21007,15 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    // 7J-SEASONHISTORYTEAMSEARCH: per Hxxdie — a select menu hard-caps at
-    // 25 options; a league with more teams than that (e.g. a 32-team NHL
-    // league) was silently losing every team past the 25th alphabetically,
-    // so "Tampa Bay Lightning" never even appeared as a choice. Search
-    // narrows the list instead of truncating it.
-    if (interaction.isButton() && interaction.customId.startsWith('seasonhistory_teamsearch:')) {
-      const token = interaction.customId.split(':')[1];
-      const session = commissionerSeasonHistorySessions.get(token);
-      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
-      const modal = new ModalBuilder()
-        .setCustomId('seasonhistory_teamsearch_modal:' + token)
-        .setTitle('Search Teams')
-        .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('query').setLabel('Team name (or part of it)').setStyle(TextInputStyle.Short).setRequired(true)));
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('seasonhistory_teamsearch_modal:')) {
-      const token = interaction.customId.split(':')[1];
-      const session = commissionerSeasonHistorySessions.get(token);
-      if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
-      const query = interaction.fields.getTextInputValue('query').trim();
-      const payload = await buildSeasonHistoryTeamPickerPayload(token, session, query);
-      await interaction.reply({ ...payload, ephemeral: true });
-      return;
-    }
-
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('seasonhistory_pick_team:')) {
       const token = interaction.customId.split(':')[1];
       const session = commissionerSeasonHistorySessions.get(token);
       if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
       const teamResult = await pool.query(`SELECT role_name FROM league_team_roles WHERE league_id = $1 AND role_id = $2`, [session.leagueId, interaction.values[0]]);
       session.pendingTeam = teamResult.rows[0]?.role_name || 'Unknown Team';
-      // 7J-SEASONHISTORYV2: Runner-Up is team-only — franchise_legacy only
-      // ever tracked a team name for it, no associated user — so this
-      // finalizes right here instead of continuing to a user select.
-      if (session.pendingTarget === 'runnerup') {
-        session.runnerUp = session.pendingTeam;
-        session.pendingTarget = null; session.pendingTeam = null;
-        await interaction.update(buildSeasonHistoryWizardPayload(token));
-        return;
-      }
+      // 7J-RUNNERUPRECOGNITION: per Hxxdie — runner-up now also captures a
+      // user, same as champion and every award, even though they get no
+      // cosmetic/currency reward — just recognized in the history books.
       const userMenu = new UserSelectMenuBuilder().setCustomId('seasonhistory_pick_user:' + token).setPlaceholder('Which user?');
       await interaction.update({
         content: `Setting: **${seasonHistoryTargetLabel(session)}** — **${session.pendingTeam}** — now pick the user.`,
@@ -21057,6 +21031,12 @@ if (interaction.commandName === 'avatar') {
       session.pendingUserId = interaction.values[0];
       if (session.pendingTarget === 'champion') {
         session.champion = { team: session.pendingTeam, userId: session.pendingUserId };
+        session.pendingTarget = null; session.pendingTeam = null; session.pendingUserId = null;
+        await interaction.update(buildSeasonHistoryWizardPayload(token));
+        return;
+      }
+      if (session.pendingTarget === 'runnerup') {
+        session.runnerUp = { team: session.pendingTeam, userId: session.pendingUserId };
         session.pendingTarget = null; session.pendingTeam = null; session.pendingUserId = null;
         await interaction.update(buildSeasonHistoryWizardPayload(token));
         return;
@@ -21123,7 +21103,7 @@ if (interaction.commandName === 'avatar') {
       const data = {
         seasonLabel: session.seasonLabel,
         champion: session.champion.team,
-        runnerUp: session.runnerUp || null,
+        runnerUp: session.runnerUp?.team || null,
         mvp: null, // no generic MVP field anymore — the awards list covers it, tagged tieredCosmetic per-award
         awards: awardLines || null,
         notes: session.notes,
@@ -21140,6 +21120,14 @@ if (interaction.commandName === 'avatar') {
       if (!alreadyGrantedByBracket) {
         const champAward = await autoGrantTieredAward(interaction.guild, league, session.champion.userId, session.champion.team, 'champion').catch(() => null);
         if (champAward) championAwardNote = `\n🎁 <@${session.champion.userId}> was automatically granted **${champAward.item.item_name}** (Championship Tier ${champAward.tier}).`;
+      }
+      // 7J-RUNNERUPRECOGNITION: per Hxxdie — no award/currency for
+      // runner-up, but the designated user still gets recorded so
+      // Start New Season can archive it into user_season_history.runner_up
+      // (same transient-field pattern as current_season_mvp_user_id) and it
+      // shows up on Member Profile.
+      if (session.runnerUp?.userId) {
+        await pool.query(`UPDATE league_custom_settings SET current_season_runnerup_user_id = $2, updated_at = NOW() WHERE league_id = $1`, [session.leagueId, session.runnerUp.userId]).catch(() => null);
       }
       const result = await postLeagueSeasonHistory(interaction, league, data);
       commissionerSeasonHistorySessions.delete(token);
@@ -39976,10 +39964,10 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
   const awardsScopeParams = activeLeague ? [guild.id, targetUser.id, activeLeague.league_id] : [guild.id, targetUser.id];
   const [titleCountsResult, namedAwardsResult] = await Promise.all([
     pool.query(
-      `SELECT COUNT(*) FILTER (WHERE champion)::int AS championships, COUNT(*) FILTER (WHERE mvp)::int AS mvps
+      `SELECT COUNT(*) FILTER (WHERE champion)::int AS championships, COUNT(*) FILTER (WHERE mvp)::int AS mvps, COUNT(*) FILTER (WHERE runner_up)::int AS runner_ups
        FROM user_season_history WHERE guild_id = $1 AND user_id = $2 ${awardsScopeClause}`,
       awardsScopeParams
-    ).catch(() => ({ rows: [{ championships: 0, mvps: 0 }] })),
+    ).catch(() => ({ rows: [{ championships: 0, mvps: 0, runner_ups: 0 }] })),
     pool.query(
       `SELECT award_name, season_label, league_id FROM league_awards WHERE guild_id = $1 AND user_id = $2 ${awardsScopeClause} ORDER BY created_at DESC LIMIT 10`,
       awardsScopeParams
@@ -39990,6 +39978,7 @@ async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) 
   const awardsLines = [];
   if (Number(titleCounts.championships)) awardsLines.push(`🏆 ${titleCounts.championships}x Champion`);
   if (Number(titleCounts.mvps)) awardsLines.push(`⭐ ${titleCounts.mvps}x MVP`);
+  if (Number(titleCounts.runner_ups)) awardsLines.push(`🥈 ${titleCounts.runner_ups}x Runner-Up`);
   for (const row of namedAwardsResult.rows) awardsLines.push(`🎖️ ${row.award_name} — ${row.season_label}`);
   const awardsDisplay = awardsLines.length ? awardsLines.join(NL).slice(0, 1024) : 'No awards recorded yet.';
 
