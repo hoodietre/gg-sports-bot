@@ -21014,20 +21014,80 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-SEASONHISTORYAUTOOWNER: per Hxxdie — auto-resolves the picked
+    // team's owner instead of always asking for a separate user pick,
+    // eliminating a whole step in the common case. Falls back to manual
+    // user selection only when the team genuinely has no assigned owner
+    // (CPU/unclaimed team) — shared by both the auto-resolved path here
+    // and the manual fallback path below, so champion/runner-up/award
+    // finalization logic exists in exactly one place.
+    async function finalizeSeasonHistoryPick(pickInteraction, pickToken, pickSession, teamName, userId) {
+      if (pickSession.pendingTarget === 'champion') {
+        pickSession.champion = { team: teamName, userId };
+        pickSession.pendingTarget = null; pickSession.pendingTeam = null; pickSession.pendingUserId = null;
+        await pickInteraction.update(buildSeasonHistoryWizardPayload(pickToken));
+        return;
+      }
+      if (pickSession.pendingTarget === 'runnerup') {
+        pickSession.runnerUp = { team: teamName, userId };
+        pickSession.pendingTarget = null; pickSession.pendingTeam = null; pickSession.pendingUserId = null;
+        await pickInteraction.update(buildSeasonHistoryWizardPayload(pickToken));
+        return;
+      }
+      // Player award — still need the player's name, no structured source for it.
+      pickSession.pendingTeam = teamName;
+      pickSession.pendingUserId = userId;
+      const modal = new ModalBuilder()
+        .setCustomId('seasonhistory_player_modal:' + pickToken)
+        .setTitle('Player Name')
+        .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('player_name').setLabel('Player name').setStyle(TextInputStyle.Short).setRequired(true)));
+      await pickInteraction.showModal(modal);
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('seasonhistory_pick_team:')) {
       const token = interaction.customId.split(':')[1];
       const session = commissionerSeasonHistorySessions.get(token);
       if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
-      const teamResult = await pool.query(`SELECT role_name FROM league_team_roles WHERE league_id = $1 AND role_id = $2`, [session.leagueId, interaction.values[0]]);
-      session.pendingTeam = teamResult.rows[0]?.role_name || 'Unknown Team';
-      // 7J-RUNNERUPRECOGNITION: per Hxxdie — runner-up now also captures a
-      // user, same as champion and every award, even though they get no
-      // cosmetic/currency reward — just recognized in the history books.
+      const teamResult = await pool.query(`SELECT role_id, role_name FROM league_team_roles WHERE league_id = $1 AND role_id = $2`, [session.leagueId, interaction.values[0]]);
+      const teamName = teamResult.rows[0]?.role_name || 'Unknown Team';
+      const roleId = teamResult.rows[0]?.role_id;
+      session.pendingTeam = teamName;
+
+      const owner = roleId ? await findTeamOwnerByRoleId(interaction.guild, roleId).catch(() => null) : null;
+      if (owner) {
+        await finalizeSeasonHistoryPick(interaction, token, session, teamName, owner.id);
+        return;
+      }
+
+      const fallbackRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('seasonhistory_noowner_manual:' + token).setLabel('Assign a User Manually').setEmoji('👤').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('seasonhistory_noowner_reteam:' + token).setLabel('Choose a Different Team').setEmoji('↩️').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.update({
+        content: `Setting: **${seasonHistoryTargetLabel(session)}** — **${teamName}** has no assigned owner. Pick a user manually, or choose a different team.`,
+        embeds: [], components: [fallbackRow],
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('seasonhistory_noowner_manual:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
       const userMenu = new UserSelectMenuBuilder().setCustomId('seasonhistory_pick_user:' + token).setPlaceholder('Which user?');
       await interaction.update({
-        content: `Setting: **${seasonHistoryTargetLabel(session)}** — **${session.pendingTeam}** — now pick the user.`,
+        content: `Setting: **${seasonHistoryTargetLabel(session)}** — **${session.pendingTeam}** — pick the user manually.`,
         embeds: [], components: [new ActionRowBuilder().addComponents(userMenu)],
       });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('seasonhistory_noowner_reteam:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = commissionerSeasonHistorySessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
+      const payload = await buildSeasonHistoryTeamPickerPayload(token, session);
+      await interaction.update(payload);
       return;
     }
 
@@ -21035,25 +21095,7 @@ if (interaction.commandName === 'avatar') {
       const token = interaction.customId.split(':')[1];
       const session = commissionerSeasonHistorySessions.get(token);
       if (!session) { await interaction.update({ content: 'This session expired. Start over from Operations → Season History.', embeds: [], components: [] }); return; }
-      session.pendingUserId = interaction.values[0];
-      if (session.pendingTarget === 'champion') {
-        session.champion = { team: session.pendingTeam, userId: session.pendingUserId };
-        session.pendingTarget = null; session.pendingTeam = null; session.pendingUserId = null;
-        await interaction.update(buildSeasonHistoryWizardPayload(token));
-        return;
-      }
-      if (session.pendingTarget === 'runnerup') {
-        session.runnerUp = { team: session.pendingTeam, userId: session.pendingUserId };
-        session.pendingTarget = null; session.pendingTeam = null; session.pendingUserId = null;
-        await interaction.update(buildSeasonHistoryWizardPayload(token));
-        return;
-      }
-      // Player award — still need the player's name, no structured source for it.
-      const modal = new ModalBuilder()
-        .setCustomId('seasonhistory_player_modal:' + token)
-        .setTitle('Player Name')
-        .addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('player_name').setLabel('Player name').setStyle(TextInputStyle.Short).setRequired(true)));
-      await interaction.showModal(modal);
+      await finalizeSeasonHistoryPick(interaction, token, session, session.pendingTeam, interaction.values[0]);
       return;
     }
 
