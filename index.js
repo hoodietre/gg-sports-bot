@@ -18410,6 +18410,7 @@ if (interaction.commandName === 'avatar') {
         const threadChannelId = league.game_threads_channel_id;
         const threadChannel = threadChannelId ? await interaction.guild.channels.fetch(threadChannelId).catch(() => null) : null;
         let gamesCreated = 0;
+        let gamesAlreadyExisted = 0;
         let threadsCreated = 0;
         const threadFailures = [];
 
@@ -18424,10 +18425,24 @@ if (interaction.commandName === 'avatar') {
           const createResult = await createLeagueGameCore(interaction, league, homeTeam, awayTeam, { weekLabel: `Game ${currentRound}` });
           if (!createResult.ok || !createResult.game) continue;
           gamesCreated += 1;
-          // 7J-DUPEGAMEFIX: this round's game already existed (Advance ran
-          // twice for it) — its thread should too, so skip creating a
-          // second one pointing at the same underlying game.
-          if (createResult.alreadyExisted) continue;
+          if (createResult.alreadyExisted) gamesAlreadyExisted += 1;
+          // 7J-DUPEGAMEFIX2: per Hxxdie — real regression in the previous
+          // fix. That fix correctly stops a duplicate GAME row from being
+          // created on a repeat Advance, but wrongly assumed an existing
+          // game always already has a working thread too — skipping
+          // unconditionally whenever the game row existed. If thread
+          // creation genuinely failed on an earlier attempt (permissions,
+          // a rate limit, a name collision, anything), the game row still
+          // exists (it's created before the thread is attempted) but has
+          // no thread_id, and the old logic then permanently blocked ever
+          // retrying it — every subsequent Advance press would find the
+          // game "already existed" and skip thread creation forever, with
+          // no way to recover except a database fix. Now only skips when
+          // the existing game already has a real thread_id — a genuine
+          // duplicate (thread already posted) is still correctly skipped,
+          // but a partial failure (game created, thread never was) can
+          // still be retried by pressing Advance again.
+          if (createResult.alreadyExisted && createResult.game.thread_id) continue;
 
           if (threadChannel?.isTextBased?.()) {
             const threadResult = await createGameCenterThread(interaction, league, createResult.game, { channelIdOverride: threadChannelId });
@@ -18454,7 +18469,10 @@ if (interaction.commandName === 'avatar') {
         const unscoredNote = unscoredCleanup && unscoredCleanup.checked
           ? `\n⚠️ ${unscoredCleanup.checked} game(s) from ${previousRoundLabel} never had a final score reported${unscoredCleanup.refunded ? ` — ${unscoredCleanup.refunded} open bet line(s) refunded` : ''}. Involved owners have been notified.`
           : '';
-        await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesCreated} game(s) created and ready to report. ${threadNote}${startedNote}${cleanupNote}${unscoredNote}` });
+        const gamesSummaryText = gamesAlreadyExisted
+          ? `${gamesCreated} game(s) ready (${gamesCreated - gamesAlreadyExisted} newly created, ${gamesAlreadyExisted} already existed from an earlier attempt).`
+          : `${gamesCreated} game(s) created and ready to report.`;
+        await interaction.editReply({ content: `${headline}\n${matchupText}\n\n${gamesSummaryText} ${threadNote}${startedNote}${cleanupNote}${unscoredNote}` });
 
         // 7J-STRUCTUREDANNOUNCE: per Hxxdie — Madden leagues already
         // announce a week advance publicly (game_threads_created news
