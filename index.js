@@ -55793,6 +55793,38 @@ function buildMaddenTransactionKey(row = {}) {
   return `${event}:${playerKey}:${oldTeam}:${newTeam}`.slice(0, 240);
 }
 
+// 7J-DIGESTDEDUPE: per Hxxdie — real, confirmed duplicate (same player,
+// same signing, listed twice under "2 updates"). The DB-level unique
+// constraint (buildMaddenTransactionKey above) is keyed off raw
+// team-name strings, so two rows for the exact same real transaction but
+// with different team-name FORMATTING between detection passes (e.g.
+// "Colts (IND)" vs bare "IND" vs "Indianapolis Colts") can each pass the
+// constraint as if they were genuinely different events. This resolves
+// every format down to the team's real abbreviation before comparing —
+// extracts a trailing "(ABBR)" directly when present, otherwise falls
+// back to getMaddenTeamAbbrev (the same resolver getMaddenTeamLogoUrl
+// already relies on) — verified against all three formats before
+// shipping, not just assumed to work.
+function normalizeMaddenTeamKey(teamName) {
+  const str = String(teamName || '').trim();
+  const parenMatch = str.match(/\(([A-Za-z]{2,4})\)\s*$/);
+  if (parenMatch) return parenMatch[1].toUpperCase();
+  const abbr = getMaddenTeamAbbrev(str);
+  return String(abbr || str).toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function dedupeMaddenDigestRows(rows) {
+  const seen = new Set();
+  return rows.filter(row => {
+    const playerKey = String(row.player_id || row.player_name || '').toLowerCase().trim();
+    const teamKey = normalizeMaddenTeamKey(row.new_team_name || row.team_name);
+    const key = `${row.event_type}:${playerKey}:${teamKey}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function maddenTransactionYearsLeft(row = {}) {
   const raw = maddenFreeAgencyRaw(row);
   const candidates = [row.years_left, row.contract_years_left, row.contractLength, row.contract_years, raw.contractYearsLeft, raw.contractLength, raw.yearsLeft, raw.contractYears];
@@ -56148,14 +56180,15 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
         weeklyDigestRows.push({ ...row, team_name: row.new_team_name || row.team_name || row.old_team_name || null, saved_id: savedRow.id });
       }
     }
-    if (weeklyDigestRows.length && guild) {
-      await postMaddenWeeklyUpdatesDigest(guild, league, weeklyDigestRows, {
+    const dedupedDigestRows = dedupeMaddenDigestRows(weeklyDigestRows);
+    if (dedupedDigestRows.length && guild) {
+      await postMaddenWeeklyUpdatesDigest(guild, league, dedupedDigestRows, {
         title: 'Weekly Transactions',
         emoji: '✂️',
         color: 0xED4245,
         describeLine: row => `${maddenTransactionPrettyLabel(row.event_type)} — ${buildMaddenTransactionSummary(row)}`,
       }).catch(error => console.warn('[7J-25WEEKLY] transactions digest failed:', error?.message || error));
-      const savedIds = weeklyDigestRows.map(r => r.saved_id).filter(Boolean);
+      const savedIds = dedupedDigestRows.map(r => r.saved_id).filter(Boolean);
       if (savedIds.length) {
         await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = ANY($1::uuid[])`, [savedIds]).catch(() => null);
       }
@@ -56347,7 +56380,7 @@ async function backfillMaddenTransactionNews(guild, league, confirm = false, lim
   // Weekly Updates by the regular sync flow — posting them individually to
   // news here would reopen the exact flooding problem via a manual back door.
   // Batch by team the same way, rather than one recordMaddenNewsEvent per row.
-  await postMaddenWeeklyUpdatesDigest(guild, league, rows.map(row => ({ ...row, team_name: row.new_team_name || row.team_name || row.old_team_name || null })), {
+  await postMaddenWeeklyUpdatesDigest(guild, league, dedupeMaddenDigestRows(rows.map(row => ({ ...row, team_name: row.new_team_name || row.team_name || row.old_team_name || null }))), {
     title: 'Weekly Transactions (Backfilled)',
     emoji: '✂️',
     color: 0xED4245,
@@ -74341,7 +74374,7 @@ Rules:
 - playoffPicture, if present, should cover who's in and who's right on the bubble — real "playoff race" content, mentioning both the last team in and first team out by name.
 - Never use the same sentence structure twice. Mix tones: hype, surprise, concern, admiration.
 - Sound like a real ESPN writer, not a bot. Use sports vernacular naturally.
-- Return ONLY valid JSON: array of objects with "headline" and "blurb" keys. No markdown, no preamble.
+- Return ONLY valid JSON: array of objects with "headline", "blurb", and "team" keys ("team" is the single primary team this story is about, in the exact team name/abbreviation format used in the data above — e.g. "49ers" or "SF" — or null if the story isn't really about one specific team, like a league-wide playoff picture update). No markdown, no preamble.
 - Max 5 items. Pick the most compelling stories.`,
         JSON.stringify(context),
         1000
@@ -74358,6 +74391,7 @@ Rules:
       newsItems.push({
         headline: `${g.winner} defeat ${g.loser === g.homeTeam ? g.loser : g.loser}`,
         blurb: `Final score: ${g.awayTeam} ${g.awayScore} – ${g.homeTeam} ${g.homeScore}. ${g.margin >= 21 ? 'A dominant performance.' : g.margin <= 3 ? 'A nail-biter to the end.' : ''}`,
+        team: g.winner,
       });
     }
     for (const s of streaks.slice(0, 2)) {
@@ -74366,6 +74400,7 @@ Rules:
         blurb: s.streakType === 'win'
           ? `${s.team} have won ${s.streakLen} in a row and are building serious momentum.`
           : `${s.team} have dropped ${s.streakLen} straight and need answers fast.`,
+        team: s.team,
       });
     }
     if (movers?.movers?.length) {
@@ -74377,6 +74412,7 @@ Rules:
         blurb: isDrop
           ? `${bigMover.team} have tumbled from #${bigMover.previousRank} to #${bigMover.rank} — the questions are starting to pile up.`
           : `${bigMover.team} moved from #${bigMover.previousRank} to #${bigMover.rank} in this week's power rankings.`,
+        team: bigMover.team,
       });
     }
     for (const m of majorMoves.slice(0, 2)) {
@@ -74385,6 +74421,7 @@ Rules:
       newsItems.push({
         headline: `${teamName} ${verb} ${m.playerName}${m.overall ? ` (${m.overall} OVR)` : ''}`,
         blurb: `A significant roster move for ${teamName}${m.position ? ` at ${m.position}` : ''} — one worth keeping an eye on.`,
+        team: m.team,
       });
     }
     for (const b of buddingStars.slice(0, 2)) {
@@ -74392,12 +74429,14 @@ Rules:
       newsItems.push({
         headline: `Budding Star Watch: ${b.playerName}${b.age ? ` (${b.age})` : ''} is turning heads`,
         blurb: `${b.playerName} put together a big game for ${teamName} — a name to keep watching this season.`,
+        team: b.team,
       });
     }
     if (gotw) {
       newsItems.push({
         headline: `Game of the Week: ${gotw.awayTeam} @ ${gotw.homeTeam}`,
         blurb: `${gotw.awayTeam} (${gotw.awayRecord}) travel to face ${gotw.homeTeam} (${gotw.homeRecord}) in this week's marquee matchup.`,
+        team: gotw.homeTeam,
       });
     }
     for (const h of hotSeats.slice(0, 1)) {
@@ -74405,6 +74444,7 @@ Rules:
       newsItems.push({
         headline: h.coachName ? `Is ${h.coachName} on the hot seat?` : `${teamName} head coach on the hot seat`,
         blurb: `${teamName} have dropped ${h.streakLen} straight and slid ${h.powerRankingDrop} spots in the power rankings — the pressure is mounting.`,
+        team: h.team,
       });
     }
     for (const p of seasonRecords.slice(0, 1)) {
@@ -74412,6 +74452,7 @@ Rules:
       newsItems.push({
         headline: `${p.playerName} posts the best game of the season so far`,
         blurb: `${p.playerName}'s outing for ${teamName} is the top single-game performance the league has seen this season.`,
+        team: p.team,
       });
     }
     for (const b of bounceBacks.slice(0, 1)) {
@@ -74421,6 +74462,7 @@ Rules:
         blurb: b.isFirstWinEver
           ? `${teamName} finally get in the win column after starting the season winless.`
           : `${teamName} put an end to a ${b.priorRunLength}-game losing streak with a much-needed win.`,
+        team: b.team,
       });
     }
     if (undefeatedWatch && (undefeatedWatch.undefeated.length || undefeatedWatch.winless.length)) {
@@ -74439,6 +74481,7 @@ Rules:
       newsItems.push({
         headline: `${teamName} take over first place in the ${d.division}`,
         blurb: `${teamName} (${d.record}) have moved to the top of the ${d.division} standings.`,
+        team: d.leader,
       });
     }
     if (playoffPicture) {
@@ -74465,12 +74508,22 @@ Rules:
     if (h.includes('power') || h.includes('rank')) color = 0xFEE75C;
 
     await newsChannel.send({
-      embeds: [new EmbedBuilder()
-        .setTitle(`${GG_EMOJI} ${item.headline}`)
-        .setDescription(item.blurb || '')
-        .setColor(color)
-        .setFooter({ text: `GG Sports • ${league.league_name} • ${weekLabel}` })
-        .setTimestamp()],
+      embeds: [(() => {
+        const embed = new EmbedBuilder()
+          .setTitle(`${GG_EMOJI} ${item.headline}`)
+          .setDescription(item.blurb || '')
+          .setColor(color)
+          .setFooter({ text: `GG Sports • ${league.league_name} • ${weekLabel}` })
+          .setTimestamp();
+        // 7J-MADDENNEWSLOGO: per Hxxdie — Madden's news feed is a fully
+        // separate pipeline from the generic (non-Madden) one, and never
+        // got the same logo treatment. Reuses getMaddenTeamLogoUrl, the
+        // exact same lookup already proven working in the transaction/
+        // roster embeds shown right next to this feed.
+        const logoUrl = item.team ? getMaddenTeamLogoUrl(item.team) : null;
+        if (logoUrl) embed.setThumbnail(logoUrl);
+        return embed;
+      })()],
     }).catch(() => null);
 
     await new Promise(r => setTimeout(r, 300)); // small delay to avoid rate limits
