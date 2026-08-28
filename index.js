@@ -10992,12 +10992,24 @@ async function finalizeSchedulingProposal(interaction, gameSource, gameRef, prop
     new ButtonBuilder().setCustomId(`scheddecline:${proposalId}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(`schedcounter:${proposalId}`).setLabel('Counter').setEmoji('🔁').setStyle(ButtonStyle.Secondary),
   ];
-  await interaction.editReply({
+  // 7J-SCHEDPUBLICFIX: per Hxxdie — this used to editReply() the final
+  // proposal onto the same ephemeral picker message the flow started with.
+  // Discord's ephemeral flag is fixed at the very first response to an
+  // interaction and can never be un-set by a later edit — so the opponent,
+  // who actually needs to click Accept/Decline/Counter, could never even
+  // SEE this message, let alone use it. Posted as a genuinely new, public
+  // message in the channel instead; the original ephemeral picker just
+  // gets a small closing confirmation only the proposer needed anyway.
+  const publicMessage = await interaction.channel.send({
     content: opponentId ? `<@${opponentId}>` : undefined,
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(buttons)],
     allowedMentions: { users: opponentId ? [opponentId] : [] },
-  });
+  }).catch(() => null);
+  await interaction.editReply({
+    content: publicMessage ? '✅ Proposal sent — visible to both teams in this thread.' : '⚠️ Could not post the proposal to this thread. Try again.',
+    embeds: [], components: [],
+  }).catch(() => null);
 }
 
 
