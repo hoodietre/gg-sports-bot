@@ -10536,8 +10536,17 @@ const TOURNAMENT_MONTH_NAMES = ['January','February','March','April','May','June
 // already needs most of that budget across its two steps).
 function inferTournamentYear(month, day) {
   const now = new Date();
+  // 7J-YEARINFERFIX: per Hxxdie — real bug, confirmed against the exact
+  // reported scenario. candidate was anchored to midnight, then compared
+  // against the current exact moment (including time-of-day) — so picking
+  // TODAY's date for "later tonight" always looked like it had already
+  // passed (midnight is always earlier than right now on the same day),
+  // silently bumping the year forward by one. Now compares at date
+  // granularity only — today's own midnight against today's own midnight —
+  // so only a date that's genuinely before today rolls to next year.
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const candidate = new Date(now.getFullYear(), month - 1, day);
-  return candidate < now ? now.getFullYear() + 1 : now.getFullYear();
+  return candidate < todayMidnight ? now.getFullYear() + 1 : now.getFullYear();
 }
 
 // Best-effort parse of the OLD free-text start_time values (e.g. "7:30 PM
