@@ -7575,7 +7575,19 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
 
 async function updateLeaguePlayoffBracketImage(guild, league, channel, existingMessageId, bracketState) {
   const png = await renderLeaguePlayoffBracketPng(league, bracketState);
-  if (!png) return null;
+  if (!png) {
+    // 7J-STALEBRACKETIMGFIX: per Hxxdie — this used to return here with the
+    // OLD image message from last season left completely untouched, since
+    // an empty/reset bracket (Start New Season) has nothing to render.
+    // Deletes the stale image instead of leaving it stuck in the channel
+    // forever.
+    if (existingMessageId) {
+      const staleMessage = await channel.messages.fetch(existingMessageId).catch(() => null);
+      if (staleMessage) await staleMessage.delete().catch(() => null);
+      await pool.query(`UPDATE league_playoff_brackets SET bracket_image_message_id = NULL, updated_at = NOW() WHERE league_id = $1`, [league.league_id]).catch(() => null);
+    }
+    return null;
+  }
 
   const attachment = new AttachmentBuilder(png, { name: 'playoff-bracket.png' });
   const content = `🏆 **${league.league_name}** — Live Playoff Bracket`;
@@ -10941,6 +10953,53 @@ async function buildSchedulingHistoryEmbed(guildId, gameSource, gameRef) {
     .setFooter({ text: 'GG Sports • Scheduling' })
     .setTimestamp();
 }
+
+// 7J-SCHEDPICKER: per Hxxdie — "eliminate typing" in Propose a Game Time.
+// Reuses the exact same date/time picker (buildDateTimePickerStepA/B) and
+// finalizeTournamentDateTime/tournamentDiscordTimestamp the tournament
+// scheduler already has proven out, just with a 'schedpropose' prefix
+// instead of building a second date/time UI from scratch.
+const schedProposeSessions = new Map();
+
+async function finalizeSchedulingProposal(interaction, gameSource, gameRef, proposedEpoch) {
+  const lookup = await findGameForScheduling(interaction.guild, gameSource, gameRef).catch(() => null);
+  if (!lookup) { await interaction.editReply({ content: 'Could not find this game anymore.' }); return; }
+  const { league, homeOwner, awayOwner, label } = lookup;
+  if (![homeOwner?.id, awayOwner?.id].includes(interaction.user.id) && !(await userCanUseLeagueSetup(interaction, league))) {
+    await interaction.editReply({ content: 'Only the two teams in this game (or staff) can propose a time.' });
+    return;
+  }
+  const opponentId = interaction.user.id === homeOwner?.id ? awayOwner?.id : homeOwner?.id;
+
+  // Supersede any still-pending proposal for this game before creating a new one.
+  await pool.query(`UPDATE game_schedule_proposals SET status = 'superseded' WHERE game_source = $1 AND game_ref = $2 AND status = 'pending'`, [gameSource, gameRef]).catch(() => null);
+
+  const proposalId = randomUUID();
+  await pool.query(
+    `INSERT INTO game_schedule_proposals (id, guild_id, league_id, game_ref, game_source, thread_id, proposer_user_id, responder_user_id, proposed_at_epoch, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')`,
+    [proposalId, interaction.guild.id, league?.league_id || null, gameRef, gameSource, interaction.channelId, interaction.user.id, opponentId || null, proposedEpoch]
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle('🗓️ Game Time Proposed')
+    .setColor(0xFEE75C)
+    .setDescription(`<@${interaction.user.id}> proposed a time for **${label}**:\n<t:${proposedEpoch}:F> (<t:${proposedEpoch}:R>)`)
+    .setFooter({ text: 'GG Sports • Scheduling' })
+    .setTimestamp();
+  const buttons = [
+    new ButtonBuilder().setCustomId(`schedaccept:${proposalId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`scheddecline:${proposalId}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`schedcounter:${proposalId}`).setLabel('Counter').setEmoji('🔁').setStyle(ButtonStyle.Secondary),
+  ];
+  await interaction.editReply({
+    content: opponentId ? `<@${opponentId}>` : undefined,
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(buttons)],
+    allowedMentions: { users: opponentId ? [opponentId] : [] },
+  });
+}
+
 
 const tournamentCreateSessions = new Map();
 const tournamentEditSessions = new Map();
@@ -20347,6 +20406,26 @@ if (interaction.commandName === 'avatar') {
          WHERE guild_id = $1 AND league_id = $2`,
         [interaction.guild.id, leagueId]
       );
+
+      // 7J-NEWSEASONGAMESCLEANUP: per Hxxdie — real, confirmed bug. The
+      // round-robin schedule generator is fully deterministic (no
+      // shuffling), so a new season regenerates the EXACT same matchup
+      // order as before. league_games had no season scoping at all, and
+      // buildTeamScheduleEmbed's lookup matches purely on week_label + team
+      // role ids with no date/season filter — so a freshly-generated
+      // "Game 4: Anaheim vs Vancouver" silently matched last season's old
+      // completed row for that exact same pairing and displayed its stale
+      // final score as if it were this season's result, before a single
+      // game had actually been played. Clearing old game threads first so
+      // nothing orphaned gets left behind in the channel.
+      const oldGamesResult = await pool.query(`SELECT id, thread_id FROM league_games WHERE guild_id = $1 AND league_id = $2`, [interaction.guild.id, leagueId]).catch(() => ({ rows: [] }));
+      for (const oldGame of oldGamesResult.rows) {
+        if (!oldGame.thread_id) continue;
+        const thread = await interaction.guild.channels.fetch(oldGame.thread_id).catch(() => null);
+        if (thread?.isThread?.()) await thread.delete('GG Sports: new season started, old game thread cleanup').catch(() => null);
+      }
+      await pool.query(`DELETE FROM league_games WHERE guild_id = $1 AND league_id = $2`, [interaction.guild.id, leagueId]).catch(() => null);
+
       await pool.query(
         `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, current_season_mvp_user_id = NULL, current_season_runnerup_user_id = NULL, updated_at = NOW() WHERE league_id = $1`,
         [leagueId]
@@ -23274,79 +23353,87 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isButton() && interaction.customId.startsWith('schedpropose:')) {
       const [, gameSource, gameRef] = interaction.customId.split(':');
       const sharedNote = await buildSchedulingSharedWindowsNote(interaction.guild.id, interaction.channel).catch(() => '');
-      const modal = new ModalBuilder()
-        .setCustomId(`schedpropose_modal:${gameSource}:${gameRef}`)
-        .setTitle('Propose a Game Time')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('month_day').setLabel('Date (Month Day, e.g. "March 14")').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('Time (e.g. "7:30 PM")').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('timezone').setLabel('Your Timezone (ET, CT, MT, PT, UTC, etc.)').setStyle(TextInputStyle.Short).setRequired(true)),
-        );
-      if (sharedNote) {
-        await interaction.reply({ content: sharedNote, ephemeral: true });
-      }
-      await interaction.showModal(modal);
+      const token = randomBytes(6).toString('hex');
+      const session = { token, gameSource, gameRef };
+      schedProposeSessions.set(token, session);
+      const payload = buildDateTimePickerStepA('schedpropose', token, session);
+      if (sharedNote) payload.content = sharedNote + '\n\n' + payload.content;
+      await interaction.reply({ ...payload, ephemeral: true });
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('schedpropose_modal:')) {
-      await interaction.deferReply();
-      const [, gameSource, gameRef] = interaction.customId.split(':');
-      const monthDayRaw = interaction.fields.getTextInputValue('month_day').trim();
-      const timeRaw = interaction.fields.getTextInputValue('time').trim();
-      const timezoneRaw = interaction.fields.getTextInputValue('timezone').trim().toUpperCase();
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('schedpropose_dtmonth:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      session.month = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('schedpropose', token, session));
+      return;
+    }
 
-      const ianaZone = TOURNAMENT_TIMEZONE_IANA[TOURNAMENT_TIMEZONE_ALIASES[timezoneRaw] || timezoneRaw];
-      const timeMatch = /(\d{1,2}):?(\d{2})?\s*(AM|PM)/i.exec(timeRaw);
-      const monthMatch = TOURNAMENT_MONTH_NAMES.findIndex(m => monthDayRaw.toLowerCase().includes(m.toLowerCase())) + 1;
-      const dayMatch = monthDayRaw.match(/\b(\d{1,2})\b/);
-      if (!ianaZone || !timeMatch || !monthMatch || !dayMatch) {
-        await interaction.editReply({ content: 'Could not parse that date/time. Try again like: Date "March 14", Time "7:30 PM", Timezone "ET".' });
-        return;
-      }
-      const hour24 = timeMatch[3].toUpperCase() === 'PM' ? (Number(timeMatch[1]) % 12) + 12 : Number(timeMatch[1]) % 12;
-      const minute = timeMatch[2] ? Number(timeMatch[2]) : 0;
-      const day = Number(dayMatch[1]);
-      const year = inferTournamentYear(monthMatch, day);
-      const epochMs = tournamentWallClockToUtcEpoch(year, monthMatch, day, hour24, minute, ianaZone);
-      const proposedEpoch = Math.floor(epochMs / 1000);
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('schedpropose_dtday1:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('schedpropose', token, session));
+      return;
+    }
 
-      const lookup = await findGameForScheduling(interaction.guild, gameSource, gameRef).catch(() => null);
-      if (!lookup) { await interaction.editReply({ content: 'Could not find this game anymore.' }); return; }
-      const { league, homeOwner, awayOwner, label } = lookup;
-      if (![homeOwner?.id, awayOwner?.id].includes(interaction.user.id) && !(await userCanUseLeagueSetup(interaction, league))) {
-        await interaction.editReply({ content: 'Only the two teams in this game (or staff) can propose a time.' });
-        return;
-      }
-      const opponentId = interaction.user.id === homeOwner?.id ? awayOwner?.id : homeOwner?.id;
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('schedpropose_dtday2:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      session.day = Number(interaction.values[0]);
+      await interaction.update(buildDateTimePickerStepA('schedpropose', token, session));
+      return;
+    }
 
-      // Supersede any still-pending proposal for this game before creating a new one.
-      await pool.query(`UPDATE game_schedule_proposals SET status = 'superseded' WHERE game_source = $1 AND game_ref = $2 AND status = 'pending'`, [gameSource, gameRef]).catch(() => null);
+    if (interaction.isButton() && interaction.customId.startsWith('schedpropose_dtdatecontinue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      await interaction.update(buildDateTimePickerStepB('schedpropose', token, session));
+      return;
+    }
 
-      const proposalId = randomUUID();
-      await pool.query(
-        `INSERT INTO game_schedule_proposals (id, guild_id, league_id, game_ref, game_source, thread_id, proposer_user_id, responder_user_id, proposed_at_epoch, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')`,
-        [proposalId, interaction.guild.id, league?.league_id || null, gameRef, gameSource, interaction.channelId, interaction.user.id, opponentId || null, proposedEpoch]
-      );
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('schedpropose_dttimeslot:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      const [hour, minute] = interaction.values[0].split(':').map(Number);
+      session.hour = hour;
+      session.minute = minute;
+      await interaction.update(buildDateTimePickerStepB('schedpropose', token, session));
+      return;
+    }
 
-      const embed = new EmbedBuilder()
-        .setTitle('🗓️ Game Time Proposed')
-        .setColor(0xFEE75C)
-        .setDescription(`<@${interaction.user.id}> proposed a time for **${label}**:\n<t:${proposedEpoch}:F> (<t:${proposedEpoch}:R>)`)
-        .setFooter({ text: 'GG Sports • Scheduling' })
-        .setTimestamp();
-      const buttons = [
-        new ButtonBuilder().setCustomId(`schedaccept:${proposalId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`scheddecline:${proposalId}`).setLabel('Decline').setEmoji('❌').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`schedcounter:${proposalId}`).setLabel('Counter').setEmoji('🔁').setStyle(ButtonStyle.Secondary),
-      ];
-      await interaction.editReply({
-        content: opponentId ? `<@${opponentId}>` : undefined,
-        embeds: [embed],
-        components: [new ActionRowBuilder().addComponents(buttons)],
-        allowedMentions: { users: opponentId ? [opponentId] : [] },
-      });
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('schedpropose_dtampm:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      session.ampm = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('schedpropose', token, session));
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('schedpropose_dttimezone:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      session.timezone = interaction.values[0];
+      await interaction.update(buildDateTimePickerStepB('schedpropose', token, session));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('schedpropose_dttimecontinue:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = schedProposeSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This session expired. Click Propose Time again.', components: [] }); return; }
+      await interaction.deferUpdate();
+      finalizeTournamentDateTime(session);
+      schedProposeSessions.delete(token);
+      await finalizeSchedulingProposal(interaction, session.gameSource, session.gameRef, session.startsAtEpoch);
       return;
     }
 
@@ -23388,15 +23475,10 @@ if (interaction.commandName === 'avatar') {
       if (proposal.status !== 'pending') { await interaction.reply({ content: `This proposal is no longer pending (status: ${proposal.status}).`, ephemeral: true }); return; }
       if (interaction.user.id !== proposal.responder_user_id) { await interaction.reply({ content: 'Only the other team can counter this proposal.', ephemeral: true }); return; }
       await pool.query(`UPDATE game_schedule_proposals SET status = 'countered', responded_at = NOW() WHERE id = $1`, [proposalId]);
-      const modal = new ModalBuilder()
-        .setCustomId(`schedpropose_modal:${proposal.game_source}:${proposal.game_ref}`)
-        .setTitle('Counter-Propose a Time')
-        .addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('month_day').setLabel('Date (Month Day, e.g. "March 14")').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('Time (e.g. "7:30 PM")').setStyle(TextInputStyle.Short).setRequired(true)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('timezone').setLabel('Your Timezone (ET, CT, MT, PT, UTC, etc.)').setStyle(TextInputStyle.Short).setRequired(true)),
-        );
-      await interaction.showModal(modal);
+      const token = randomBytes(6).toString('hex');
+      const session = { token, gameSource: proposal.game_source, gameRef: proposal.game_ref };
+      schedProposeSessions.set(token, session);
+      await interaction.reply({ ...buildDateTimePickerStepA('schedpropose', token, session), ephemeral: true });
       return;
     }
 
@@ -34641,7 +34723,12 @@ async function refundUnscoredStructuredGamesForRound(guild, league, weekLabel) {
     const homeOwner = await findTeamOwnerByRoleId(guild, game.home_team_role_id).catch(() => null);
     const awayOwner = await findTeamOwnerByRoleId(guild, game.away_team_role_id).catch(() => null);
     const reminderText = `Your **${weekLabel}** matchup (**${game.away_team_name} @ ${game.home_team_name}**) in **${league.league_name}** advanced without a final score ever being reported${openLines.rows.length ? ' — any open bets on it have been refunded' : ''}. Please report scores promptly once a game finishes so this doesn't happen again.`;
-    for (const owner of [homeOwner, awayOwner].filter(Boolean)) {
+    // 7J-DUPEDMFIX: per Hxxdie — if the same person owns both teams in a
+    // matchup (common during solo testing, but possible any time), they
+    // were getting sent the identical reminder twice, once per role.
+    // Deduped by user id so each real recipient only ever gets it once.
+    const uniqueOwners = [...new Map([homeOwner, awayOwner].filter(Boolean).map(o => [o.id, o])).values()];
+    for (const owner of uniqueOwners) {
       await owner.send({ content: reminderText }).catch(() => null);
     }
   }
