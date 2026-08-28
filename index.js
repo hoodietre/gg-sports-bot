@@ -2076,6 +2076,22 @@ async function initDatabase() {
     )
   `);
   await pool.query(`ALTER TABLE league_games ADD COLUMN IF NOT EXISTS thread_id TEXT`);
+  // 7J-ARCHIVENOTDELETE: per Hxxdie — a season rollover (or the wipeallgames
+  // tool) used to hard-DELETE league_games rows, which is what originally
+  // fixed the "stale season showing as current" bug — but that same delete
+  // also permanently erases real historical data other features genuinely
+  // depend on (team-level head-to-head, in particular, is a live query
+  // against this table with no separate aggregate — see
+  // getHeadToHeadSnapshot). archived_at replaces hard deletion: NULL means
+  // "current season, still live," non-NULL means "belongs to a past
+  // season." Every query that means "what's happening THIS season"
+  // (schedule display, duplicate-round checks, unreported-game reminders,
+  // win/loss streaks — which reset each season by normal sports
+  // convention) filters on archived_at IS NULL. All-time/historical
+  // queries (head-to-head) intentionally do NOT filter on it, preserving
+  // full history across every season exactly as before.
+  await pool.query(`ALTER TABLE league_games ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_league_games_active ON league_games (guild_id, league_id, week_label) WHERE archived_at IS NULL`);
   // 7J-48LOCK: Track H item 26 — anti-late-betting exploit. Authoritative
   // per-game record of whether "Game Started" was pressed, since a single
   // league_game can have multiple associated sportsbook_games rows
@@ -4501,7 +4517,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false)))
-      .addSubcommand(sc => sc.setName('cleanupduplicates').setDescription('Staff: find and remove duplicate game records for the same round matchup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
+      .addSubcommand(sc => sc.setName('cleanupduplicates').setDescription('Staff: find and remove duplicate game records for the same round matchup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('wipeallgames').setDescription('Staff: archive ALL current game records + delete their threads (history preserved, standings/schedule untouched)').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('activecheck')
@@ -6474,7 +6491,7 @@ async function buildTeamScheduleEmbed(guild, league, customSettings, teamRoleId,
     const sideLabel = isHome ? 'vs' : '@';
 
     const reportedResult = await pool.query(
-      `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3
+      `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3 AND archived_at IS NULL
        AND (home_team_role_id = $4 OR away_team_role_id = $4) LIMIT 1`,
       [guild.id, league.league_id, weekLabel, teamRoleId]
     ).catch(() => ({ rows: [] }));
@@ -8540,7 +8557,7 @@ async function getTeamResultStreak(guildId, leagueId, teamRoleId) {
   const result = await pool.query(
     `SELECT home_team_role_id, away_team_role_id, winner_team_role_id, home_score, away_score
      FROM league_games
-     WHERE guild_id = $1 AND league_id = $2 AND status = 'final'
+     WHERE guild_id = $1 AND league_id = $2 AND status = 'final' AND archived_at IS NULL
        AND (home_team_role_id = $3 OR away_team_role_id = $3)
      ORDER BY updated_at DESC
      LIMIT 10`,
@@ -8573,7 +8590,7 @@ async function getPriorTeamResultStreak(guildId, leagueId, teamRoleId, excludeGa
   const result = await pool.query(
     `SELECT home_team_role_id, away_team_role_id, winner_team_role_id, home_score, away_score
      FROM league_games
-     WHERE guild_id = $1 AND league_id = $2 AND status = 'final' AND id != $4
+     WHERE guild_id = $1 AND league_id = $2 AND status = 'final' AND id != $4 AND archived_at IS NULL
        AND (home_team_role_id = $3 OR away_team_role_id = $3)
      ORDER BY updated_at DESC
      LIMIT 10`,
@@ -11098,6 +11115,10 @@ const commissionerSeasonHistorySessions = new Map();
 // dry-run reply and the confirm button, same session-token pattern used
 // throughout the bot for any destructive two-step confirm.
 const gameCleanupDuplicateSessions = new Map();
+// 7J-WIPEALLGAMES: same session-token confirm pattern, for the "wipe every
+// game record for a league" tool — deliberately separate from
+// gameCleanupDuplicateSessions since it's a distinct, more sweeping action.
+const gameWipeAllSessions = new Map();
 
 // 7J-SEASONHISTORYV2: resolves the display label for whatever the wizard is
 // currently filling in — the trophy name for "champion", or the configured
@@ -20479,13 +20500,20 @@ if (interaction.commandName === 'avatar') {
       // final score as if it were this season's result, before a single
       // game had actually been played. Clearing old game threads first so
       // nothing orphaned gets left behind in the channel.
-      const oldGamesResult = await pool.query(`SELECT id, thread_id FROM league_games WHERE guild_id = $1 AND league_id = $2`, [interaction.guild.id, leagueId]).catch(() => ({ rows: [] }));
+      // 7J-ARCHIVENOTDELETE: per Hxxdie — this originally hard-deleted
+      // these rows, which also fixed the bug above but permanently erased
+      // real history other features depend on (team-level head-to-head is
+      // a live query against this table, with no separate aggregate).
+      // Archives instead — every "current season" query elsewhere now
+      // filters on archived_at IS NULL, so this still fully fixes the
+      // stale-schedule bug without losing anything.
+      const oldGamesResult = await pool.query(`SELECT id, thread_id FROM league_games WHERE guild_id = $1 AND league_id = $2 AND archived_at IS NULL`, [interaction.guild.id, leagueId]).catch(() => ({ rows: [] }));
       for (const oldGame of oldGamesResult.rows) {
         if (!oldGame.thread_id) continue;
         const thread = await interaction.guild.channels.fetch(oldGame.thread_id).catch(() => null);
         if (thread?.isThread?.()) await thread.delete('GG Sports: new season started, old game thread cleanup').catch(() => null);
       }
-      await pool.query(`DELETE FROM league_games WHERE guild_id = $1 AND league_id = $2`, [interaction.guild.id, leagueId]).catch(() => null);
+      await pool.query(`UPDATE league_games SET archived_at = NOW() WHERE guild_id = $1 AND league_id = $2 AND archived_at IS NULL`, [interaction.guild.id, leagueId]).catch(() => null);
 
       await pool.query(
         `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, current_season_mvp_user_id = NULL, current_season_runnerup_user_id = NULL, updated_at = NOW() WHERE league_id = $1`,
@@ -21316,6 +21344,34 @@ if (interaction.commandName === 'avatar') {
     if (interaction.isButton() && interaction.customId.startsWith('gamecleanup_cancel:')) {
       const token = interaction.customId.split(':')[1];
       gameCleanupDuplicateSessions.delete(token);
+      await interaction.update({ content: 'Cancelled — nothing was deleted.', components: [] });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamewipeall_confirm:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = gameWipeAllSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This preview expired. Run `/game wipeallgames` again.', components: [] }); return; }
+      const league = await getLeagueById(session.leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true }); return; }
+      await interaction.update({ content: 'Archiving games...', components: [] });
+
+      for (const threadId of session.deleteThreadIds) {
+        const thread = await interaction.guild.channels.fetch(threadId).catch(() => null);
+        if (thread?.isThread?.()) await thread.delete('GG Sports: archive all games').catch(() => null);
+      }
+      if (session.archiveIds.length) {
+        await pool.query(`UPDATE league_games SET archived_at = NOW() WHERE id = ANY($1::uuid[])`, [session.archiveIds]).catch(() => null);
+      }
+      gameWipeAllSessions.delete(token);
+
+      await interaction.editReply({ content: `✅ Archived **${session.archiveIds.length}** game record(s) and deleted their threads for **${league.league_name}**. Records are preserved for head-to-head history, just excluded from current-season views. Standings, schedule, and current round were not touched.` });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamewipeall_cancel:')) {
+      const token = interaction.customId.split(':')[1];
+      gameWipeAllSessions.delete(token);
       await interaction.update({ content: 'Cancelled — nothing was deleted.', components: [] });
       return;
     }
@@ -26130,7 +26186,7 @@ if (interaction.commandName === 'avatar') {
         const groupsResult = await pool.query(
           `SELECT week_label, LEAST(home_team_role_id, away_team_role_id) AS team_a, GREATEST(home_team_role_id, away_team_role_id) AS team_b, COUNT(*)::int AS n
            FROM league_games
-           WHERE guild_id = $1 AND league_id = $2 AND week_label IS NOT NULL
+           WHERE guild_id = $1 AND league_id = $2 AND week_label IS NOT NULL AND archived_at IS NULL
            GROUP BY week_label, LEAST(home_team_role_id, away_team_role_id), GREATEST(home_team_role_id, away_team_role_id)
            HAVING COUNT(*) > 1`,
           [interaction.guild.id, cleanupLeague.league_id]
@@ -26147,7 +26203,7 @@ if (interaction.commandName === 'avatar') {
         const previewLines = [];
         for (const group of groupsResult.rows) {
           const rowsResult = await pool.query(
-            `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3
+            `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3 AND archived_at IS NULL
                AND ((home_team_role_id = $4 AND away_team_role_id = $5) OR (home_team_role_id = $5 AND away_team_role_id = $4))
              ORDER BY (status = 'final') DESC, created_at ASC`,
             [interaction.guild.id, cleanupLeague.league_id, group.week_label, group.team_a, group.team_b]
@@ -26183,6 +26239,65 @@ if (interaction.commandName === 'avatar') {
           components: [new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('gamecleanup_confirm:' + token).setLabel('Delete Duplicates').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId('gamecleanup_cancel:' + token).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+          )],
+        });
+        return;
+      }
+
+      // 7J-WIPEALLGAMES: per Hxxdie — a targeted fix for a real scenario
+      // cleanupduplicates can't touch: a Season 1 -> Season 2 rollover that
+      // happened BEFORE the league_games cleanup fix existed, leaving old
+      // Season 1 results sitting in the table under the same game numbers
+      // Season 2 is now reaching. These aren't duplicates (only one row
+      // per game exists) so the duplicate-scan correctly finds nothing —
+      // this is a different, narrower tool: archive every CURRENT (non-
+      // archived) game record for a league. Deliberately does NOT touch
+      // standings, schedule, or current_round — those may already be
+      // legitimately correct, and touching them without being asked would
+      // risk the exact kind of unintended side effect this tool exists to
+      // avoid.
+      // 7J-ARCHIVENOTDELETE: per Hxxdie — this originally hard-deleted
+      // every row, which would have permanently erased real history other
+      // features depend on (team-level head-to-head, in particular).
+      // Archives instead of deleting, and only ever touches rows that are
+      // still current (archived_at IS NULL) — running this twice in a row
+      // is safe and simply finds nothing left to archive the second time.
+      if (gameSubcommand === 'wipeallgames') {
+        const wipeLeagueName = interaction.options.getString('league');
+        const wipeLeague = await getLeagueByName(interaction.guild.id, wipeLeagueName);
+        if (!wipeLeague) { await interaction.reply({ content: 'Could not find that league.', ephemeral: true }); return; }
+        if (!(await userCanUseLeagueSetup(interaction, wipeLeague))) {
+          await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true });
+          return;
+        }
+        await interaction.deferReply({ ephemeral: true });
+
+        const rowsResult = await pool.query(`SELECT id, thread_id, week_label, home_team_name, away_team_name, status FROM league_games WHERE guild_id = $1 AND league_id = $2 AND archived_at IS NULL ORDER BY week_label ASC`, [interaction.guild.id, wipeLeague.league_id]);
+        if (!rowsResult.rows.length) {
+          await interaction.editReply({ content: `No current (non-archived) game records exist for **${wipeLeague.league_name}** — nothing to archive.` });
+          return;
+        }
+        const finalCount = rowsResult.rows.filter(r => r.status === 'final').length;
+        const threadCount = rowsResult.rows.filter(r => r.thread_id).length;
+
+        const token = randomBytes(6).toString('hex');
+        gameWipeAllSessions.set(token, {
+          leagueId: wipeLeague.league_id,
+          archiveIds: rowsResult.rows.map(r => r.id),
+          deleteThreadIds: rowsResult.rows.map(r => r.thread_id).filter(Boolean),
+        });
+
+        const previewEmbed = new EmbedBuilder()
+          .setTitle(`📦 Archive All Games Preview — ${wipeLeague.league_name}`)
+          .setColor(0xED4245)
+          .setDescription(`This will archive **${rowsResult.rows.length}** current game record(s) (${finalCount} with a reported final score, ${rowsResult.rows.length - finalCount} not yet reported) and delete **${threadCount}** associated thread(s) from the channel.\n\nArchived records are NOT deleted — they're preserved for head-to-head history and any future audit, just excluded from current-season views (schedule, duplicate checks, reminders, streaks). **Standings, the schedule, and current round progress are NOT touched.** Nothing has been archived yet.`)
+          .setFooter({ text: 'GG Sports • Game Cleanup' });
+
+        await interaction.editReply({
+          embeds: [previewEmbed],
+          components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('gamewipeall_confirm:' + token).setLabel('Archive All Games').setEmoji('📦').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('gamewipeall_cancel:' + token).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
           )],
         });
         return;
@@ -34841,7 +34956,7 @@ async function createLeagueGameCore(interaction, activeLeague, home, away, { sch
   if (weekLabel) {
     const existingResult = await pool.query(
       `SELECT * FROM league_games
-       WHERE guild_id = $1 AND league_id = $2 AND week_label = $3
+       WHERE guild_id = $1 AND league_id = $2 AND week_label = $3 AND archived_at IS NULL
          AND ((home_team_role_id = $4 AND away_team_role_id = $5) OR (home_team_role_id = $5 AND away_team_role_id = $4))
        LIMIT 1`,
       [interaction.guild.id, activeLeague.league_id, weekLabel, home.id, away.id]
@@ -34891,7 +35006,7 @@ async function createLeagueGameCore(interaction, activeLeague, home, away, { sch
 // future rounds rather than letting them pile up unreported.
 async function refundUnscoredStructuredGamesForRound(guild, league, weekLabel) {
   const unscoredGames = await pool.query(
-    `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3 AND status != 'final'`,
+    `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3 AND status != 'final' AND archived_at IS NULL`,
     [guild.id, league.league_id, weekLabel]
   ).catch(() => ({ rows: [] }));
 
