@@ -4500,7 +4500,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('reset').setDescription('Staff: reset a reported game').addStringOption(o => o.setName('game_id').setDescription('Game ID').setRequired(true).setAutocomplete(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(false)))
       .addSubcommand(sc => sc.setName('schedule').setDescription('Show schedule').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
-      .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false))),
+      .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false)))
+      .addSubcommand(sc => sc.setName('cleanupduplicates').setDescription('Staff: find and remove duplicate game records for the same round matchup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('activecheck')
@@ -11093,6 +11094,10 @@ function presentLeagueRoleRemoval(interaction, { league, targetUser, teamRoleIds
 // leagueKickConfirmations above.
 const pendingPanelLeagueCreations = new Map();
 const commissionerSeasonHistorySessions = new Map();
+// 7J-DUPEGAMEFIX: holds a cleanup preview's computed delete list between the
+// dry-run reply and the confirm button, same session-token pattern used
+// throughout the bot for any destructive two-step confirm.
+const gameCleanupDuplicateSessions = new Map();
 
 // 7J-SEASONHISTORYV2: resolves the display label for whatever the wizard is
 // currently filling in — the trophy name for "champion", or the configured
@@ -18419,6 +18424,10 @@ if (interaction.commandName === 'avatar') {
           const createResult = await createLeagueGameCore(interaction, league, homeTeam, awayTeam, { weekLabel: `Game ${currentRound}` });
           if (!createResult.ok || !createResult.game) continue;
           gamesCreated += 1;
+          // 7J-DUPEGAMEFIX: this round's game already existed (Advance ran
+          // twice for it) — its thread should too, so skip creating a
+          // second one pointing at the same underlying game.
+          if (createResult.alreadyExisted) continue;
 
           if (threadChannel?.isTextBased?.()) {
             const threadResult = await createGameCenterThread(interaction, league, createResult.game, { channelIdOverride: threadChannelId });
@@ -21262,6 +21271,34 @@ if (interaction.commandName === 'avatar') {
       if (!session) { await interaction.reply({ content: 'This session expired. Start over from Operations → Season History.', ephemeral: true }); return; }
       session.notes = interaction.fields.getTextInputValue('notes') || null;
       await interaction.reply({ ...buildSeasonHistoryWizardPayload(token), ephemeral: true });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamecleanup_confirm:')) {
+      const token = interaction.customId.split(':')[1];
+      const session = gameCleanupDuplicateSessions.get(token);
+      if (!session) { await interaction.update({ content: 'This cleanup preview expired. Run `/game cleanupduplicates` again.', components: [] }); return; }
+      const league = await getLeagueById(session.leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true }); return; }
+      await interaction.update({ content: 'Removing duplicates...', components: [] });
+
+      for (const threadId of session.deleteThreadIds) {
+        const thread = await interaction.guild.channels.fetch(threadId).catch(() => null);
+        if (thread?.isThread?.()) await thread.delete('GG Sports: duplicate game cleanup').catch(() => null);
+      }
+      const deleteResult = session.deleteIds.length
+        ? await pool.query(`DELETE FROM league_games WHERE id = ANY($1::uuid[])`, [session.deleteIds]).catch(() => null)
+        : null;
+      gameCleanupDuplicateSessions.delete(token);
+
+      await interaction.editReply({ content: `✅ Removed **${session.deleteIds.length}** duplicate game record(s) and their threads for **${league.league_name}**.` });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('gamecleanup_cancel:')) {
+      const token = interaction.customId.split(':')[1];
+      gameCleanupDuplicateSessions.delete(token);
+      await interaction.update({ content: 'Cancelled — nothing was deleted.', components: [] });
       return;
     }
 
@@ -26055,7 +26092,67 @@ if (interaction.commandName === 'avatar') {
       if (!interaction.guild) return;
       const gameSubcommand = interaction.options.getSubcommand();
 
-      
+      // 7J-DUPEGAMEFIX: per Hxxdie — real, confirmed live duplicates
+      // already exist from before the createLeagueGameCore fix (that fix
+      // only stops NEW duplicates; it can't retroactively fix rows already
+      // sitting in the database). This finds and lets staff clean up
+      // existing duplicate (week_label, home, away) groups for a league.
+      // Dry-run by default — shows exactly what would be removed and
+      // requires an explicit confirm button before deleting anything.
+      if (gameSubcommand === 'cleanupduplicates') {
+        const cleanupLeagueName = interaction.options.getString('league');
+        const cleanupLeague = await getLeagueByName(interaction.guild.id, cleanupLeagueName);
+        if (!cleanupLeague) { await interaction.reply({ content: 'Could not find that league.', ephemeral: true }); return; }
+        if (!(await userCanUseLeagueSetup(interaction, cleanupLeague))) {
+          await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true });
+          return;
+        }
+        await interaction.deferReply({ ephemeral: true });
+
+        const groupsResult = await pool.query(
+          `SELECT week_label, LEAST(home_team_role_id, away_team_role_id) AS team_a, GREATEST(home_team_role_id, away_team_role_id) AS team_b, COUNT(*)::int AS n
+           FROM league_games
+           WHERE guild_id = $1 AND league_id = $2 AND week_label IS NOT NULL
+           GROUP BY week_label, LEAST(home_team_role_id, away_team_role_id), GREATEST(home_team_role_id, away_team_role_id)
+           HAVING COUNT(*) > 1`,
+          [interaction.guild.id, cleanupLeague.league_id]
+        );
+
+        if (!groupsResult.rows.length) {
+          await interaction.editReply({ content: `No duplicate game records found for **${cleanupLeague.league_name}**.` });
+          return;
+        }
+
+        const toKeep = [];
+        const toDelete = [];
+        const NL = String.fromCharCode(10);
+        const previewLines = [];
+        for (const group of groupsResult.rows) {
+          const rowsResult = await pool.query(
+            `SELECT * FROM league_games WHERE guild_id = $1 AND league_id = $2 AND week_label = $3
+               AND ((home_team_role_id = $4 AND away_team_role_id = $5) OR (home_team_role_id = $5 AND away_team_role_id = $4))
+             ORDER BY (status = 'final') DESC, created_at ASC`,
+            [interaction.guild.id, cleanupLeague.league_id, group.week_label, group.team_a, group.team_b]
+          );
+          const [keeper, ...dupes] = rowsResult.rows;
+          toKeep.push(keeper);
+          toDelete.push(...dupes);
+          previewLines.push(`**${group.week_label}**: ${keeper.away_team_name} @ ${keeper.home_team_name} — keeping ${keeper.status === 'final' ? 'the reported final' : '1 copy'}, removing ${dupes.length} duplicate(s).`);
+        }
+
+        const token = randomBytes(6).toString('hex');
+        gameCleanupDuplicateSessions.set(token, { leagueId: cleanupLeague.league_id, deleteIds: toDelete.map(r => r.id), deleteThreadIds: toDelete.map(r => r.thread_id).filter(Boolean) });
+
+        await interaction.editReply({
+          content: `Found **${groupsResult.rows.length}** duplicate matchup group(s) in **${cleanupLeague.league_name}**, **${toDelete.length}** row(s) would be removed:${NL}${NL}${previewLines.join(NL)}${NL}${NL}Where one copy has a reported final score, that one is always kept. Nothing has been deleted yet.`,
+          components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('gamecleanup_confirm:' + token).setLabel('Delete Duplicates').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('gamecleanup_cancel:' + token).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+          )],
+        });
+        return;
+      }
+
       if (gameSubcommand === 'reset') {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to reset games.', ephemeral: true });
@@ -34693,6 +34790,32 @@ async function createLeagueGameCore(interaction, activeLeague, home, away, { sch
   if (home.id === away.id) {
     return { ok: false, message: 'Home and away teams must be different.' };
   }
+
+  // 7J-DUPEGAMEFIX: per Hxxdie — real, confirmed bug. This had zero
+  // duplicate protection at all — if Advance ever fired twice for the same
+  // round (double-click, an interaction retry, anything), this created a
+  // COMPLETE second set of league_games rows and threads for that round,
+  // with no way to tell they were duplicates afterward. Explains both the
+  // duplicate "advanced without a score" DM (two separate rows both
+  // matching that round, each independently triggering the reminder) and
+  // the schedule showing confusing/stale state, since a report could land
+  // on either copy while the other sat unreported forever. Scoped to
+  // weekLabel only (structured leagues) — open-schedule intentionally has
+  // no week concept and legitimately allows the same two teams to play
+  // multiple times ad-hoc, so this check would be wrong to apply there.
+  if (weekLabel) {
+    const existingResult = await pool.query(
+      `SELECT * FROM league_games
+       WHERE guild_id = $1 AND league_id = $2 AND week_label = $3
+         AND ((home_team_role_id = $4 AND away_team_role_id = $5) OR (home_team_role_id = $5 AND away_team_role_id = $4))
+       LIMIT 1`,
+      [interaction.guild.id, activeLeague.league_id, weekLabel, home.id, away.id]
+    ).catch(() => ({ rows: [] }));
+    if (existingResult.rows[0]) {
+      return { ok: true, game: existingResult.rows[0], alreadyExisted: true };
+    }
+  }
+
   const gameId = randomUUID();
 
   await pool.query(
