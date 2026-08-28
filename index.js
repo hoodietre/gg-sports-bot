@@ -6080,19 +6080,26 @@ function buildTradeHistoryEmbed(league, rows, title = 'Trade History') {
 
 function buildSeasonHistoryEmbed(league, data) {
   const embed = new EmbedBuilder()
-    .setTitle(`${league.league_name} • ${data.seasonLabel} History`)
+    .setTitle(`🏆 ${league.league_name} • ${data.seasonLabel} History`)
     .setColor(0xFEE75C)
-    .addFields({ name: 'Champion', value: data.champion, inline: true })
+    .addFields({ name: '🏆 Champion', value: data.champion, inline: true })
     .setFooter({ text: 'GG Sports • League History' })
     .setTimestamp();
 
-  if (data.runnerUp) embed.addFields({ name: 'Runner-Up', value: data.runnerUp, inline: true });
+  // 7J-HISTORYEMBEDLOGO: per Hxxdie — a Discord embed only has room for one
+  // thumbnail, so the champion (the season's biggest story) gets it;
+  // emojis throughout carry the visual life for everyone else, since
+  // individual award fields can't hold their own inline images.
+  const championLogoUrl = getGenericTeamLogoUrl(data.champion, league);
+  if (championLogoUrl) embed.setThumbnail(championLogoUrl);
+
+  if (data.runnerUp) embed.addFields({ name: '🥈 Runner-Up', value: data.runnerUp, inline: true });
   // 7J-AWARDPLAYERTEAM: MVP is now also Team | Player | @User — parsed the
   // same way as every other award line, so display it the same way too.
   if (data.mvp) {
     const [mvpParsed] = parseCustomAwards('MVP: ' + data.mvp);
     embed.addFields({
-      name: 'MVP / Top Player',
+      name: '⭐ MVP / Top Player',
       value: mvpParsed && !mvpParsed.incomplete ? `${mvpParsed.player} (${mvpParsed.team})` : data.mvp,
       inline: false,
     });
@@ -6100,13 +6107,13 @@ function buildSeasonHistoryEmbed(league, data) {
 
   const customAwards = parseCustomAwards(data.awards);
   if (customAwards.length > 0) {
-    embed.addFields({ name: 'Award Winners', value: '━━━━━━━━━━━━━━', inline: false });
+    embed.addFields({ name: '🎖️ Award Winners', value: '━━━━━━━━━━━━━━', inline: false });
     for (const award of customAwards.slice(0, 20)) {
-      embed.addFields({ name: award.name, value: award.incomplete ? `⚠️ Incomplete (missing team/player/@mention): ${award.mentionText || 'not provided'}` : `${award.player} (${award.team})`, inline: true });
+      embed.addFields({ name: `🎖️ ${award.name}`, value: award.incomplete ? `⚠️ Incomplete (missing team/player/@mention): ${award.mentionText || 'not provided'}` : `${award.player} (${award.team})`, inline: true });
     }
   }
 
-  if (data.notes) embed.addFields({ name: 'Season Notes', value: data.notes, inline: false });
+  if (data.notes) embed.addFields({ name: '📝 Season Notes', value: data.notes, inline: false });
   return embed;
 }
 
@@ -6253,10 +6260,18 @@ function getLeagueSportKey(league) {
 const LEAGUE_DEFAULT_AWARDS = {
   nba: ['MVP', 'Defensive Player of the Year', '6th Man of the Year', 'Most Improved Player', 'Rookie of the Year', 'Coach of the Year'],
   mlb: ['MVP', 'Cy Young', 'Rookie of the Year', 'Manager of the Year'],
-  nhl: ['Hart Trophy (MVP)', 'Vezina Trophy (Goalie)', 'Norris Trophy (Defenseman)', 'Calder Trophy (Rookie)', 'Conn Smythe (Playoffs MVP)'],
+  nhl: ['Hart Trophy (MVP)', 'Vezina Trophy (Goalie)', 'Norris Trophy (Defenseman)', 'Calder Trophy (Rookie)', 'Conn Smythe (Playoffs MVP)', 'Art Ross Trophy (Points Leader)', 'Maurice Richard Trophy (Goals Leader)'],
   cfb: ['Heisman Trophy', 'Coach of the Year'],
   fc: ['Golden Boot', 'Golden Glove', 'Player of the Season', "Young Player of the Season"],
   other: ['MVP'],
+};
+// 7J-DEFAULTAWARDTIER: per Hxxdie — the default-seeded award list never
+// actually marked anything as the tiered-cosmetic (MVP-equivalent) trigger,
+// so even a league's own Hart/MVP/etc. trophy silently fell back to a
+// currency payout instead of the tiered cosmetic item it's meant for. One
+// label per sport, matched case-insensitively at seed time below.
+const LEAGUE_DEFAULT_TIERED_AWARD = {
+  nba: 'MVP', mlb: 'MVP', nhl: 'Hart Trophy (MVP)', cfb: 'Heisman Trophy', fc: 'Player of the Season', other: 'MVP',
 };
 
 // 7J-100AUTOSETUP: real team names for the auto-create-team-roles feature.
@@ -6346,7 +6361,12 @@ async function ensureLeagueCustomSettings(league) {
 
   const sportKey = getLeagueSportKey(league);
   const defaults = LEAGUE_SPORT_DEFAULT_SETTINGS[sportKey] || {};
-  const awards = (LEAGUE_DEFAULT_AWARDS[sportKey] || LEAGUE_DEFAULT_AWARDS.other).map(label => ({ key: label.toLowerCase().replace(/[^a-z0-9]+/g, '_'), label }));
+  const tieredLabel = LEAGUE_DEFAULT_TIERED_AWARD[sportKey] || LEAGUE_DEFAULT_TIERED_AWARD.other;
+  const awards = (LEAGUE_DEFAULT_AWARDS[sportKey] || LEAGUE_DEFAULT_AWARDS.other).map(label => ({
+    key: label.toLowerCase().replace(/[^a-z0-9]+/g, '_'),
+    label,
+    tieredCosmetic: label.toLowerCase() === tieredLabel.toLowerCase(),
+  }));
 
   const result = await pool.query(
     `INSERT INTO league_custom_settings (league_id, use_conferences, use_divisions, playoff_seeding_method, ties_allowed, standings_system, win_points, loss_points, tie_points, awards)
@@ -21180,7 +21200,12 @@ if (interaction.commandName === 'avatar') {
       }
       const result = await postLeagueSeasonHistory(interaction, league, data);
       commissionerSeasonHistorySessions.delete(token);
-      await interaction.followUp({ content: result.message + championAwardNote, ephemeral: true });
+      // 7J-SUBMITSTUCKFIX: per Hxxdie — this used to followUp() with the
+      // real result while leaving the original "Submitting..." message
+      // stuck exactly as-is forever (interaction.update() only sets
+      // content once; nothing ever touched it again). editReply() updates
+      // that same original message instead of posting a second one.
+      await interaction.editReply({ content: '✅ ' + result.message + championAwardNote });
       return;
     }
 
@@ -39888,17 +39913,21 @@ async function postLeagueSeasonHistory(interaction, activeLeague, data) {
   // the same way every other generic news trigger is.
   if (getLeagueSportKey(activeLeague) !== 'madden') {
     await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'league_champion', {
-      championTeam: data.champion, seasonLabel: data.seasonLabel,
+      championTeam: data.champion, champion: data.champion, seasonLabel: data.seasonLabel,
     }).catch(() => null);
     for (const award of awardRows) {
       if (award.incomplete) continue;
+      // 7J-NEWSLOGOFIX: per Hxxdie — award news wasn't showing a team logo
+      // because playerName was a combined "Player (Team)" string with no
+      // clean team name for the existing logo lookup to match against.
+      // team is now passed separately for exactly that.
       await generateAndPostLeagueNewsEvent(interaction.guild, activeLeague, 'award_winner', {
-        playerName: `${award.player} (${award.team})`, awardName: award.name, leagueName: activeLeague.league_name,
+        playerName: `${award.player} (${award.team})`, team: award.team, awardName: award.name, leagueName: activeLeague.league_name,
       }).catch(() => null);
     }
   }
 
-  return { ok: true, message: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.${autoAwardNote}` };
+  return { ok: true, message: `Season history posted for **${activeLeague.league_name} • ${data.seasonLabel}** in ${historyChannel}.${autoAwardNote}\n\nWhen you're ready to move on, use **Start New Season** (Operations panel) to archive this season's records and reset for the next one.` };
 }
 
 async function buildFranchiseHubPayload(guild, targetUser, activeLeague = null) {
