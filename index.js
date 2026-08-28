@@ -35631,12 +35631,6 @@ function buildGameCenterThreadComponents(gameId, isFinal, isStarted = false, wag
   }
   row1.addComponents(
     new ButtonBuilder().setCustomId('gamecenter_stream:' + gameId).setLabel('Stream Hub').setEmoji('📺').setStyle(ButtonStyle.Secondary),
-    // 7J-THREADREFRESH: per Hxxdie — an old thread's message keeps whatever
-    // button set it was created with; Discord doesn't retroactively update
-    // it when the bot's code changes (e.g. Delete Game not existing on
-    // threads created before it was added). Staff-only, posts a fresh
-    // message with the current embed + full up-to-date button set.
-    new ButtonBuilder().setCustomId('gamecenter_refresh:' + gameId).setLabel('Refresh Buttons (Staff)').setEmoji('🔁').setStyle(ButtonStyle.Secondary),
   );
 
   // 7J-PREGAMETOOLS: Coin Toss and Who's Got Next moved out of the matchup
