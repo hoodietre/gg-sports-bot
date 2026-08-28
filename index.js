@@ -26143,8 +26143,25 @@ if (interaction.commandName === 'avatar') {
         const token = randomBytes(6).toString('hex');
         gameCleanupDuplicateSessions.set(token, { leagueId: cleanupLeague.league_id, deleteIds: toDelete.map(r => r.id), deleteThreadIds: toDelete.map(r => r.thread_id).filter(Boolean) });
 
+        // 7J-CLEANUPPREVIEWFIX: per Hxxdie — real bug, confirmed via error
+        // log. This used to build the preview as raw message content
+        // (2000-char hard limit), and a league with a lot of duplicate
+        // groups (48, in this case) blew straight past it — the API call
+        // failed outright, the interaction never got a response, and it
+        // sat stuck on "thinking..." forever with no visible error. An
+        // embed's description allows up to 4096 characters; still sliced
+        // defensively in case an even larger league somehow exceeds that
+        // too.
+        const previewDescription = previewLines.join(NL);
+        const previewEmbed = new EmbedBuilder()
+          .setTitle(`🗑️ Duplicate Game Cleanup Preview — ${cleanupLeague.league_name}`)
+          .setColor(0xED4245)
+          .setDescription(previewDescription.length > 3900 ? previewDescription.slice(0, 3900) + `${NL}${NL}...and more (truncated for display — all duplicates listed above are still included in the actual cleanup).` : previewDescription)
+          .addFields({ name: 'Summary', value: `**${groupsResult.rows.length}** duplicate matchup group(s) found, **${toDelete.length}** row(s) would be removed. Where one copy has a reported final score, that one is always kept. Nothing has been deleted yet.`, inline: false })
+          .setFooter({ text: 'GG Sports • Game Cleanup' });
+
         await interaction.editReply({
-          content: `Found **${groupsResult.rows.length}** duplicate matchup group(s) in **${cleanupLeague.league_name}**, **${toDelete.length}** row(s) would be removed:${NL}${NL}${previewLines.join(NL)}${NL}${NL}Where one copy has a reported final score, that one is always kept. Nothing has been deleted yet.`,
+          embeds: [previewEmbed],
           components: [new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('gamecleanup_confirm:' + token).setLabel('Delete Duplicates').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId('gamecleanup_cancel:' + token).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
