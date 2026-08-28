@@ -10534,19 +10534,31 @@ const TOURNAMENT_MONTH_NAMES = ['January','February','March','April','May','June
 // occurrence" of a given month/day, so we infer the year rather than adding
 // a 3rd select row (Discord caps messages at 5 rows total, and this picker
 // already needs most of that budget across its two steps).
-function inferTournamentYear(month, day) {
+function inferTournamentYear(month, day, ianaZone = null) {
   const now = new Date();
-  // 7J-YEARINFERFIX: per Hxxdie — real bug, confirmed against the exact
-  // reported scenario. candidate was anchored to midnight, then compared
-  // against the current exact moment (including time-of-day) — so picking
-  // TODAY's date for "later tonight" always looked like it had already
-  // passed (midnight is always earlier than right now on the same day),
-  // silently bumping the year forward by one. Now compares at date
-  // granularity only — today's own midnight against today's own midnight —
-  // so only a date that's genuinely before today rolls to next year.
-  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const candidate = new Date(now.getFullYear(), month - 1, day);
-  return candidate < todayMidnight ? now.getFullYear() + 1 : now.getFullYear();
+  // 7J-YEARINFERFIX2: per Hxxdie — the first fix (date-granularity, not
+  // exact-time comparison) was real but insufficient on its own. The
+  // deeper bug: "today" was computed from the SERVER's system clock
+  // (now.getFullYear/getMonth/getDate use the machine's local timezone),
+  // not the timezone the user actually selected for their proposed time.
+  // Railway runs on UTC — if it's 9:46 PM ET, that's already after
+  // midnight UTC, so the server's own "today" is already tomorrow. Picking
+  // today's date (in the user's zone) then looked like picking yesterday
+  // (in the server's zone), tripping the "already passed" branch and
+  // silently adding a year. Verified numerically against this exact
+  // scenario before shipping. Now computes "today" in the SAME timezone
+  // the date/time is actually being entered for, when known.
+  let nowYear, nowMonth, nowDate;
+  if (ianaZone) {
+    const parts = {};
+    for (const p of new Intl.DateTimeFormat('en-US', { timeZone: ianaZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now)) parts[p.type] = p.value;
+    nowYear = Number(parts.year); nowMonth = Number(parts.month); nowDate = Number(parts.day);
+  } else {
+    nowYear = now.getFullYear(); nowMonth = now.getMonth() + 1; nowDate = now.getDate();
+  }
+  const todayMidnight = new Date(nowYear, nowMonth - 1, nowDate);
+  const candidate = new Date(nowYear, month - 1, day);
+  return candidate < todayMidnight ? nowYear + 1 : nowYear;
 }
 
 // Best-effort parse of the OLD free-text start_time values (e.g. "7:30 PM
@@ -10712,13 +10724,14 @@ function tournamentDiscordTimestamp(session) {
   const ianaZone = TOURNAMENT_TIMEZONE_IANA[session.timezone];
   if (!ianaZone) return null;
   const hour24 = session.ampm === 'PM' ? (session.hour % 12) + 12 : session.hour % 12;
-  const year = inferTournamentYear(session.month, session.day);
+  const year = inferTournamentYear(session.month, session.day, ianaZone);
   const epochMs = tournamentWallClockToUtcEpoch(year, session.month, session.day, hour24, session.minute, ianaZone);
   return Math.floor(epochMs / 1000);
 }
 
 function finalizeTournamentDateTime(session) {
-  const year = inferTournamentYear(session.month, session.day);
+  const ianaZone = TOURNAMENT_TIMEZONE_IANA[session.timezone];
+  const year = inferTournamentYear(session.month, session.day, ianaZone);
   session.date = `${year}-${String(session.month).padStart(2, '0')}-${String(session.day).padStart(2, '0')}`;
   session.time = `${session.hour}:${String(session.minute).padStart(2, '0')} ${session.ampm} ${session.timezone}`;
   session.startsAtEpoch = tournamentDiscordTimestamp(session);
