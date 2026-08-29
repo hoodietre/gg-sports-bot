@@ -75234,9 +75234,14 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
 
   if (useClaudeApi && hasAnyEvent) {
     try {
+      const [weekGroup, weekIdx] = maddenWeekLabelSortKey(weekLabel);
+      const isPlayoffWeek = weekGroup === 2;
+      const playoffRoundLabel = isPlayoffWeek ? tournamentBracketRoundLabel(weekIdx + 1, 4, weekIdx, 'nfl') : null;
       const context = {
         leagueName: league.league_name,
         weekLabel,
+        isPlayoffWeek,
+        playoffRoundLabel,
         gameResults: gameResults.slice(0, 8).map(g => ({
           matchup: `${g.awayTeam} @ ${g.homeTeam}`,
           score: `${g.awayTeam} ${g.awayScore} - ${g.homeTeam} ${g.homeScore}`,
@@ -75318,6 +75323,7 @@ Rules:
 - buddingStarWatch entries are young players (24 or under) putting up big numbers — frame these as "one to watch" / breakout-potential stories, genuinely excited about a player's future, not just a stat line.
 - gameOfTheWeek, if present, should always be included as one of the items — write it as a genuine preview/hype piece for the marquee matchup of the upcoming week, not a past result.
 - coachHotSeat entries are teams struggling on multiple fronts at once (a real losing streak AND a real power-rankings slide happening together) — this is the most serious drama angle available. Write it like real "is the seat getting hot" sports-radio speculation, naming the coach if given, but don't invent anything not in the data.
+- If isPlayoffWeek is true, EVERY gameResult this week is single-elimination — the loser's season is over, the winner advances toward playoffRoundLabel's next round. Write these with real playoff stakes and finality (a losing team's season ending is genuinely heavier than a regular-season loss), not the same neutral tone as a Week 6 result.
 - seasonHighPerformances are the single best game any player has posted in the league THIS season for that stat, not just a good game — write these with extra weight, like a real "best performance of the year (so far)" piece.
 - bounceBackWins are teams that just snapped a real losing streak (or a still-winless team's first win) — genuine feel-good redemption stories, warm and triumphant in tone, the opposite of the drama framing used for skids.
 - undefeatedWinlessWatch is a "state of the league" angle — write about which team(s) remain perfect or still winless, especially compelling if there's only one of either.
@@ -75577,7 +75583,107 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   console.log('[SEASON TRANSITION] Offseason finalization complete for league', league.league_id);
 }
 
-// 7J-MADDENPLAYOFFAUTOSTART: per Hxxdie — real gap, not a posting failure.
+// 7J-PLAYOFFCOVERAGE: per Hxxdie — the regular season gets real
+// narrative coverage (Game of the Week, streaks, breakouts, division
+// races), but once a league actually reaches the playoffs — the thing
+// every team spent the whole season playing toward — coverage dropped
+// back to generic weekly stat leaders. Real sports media goes deeper on
+// playoff coverage, not shallower. Two pieces: this one previews every
+// matchup in a newly-built round with real seed/record context and a
+// simple prediction (the AI news writer already has a defined voice for
+// hype/stakes framing — this just gives it the playoff-specific data to
+// work with); postMaddenPlayoffUpsetAlert (below, wired into the
+// results-processing loop) flags it when a lower seed actually beats a
+// higher one. Posted directly rather than folded into the generic weekly
+// AI recap, since a full round preview is substantial enough to deserve
+// its own moment rather than competing for space with stat leaders.
+async function postMaddenPlayoffMatchupPreview(guild, league, round, roundLabel) {
+  const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+  if (!newsChannelId) return;
+  const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
+  if (!newsChannel?.isTextBased?.()) return;
+
+  // Dedup — never repost the same round's preview twice, even across
+  // repeat syncs or a retry.
+  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_preview', roundLabel, 'posted').catch(() => false);
+  if (!shouldPost) return;
+
+  const teamsResult = await pool.query(
+    `SELECT team_name, wins, losses, ties FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const recordByTeam = new Map((teamsResult.rows || []).map(t => [String(t.team_name).toLowerCase(), `${t.wins}-${t.losses}${t.ties ? `-${t.ties}` : ''}`]));
+
+  const conferences = [...new Set(round.map(s => s.conference).filter(Boolean))];
+  const lines = [];
+  for (const conference of conferences.length ? conferences : [null]) {
+    const confSeries = round.filter(s => s.conference === conference);
+    if (!confSeries.length) continue;
+    if (conference) lines.push(`**${conference}**`);
+    for (const s of confSeries) {
+      if (s.bye) {
+        lines.push(`${getMaddenTeamEmoji(s.teamA.name)} **${maddenTeamDisplayName(s.teamA.name)}** — first-round bye`);
+        continue;
+      }
+      const recA = recordByTeam.get(s.teamA.name.toLowerCase()) || '—';
+      const recB = recordByTeam.get(s.teamB.name.toLowerCase()) || '—';
+      const seedA = typeof s.teamA.seed === 'number' ? `#${s.teamA.seed} ` : '';
+      const seedB = typeof s.teamB.seed === 'number' ? `#${s.teamB.seed} ` : '';
+      // Simple, transparent prediction basis: better seed favored when
+      // both are known; better record as a fallback when seed is missing
+      // for one side (e.g. a wildcard team the tiebreak computation
+      // didn't land on — see 7J-REALBRACKETMATCHUPS). Never claims more
+      // certainty than this actually has.
+      let favorite = null;
+      if (typeof s.teamA.seed === 'number' && typeof s.teamB.seed === 'number') {
+        favorite = s.teamA.seed < s.teamB.seed ? s.teamA.name : s.teamB.name;
+      }
+      const favoriteNote = favorite ? ` — ${maddenTeamDisplayName(favorite)} favored` : '';
+      lines.push(`${getMaddenTeamEmoji(s.teamA.name)} **${seedA}${maddenTeamDisplayName(s.teamA.name)}** (${recA}) vs ${getMaddenTeamEmoji(s.teamB.name)} **${seedB}${maddenTeamDisplayName(s.teamB.name)}** (${recB})${favoriteNote}`);
+    }
+    lines.push('');
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏈 ${roundLabel} Preview — ${league.league_name}`)
+    .setColor(0xED4245)
+    .setDescription(lines.join('\n').trim().slice(0, 4000) || 'Matchups set.')
+    .setFooter({ text: 'GG Sports • Playoff Coverage' })
+    .setTimestamp();
+
+  await newsChannel.send({ embeds: [embed] }).catch(() => null);
+}
+
+// Fires when a completed playoff series' winner had a numerically worse
+// (higher) seed than the loser — a real upset, not just "a team won."
+// Never fires for a bye. Dedup-gated per series id so it can't repeat
+// across syncs.
+async function postMaddenPlayoffUpsetAlert(guild, league, series, roundLabel) {
+  if (series.bye || !series.teamA?.seed || !series.teamB?.seed) return; // need both real seeds to call it an upset at all
+  const winnerTeam = series.teamA.name === series.winner ? series.teamA : series.teamB;
+  const loserTeam = series.teamA.name === series.winner ? series.teamB : series.teamA;
+  if (typeof winnerTeam.seed !== 'number' || typeof loserTeam.seed !== 'number') return;
+  if (winnerTeam.seed <= loserTeam.seed) return; // not an upset — better or equal seed won
+
+  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_upset', series.id, 'posted').catch(() => false);
+  if (!shouldPost) return;
+
+  const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+  if (!newsChannelId) return;
+  const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
+  if (!newsChannel?.isTextBased?.()) return;
+
+  const embed = new EmbedBuilder()
+    .setTitle('🚨 Upset Alert')
+    .setColor(0xFEE75C)
+    .setDescription(`${getMaddenTeamEmoji(winnerTeam.name)} **#${winnerTeam.seed} ${maddenTeamDisplayName(winnerTeam.name)}** knock out **#${loserTeam.seed} ${maddenTeamDisplayName(loserTeam.name)}** ${getMaddenTeamEmoji(loserTeam.name)} in the ${roundLabel}.`)
+    .setFooter({ text: 'GG Sports • Playoff Coverage' })
+    .setTimestamp();
+
+  await newsChannel.send({ embeds: [embed] }).catch(() => null);
+}
+
+
 // The playoff bracket channel and league_settings column were already
 // auto-configured (singleChannelSpecs' playoff_bracket_channel_id entry),
 // but autoPostPlayoffBracketPanel was only ever called from the manual
@@ -75651,6 +75757,8 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
     );
     await refreshPlayoffBracketPanel(guild, league).catch(() => null);
     await autoPostPlayoffBracketPanel(guild, league).catch(() => null);
+    await postMaddenPlayoffMatchupPreview(guild, league, firstRound, 'Wild Card').catch(err =>
+      console.error('[SEASON TRANSITION] Wild Card matchup preview failed:', err?.message || err));
   } catch (error) {
     console.error('[SEASON TRANSITION] Auto playoff bracket start failed:', error?.message || error);
     return; // don't flip the stage flag if it failed — retry next sync tick
@@ -75795,6 +75903,9 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
     series.winsB = winnerIsA ? 0 : 1;
     series.winner = winnerIsA ? series.teamA.name : series.teamB.name;
     mutated = true;
+    const currentRoundLabel = tournamentBracketRoundLabel(roundIndex + 1, 4, roundIndex, 'nfl');
+    await postMaddenPlayoffUpsetAlert(guild, league, series, currentRoundLabel).catch(err =>
+      console.error('[MADDEN BRACKET] Upset alert check failed:', err?.message || err));
   }
 
   if (!mutated) return;
@@ -75836,6 +75947,9 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
       `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
       [league.league_id, JSON.stringify(bracket), Number(bracketState.current_round || 1) + 1]
     ).catch(() => null);
+    const nextRoundLabel = tournamentBracketRoundLabel(roundIndex + 2, 4, roundIndex + 1, 'nfl');
+    await postMaddenPlayoffMatchupPreview(guild, league, nextRound, nextRoundLabel).catch(err =>
+      console.error('[MADDEN BRACKET] Matchup preview for', nextRoundLabel, 'failed:', err?.message || err));
     console.log('[MADDEN BRACKET] Round', bracketState.current_round, 'complete for league', league.league_id, '— advanced to round', Number(bracketState.current_round || 1) + 1);
   }
 
