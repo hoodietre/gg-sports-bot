@@ -8536,6 +8536,123 @@ async function selectMaddenPlayoffTeams(guild, league) {
   return seeded;
 }
 
+// 7J-REALBRACKETMATCHUPS: per Hxxdie — real insight: the regular weekly
+// game-thread creation is trustworthy precisely because it READS EA's real
+// synced schedule for the current week rather than trying to predict it.
+// The bracket's matchups now work the same way. Building a round from
+// selectMaddenPlayoffTeams' computed seeding required correctly guessing
+// EA's internal tie-break rule for a close wildcard race — two separate
+// attempts (non-deterministic sort, then point differential, then real
+// head-to-head) all failed to reproduce it for a real 4-way 9-8 tie live.
+// Reading the real matchup directly from madden_imported_games instead
+// means the bracket can never disagree with what actually happened in the
+// game, since it's the exact same ground-truth data source that already
+// builds the (confirmed accurate) weekly game threads. Standings/seeding
+// computation is used ONLY for two lower-risk things that don't determine
+// who plays whom: identifying the bye team (the #1 seed is essentially
+// never part of a close multi-way tie the way a 6/7 wildcard cutoff can
+// be) and best-effort cosmetic seed LABELS for display.
+async function getMaddenPlayoffWeekGames(guild, league, group, idx) {
+  const gamesResult = await pool.query(
+    `SELECT home_team, away_team, week_label
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const matching = (gamesResult.rows || []).filter(g => {
+    const [g2, i2] = maddenWeekLabelSortKey(g.week_label);
+    return g2 === group && i2 === idx;
+  });
+  // Dedup by matchup (team-pair, order-independent) — a game can appear
+  // more than once across syncs if EA re-exports it before it's played.
+  const seen = new Set();
+  const unique = [];
+  for (const g of matching) {
+    const key = [String(g.home_team).toLowerCase(), String(g.away_team).toLowerCase()].sort().join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(g);
+  }
+  return unique;
+}
+
+async function buildMaddenWildCardRoundFromRealGames(guild, league) {
+  // Best-effort seed labels + bye-team identification only — never used to
+  // determine matchups.
+  const computedSeeding = await selectMaddenPlayoffTeams(guild, league).catch(() => []);
+  const seedByTeamName = new Map(computedSeeding.map(t => [t.team_name.toLowerCase(), t.seed]));
+  const byeTeams = computedSeeding.filter(t => t.byeRound1);
+
+  const wildCardGames = await getMaddenPlayoffWeekGames(guild, league, 2, 0);
+  const series = [];
+  const gamesByConference = new Map();
+  for (const g of wildCardGames) {
+    const { conference } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, g.home_team, league).catch(() => ({}));
+    const conf = conference || 'Conference';
+    if (!gamesByConference.has(conf)) gamesByConference.set(conf, []);
+    gamesByConference.get(conf).push(g);
+  }
+
+  for (const [conference, games] of gamesByConference) {
+    const byeTeam = byeTeams.find(t => t.conference === conference);
+    if (byeTeam) {
+      series.push({ id: randomUUID(), teamA: { name: byeTeam.team_name, seed: 1 }, teamB: null, seriesLength: 1, winsA: 1, winsB: 0, winner: byeTeam.team_name, games: [], bye: true, conference });
+    }
+    for (const g of games) {
+      series.push({
+        id: randomUUID(),
+        teamA: { name: g.home_team, seed: seedByTeamName.get(String(g.home_team).toLowerCase()) ?? null },
+        teamB: { name: g.away_team, seed: seedByTeamName.get(String(g.away_team).toLowerCase()) ?? null },
+        seriesLength: 1,
+        winsA: 0,
+        winsB: 0,
+        winner: null,
+        games: [],
+        unlocksAt: null,
+        disputed: false,
+        conference,
+      });
+    }
+  }
+  return series;
+}
+
+// Rounds after Wild Card: same "read, don't predict" principle. Seed and
+// conference are carried forward from whoever won each series in the
+// previous round (real data, already confirmed by that round's own real
+// results), and the actual pairing comes from EA's real synced schedule
+// for the next round — never from a reseed formula guessing who plays whom.
+async function buildMaddenNextRoundFromRealGames(guild, league, previousRound, nextRoundIdx) {
+  const winnerInfo = new Map(); // lowercase team name -> { seed, conference }
+  for (const s of previousRound) {
+    if (!s.winner) continue;
+    const winnerTeam = s.teamA?.name === s.winner ? s.teamA : s.teamB;
+    winnerInfo.set(s.winner.toLowerCase(), { seed: winnerTeam?.seed ?? null, conference: s.conference || null });
+  }
+
+  const roundGames = await getMaddenPlayoffWeekGames(guild, league, 2, nextRoundIdx);
+  const series = [];
+  for (const g of roundGames) {
+    const homeInfo = winnerInfo.get(String(g.home_team).toLowerCase());
+    const awayInfo = winnerInfo.get(String(g.away_team).toLowerCase());
+    const conference = homeInfo?.conference && homeInfo.conference === awayInfo?.conference ? homeInfo.conference : null;
+    series.push({
+      id: randomUUID(),
+      teamA: { name: g.home_team, seed: homeInfo?.seed ?? null },
+      teamB: { name: g.away_team, seed: awayInfo?.seed ?? null },
+      seriesLength: 1,
+      winsA: 0,
+      winsB: 0,
+      winner: null,
+      games: [],
+      unlocksAt: null,
+      disputed: false,
+      conference,
+    });
+  }
+  return series;
+}
+
 // 7J-SPORTPLAYOFFFORMAT: NHL — top 3 per division (2 divisions per
 // conference) auto-qualify (6 of 8 spots), plus the next 2 best conference
 // records outside those top-3s fill the wildcard spots.
@@ -75480,15 +75597,15 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
 
   console.log('[SEASON TRANSITION] Playoff week detected for league', league.league_id, '— auto-starting playoff bracket.');
   try {
-    const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
-    const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length
-      ? customSettings.playoff_series_lengths : [1];
-    const seededTeams = await selectMaddenPlayoffTeams(guild, league);
-    if (seededTeams.length < 2) {
-      console.warn('[SEASON TRANSITION] Not enough teams to auto-start playoff bracket for league', league.league_id);
+    // 7J-REALBRACKETMATCHUPS: reads Round 1 directly from EA's real synced
+    // Wild Card schedule instead of predicting it — see the function's own
+    // comment for why. seriesLengths/buildInitialPlayoffRound are no longer
+    // used here.
+    const firstRound = await buildMaddenWildCardRoundFromRealGames(guild, league);
+    if (firstRound.length < 2) {
+      console.warn('[SEASON TRANSITION] Wild Card games not yet synced for league', league.league_id, '— will retry next sync.');
       return; // retry next sync tick rather than flipping the stage on a no-op
     }
-    const firstRound = buildInitialPlayoffRound(seededTeams, seriesLengths, 'nfl');
     // 7J-NOMADDENBRACKETTHREADS: per Hxxdie — real bug, not a cosmetic
     // duplicate. Madden playoff-week games already get their own native
     // Game Center threads from the regular weekly sync (autoCreateGameThreadsAfterSync
@@ -75555,61 +75672,36 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
   if (!roundSeries || !roundSeries.length) return;
   if (roundIndex > 3) return; // shouldn't happen — real NFL bracket is always exactly 4 rounds
 
-  // 7J-BRACKETRESEED: per Hxxdie — real live incident, not hypothetical.
-  // The now-fixed non-deterministic tie-breaking bug (7J-SEEDTIEBREAKFIX)
-  // could seed the wrong team into a close wildcard race — confirmed live:
-  // Jaguars was the real 7-seed but the bracket had Chargers instead, and
-  // the same tie almost certainly affected the 6-seed too (the
-  // playoff-picture story separately reported Texans, not Chargers, as the
-  // team just missing the cutoff). Self-heals by recomputing seeding fresh
-  // (now with the real tiebreaker) and, for each seed, swapping in
-  // whichever team should actually be there if it doesn't match. Any
-  // result already recorded against a wrong opponent is voided — that game
-  // was real, but against a team that was never supposed to be in the
-  // bracket at all, so the result can't stand. Deliberately scoped to
-  // Round 1 ONLY (roundIndex === 0): every other round's participants are
-  // determined by who WON the previous round, not by standings, so this
-  // correction has nothing meaningful to compare them against and doesn't
-  // attempt it — a seeding error caught after Round 1 has already advanced
-  // needs manual staff handling instead.
+  // 7J-BRACKETREALCHECK: per Hxxdie — replaces the old guess-based reseed
+  // correction (7J-BRACKETRESEED), which tried to fix a wrong matchup by
+  // recomputing seeding and swapping in "whichever team should be at this
+  // seed" — a second and third attempt at the same underlying guess that
+  // still didn't match what actually happened live (see
+  // buildMaddenWildCardRoundFromRealGames's comment for the full story).
+  // This instead compares the bracket's current Round 1 against the real
+  // synced Wild Card games directly. If they don't match, the whole round
+  // is replaced wholesale with the real matchups — simpler and safer than
+  // patching individual series, and it cannot reproduce the old
+  // wrong-conference bug since there's no seed-number lookup involved at
+  // all anymore. Any previously-recorded result is discarded along with
+  // it (it was real, but against whichever opponent the guess had wrongly
+  // assigned) — the results-processing loop right below this will
+  // immediately re-attach the real result for the corrected matchup on
+  // this same sync. Scoped to Round 1 only, same reasoning as before:
+  // later rounds' participants depend on who won, not on this check.
   if (roundIndex === 0) {
-    const correctSeededTeams = await selectMaddenPlayoffTeams(guild, league).catch(() => []);
-    if (correctSeededTeams.length >= 2) {
-      const correctTeamNames = new Set(correctSeededTeams.map(t => t.team_name));
-      let reseedMutated = false;
-      const reseedLog = [];
-      for (const series of roundSeries) {
-        for (const side of ['teamA', 'teamB']) {
-          const currentTeam = series[side];
-          if (!currentTeam || correctTeamNames.has(currentTeam.name)) continue; // not seeded, or genuinely correct
-          // 7J-BRACKETRESEEDCONFFIX: per Hxxdie — real bug, confirmed live.
-          // Seed numbers 1-7 exist independently in EACH conference, so
-          // matching by seed alone with no conference filter could (and
-          // did) grab the wrong conference's team entirely — e.g. AFC's
-          // 6-seed getting "corrected" to NFC's 6-seed, putting the same
-          // team in the bracket twice under two different conferences.
-          // series.conference is set at bracket creation from the team's
-          // actual conference assignment, which doesn't depend on
-          // standings/records at all — unaffected by the tie-break bug
-          // this whole correction exists to clean up after, so it's safe
-          // to filter on here.
-          const correctTeam = correctSeededTeams.find(t => t.seed === currentTeam.seed && t.conference === series.conference);
-          if (!correctTeam || correctTeam.team_name === currentTeam.name) continue;
-          reseedLog.push(`${currentTeam.name} → ${correctTeam.team_name} (${series.conference} seed ${correctTeam.seed})`);
-          series[side] = { name: correctTeam.team_name, seed: correctTeam.seed };
-          // Voiding any result — it was real, but against a team that was
-          // never actually supposed to be in the bracket.
-          series.winsA = 0;
-          series.winsB = 0;
-          series.winner = null;
-          series.games = [];
-          reseedMutated = true;
-        }
-      }
-      if (reseedMutated) {
-        bracket[roundIndex] = roundSeries;
+    const realFirstRound = await buildMaddenWildCardRoundFromRealGames(guild, league).catch(() => []);
+    if (realFirstRound.length >= 2) {
+      const pairKey = (s) => s.bye ? `bye:${s.teamA.name.toLowerCase()}` : [s.teamA.name.toLowerCase(), s.teamB.name.toLowerCase()].sort().join('|');
+      const currentPairs = new Set(roundSeries.map(pairKey));
+      const realPairs = new Set(realFirstRound.map(pairKey));
+      const matches = currentPairs.size === realPairs.size && [...currentPairs].every(p => realPairs.has(p));
+      if (!matches) {
+        console.log('[MADDEN BRACKET] Round 1 did not match real synced games for league', league.league_id, '— replacing with real matchups.');
+        bracket[roundIndex] = realFirstRound;
+        roundSeries.length = 0;
+        roundSeries.push(...realFirstRound);
         await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
-        console.log('[MADDEN BRACKET] Seeding correction applied for league', league.league_id, ':', reseedLog.join(', '));
         await refreshPlayoffBracketPanel(guild, league).catch(() => null);
       }
     }
@@ -75685,10 +75777,19 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
     ).catch(() => null);
     console.log('[MADDEN BRACKET] Champion decided for league', league.league_id, ':', champion);
   } else {
-    const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
-    const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length
-      ? customSettings.playoff_series_lengths : [1];
-    const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1, 'nfl');
+    // 7J-REALBRACKETMATCHUPS: reads the next round from EA's real synced
+    // schedule instead of predicting it via a reseed formula — see
+    // buildMaddenNextRoundFromRealGames's comment. If EA hasn't exported
+    // this round's schedule yet even though the previous round is fully
+    // decided, wait and retry rather than advancing into an empty round.
+    const nextRound = await buildMaddenNextRoundFromRealGames(guild, league, roundSeries, roundIndex + 1);
+    if (!nextRound.length) {
+      bracket[roundIndex] = roundSeries;
+      await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
+      await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+      console.log('[MADDEN BRACKET] Round', bracketState.current_round, 'complete for league', league.league_id, '— next round not yet synced by EA, will retry.');
+      return;
+    }
     bracket[roundIndex] = roundSeries;
     bracket.push(nextRound);
     await pool.query(
