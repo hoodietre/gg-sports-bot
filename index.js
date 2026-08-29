@@ -75702,29 +75702,45 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
   // seed" — a second and third attempt at the same underlying guess that
   // still didn't match what actually happened live (see
   // buildMaddenWildCardRoundFromRealGames's comment for the full story).
-  // This instead compares the bracket's current Round 1 against the real
-  // synced Wild Card games directly. If they don't match, the whole round
-  // is replaced wholesale with the real matchups — simpler and safer than
+  // This instead compares the bracket's current round against a freshly
+  // rebuilt version straight from real synced games. If they don't match,
+  // the whole round is replaced wholesale — simpler and safer than
   // patching individual series, and it cannot reproduce the old
   // wrong-conference bug since there's no seed-number lookup involved at
-  // all anymore. Any previously-recorded result is discarded along with
-  // it (it was real, but against whichever opponent the guess had wrongly
-  // assigned) — the results-processing loop right below this will
-  // immediately re-attach the real result for the corrected matchup on
-  // this same sync. Scoped to Round 1 only, same reasoning as before:
-  // later rounds' participants depend on who won, not on this check.
-  if (roundIndex === 0) {
-    const realFirstRound = await buildMaddenWildCardRoundFromRealGames(guild, league).catch(() => []);
-    if (realFirstRound.length >= 2) {
+  // all anymore. Any previously-recorded result against a since-corrected
+  // matchup is discarded along with it — the results-processing loop
+  // right below this will immediately re-attach the real result for the
+  // corrected matchup on this same sync.
+  //
+  // 7J-BRACKETREALCHECKALLROUNDS: originally scoped to Round 1 only, on
+  // the reasoning that later rounds' participants depend on who won, not
+  // on this check. Real gap found live: a round built once by an earlier
+  // (pre-conference-grouping) version of buildMaddenNextRoundFromRealGames
+  // stayed permanently wrong, since nothing ever re-verified an
+  // already-built round beyond Round 1. Generalized to run for whichever
+  // round is currently active, using the previous round (already decided,
+  // safe to rebuild from) as input for anything past Round 1.
+  //
+  // 7J-BRACKETREALCHECKORDER: also fixes a second real bug found in the
+  // same incident — the match comparison used Set equality over pairKey
+  // strings, which is order-insensitive. A round whose matchup CONTENT
+  // was correct but whose ARRAY ORDER was wrong (exactly what conference-
+  // grouping regressions look like) would report "matches" and skip the
+  // fix entirely. Now compares the exact ordered sequence.
+  {
+    const realRound = roundIndex === 0
+      ? await buildMaddenWildCardRoundFromRealGames(guild, league).catch(() => [])
+      : await buildMaddenNextRoundFromRealGames(guild, league, bracket[roundIndex - 1] || [], roundIndex).catch(() => []);
+    if (realRound.length >= 2) {
       const pairKey = (s) => s.bye ? `bye:${s.teamA.name.toLowerCase()}` : [s.teamA.name.toLowerCase(), s.teamB.name.toLowerCase()].sort().join('|');
-      const currentPairs = new Set(roundSeries.map(pairKey));
-      const realPairs = new Set(realFirstRound.map(pairKey));
-      const matches = currentPairs.size === realPairs.size && [...currentPairs].every(p => realPairs.has(p));
+      const currentKeys = roundSeries.map(pairKey);
+      const realKeys = realRound.map(pairKey);
+      const matches = currentKeys.length === realKeys.length && currentKeys.every((k, i) => k === realKeys[i]);
       if (!matches) {
-        console.log('[MADDEN BRACKET] Round 1 did not match real synced games for league', league.league_id, '— replacing with real matchups.');
-        bracket[roundIndex] = realFirstRound;
+        console.log('[MADDEN BRACKET] Round', bracketState.current_round, 'did not match real synced games for league', league.league_id, '— replacing with real matchups.');
+        bracket[roundIndex] = realRound;
         roundSeries.length = 0;
-        roundSeries.push(...realFirstRound);
+        roundSeries.push(...realRound);
         await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
         await refreshPlayoffBracketPanel(guild, league).catch(() => null);
       }
