@@ -74547,11 +74547,24 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     }
   }
 
-  // 7J-29STORY: playoff picture update — an ongoing storyline for the back
-  // half of the season (fixed week-8 threshold rather than dynamically
-  // computed against season length, to keep this simple), distinct from the
-  // still-deferred "missed playoffs" trigger, which fires once at season
-  // end. Dedup-gated to post at most once per week.
+  // 7J-PLAYOFFPICTURESEEDFIX: per Hxxdie — this used to rank all 32 teams
+  // league-wide by raw win pct and take a flat top-N cutoff, which isn't how
+  // NFL playoffs work at all: seeding is PER CONFERENCE, and the 4 division
+  // winners are guaranteed a top-4 seed in their conference regardless of
+  // record — a flat cross-conference sort can and did push genuinely-in
+  // teams (a weaker conference's division winner, or its 3rd wildcard) below
+  // the cutoff line while a stronger conference's non-division-winning
+  // 8th-best team incorrectly looked "in." Real case that surfaced this:
+  // Packers (9-7) and Texans (8-8) were both actually seeded playoff teams
+  // (NFC 6, AFC 7) but got reported as the bubble because their pct ranked
+  // outside a flat top-14 cut. Mirrors the real seeding rule already
+  // implemented in selectNflPlayoffTeams (division winners 1-4 by
+  // within-conference record, next-3 records fill wildcards 5-7), sourced
+  // from madden_imported_team_stats since Madden leagues never populate
+  // league_standings (selectNflPlayoffTeams's normal data source). Only
+  // applied for NFL-format leagues — other sports' storyline behavior is
+  // left exactly as it was, since there's no reported issue there and no
+  // reason to touch working code while fixing this.
   if (maddenWeekSortValue(weekLabel) >= 8) {
     const canPostPicture = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_picture', weekLabel, 'posted').catch(() => false);
     if (canPostPicture) {
@@ -74562,16 +74575,49 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
       const ranked = (allTeamsResult.rows || [])
         .map(t => ({ team: t.team_name, wins: t.wins, losses: t.losses, pct: (t.wins + t.losses) > 0 ? t.wins / (t.wins + t.losses) : 0 }))
         .sort((a, b) => b.pct - a.pct || b.wins - a.wins);
-      const playoffCount = Number(league.playoff_team_count || 8);
-      if (ranked.length > playoffCount) {
-        const lastIn = ranked[playoffCount - 1];
-        const firstOut = ranked[playoffCount];
-        events.push({
-          type: 'playoff_picture',
-          inTeams: ranked.slice(0, playoffCount).map(r => r.team),
-          lastIn: lastIn ? { team: lastIn.team, record: `${lastIn.wins}-${lastIn.losses}` } : null,
-          firstOut: firstOut ? { team: firstOut.team, record: `${firstOut.wins}-${firstOut.losses}` } : null,
-        });
+
+      if (getPlayoffFormatKey(league) === 'nfl') {
+        const withMeta = await Promise.all(ranked.map(async t => {
+          const { conference, division } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, t.team, league).catch(() => ({}));
+          return { ...t, resolvedConference: conference || 'Conference', resolvedDivision: division || 'Division' };
+        }));
+        const conferences = [...new Set(withMeta.map(t => t.resolvedConference))];
+        const bubbles = [];
+        for (const conference of conferences) {
+          const inConf = withMeta.filter(t => t.resolvedConference === conference);
+          const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
+          const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean)
+            .sort((a, b) => inConf.indexOf(a) - inConf.indexOf(b));
+          const winnerNames = new Set(divisionWinners.map(t => t.team));
+          const wildcardEligible = inConf.filter(t => !winnerNames.has(t.team));
+          const lastIn = wildcardEligible[2]; // 3rd wildcard = last team actually in
+          const firstOut = wildcardEligible[3]; // next-best non-division-winner = true bubble miss
+          if (lastIn && firstOut) {
+            bubbles.push({
+              conference,
+              lastIn: { team: lastIn.team, record: `${lastIn.wins}-${lastIn.losses}` },
+              firstOut: { team: firstOut.team, record: `${firstOut.wins}-${firstOut.losses}` },
+            });
+          }
+        }
+        if (bubbles.length) {
+          events.push({ type: 'playoff_picture', bubbles });
+        }
+      } else {
+        const playoffCount = Number(league.playoff_team_count || 8);
+        if (ranked.length > playoffCount) {
+          const lastIn = ranked[playoffCount - 1];
+          const firstOut = ranked[playoffCount];
+          events.push({
+            type: 'playoff_picture',
+            inTeams: ranked.slice(0, playoffCount).map(r => r.team),
+            bubbles: [{
+              conference: null,
+              lastIn: lastIn ? { team: lastIn.team, record: `${lastIn.wins}-${lastIn.losses}` } : null,
+              firstOut: firstOut ? { team: firstOut.team, record: `${firstOut.wins}-${firstOut.losses}` } : null,
+            }],
+          });
+        }
       }
     }
   }
@@ -74773,8 +74819,7 @@ async function generateMaddenESPNNews(guild, league, events, weekLabel) {
           record: d.record,
         })),
         playoffPicture: playoffPicture ? {
-          lastTeamIn: playoffPicture.lastIn,
-          firstTeamOut: playoffPicture.firstOut,
+          bubbles: playoffPicture.bubbles,
         } : null,
       };
 
@@ -74793,7 +74838,7 @@ Rules:
 - bounceBackWins are teams that just snapped a real losing streak (or a still-winless team's first win) — genuine feel-good redemption stories, warm and triumphant in tone, the opposite of the drama framing used for skids.
 - undefeatedWinlessWatch is a "state of the league" angle — write about which team(s) remain perfect or still winless, especially compelling if there's only one of either.
 - divisionRaces fire when a division's first-place team changes hands — real "there's a new team atop the division" news.
-- playoffPicture, if present, should cover who's in and who's right on the bubble — real "playoff race" content, mentioning both the last team in and first team out by name.
+- playoffPicture, if present, has a bubbles array — one entry per conference for NFL leagues (each with a conference label), or a single entry for other sports. Cover who's in and who's right on the bubble for each entry, real "playoff race" content, mentioning both the last team in and first team out by name and by conference when a conference label is present.
 - Never use the same sentence structure twice. Mix tones: hype, surprise, concern, admiration.
 - Sound like a real ESPN writer, not a bot. Use sports vernacular naturally.
 - Return ONLY valid JSON: array of objects with "headline", "blurb", and "team" keys ("team" is the single primary team this story is about, in the exact team name/abbreviation format used in the data above — e.g. "49ers" or "SF" — or null if the story isn't really about one specific team, like a league-wide playoff picture update). No markdown, no preamble.
@@ -74906,14 +74951,17 @@ Rules:
         team: d.leader,
       });
     }
-    if (playoffPicture) {
-      const lastInName = playoffPicture.lastIn ? maddenTeamDisplayName(playoffPicture.lastIn.team) : null;
-      const firstOutName = playoffPicture.firstOut ? maddenTeamDisplayName(playoffPicture.firstOut.team) : null;
+    if (playoffPicture?.bubbles?.length) {
+      const parts = playoffPicture.bubbles.map(b => {
+        const lastInName = b.lastIn ? maddenTeamDisplayName(b.lastIn.team) : null;
+        const firstOutName = b.firstOut ? maddenTeamDisplayName(b.firstOut.team) : null;
+        if (!lastInName || !firstOutName) return null;
+        const prefix = b.conference ? `In the ${b.conference}, ` : '';
+        return `${prefix}${lastInName} (${b.lastIn.record}) currently hold the last playoff spot, with ${firstOutName} (${b.firstOut.record}) right on the outside looking in.`;
+      }).filter(Boolean);
       newsItems.push({
         headline: 'Playoff Picture Update',
-        blurb: lastInName && firstOutName
-          ? `${lastInName} (${playoffPicture.lastIn.record}) currently hold the last playoff spot, with ${firstOutName} (${playoffPicture.firstOut.record}) right on the outside looking in.`
-          : 'The playoff race is heating up as the season enters its final stretch.',
+        blurb: parts.length ? parts.join(' ') : 'The playoff race is heating up as the season enters its final stretch.',
       });
     }
   }
