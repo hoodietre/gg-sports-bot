@@ -8445,6 +8445,48 @@ async function selectMaddenPlayoffTeams(guild, league) {
     `SELECT team_name, wins, losses, ties, points_for, points_against FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
     [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [] }));
+  // 7J-H2HTIEBREAK: per Hxxdie — real NFL tie-breaking checks head-to-head
+  // result BEFORE point differential; point-differential-only risked (and,
+  // live, may have) landed on a different team than the real game actually
+  // determined whenever head-to-head was the deciding factor. Pre-fetches
+  // completed regular-season games into a lookup map so the sort
+  // comparator (which must stay synchronous) can consult real head-to-head
+  // results for any two tied teams. Still not the FULL real NFL tie-break
+  // chain (division/conference record, common opponents, strength of
+  // victory, etc. aren't implemented) — head-to-head is by far the most
+  // common decider for the ordinary 2-team tie case, which covers the
+  // large majority of real scenarios; anything head-to-head can't resolve
+  // (no meeting, or a 3+-way tie it can't fully order) falls through to
+  // point differential same as before.
+  const h2hGamesResult = await pool.query(
+    `SELECT home_team, away_team, home_score, away_score, status
+     FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const h2hWinner = new Map(); // key: "teamA|teamB" (lowercase, alpha-sorted) -> winning team name (lowercase)
+  for (const g of h2hGamesResult.rows || []) {
+    const home = String(g.home_team || '').toLowerCase();
+    const away = String(g.away_team || '').toLowerCase();
+    if (!home || !away) continue;
+    const homeScore = Number(g.home_score) || 0;
+    const awayScore = Number(g.away_score) || 0;
+    let winner = null;
+    if (homeScore > awayScore) winner = home;
+    else if (awayScore > homeScore) winner = away;
+    else {
+      const s = String(g.status || '').toLowerCase();
+      if (s === 'home_win') winner = home;
+      else if (s === 'away_win') winner = away;
+    }
+    if (!winner) continue;
+    // If these two teams played more than once, last write wins — a single
+    // flag can't represent a split season series anyway, and a genuine
+    // split falls through to point differential below regardless.
+    h2hWinner.set([home, away].sort().join('|'), winner);
+  }
+
   // 7J-SEEDTIEBREAKFIX: per Hxxdie — real bug that live-corrupted a bracket.
   // Multiple AFC teams were tied at 9-8 fighting for the last wildcard
   // spot; this sort had no tiebreaker beyond wins, which is identical for
@@ -8453,17 +8495,26 @@ async function selectMaddenPlayoffTeams(guild, league) {
   // above) — non-deterministic, and could genuinely differ between two
   // separate computations of the same standings, which is exactly how the
   // bracket ended up seeding a different team than the playoff-picture
-  // story reported as the real 7-seed. Added point differential as a real
-  // tiebreaker (the same convention getStandingsRows already uses for
-  // structured-league standings: wins, losses, point differential), plus
-  // team name as a final deterministic fallback so this can never again
-  // depend on incidental row order.
+  // story reported as the real 7-seed. Added head-to-head (above) and
+  // point differential as real tiebreakers (the latter matching the same
+  // convention getStandingsRows already uses for structured-league
+  // standings: wins, losses, point differential), plus team name as a
+  // final deterministic fallback so this can never again depend on
+  // incidental row order.
   const standingsRows = (teamsResult.rows || [])
     .map(t => {
       const gp = t.wins + t.losses + (t.ties || 0);
       return { ...t, pct: gp > 0 ? (t.wins + (t.ties || 0) * 0.5) / gp : 0, pointDiff: Number(t.points_for || 0) - Number(t.points_against || 0) };
     })
-    .sort((a, b) => b.pct - a.pct || b.wins - a.wins || b.pointDiff - a.pointDiff || a.team_name.localeCompare(b.team_name));
+    .sort((a, b) => {
+      if (b.pct !== a.pct) return b.pct - a.pct;
+      if (b.wins !== a.wins) return b.wins - a.wins;
+      const h2hKey = [a.team_name.toLowerCase(), b.team_name.toLowerCase()].sort().join('|');
+      const h2hResult = h2hWinner.get(h2hKey);
+      if (h2hResult === a.team_name.toLowerCase()) return -1;
+      if (h2hResult === b.team_name.toLowerCase()) return 1;
+      return b.pointDiff - a.pointDiff || a.team_name.localeCompare(b.team_name);
+    });
 
   const withMeta = await Promise.all(standingsRows.map(async t => {
     const { conference, division } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, t.team_name, league).catch(() => ({}));
@@ -74828,13 +74879,45 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
         [guild.id, String(league.league_id)]
       ).catch(() => ({ rows: [] }));
       // 7J-SEEDTIEBREAKFIX2: same non-deterministic-tie bug as
-      // selectMaddenPlayoffTeams (see 7J-SEEDTIEBREAKFIX) — no tiebreaker
-      // beyond wins meant tied teams sorted by arbitrary row order. Same
-      // fix: point differential, then team name as a final deterministic
-      // fallback.
+      // selectMaddenPlayoffTeams (see 7J-SEEDTIEBREAKFIX), plus the same
+      // head-to-head tiebreaker (7J-H2HTIEBREAK) — kept consistent with the
+      // bracket's own seeding computation so this storyline can't report a
+      // different team than the bracket actually seeds in a future week.
+      const h2hGamesForPicture = await pool.query(
+        `SELECT home_team, away_team, home_score, away_score, status
+         FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id::text = $2::text
+           AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')`,
+        [guild.id, String(league.league_id)]
+      ).catch(() => ({ rows: [] }));
+      const h2hWinnerForPicture = new Map();
+      for (const g of h2hGamesForPicture.rows || []) {
+        const home = String(g.home_team || '').toLowerCase();
+        const away = String(g.away_team || '').toLowerCase();
+        if (!home || !away) continue;
+        const homeScore = Number(g.home_score) || 0;
+        const awayScore = Number(g.away_score) || 0;
+        let winner = null;
+        if (homeScore > awayScore) winner = home;
+        else if (awayScore > homeScore) winner = away;
+        else {
+          const s = String(g.status || '').toLowerCase();
+          if (s === 'home_win') winner = home;
+          else if (s === 'away_win') winner = away;
+        }
+        if (winner) h2hWinnerForPicture.set([home, away].sort().join('|'), winner);
+      }
       const ranked = (allTeamsResult.rows || [])
         .map(t => ({ team: t.team_name, wins: t.wins, losses: t.losses, pct: (t.wins + t.losses) > 0 ? t.wins / (t.wins + t.losses) : 0, pointDiff: Number(t.points_for || 0) - Number(t.points_against || 0) }))
-        .sort((a, b) => b.pct - a.pct || b.wins - a.wins || b.pointDiff - a.pointDiff || a.team.localeCompare(b.team));
+        .sort((a, b) => {
+          if (b.pct !== a.pct) return b.pct - a.pct;
+          if (b.wins !== a.wins) return b.wins - a.wins;
+          const h2hKey = [a.team.toLowerCase(), b.team.toLowerCase()].sort().join('|');
+          const h2hResult = h2hWinnerForPicture.get(h2hKey);
+          if (h2hResult === a.team.toLowerCase()) return -1;
+          if (h2hResult === b.team.toLowerCase()) return 1;
+          return b.pointDiff - a.pointDiff || a.team.localeCompare(b.team);
+        });
 
       if (getPlayoffFormatKey(league) === 'nfl') {
         const withMeta = await Promise.all(ranked.map(async t => {
@@ -75499,9 +75582,20 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
         for (const side of ['teamA', 'teamB']) {
           const currentTeam = series[side];
           if (!currentTeam || correctTeamNames.has(currentTeam.name)) continue; // not seeded, or genuinely correct
-          const correctTeam = correctSeededTeams.find(t => t.seed === currentTeam.seed);
+          // 7J-BRACKETRESEEDCONFFIX: per Hxxdie — real bug, confirmed live.
+          // Seed numbers 1-7 exist independently in EACH conference, so
+          // matching by seed alone with no conference filter could (and
+          // did) grab the wrong conference's team entirely — e.g. AFC's
+          // 6-seed getting "corrected" to NFC's 6-seed, putting the same
+          // team in the bracket twice under two different conferences.
+          // series.conference is set at bracket creation from the team's
+          // actual conference assignment, which doesn't depend on
+          // standings/records at all — unaffected by the tie-break bug
+          // this whole correction exists to clean up after, so it's safe
+          // to filter on here.
+          const correctTeam = correctSeededTeams.find(t => t.seed === currentTeam.seed && t.conference === series.conference);
           if (!correctTeam || correctTeam.team_name === currentTeam.name) continue;
-          reseedLog.push(`${currentTeam.name} → ${correctTeam.team_name} (seed ${correctTeam.seed})`);
+          reseedLog.push(`${currentTeam.name} → ${correctTeam.team_name} (${series.conference} seed ${correctTeam.seed})`);
           series[side] = { name: correctTeam.team_name, seed: correctTeam.seed };
           // Voiding any result — it was real, but against a team that was
           // never actually supposed to be in the bracket.
