@@ -34920,11 +34920,23 @@ async function deleteLeagueGameThreadsForWeekSilent(guild, league, weekLabel) {
     const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
     if (thread) {
       const ok = await thread.delete('GG Sports structured league round rotation').catch(() => false);
-      if (ok !== false) deleted++;
-      else failed++;
+      if (ok !== false) {
+        deleted++;
+      } else {
+        failed++;
+        continue; // deletion genuinely failed — leave thread_id intact so it isn't silently orphaned
+      }
     } else {
       deleted++; // already gone from Discord — still counts as cleared
     }
+    // 7J-STALETHREADIDFIX: per Hxxdie's report of "no game threads on
+    // Advance" — this row's thread_id was left pointing at a deleted (or
+    // never-cleaned) thread, and createLeagueGameCore's duplicate-check
+    // treats a non-null thread_id as "already has a working thread,"
+    // permanently skipping recreation. Clearing it here whenever the
+    // Discord thread is actually gone closes that hole at the source,
+    // regardless of which path caused the row to still be non-archived.
+    await pool.query(`UPDATE league_games SET thread_id = NULL WHERE id = $1`, [game.id]).catch(() => null);
   }
   return { deleted, failed };
 }
