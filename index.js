@@ -8442,15 +8442,28 @@ async function selectNflPlayoffTeams(guildId, league, standingsRows) {
 // exactly, so it drops straight into buildInitialPlayoffRound unchanged.
 async function selectMaddenPlayoffTeams(guild, league) {
   const teamsResult = await pool.query(
-    `SELECT team_name, wins, losses, ties FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+    `SELECT team_name, wins, losses, ties, points_for, points_against FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
     [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [] }));
+  // 7J-SEEDTIEBREAKFIX: per Hxxdie — real bug that live-corrupted a bracket.
+  // Multiple AFC teams were tied at 9-8 fighting for the last wildcard
+  // spot; this sort had no tiebreaker beyond wins, which is identical for
+  // tied teams, so the result silently fell back to whatever arbitrary
+  // order Postgres happened to return rows in (no ORDER BY on the query
+  // above) — non-deterministic, and could genuinely differ between two
+  // separate computations of the same standings, which is exactly how the
+  // bracket ended up seeding a different team than the playoff-picture
+  // story reported as the real 7-seed. Added point differential as a real
+  // tiebreaker (the same convention getStandingsRows already uses for
+  // structured-league standings: wins, losses, point differential), plus
+  // team name as a final deterministic fallback so this can never again
+  // depend on incidental row order.
   const standingsRows = (teamsResult.rows || [])
     .map(t => {
       const gp = t.wins + t.losses + (t.ties || 0);
-      return { ...t, pct: gp > 0 ? (t.wins + (t.ties || 0) * 0.5) / gp : 0 };
+      return { ...t, pct: gp > 0 ? (t.wins + (t.ties || 0) * 0.5) / gp : 0, pointDiff: Number(t.points_for || 0) - Number(t.points_against || 0) };
     })
-    .sort((a, b) => b.pct - a.pct || b.wins - a.wins);
+    .sort((a, b) => b.pct - a.pct || b.wins - a.wins || b.pointDiff - a.pointDiff || a.team_name.localeCompare(b.team_name));
 
   const withMeta = await Promise.all(standingsRows.map(async t => {
     const { conference, division } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, t.team_name, league).catch(() => ({}));
@@ -74798,16 +74811,30 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   // applied for NFL-format leagues — other sports' storyline behavior is
   // left exactly as it was, since there's no reported issue there and no
   // reason to touch working code while fixing this.
-  if (maddenWeekSortValue(weekLabel) >= 8) {
+  // 7J-PLAYOFFPICTUREPOSTSEASON: per Hxxdie — this only ever checked a raw
+  // week-number threshold (>= 8), so it kept posting "who's fighting for
+  // the last playoff spot" content even after the regular season ended and
+  // the real bracket was already set — stale and confusing once there's no
+  // more race left to speculate about. Now also requires the week to
+  // actually still be regular season (maddenWeekLabelSortKey group 1, not
+  // group 2/playoffs) — correctly stops the moment Wild Card week (or
+  // later) is detected, regardless of what raw week number that happens to
+  // land on.
+  if (maddenWeekSortValue(weekLabel) >= 8 && maddenWeekLabelSortKey(weekLabel)[0] === 1) {
     const canPostPicture = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_picture', weekLabel, 'posted').catch(() => false);
     if (canPostPicture) {
       const allTeamsResult = await pool.query(
-        `SELECT team_name, wins, losses FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+        `SELECT team_name, wins, losses, points_for, points_against FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
         [guild.id, String(league.league_id)]
       ).catch(() => ({ rows: [] }));
+      // 7J-SEEDTIEBREAKFIX2: same non-deterministic-tie bug as
+      // selectMaddenPlayoffTeams (see 7J-SEEDTIEBREAKFIX) — no tiebreaker
+      // beyond wins meant tied teams sorted by arbitrary row order. Same
+      // fix: point differential, then team name as a final deterministic
+      // fallback.
       const ranked = (allTeamsResult.rows || [])
-        .map(t => ({ team: t.team_name, wins: t.wins, losses: t.losses, pct: (t.wins + t.losses) > 0 ? t.wins / (t.wins + t.losses) : 0 }))
-        .sort((a, b) => b.pct - a.pct || b.wins - a.wins);
+        .map(t => ({ team: t.team_name, wins: t.wins, losses: t.losses, pct: (t.wins + t.losses) > 0 ? t.wins / (t.wins + t.losses) : 0, pointDiff: Number(t.points_for || 0) - Number(t.points_against || 0) }))
+        .sort((a, b) => b.pct - a.pct || b.wins - a.wins || b.pointDiff - a.pointDiff || a.team.localeCompare(b.team));
 
       if (getPlayoffFormatKey(league) === 'nfl') {
         const withMeta = await Promise.all(ranked.map(async t => {
@@ -75444,6 +75471,55 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
   const roundSeries = bracket[roundIndex];
   if (!roundSeries || !roundSeries.length) return;
   if (roundIndex > 3) return; // shouldn't happen — real NFL bracket is always exactly 4 rounds
+
+  // 7J-BRACKETRESEED: per Hxxdie — real live incident, not hypothetical.
+  // The now-fixed non-deterministic tie-breaking bug (7J-SEEDTIEBREAKFIX)
+  // could seed the wrong team into a close wildcard race — confirmed live:
+  // Jaguars was the real 7-seed but the bracket had Chargers instead, and
+  // the same tie almost certainly affected the 6-seed too (the
+  // playoff-picture story separately reported Texans, not Chargers, as the
+  // team just missing the cutoff). Self-heals by recomputing seeding fresh
+  // (now with the real tiebreaker) and, for each seed, swapping in
+  // whichever team should actually be there if it doesn't match. Any
+  // result already recorded against a wrong opponent is voided — that game
+  // was real, but against a team that was never supposed to be in the
+  // bracket at all, so the result can't stand. Deliberately scoped to
+  // Round 1 ONLY (roundIndex === 0): every other round's participants are
+  // determined by who WON the previous round, not by standings, so this
+  // correction has nothing meaningful to compare them against and doesn't
+  // attempt it — a seeding error caught after Round 1 has already advanced
+  // needs manual staff handling instead.
+  if (roundIndex === 0) {
+    const correctSeededTeams = await selectMaddenPlayoffTeams(guild, league).catch(() => []);
+    if (correctSeededTeams.length >= 2) {
+      const correctTeamNames = new Set(correctSeededTeams.map(t => t.team_name));
+      let reseedMutated = false;
+      const reseedLog = [];
+      for (const series of roundSeries) {
+        for (const side of ['teamA', 'teamB']) {
+          const currentTeam = series[side];
+          if (!currentTeam || correctTeamNames.has(currentTeam.name)) continue; // not seeded, or genuinely correct
+          const correctTeam = correctSeededTeams.find(t => t.seed === currentTeam.seed);
+          if (!correctTeam || correctTeam.team_name === currentTeam.name) continue;
+          reseedLog.push(`${currentTeam.name} → ${correctTeam.team_name} (seed ${correctTeam.seed})`);
+          series[side] = { name: correctTeam.team_name, seed: correctTeam.seed };
+          // Voiding any result — it was real, but against a team that was
+          // never actually supposed to be in the bracket.
+          series.winsA = 0;
+          series.winsB = 0;
+          series.winner = null;
+          series.games = [];
+          reseedMutated = true;
+        }
+      }
+      if (reseedMutated) {
+        bracket[roundIndex] = roundSeries;
+        await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
+        console.log('[MADDEN BRACKET] Seeding correction applied for league', league.league_id, ':', reseedLog.join(', '));
+        await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+      }
+    }
+  }
 
   let mutated = false;
   for (const series of roundSeries) {
