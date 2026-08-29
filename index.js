@@ -8624,19 +8624,22 @@ async function buildMaddenWildCardRoundFromRealGames(guild, league) {
 // for the next round — never from a reseed formula guessing who plays whom.
 async function buildMaddenNextRoundFromRealGames(guild, league, previousRound, nextRoundIdx) {
   const winnerInfo = new Map(); // lowercase team name -> { seed, conference }
+  const conferenceOrder = []; // first-seen order, so this round's layout matches the previous round's
   for (const s of previousRound) {
     if (!s.winner) continue;
     const winnerTeam = s.teamA?.name === s.winner ? s.teamA : s.teamB;
-    winnerInfo.set(s.winner.toLowerCase(), { seed: winnerTeam?.seed ?? null, conference: s.conference || null });
+    const conference = s.conference || null;
+    winnerInfo.set(s.winner.toLowerCase(), { seed: winnerTeam?.seed ?? null, conference });
+    if (conference && !conferenceOrder.includes(conference)) conferenceOrder.push(conference);
   }
 
   const roundGames = await getMaddenPlayoffWeekGames(guild, league, 2, nextRoundIdx);
-  const series = [];
+  const builtSeries = [];
   for (const g of roundGames) {
     const homeInfo = winnerInfo.get(String(g.home_team).toLowerCase());
     const awayInfo = winnerInfo.get(String(g.away_team).toLowerCase());
     const conference = homeInfo?.conference && homeInfo.conference === awayInfo?.conference ? homeInfo.conference : null;
-    series.push({
+    builtSeries.push({
       id: randomUUID(),
       teamA: { name: g.home_team, seed: homeInfo?.seed ?? null },
       teamB: { name: g.away_team, seed: awayInfo?.seed ?? null },
@@ -8650,6 +8653,27 @@ async function buildMaddenNextRoundFromRealGames(guild, league, previousRound, n
       conference,
     });
   }
+
+  // 7J-BRACKETCONFORDER: per Hxxdie — real bug, confirmed live via
+  // screenshot (matchups were correct, but the bracket image's connector
+  // lines visually crossed between conferences). The PNG renderer
+  // computes each round's vertical position as the average of its two
+  // "parent" series in the previous round, purely by array index
+  // (prev[i*2]/prev[i*2+1]) — that positional math only holds if this
+  // round's series are grouped contiguously by conference, in the same
+  // conference order the previous round used. Raw SQL-return order gave
+  // no such guarantee. Grouping here (rather than at every render call
+  // site) keeps the fix in the one place responsible for building this
+  // data, matching where buildMaddenWildCardRoundFromRealGames already
+  // does the same grouping for Round 1.
+  const series = [];
+  for (const conference of conferenceOrder) {
+    series.push(...builtSeries.filter(s => s.conference === conference));
+  }
+  // Anything that didn't match a known conference (shouldn't happen in
+  // practice) still gets included, just appended at the end rather than
+  // silently dropped.
+  series.push(...builtSeries.filter(s => !conferenceOrder.includes(s.conference)));
   return series;
 }
 
