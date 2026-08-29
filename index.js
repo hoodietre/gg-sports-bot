@@ -73822,7 +73822,22 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
 
     const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
     const [curG, curN] = maddenWeekLabelSortKey(eaReportedWeek);
-    const movedForward = curG > lastG || (curG === lastG && curN > lastN);
+    // 7J-POSTPLAYOFFWEEKFIX: per Hxxdie — real bug, confirmed live. A
+    // franchise can never genuinely regress from a playoff week back to
+    // an earlier regular-season week within the same season — but EA
+    // reports the week right after Conference Championship as literally
+    // "Week 1" (not "Pro Bowl" as the label naming elsewhere in this
+    // codebase would suggest), which classifies as early regular season
+    // and sorts BEFORE "Conf. Playoff." The plain forward-progress check
+    // below silently rejected this as "nothing advanced" and blocked
+    // every downstream post (news, threads, bracket checks) — the exact
+    // same failure pattern as the earlier "Div. Playoff" bug, just one
+    // step later in the season. If the previously-processed week was
+    // itself a playoff week (group 2), ANY newly-reported week counts as
+    // forward progress regardless of how it classifies — there's no real
+    // scenario where EA legitimately reports something earlier once the
+    // league has already reached the playoffs.
+    const movedForward = lastG === 2 || curG > lastG || (curG === lastG && curN > lastN);
     if (!movedForward) return null;
 
     // Find the single next known week after lastLabel in the schedule sequence,
