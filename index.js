@@ -20508,13 +20508,24 @@ if (interaction.commandName === 'avatar') {
       // Archives instead — every "current season" query elsewhere now
       // filters on archived_at IS NULL, so this still fully fixes the
       // stale-schedule bug without losing anything.
+      // 7J-WIPEORDERFIX2: per Hxxdie — same race condition as the
+      // wipeallgames command (7J-WIPEORDERFIX): archiving used to run
+      // AFTER the sequential thread-deletion loop, so any query made in
+      // that window (schedule regeneration, the first Advance of the new
+      // season, anything) could still see last season's rows as
+      // archived_at IS NULL. This is the automatic path every season
+      // rollover actually goes through, so this ordering bug is almost
+      // certainly how last season's rows were still unarchived when this
+      // season's schedule collided with them in the first place. Archive
+      // first (fast, single query — the part correctness depends on),
+      // then clean up threads after.
       const oldGamesResult = await pool.query(`SELECT id, thread_id FROM league_games WHERE guild_id = $1 AND league_id = $2 AND archived_at IS NULL`, [interaction.guild.id, leagueId]).catch(() => ({ rows: [] }));
+      await pool.query(`UPDATE league_games SET archived_at = NOW() WHERE guild_id = $1 AND league_id = $2 AND archived_at IS NULL`, [interaction.guild.id, leagueId]).catch(() => null);
       for (const oldGame of oldGamesResult.rows) {
         if (!oldGame.thread_id) continue;
         const thread = await interaction.guild.channels.fetch(oldGame.thread_id).catch(() => null);
         if (thread?.isThread?.()) await thread.delete('GG Sports: new season started, old game thread cleanup').catch(() => null);
       }
-      await pool.query(`UPDATE league_games SET archived_at = NOW() WHERE guild_id = $1 AND league_id = $2 AND archived_at IS NULL`, [interaction.guild.id, leagueId]).catch(() => null);
 
       await pool.query(
         `UPDATE league_custom_settings SET schedule = '[]', current_round = 0, current_season_mvp_user_id = NULL, current_season_runnerup_user_id = NULL, updated_at = NOW() WHERE league_id = $1`,
@@ -21329,13 +21340,18 @@ if (interaction.commandName === 'avatar') {
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true }); return; }
       await interaction.update({ content: 'Removing duplicates...', components: [] });
 
+      // 7J-WIPEORDERFIX3: same class of bug as 7J-WIPEORDERFIX/2 — the row
+      // removal is the part correctness depends on (a lingering duplicate
+      // row is what caused problems elsewhere), so it now runs before the
+      // slower sequential thread-deletion cleanup instead of after.
+      const deleteResult = session.deleteIds.length
+        ? await pool.query(`DELETE FROM league_games WHERE id = ANY($1::uuid[])`, [session.deleteIds]).catch(() => null)
+        : null;
+
       for (const threadId of session.deleteThreadIds) {
         const thread = await interaction.guild.channels.fetch(threadId).catch(() => null);
         if (thread?.isThread?.()) await thread.delete('GG Sports: duplicate game cleanup').catch(() => null);
       }
-      const deleteResult = session.deleteIds.length
-        ? await pool.query(`DELETE FROM league_games WHERE id = ANY($1::uuid[])`, [session.deleteIds]).catch(() => null)
-        : null;
       gameCleanupDuplicateSessions.delete(token);
 
       await interaction.editReply({ content: `✅ Removed **${session.deleteIds.length}** duplicate game record(s) and their threads for **${league.league_name}**.` });
@@ -35044,7 +35060,25 @@ async function createLeagueGameCore(interaction, activeLeague, home, away, { sch
       [interaction.guild.id, activeLeague.league_id, weekLabel, home.id, away.id]
     ).catch(() => ({ rows: [] }));
     if (existingResult.rows[0]) {
-      return { ok: true, game: existingResult.rows[0], alreadyExisted: true };
+      const existingGame = existingResult.rows[0];
+      // 7J-VERIFYTHREADFIX: per Hxxdie — this used to trust
+      // existingGame.thread_id at face value, so any stale thread_id (a
+      // deleted thread whose row was never cleared, a race during
+      // archiving, anything) permanently blocked ever recreating that
+      // game's thread — that's the actual mechanism behind today's whole
+      // "no game threads on Advance" investigation. The Madden thread-
+      // creation path already verifies against real Discord state instead
+      // of trusting the DB column; bringing this path to the same
+      // standard means a stale thread_id can never cause this again,
+      // independent of whether every write path gets its ordering right.
+      if (existingGame.thread_id) {
+        const stillExists = await interaction.guild.channels.fetch(existingGame.thread_id).catch(() => null);
+        if (!stillExists) {
+          await pool.query(`UPDATE league_games SET thread_id = NULL WHERE id = $1`, [existingGame.id]).catch(() => null);
+          existingGame.thread_id = null;
+        }
+      }
+      return { ok: true, game: existingGame, alreadyExisted: true };
     }
   }
 
