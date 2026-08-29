@@ -7373,6 +7373,15 @@ async function resolvePlayoffDispute(guild, league, seriesId, resolution) {
 
 function buildLivePlayoffBracketEmbed(league, bracketState) {
   const bracket = Array.isArray(bracketState.bracket) ? bracketState.bracket : [];
+  const playoffFormatKey = getPlayoffFormatKey(league);
+  // 7J-NFLROUNDNAMES: same "true total rounds" inference the PNG renderer
+  // uses — bracket.length alone under-counts before later rounds exist in
+  // the data yet (e.g. still 1 during Wild Card week, even though a real
+  // NFL bracket always has 4 rounds total), which would otherwise show
+  // "Round 1 of 1" instead of the real round name.
+  const round1TeamCount = bracket[0]?.reduce((sum, s) => sum + (s.teamB ? 2 : 1), 0) || 0;
+  const trueTotalRounds = Math.max(bracket.length, round1TeamCount ? Math.ceil(Math.log2(Math.max(2, round1TeamCount))) : bracket.length);
+  const roundLabel = (roundIndex) => tournamentBracketRoundLabel(roundIndex + 1, trueTotalRounds, roundIndex, playoffFormatKey);
   const embed = new EmbedBuilder()
     .setTitle(`🏆 ${league.league_name} • Playoff Bracket`)
     .setColor(0xED4245)
@@ -7384,7 +7393,7 @@ function buildLivePlayoffBracketEmbed(league, bracketState) {
   } else if (!bracket.length) {
     embed.setDescription('Playoffs have not started yet.');
   } else {
-    embed.setDescription(`Round ${bracketState.current_round} of ${bracket.length}`);
+    embed.setDescription(`${roundLabel(bracketState.current_round - 1)} (Round ${bracketState.current_round} of ${trueTotalRounds})`);
   }
 
   bracket.forEach((round, index) => {
@@ -7395,7 +7404,7 @@ function buildLivePlayoffBracketEmbed(league, bracketState) {
         : `**${series.teamA.name}** — awaiting opponent`;
       return series.winner ? `${label} ✅ ${series.winner} wins` : label;
     });
-    embed.addFields({ name: `Round ${index + 1}`, value: lines.join('\n').slice(0, 1024) || 'TBD', inline: false });
+    embed.addFields({ name: roundLabel(index), value: lines.join('\n').slice(0, 1024) || 'TBD', inline: false });
   });
 
   return embed;
@@ -7602,7 +7611,7 @@ async function renderLeaguePlayoffBracketPng(league, bracketState) {
 
   roundNumbers.forEach((r, ri) => {
     const x = marginLeft + ri * (boxW + roundGapX);
-    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${leaguePlayoffBracketEscapeXml(tournamentBracketRoundLabel(r + 1, trueTotalRounds, ri))}</text>`);
+    parts.push(`<text x="${x + boxW / 2}" y="28" font-family="DejaVu Sans" font-size="16" font-weight="bold" fill="#949ba4" text-anchor="middle">${leaguePlayoffBracketEscapeXml(tournamentBracketRoundLabel(r + 1, trueTotalRounds, ri, getPlayoffFormatKey(league)))}</text>`);
     rounds[r].forEach((series, i) => {
       const yCenter = centers[r][i];
       const y = yCenter - boxH / 2;
@@ -11584,8 +11593,23 @@ function tournamentBracketEscapeXml(text) {
   return String(text == null ? '' : text).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[ch]));
 }
 
-function tournamentBracketRoundLabel(roundNumber, totalRounds, roundIndex) {
+function tournamentBracketRoundLabel(roundNumber, totalRounds, roundIndex, playoffFormatKey = null) {
   const fromEnd = totalRounds - roundIndex;
+  // 7J-NFLROUNDNAMES: per Hxxdie — the NFL/Madden playoff bracket always
+  // has exactly 4 rounds under the real per-conference seeding (7 teams
+  // per conference: Wild Card, Divisional, Conference Championship, Super
+  // Bowl), so this maps deterministically rather than guessing from
+  // fromEnd like the generic fallback below has to. Only applied when the
+  // caller explicitly passes 'nfl' — the generic Quarterfinals/Semifinals/
+  // Final naming stays exactly as it was for every other sport and for the
+  // standalone Tournament feature, which shares this same function and has
+  // no sport concept at all.
+  if (playoffFormatKey === 'nfl' && totalRounds === 4) {
+    if (fromEnd === 1) return 'Super Bowl';
+    if (fromEnd === 2) return 'Conference Championship';
+    if (fromEnd === 3) return 'Divisional';
+    if (fromEnd === 4) return 'Wild Card';
+  }
   if (fromEnd === 1) return 'Final';
   if (fromEnd === 2) return 'Semifinals';
   if (fromEnd === 3) return 'Quarterfinals';
@@ -75330,8 +75354,18 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
       return; // retry next sync tick rather than flipping the stage on a no-op
     }
     const firstRound = buildInitialPlayoffRound(seededTeams, seriesLengths, 'nfl');
-    await createPlayoffSeriesThreads(guild, league, firstRound, 1).catch(err =>
-      console.error('[SEASON TRANSITION] Playoff Round 1 thread creation failed:', err?.message || err));
+    // 7J-NOMADDENBRACKETTHREADS: per Hxxdie — real bug, not a cosmetic
+    // duplicate. Madden playoff-week games already get their own native
+    // Game Center threads from the regular weekly sync (autoCreateGameThreadsAfterSync
+    // runs earlier in the same sync tick, for whatever week_label EA
+    // currently reports — including "Wild Card", since EA exports playoff
+    // weeks the same way as any other week). createPlayoffSeriesThreads is
+    // the structured-league playoff-series thread style (Report Score /
+    // Series Score / Best-of-N framing) — calling it here created a second,
+    // redundant thread set on top of the real Madden game threads that
+    // already existed. This bracket only needs to exist as a visual/embed
+    // panel for Madden; the actual games are tracked through the normal
+    // Madden sync path, not through series threads.
     const bracket = [firstRound];
     await pool.query(
       `INSERT INTO league_playoff_brackets (league_id, bracket, current_round, status, champion_team, updated_at)
@@ -75351,6 +75385,118 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
     [league.league_id]
   ).catch(() => null);
   console.log('[SEASON TRANSITION] Playoff bracket auto-start complete for league', league.league_id);
+}
+
+// 7J-MADDENBRACKETADVANCE: per Hxxdie — the piece handleMaddenPlayoffBracketTransition
+// was explicitly missing. Structured leagues advance their bracket
+// (winsA/winsB/winner, next-round generation, champion) exclusively through
+// the "Report Score" button inside a series thread — see
+// recordPlayoffGameResult. Madden playoff games don't have series threads
+// (7J-NOMADDENBRACKETTHREADS — they get real Game Center threads from the
+// normal weekly sync instead), so nothing was ever feeding real results
+// into the bracket JSON. This is that missing feed: for the bracket's
+// CURRENT round, looks up each still-undecided series' real EA-synced game
+// (matched by week_label + team names) and, once every series in the round
+// has a winner, either builds the next round (reusing buildNextPlayoffRound
+// — the same real NFL reseed logic the structured-league path already
+// trusts) or marks the bracket completed with a champion. Deliberately
+// does NOT grant any championship award/currency here — Madden already has
+// its own Super-Bowl-triggered payout pipeline (getMaddenSuperBowlResult +
+// handleMaddenOffseasonTransition + buildMaddenYearEndPrepEmbed), and
+// duplicating that here would risk double-paying the champion. This
+// function's only job is keeping the bracket's visual/embed state correct.
+const MADDEN_PLAYOFF_ROUND_WEEK_LABELS = ['Wild Card', 'Divisional', 'Conference Championship', 'Super Bowl'];
+async function syncMaddenPlayoffBracketFromResults(guild, league) {
+  if (getPlayoffFormatKey(league) !== 'nfl') return;
+  const settings = await ensureMaddenLeagueSettings(league);
+  if ((settings.current_season_stage || 'preseason') !== 'playoffs') return; // only relevant mid-playoffs
+
+  const bracketResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1`, [league.league_id]).catch(() => ({ rows: [] }));
+  const bracketState = bracketResult.rows[0];
+  if (!bracketState || bracketState.status !== 'in_progress') return;
+
+  const bracket = Array.isArray(bracketState.bracket) ? bracketState.bracket : [];
+  const roundIndex = Number(bracketState.current_round || 1) - 1;
+  const roundSeries = bracket[roundIndex];
+  if (!roundSeries || !roundSeries.length) return;
+
+  const roundWeekLabel = MADDEN_PLAYOFF_ROUND_WEEK_LABELS[roundIndex];
+  if (!roundWeekLabel) return; // shouldn't happen — real NFL bracket is always exactly these 4 rounds
+
+  let mutated = false;
+  for (const series of roundSeries) {
+    if (series.bye || series.winner || !series.teamB) continue;
+    const gameResult = await pool.query(
+      `SELECT home_team, away_team, home_score, away_score, status
+       FROM madden_imported_games
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND LOWER(COALESCE(week_label, '')) = LOWER($3)
+         AND ((LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($5)) OR (LOWER(home_team) = LOWER($5) AND LOWER(away_team) = LOWER($4)))
+         AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
+       ORDER BY imported_at DESC LIMIT 1`,
+      [guild.id, String(league.league_id), roundWeekLabel, series.teamA.name, series.teamB.name]
+    ).catch(() => ({ rows: [] }));
+    const game = gameResult.rows[0];
+    if (!game) continue; // not played/synced yet — check again next sync
+
+    const homeScore = Number(game.home_score) || 0;
+    const awayScore = Number(game.away_score) || 0;
+    let winningTeamName = null;
+    if (homeScore !== awayScore) {
+      winningTeamName = homeScore > awayScore ? game.home_team : game.away_team;
+    } else {
+      // No real score difference (e.g. a fallback-flag-resolved win with no
+      // raw score at all — see 7J-47PPG) — fall back to the same
+      // status-encoded winner every other completion check in this
+      // codebase already trusts, rather than guessing or leaving a
+      // single-elimination series stuck forever on an ambiguous 0-0.
+      const lowerStatus = String(game.status || '').toLowerCase();
+      if (lowerStatus === 'home_win') winningTeamName = game.home_team;
+      else if (lowerStatus === 'away_win') winningTeamName = game.away_team;
+    }
+    if (!winningTeamName) continue; // genuinely unresolved — retry next sync
+
+    const winnerIsA = String(winningTeamName).toLowerCase() === String(series.teamA.name).toLowerCase();
+    series.winsA = winnerIsA ? 1 : 0;
+    series.winsB = winnerIsA ? 0 : 1;
+    series.winner = winnerIsA ? series.teamA.name : series.teamB.name;
+    mutated = true;
+  }
+
+  if (!mutated) return;
+
+  const roundComplete = roundSeries.every(s => s.bye || s.winner);
+  if (!roundComplete) {
+    bracket[roundIndex] = roundSeries;
+    await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
+    await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+    return;
+  }
+
+  const isFinalRound = roundSeries.length === 1;
+  if (isFinalRound) {
+    const champion = roundSeries[0].winner;
+    bracket[roundIndex] = roundSeries;
+    await pool.query(
+      `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
+      [league.league_id, JSON.stringify(bracket), champion]
+    ).catch(() => null);
+    console.log('[MADDEN BRACKET] Champion decided for league', league.league_id, ':', champion);
+  } else {
+    const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+    const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length
+      ? customSettings.playoff_series_lengths : [1];
+    const nextRound = buildNextPlayoffRound(roundSeries, seriesLengths, roundIndex + 1, 'nfl');
+    bracket[roundIndex] = roundSeries;
+    bracket.push(nextRound);
+    await pool.query(
+      `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
+      [league.league_id, JSON.stringify(bracket), Number(bracketState.current_round || 1) + 1]
+    ).catch(() => null);
+    console.log('[MADDEN BRACKET] Round', bracketState.current_round, 'complete for league', league.league_id, '— advanced to round', Number(bracketState.current_round || 1) + 1);
+  }
+
+  await refreshPlayoffBracketPanel(guild, league).catch(() => null);
 }
 
 async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel) {
@@ -75477,6 +75623,16 @@ async function autoDetectAfterSync(guild, league) {
     await handleMaddenPlayoffBracketTransition(guild, league, eaCurrentWeekSettings.ea_reported_current_week).catch(err =>
       console.error('[AUTO DETECT] Playoff bracket catch-up check failed:', err?.message));
   }
+
+  // 7J-MADDENBRACKETADVANCE: runs every sync, same reasoning as the
+  // sportsbook/reward passes above — playoff games complete at different
+  // times throughout the week just like regular season games, not all at
+  // once, so this can't wait for a full week-advance. Safe to call
+  // unconditionally thanks to syncMaddenPlayoffBracketFromResults' own
+  // stage/status guards and the fact that it only ever acts on series that
+  // don't already have a winner set.
+  await syncMaddenPlayoffBracketFromResults(guild, league).catch(err =>
+    console.error('[AUTO DETECT] Playoff bracket result sync failed:', err?.message));
 
   // Week-advance dedup guard — everything below this point (news/streaks/
   // performances, new lines, new props, thread creation, season transitions) is
