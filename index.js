@@ -65957,6 +65957,49 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
   }
 
   const stageIndex = Number(process.env.EA_PLAYER_STAT_DISCOVERY_STAGE_INDEX || 1);
+  // Regular-season candidates: existing behavior, unchanged.
+  let discoveryTargets = weekIndexes.map(weekIndex => ({ weekIndex, stageIndex }));
+
+  // 7J-PLAYOFFSTATDISCOVERY: per Hxxdie — real bug, confirmed live (a
+  // "Stat Leaders" post during the playoffs showed players from teams
+  // that hadn't even made the playoffs). Root cause: the week-range query
+  // above only recognizes "Week N"-style labels — any playoff label
+  // ("Wild Card", "Div. Playoff", etc.) contributes NULL to the MAX() and
+  // is silently invisible to it, so weekIndexes above never extends past
+  // the last real regular-season week. Player-level weekly stats for
+  // every playoff round were simply never being fetched at all — the
+  // Stat Leaders post was always showing the last regular-season week's
+  // data, just mislabeled. Adds candidates for whichever playoff round is
+  // actually current, trying BOTH stageIndex conventions already
+  // established elsewhere in this codebase for other EA endpoints (see
+  // getMaddenEaPostseasonStageLabel: stageIndex 2-6 per round; and the
+  // confirmed weekIndex 18-22 / stageIndex 1 scheme
+  // getMaddenPlayoffWeekLabelFromDisplayWeek uses for the schedule
+  // export) — genuinely unclear from static analysis which one weekly
+  // STAT exports specifically use, and this environment has no way to
+  // test against EA's live API directly. Bounded to only the current
+  // round (not all 5 playoff weeks) to keep the extra probe cost
+  // reasonable; whichever convention actually returns real rows is the
+  // one that gets used, the other just fails harmlessly.
+  try {
+    const currentWeekResult = await pool.query(
+      `SELECT week_label FROM madden_imported_games
+       WHERE guild_id = $1::text AND league_id::text = $2::text AND week_label IS NOT NULL
+       ORDER BY imported_at DESC LIMIT 1`,
+      [guild.id, league.league_id]
+    ).catch(() => ({ rows: [] }));
+    const currentWeekLabel = currentWeekResult.rows?.[0]?.week_label;
+    const [group, idx] = maddenWeekLabelSortKey(currentWeekLabel);
+    if (group === 2 && idx >= 0 && idx <= 3) {
+      // idx: 0=Wild Card, 1=Divisional, 2=Conference Championship, 3=Super Bowl
+      const scheduleWeekIndex = 18 + idx + (idx === 3 ? 1 : 0); // skips 21 (Pro Bowl) before Super Bowl, matching getMaddenPlayoffWeekLabelFromDisplayWeek
+      const postseasonStageIndex = 2 + idx + (idx === 3 ? 1 : 0); // skips 5 (Pro Bowl), matching getMaddenEaPostseasonStageLabel
+      discoveryTargets.push({ weekIndex: scheduleWeekIndex, stageIndex: 1 });
+      discoveryTargets.push({ weekIndex: 0, stageIndex: postseasonStageIndex });
+    }
+  } catch (error) {
+    console.error('[PLAYER STAT DISCOVERY 7J-PLAYOFFSTATDISCOVERY] Failed to derive playoff discovery targets:', error?.message || error);
+  }
 
   const weeklyExports = [
     'CareerMode_GetWeeklyTeamStatsExport',
@@ -65969,11 +66012,11 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
   ];
 
   const results = [];
-  for (const weekIndex of weekIndexes) {
+  for (const target of discoveryTargets) {
     for (const exportType of weeklyExports) {
-      const result = await probeOneMaddenWeeklyExport(context, exportType, weekIndex, stageIndex)
-        .catch(error => ({ success: false, exportType, weekIndex, stageIndex, error: String(error?.message || error).slice(0, 500), attempts: [] }));
-      results.push({ weekIndex, stageIndex, displayWeek: weekIndex + 1, ...result });
+      const result = await probeOneMaddenWeeklyExport(context, exportType, target.weekIndex, target.stageIndex)
+        .catch(error => ({ success: false, exportType, weekIndex: target.weekIndex, stageIndex: target.stageIndex, error: String(error?.message || error).slice(0, 500), attempts: [] }));
+      results.push({ weekIndex: target.weekIndex, stageIndex: target.stageIndex, displayWeek: target.weekIndex + 1, ...result });
     }
   }
 
@@ -65996,6 +66039,7 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
     leagueName: league?.league_name,
     weekIndexes,
     stageIndex,
+    discoveryTargets,
     successfulCount: successful.length,
     statImportResults,
     successful: successful.map(result => ({
@@ -75200,7 +75244,17 @@ async function getMaddenAwardRaceLeaders(guildId, leagueId, weekIndex = null) {
 // Generates headlines + blurbs for the week's notable events.
 // Falls back to templates if the API fails.
 // ---------------------------------------------------------------------------
-async function generateMaddenESPNNews(guild, league, events, weekLabel) {
+// 7J-STATLEADERSWEEKFIX: per Hxxdie — weekLabel here is newWeekLabel from
+// the caller: the week that was just DETECTED as starting, not the week
+// these results/stats actually happened in. That's correct for
+// forward-looking content (the Game of the Week preview genuinely is
+// about the upcoming matchup), but the Stat Leaders post specifically
+// titled itself with weekLabel too, making "Conf. Playoff Stat Leaders"
+// show Divisional's actual leaders — a real, confusing mismatch, since
+// those games hadn't been played yet under that label. resultsWeekLabel
+// (the real prior week these events are FROM, already computed by the
+// caller as previousWeekLabel) is used specifically for that post instead.
+async function generateMaddenESPNNews(guild, league, events, weekLabel, resultsWeekLabel = null) {
   const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
   if (!newsChannelId) return;
   const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
@@ -75500,7 +75554,7 @@ Rules:
       const wrLines = wrs.map(r => `**${r.full_name}** (${r.team_name}) — ${r.rec_yds} YDS ${r.rec_tds} TD`).join('\n') || 'No data';
       await newsChannel.send({
         embeds: [new EmbedBuilder()
-          .setTitle(`${GG_EMOJI} ${weekLabel} Stat Leaders`)
+          .setTitle(`${GG_EMOJI} ${resultsWeekLabel || weekLabel} Stat Leaders`)
           .setColor(0x9B59B6)
           .addFields(
             { name: '🏈 Passing', value: qbLines, inline: true },
@@ -76164,7 +76218,7 @@ async function autoDetectAfterSync(guild, league) {
 
   // 5. ESPN-style news
   if (allEvents.length > 0) {
-    await generateMaddenESPNNews(guild, league, allEvents, newWeekLabel).catch(err =>
+    await generateMaddenESPNNews(guild, league, allEvents, newWeekLabel, previousWeekLabel).catch(err =>
       console.error('[AUTO DETECT] ESPN news:', err?.message));
   }
 
