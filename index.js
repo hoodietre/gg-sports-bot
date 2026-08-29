@@ -4675,14 +4675,32 @@ async function getMaddenEstimatedDraftOrderRows(guildId, leagueId, limit = 32) {
 }
 
 async function getMaddenSuperBowlResult(guildId, leagueId) {
+  // 7J-SEASONSCOPESB: per Hxxdie — this is the direct gate
+  // handleMaddenOffseasonTransition checks every sync to decide whether to
+  // auto-finalize year-end (see 7J-SEASONSCOPESTANDINGS for the matching
+  // issue on standings). Unscoped, a leftover prior-season "Super Bowl"
+  // week-label row would still match here after a new season begins,
+  // isFinal: true and all — which could cause the automatic pipeline to
+  // re-finalize and re-pay an old champion under the NEW season's
+  // achievement key the moment preseason resets the stage flag, well
+  // before this season's real Super Bowl has happened. Scoped the same way
+  // as the standings fix: falls back to unfiltered only if the league has
+  // never actually synced a season year yet.
+  const seasonYearResult = await pool.query(
+    `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
+    [leagueId]
+  ).catch(() => ({ rows: [] }));
+  const seasonYear = seasonYearResult.rows[0]?.madden_season_year ?? null;
+
   const result = await pool.query(
     `SELECT *
      FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND (LOWER(COALESCE(week_label, '')) LIKE '%super%' OR COALESCE(week_label, '') IN ('23', 'Week 23', 'week 23'))
+       AND ($3::integer IS NULL OR season_year = $3::integer)
      ORDER BY imported_at DESC
      LIMIT 1`,
-    [guildId, String(leagueId)]
+    [guildId, String(leagueId), seasonYear]
   ).catch(() => ({ rows: [] }));
   const game = result.rows[0];
   if (!game) return null;
@@ -5282,7 +5300,7 @@ async function buildMaddenOffseasonReadinessEmbed(guildId, league) {
       { name: 'Checklist', value: checklist, inline: false },
       { name: 'Estimated Draft Order Top 5', value: (draftPreviewLines.join('\n') || 'No draft order data found.').slice(0, 1024), inline: true },
       { name: 'Top Expiring Contracts', value: (expiringPreviewLines.join('\n') || 'No expiring contracts found.').slice(0, 1024), inline: true },
-      { name: 'Recommendation', value: sb?.isFinal ? 'Run `/maddenseason yearend confirm:true`, then `/maddenseason offseasonlock confirm:true`, then advance to offseason.' : 'Do not advance until the Super Bowl result is final and synced. You can still preview year-end prep now.', inline: false }
+      { name: 'Recommendation', value: sb?.isFinal ? 'Super Bowl is final — year-end awards/champion and the offseason lock checkpoint will finalize automatically on the next sync. No action needed.' : 'Do not advance until the Super Bowl result is final and synced. You can still preview year-end prep now with `/maddenseason yearend` (leave confirm off).', inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-10BY-DG Offseason Readiness' })
     .setTimestamp();
@@ -18537,7 +18555,7 @@ if (interaction.commandName === 'avatar') {
           if (readinessEmbed) {
             await interaction.reply({ embeds: [readinessEmbed], ephemeral: true });
           } else {
-            await interaction.reply({ content: 'Madden playoffs and the season-to-offseason transition are tracked automatically through EA sync, not this panel. Once your Super Bowl is final and synced, use `/maddenseason offseasonreadiness` to check status, then `/maddenseason yearend confirm:true` followed by `/maddenseason offseasonlock confirm:true` to move into the new season.', ephemeral: true });
+            await interaction.reply({ content: 'Madden playoffs and the season-to-offseason transition are tracked automatically through EA sync, not this panel. Once your Super Bowl is final and synced, year-end awards/champion and the offseason lock checkpoint both finalize automatically on the next sync — no commands needed. Use `/maddenseason readiness` anytime to check status, or `/maddenseason yearend`/`offseasonlock` (without `confirm:true`) to preview what will be finalized before it happens.', ephemeral: true });
           }
           return;
         }
@@ -53582,16 +53600,24 @@ async function deleteMaddenWeekThreadsSilent(guild, league, weekLabel) {
 // can be called with or without an interaction (manual command or auto-sync).
 async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visibility = 'private', baseChannel) {
   await ensureMaddenGameThreadColumns();
-  const result = await pool.query(
+  // 7J-SEASONSCOPETHREADS: per Hxxdie — same class of gap as
+  // 7J-SEASONSCOPESTANDINGS/7J-SEASONSCOPESB. Week labels ("Week 1", etc.)
+  // repeat every season, and madden_imported_games keeps every season's
+  // rows forever (unique external_game_id per real game), so this used to
+  // pull BOTH seasons' "Week 1" games into the same thread-creation batch
+  // the moment a new season started syncing in next to old leftover rows —
+  // duplicate/wrong threads for the wrong owners. Same null-safe fallback
+  // pattern: unfiltered only if this league has never synced a season year.
+  const games = (await pool.query(
     `SELECT *
      FROM madden_imported_games
      WHERE guild_id = $1::text
        AND league_id::text = $2::text
        AND LOWER(COALESCE(week_label, '')) = LOWER($3)
+       AND ($4::integer IS NULL OR season_year = $4::integer)
      ORDER BY away_team ASC, home_team ASC`,
-    [guild.id, String(league.league_id), String(weekLabel || '')]
-  );
-  const games = result.rows || [];
+    [guild.id, String(league.league_id), String(weekLabel || ''), league.madden_season_year ?? null]
+  )).rows || [];
   const out = { created: [], skipped: [], failed: [] };
 
   if (!baseChannel?.isTextBased?.()) {
@@ -70739,13 +70765,26 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
     [guild.id, league.league_id]
   );
 
+  // 7J-SEASONSCOPESTANDINGS: per Hxxdie — real gap found while reviewing the
+  // Madden 26 -> 27 transition. madden_imported_games is keyed by EA's own
+  // external_game_id, which is unique per real game forever, so old seasons'
+  // completed games are never overwritten or removed — they just accumulate
+  // in the same table as this season's. This query had no season boundary at
+  // all, so the moment a new season's games start syncing in next to last
+  // season's leftover completed games, standings would silently sum both
+  // together (e.g. Week 1 of a new season showing a carried-over W-L record
+  // instead of 0-0). Scoped to league.madden_season_year — the real
+  // EA-sourced season boundary this codebase already trusts for achievement
+  // dedup (see 7J-41SEASON) — with a null-safe fallback to unfiltered
+  // behavior only if the league has never actually synced a season year yet.
   const gamesResult = await pool.query(
     `SELECT *
      FROM madden_imported_games
      WHERE guild_id = $1
        AND league_id = $2
-       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')`,
-    [guild.id, league.league_id]
+       AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
+       AND ($3::integer IS NULL OR season_year = $3::integer)`,
+    [guild.id, league.league_id, league.madden_season_year ?? null]
   );
 
   const records = new Map();
@@ -74951,7 +74990,8 @@ function maddenIsRegularSeasonWeek(weekLabel) {
 // Regular/playoffs -> offseason transition, mirroring the preseason -> regular pattern
 // above. Per user instruction: for Madden leagues, league history should post
 // automatically once the league has advanced past Super Bowl week and synced — no
-// manual `/maddenseason yearend confirm:true` needed. Guarded by current_season_stage
+// manual `/maddenseason yearend confirm:true` or `/maddenseason offseasonlock
+// confirm:true` needed; both fire together here. Guarded by current_season_stage
 // so this only fires once per season even though autosync runs every 60 seconds; the
 // stage is reset back to 'preseason' the moment next year's preseason weeks are
 // detected (see the reset branch below), so the cycle repeats correctly year over year.
@@ -74974,12 +75014,28 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   const sb = await getMaddenSuperBowlResult(guild.id, league.league_id).catch(() => null);
   if (!sb?.isFinal) return;
 
-  console.log('[SEASON TRANSITION] Super Bowl final detected for league', league.league_id, '— auto-finalizing year-end.');
+  console.log('[SEASON TRANSITION] Super Bowl final detected for league', league.league_id, '— auto-finalizing year-end and offseason lock.');
   try {
     await buildMaddenYearEndPrepEmbed(guild, league, true, null);
   } catch (error) {
     console.error('[SEASON TRANSITION] Auto year-end finalization failed:', error?.message || error);
     return; // don't flip the stage flag if it failed — retry next sync tick
+  }
+
+  // 7J-AUTOOFFSEASONLOCK: per Hxxdie — offseasonlock previously only ran as
+  // a manual command that nothing else ever called, despite being part of
+  // the documented flow. Year-end just finalized successfully above, so
+  // the readiness snapshot this saves is meaningful now — running it here
+  // means the commissioner never needs to run either command for the
+  // normal flow, only readiness remains manual (it's a pure status check
+  // with no side effects, so there's nothing to automate there).
+  try {
+    await buildMaddenOffseasonLockEmbed(guild, league, true, null);
+  } catch (error) {
+    console.error('[SEASON TRANSITION] Auto offseason lock failed:', error?.message || error);
+    // Year-end already succeeded and is the part that actually matters
+    // (awards, champion, currency, history) — don't block flipping the
+    // stage flag over the lock checkpoint, which is an audit record only.
   }
 
   await pool.query(
