@@ -43658,10 +43658,21 @@ function maddenWeekSortValue(weekLabel) {
   const label = String(weekLabel || '').toLowerCase();
   const n = Number((label.match(/\d+/) || [999])[0]);
   if (label.includes('preseason')) return n - 100;
-  if (label.includes('wildcard')) return 100;
-  if (label.includes('divisional')) return 101;
-  if (label.includes('conference')) return 102;
+  // 7J-DIVPLAYOFFFIX3: per Hxxdie — same root cause as
+  // maddenWeekLabelSortKey (see 7J-DIVPLAYOFFFIX). 'wildcard' (no space)
+  // never matched the real "Wild Card" label (which has a space), and
+  // 'divisional' never matched the real "Div. Playoff" label — both fell
+  // through to the final `return 999` fallback, identical to an
+  // unclassified garbage label, which broke any chronological sort relying
+  // on this function for playoff-week games. Numeric scale intentionally
+  // unchanged (100/101/102/103) — several call sites compare this against
+  // raw regular-season week numbers via >= 4 / >= 8, so only the matching
+  // needed fixing, not the value scheme.
+  if (label.includes('wild card')) return 100;
   if (label.includes('super bowl')) return 103;
+  if (label.includes('div')) return 101; // "Divisional", "Div. Playoff", etc.
+  if (label.includes('conf')) return 102; // "Conference Championship", "Conf. Championship", etc.
+  if (label.includes('championship')) return 103;
   if (label.includes('week')) return n;
   return 999;
 }
@@ -53711,10 +53722,24 @@ function maddenWeekLabelSortKey(label) {
   if (preMatch) return [0, Number(preMatch[1])];
   const regMatch = s.match(/^week (\d+)$/);
   if (regMatch) return [1, Number(regMatch[1])];
-  if (s.includes('wild card'))  return [2, 0];
-  if (s.includes('divisional')) return [2, 1];
-  if (s.includes('conference')) return [2, 2];
-  if (s.includes('super bowl') || s.includes('championship')) return [2, 3];
+  // 7J-DIVPLAYOFFFIX: per Hxxdie — real EA output confirmed to be "Div.
+  // Playoff", not "Divisional". That fell through every check below to the
+  // regular-season fallback, which then poisoned getMaddenNewAdvanceWeek's
+  // forward-progress comparison (a playoff week misread as "week 999" of
+  // the REGULAR season sorts as group 1, behind Wild Card's correctly-
+  // classified group 2 — making a genuine advance look like it went
+  // backward) and silently blocked every downstream auto-trigger this
+  // session built. Matched on short, distinctive substrings ("div", "conf")
+  // instead of the full word, since EA has now been shown to abbreviate at
+  // least one of these — safer to catch likely abbreviated forms than to
+  // require an exact word match we can't fully verify for every round.
+  // "super bowl" checked first since it's the most specific/least likely to
+  // collide with anything.
+  if (s.includes('wild card')) return [2, 0];
+  if (s.includes('super bowl')) return [2, 3];
+  if (s.includes('div')) return [2, 1]; // "Divisional", "Div. Playoff", "Div Round", etc.
+  if (s.includes('conf')) return [2, 2]; // "Conference Championship", "Conf. Championship", etc.
+  if (s.includes('championship')) return [2, 3];
   return [1, 999];
 }
 function compareMaddenWeekLabels(a, b) {
@@ -75405,7 +75430,6 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
 // handleMaddenOffseasonTransition + buildMaddenYearEndPrepEmbed), and
 // duplicating that here would risk double-paying the champion. This
 // function's only job is keeping the bracket's visual/embed state correct.
-const MADDEN_PLAYOFF_ROUND_WEEK_LABELS = ['Wild Card', 'Divisional', 'Conference Championship', 'Super Bowl'];
 async function syncMaddenPlayoffBracketFromResults(guild, league) {
   if (getPlayoffFormatKey(league) !== 'nfl') return;
   const settings = await ensureMaddenLeagueSettings(league);
@@ -75419,24 +75443,32 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
   const roundIndex = Number(bracketState.current_round || 1) - 1;
   const roundSeries = bracket[roundIndex];
   if (!roundSeries || !roundSeries.length) return;
-
-  const roundWeekLabel = MADDEN_PLAYOFF_ROUND_WEEK_LABELS[roundIndex];
-  if (!roundWeekLabel) return; // shouldn't happen — real NFL bracket is always exactly these 4 rounds
+  if (roundIndex > 3) return; // shouldn't happen — real NFL bracket is always exactly 4 rounds
 
   let mutated = false;
   for (const series of roundSeries) {
     if (series.bye || series.winner || !series.teamB) continue;
+    // 7J-DIVPLAYOFFFIX2: per Hxxdie — this used to match week_label against
+    // a hardcoded guess ('Divisional', etc.), which silently never matched
+    // anything once EA's real label turned out to be "Div. Playoff"
+    // instead. Now pulls every candidate completed game for this matchup
+    // and confirms the round via maddenWeekLabelSortKey — the same real
+    // classification the rest of the auto-detect pipeline already relies
+    // on — instead of requiring an exact label string this codebase can't
+    // fully verify for every round.
     const gameResult = await pool.query(
-      `SELECT home_team, away_team, home_score, away_score, status
+      `SELECT week_label, home_team, away_team, home_score, away_score, status
        FROM madden_imported_games
        WHERE guild_id = $1 AND league_id::text = $2::text
-         AND LOWER(COALESCE(week_label, '')) = LOWER($3)
-         AND ((LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($5)) OR (LOWER(home_team) = LOWER($5) AND LOWER(away_team) = LOWER($4)))
+         AND ((LOWER(home_team) = LOWER($3) AND LOWER(away_team) = LOWER($4)) OR (LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($3)))
          AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
-       ORDER BY imported_at DESC LIMIT 1`,
-      [guild.id, String(league.league_id), roundWeekLabel, series.teamA.name, series.teamB.name]
+       ORDER BY imported_at DESC`,
+      [guild.id, String(league.league_id), series.teamA.name, series.teamB.name]
     ).catch(() => ({ rows: [] }));
-    const game = gameResult.rows[0];
+    const game = (gameResult.rows || []).find(g => {
+      const [group, idx] = maddenWeekLabelSortKey(g.week_label);
+      return group === 2 && idx === roundIndex;
+    });
     if (!game) continue; // not played/synced yet — check again next sync
 
     const homeScore = Number(game.home_score) || 0;
