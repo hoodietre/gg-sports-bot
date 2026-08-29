@@ -4518,7 +4518,8 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false)))
       .addSubcommand(sc => sc.setName('cleanupduplicates').setDescription('Staff: find and remove duplicate game records for the same round matchup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
-      .addSubcommand(sc => sc.setName('wipeallgames').setDescription('Staff: archive ALL current games + delete threads (history/standings untouched)').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
+      .addSubcommand(sc => sc.setName('wipeallgames').setDescription('Staff: archive ALL current games + delete threads (history/standings untouched)').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('retrythreads').setDescription('Staff: recreate missing threads for the current round, without advancing').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('activecheck')
@@ -21356,12 +21357,23 @@ if (interaction.commandName === 'avatar') {
       if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true }); return; }
       await interaction.update({ content: 'Archiving games...', components: [] });
 
+      // 7J-WIPEORDERFIX: per Hxxdie — real race condition. This used to
+      // delete every Discord thread first (one sequential awaited API call
+      // per thread) and only mark archived_at afterward. With hundreds of
+      // threads that loop can run well past a minute, and anything that
+      // reads "current" games in that window (like Advance's duplicate
+      // check) still sees these rows as archived_at IS NULL — exactly what
+      // was letting stale not-yet-archived rows block new thread creation
+      // right after a wipe. The archive UPDATE is the part correctness
+      // depends on and is a single fast query, so it now runs first;
+      // thread deletion is cleanup that can safely take its time after.
+      if (session.archiveIds.length) {
+        await pool.query(`UPDATE league_games SET archived_at = NOW() WHERE id = ANY($1::uuid[])`, [session.archiveIds]).catch(() => null);
+      }
+
       for (const threadId of session.deleteThreadIds) {
         const thread = await interaction.guild.channels.fetch(threadId).catch(() => null);
         if (thread?.isThread?.()) await thread.delete('GG Sports: archive all games').catch(() => null);
-      }
-      if (session.archiveIds.length) {
-        await pool.query(`UPDATE league_games SET archived_at = NOW() WHERE id = ANY($1::uuid[])`, [session.archiveIds]).catch(() => null);
       }
       gameWipeAllSessions.delete(token);
 
@@ -26262,6 +26274,64 @@ if (interaction.commandName === 'avatar') {
       // Archives instead of deleting, and only ever touches rows that are
       // still current (archived_at IS NULL) — running this twice in a row
       // is safe and simply finds nothing left to archive the second time.
+      if (gameSubcommand === 'retrythreads') {
+        const retryLeagueName = interaction.options.getString('league');
+        const retryLeague = await getLeagueByName(interaction.guild.id, retryLeagueName);
+        if (!retryLeague) { await interaction.reply({ content: 'Could not find that league.', ephemeral: true }); return; }
+        if (!(await userCanUseLeagueSetup(interaction, retryLeague))) {
+          await interaction.reply({ content: 'You do not have permission to manage this league.', ephemeral: true });
+          return;
+        }
+        const retryCustomSettings = await ensureLeagueCustomSettings(retryLeague).catch(() => ({}));
+        if (retryCustomSettings.schedule_style !== 'structured') {
+          await interaction.reply({ content: 'This league is not using a structured schedule.', ephemeral: true });
+          return;
+        }
+        const retrySchedule = Array.isArray(retryCustomSettings.schedule) ? retryCustomSettings.schedule : [];
+        const retryCurrentRound = Number(retryCustomSettings.current_round || 0);
+        if (retryCurrentRound < 1 || retryCurrentRound > retrySchedule.length) {
+          await interaction.reply({ content: 'No current round to retry — start or advance the league first.', ephemeral: true });
+          return;
+        }
+        await interaction.deferReply({ ephemeral: true });
+
+        // 7J-RETRYTHREADS: per Hxxdie — Advance always moves forward a
+        // round; there was no way to recover a round left without threads
+        // (partial failure, stale rows blocking creation, etc) short of
+        // pressing Advance again, which abandons that round entirely and
+        // moves to the next one. Reuses schedule[currentRound - 1] — the
+        // same matchups Advance itself would have used for this round —
+        // and the identical createLeagueGameCore + createGameCenterThread
+        // path, so this is exactly "redo the thread-creation half of
+        // Advance for the round we're already on," nothing new.
+        const retryWeekLabel = `Game ${retryCurrentRound}`;
+        const retryMatchups = retrySchedule[retryCurrentRound - 1] || [];
+        const retryThreadChannelId = retryLeague.game_threads_channel_id;
+        const retryThreadChannel = retryThreadChannelId ? await interaction.guild.channels.fetch(retryThreadChannelId).catch(() => null) : null;
+        let retryGamesChecked = 0, retryAlreadyHadThread = 0, retryThreadsCreated = 0;
+        const retryThreadFailures = [];
+
+        for (const matchup of retryMatchups) {
+          const homeTeam = { id: matchup.home.role_id, name: matchup.home.role_name };
+          const awayTeam = { id: matchup.away.role_id, name: matchup.away.role_name };
+          const createResult = await createLeagueGameCore(interaction, retryLeague, homeTeam, awayTeam, { weekLabel: retryWeekLabel });
+          if (!createResult.ok || !createResult.game) continue;
+          retryGamesChecked += 1;
+          if (createResult.alreadyExisted && createResult.game.thread_id) { retryAlreadyHadThread += 1; continue; }
+          if (retryThreadChannel?.isTextBased?.()) {
+            const threadResult = await createGameCenterThread(interaction, retryLeague, createResult.game, { channelIdOverride: retryThreadChannelId });
+            if (threadResult.ok) retryThreadsCreated += 1;
+            else retryThreadFailures.push(`${matchup.away.role_name} vs ${matchup.home.role_name}: ${threadResult.message}`);
+          }
+        }
+
+        const retryThreadNote = retryThreadChannel
+          ? `${retryThreadsCreated} new thread(s) created in <#${retryThreadChannel.id}> (${retryAlreadyHadThread} already had one).${retryThreadFailures.length ? '\n⚠️ ' + retryThreadFailures.join('\n⚠️ ') : ''}`
+          : 'No Game Threads channel configured — set one first (Admin Panel → League Setup).';
+        await interaction.editReply({ content: `**Retried threads for ${retryWeekLabel}/${retrySchedule.length}**\n\n${retryGamesChecked} matchup(s) checked. ${retryThreadNote}` });
+        return;
+      }
+
       if (gameSubcommand === 'wipeallgames') {
         const wipeLeagueName = interaction.options.getString('league');
         const wipeLeague = await getLeagueByName(interaction.guild.id, wipeLeagueName);
