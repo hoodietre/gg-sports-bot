@@ -1884,6 +1884,19 @@ async function initDatabase() {
   // ("Stanley Cup Champion" instead of a generic "Champion"). NULL means
   // "use the sport-appropriate default" — see getChampionshipTrophyName.
   await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS championship_trophy_name TEXT`);
+  // 7J-GAMEEDITION: per Hxxdie — structured (non-Madden) leagues have no
+  // live game-data sync, so unlike Madden's real EA-sourced
+  // madden_season_year, there's no automatic ground truth for "which
+  // annual edition of the game (NHL 26 vs NHL 27, etc.) this season was
+  // played on." Commissioner-set instead, prefixed directly into each
+  // archived season's season_label at write time (see the "Start New
+  // Season" archival flow) so every existing display path that already
+  // shows season_label picks this up with zero further changes — no new
+  // column needed on team_season_history/user_season_history/season_history.
+  // Sequential "Season N" numbering is untouched and keeps incrementing
+  // globally across editions, exactly as before; this only adds a visible
+  // tag for which real game a given season was actually played on.
+  await pool.query(`ALTER TABLE league_custom_settings ADD COLUMN IF NOT EXISTS game_edition TEXT`);
   // 7J-NBAPLAYIN: snapshot of seeds 1-10 per conference at the moment
   // playoffs start — the "real" bracket's seeds 1-6 aren't known as
   // finished series until the play-in stage resolves seeds 7-8, so this is
@@ -5077,17 +5090,30 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
   const championOwnerId = championName ? await findMaddenOwnerForTeamName(guild.id, league.league_id, championName) : null;
 
   if (confirm) {
-    const seasonLabel = 'Current';
+    // 7J-REALSEASONLABEL: per Hxxdie — real data-loss bug, not just a
+    // cosmetic label issue. season_label was hardcoded to the literal
+    // string 'Current', which is the ON CONFLICT key for BOTH
+    // madden_championship_history and madden_award_history below — so
+    // every new season's year-end finalization was overwriting the
+    // previous season's row in place. Only the most recently finalized
+    // season's champion/awards were ever retrievable; every prior year's
+    // history was silently destroyed the next time this ran. madden_season_year
+    // was added specifically to solve exactly this class of problem (see
+    // 7J-41SEASON above) but was only ever wired into the achievement dedup
+    // key, never into season_label itself — this finishes that. Falls back
+    // to the old 'Current' literal only if a league has never actually
+    // synced a season year (shouldn't happen in practice by this point in
+    // the flow, but matches the same null-safe fallback pattern used
+    // elsewhere rather than leaving a hole). The existing display/sort
+    // logic (see getMaddenStoredChampionshipRows) already handles any
+    // numeric season_label correctly — this needed no changes there.
+    const seasonLabel = league.madden_season_year != null ? String(league.madden_season_year) : 'Current';
     // 7J-41SEASON: achievements now key off the real EA-sourced season year
     // (league.madden_season_year, persisted every sync — see
     // runMaddenEaDirectSync) instead of the literal 'Current' label used
     // everywhere else in this function. This is what actually lets a new
     // season's MVP/champion get paid again instead of being silently
     // blocked by the previous season's already-claimed achievement key.
-    // seasonLabel itself is left alone here deliberately — madden_award_history/
-    // madden_championship_history's ON CONFLICT keys already depend on it
-    // staying 'Current' for their own upsert-in-place behavior, and changing
-    // that is a bigger, separate migration, not part of this fix.
     const achievementSeasonKey = league.madden_season_year != null ? String(league.madden_season_year) : seasonLabel;
     const currencySettings = await getCurrencySettings(guild.id).catch(() => null);
     const awardPayout = Number(currencySettings?.award_payout ?? 50);
@@ -7780,6 +7806,25 @@ const NFL_TEAM_CONF_DIV = buildExactTeamLookup([
   [['Seattle Seahawks'], 'NFC', 'NFC West'],
 ]);
 
+// 7J-NFLCONFDIVABBR: lazily-built (not at module load — getMaddenTeamAbbrev
+// and NFL_TEAM_ABBREVIATIONS live much later in this file, so building this
+// eagerly here would hit them before they're initialized) reverse lookup
+// from team abbreviation ("DEN") to conference/division, derived from the
+// same NFL_TEAM_CONF_DIV table above. Lets getTeamConferenceDivisionForLeague
+// resolve mascot-only names ("Broncos") and city-only names, not just an
+// exact full "City Mascot" match — see the call site for why this matters.
+let _nflTeamConfDivByAbbrCache = null;
+function getNflTeamConfDivByAbbr() {
+  if (_nflTeamConfDivByAbbrCache) return _nflTeamConfDivByAbbrCache;
+  const map = new Map();
+  for (const [fullNameKey, meta] of NFL_TEAM_CONF_DIV.entries()) {
+    const abbr = getMaddenTeamAbbrev(fullNameKey);
+    if (abbr) map.set(abbr.toUpperCase(), meta);
+  }
+  _nflTeamConfDivByAbbrCache = map;
+  return map;
+}
+
 const MLB_TEAM_CONF_DIV = buildExactTeamLookup([
   [['Baltimore Orioles'], 'American League', 'AL East'],
   [['Boston Red Sox'], 'American League', 'AL East'],
@@ -7854,8 +7899,26 @@ async function getTeamConferenceDivisionForLeague(guildId, leagueId, teamName, l
       autoDetected = { conference: getTeamConference(teamName), division: null };
     } else if (league && isNhlLeague(league) && NHL_TEAM_CONF_DIV.has(normalizedName)) {
       autoDetected = NHL_TEAM_CONF_DIV.get(normalizedName);
-    } else if (league && isNflLeague(league) && NFL_TEAM_CONF_DIV.has(normalizedName)) {
-      autoDetected = NFL_TEAM_CONF_DIV.get(normalizedName);
+    } else if (league && isNflLeague(league)) {
+      // 7J-NFLCONFDIVABBR: per Hxxdie — real bug found reviewing the wild
+      // card playoff picture story. EA/Madden exports team names as
+      // mascot-only ("Broncos", "Buccaneers"), but this exact-match lookup
+      // only had full "City Mascot" names ("Denver Broncos") as keys, so it
+      // silently failed for essentially every real Madden league — every
+      // team fell through to the generic conference/division fallback and
+      // got compared against every OTHER team as if they were all in one
+      // merged conference. Falls back to matching via the team's
+      // abbreviation (through the same NFL_TEAM_ABBREVIATIONS table
+      // already trusted elsewhere for display names) whenever the raw name
+      // doesn't match a full name directly — covers mascot-only, full-name,
+      // and city-only export formats without needing a second hand-typed
+      // alias list.
+      if (NFL_TEAM_CONF_DIV.has(normalizedName)) {
+        autoDetected = NFL_TEAM_CONF_DIV.get(normalizedName);
+      } else {
+        const abbr = getMaddenTeamAbbrev(teamName);
+        if (abbr) autoDetected = getNflTeamConfDivByAbbr().get(abbr.toUpperCase()) || null;
+      }
     } else if (league && isMlbLeague(league) && MLB_TEAM_CONF_DIV.has(normalizedName)) {
       autoDetected = MLB_TEAM_CONF_DIV.get(normalizedName);
     }
@@ -8342,6 +8405,51 @@ async function selectNflPlayoffTeams(guildId, league, standingsRows) {
     // to who actually has the better record. Re-sorting by their position
     // in inConf (true rank order) before seeding fixes that; wildcards
     // were already fine since a plain filter() preserves relative order.
+    const inConf = withMeta.filter(t => t.resolvedConference === conference);
+    const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
+    const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean)
+      .sort((a, b) => inConf.indexOf(a) - inConf.indexOf(b));
+    const winnerNames = new Set(divisionWinners.map(t => t.team_name));
+    const wildcards = inConf.filter(t => !winnerNames.has(t.team_name)).slice(0, 3);
+    [...divisionWinners.slice(0, 4), ...wildcards].forEach((team, index) => {
+      seeded.push({ ...team, seed: index + 1, conference, byeRound1: index === 0 });
+    });
+  }
+  return seeded;
+}
+
+// 7J-MADDENPLAYOFFAUTOSTART: per Hxxdie — the playoff bracket panel had a
+// channel and everything already auto-configured (see singleChannelSpecs'
+// playoff_bracket_channel_id entry), but nothing ever actually built or
+// posted a bracket for Madden leagues — autoPostPlayoffBracketPanel was
+// only ever called from the manual "Start Playoffs" button, which is a
+// structured-league flow Madden leagues have no reason to know exists.
+// Same real seeding rule as selectNflPlayoffTeams (division winners 1-4 by
+// within-conference record, next-3 records fill wildcards 5-7), sourced
+// from madden_imported_team_stats since Madden leagues never populate
+// league_standings (selectNflPlayoffTeams's normal data source — see the
+// matching note on 7J-SEASONSCOPESTANDINGS/7J-PLAYOFFPICTURESEEDFIX for the
+// same table-source distinction). Output shape matches selectNflPlayoffTeams
+// exactly, so it drops straight into buildInitialPlayoffRound unchanged.
+async function selectMaddenPlayoffTeams(guild, league) {
+  const teamsResult = await pool.query(
+    `SELECT team_name, wins, losses, ties FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const standingsRows = (teamsResult.rows || [])
+    .map(t => {
+      const gp = t.wins + t.losses + (t.ties || 0);
+      return { ...t, pct: gp > 0 ? (t.wins + (t.ties || 0) * 0.5) / gp : 0 };
+    })
+    .sort((a, b) => b.pct - a.pct || b.wins - a.wins);
+
+  const withMeta = await Promise.all(standingsRows.map(async t => {
+    const { conference, division } = await getTeamConferenceDivisionForLeague(guild.id, league.league_id, t.team_name, league).catch(() => ({}));
+    return { ...t, resolvedConference: conference || 'Conference', resolvedDivision: division || 'Division' };
+  }));
+  const conferences = [...new Set(withMeta.map(t => t.resolvedConference))];
+  const seeded = [];
+  for (const conference of conferences) {
     const inConf = withMeta.filter(t => t.resolvedConference === conference);
     const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
     const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean)
@@ -14886,10 +14994,10 @@ if (interaction.commandName === 'avatar') {
         .setTitle('Edit Cosmetic Details')
         .addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rarity').setLabel('Rarity (common/uncommon/rare/epic/legendary)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.rarity || 'common')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('art_key').setLabel('Art key (links to assets/avatar/layers/{slot}/)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.art_asset_key || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('art_key').setLabel('Art key (assets/avatar/layers/{slot}/)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.art_asset_key || '')),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('colorable').setLabel('Colorable? (yes/no)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.is_colorable ? 'yes' : 'no')),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('award_only').setLabel('Award-only? (yes/no)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.is_award_only ? 'yes' : 'no')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gift_type').setLabel('Gift type + year (blank/birthday/christmas 2027)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.gift_type ? (item.gift_type + (item.gift_year ? ' ' + item.gift_year : '')) : '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gift_type').setLabel('Gift type + year (birthday/christmas 2027)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.gift_type ? (item.gift_type + (item.gift_year ? ' ' + item.gift_year : '')) : '')),
         );
       await interaction.showModal(modal);
       return;
@@ -15003,12 +15111,12 @@ if (interaction.commandName === 'avatar') {
         );
       } else if (item.avatar_slot === 'accessory') {
         modal.addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('accessory_type').setLabel('Accessory type (neck/wrist/face/ears/legs/other)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.accessory_type || '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('accessory_type').setLabel('Accessory type (neck/wrist/face/ears/legs)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.accessory_type || '')),
         );
       } else if (item.avatar_slot === 'pet') {
         modal.addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pet_position').setLabel('Pet position (left/right/front/shoulder/float_left/float_right/float_center)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.pet_position || 'left')),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pet_scale').setLabel('Pet scale (fraction of wearer height, e.g. 0.35)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.pet_scale ? String(item.pet_scale) : '')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pet_position').setLabel('Pet position (left/right/front/shoulder/etc)').setStyle(TextInputStyle.Short).setRequired(true).setValue(item.pet_position || 'left')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pet_scale').setLabel('Pet scale, fraction of height (e.g. 0.35)').setStyle(TextInputStyle.Short).setRequired(false).setValue(item.pet_scale ? String(item.pet_scale) : '')),
         );
       }
       await interaction.showModal(modal);
@@ -20229,6 +20337,36 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-GAMEEDITION: same edit pattern as Trophy Name above — see the
+    // league_custom_settings.game_edition column comment for why this
+    // exists (no automatic source for non-Madden leagues, unlike Madden's
+    // real EA-sourced madden_season_year).
+    if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_gameedition:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+      const modal = new ModalBuilder()
+        .setCustomId('leaguecustom_gameedition_submit:' + leagueId)
+        .setTitle('Game Edition')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('game_edition').setLabel('e.g. "NHL 26" — update when you switch games').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(40).setValue(customSettings.game_edition || '')),
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('leaguecustom_gameedition_submit:')) {
+      const leagueId = interaction.customId.split(':')[1];
+      const league = await getLeagueById(leagueId);
+      if (!league || !(await userCanUseLeagueSetup(interaction, league))) { await interaction.reply({ content: 'You do not have permission to edit this.', ephemeral: true }); return; }
+      const gameEdition = interaction.fields.getTextInputValue('game_edition').trim();
+      await pool.query(`UPDATE league_custom_settings SET game_edition = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, gameEdition || null]);
+      await interaction.deferUpdate();
+      await showLeagueCustomizationSection(interaction, leagueId, 'awards', { update: false });
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('leaguecustom_award_add:')) {
       const leagueId = interaction.customId.split(':')[1];
       const league = await getLeagueById(leagueId);
@@ -20463,7 +20601,18 @@ if (interaction.commandName === 'avatar') {
       const runnerUpUserId = archivalCustomSettings.current_season_runnerup_user_id || null;
 
       const seasonCountResult = await pool.query(`SELECT COUNT(DISTINCT season_label)::int AS n FROM team_season_history WHERE league_id = $1`, [leagueId]).catch(() => ({ rows: [{ n: 0 }] }));
-      const seasonLabel = `Season ${Number(seasonCountResult.rows[0]?.n || 0) + 1}`;
+      // 7J-GAMEEDITION: per Hxxdie — non-Madden equivalent of the Madden
+      // season-label fix (7J-REALSEASONLABEL). No automatic source exists
+      // here (no live game-data sync for these sports), so this is
+      // commissioner-set instead — see the game_edition column comment.
+      // Prefixed directly into the label so every existing display path
+      // that already reads season_label shows it with no further changes.
+      // Numbering itself is untouched, still counting straight through
+      // across editions exactly as before.
+      const seasonNumber = Number(seasonCountResult.rows[0]?.n || 0) + 1;
+      const seasonLabel = archivalCustomSettings.game_edition
+        ? `${archivalCustomSettings.game_edition} - Season ${seasonNumber}`
+        : `Season ${seasonNumber}`;
 
       let teamsArchived = 0;
       let ownersArchived = 0;
@@ -30294,6 +30443,7 @@ if (shopSubcommand === 'view') {
           return;
         }
 
+        const awardsCustomSettings = await ensureLeagueCustomSettings(activeLeague).catch(() => ({}));
         const modal = new ModalBuilder()
           .setCustomId('league_awards_modal:' + activeLeague.league_id)
           .setTitle('League Awards • ' + activeLeague.league_name.slice(0, 24));
@@ -30305,6 +30455,11 @@ if (shopSubcommand === 'view') {
               .setLabel('Season / award period')
               .setStyle(TextInputStyle.Short)
               .setPlaceholder('Season 1, 2026 Spring, Week 8, etc.')
+              // 7J-GAMEEDITION: suggested default only — this field also
+              // covers partial periods ("Week 8"), so it stays free-text
+              // rather than auto-generating a season number the way the
+              // full season-archival flow does.
+              .setValue(awardsCustomSettings.game_edition ? `${awardsCustomSettings.game_edition} - ` : '')
               .setRequired(true)
           ),
           new ActionRowBuilder().addComponents(
@@ -63013,7 +63168,21 @@ function maddenAwardHistorySnapshot(row, awardKey) {
 
 async function refreshMaddenProjectedAwardHistory(guildId, leagueId) {
   await ensureMaddenAwardHistoryTable();
-  const seasonLabel = maddenAwardHistorySeasonLabel();
+  // 7J-REALSEASONLABEL2: per Hxxdie — same data-loss bug as the year-end
+  // finalization path (see 7J-REALSEASONLABEL), just in the "projected"
+  // (in-progress award race leader) snapshot instead of the finalized one.
+  // maddenAwardHistorySeasonLabel() returned the literal 'Current', which
+  // is part of this table's ON CONFLICT key, so a new season's projected
+  // leader was overwriting the previous season's projected snapshot in
+  // place. Fetches the real EA-sourced season year directly (this function
+  // only receives guildId/leagueId, not a full league object) rather than
+  // changing every caller's signature.
+  const seasonYearResult = await pool.query(
+    `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
+    [leagueId]
+  ).catch(() => ({ rows: [] }));
+  const seasonYear = seasonYearResult.rows[0]?.madden_season_year ?? null;
+  const seasonLabel = seasonYear != null ? String(seasonYear) : maddenAwardHistorySeasonLabel();
   const awardKeys = ['mvp', 'opoy', 'dpoy', 'oroy', 'droy'];
   for (const awardKey of awardKeys) {
     const rows = await getMaddenAwardsRace(guildId, leagueId, awardKey, 1).catch(() => []);
@@ -71060,16 +71229,31 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     // imported game data, and how many of each are scored vs not. Built after
     // three rounds of trying to diagnose this from truncated log snippets;
     // surfacing this plainly in the sync result itself removes the guesswork.
+    //
+    // 7J-WEEKBREAKDOWNFIX: per Hxxdie — two real bugs here. (1) ORDER BY
+    // week_label is a plain alphabetical SQL sort ("Week 1", "Week 10",
+    // "Week 11", ..., "Week 2"), not chronological — now sorted in JS via
+    // compareMaddenWeekLabels, the same real week-ordering logic already
+    // used everywhere else in this codebase. (2) "scored" used to check
+    // home_score > 0 OR away_score > 0, which miscounts any legitimately-
+    // completed game that doesn't fit that shape — a real 0-0 tie, or a
+    // game resolved via fallback win flags (forceWin/homeWin/awayWin) with
+    // no raw score at all (see 7J-47PPG) — as unscored. That's exactly why
+    // Week 18 showed 0/16 despite having already imported correctly and
+    // taken effect throughout the league: functionally fine, but a
+    // needlessly alarming diagnostic message. Now uses the same
+    // status-based completion check recalculateMaddenStandingsFromImportedGames
+    // already trusts as the real definition of "this game is done."
     const weekLabelBreakdownResult = await pool.query(
       `SELECT week_label, COUNT(*)::int AS total,
-         COUNT(*) FILTER (WHERE home_score > 0 OR away_score > 0)::int AS scored
+         COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie'))::int AS scored
        FROM madden_imported_games
        WHERE guild_id = $1 AND league_id::text = $2::text AND week_label IS NOT NULL
-       GROUP BY week_label
-       ORDER BY week_label`,
+       GROUP BY week_label`,
       [guild.id, String(league.league_id)]
     ).catch(() => ({ rows: [] }));
     const weekLabelBreakdown = weekLabelBreakdownResult.rows
+      .sort((a, b) => compareMaddenWeekLabels(a.week_label, b.week_label))
       .map(row => `${row.week_label}: ${row.scored}/${row.total} scored`)
       .join(' | ');
     console.log(`[WEEK LABEL BREAKDOWN 7J-6WK] League ${league.league_id}: ${weekLabelBreakdown || '(no games found)'}`);
@@ -75093,6 +75277,82 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   console.log('[SEASON TRANSITION] Offseason finalization complete for league', league.league_id);
 }
 
+// 7J-MADDENPLAYOFFAUTOSTART: per Hxxdie — real gap, not a posting failure.
+// The playoff bracket channel and league_settings column were already
+// auto-configured (singleChannelSpecs' playoff_bracket_channel_id entry),
+// but autoPostPlayoffBracketPanel was only ever called from the manual
+// "Start Playoffs" commissioner button — a structured-league flow with no
+// Madden equivalent, so nothing ever built or posted a bracket for a Madden
+// league at all. Fires once, the moment Wild Card week is first detected
+// while the league is still in 'regular' stage, mirroring the exact same
+// once-per-season auto-trigger pattern as handleMaddenSeasonTransition and
+// handleMaddenOffseasonTransition. Reuses the same real bracket-building
+// pipeline the manual flow uses (buildInitialPlayoffRound,
+// createPlayoffSeriesThreads, the league_playoff_brackets upsert,
+// refreshPlayoffBracketPanel, autoPostPlayoffBracketPanel) — only the seed
+// source differs (selectMaddenPlayoffTeams instead of
+// selectPlayoffTeamsForLeague, since Madden leagues don't populate
+// league_standings). Checks group === 2 (any playoff week), not
+// specifically "Wild Card", so a sync that happens to skip straight past
+// Wild Card week (a missed sync tick) still catches the bracket start
+// rather than silently never firing.
+async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel) {
+  if (getPlayoffFormatKey(league) !== 'nfl') return;
+  const settings = await ensureMaddenLeagueSettings(league);
+  const stage = settings.current_season_stage || 'preseason';
+  if (stage !== 'regular') return; // already started (or not regular season yet) — nothing to do
+  if (maddenWeekLabelSortKey(newWeekLabel)[0] !== 2) return; // not a playoff week yet
+
+  // Safety net: if a bracket already exists (started manually, or a prior
+  // run of this handler that failed after the insert but before the stage
+  // flag flip), don't build a second one on top of it — just catch the
+  // stage flag up so this stops re-checking every sync.
+  const existingBracket = await pool.query(
+    `SELECT league_id FROM league_playoff_brackets WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  if (existingBracket.rows.length) {
+    await pool.query(
+      `UPDATE madden_league_settings SET current_season_stage = 'playoffs', updated_at = NOW() WHERE league_id = $1`,
+      [league.league_id]
+    ).catch(() => null);
+    return;
+  }
+
+  console.log('[SEASON TRANSITION] Playoff week detected for league', league.league_id, '— auto-starting playoff bracket.');
+  try {
+    const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+    const seriesLengths = Array.isArray(customSettings.playoff_series_lengths) && customSettings.playoff_series_lengths.length
+      ? customSettings.playoff_series_lengths : [1];
+    const seededTeams = await selectMaddenPlayoffTeams(guild, league);
+    if (seededTeams.length < 2) {
+      console.warn('[SEASON TRANSITION] Not enough teams to auto-start playoff bracket for league', league.league_id);
+      return; // retry next sync tick rather than flipping the stage on a no-op
+    }
+    const firstRound = buildInitialPlayoffRound(seededTeams, seriesLengths, 'nfl');
+    await createPlayoffSeriesThreads(guild, league, firstRound, 1).catch(err =>
+      console.error('[SEASON TRANSITION] Playoff Round 1 thread creation failed:', err?.message || err));
+    const bracket = [firstRound];
+    await pool.query(
+      `INSERT INTO league_playoff_brackets (league_id, bracket, current_round, status, champion_team, updated_at)
+       VALUES ($1, $2, 1, 'in_progress', NULL, NOW())
+       ON CONFLICT (league_id) DO UPDATE SET bracket = $2, current_round = 1, status = 'in_progress', champion_team = NULL, channel_id = league_playoff_brackets.channel_id, message_id = league_playoff_brackets.message_id, updated_at = NOW()`,
+      [league.league_id, JSON.stringify(bracket)]
+    );
+    await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+    await autoPostPlayoffBracketPanel(guild, league).catch(() => null);
+  } catch (error) {
+    console.error('[SEASON TRANSITION] Auto playoff bracket start failed:', error?.message || error);
+    return; // don't flip the stage flag if it failed — retry next sync tick
+  }
+
+  await pool.query(
+    `UPDATE madden_league_settings SET current_season_stage = 'playoffs', updated_at = NOW() WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => null);
+  console.log('[SEASON TRANSITION] Playoff bracket auto-start complete for league', league.league_id);
+}
+
 async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel) {
   if (!previousWeekLabel || !newWeekLabel) return;
   const wasPreseason = maddenIsPreseasonWeek(previousWeekLabel);
@@ -75197,6 +75457,26 @@ async function autoDetectAfterSync(guild, league) {
   // full week-advance.
   await autoDistributeCompletedMaddenGameRewards(guild, league).catch(err =>
     console.error('[AUTO DETECT] Per-game reward distribution:', err?.message));
+
+  // 7J-PLAYOFFBRACKETCATCHUP: per Hxxdie — handleMaddenPlayoffBracketTransition
+  // is also reachable via the newWeekLabel edge-trigger further below, but
+  // that only fires on the ONE sync where the week actually changes. If this
+  // feature's deploy lands after a league has already advanced into a
+  // playoff week (EA reports the same week on every subsequent sync from
+  // then on), that edge event has already been consumed and won't fire
+  // again this season — silently leaving the bracket unposted for the rest
+  // of the playoffs with no further chance to self-correct. Runs
+  // unconditionally every sync instead, using EA's raw reported current
+  // week rather than the edge-triggered "new advance" value, so a league
+  // already sitting in a playoff week still gets caught. Safe to call every
+  // sync thanks to handleMaddenPlayoffBracketTransition's own stage and
+  // existing-bracket guards — same "idempotent, so call it unconditionally"
+  // pattern as the sportsbook/reward passes just above.
+  const eaCurrentWeekSettings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+  if (eaCurrentWeekSettings.ea_reported_current_week) {
+    await handleMaddenPlayoffBracketTransition(guild, league, eaCurrentWeekSettings.ea_reported_current_week).catch(err =>
+      console.error('[AUTO DETECT] Playoff bracket catch-up check failed:', err?.message));
+  }
 
   // Week-advance dedup guard — everything below this point (news/streaks/
   // performances, new lines, new props, thread creation, season transitions) is
@@ -76032,18 +76312,24 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
   } else if (section === 'awards') {
     const awards = Array.isArray(customSettings.awards) ? customSettings.awards : [];
     const trophyName = getChampionshipTrophyName(league, customSettings);
+    const gameEdition = customSettings.game_edition || 'Not set';
     embed = new EmbedBuilder()
       .setTitle(`🎖️ Awards • ${league.league_name}`)
       .setColor(0x5865F2)
-      .addFields({ name: 'Championship Trophy Name', value: trophyName, inline: false })
+      .addFields(
+        { name: 'Championship Trophy Name', value: trophyName, inline: true },
+        { name: 'Game Edition', value: gameEdition, inline: true },
+      )
       .setDescription((awards.length ? awards.map((a, i) => `${i + 1}. ${a.label}${a.tieredCosmetic ? ' 🎁' : ''}`).join('\n') : 'No awards configured yet.')
         + '\n\n🎁 = grants an automated tiered cosmetic item (usually the MVP-equivalent award); every other award pays currency instead.'
-        + '\n\nThis is the list of awards this league recognizes. There\'s no live stat-driven race for non-Madden leagues — record each season\'s winners from **Operations → Season History** at season end, which walks through the champion and each configured award with team/user pickers, posts everything in the League History channel, and updates franchise legacy.')
+        + '\n\nThis is the list of awards this league recognizes. There\'s no live stat-driven race for non-Madden leagues — record each season\'s winners from **Operations → Season History** at season end, which walks through the champion and each configured award with team/user pickers, posts everything in the League History channel, and updates franchise legacy.'
+        + '\n\n**Game Edition** tags which year\'s game (e.g. "NHL 26") each archived season was actually played on — set it once, then update it whenever the league switches to the new year\'s game. Doesn\'t affect the "Season 1, Season 2..." numbering, which keeps counting straight through; this just makes it possible to tell which real game a given season came from when looking back at league history later.')
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
     const rows = [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('leaguecustom_award_add:' + leagueId).setLabel('Add Award').setEmoji('➕').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('leaguecustom_trophyname:' + leagueId).setLabel('Edit Trophy Name').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('leaguecustom_gameedition:' + leagueId).setLabel('Edit Game Edition').setEmoji('🎮').setStyle(ButtonStyle.Secondary),
     )];
     if (awards.length) {
       const removeMenu = new StringSelectMenuBuilder()
