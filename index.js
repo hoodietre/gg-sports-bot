@@ -4518,7 +4518,7 @@ function buildCommands() {
       .addSubcommand(sc => sc.setName('standings').setDescription('Show standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
       .addSubcommand(sc => sc.setName('adjuststandings').setDescription('Staff: adjust standings').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)).addRoleOption(o => o.setName('team').setDescription('Team role').setRequired(true)).addIntegerOption(o => o.setName('wins').setDescription('Wins').setRequired(true)).addIntegerOption(o => o.setName('losses').setDescription('Losses').setRequired(true)).addIntegerOption(o => o.setName('ties').setDescription('Ties (if this league allows them)').setRequired(false)))
       .addSubcommand(sc => sc.setName('cleanupduplicates').setDescription('Staff: find and remove duplicate game records for the same round matchup').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true)))
-      .addSubcommand(sc => sc.setName('wipeallgames').setDescription('Staff: archive ALL current game records + delete their threads (history preserved, standings/schedule untouched)').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
+      .addSubcommand(sc => sc.setName('wipeallgames').setDescription('Staff: archive ALL current games + delete threads (history/standings untouched)').addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))),
 
     new SlashCommandBuilder()
       .setName('activecheck')
