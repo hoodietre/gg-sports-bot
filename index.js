@@ -56801,11 +56801,26 @@ function maddenTransactionTeamKey(team = '') {
     .trim();
 }
 
+// 7J-TRANSACTIONKEYSTABLE: real bug, confirmed live — Brandon Aubrey's
+// Dolphins signing reposted across multiple syncs. Root cause: this key
+// normalized old/new team names with a bare character-strip only (no team
+// identity resolution), while maddenTransactionTeamKey (used elsewhere in
+// this exact file, e.g. the expiring-contract-repair path) already exists
+// specifically to resolve real team identity regardless of format
+// ("Giants" vs "Giants (NYG)" vs a raw numeric team ID — see its own
+// comment). Two different detection passes in scanMaddenOffseasonTransactions
+// can independently find the same real signing but pull old_team_name from
+// different sources with different formatting — with the old weak
+// normalization, that produced two different persisted keys for the same
+// real event, bypassing the ON CONFLICT DO NOTHING dedup below and
+// reposting the same signing on a later sync once formatting happened to
+// differ again. Using the same real-identity resolver everywhere closes
+// that gap.
 function buildMaddenTransactionKey(row = {}) {
   const playerKey = String(row.player_id || row.player_name || 'player').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 80);
   const event = String(row.event_type || 'transaction').toLowerCase();
-  const oldTeam = String(row.old_team_name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40);
-  const newTeam = String(row.new_team_name || row.team_name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40);
+  const oldTeam = maddenTransactionTeamKey(row.old_team_name || '').slice(0, 40);
+  const newTeam = maddenTransactionTeamKey(row.new_team_name || row.team_name || '').slice(0, 40);
   return `${event}:${playerKey}:${oldTeam}:${newTeam}`.slice(0, 240);
 }
 
@@ -57818,8 +57833,27 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
 // different size replaces it (old rookies' yearsPro rolls over off 0 by
 // then, same roster-refresh mechanic already relied on elsewhere).
 async function checkAndPostMaddenDraftRecap(guild, league) {
-  const rookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
-  if (!rookies.length) return;
+  const rawRookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
+  if (!rawRookies.length) return;
+
+  // 7J-DRAFTRECAPSANITY: real bug, confirmed live — fired on 2 "rookies"
+  // with garbage data (Round 63, Pick 0, one with no team at all) well
+  // before the real draft happened. getMaddenDraftClass's identification
+  // (yearsPro === 0 plus a parsed draft slot) also matches pre-draft
+  // prospect/placeholder entries that exist in madden_players before the
+  // real draft — those carry uninitialized or nonsensical round/pick
+  // values and no real team yet, unlike an actual drafted rookie. A real
+  // completed draft (a) only ever has round numbers within a normal draft's
+  // range, (b) always has every pick assigned to a real team, and (c)
+  // always produces far more than a couple of picks. Filtering on all
+  // three before trusting the class as "the draft happened" avoids
+  // treating prospect noise as a completed draft.
+  const rookies = rawRookies.filter(r =>
+    Number.isFinite(Number(r.draft_round)) && Number(r.draft_round) >= 1 && Number(r.draft_round) <= 10 &&
+    r.team_name && !isMaddenFreeAgentTeamName(r.team_name)
+  );
+  if (rookies.length < 20) return; // not a real completed draft class yet
+
   const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'draft_recap', 'posted', rookies.length).catch(() => false);
   if (!shouldPost) return;
 
@@ -57858,11 +57892,27 @@ async function scanMaddenRetirements(guild, league, confirm = false) {
   const baselineMap = await getMaddenRetirementBaselineMap(guildId, leagueId).catch(() => new Map());
   const previousMap = baselineMap.size ? baselineMap : await getMaddenPreviousTransactionSnapshot(guildId, leagueId);
   const rows = [];
-  const latestSync = await pool.query(
-    `SELECT week_label, completed_at, started_at FROM madden_sync_runs WHERE guild_id = $1 AND league_id = $2 ORDER BY started_at DESC LIMIT 1`,
-    [guildId, leagueId]
-  ).catch(() => ({ rows: [] }));
-  const seasonLabel = latestSync.rows?.[0]?.week_label || 'Offseason';
+  // 7J-RETIREMENTKEYSTABLE: real bug, confirmed live — the same retirement
+  // (Connor McGovern) reposted on 3 consecutive syncs. Root cause:
+  // maddenRetirementKey's uniqueness includes this season_label, but it was
+  // being sourced from the MOST RECENT sync's raw week_label — which
+  // changes at every offseason stage ("Free Agency Stage 2", "Stage 3",
+  // etc., same underlying issue as 7J-SEASONLABELFALLBACK earlier this
+  // session). A stage-to-stage change produced a genuinely different key
+  // for the exact same real retirement every time, bypassing the
+  // ON CONFLICT DO NOTHING dedup entirely. Uses the same stable
+  // season-count fallback already established for the archive label/
+  // achievement keys instead of a volatile stage label.
+  let seasonLabel;
+  if (league.madden_season_year != null) {
+    seasonLabel = String(league.madden_season_year);
+  } else {
+    const fallbackCountResult = await pool.query(
+      `SELECT COUNT(DISTINCT season_label)::int AS n FROM madden_championship_history WHERE league_id = $1`,
+      [league.league_id]
+    ).catch(() => ({ rows: [{ n: 0 }] }));
+    seasonLabel = `Season ${Number(fallbackCountResult.rows[0]?.n || 0) + 1}`;
+  }
 
   for (const previous of previousMap.values()) {
     const key = maddenTransactionPlayerKey(previous);
