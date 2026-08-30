@@ -54623,7 +54623,7 @@ function maddenRawValueFromPayload(payload, keys = []) {
 }
 
 function normalizeMaddenDevTraitForChangeLog(value) {
-  const raw = String(value || '').trim();
+  const raw = String(value ?? '').trim();
   if (!raw) return null;
   const lower = raw.toLowerCase();
   if (['xfactor', 'x-factor', 'x factor', 'superstar x factor', 'superstar_xfactor'].includes(lower)) return 'X-Factor';
@@ -54631,6 +54631,21 @@ function normalizeMaddenDevTraitForChangeLog(value) {
   if (lower.includes('star')) return 'Star';
   if (lower.includes('hidden')) return 'Hidden';
   if (lower.includes('normal')) return 'Normal';
+  // 7J-DEVTRAITNUMERIC: per Hxxdie — confirmed live, dev trait change
+  // announcements were showing raw numbers ("2") instead of badge names
+  // ("Superstar"). None of the text-based checks above match because
+  // EA's export represents dev trait as a numeric code in at least some
+  // payload shapes. This is a well-documented public Madden Companion/
+  // Franchise convention (0=Normal, 1=Star, 2=Superstar, 3=X-Factor), but
+  // — unlike other EA conventions confirmed against actual code elsewhere
+  // this session — not independently verified against this specific
+  // league's raw payload. Only maps exactly these 4 known values;
+  // anything else still falls through to the raw value below rather than
+  // risk confidently mislabeling something uncertain.
+  if (raw === '0') return 'Normal';
+  if (raw === '1') return 'Star';
+  if (raw === '2') return 'Superstar';
+  if (raw === '3') return 'X-Factor';
   return raw;
 }
 
