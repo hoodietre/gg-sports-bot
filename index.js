@@ -57800,6 +57800,39 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
   return embed;
 }
 
+// 7J-DRAFTRECAPTIMING: real gap, confirmed live — the only existing
+// auto-post trigger for the draft recap lived inside
+// handleMaddenSeasonTransition, gated on going from "Preseason Week N"
+// straight to "Week 1." The actual draft happens well before preseason
+// exhibition games even start (Free Agency → Draft → ... → Preseason Week
+// 1-4 → Week 1), so that trigger doesn't fire until the entire preseason is
+// over — weeks after the draft itself, not "following the draft" the way a
+// draft recap should read. The underlying data has no such delay:
+// getMaddenDraftClass reads live from madden_players (yearsPro === 0 with a
+// real draft slot), available the moment the draft happens, independent of
+// week labels entirely — same reasoning as the retirement/transaction
+// unconditional-every-sync fix earlier this session. Dedup via
+// shouldPostMaddenStoryline keyed on class size: fires once when a real
+// class first appears, stays silent on every later sync while the count is
+// unchanged, and fires again next year once a new class of the same or
+// different size replaces it (old rookies' yearsPro rolls over off 0 by
+// then, same roster-refresh mechanic already relied on elsewhere).
+async function checkAndPostMaddenDraftRecap(guild, league) {
+  const rookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
+  if (!rookies.length) return;
+  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'draft_recap', 'posted', rookies.length).catch(() => false);
+  if (!shouldPost) return;
+
+  const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+  const draftRecapChannelId = league.draft_recap_channel_id || newsChannelId;
+  if (!draftRecapChannelId) return;
+  const draftRecapChannel = await guild.channels.fetch(draftRecapChannelId).catch(() => null);
+  if (!draftRecapChannel?.isTextBased?.()) return;
+  await draftRecapChannel.send({ embeds: [buildDraftRecapEmbed(league, rookies)] }).catch(err =>
+    console.error('[AUTO DETECT] Draft recap post failed:', err?.message || err));
+  console.log('[AUTO DETECT] Draft recap posted for league', league.league_id, '—', rookies.length, 'rookies.');
+}
+
 function isLikelyMaddenRetirementCandidate(row = {}) {
   if (!row?.player_name) return false;
   const teamName = row.team_name || '';
@@ -76493,7 +76526,37 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
 // Replaces the existing autoCreateGameThreadsAfterSync pattern by
 // wrapping it and adding all the new detection on top.
 // ---------------------------------------------------------------------------
+// 7J-AUTODETECTLOCK: real bug, confirmed live — a manual Run Sync and the
+// scheduled background autosync (runDueMaddenAutosyncs) both call this
+// function independently, with no coordination between them. Retirement/
+// transaction detection now runs unconditionally every sync (see
+// 7J-OFFSEASONGATEFIX above) rather than being gated behind a week-advance
+// check, which widened the window for both to land within the same minute.
+// scanMaddenOffseasonTransactions' dedup relies on reading the "previous"
+// snapshot, then later writing the new one back — if two calls overlap,
+// both can read the same stale snapshot before either writes, both see the
+// same signing as new, and both post their own news event. Confirmed live:
+// a single Brandon Aubrey signing posted twice, same minute. Simple
+// per-league in-memory lock — a second call for the same league while one
+// is still in flight is skipped rather than run concurrently, and retried
+// naturally on the next tick instead.
+const maddenAutoDetectInFlightLeagues = new Set();
+
 async function autoDetectAfterSync(guild, league) {
+  const lockKey = String(league.league_id);
+  if (maddenAutoDetectInFlightLeagues.has(lockKey)) {
+    console.log(`[AUTO DETECT] Already in progress for league ${lockKey} — skipping this overlapping call.`);
+    return { advanced: false, weekLabel: null, skipped: 'already_in_progress' };
+  }
+  maddenAutoDetectInFlightLeagues.add(lockKey);
+  try {
+    return await autoDetectAfterSyncInner(guild, league);
+  } finally {
+    maddenAutoDetectInFlightLeagues.delete(lockKey);
+  }
+}
+
+async function autoDetectAfterSyncInner(guild, league) {
   await ensureMaddenAutoDetectColumns();
 
   // Runs every sync, independent of whether the week as a whole has advanced —
@@ -76541,6 +76604,13 @@ async function autoDetectAfterSync(guild, league) {
   // don't already have a winner set.
   await syncMaddenPlayoffBracketFromResults(guild, league).catch(err =>
     console.error('[AUTO DETECT] Playoff bracket result sync failed:', err?.message));
+
+  // 7J-DRAFTRECAPTIMING: see checkAndPostMaddenDraftRecap's own comment —
+  // posts the moment a real draft class appears rather than waiting all
+  // the way until preseason exhibition games conclude. Own dedup guard
+  // (shouldPostMaddenStoryline) makes this safe to call every sync.
+  await checkAndPostMaddenDraftRecap(guild, league).catch(err =>
+    console.error('[AUTO DETECT] Draft recap check failed:', err?.message));
 
   // 7J-OFFSEASONGATEFIX: real bug, confirmed live — retirement and
   // transaction detection (and the weekly updates digests/news they drive)
