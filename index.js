@@ -5005,6 +5005,17 @@ async function enrichMaddenAwardWinner(guildId, leagueId, award) {
   };
 }
 
+async function getMaddenTeamRecord(guildId, leagueId, teamName) {
+  if (!teamName) return null;
+  const result = await pool.query(
+    `SELECT wins, losses, ties FROM madden_imported_team_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(COALESCE(team_name, '')) = LOWER($3)
+     ORDER BY imported_at DESC LIMIT 1`,
+    [String(guildId), String(leagueId), teamName]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0] || null;
+}
+
 async function getMaddenBestRegularSeasonTeam(guildId, leagueId) {
   const result = await pool.query(
     `SELECT team_name, wins, losses, ties, points_for, points_against
@@ -5066,6 +5077,28 @@ function formatMaddenCleanAwardLine(award) {
   const team = award.team_name ? maddenTeamDisplayName(award.team_name) : 'Team unavailable';
   const info = maddenFormatPositionOverall(award.position, award.overall);
   return `**${award.award_name}:** ${award.player_name} — ${team}\n${info} • Owner: ${maddenOwnerDisplay(award.owner_user_id)}`;
+}
+
+// 7J-AWARDCATEGORYVISIBILITY: real gap, confirmed live — the 5 award
+// categories (MVP/OPOY/DPOY/OROY/DROY) are all fetched by
+// getMaddenYearEndAwardWinners, but any category with no qualifying
+// candidate (most commonly OROY/DROY, since those additionally require a
+// real rookie flag or 0-years-pro from the imported EA roster data) was
+// simply missing from the resulting array — the line for that award
+// disappeared from the archive entirely rather than showing as "Not
+// detected" the way champion/runner-up/best-record already do elsewhere in
+// these same embeds. Made it look like the category didn't exist at all
+// instead of just having no winner yet. This always renders all 5 category
+// lines; only the display is affected — getMaddenYearEndAwardWinners's
+// output (what actually gets persisted/paid) is unchanged.
+function maddenAwardDisplayLines(awards) {
+  const byKey = new Map((awards || []).map(a => [a.award_key, a]));
+  return Object.keys(MADDEN_AWARD_RACES).map(key => {
+    const award = byKey.get(key);
+    if (award) return formatMaddenCleanAwardLine(award);
+    const raceName = (MADDEN_AWARD_RACES[key] || MADDEN_AWARD_RACES.mvp).title.replace(' Race', '');
+    return `**${raceName}:** Not detected`;
+  }).join('\n\n');
 }
 
 async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userId = null) {
@@ -5189,6 +5222,77 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
         }
       }
     }
+
+    // 7J-PROFILEAWARDSYNC: real bug, confirmed live — everything above this
+    // point (madden_award_history, madden_championship_history,
+    // achievements_claimed via grantAchievement) is a Madden-specific
+    // record-keeping system. Member Profile's "Awards Won" field reads a
+    // completely different, older pair of tables instead —
+    // user_season_history.champion/mvp/runner_up (booleans, tallied into
+    // the 🏆/⭐/🥈 counts) and league_awards (individual named awards like
+    // OPOY/DPOY, listed by name + season). Those are only ever populated by
+    // the generic non-Madden "Start New Season" wizard (see 7J-AUTOAWARDS /
+    // 7J-RUNNERUPRECOGNITION) — Madden's automated year-end flow never
+    // wrote into either, so a Madden league's champion/MVP/runner-up/named
+    // awards would never appear on Member Profile no matter what, entirely
+    // independent of the achievement currency threshold above. This mirrors
+    // the same insert shape the generic wizard already uses so both paths
+    // feed the same profile display. Light existence check first (this
+    // table has no unique constraint to upsert against, matching the
+    // generic wizard's own plain-INSERT behavior) so re-running confirm on
+    // the same season doesn't duplicate rows.
+    const seasonHistoryOwners = new Map(); // ownerId -> { teamName, champion, mvp, runnerUp }
+    const markSeasonHistoryOwner = (ownerId, teamName, flags) => {
+      if (!ownerId) return;
+      const existing = seasonHistoryOwners.get(ownerId) || { teamName: teamName || null, champion: false, mvp: false, runnerUp: false };
+      if (teamName) existing.teamName = teamName;
+      Object.assign(existing, flags);
+      seasonHistoryOwners.set(ownerId, existing);
+    };
+    if (championOwnerId) markSeasonHistoryOwner(championOwnerId, championName, { champion: true });
+    let runnerUpOwnerId = null;
+    if (runnerUpName) {
+      runnerUpOwnerId = await findMaddenOwnerForTeamName(guild.id, league.league_id, runnerUpName).catch(() => null);
+      if (runnerUpOwnerId) markSeasonHistoryOwner(runnerUpOwnerId, runnerUpName, { runnerUp: true });
+    }
+    const mvpAward = awards.find(a => a.award_key === 'mvp' && a.team_name);
+    if (mvpAward) {
+      const mvpOwnerId = mvpAward.owner_user_id || await findMaddenOwnerForTeamName(guild.id, league.league_id, mvpAward.team_name).catch(() => null);
+      if (mvpOwnerId) markSeasonHistoryOwner(mvpOwnerId, mvpAward.team_name, { mvp: true });
+    }
+    for (const [ownerId, info] of seasonHistoryOwners) {
+      const alreadyArchived = await pool.query(
+        `SELECT 1 FROM user_season_history WHERE guild_id = $1 AND league_id = $2 AND season_label = $3 AND user_id = $4 LIMIT 1`,
+        [guild.id, league.league_id, seasonLabel, ownerId]
+      ).catch(() => ({ rows: [] }));
+      if (alreadyArchived.rows.length) continue;
+      const record = await getMaddenTeamRecord(guild.id, league.league_id, info.teamName).catch(() => null);
+      await pool.query(
+        `INSERT INTO user_season_history (id, guild_id, league_id, season_label, user_id, team_name, wins, losses, ties, champion, mvp, runner_up)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [randomUUID(), guild.id, String(league.league_id), seasonLabel, ownerId, info.teamName || 'Unknown', record?.wins || 0, record?.losses || 0, record?.ties || 0, info.champion, info.mvp, info.runnerUp]
+      ).catch(() => null);
+    }
+    // Named awards beyond MVP (OPOY/DPOY/OROY/DROY) have no dedicated
+    // boolean column on user_season_history — recorded into league_awards
+    // instead, same table/shape the generic wizard's manual Award modal
+    // already uses, so they show up in the "🎖️ Award Name — Season" lines.
+    for (const award of awards) {
+      if (award.award_key === 'mvp' || !award.team_name) continue; // MVP handled above; skip undetected placeholders
+      const awardOwnerId = award.owner_user_id || await findMaddenOwnerForTeamName(guild.id, league.league_id, award.team_name).catch(() => null);
+      if (!awardOwnerId) continue;
+      const alreadyRecorded = await pool.query(
+        `SELECT 1 FROM league_awards WHERE guild_id = $1 AND league_id = $2 AND season_label = $3 AND user_id = $4 AND award_name = $5 LIMIT 1`,
+        [guild.id, league.league_id, seasonLabel, awardOwnerId, award.award_name]
+      ).catch(() => ({ rows: [] }));
+      if (alreadyRecorded.rows.length) continue;
+      await pool.query(
+        `INSERT INTO league_awards (id, guild_id, league_id, season_label, award_name, user_id, team_name, player_name, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [randomUUID(), guild.id, league.league_id, seasonLabel, award.award_name, awardOwnerId, award.team_name, award.player_name, null]
+      ).catch(() => null);
+    }
+
     await pool.query(
       `INSERT INTO madden_year_end_checkpoints (id, guild_id, league_id, season_label, checkpoint_type, status, summary, created_by)
        VALUES ($1, $2, $3, 'Current', 'year_end', 'finalized', $4::jsonb, $5)
@@ -58449,13 +58553,29 @@ async function getMaddenFinalPowerRankingRows(guildId, leagueId, limit = 10) {
 // real-world calendar date, which has nothing to do with the actual
 // in-franchise season. A league could be on franchise season 3 while the
 // real-world date says 2028; this label would've just always shown
-// whatever year it happens to be in real life. Now uses the real
-// EA-sourced season year (league.madden_season_year, see runMaddenEaDirectSync)
-// when available, falling back to the real-world year only for leagues that
-// haven't synced with season-year tracking yet.
-function maddenCurrentSeasonArchiveLabel(seasonYear = null) {
-  const year = seasonYear != null ? seasonYear : new Date().getFullYear();
-  return `Season Archive • ${year}`;
+// whatever year it happens to be in real life.
+//
+// 7J-ARCHIVESEASONNUMBER: per Hxxdie — replaced the raw-year label
+// entirely (rather than just fixing which year) with the same
+// "Season N • Game Edition" convention non-Madden leagues already get from
+// the Start New Season wizard (see 7J-GAMEEDITION), for the same
+// history-book readability. league_custom_settings.game_edition is a
+// generic per-league field, not sport-restricted — a Madden league can set
+// it (e.g. "Madden 26") through the same commissioner UI non-Madden
+// leagues already use. Season number counts this league's own finalized
+// madden_championship_history rows rather than trusting madden_season_year
+// to count sequentially from 1 — by the time this runs, the current
+// season's row has already been inserted (see the confirm block above),
+// so no +1 is needed here.
+async function maddenCurrentSeasonArchiveLabel(guild, league) {
+  const countResult = await pool.query(
+    `SELECT COUNT(DISTINCT season_label)::int AS n FROM madden_championship_history WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [{ n: 0 }] }));
+  const seasonNumber = Math.max(1, Number(countResult.rows[0]?.n || 0));
+  const customSettings = await ensureLeagueCustomSettings(league).catch(() => ({}));
+  const gameEdition = customSettings.game_edition || null;
+  return gameEdition ? `Archived Season ${seasonNumber} • ${gameEdition}` : `Archived Season ${seasonNumber}`;
 }
 
 async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
@@ -58471,7 +58591,7 @@ async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
   const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
   const championOwner = championName ? await findMaddenOwnerForTeamName(guild.id, league.league_id, championName).catch(() => null) : null;
   const runnerUpOwner = runnerUpName ? await findMaddenOwnerForTeamName(guild.id, league.league_id, runnerUpName).catch(() => null) : null;
-  const awardLines = awards.length ? awards.map(formatMaddenCleanAwardLine).join('\n\n') : 'No award winners detected yet.';
+  const awardLines = maddenAwardDisplayLines(awards);
   const bestRecordText = bestRecord
     ? `**${maddenTeamDisplayName(bestRecord.team_name)}** (${Number(bestRecord.wins || 0)}-${Number(bestRecord.losses || 0)}${Number(bestRecord.ties || 0) ? `-${Number(bestRecord.ties || 0)}` : ''})\nOwner: ${maddenOwnerDisplay(bestRecord.owner_user_id)}`
     : 'Not detected.';
@@ -58512,12 +58632,13 @@ async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
   const bestRecordValue = bestRecord
     ? `**${maddenTeamDisplayName(bestRecord.team_name)}** (${Number(bestRecord.wins || 0)}-${Number(bestRecord.losses || 0)}${Number(bestRecord.ties || 0) ? `-${Number(bestRecord.ties || 0)}` : ''})\nOwner: ${maddenOwnerDisplay(bestRecord.owner_user_id)}`
     : 'Not detected.';
-  const awardText = awards.length ? awards.map(formatMaddenCleanAwardLine).join('\n\n') : 'No award winners detected.';
+  const awardText = maddenAwardDisplayLines(awards);
   const sbMvpText = sbMvp?.player_name && sbMvp.player_name !== 'Not detected'
     ? `**${sbMvp.player_name}** — ${maddenTeamDisplayName(sbMvp.team_name)}\n${maddenFormatPositionOverall(sbMvp.position, sbMvp.overall)}`
     : 'Not detected.';
+  const seasonArchiveLabel = await maddenCurrentSeasonArchiveLabel(guild, league);
   const embed = new EmbedBuilder()
-    .setTitle(`🏆 ${league.league_name} • Season Archive${league.madden_season_year != null ? ` (${league.madden_season_year})` : ''}`)
+    .setTitle(`🏆 ${league.league_name} • ${seasonArchiveLabel}`)
     .setColor(0xFEE75C)
     .addFields(
       { name: 'Champion', value: championName ? `**${maddenTeamDisplayName(championName)}**\nOwner: ${maddenOwnerDisplay(championOwner)}` : 'Not detected.', inline: true },
@@ -58525,7 +58646,7 @@ async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
       { name: 'Best Regular Season Record', value: bestRecordValue, inline: false },
       { name: 'Super Bowl MVP', value: sbMvpText, inline: false },
       { name: 'Award Winners', value: maddenSafeEmbedText(awardText, 1024), inline: false },
-      { name: 'Recorded', value: maddenCurrentSeasonArchiveLabel(league.madden_season_year), inline: false }
+      { name: 'Recorded', value: seasonArchiveLabel, inline: false }
     )
     .setFooter({ text: 'GG Sports • 7J-10BY-DL League History Archive' })
     .setTimestamp();
