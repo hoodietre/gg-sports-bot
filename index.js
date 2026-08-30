@@ -57966,8 +57966,8 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
 
   embed.setDescription(
     `${rookies.length} rookies drafted across ${byTeam.size} teams.` + NL + NL +
-    (bestValue ? `🏆 **Steal of the Draft:** ${bestValue.player_name} (${bestValue.team_name}) — Rd ${bestValue.draft_round} Pk ${bestValue.draft_pick ?? '?'}, OVR ${bestValue.overall}, Grade **${bestValue.grade}**` + NL : '') +
-    (worstValue ? `📉 **Biggest Reach:** ${worstValue.player_name} (${worstValue.team_name}) — Rd ${worstValue.draft_round} Pk ${worstValue.draft_pick ?? '?'}, OVR ${worstValue.overall}, Grade **${worstValue.grade}**` : '')
+    (bestValue ? `🏆 **Steal of the Draft:** ${bestValue.player_name} (${maddenTeamDisplayNameWithLogo(bestValue.team_name)}) — Rd ${bestValue.draft_round} Pk ${bestValue.draft_pick ?? '?'}, OVR ${bestValue.overall}, Grade **${bestValue.grade}**` + NL : '') +
+    (worstValue ? `📉 **Biggest Reach:** ${worstValue.player_name} (${maddenTeamDisplayNameWithLogo(worstValue.team_name)}) — Rd ${worstValue.draft_round} Pk ${worstValue.draft_pick ?? '?'}, OVR ${worstValue.overall}, Grade **${worstValue.grade}**` : '')
   );
 
   // 7J-DRAFTRECAP25FIELDS: real bug, confirmed live — Discord hard-caps
@@ -57979,7 +57979,7 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
   // league size, and comfortably stays under both the 25-field cap and the
   // 1024-char-per-field-value limit (each line is short; a 1024-char field
   // easily holds 15+ team lines).
-  const teamLines = teamSummaries.map(t => `**${t.team}** — ${t.grade} (${t.picks.length} pick${t.picks.length === 1 ? '' : 's'})`);
+  const teamLines = teamSummaries.map(t => `**${maddenTeamDisplayNameWithLogo(t.team)}** — ${t.grade} (${t.picks.length} pick${t.picks.length === 1 ? '' : 's'})`);
   const TEAMS_PER_FIELD = 11;
   const teamFieldChunks = [];
   for (let i = 0; i < teamLines.length; i += TEAMS_PER_FIELD) {
@@ -58014,7 +58014,7 @@ function buildDraftRecapRoundEmbed(league, rookies, round) {
     return embed;
   }
   const lines = picks.map(p =>
-    `**Rd ${p.draft_round} Pk ${p.draft_pick ?? '?'}** — ${maddenTeamDisplayName(p.team_name)}\n${p.player_name} • ${p.position || '?'} • ${p.overall ?? '?'} OVR • Grade **${p.grade}**`
+    `**Rd ${p.draft_round} Pk ${p.draft_pick ?? '?'}** — ${maddenTeamDisplayNameWithLogo(p.team_name)}\n${p.player_name} • ${p.position || '?'} • ${p.overall ?? '?'} OVR • Grade **${p.grade}**`
   );
   embed.setDescription(lines.join(NL + NL).slice(0, 4096));
   return embed;
@@ -58032,6 +58032,7 @@ function buildDraftRecapRoundComponents(leagueId, currentRound, availableRounds)
   }
   return rows.slice(0, 5); // Discord caps a message at 5 action rows total
 }
+
 
 // 7J-DRAFTRECAPTIMING: real gap, confirmed live — the only existing
 // auto-post trigger for the draft recap lived inside
@@ -58068,8 +58069,9 @@ async function checkAndPostMaddenDraftRecap(guild, league) {
   const draftRecapChannel = await guild.channels.fetch(draftRecapChannelId).catch(() => null);
   if (!draftRecapChannel?.isTextBased?.()) return;
   const availableRounds = [...new Set(rookies.map(r => Number(r.draft_round)))].sort((a, b) => a - b);
+  const overviewEmbed = buildDraftRecapEmbed(league, rookies);
   await draftRecapChannel.send({
-    embeds: [buildDraftRecapEmbed(league, rookies)],
+    embeds: [overviewEmbed],
     components: buildDraftRecapRoundComponents(league.league_id, 0, availableRounds),
   }).catch(err =>
     console.error('[AUTO DETECT] Draft recap post failed:', err?.message || err));
