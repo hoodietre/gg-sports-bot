@@ -75950,161 +75950,194 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
   if (!bracketState || bracketState.status !== 'in_progress') return;
 
   const bracket = Array.isArray(bracketState.bracket) ? bracketState.bracket : [];
-  const roundIndex = Number(bracketState.current_round || 1) - 1;
-  const roundSeries = bracket[roundIndex];
-  if (!roundSeries || !roundSeries.length) return;
-  if (roundIndex > 3) return; // shouldn't happen — real NFL bracket is always exactly 4 rounds
+  let currentRoundNum = Number(bracketState.current_round || 1);
+  let currentStatus = bracketState.status;
 
-  // 7J-BRACKETREALCHECK: per Hxxdie — replaces the old guess-based reseed
-  // correction (7J-BRACKETRESEED), which tried to fix a wrong matchup by
-  // recomputing seeding and swapping in "whichever team should be at this
-  // seed" — a second and third attempt at the same underlying guess that
-  // still didn't match what actually happened live (see
-  // buildMaddenWildCardRoundFromRealGames's comment for the full story).
-  // This instead compares the bracket's current round against a freshly
-  // rebuilt version straight from real synced games. If they don't match,
-  // the whole round is replaced wholesale — simpler and safer than
-  // patching individual series, and it cannot reproduce the old
-  // wrong-conference bug since there's no seed-number lookup involved at
-  // all anymore. Any previously-recorded result against a since-corrected
-  // matchup is discarded along with it — the results-processing loop
-  // right below this will immediately re-attach the real result for the
-  // corrected matchup on this same sync.
-  //
-  // 7J-BRACKETREALCHECKALLROUNDS: originally scoped to Round 1 only, on
-  // the reasoning that later rounds' participants depend on who won, not
-  // on this check. Real gap found live: a round built once by an earlier
-  // (pre-conference-grouping) version of buildMaddenNextRoundFromRealGames
-  // stayed permanently wrong, since nothing ever re-verified an
-  // already-built round beyond Round 1. Generalized to run for whichever
-  // round is currently active, using the previous round (already decided,
-  // safe to rebuild from) as input for anything past Round 1.
-  //
-  // 7J-BRACKETREALCHECKORDER: also fixes a second real bug found in the
-  // same incident — the match comparison used Set equality over pairKey
-  // strings, which is order-insensitive. A round whose matchup CONTENT
-  // was correct but whose ARRAY ORDER was wrong (exactly what conference-
-  // grouping regressions look like) would report "matches" and skip the
-  // fix entirely. Now compares the exact ordered sequence.
-  {
-    const realRound = roundIndex === 0
-      ? await buildMaddenWildCardRoundFromRealGames(guild, league).catch(() => [])
-      : await buildMaddenNextRoundFromRealGames(guild, league, bracket[roundIndex - 1] || [], roundIndex).catch(() => []);
-    if (realRound.length >= 2) {
-      const pairKey = (s) => s.bye ? `bye:${s.teamA.name.toLowerCase()}` : [s.teamA.name.toLowerCase(), s.teamB.name.toLowerCase()].sort().join('|');
-      const currentKeys = roundSeries.map(pairKey);
-      const realKeys = realRound.map(pairKey);
-      const matches = currentKeys.length === realKeys.length && currentKeys.every((k, i) => k === realKeys[i]);
-      if (!matches) {
-        console.log('[MADDEN BRACKET] Round', bracketState.current_round, 'did not match real synced games for league', league.league_id, '— replacing with real matchups.');
-        bracket[roundIndex] = realRound;
-        roundSeries.length = 0;
-        roundSeries.push(...realRound);
-        await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
-        await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+  // 7J-BRACKETCATCHUPLOOP: real bug, confirmed live — the previous
+  // single-pass version processed at most ONE round per call: it would
+  // decide the current round, build the next round's shell, and return —
+  // never checking whether that freshly-built round's game was *already*
+  // finished. That's exactly what happens when a sync jumps straight past
+  // a round that got stuck (e.g. Conference Championship sat undetected
+  // for a tick, and by the time it's caught up the Super Bowl itself has
+  // already been played). Worse, `current_season_stage` flips to
+  // 'offseason' later in this SAME outer sync (via
+  // handleMaddenOffseasonTransition, driven independently off
+  // getMaddenSuperBowlResult — unaffected by this table). Once that flips,
+  // this function's own stage gate above blocks it on every future call,
+  // so a round built-but-unresolved here would stay stuck forever with no
+  // winner/champion ever recorded in league_playoff_brackets. Fix: loop
+  // and keep advancing — build a round, immediately check whether it's
+  // already decided too, and keep going — until there's genuinely nothing
+  // left to do, all within this one call.
+  for (let iteration = 0; iteration < 5; iteration++) {
+    const roundIndex = currentRoundNum - 1;
+    if (roundIndex > 3) break; // shouldn't happen — real NFL bracket is always exactly 4 rounds
+    const roundSeries = bracket[roundIndex];
+    if (!roundSeries || !roundSeries.length) break;
+
+    // 7J-BRACKETREALCHECK: per Hxxdie — replaces the old guess-based reseed
+    // correction (7J-BRACKETRESEED), which tried to fix a wrong matchup by
+    // recomputing seeding and swapping in "whichever team should be at this
+    // seed" — a second and third attempt at the same underlying guess that
+    // still didn't match what actually happened live (see
+    // buildMaddenWildCardRoundFromRealGames's comment for the full story).
+    // This instead compares the bracket's current round against a freshly
+    // rebuilt version straight from real synced games. If they don't match,
+    // the whole round is replaced wholesale — simpler and safer than
+    // patching individual series, and it cannot reproduce the old
+    // wrong-conference bug since there's no seed-number lookup involved at
+    // all anymore. Any previously-recorded result against a since-corrected
+    // matchup is discarded along with it — the results-processing loop
+    // right below this will immediately re-attach the real result for the
+    // corrected matchup on this same sync.
+    //
+    // Only run this check on the round we STARTED this call at (iteration
+    // 0). Rounds built later in this same loop came straight out of
+    // buildMaddenNextRoundFromRealGames already — re-verifying them against
+    // themselves is redundant work, not a correctness need.
+    if (iteration === 0) {
+      const realRound = roundIndex === 0
+        ? await buildMaddenWildCardRoundFromRealGames(guild, league).catch(() => [])
+        : await buildMaddenNextRoundFromRealGames(guild, league, bracket[roundIndex - 1] || [], roundIndex).catch(() => []);
+      if (realRound.length >= 2) {
+        const pairKey = (s) => s.bye ? `bye:${s.teamA.name.toLowerCase()}` : [s.teamA.name.toLowerCase(), s.teamB.name.toLowerCase()].sort().join('|');
+        const currentKeys = roundSeries.map(pairKey);
+        const realKeys = realRound.map(pairKey);
+        const matches = currentKeys.length === realKeys.length && currentKeys.every((k, i) => k === realKeys[i]);
+        if (!matches) {
+          console.log('[MADDEN BRACKET] Round', currentRoundNum, 'did not match real synced games for league', league.league_id, '— replacing with real matchups.');
+          bracket[roundIndex] = realRound;
+          roundSeries.length = 0;
+          roundSeries.push(...realRound);
+          await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
+          await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+        }
       }
     }
-  }
 
-  let mutated = false;
-  for (const series of roundSeries) {
-    if (series.bye || series.winner || !series.teamB) continue;
-    // 7J-DIVPLAYOFFFIX2: per Hxxdie — this used to match week_label against
-    // a hardcoded guess ('Divisional', etc.), which silently never matched
-    // anything once EA's real label turned out to be "Div. Playoff"
-    // instead. Now pulls every candidate completed game for this matchup
-    // and confirms the round via maddenWeekLabelSortKey — the same real
-    // classification the rest of the auto-detect pipeline already relies
-    // on — instead of requiring an exact label string this codebase can't
-    // fully verify for every round.
-    const gameResult = await pool.query(
-      `SELECT week_label, home_team, away_team, home_score, away_score, status
-       FROM madden_imported_games
-       WHERE guild_id = $1 AND league_id::text = $2::text
-         AND ((LOWER(home_team) = LOWER($3) AND LOWER(away_team) = LOWER($4)) OR (LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($3)))
-         AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
-       ORDER BY imported_at DESC`,
-      [guild.id, String(league.league_id), series.teamA.name, series.teamB.name]
-    ).catch(() => ({ rows: [] }));
-    const game = (gameResult.rows || []).find(g => {
-      const [group, idx] = maddenWeekLabelSortKey(g.week_label);
-      return group === 2 && idx === roundIndex;
-    });
-    if (!game) continue; // not played/synced yet — check again next sync
+    let mutated = false;
+    for (const series of roundSeries) {
+      if (series.bye || series.winner || !series.teamB) continue;
+      // 7J-DIVPLAYOFFFIX2: per Hxxdie — this used to match week_label against
+      // a hardcoded guess ('Divisional', etc.), which silently never matched
+      // anything once EA's real label turned out to be "Div. Playoff"
+      // instead. Now pulls every candidate completed game for this matchup
+      // and confirms the round via maddenWeekLabelSortKey — the same real
+      // classification the rest of the auto-detect pipeline already relies
+      // on — instead of requiring an exact label string this codebase can't
+      // fully verify for every round.
+      const gameResult = await pool.query(
+        `SELECT week_label, home_team, away_team, home_score, away_score, status
+         FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id::text = $2::text
+           AND ((LOWER(home_team) = LOWER($3) AND LOWER(away_team) = LOWER($4)) OR (LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($3)))
+           AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
+         ORDER BY imported_at DESC`,
+        [guild.id, String(league.league_id), series.teamA.name, series.teamB.name]
+      ).catch(() => ({ rows: [] }));
+      const game = (gameResult.rows || []).find(g => {
+        const [group, idx] = maddenWeekLabelSortKey(g.week_label);
+        return group === 2 && idx === roundIndex;
+      });
+      if (!game) continue; // not played/synced yet — check again next sync
 
-    const homeScore = Number(game.home_score) || 0;
-    const awayScore = Number(game.away_score) || 0;
-    let winningTeamName = null;
-    if (homeScore !== awayScore) {
-      winningTeamName = homeScore > awayScore ? game.home_team : game.away_team;
-    } else {
-      // No real score difference (e.g. a fallback-flag-resolved win with no
-      // raw score at all — see 7J-47PPG) — fall back to the same
-      // status-encoded winner every other completion check in this
-      // codebase already trusts, rather than guessing or leaving a
-      // single-elimination series stuck forever on an ambiguous 0-0.
-      const lowerStatus = String(game.status || '').toLowerCase();
-      if (lowerStatus === 'home_win') winningTeamName = game.home_team;
-      else if (lowerStatus === 'away_win') winningTeamName = game.away_team;
+      const homeScore = Number(game.home_score) || 0;
+      const awayScore = Number(game.away_score) || 0;
+      let winningTeamName = null;
+      if (homeScore !== awayScore) {
+        winningTeamName = homeScore > awayScore ? game.home_team : game.away_team;
+      } else {
+        // No real score difference (e.g. a fallback-flag-resolved win with no
+        // raw score at all — see 7J-47PPG) — fall back to the same
+        // status-encoded winner every other completion check in this
+        // codebase already trusts, rather than guessing or leaving a
+        // single-elimination series stuck forever on an ambiguous 0-0.
+        const lowerStatus = String(game.status || '').toLowerCase();
+        if (lowerStatus === 'home_win') winningTeamName = game.home_team;
+        else if (lowerStatus === 'away_win') winningTeamName = game.away_team;
+      }
+      if (!winningTeamName) continue; // genuinely unresolved — retry next sync
+
+      const winnerIsA = String(winningTeamName).toLowerCase() === String(series.teamA.name).toLowerCase();
+      series.winsA = winnerIsA ? 1 : 0;
+      series.winsB = winnerIsA ? 0 : 1;
+      series.winner = winnerIsA ? series.teamA.name : series.teamB.name;
+      mutated = true;
+      const currentRoundLabel = tournamentBracketRoundLabel(roundIndex + 1, 4, roundIndex, 'nfl');
+      await postMaddenPlayoffUpsetAlert(guild, league, series, currentRoundLabel).catch(err =>
+        console.error('[MADDEN BRACKET] Upset alert check failed:', err?.message || err));
     }
-    if (!winningTeamName) continue; // genuinely unresolved — retry next sync
 
-    const winnerIsA = String(winningTeamName).toLowerCase() === String(series.teamA.name).toLowerCase();
-    series.winsA = winnerIsA ? 1 : 0;
-    series.winsB = winnerIsA ? 0 : 1;
-    series.winner = winnerIsA ? series.teamA.name : series.teamB.name;
-    mutated = true;
-    const currentRoundLabel = tournamentBracketRoundLabel(roundIndex + 1, 4, roundIndex, 'nfl');
-    await postMaddenPlayoffUpsetAlert(guild, league, series, currentRoundLabel).catch(err =>
-      console.error('[MADDEN BRACKET] Upset alert check failed:', err?.message || err));
-  }
+    // 7J-BRACKETSTUCKROUND: real bug, confirmed live — a round whose series
+    // already all had winners (from an earlier tick) was invisible to the
+    // `mutated` flag above, since the per-series loop skips anything that
+    // already has a winner. Without this, a round stuck between "fully
+    // decided" and "next round built" (or, for the last round, between
+    // "decided" and "marked completed") would never get picked back up.
+    // Detect that state explicitly instead of relying solely on `mutated`.
+    const roundAlreadyComplete = roundSeries.every(s => s.bye || s.winner);
+    const isFinalRoundCandidate = roundSeries.length === 1;
+    const needsAdvanceRetry = roundAlreadyComplete && !isFinalRoundCandidate && !bracket[roundIndex + 1];
+    const needsFinalizeRetry = roundAlreadyComplete && isFinalRoundCandidate && currentStatus !== 'completed';
+    if (!mutated && !needsAdvanceRetry && !needsFinalizeRetry) break; // genuinely nothing to do — stop looping
 
-  if (!mutated) return;
+    const roundComplete = roundSeries.every(s => s.bye || s.winner);
+    if (!roundComplete) {
+      bracket[roundIndex] = roundSeries;
+      await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
+      await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+      break;
+    }
 
-  const roundComplete = roundSeries.every(s => s.bye || s.winner);
-  if (!roundComplete) {
-    bracket[roundIndex] = roundSeries;
-    await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
-    await refreshPlayoffBracketPanel(guild, league).catch(() => null);
-    return;
-  }
+    const isFinalRound = roundSeries.length === 1;
+    if (isFinalRound) {
+      const champion = roundSeries[0].winner;
+      bracket[roundIndex] = roundSeries;
+      await pool.query(
+        `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
+        [league.league_id, JSON.stringify(bracket), champion]
+      ).catch(() => null);
+      currentStatus = 'completed';
+      console.log('[MADDEN BRACKET] Champion decided for league', league.league_id, ':', champion);
+      await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+      break; // nothing more to advance to — done
+    }
 
-  const isFinalRound = roundSeries.length === 1;
-  if (isFinalRound) {
-    const champion = roundSeries[0].winner;
-    bracket[roundIndex] = roundSeries;
-    await pool.query(
-      `UPDATE league_playoff_brackets SET bracket = $2, status = 'completed', champion_team = $3, updated_at = NOW() WHERE league_id = $1`,
-      [league.league_id, JSON.stringify(bracket), champion]
-    ).catch(() => null);
-    console.log('[MADDEN BRACKET] Champion decided for league', league.league_id, ':', champion);
-  } else {
     // 7J-REALBRACKETMATCHUPS: reads the next round from EA's real synced
     // schedule instead of predicting it via a reseed formula — see
     // buildMaddenNextRoundFromRealGames's comment. If EA hasn't exported
     // this round's schedule yet even though the previous round is fully
     // decided, wait and retry rather than advancing into an empty round.
-    const nextRound = await buildMaddenNextRoundFromRealGames(guild, league, roundSeries, roundIndex + 1);
+    const nextRound = bracket[roundIndex + 1]?.length
+      ? bracket[roundIndex + 1] // already built by a previous tick — just move into it
+      : await buildMaddenNextRoundFromRealGames(guild, league, roundSeries, roundIndex + 1);
     if (!nextRound.length) {
       bracket[roundIndex] = roundSeries;
       await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
       await refreshPlayoffBracketPanel(guild, league).catch(() => null);
-      console.log('[MADDEN BRACKET] Round', bracketState.current_round, 'complete for league', league.league_id, '— next round not yet synced by EA, will retry.');
-      return;
+      console.log('[MADDEN BRACKET] Round', currentRoundNum, 'complete for league', league.league_id, '— next round not yet synced by EA, will retry.');
+      break;
     }
+    const alreadyHadNextRound = !!bracket[roundIndex + 1]?.length;
     bracket[roundIndex] = roundSeries;
-    bracket.push(nextRound);
+    if (!alreadyHadNextRound) bracket.push(nextRound);
     await pool.query(
       `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
-      [league.league_id, JSON.stringify(bracket), Number(bracketState.current_round || 1) + 1]
+      [league.league_id, JSON.stringify(bracket), currentRoundNum + 1]
     ).catch(() => null);
-    const nextRoundLabel = tournamentBracketRoundLabel(roundIndex + 2, 4, roundIndex + 1, 'nfl');
-    await postMaddenPlayoffMatchupPreview(guild, league, nextRound, nextRoundLabel).catch(err =>
-      console.error('[MADDEN BRACKET] Matchup preview for', nextRoundLabel, 'failed:', err?.message || err));
-    console.log('[MADDEN BRACKET] Round', bracketState.current_round, 'complete for league', league.league_id, '— advanced to round', Number(bracketState.current_round || 1) + 1);
+    if (!alreadyHadNextRound) {
+      const nextRoundLabel = tournamentBracketRoundLabel(roundIndex + 2, 4, roundIndex + 1, 'nfl');
+      await postMaddenPlayoffMatchupPreview(guild, league, nextRound, nextRoundLabel).catch(err =>
+        console.error('[MADDEN BRACKET] Matchup preview for', nextRoundLabel, 'failed:', err?.message || err));
+    }
+    console.log('[MADDEN BRACKET] Round', currentRoundNum, 'complete for league', league.league_id, '— advanced to round', currentRoundNum + 1);
+    await refreshPlayoffBracketPanel(guild, league).catch(() => null);
+    currentRoundNum += 1;
+    // loop continues — immediately check whether the round we just moved
+    // into is *also* already decided (e.g. Super Bowl already played by
+    // the time a stuck earlier round got caught up).
   }
-
-  await refreshPlayoffBracketPanel(guild, league).catch(() => null);
 }
 
 async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel) {
