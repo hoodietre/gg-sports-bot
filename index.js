@@ -20742,7 +20742,7 @@ if (interaction.commandName === 'avatar') {
       const gameEdition = interaction.fields.getTextInputValue('game_edition').trim();
       await pool.query(`UPDATE league_custom_settings SET game_edition = $2, updated_at = NOW() WHERE league_id = $1`, [leagueId, gameEdition || null]);
       await interaction.deferUpdate();
-      await showLeagueCustomizationSection(interaction, leagueId, 'awards', { update: false });
+      await showLeagueCustomizationSection(interaction, leagueId, 'ruleset', { update: false });
       return;
     }
 
@@ -76987,6 +76987,7 @@ async function showCommissionerBrowse(interaction, leagueId) {
 function buildLeagueRulesetEmbed(league, customSettings) {
   const sportKey = getLeagueSportKey(league);
   const isMadden = sportKey === 'madden';
+  const gameEdition = customSettings.game_edition || 'Not set';
   const embed = new EmbedBuilder()
     .setTitle(`📝 League Info • ${league.league_name}`)
     .setColor(0x5865F2)
@@ -76997,6 +76998,7 @@ function buildLeagueRulesetEmbed(league, customSettings) {
       { name: 'Difficulty', value: customSettings.game_difficulty || 'Not set', inline: true },
       { name: 'Sim / Comp', value: customSettings.sim_or_comp || 'Not set', inline: true },
       { name: 'CPU Trades', value: customSettings.cpu_trades_allowed === false ? 'Not Allowed' : 'Allowed', inline: true },
+      { name: 'Game Edition', value: gameEdition, inline: true },
     );
   if (!isMadden) {
     embed.addFields({ name: 'Schedule Style', value: customSettings.schedule_style === 'structured' ? 'Structured' : 'Open', inline: true });
@@ -77004,6 +77006,14 @@ function buildLeagueRulesetEmbed(league, customSettings) {
   if (customSettings.ruleset_notes) {
     embed.addFields({ name: 'Additional Notes', value: customSettings.ruleset_notes.slice(0, 1024), inline: false });
   }
+  // 7J-GAMEEDITIONHOME: per Hxxdie — moved here from the Awards section.
+  // Game Edition is stored on the same league_custom_settings.game_edition
+  // column and used the same way (see 7J-ARCHIVESEASONNUMBER), just
+  // surfaced somewhere a commissioner is more likely to actually look for
+  // it — it reads as general league metadata ("what game is this league
+  // on"), not something tied to Awards specifically, and most
+  // commissioners won't make that connection on their own.
+  embed.addFields({ name: 'About Game Edition', value: 'Tags which year\'s game (e.g. "Madden 26") each archived season was actually played on — set it once, then update it whenever the league switches to the new year\'s game. Doesn\'t affect the "Season 1, Season 2..." numbering, which keeps counting straight through; this just makes it possible to tell which real game a given season came from when looking back at league history later.', inline: false });
   embed.setFooter({ text: 'GG Sports • League Info' }).setTimestamp();
   return embed;
 }
@@ -77337,30 +77347,27 @@ async function showLeagueCustomizationSection(interaction, leagueId, section, { 
     components = [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('leaguecustom_ruleset_modal:' + leagueId).setLabel('Edit League Info').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('leaguecustom_gameedition:' + leagueId).setLabel('Edit Game Edition').setEmoji('🎮').setStyle(ButtonStyle.Secondary),
       ),
       buildLeagueCustomizationBackRow(leagueId),
     ];
   } else if (section === 'awards') {
     const awards = Array.isArray(customSettings.awards) ? customSettings.awards : [];
     const trophyName = getChampionshipTrophyName(league, customSettings);
-    const gameEdition = customSettings.game_edition || 'Not set';
     embed = new EmbedBuilder()
       .setTitle(`🎖️ Awards • ${league.league_name}`)
       .setColor(0x5865F2)
       .addFields(
         { name: 'Championship Trophy Name', value: trophyName, inline: true },
-        { name: 'Game Edition', value: gameEdition, inline: true },
       )
       .setDescription((awards.length ? awards.map((a, i) => `${i + 1}. ${a.label}${a.tieredCosmetic ? ' 🎁' : ''}`).join('\n') : 'No awards configured yet.')
         + '\n\n🎁 = grants an automated tiered cosmetic item (usually the MVP-equivalent award); every other award pays currency instead.'
-        + '\n\nThis is the list of awards this league recognizes. There\'s no live stat-driven race for non-Madden leagues — record each season\'s winners from **Operations → Season History** at season end, which walks through the champion and each configured award with team/user pickers, posts everything in the League History channel, and updates franchise legacy.'
-        + '\n\n**Game Edition** tags which year\'s game (e.g. "NHL 26") each archived season was actually played on — set it once, then update it whenever the league switches to the new year\'s game. Doesn\'t affect the "Season 1, Season 2..." numbering, which keeps counting straight through; this just makes it possible to tell which real game a given season came from when looking back at league history later.')
+        + '\n\nThis is the list of awards this league recognizes. There\'s no live stat-driven race for non-Madden leagues — record each season\'s winners from **Operations → Season History** at season end, which walks through the champion and each configured award with team/user pickers, posts everything in the League History channel, and updates franchise legacy.')
       .setFooter({ text: 'GG Sports • League Customization' })
       .setTimestamp();
     const rows = [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('leaguecustom_award_add:' + leagueId).setLabel('Add Award').setEmoji('➕').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('leaguecustom_trophyname:' + leagueId).setLabel('Edit Trophy Name').setEmoji('🏆').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('leaguecustom_gameedition:' + leagueId).setLabel('Edit Game Edition').setEmoji('🎮').setStyle(ButtonStyle.Secondary),
     )];
     if (awards.length) {
       const removeMenu = new StringSelectMenuBuilder()
