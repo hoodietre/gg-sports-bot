@@ -57725,12 +57725,19 @@ function extractMaddenDraftInfo(row) {
   return { draftRound, draftPick };
 }
 
-// Rough baseline overall a rookie "should" have coming in at each round —
-// there's no external scouting-grade data to grade against, so grades are
-// value-based: how much a pick's actual overall beats or misses the
-// baseline for where they were drafted. These baselines are an approximation
-// (Madden's own rookie generation trends lower by round in a similar shape),
-// not official EA data.
+// 7J-DRAFTGRADECALIBRATION: real bug, confirmed live — every single one of
+// 32 teams graded an A on a real draft class. Root cause: this table is a
+// fixed, guessed baseline ("Madden's own rookie generation trends lower by
+// round in a similar shape" — an assumption, never verified against real
+// output). Confirmed live that assumption was wrong for this Madden
+// edition: actual rookie overalls ran consistently well above every one of
+// these numbers, so nearly every pick scored a positive delta regardless of
+// how good or bad the pick actually was relative to its peers — the table
+// wasn't just off by a little, it made the grading measure nothing real.
+// Kept only as an emergency fallback for a round with too few picks in a
+// given class to self-calibrate from (see getMaddenDraftClass below, which
+// now computes each round's real baseline from the actual class first and
+// only falls back to this table when that's not possible).
 const MADDEN_DRAFT_ROUND_BASELINE_OVERALL = { 1: 74, 2: 70, 3: 67, 4: 64, 5: 61, 6: 59, 7: 57 };
 function expectedMaddenOverallForRound(round) {
   if (MADDEN_DRAFT_ROUND_BASELINE_OVERALL[round]) return MADDEN_DRAFT_ROUND_BASELINE_OVERALL[round];
@@ -57748,10 +57755,26 @@ function gradeForValueDelta(delta) {
   return 'F';
 }
 
-function gradeMaddenDraftPick(overall, round) {
-  const expected = expectedMaddenOverallForRound(round);
-  const delta = Number(overall || 0) - expected;
-  return { expected, delta, grade: gradeForValueDelta(delta) };
+function worseMaddenGrade(a, b) {
+  return (DRAFT_GRADE_POINTS[a] ?? 2) <= (DRAFT_GRADE_POINTS[b] ?? 2) ? a : b;
+}
+
+function gradeMaddenDraftPick(overall, expected) {
+  const numOverall = Number(overall || 0);
+  const delta = numOverall - expected;
+  let grade = gradeForValueDelta(delta);
+  // 7J-DRAFTGRADEFLOOR: real bug, confirmed live — a 62 OVR 4th-round pick
+  // (the actual "Biggest Reach" of a real draft) graded a "B" because it
+  // was close to that round's (miscalibrated) baseline. Relative-to-peers
+  // performance isn't the whole story: a player that low realistically
+  // won't make an NFL roster no matter how the round around them went — a
+  // weak round doesn't make an individual weak pick within it fine. Caps
+  // the grade by absolute overall regardless of relative delta, and can
+  // only ever make a grade worse, never better, than what relative
+  // performance already earned.
+  if (numOverall < 60) grade = 'F';
+  else if (numOverall < 65) grade = worseMaddenGrade(grade, 'D');
+  return { expected, delta, grade };
 }
 
 function averageDraftGrade(grades) {
@@ -57767,32 +57790,57 @@ function averageDraftGrade(grades) {
 }
 
 async function getMaddenDraftClass(guildId, leagueId, teamName = null) {
+  // 7J-DRAFTGRADECALIBRATION: always pull the FULL league's draft class
+  // here, regardless of teamName — round baselines need to be computed
+  // from the whole class to mean anything; filtering to one team's handful
+  // of picks first would make self-calibration meaningless (or impossible
+  // for a team with only 1-2 picks in a round). Team filtering happens at
+  // the very end instead, after grading.
   const result = await pool.query(
-    teamName
-      ? `SELECT * FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(team_name) = LOWER($3)`
-      : `SELECT * FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text`,
-    teamName ? [guildId, String(leagueId), teamName] : [guildId, String(leagueId)]
+    `SELECT * FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guildId, String(leagueId)]
   ).catch(() => ({ rows: [] }));
 
-  const rookies = [];
+  const drafted = [];
   for (const row of result.rows) {
     const yearsPro = maddenRetirementYearsPro(row);
     if (yearsPro !== 0) continue;
     const { draftRound, draftPick } = extractMaddenDraftInfo(row);
     if (draftRound === null || draftRound < 1) continue;
-    const { expected, delta, grade } = gradeMaddenDraftPick(row.overall, draftRound);
-    rookies.push({
+    drafted.push({
       player_name: row.full_name || `${row.first_name || ''} ${row.last_name || ''}`.trim() || 'Unknown Player',
       team_name: row.team_name,
       position: row.position,
-      overall: row.overall,
+      overall: Number(row.overall) || 0,
       draft_round: draftRound,
       draft_pick: draftPick,
-      expected_overall: expected,
-      value_delta: delta,
-      grade,
     });
   }
+
+  // Self-calibrate each round's baseline from this actual class (its
+  // average overall for that round) rather than trusting the fixed guessed
+  // table — see the table's own comment for why. Needs a real sample to
+  // mean anything; falls back to the static table for a round too thin to
+  // average meaningfully (e.g. a supplemental round with 1-2 picks).
+  const overallsByRound = new Map();
+  for (const r of drafted) {
+    if (!overallsByRound.has(r.draft_round)) overallsByRound.set(r.draft_round, []);
+    overallsByRound.get(r.draft_round).push(r.overall);
+  }
+  const roundBaseline = new Map();
+  for (const [round, overalls] of overallsByRound) {
+    roundBaseline.set(round, overalls.length >= 4
+      ? overalls.reduce((a, b) => a + b, 0) / overalls.length
+      : expectedMaddenOverallForRound(round));
+  }
+
+  const rookies = drafted
+    .filter(r => !teamName || String(r.team_name || '').toLowerCase() === String(teamName).toLowerCase())
+    .map(r => {
+      const expected = roundBaseline.get(r.draft_round) ?? expectedMaddenOverallForRound(r.draft_round);
+      const { delta, grade } = gradeMaddenDraftPick(r.overall, expected);
+      return { ...r, expected_overall: Math.round(expected), value_delta: delta, grade };
+    });
   rookies.sort((a, b) => (a.draft_round - b.draft_round) || ((a.draft_pick ?? 0) - (b.draft_pick ?? 0)));
   return rookies;
 }
