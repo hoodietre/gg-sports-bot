@@ -57930,7 +57930,18 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
     .sort((a, b) => (DRAFT_GRADE_POINTS[b.grade] ?? 0) - (DRAFT_GRADE_POINTS[a.grade] ?? 0));
 
   const bestValue = [...rookies].sort((a, b) => b.value_delta - a.value_delta)[0];
-  const worstValue = [...rookies].sort((a, b) => a.value_delta - b.value_delta)[0];
+  // 7J-DRAFTREACHROUNDS: real gap, confirmed live — "Biggest Reach" picked
+  // whoever had the single worst value_delta across the ENTIRE draft, no
+  // matter the round. A round 6/7 pick missing its (already low)
+  // expectations barely means anything — there's little draft capital or
+  // real expectation on the line that late. A genuine "reach" story is
+  // about early draft capital: passing on better-rated players when it
+  // actually costs something. Restricted to rounds 1-5; falls back to the
+  // full class only if a draft is somehow shorter than 5 rounds. "Steal of
+  // the Draft" stays unrestricted on purpose — a late-round gem is a real,
+  // commonly celebrated part of draft coverage, unlike a late-round reach.
+  const reachCandidates = rookies.filter(r => Number(r.draft_round) <= 5);
+  const worstValue = [...(reachCandidates.length ? reachCandidates : rookies)].sort((a, b) => a.value_delta - b.value_delta)[0];
 
   embed.setDescription(
     `${rookies.length} rookies drafted across ${byTeam.size} teams.` + NL + NL +
