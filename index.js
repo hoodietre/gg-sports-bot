@@ -76542,6 +76542,40 @@ async function autoDetectAfterSync(guild, league) {
   await syncMaddenPlayoffBracketFromResults(guild, league).catch(err =>
     console.error('[AUTO DETECT] Playoff bracket result sync failed:', err?.message));
 
+  // 7J-OFFSEASONGATEFIX: real bug, confirmed live — retirement and
+  // transaction detection (and the weekly updates digests/news they drive)
+  // silently stopped firing for an entire offseason. Root cause: both used
+  // to live below the newWeekLabel gate further down, which only opens when
+  // EA's own reported "current week" (ea_reported_current_week, sourced
+  // from the hub's displayedWeek field) actually changes. That field
+  // tracks real season weeks — it has no concept of offseason SUB-stages
+  // (Resign Players, Free Agency Preview, Free Agency Stage 1, Stage 2,
+  // etc.), so it can report the exact same value across several real
+  // offseason advances in a row. The gate never opened, so retirements,
+  // signings, and the "who just moved" news recap all silently went dark
+  // the moment the season ended — exactly matching what was seen live:
+  // a wave of Free Agency Stage 2 signings produced zero weekly updates.
+  // Moved here so both run every sync regardless of week-label staleness,
+  // same reasoning and same idempotency-guard safety as the sportsbook/
+  // reward/bracket passes above — scanMaddenRetirements' retirement_key
+  // unique constraint and scanMaddenOffseasonTransactions' snapshot-diff
+  // approach both already make repeat calls harmless.
+  const retirements = await autoDetectMaddenRetirements(guild, league).catch(() => []);
+  const transactionEvents = await autoDetectMaddenTransactions(guild, league).catch(err => {
+    console.error('[AUTO DETECT] Transactions:', err?.message);
+    return [];
+  });
+  const majorMovementEvents = (transactionEvents || []).filter(e => e.type === 'major_movement');
+  // Fires the same "big splashy signing/release" AI news recap the
+  // regular-season path below also generates from allEvents — offseason
+  // free agency is exactly when this matters most (a 90+ OVR player
+  // signing is genuinely headline news), and it was previously unreachable
+  // all offseason for the same reason as above.
+  if (majorMovementEvents.length > 0) {
+    await generateMaddenESPNNews(guild, league, majorMovementEvents, eaCurrentWeekSettings.ea_reported_current_week || null, null).catch(err =>
+      console.error('[AUTO DETECT] Offseason transaction news:', err?.message));
+  }
+
   // Week-advance dedup guard — everything below this point (news/streaks/
   // performances, new lines, new props, thread creation, season transitions) is
   // genuinely tied to "a new week has begun," not to any individual game
@@ -76577,32 +76611,6 @@ async function autoDetectAfterSync(guild, league) {
   // league history and finalizes awards/champion, no manual command needed.
   await handleMaddenOffseasonTransition(guild, league, newWeekLabel).catch(err =>
     console.error('[AUTO DETECT] Offseason transition handler failed:', err?.message));
-
-  // 7J-RETIREOVERWRITE: real bug, confirmed live — 103 real retirements
-  // processed in one offseason stage, only 1 was ever detected. Root cause:
-  // autoDetectMaddenTransactions (via scanMaddenOffseasonTransactions) ends
-  // by calling saveMaddenCurrentTransactionSnapshot, which overwrites
-  // madden_player_team_snapshots — the exact "roster before" baseline
-  // autoDetectMaddenRetirements diffs against to find who's missing now.
-  // With retirements running SECOND in the same tick, the baseline it read
-  // had already been refreshed to match the post-retirement roster moments
-  // earlier by the transaction scan, so "before" and "after" were nearly
-  // identical by the time retirement detection ever looked — only whichever
-  // player happened to fall through the exact timing gap got caught. Fixed
-  // by running retirement detection FIRST, so it reads the still-stale
-  // (correct) pre-retirement snapshot before transactions gets a chance to
-  // overwrite it. This does not recover the ~102 retirements already missed
-  // this season — that baseline is gone — but fixes future seasons.
-  // 2. Retirement auto-detect
-  const retirements = await autoDetectMaddenRetirements(guild, league).catch(() => []);
-  allEvents.push(...retirements);
-
-  // 1. Transaction auto-detect
-  const transactionEvents = await autoDetectMaddenTransactions(guild, league).catch(err => {
-    console.error('[AUTO DETECT] Transactions:', err?.message);
-    return [];
-  });
-  allEvents.push(...(transactionEvents || []).filter(e => e.type === 'major_movement'));
 
   // 3. Game results, performances, streaks, awards, power movers
   const gameEvents = await autoProcessMaddenGameResults(guild, league, newWeekLabel).catch(() => []);
