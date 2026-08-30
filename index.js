@@ -57055,8 +57055,44 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     for (const key of maddenTransactionLookupKeys(current)) currentMap.set(key, current);
   }
 
+  // 7J-TXNALREADYRECORDED: real bug, confirmed live — Brandon Aubrey's
+  // Dolphins signing kept reposting across multiple syncs even after
+  // buildMaddenTransactionKey was fixed to normalize team names properly
+  // (that fix was real and necessary, but not the actual cause here). Root
+  // cause: the "expiring contract repair" pass further below (7J-10BY-ED1)
+  // matches CURRENT roster rows against historical madden_transactions rows
+  // with event_type IN ('expiring_contract','entered_free_agency') — that
+  // historical row is never deleted or marked consumed after a match, so on
+  // every future sync it gets matched AGAIN against the same now-signed
+  // player, re-classified as a fresh "signed" event every single time,
+  // indefinitely, regardless of key formatting. Pre-fetches everything
+  // already persisted for this player+event+destination-team combo once up
+  // front (same "one query instead of N" pattern already used elsewhere in
+  // this file) and skips any candidate that matches, closing this off at
+  // the source rather than relying solely on key-collision to catch it.
+  const alreadyRecordedResult = await pool.query(
+    `SELECT player_id, LOWER(COALESCE(player_name, '')) AS player_name_lower, event_type, new_team_name
+     FROM madden_transactions WHERE guild_id = $1 AND league_id = $2`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  const alreadyRecordedSet = new Set();
+  for (const r of alreadyRecordedResult.rows || []) {
+    const eventKey = String(r.event_type || '').toLowerCase();
+    const teamKey = maddenTransactionTeamKey(r.new_team_name || '');
+    if (r.player_id) alreadyRecordedSet.add(`id:${String(r.player_id).toLowerCase()}|${eventKey}|${teamKey}`);
+    if (r.player_name_lower) alreadyRecordedSet.add(`name:${r.player_name_lower}|${eventKey}|${teamKey}`);
+  }
+  function isAlreadyRecordedTransaction(data) {
+    const eventKey = String(data.event_type || '').toLowerCase();
+    const teamKey = maddenTransactionTeamKey(data.new_team_name || data.team_name || '');
+    if (data.player_id && alreadyRecordedSet.has(`id:${String(data.player_id).toLowerCase()}|${eventKey}|${teamKey}`)) return true;
+    if (data.player_name && alreadyRecordedSet.has(`name:${String(data.player_name).toLowerCase()}|${eventKey}|${teamKey}`)) return true;
+    return false;
+  }
+
   function addDetectedTransaction(data) {
     if (!data?.player_name) return;
+    if (isAlreadyRecordedTransaction(data)) return;
     const key = buildMaddenTransactionKey(data);
     if (rowKeys.has(key)) return;
     rowKeys.add(key);
@@ -57892,6 +57928,29 @@ async function scanMaddenRetirements(guild, league, confirm = false) {
   const baselineMap = await getMaddenRetirementBaselineMap(guildId, leagueId).catch(() => new Map());
   const previousMap = baselineMap.size ? baselineMap : await getMaddenPreviousTransactionSnapshot(guildId, leagueId);
   const rows = [];
+  // 7J-RETIREMENTALREADYRECORDED: real bug, confirmed live — Connor
+  // McGovern's retirement reposted on 3 consecutive syncs even after the
+  // season_label fix below (that fix was real and necessary, but not
+  // sufficient on its own). Root cause: previousMap — especially the manual
+  // baseline from /maddenretirements baseline, which never auto-advances —
+  // keeps showing the same already-gone player as "missing from current"
+  // on every sync, and the digest below posted unconditionally for
+  // whatever this diff found, with no check for whether that retirement
+  // had already been recorded in a prior sync. Same "one query instead of
+  // re-deriving from a stale diff every time" fix as the transaction scan
+  // above: pre-fetch who's already recorded once, skip them here.
+  const alreadyRetiredResult = await pool.query(
+    `SELECT player_id, LOWER(COALESCE(player_name, '')) AS player_name_lower FROM madden_retirements WHERE guild_id = $1 AND league_id = $2`,
+    [guildId, leagueId]
+  ).catch(() => ({ rows: [] }));
+  const alreadyRetiredIds = new Set((alreadyRetiredResult.rows || []).map(r => r.player_id ? String(r.player_id).toLowerCase() : null).filter(Boolean));
+  const alreadyRetiredNames = new Set((alreadyRetiredResult.rows || []).map(r => r.player_name_lower).filter(Boolean));
+  function isAlreadyRetired(row) {
+    const id = row.player_id || row.external_player_id || row.id;
+    if (id && alreadyRetiredIds.has(String(id).toLowerCase())) return true;
+    if (row.player_name && alreadyRetiredNames.has(String(row.player_name).toLowerCase())) return true;
+    return false;
+  }
   // 7J-RETIREMENTKEYSTABLE: real bug, confirmed live — the same retirement
   // (Connor McGovern) reposted on 3 consecutive syncs. Root cause:
   // maddenRetirementKey's uniqueness includes this season_label, but it was
@@ -57915,6 +57974,7 @@ async function scanMaddenRetirements(guild, league, confirm = false) {
   }
 
   for (const previous of previousMap.values()) {
+    if (isAlreadyRetired(previous)) continue;
     const key = maddenTransactionPlayerKey(previous);
     if (!key || currentKeys.has(key)) continue;
     if (!isLikelyMaddenRetirementCandidate(previous)) continue;
