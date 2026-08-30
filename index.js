@@ -56528,19 +56528,38 @@ async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minO
   const cached = maddenFreeAgentRowsCache.get(cacheKey);
   if (useCache && cached && Date.now() - cached.createdAt < MADDEN_FREE_AGENT_CACHE_TTL_MS) return cached.rows;
 
+  // 7J-FALISTREALSOURCE: real bug, confirmed live — Jalen Carter (91 OVR,
+  // correctly showing as a Free Agent via /madden player, which queries
+  // madden_players) never appeared anywhere in this list, top or bottom,
+  // even after a completely fresh repost with no caching involved. Root
+  // cause: this query read from madden_player_attributes — a SEPARATE,
+  // derived table only kept current by a backfill process
+  // (backfillMaddenExpandedPlayerDataForLeague) copying rows out of
+  // madden_players. If that backfill hasn't (re)run for a given player
+  // since their status changed, madden_player_attributes silently drifts
+  // out of sync with the real roster while madden_players — the actual
+  // live EA-synced source, already established elsewhere in this file
+  // (7J-OFFSEASON-2) as "confirmed correct" — has the truth the whole
+  // time. Reading directly from madden_players removes the whole class of
+  // "these two tables can disagree" bugs, and adds is_free_agent (a real
+  // boolean column EA provides directly, more reliable than string-
+  // matching team_name) as the primary signal.
   const params = [String(guildId), String(leagueId)];
   const result = await pool.query(
-    `SELECT a.*, COALESCE(v.value_score, 0) AS stored_value_score
-     FROM madden_player_attributes a
+    `SELECT p.id AS player_id,
+            COALESCE(NULLIF(CONCAT_WS(' ', p.first_name, p.last_name), ''), p.full_name) AS player_name,
+            p.team_name, p.position, p.overall, p.age, p.dev_trait, p.raw_payload, p.is_free_agent,
+            COALESCE(v.value_score, 0) AS stored_value_score
+     FROM madden_players p
      LEFT JOIN madden_player_values v
-       ON v.guild_id = a.guild_id AND v.league_id = a.league_id AND v.player_id = a.player_id
-     WHERE a.guild_id = $1 AND a.league_id = $2
+       ON v.guild_id = p.guild_id AND v.league_id::text = p.league_id::text AND v.player_id = p.id
+     WHERE p.guild_id = $1 AND p.league_id::text = $2::text
        AND (
-         LOWER(COALESCE(a.team_name, '')) IN ('fa','free agent','free agents','freeagent')
-         OR COALESCE(a.team_name, '') = ''
-         OR COALESCE(a.raw_payload->>'isFreeAgent','false') IN ('true','1','True')
-         OR COALESCE(a.raw_payload->>'isFA','false') IN ('true','1','True')
-         OR LOWER(COALESCE(a.contract_status, '')) LIKE '%free%'
+         p.is_free_agent = TRUE
+         OR LOWER(COALESCE(p.team_name, '')) IN ('fa','free agent','free agents','freeagent')
+         OR COALESCE(p.team_name, '') = ''
+         OR COALESCE(p.raw_payload->>'isFreeAgent','false') IN ('true','1','True')
+         OR COALESCE(p.raw_payload->>'isFA','false') IN ('true','1','True')
        )`,
     params
   ).catch(() => ({ rows: [] }));
