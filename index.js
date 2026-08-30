@@ -57807,9 +57807,23 @@ async function getMaddenDraftClass(guildId, leagueId, teamName = null) {
     if (yearsPro !== 0) continue;
     const { draftRound, draftPick } = extractMaddenDraftInfo(row);
     if (draftRound === null || draftRound < 1) continue;
+    // 7J-DRAFTCLASSSANITY: real bug, confirmed live — the manual /draftrecap
+    // command (and everything else reading getMaddenDraftClass directly)
+    // was still showing pre-draft placeholder/prospect noise: "Rd 63 Pk ?",
+    // null team, absurd overalls. checkAndPostMaddenDraftRecap already
+    // filters this out for the auto-post, but that filter lived only in
+    // the caller — every OTHER consumer of this shared function had no
+    // protection at all, and a stray "round 63" group was even corrupting
+    // its own self-calibrated baseline (falling through to the static
+    // fallback formula, producing a nonsense "Steal of the Draft"). Same
+    // three checks (sane round range, real team assigned) moved down into
+    // the shared function itself so every caller benefits, not just one.
+    const teamName2 = row.team_name;
+    if (draftRound > 10) continue;
+    if (!teamName2 || isMaddenFreeAgentTeamName(teamName2)) continue;
     drafted.push({
       player_name: row.full_name || `${row.first_name || ''} ${row.last_name || ''}`.trim() || 'Unknown Player',
-      team_name: row.team_name,
+      team_name: teamName2,
       position: row.position,
       overall: Number(row.overall) || 0,
       draft_round: draftRound,
@@ -57890,9 +57904,24 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
     (worstValue ? `📉 **Biggest Reach:** ${worstValue.player_name} (${worstValue.team_name}) — Rd ${worstValue.draft_round} Pk ${worstValue.draft_pick ?? '?'}, OVR ${worstValue.overall}, Grade **${worstValue.grade}**` : '')
   );
 
-  embed.addFields(teamSummaries.slice(0, 25).map(t => ({
-    name: `${t.team} — Grade: ${t.grade}`,
-    value: `${t.picks.length} pick${t.picks.length === 1 ? '' : 's'}`,
+  // 7J-DRAFTRECAP25FIELDS: real bug, confirmed live — Discord hard-caps
+  // embeds at 25 fields. One field per team silently dropped every team
+  // past the 25th with no error or indication anything was missing (a
+  // 32-team league only ever showed 25). Grouped into a small, fixed
+  // number of text fields instead — each holding several teams' lines —
+  // so a full 32+ team league always displays completely regardless of
+  // league size, and comfortably stays under both the 25-field cap and the
+  // 1024-char-per-field-value limit (each line is short; a 1024-char field
+  // easily holds 15+ team lines).
+  const teamLines = teamSummaries.map(t => `**${t.team}** — ${t.grade} (${t.picks.length} pick${t.picks.length === 1 ? '' : 's'})`);
+  const TEAMS_PER_FIELD = 11;
+  const teamFieldChunks = [];
+  for (let i = 0; i < teamLines.length; i += TEAMS_PER_FIELD) {
+    teamFieldChunks.push(teamLines.slice(i, i + TEAMS_PER_FIELD));
+  }
+  embed.addFields(teamFieldChunks.slice(0, 25).map((chunk, i) => ({
+    name: i === 0 ? 'Team Grades' : '\u200b',
+    value: chunk.join(NL).slice(0, 1024),
     inline: true,
   })));
 
@@ -57917,25 +57946,12 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
 // different size replaces it (old rookies' yearsPro rolls over off 0 by
 // then, same roster-refresh mechanic already relied on elsewhere).
 async function checkAndPostMaddenDraftRecap(guild, league) {
-  const rawRookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
-  if (!rawRookies.length) return;
-
-  // 7J-DRAFTRECAPSANITY: real bug, confirmed live — fired on 2 "rookies"
-  // with garbage data (Round 63, Pick 0, one with no team at all) well
-  // before the real draft happened. getMaddenDraftClass's identification
-  // (yearsPro === 0 plus a parsed draft slot) also matches pre-draft
-  // prospect/placeholder entries that exist in madden_players before the
-  // real draft — those carry uninitialized or nonsensical round/pick
-  // values and no real team yet, unlike an actual drafted rookie. A real
-  // completed draft (a) only ever has round numbers within a normal draft's
-  // range, (b) always has every pick assigned to a real team, and (c)
-  // always produces far more than a couple of picks. Filtering on all
-  // three before trusting the class as "the draft happened" avoids
-  // treating prospect noise as a completed draft.
-  const rookies = rawRookies.filter(r =>
-    Number.isFinite(Number(r.draft_round)) && Number(r.draft_round) >= 1 && Number(r.draft_round) <= 10 &&
-    r.team_name && !isMaddenFreeAgentTeamName(r.team_name)
-  );
+  // 7J-DRAFTRECAPSANITY: getMaddenDraftClass itself now filters out
+  // pre-draft placeholder/prospect noise (see 7J-DRAFTCLASSSANITY there) —
+  // this only needs its own check for whether a real, COMPLETE class exists
+  // yet, since a genuine draft always produces far more than a couple of
+  // picks even after that filtering.
+  const rookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
   if (rookies.length < 20) return; // not a real completed draft class yet
 
   const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'draft_recap', 'posted', rookies.length).catch(() => false);
