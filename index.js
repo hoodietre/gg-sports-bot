@@ -25932,6 +25932,22 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    if (interaction.isButton() && interaction.customId.startsWith('draftrecap_round:')) {
+      const [, leagueId, roundText] = interaction.customId.split(':');
+      await interaction.deferUpdate().catch(() => null);
+      const league = await getLeagueById(leagueId).catch(() => null);
+      if (!league || !interaction.guild) return;
+      const round = Number(roundText || 0);
+      const rookies = await getMaddenDraftClass(interaction.guild.id, league.league_id).catch(() => []);
+      const availableRounds = [...new Set(rookies.map(r => Number(r.draft_round)))].sort((a, b) => a - b);
+      const embed = round === 0 ? buildDraftRecapEmbed(league, rookies) : buildDraftRecapRoundEmbed(league, rookies, round);
+      await interaction.message.edit({
+        embeds: [embed],
+        components: buildDraftRecapRoundComponents(league.league_id, round, availableRounds),
+      }).catch(() => null);
+      return;
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('madden_players_view:')) {
       const [, token, mode] = interaction.customId.split(':');
       const session = maddenPlayerSearchSessions.get(token);
@@ -26733,7 +26749,12 @@ if (interaction.commandName === 'avatar') {
       await interaction.deferReply();
       const rookies = await getMaddenDraftClass(interaction.guild.id, recapLeague.league_id, teamRole?.name || null);
       const embed = buildDraftRecapEmbed(recapLeague, rookies, teamRole?.name || null);
-      await interaction.editReply({ embeds: [embed] });
+      if (teamRole) {
+        await interaction.editReply({ embeds: [embed] });
+      } else {
+        const availableRounds = [...new Set(rookies.map(r => Number(r.draft_round)))].sort((a, b) => a - b);
+        await interaction.editReply({ embeds: [embed], components: buildDraftRecapRoundComponents(recapLeague.league_id, 0, availableRounds) });
+      }
       return;
     }
 
@@ -57973,6 +57994,45 @@ function buildDraftRecapEmbed(league, rookies, teamFilter = null) {
   return embed;
 }
 
+// 7J-DRAFTRECAPROUNDVIEW: per user request — a round-by-round breakdown
+// alongside the existing league-wide overview, switchable via buttons the
+// same way the Free Agents board switches position filters. "round" here
+// is 0 for the overview page, or a real round number for that round's
+// pick-by-pick list.
+function buildDraftRecapRoundEmbed(league, rookies, round) {
+  const NL = String.fromCharCode(10);
+  const picks = rookies
+    .filter(r => Number(r.draft_round) === Number(round))
+    .sort((a, b) => (a.draft_pick ?? 0) - (b.draft_pick ?? 0));
+  const embed = new EmbedBuilder()
+    .setTitle(`📋 Draft Recap • ${league.league_name} • Round ${round}`)
+    .setColor(0x5865F2)
+    .setFooter({ text: 'GG Sports • Draft Recap • Grades are value-based (overall vs. typical for that draft slot), not official EA data' })
+    .setTimestamp();
+  if (!picks.length) {
+    embed.setDescription(`No picks found for Round ${round}.`);
+    return embed;
+  }
+  const lines = picks.map(p =>
+    `**Rd ${p.draft_round} Pk ${p.draft_pick ?? '?'}** — ${maddenTeamDisplayName(p.team_name)}\n${p.player_name} • ${p.position || '?'} • ${p.overall ?? '?'} OVR • Grade **${p.grade}**`
+  );
+  embed.setDescription(lines.join(NL + NL).slice(0, 4096));
+  return embed;
+}
+
+function buildDraftRecapRoundComponents(leagueId, currentRound, availableRounds) {
+  const mk = (label, round) => new ButtonBuilder()
+    .setCustomId(`draftrecap_round:${leagueId}:${round}`)
+    .setLabel(label)
+    .setStyle(Number(currentRound) === Number(round) ? ButtonStyle.Primary : ButtonStyle.Secondary);
+  const buttons = [mk('Overview', 0), ...availableRounds.map(r => mk(`Rd ${r}`, r))];
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+  }
+  return rows.slice(0, 5); // Discord caps a message at 5 action rows total
+}
+
 // 7J-DRAFTRECAPTIMING: real gap, confirmed live — the only existing
 // auto-post trigger for the draft recap lived inside
 // handleMaddenSeasonTransition, gated on going from "Preseason Week N"
@@ -58007,7 +58067,11 @@ async function checkAndPostMaddenDraftRecap(guild, league) {
   if (!draftRecapChannelId) return;
   const draftRecapChannel = await guild.channels.fetch(draftRecapChannelId).catch(() => null);
   if (!draftRecapChannel?.isTextBased?.()) return;
-  await draftRecapChannel.send({ embeds: [buildDraftRecapEmbed(league, rookies)] }).catch(err =>
+  const availableRounds = [...new Set(rookies.map(r => Number(r.draft_round)))].sort((a, b) => a - b);
+  await draftRecapChannel.send({
+    embeds: [buildDraftRecapEmbed(league, rookies)],
+    components: buildDraftRecapRoundComponents(league.league_id, 0, availableRounds),
+  }).catch(err =>
     console.error('[AUTO DETECT] Draft recap post failed:', err?.message || err));
   console.log('[AUTO DETECT] Draft recap posted for league', league.league_id, '—', rookies.length, 'rookies.');
 }
