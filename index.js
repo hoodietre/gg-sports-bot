@@ -76545,16 +76545,31 @@ async function autoDetectAfterSync(guild, league) {
   await handleMaddenOffseasonTransition(guild, league, newWeekLabel).catch(err =>
     console.error('[AUTO DETECT] Offseason transition handler failed:', err?.message));
 
+  // 7J-RETIREOVERWRITE: real bug, confirmed live — 103 real retirements
+  // processed in one offseason stage, only 1 was ever detected. Root cause:
+  // autoDetectMaddenTransactions (via scanMaddenOffseasonTransactions) ends
+  // by calling saveMaddenCurrentTransactionSnapshot, which overwrites
+  // madden_player_team_snapshots — the exact "roster before" baseline
+  // autoDetectMaddenRetirements diffs against to find who's missing now.
+  // With retirements running SECOND in the same tick, the baseline it read
+  // had already been refreshed to match the post-retirement roster moments
+  // earlier by the transaction scan, so "before" and "after" were nearly
+  // identical by the time retirement detection ever looked — only whichever
+  // player happened to fall through the exact timing gap got caught. Fixed
+  // by running retirement detection FIRST, so it reads the still-stale
+  // (correct) pre-retirement snapshot before transactions gets a chance to
+  // overwrite it. This does not recover the ~102 retirements already missed
+  // this season — that baseline is gone — but fixes future seasons.
+  // 2. Retirement auto-detect
+  const retirements = await autoDetectMaddenRetirements(guild, league).catch(() => []);
+  allEvents.push(...retirements);
+
   // 1. Transaction auto-detect
   const transactionEvents = await autoDetectMaddenTransactions(guild, league).catch(err => {
     console.error('[AUTO DETECT] Transactions:', err?.message);
     return [];
   });
   allEvents.push(...(transactionEvents || []).filter(e => e.type === 'major_movement'));
-
-  // 2. Retirement auto-detect
-  const retirements = await autoDetectMaddenRetirements(guild, league).catch(() => []);
-  allEvents.push(...retirements);
 
   // 3. Game results, performances, streaks, awards, power movers
   const gameEvents = await autoProcessMaddenGameResults(guild, league, newWeekLabel).catch(() => []);
