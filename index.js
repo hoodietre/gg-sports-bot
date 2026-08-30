@@ -73819,7 +73819,26 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
       console.log(`[AUTO DETECT] First run — anchored to EA-reported current week: ${eaReportedWeek}. Will detect NEXT real advance.`);
       return null;
     }
-    if (eaReportedWeek === lastLabel) return null; // EA still reports the same week — nothing has actually advanced.
+    // 7J-CORRUPTEDLABELFIX: per Hxxdie — confirmed live. This shortcut used
+    // to trust lastLabel unconditionally the moment EA reports the same
+    // thing twice in a row — but if a PRIOR sync (before 7J-POSTPLAYOFFWEEKFIX2
+    // above existed) already wrote a raw, uncorrected value like "Week 1"
+    // into last_auto_detect_week_label while the league was genuinely in
+    // the playoffs, that corrupted value gets trusted forever — EA keeps
+    // reporting "Week 1", lastLabel is already "Week 1", this shortcut
+    // fires every single time, and the override logic below (which would
+    // otherwise catch and correct exactly this) never even gets a chance
+    // to run. Detects the one specific signal that can only mean the
+    // stored label is corrupted: the league is still in the playoffs
+    // stage, but the stored label itself doesn't classify as a playoff
+    // week and isn't the known-safe "Pro Bowl" fallback either — that
+    // combination is otherwise impossible under correct operation.
+    if (eaReportedWeek === lastLabel) {
+      const [lastLabelGroup] = maddenWeekLabelSortKey(lastLabel);
+      const lastLabelLooksCorrupted = currentSeasonStage === 'playoffs' && lastLabelGroup !== 2 && lastLabel !== 'Pro Bowl';
+      if (!lastLabelLooksCorrupted) return null; // EA still reports the same week — nothing has actually advanced.
+      console.log(`[AUTO DETECT] Stored last-processed week "${lastLabel}" is inconsistent with the league still being in playoffs — treating as corrupted from a prior sync and re-evaluating instead of trusting it.`);
+    }
 
     const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
     const [curG, curN] = maddenWeekLabelSortKey(eaReportedWeek);
