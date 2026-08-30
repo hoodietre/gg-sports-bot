@@ -75119,12 +75119,26 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   // week-number threshold (>= 8), so it kept posting "who's fighting for
   // the last playoff spot" content even after the regular season ended and
   // the real bracket was already set — stale and confusing once there's no
-  // more race left to speculate about. Now also requires the week to
-  // actually still be regular season (maddenWeekLabelSortKey group 1, not
-  // group 2/playoffs) — correctly stops the moment Wild Card week (or
-  // later) is detected, regardless of what raw week number that happens to
-  // land on.
-  if (maddenWeekSortValue(weekLabel) >= 8 && maddenWeekLabelSortKey(weekLabel)[0] === 1) {
+  // more race left to speculate about.
+  //
+  // 7J-PLAYOFFPICTURESTAGEFIX: per Hxxdie — real regression, confirmed
+  // live. The first fix here checked maddenWeekLabelSortKey(weekLabel)[0]
+  // === 1 (regular season) to decide whether to stop — but "Pro Bowl"
+  // (the safe synthetic label 7J-POSTPLAYOFFWEEKFIX2 introduced later
+  // this session, deliberately NOT taught to the classifier since doing
+  // so would have shifted the Super Bowl's index in the 4-round
+  // bracket-building logic used throughout this session) falls through to
+  // that same default regular-season classification, so this gate wrongly
+  // let the playoff-picture story fire again during Pro Bowl week — well
+  // after the real bracket was set. Checks current_season_stage directly
+  // instead — the same authoritative DB field already relied on elsewhere
+  // this session specifically because parsing EA's week-label strings
+  // keeps being unreliable for exactly this kind of "are we still in the
+  // regular season" question. Stage is 'regular' only during the actual
+  // regular season; 'playoffs' and 'offseason' both correctly stop this,
+  // regardless of what confusing label a transitional week happens to get.
+  const seasonStageForPicture = (await ensureMaddenLeagueSettings(league).catch(() => ({}))).current_season_stage;
+  if (maddenWeekSortValue(weekLabel) >= 8 && seasonStageForPicture === 'regular') {
     const canPostPicture = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_picture', weekLabel, 'posted').catch(() => false);
     if (canPostPicture) {
       const allTeamsResult = await pool.query(
