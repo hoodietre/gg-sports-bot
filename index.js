@@ -18772,7 +18772,8 @@ if (interaction.commandName === 'avatar') {
 
         const run = await runMaddenExternalFetchSync(interaction.guild, league, {}).catch(err => ({ status: 'error', message: err?.message || String(err) }));
         await postMaddenSyncFeed(interaction.guild, league, run).catch(() => null);
-        await refreshMaddenFreeAgentsPanelForLeague(interaction.guild, league).catch(() => null);
+        await refreshMaddenFreeAgentsPanelForLeague(interaction.guild, league).catch(err =>
+          console.error('[FREE AGENTS PANEL] Refresh after sync failed:', err?.message || err));
         await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(league, run)], components: [buildCommissionerBackRow(leagueId)] });
         return;
       }
@@ -28794,7 +28795,8 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         await interaction.deferReply({ ephemeral: true });
         const run = await runMaddenExternalFetchSync(interaction.guild, activeLeague, { week });
         await postMaddenSyncFeed(interaction.guild, activeLeague, run).catch(() => null);
-        await refreshMaddenFreeAgentsPanelForLeague(interaction.guild, activeLeague).catch(() => null);
+        await refreshMaddenFreeAgentsPanelForLeague(interaction.guild, activeLeague).catch(err =>
+          console.error('[FREE AGENTS PANEL] Refresh after sync failed:', err?.message || err));
         await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
         return;
       }
@@ -56535,6 +56537,7 @@ async function getMaddenFreeAgentRows(guildId, leagueId, { position = null, minO
      WHERE a.guild_id = $1 AND a.league_id = $2
        AND (
          LOWER(COALESCE(a.team_name, '')) IN ('fa','free agent','free agents','freeagent')
+         OR COALESCE(a.team_name, '') = ''
          OR COALESCE(a.raw_payload->>'isFreeAgent','false') IN ('true','1','True')
          OR COALESCE(a.raw_payload->>'isFA','false') IN ('true','1','True')
          OR LOWER(COALESCE(a.contract_status, '')) LIKE '%free%'
@@ -56660,7 +56663,7 @@ async function getMaddenFreeAgentsChannelId(leagueId) {
 async function postOrRefreshMaddenFreeAgentsPanel(guild, league, options = {}) {
   await ensureMaddenFreeAgencyTables();
   const channelId = await getMaddenFreeAgentsChannelId(league.league_id);
-  if (!channelId) return { ok: false, message: 'No free agents channel configured. Run `/maddenfreeagents setup` first.' };
+  if (!channelId) return { ok: false, message: 'No free agents channel configured. Set it from Setup Dashboard → Post/Refresh Panels → Madden Free Agents Board.' };
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased?.()) return { ok: false, message: 'Configured free agents channel was not found or is not text-based.' };
   const payload = await buildMaddenFreeAgentsMessagePayload(guild.id, league, { position: options.position || null, minOvr: options.minOvr || 0, limit: MADDEN_FREE_AGENT_PAGE_SIZE, page: options.page || 0, userId: 'panel' });
@@ -56697,7 +56700,18 @@ async function refreshMaddenFreeAgentsPanelForLeague(guild, league) {
   await ensureMaddenFreeAgencyTables();
   const result = await pool.query(`SELECT * FROM madden_free_agent_panels WHERE guild_id = $1 AND league_id = $2 LIMIT 1`, [String(guild.id), String(league.league_id)]).catch(() => ({ rows: [] }));
   const panel = result.rows?.[0];
-  if (!panel) return null;
+  // 7J-FAPANELSTALE: real bug, confirmed live — a league's free agents
+  // board sat un-refreshed for months (no "(edited)" tag despite this
+  // function being called on every sync) with no error anywhere, because
+  // this early return is silent. If the tracked panel row is ever missing
+  // (deleted, never created via Setup Dashboard, or lost some other way),
+  // every future sync's refresh call quietly does nothing forever. Logging
+  // here doesn't fix a missing row on its own, but makes this failure mode
+  // visible in logs instead of invisible.
+  if (!panel) {
+    console.warn('[FREE AGENTS PANEL] No tracked panel row for league', league.league_id, '— refresh skipped. Set it up via Setup Dashboard → Post/Refresh Panels → Madden Free Agents Board.');
+    return null;
+  }
   return postOrRefreshMaddenFreeAgentsPanel(guild, league, { position: panel.position || null, minOvr: Number(panel.min_ovr || 0), page: Number(panel.page || 0) });
 }
 
