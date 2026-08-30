@@ -4836,9 +4836,31 @@ async function ensureMaddenYearEndTables() {
 async function getMaddenYearEndAwardWinners(guildId, leagueId) {
   const awardKeys = ['mvp', 'opoy', 'dpoy', 'oroy', 'droy'];
   const winners = [];
+  let rookieSnapshot = null;
   for (const awardKey of awardKeys) {
-    const rows = await getMaddenAwardsRace(guildId, leagueId, awardKey, 1).catch(() => []);
-    const player = rows[0];
+    let player = (await getMaddenAwardsRace(guildId, leagueId, awardKey, 1).catch(() => []))[0];
+    // 7J-ROOKIEAWARDSNAPSHOT: live rookie-status data (years_pro from the
+    // current madden_players roster snapshot) can go stale by the time
+    // year-end finalization runs — see the write site's comment in
+    // handleMaddenPlayoffBracketTransition for the full explanation. Fall
+    // back to that frozen playoff-start snapshot for OROY/DROY specifically
+    // when the live race comes back empty, rather than reporting a real
+    // season-long rookie leader as "Not detected" just because the roster
+    // already reflects next season by finalization time. Leagues that
+    // already passed playoff-start before this snapshot existed have
+    // nothing to fall back to and will still show "Not detected" for that
+    // one season — this only protects seasons that start playoffs after
+    // this fix is deployed.
+    if (!player && (awardKey === 'oroy' || awardKey === 'droy')) {
+      if (rookieSnapshot === null) {
+        const settingsResult = await pool.query(
+          `SELECT rookie_award_snapshot FROM madden_league_settings WHERE league_id = $1`,
+          [leagueId]
+        ).catch(() => ({ rows: [] }));
+        rookieSnapshot = settingsResult.rows[0]?.rookie_award_snapshot || {};
+      }
+      player = rookieSnapshot[awardKey] || null;
+    }
     if (!player) continue;
     const race = MADDEN_AWARD_RACES[awardKey] || MADDEN_AWARD_RACES.mvp;
     const baseAward = {
@@ -5140,7 +5162,31 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
     // elsewhere rather than leaving a hole). The existing display/sort
     // logic (see getMaddenStoredChampionshipRows) already handles any
     // numeric season_label correctly — this needed no changes there.
-    const seasonLabel = league.madden_season_year != null ? String(league.madden_season_year) : 'Current';
+    // 7J-SEASONLABELFALLBACK: real bug, confirmed live — leagues whose EA
+    // sync never provides a real season year (seasonYear/calendarYear
+    // absent from the hub payload — e.g. this test league, confirmed via
+    // the archive label falling back to the real-world calendar year)
+    // always fell back to the literal string 'Current' for BOTH
+    // season_label AND achievementSeasonKey. Not just cosmetic:
+    // achievements_claimed dedups on `award_<key>_<achievementSeasonKey>`
+    // with ON CONFLICT DO NOTHING — once any 'Current'-keyed award was
+    // claimed in ANY earlier season (this league's tracking doc confirms a
+    // prior Season 1 → Season 2 rollover), that exact key can never be
+    // claimed again for this league, ever, silently blocking every future
+    // season's payout with no error. Falls back to the same season-count
+    // approach the archive label already uses (7J-ARCHIVESEASONNUMBER)
+    // instead of a static string, so a league without real EA season-year
+    // data still gets a distinct key per finalize.
+    let seasonLabel;
+    if (league.madden_season_year != null) {
+      seasonLabel = String(league.madden_season_year);
+    } else {
+      const fallbackCountResult = await pool.query(
+        `SELECT COUNT(DISTINCT season_label)::int AS n FROM madden_championship_history WHERE league_id = $1`,
+        [league.league_id]
+      ).catch(() => ({ rows: [{ n: 0 }] }));
+      seasonLabel = `Season ${Number(fallbackCountResult.rows[0]?.n || 0) + 1}`;
+    }
     // 7J-41SEASON: achievements now key off the real EA-sourced season year
     // (league.madden_season_year, persisted every sync — see
     // runMaddenEaDirectSync) instead of the literal 'Current' label used
@@ -58662,7 +58708,32 @@ async function postMaddenLeagueHistoryYearEndReport(guild, league, userId = null
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased?.()) return { posted: false, reason: 'Configured history channel is not available.' };
   const embed = await buildMaddenLeagueHistoryYearEndEmbed(guild, league);
-  const msg = await channel.send({ embeds: [embed] }).catch(() => null);
+
+  // 7J-ARCHIVEDBRACKETIMAGE: per Hxxdie — the archive report already covers
+  // champion/awards/records in text, but the actual bracket shape (who beat
+  // who, upsets along the way) only ever lived in the live, ever-changing
+  // bracket panel — nothing preserved a final snapshot once the season
+  // rolled over. Reuses the exact same PNG renderer and AttachmentBuilder
+  // pattern already proven in updateLeaguePlayoffBracketImage, just pointed
+  // at this season's now-completed bracket instead of the live one, and
+  // attached to the archive post itself via setImage rather than sent as a
+  // separate message — non-fatal if rendering fails (no sharp available,
+  // bracket missing, etc.) so a missing image never blocks the text report.
+  const files = [];
+  const bracketResult = await pool.query(`SELECT * FROM league_playoff_brackets WHERE league_id = $1`, [league.league_id]).catch(() => ({ rows: [] }));
+  const bracketState = bracketResult.rows[0];
+  if (bracketState) {
+    const bracketPng = await renderLeaguePlayoffBracketPng(league, bracketState).catch(err => {
+      console.error('[LEAGUE HISTORY] Bracket image render failed:', err?.message || err);
+      return null;
+    });
+    if (bracketPng) {
+      files.push(new AttachmentBuilder(bracketPng, { name: 'final-playoff-bracket.png' }));
+      embed.setImage('attachment://final-playoff-bracket.png');
+    }
+  }
+
+  const msg = await channel.send({ embeds: [embed], files }).catch(() => null);
   if (!msg?.id) return { posted: false, reason: 'Failed to send history embed.' };
   await pool.query(
     `INSERT INTO madden_year_end_checkpoints (id, guild_id, league_id, season_label, checkpoint_type, status, summary, created_by)
@@ -73903,6 +73974,10 @@ async function ensureMaddenAutoDetectColumns() {
   // Sportsbook auto-lines
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS sportsbook_auto_lines_enabled BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
+  // 7J-ROOKIEAWARDSNAPSHOT: see the comment at its write site
+  // (handleMaddenPlayoffBracketTransition) and read site
+  // (getMaddenYearEndAwardWinners) for why this exists.
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS rookie_award_snapshot JSONB`);
   // Link madden games to sportsbook games for auto-settlement
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS sportsbook_game_id UUID REFERENCES sportsbook_games(id) ON DELETE SET NULL`);
   await pool.query(`ALTER TABLE madden_imported_games ADD COLUMN IF NOT EXISTS is_user_vs_user BOOLEAN`);
@@ -76034,6 +76109,44 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
   } catch (error) {
     console.error('[SEASON TRANSITION] Auto playoff bracket start failed:', error?.message || error);
     return; // don't flip the stage flag if it failed — retry next sync tick
+  }
+
+  // 7J-ROOKIEAWARDSNAPSHOT: real bug, confirmed live — OROY/DROY determine
+  // rookie eligibility off each player's CURRENT years_pro/experience value
+  // from madden_players (see isMaddenRookieCandidate / getMaddenLeagueLeaders'
+  // join against that table) — a live snapshot, overwritten in place on
+  // every roster sync, not season-scoped like the weekly stat totals it's
+  // joined against. That's fine while the season is still being played, but
+  // by the time year-end finalization actually runs (after the Super Bowl,
+  // once the league has moved into offseason), a roster sync may have
+  // already reflected the team's NEXT-season state — real rookies who
+  // played the whole season now show years_pro=1, so OROY/DROY come back
+  // "Not detected" despite having genuinely qualified all season. Playoffs
+  // starting is the last point at which every player who has been a rookie
+  // all season is still guaranteed to read as one — no further regular-
+  // season games remain to change who was actually a rookie this year, and
+  // this handler already only fires once per season. Freezing the race
+  // winners here, rather than the years_pro values themselves, keeps the
+  // fix scoped to exactly the two award categories affected instead of
+  // touching every other rookie-status read site in the file.
+  try {
+    const [oroyRows, droyRows] = await Promise.all([
+      getMaddenAwardsRace(guild.id, league.league_id, 'oroy', 1).catch(() => []),
+      getMaddenAwardsRace(guild.id, league.league_id, 'droy', 1).catch(() => []),
+    ]);
+    const snapshot = {};
+    if (oroyRows[0]) snapshot.oroy = oroyRows[0];
+    if (droyRows[0]) snapshot.droy = droyRows[0];
+    if (Object.keys(snapshot).length) {
+      await pool.query(
+        `UPDATE madden_league_settings SET rookie_award_snapshot = $2, updated_at = NOW() WHERE league_id = $1`,
+        [league.league_id, JSON.stringify(snapshot)]
+      ).catch(err => console.error('[SEASON TRANSITION] Rookie award snapshot failed to save:', err?.message || err));
+    }
+  } catch (error) {
+    console.error('[SEASON TRANSITION] Rookie award snapshot failed:', error?.message || error);
+    // Non-fatal — year-end finalization falls back to a live (possibly
+    // stale) rookie check if this snapshot never got taken.
   }
 
   await pool.query(
