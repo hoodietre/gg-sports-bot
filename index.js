@@ -74434,6 +74434,34 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
       console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" right after a playoff week ("${lastLabel}") while still in playoffs — treating as "${safeLabel}" instead of trusting the raw (potentially colliding) report.`);
       return safeLabel;
     }
+    // 7J-OFFSEASONROLLOVERFIX: real bug, confirmed live — an entire
+    // offseason (Free Agency, Draft, etc.) never registers as a "new
+    // advance" through this function at all (see 7J-OFFSEASONGATEFIX
+    // elsewhere, which had to move retirement/transaction detection OUT
+    // from behind this same gate for exactly this reason), so
+    // last_auto_detect_week_label stays stuck at whatever the last real
+    // week was — the OLD season's Super Bowl (group 2). When the new
+    // season's real Preseason Week 1 (group 0) or Week 1 (a no-preseason
+    // league) finally arrives, the raw group-number comparison sees
+    // "preseason/regular" as sorting BEFORE "playoffs" and refuses to
+    // recognize it as forward progress — even though it's obviously a new
+    // season starting, not the league regressing. Confirmed live: game
+    // threads, sportsbook lines, news, and every other week-gated feature
+    // (including this session's offseason→preseason stat wipe and the
+    // no-preseason kickoff path) stayed completely dark through a real
+    // preseason-week-1 advance because of this. If the league's own stage
+    // is still stuck on 'offseason' and EA now reports a genuine preseason
+    // or regular-season week label, that alone is unambiguous evidence a
+    // new season has begun — trust it directly rather than the stale
+    // group comparison, and skip the "cap to next known week in sequence"
+    // step below entirely, since the old season's week sequence has
+    // nothing meaningful to say about the new season's numbering.
+    const looksLikeGenuineSeasonStart = currentSeasonStage === 'offseason' &&
+      (maddenIsPreseasonWeek(eaReportedWeek) || /^week \d+$/i.test(String(eaReportedWeek || '').trim()));
+    if (!genuinelyMovedForward && looksLikeGenuineSeasonStart) {
+      console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" while league was stuck in 'offseason' stage — recognizing as the start of a new season despite not sorting after the stale last-processed label ("${lastLabel}").`);
+      return eaReportedWeek;
+    }
     if (!genuinelyMovedForward) return null;
 
     // Find the single next known week after lastLabel in the schedule sequence,
