@@ -76231,6 +76231,88 @@ function maddenIsRegularSeasonWeek(weekLabel) {
 // so this only fires once per season even though autosync runs every 60 seconds; the
 // stage is reset back to 'preseason' the moment next year's preseason weeks are
 // detected (see the reset branch below), so the cycle repeats correctly year over year.
+// 7J-NOPRESEASONKICKOFF: real gap, confirmed live via user report — not all
+// Madden leagues run a preseason. For one that doesn't, EA reports the
+// first real "Week 1" label directly after the offseason stages (Free
+// Agency, Draft, etc.) with no "Preseason Week N" label ever appearing in
+// between. Extracted the kickoff steps (stat wipe, embed reset, stage flip,
+// announcement, draft recap) into their own function so both real paths —
+// normal preseason→regular (handleMaddenSeasonTransition, unchanged
+// behavior) and offseason→regular directly (handleMaddenOffseasonTransition,
+// new) — can call the exact same steps instead of one of them being
+// missing entirely. Previously a no-preseason league's stage would never
+// leave 'offseason' at all (handleMaddenOffseasonTransition's reset only
+// checked for a preseason week label; handleMaddenSeasonTransition's
+// kickoff only checked for a preseason→regular transition) — both would
+// silently never fire, permanently blocking the wipe, the kickoff
+// announcement, and next year's Super Bowl→offseason detection (which
+// itself is gated on stage no longer being stuck at 'offseason').
+async function wipeMaddenWeeklyStats(guildId, leagueId) {
+  const wiped = await pool.query(
+    `DELETE FROM madden_player_weekly_stats
+     WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guildId, String(leagueId)]
+  ).catch(err => {
+    console.error('[SEASON TRANSITION] Stats wipe failed:', err?.message);
+    return null;
+  });
+  return wiped?.rowCount || 0;
+}
+
+async function performMaddenRegularSeasonKickoff(guild, league, newWeekLabel) {
+  // 1. Wipe weekly stats accumulated before the regular season (preseason
+  // exhibition games, or whatever leftover rows exist for a league with no
+  // preseason at all) so nobody's regular-season numbers start inflated.
+  const wipedCount = await wipeMaddenWeeklyStats(guild.id, league.league_id);
+  console.log('[SEASON TRANSITION] Wiped pre-regular-season stats:', wipedCount, 'rows');
+
+  // 2. Reset persistent embed message IDs so they repost fresh for regular season
+  await pool.query(
+    `UPDATE madden_league_settings
+     SET standings_message_id = NULL,
+         power_rankings_message_id = NULL,
+         free_agents_message_id = NULL,
+         current_season_stage = 'regular',
+         updated_at = NOW()
+     WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => null);
+
+  // 3. Post season kickoff announcement to news channel
+  const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
+  if (newsChannelId) {
+    const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
+    if (newsChannel?.isTextBased?.()) {
+      await newsChannel.send({
+        embeds: [new EmbedBuilder()
+          .setTitle(`${GG_EMOJI} 🏈 ${league.league_name} Regular Season Starts NOW`)
+          .setColor(0x57F287)
+          .setDescription([
+            '**The wait is over.** Rosters are set, and every game counts.',
+            '',
+            `Preseason/offseason records and stats have been cleared. Every team enters ${newWeekLabel} at **0-0**.`,
+            '',
+            'Game threads, standings, sportsbook lines, and news will auto-update after every advance.',
+            '',
+            '**May the best GM win.** 🏆',
+          ].join('\n'))
+          .setFooter({ text: `GG Sports • ${league.league_name} • Season Kickoff` })
+          .setTimestamp()],
+      }).catch(() => null);
+    }
+  }
+
+  // 4. Draft Recap backstop — checkAndPostMaddenDraftRecap (run every sync,
+  // see 7J-DRAFTRECAPTIMING) is the real, timely trigger now; this is just
+  // a safety net in case that never caught a real class for some reason.
+  // Its own dedup (shouldPostMaddenStoryline, keyed on class size) means
+  // this naturally no-ops if the recap already posted.
+  await checkAndPostMaddenDraftRecap(guild, league).catch(err =>
+    console.error('[SEASON TRANSITION] Draft recap backstop failed:', err?.message));
+
+  console.log('[SEASON TRANSITION] Complete — regular season is live for league', league.league_id);
+}
+
 async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   const settings = await ensureMaddenLeagueSettings(league);
   const stage = settings.current_season_stage || 'preseason';
@@ -76238,10 +76320,36 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   // Reset for next year: once a new preseason begins after an offseason was finalized,
   // clear the flag so the next Super Bowl can trigger this again.
   if (stage === 'offseason' && maddenIsPreseasonWeek(newWeekLabel)) {
+    // 7J-PRESEASONSTATWIPE: per user request — stats should also wipe at
+    // the START of preseason, not just at the preseason→regular
+    // transition. Without this, whatever weekly-stat rows were left over
+    // from last season's playoffs would still be sitting in the table when
+    // preseason exhibition games start accumulating new ones on top —
+    // technically harmless to real-season stats (the existing
+    // preseason→regular wipe still clears everything before Week 1), but
+    // means any preseason-stats-dependent view (leaders, awards races)
+    // would show stale mixed data for the whole preseason window.
+    const wipedCount = await wipeMaddenWeeklyStats(guild.id, league.league_id);
+    console.log('[SEASON TRANSITION] Wiped leftover stats at preseason start:', wipedCount, 'rows');
     await pool.query(
       `UPDATE madden_league_settings SET current_season_stage = 'preseason', updated_at = NOW() WHERE league_id = $1`,
       [league.league_id]
     ).catch(() => null);
+    return;
+  }
+
+  // 7J-NOPRESEASONKICKOFF: not every league runs a preseason — EA can go
+  // straight from offseason stages to a real "Week 1" with no "Preseason
+  // Week N" label ever appearing. Without this branch, the check above
+  // never matches (newWeekLabel isn't a preseason label) and this stage
+  // gets permanently stuck on 'offseason', which also blocks next year's
+  // Super Bowl→offseason detection since that's gated on the stage not
+  // already being 'offseason'. Runs the exact same kickoff a preseason
+  // league gets via handleMaddenSeasonTransition, just triggered directly
+  // off leaving 'offseason' instead of off a preseason→regular transition.
+  if (stage === 'offseason' && maddenIsRegularSeasonWeek(newWeekLabel)) {
+    console.log('[SEASON TRANSITION] No preseason detected for league', league.league_id, '— offseason → regular season directly.');
+    await performMaddenRegularSeasonKickoff(guild, league, newWeekLabel);
     return;
   }
 
@@ -76735,74 +76843,7 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
   // they never update statuses. Since EA only exports current-week games, the
   // mere appearance of regular season Week 1 in the DB confirms we've advanced.
   console.log('[SEASON TRANSITION] Preseason → Regular Season confirmed for league', league.league_id);
-
-  // 1. Wipe preseason weekly stats (don't carry into regular season)
-  const wiped = await pool.query(
-    `DELETE FROM madden_player_weekly_stats
-     WHERE guild_id = $1 AND league_id::text = $2::text`,
-    [guild.id, String(league.league_id)]
-  ).catch(err => {
-    console.error('[SEASON TRANSITION] Stats wipe failed:', err?.message);
-    return null;
-  });
-  console.log('[SEASON TRANSITION] Wiped preseason stats:', wiped?.rowCount || 0, 'rows');
-
-  // 2. Reset persistent embed message IDs so they repost fresh for regular season
-  await pool.query(
-    `UPDATE madden_league_settings
-     SET standings_message_id = NULL,
-         power_rankings_message_id = NULL,
-         free_agents_message_id = NULL,
-         current_season_stage = 'regular',
-         updated_at = NOW()
-     WHERE league_id = $1`,
-    [league.league_id]
-  ).catch(() => null);
-
-  // 3. Post season kickoff announcement to news channel
-  const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
-  if (newsChannelId) {
-    const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
-    if (newsChannel?.isTextBased?.()) {
-      await newsChannel.send({
-        embeds: [new EmbedBuilder()
-          .setTitle(`${GG_EMOJI} 🏈 ${league.league_name} Regular Season Starts NOW`)
-          .setColor(0x57F287)
-          .setDescription([
-            '**The wait is over.** Preseason is done, rosters are set, and every game counts.',
-            '',
-            `Preseason records and stats have been cleared. Every team enters ${newWeekLabel} at **0-0**.`,
-            '',
-            'Game threads, standings, sportsbook lines, and news will auto-update after every advance.',
-            '',
-            '**May the best GM win.** 🏆',
-          ].join('\n'))
-          .setFooter({ text: `GG Sports • ${league.league_name} • Season Kickoff` })
-          .setTimestamp()],
-      }).catch(() => null);
-    }
-  }
-
-  // 4. Post Draft Recap — the draft happens during preseason, so the
-  // preseason → regular season transition is the reliable signal that it's
-  // over. Falls back to the news channel if no dedicated Draft Recap
-  // channel is configured, same fallback pattern as the announcement above.
-  const draftRecapChannelId = league.draft_recap_channel_id || newsChannelId;
-  if (draftRecapChannelId) {
-    const draftRecapChannel = await guild.channels.fetch(draftRecapChannelId).catch(() => null);
-    if (draftRecapChannel?.isTextBased?.()) {
-      const rookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
-      if (rookies.length) {
-        await draftRecapChannel.send({ embeds: [buildDraftRecapEmbed(league, rookies)] }).catch(err => {
-          console.error('[SEASON TRANSITION] Draft recap post failed:', err?.message);
-        });
-      } else {
-        console.log('[SEASON TRANSITION] No rookies found for draft recap — skipping post.');
-      }
-    }
-  }
-
-  console.log('[SEASON TRANSITION] Complete — regular season is live.');
+  await performMaddenRegularSeasonKickoff(guild, league, newWeekLabel);
 }
 
 
