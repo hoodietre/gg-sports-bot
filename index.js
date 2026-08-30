@@ -73780,11 +73780,12 @@ async function ensureMaddenAutoDetectColumns() {
 // ---------------------------------------------------------------------------
 async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   const settingsResult = await pool.query(
-    `SELECT last_auto_detect_week_label, ea_reported_current_week FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    `SELECT last_auto_detect_week_label, ea_reported_current_week, current_season_stage FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
     [leagueId]
   ).catch(() => ({ rows: [] }));
   const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
   const eaReportedWeek = settingsResult.rows[0]?.ea_reported_current_week || null;
+  const currentSeasonStage = settingsResult.rows[0]?.current_season_stage || null;
 
   // Known week sequence from the schedule — shared by both paths below. Used by
   // the EA-hub path specifically as a hard cap: never advance more than one step
@@ -73822,23 +73823,37 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
 
     const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
     const [curG, curN] = maddenWeekLabelSortKey(eaReportedWeek);
-    // 7J-POSTPLAYOFFWEEKFIX: per Hxxdie — real bug, confirmed live. A
-    // franchise can never genuinely regress from a playoff week back to
-    // an earlier regular-season week within the same season — but EA
-    // reports the week right after Conference Championship as literally
-    // "Week 1" (not "Pro Bowl" as the label naming elsewhere in this
-    // codebase would suggest), which classifies as early regular season
-    // and sorts BEFORE "Conf. Playoff." The plain forward-progress check
-    // below silently rejected this as "nothing advanced" and blocked
-    // every downstream post (news, threads, bracket checks) — the exact
-    // same failure pattern as the earlier "Div. Playoff" bug, just one
-    // step later in the season. If the previously-processed week was
-    // itself a playoff week (group 2), ANY newly-reported week counts as
-    // forward progress regardless of how it classifies — there's no real
-    // scenario where EA legitimately reports something earlier once the
-    // league has already reached the playoffs.
-    const movedForward = lastG === 2 || curG > lastG || (curG === lastG && curN > lastN);
-    if (!movedForward) return null;
+    const genuinelyMovedForward = curG > lastG || (curG === lastG && curN > lastN);
+    // 7J-POSTPLAYOFFWEEKFIX: per Hxxdie — real bug, confirmed live twice.
+    // A franchise can never genuinely regress out of the playoffs back to
+    // an earlier regular-season week — but EA reports the week right
+    // after Conference Championship as literally "Week 1" (not "Pro
+    // Bowl"), which classifies as early regular season and sorts BEFORE
+    // "Conf. Playoff." checking current_season_stage (still 'playoffs'
+    // until Super Bowl is actually detected) instead of re-classifying
+    // lastLabel keeps this override working correctly even across
+    // whatever confusingly-labeled week EA reports NEXT, not just this
+    // one specific case.
+    //
+    // 7J-POSTPLAYOFFWEEKFIX2: per Hxxdie — the first version of this fix
+    // stopped at "treat this as forward progress" and let the raw
+    // "Week 1" label flow straight through to thread/game creation —
+    // which blindly matched it against real Week 1 games from months ago
+    // (this season's actual Week 1) and recreated an old thread live.
+    // Now returns a safe synthetic label instead whenever the override is
+    // what made this count as forward progress, so nothing downstream can
+    // ever mistake old historical data for new content again — matches
+    // the label the user's own real Madden confirmed this stage is
+    // ("Pro Bowl week"). autoCreateGameThreadsAfterSync/game-import will
+    // correctly find zero existing rows for this label and create
+    // nothing, which is exactly right — Pro Bowl has no real matchups to
+    // announce.
+    if (!genuinelyMovedForward && currentSeasonStage === 'playoffs') {
+      const safeLabel = 'Pro Bowl';
+      console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" right after a playoff week ("${lastLabel}") while still in playoffs — treating as "${safeLabel}" instead of trusting the raw (potentially colliding) report.`);
+      return safeLabel;
+    }
+    if (!genuinelyMovedForward) return null;
 
     // Find the single next known week after lastLabel in the schedule sequence,
     // and cap to that — never jump straight to eaReportedWeek itself.
@@ -74798,7 +74813,26 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [] }));
 
-  const games = completedGames.rows || [];
+  // 7J-GAMERESULTDEDUP: per Hxxdie — real bug, found while investigating
+  // the safety of syncing again shortly after a previous "new week
+  // detected" cycle. This query had NO dedup at all: every time a new
+  // week is detected, it re-pulls the top 32 most-recently-updated
+  // completed games unconditionally and rebuilds fresh news events for
+  // every one of them. A game already covered in a previous cycle would
+  // get silently re-announced as "news" a second time if it was still
+  // sitting in that top-32 window on a later cycle — a real, live risk
+  // once a transitional week (like the "Pro Bowl" safe-label fallback)
+  // could legitimately fire more than once in a row. Filters out games
+  // that have already had their result posted, using the same
+  // shouldPostMaddenStoryline dedup infrastructure already proven
+  // elsewhere in this codebase, keyed by each game's stable UUID id —
+  // so a repeat cycle can never re-cover an already-announced result,
+  // regardless of how many times it fires.
+  const games = [];
+  for (const game of completedGames.rows || []) {
+    const shouldAnnounce = await shouldPostMaddenStoryline(guild.id, league.league_id, 'game_result_news', game.id, 'posted').catch(() => false);
+    if (shouldAnnounce) games.push(game);
+  }
 
   for (const game of games) {
     const homeScore = Number(game.home_score || 0);
