@@ -57745,15 +57745,6 @@ function expectedMaddenOverallForRound(round) {
 }
 
 const DRAFT_GRADE_POINTS = { 'A+': 4.3, 'A': 4.0, 'B+': 3.3, 'B': 3.0, 'C': 2.0, 'D': 1.0, 'F': 0.0 };
-function gradeForValueDelta(delta) {
-  if (delta >= 8) return 'A+';
-  if (delta >= 4) return 'A';
-  if (delta >= 1) return 'B+';
-  if (delta >= -2) return 'B';
-  if (delta >= -5) return 'C';
-  if (delta >= -8) return 'D';
-  return 'F';
-}
 
 function worseMaddenGrade(a, b) {
   return (DRAFT_GRADE_POINTS[a] ?? 2) <= (DRAFT_GRADE_POINTS[b] ?? 2) ? a : b;
@@ -57762,19 +57753,45 @@ function worseMaddenGrade(a, b) {
 function gradeMaddenDraftPick(overall, expected) {
   const numOverall = Number(overall || 0);
   const delta = numOverall - expected;
-  let grade = gradeForValueDelta(delta);
-  // 7J-DRAFTGRADEFLOOR: real bug, confirmed live — a 62 OVR 4th-round pick
-  // (the actual "Biggest Reach" of a real draft) graded a "B" because it
-  // was close to that round's (miscalibrated) baseline. Relative-to-peers
-  // performance isn't the whole story: a player that low realistically
-  // won't make an NFL roster no matter how the round around them went — a
+  return { expected, delta };
+}
+
+// 7J-DRAFTGRADESPREAD: real bug, confirmed live — even after self-
+// calibrating each round's baseline to that round's own average (fixing
+// the "every team gets an A" bug), grades still clustered almost entirely
+// into B/B+/C, with essentially nothing hitting A+, A, or F. Root cause:
+// self-calibrating the baseline to the round's own average makes most
+// deltas mathematically cluster near zero BY DEFINITION — that's what an
+// average is — but the delta-threshold bands (e.g. "-2 to +1 = B") were
+// still sized for a fixed, spread-out guessed baseline, not a
+// self-centered one. Narrow bands around a self-centered mean squeeze
+// almost every pick into the middle grades no matter how the round actually
+// played out. Fixed by grading on each pick's RANK against its actual
+// round peers instead of a delta threshold — guarantees a real spread
+// every single draft (some picks are always relatively best/worst in
+// their round, by definition of ranking), regardless of how tightly or
+// widely that round's overalls happen to cluster.
+function gradeForRoundRank(rankFraction) {
+  if (rankFraction <= 0.10) return 'A+';
+  if (rankFraction <= 0.25) return 'A';
+  if (rankFraction <= 0.45) return 'B+';
+  if (rankFraction <= 0.65) return 'B';
+  if (rankFraction <= 0.85) return 'C';
+  if (rankFraction <= 0.95) return 'D';
+  return 'F';
+}
+
+function applyMaddenDraftGradeFloor(grade, overall) {
+  const numOverall = Number(overall || 0);
+  // 7J-DRAFTGRADEFLOOR: a 62 OVR 4th-round pick graded a "B" because it was
+  // close to that round's baseline — but a player that low realistically
+  // won't make an NFL roster no matter how the round around them went. A
   // weak round doesn't make an individual weak pick within it fine. Caps
-  // the grade by absolute overall regardless of relative delta, and can
-  // only ever make a grade worse, never better, than what relative
-  // performance already earned.
-  if (numOverall < 60) grade = 'F';
-  else if (numOverall < 65) grade = worseMaddenGrade(grade, 'D');
-  return { expected, delta, grade };
+  // the grade by absolute overall regardless of relative/rank performance,
+  // and can only ever make a grade worse, never better.
+  if (numOverall < 60) return 'F';
+  if (numOverall < 65) return worseMaddenGrade(grade, 'D');
+  return grade;
 }
 
 function averageDraftGrade(grades) {
@@ -57831,11 +57848,10 @@ async function getMaddenDraftClass(guildId, leagueId, teamName = null) {
     });
   }
 
-  // Self-calibrate each round's baseline from this actual class (its
-  // average overall for that round) rather than trusting the fixed guessed
-  // table — see the table's own comment for why. Needs a real sample to
-  // mean anything; falls back to the static table for a round too thin to
-  // average meaningfully (e.g. a supplemental round with 1-2 picks).
+  // Self-calibrated round baseline — kept purely as a descriptive stat now
+  // ("expected ~X" shown next to each pick), not what determines the
+  // grade. Needs a real sample to mean anything; falls back to the static
+  // table for a round too thin to average meaningfully.
   const overallsByRound = new Map();
   for (const r of drafted) {
     if (!overallsByRound.has(r.draft_round)) overallsByRound.set(r.draft_round, []);
@@ -57848,11 +57864,29 @@ async function getMaddenDraftClass(guildId, leagueId, teamName = null) {
       : expectedMaddenOverallForRound(round));
   }
 
+  // Rank each pick against its actual round peers — see 7J-DRAFTGRADESPREAD
+  // above for why this replaced delta-threshold grading.
+  const gradeByRef = new Map();
+  const rowsByRound = new Map();
+  for (const r of drafted) {
+    if (!rowsByRound.has(r.draft_round)) rowsByRound.set(r.draft_round, []);
+    rowsByRound.get(r.draft_round).push(r);
+  }
+  for (const [, list] of rowsByRound) {
+    const sorted = [...list].sort((a, b) => b.overall - a.overall);
+    const n = sorted.length;
+    sorted.forEach((r, idx) => {
+      const rankFraction = n > 1 ? idx / (n - 1) : 0; // 0 = best in round, 1 = worst
+      gradeByRef.set(r, gradeForRoundRank(rankFraction));
+    });
+  }
+
   const rookies = drafted
     .filter(r => !teamName || String(r.team_name || '').toLowerCase() === String(teamName).toLowerCase())
     .map(r => {
       const expected = roundBaseline.get(r.draft_round) ?? expectedMaddenOverallForRound(r.draft_round);
-      const { delta, grade } = gradeMaddenDraftPick(r.overall, expected);
+      const { delta } = gradeMaddenDraftPick(r.overall, expected);
+      const grade = applyMaddenDraftGradeFloor(gradeByRef.get(r) || 'C', r.overall);
       return { ...r, expected_overall: Math.round(expected), value_delta: delta, grade };
     });
   rookies.sort((a, b) => (a.draft_round - b.draft_round) || ((a.draft_pick ?? 0) - (b.draft_pick ?? 0)));
