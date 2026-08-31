@@ -25997,7 +25997,16 @@ if (interaction.commandName === 'avatar') {
       const league = await getLeagueById(leagueId).catch(() => null);
       if (!league || !interaction.guild) return;
       const round = Number(roundText || 0);
-      const rookies = await getMaddenDraftClass(interaction.guild.id, league.league_id).catch(() => []);
+      // 7J-10BY-DRAFTRECAPSNAPSHOT: read the frozen snapshot if this
+      // season's recap has already been posted, so clicking round buttons
+      // later in the season shows the same data as the original post
+      // instead of getMaddenDraftClass's live (and, confirmed live,
+      // drifting) recomputation. Falls back to live data only if no
+      // snapshot exists yet for this league/season (e.g. viewing a manual
+      // /draftrecap result before the auto-post has fired).
+      const seasonKeyForRoundView = await getMaddenCurrentSeasonKey(league).catch(() => null);
+      const snapshotRookies = await getMaddenDraftRecapSnapshot(interaction.guild.id, league.league_id, seasonKeyForRoundView).catch(() => null);
+      const rookies = snapshotRookies || await getMaddenDraftClass(interaction.guild.id, league.league_id).catch(() => []);
       const availableRounds = [...new Set(rookies.map(r => Number(r.draft_round)))].sort((a, b) => a - b);
       const embed = round === 0 ? buildDraftRecapEmbed(league, rookies) : buildDraftRecapRoundEmbed(league, rookies, round);
       await interaction.message.edit({
@@ -58151,7 +58160,54 @@ function buildDraftRecapRoundComponents(leagueId, currentRound, availableRounds)
 // unchanged, and fires again next year once a new class of the same or
 // different size replaces it (old rookies' yearsPro rolls over off 0 by
 // then, same roster-refresh mechanic already relied on elsewhere).
+async function ensureMaddenDraftRecapSnapshotTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_draft_recap_snapshots (
+      guild_id TEXT NOT NULL,
+      league_id UUID NOT NULL,
+      season_key TEXT NOT NULL,
+      rookies_json JSONB NOT NULL,
+      posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (guild_id, league_id, season_key)
+    )
+  `);
+}
+
+// 7J-10BY-DRAFTRECAPSNAPSHOT: real bug, confirmed live a THIRD time —
+// getMaddenDraftClass recomputes the rookie list live from madden_players
+// on every call, not from a stored snapshot. The debounce fix below (two
+// consecutive identical reads) only protects against settling right after
+// the draft — rookie data turns out to keep genuinely drifting all season
+// long (trades, releases, position/team changes on rookies), so the count
+// can stabilize, post, then later stabilize again at a DIFFERENT value and
+// post again. Per Hxxdie: the draft recap is a single historical event —
+// post exactly once, right after the draft, and never change again for
+// that season no matter what happens to those players afterward. Freezes
+// the actual rookie data once, the first time it's genuinely ready, and
+// reads that frozen snapshot forever after for that season — never
+// touching getMaddenDraftClass again once frozen, regardless of drift.
+async function getMaddenDraftRecapSnapshot(guildId, leagueId, seasonKey) {
+  await ensureMaddenDraftRecapSnapshotTable();
+  const result = await pool.query(
+    `SELECT rookies_json FROM madden_draft_recap_snapshots WHERE guild_id = $1 AND league_id::text = $2::text AND season_key = $3::text`,
+    [guildId, String(leagueId), seasonKey]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0]?.rookies_json || null;
+}
+
 async function checkAndPostMaddenDraftRecap(guild, league) {
+  await ensureMaddenDraftRecapSnapshotTable();
+  const seasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
+
+  // Already frozen and posted for this season — never touch live draft
+  // data again, no matter how much it's drifted since. This is the actual
+  // permanent lock; everything below only runs before that snapshot exists.
+  const existingSnapshot = await pool.query(
+    `SELECT 1 FROM madden_draft_recap_snapshots WHERE guild_id = $1 AND league_id::text = $2::text AND season_key = $3::text LIMIT 1`,
+    [guild.id, String(league.league_id), seasonKey]
+  ).catch(() => ({ rows: [] }));
+  if ((existingSnapshot.rows || []).length > 0) return;
+
   // 7J-DRAFTRECAPSANITY: getMaddenDraftClass itself now filters out
   // pre-draft placeholder/prospect noise (see 7J-DRAFTCLASSSANITY there) —
   // this only needs its own check for whether a real, COMPLETE class exists
@@ -58160,23 +58216,12 @@ async function checkAndPostMaddenDraftRecap(guild, league) {
   const rookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
   if (rookies.length < 20) return; // not a real completed draft class yet
 
-  // 7J-10BY-DRAFTRECAPDEBOUNCE: real bug, confirmed live TWICE now —
-  // getMaddenDraftClass recomputes the rookie list live from madden_players
-  // on every call, not from a stored snapshot, so roster data can genuinely
-  // keep settling across syncs (a rookie missing a team assignment on one
-  // sync, populated by the next) with zero real change to the draft. The
-  // first fix keyed dedup on rookies.length directly — any fluctuation
-  // reposted the whole recap. The second fix keyed on season_key instead —
-  // but that depends on league.madden_season_year, which itself gets
-  // populated by EA's hub mid-stream, same as every other field that's
-  // proven unstable today; if it was null for the first post and got a
-  // real value by a later one, that's a different key both times, same
-  // failure shape one layer over. This targets the actual root cause
-  // instead of hunting a fourth proxy identity: require the rookie count
-  // to read IDENTICAL across two consecutive syncs before ever
-  // considering it final. A still-settling count naturally keeps changing
-  // sync to sync and never gets a chance to post; a genuinely-finished
-  // draft naturally stabilizes and posts exactly once.
+  // 7J-10BY-DRAFTRECAPDEBOUNCE: still worth keeping even with the snapshot
+  // lock above — this only protects against freezing an INCOMPLETE class
+  // mid-settling (e.g. catching it at 20 real picks with 12 more still
+  // about to appear). Once frozen, it's frozen for the whole season
+  // regardless of what happens to the live count afterward, so getting the
+  // moment of freezing right still matters.
   const lastSeenResult = await pool.query(
     `SELECT last_value FROM madden_storyline_posts WHERE guild_id = $1 AND league_id::text = $2::text AND story_type = 'draft_recap' AND subject_key = 'last_seen_count'`,
     [guild.id, String(league.league_id)]
@@ -58189,12 +58234,22 @@ async function checkAndPostMaddenDraftRecap(guild, league) {
     [randomUUID(), guild.id, String(league.league_id), String(rookies.length)]
   ).catch(() => null);
   if (String(lastSeenCount) !== String(rookies.length)) {
-    console.log(`[AUTO DETECT] Draft class rookie count changed (${lastSeenCount ?? 'none seen yet'} -> ${rookies.length}) for league ${league.league_id} — still settling, waiting for it to stabilize before posting recap.`);
+    console.log(`[AUTO DETECT] Draft class rookie count changed (${lastSeenCount ?? 'none seen yet'} -> ${rookies.length}) for league ${league.league_id} — still settling, waiting for it to stabilize before freezing recap.`);
     return;
   }
 
-  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'draft_recap', 'posted', rookies.length).catch(() => false);
-  if (!shouldPost) return;
+  // Freeze it. ON CONFLICT DO NOTHING means if two overlapping syncs somehow
+  // both reach this point, only one snapshot ever gets recorded — the loser
+  // just won't post (checked via the row count below), rather than creating
+  // two competing "frozen" versions.
+  const freezeResult = await pool.query(
+    `INSERT INTO madden_draft_recap_snapshots (guild_id, league_id, season_key, rookies_json, posted_at)
+     VALUES ($1, $2, $3, $4::jsonb, NOW())
+     ON CONFLICT (guild_id, league_id, season_key) DO NOTHING
+     RETURNING guild_id`,
+    [guild.id, String(league.league_id), seasonKey, JSON.stringify(rookies)]
+  ).catch(() => ({ rows: [] }));
+  if (!(freezeResult.rows || []).length) return; // lost the race to another overlapping sync — it already posted
 
   const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
   const draftRecapChannelId = league.draft_recap_channel_id || newsChannelId;
@@ -76587,6 +76642,28 @@ async function performMaddenRegularSeasonKickoff(guild, league, newWeekLabel) {
      WHERE league_id = $1`,
     [league.league_id]
   ).catch(() => null);
+
+  // 2a. 7J-10BY-TRADECOUNTRESET: real bug, confirmed live — league_trade_counts
+  // had no season scoping and nothing anywhere ever reset it, despite
+  // trade_limit_per_season (checked against this exact counter — see the
+  // negotiate/confirm flow) being explicitly a PER-SEASON limit. Without a
+  // reset, a team's count only ever goes up across the league's entire
+  // history, meaning any team that ever hit the limit once would be
+  // permanently locked out of trading forever, every season after, with no
+  // automatic recovery — only the existing manual staff override command
+  // could unstick them, one team at a time, every single season. Resets
+  // every team back to 0 at the same reliable kickoff point that already
+  // resets weekly stats and the persistent boards.
+  const tradeCountResetResult = await pool.query(
+    `UPDATE league_trade_counts SET trade_count = 0 WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(err => {
+    console.error('[SEASON TRANSITION] Trade count reset failed:', err?.message);
+    return null;
+  });
+  console.log('[SEASON TRANSITION] Reset trade counts:', tradeCountResetResult?.rowCount || 0, 'teams');
+  await updateTradeCountPanel(guild, league).catch(err =>
+    console.error('[SEASON TRANSITION] Trade count panel refresh failed:', err?.message));
 
   // 3. Post season kickoff announcement to news channel
   const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
