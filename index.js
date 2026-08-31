@@ -884,6 +884,12 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE league_settings ADD COLUMN IF NOT EXISTS madden_sportsbook_channel_id TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS ea_reported_current_week TEXT`);
+  // 7J-10BY-SKIPPRESEASON: EA's own structural preseason signal (from hub
+  // fields, not the ambiguous "Week N" label string) — see the sync
+  // function and getMaddenNewAdvanceWeek for how this replaces the
+  // label-prefixing approach that kept breaking across two preseason
+  // rollovers.
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS ea_hub_is_preseason BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS current_season_stage TEXT NOT NULL DEFAULT 'preseason'`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS power_rankings_channel_id TEXT`);
@@ -72178,30 +72184,26 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     // getMaddenNewAdvanceWeek can compare it directly against the last-processed
     // week without needing to guess from game data at all.
     if (eaHubCtx?.displayedWeek) {
-      // 7J-10BY-RAWWEEKNORM: real bug, confirmed live over two separate
-      // preseason rollovers — EA's hub reports a bare "Week N" here even
-      // while the league is genuinely in preseason; it never carries the
-      // "Preseason" prefix on this field. Individual game rows already get
-      // corrected for this at import time (repairEaFutureWeekLabelFromGameCore
-      // / 7J-10BY-EF), but this column — the one thing every week-advance
-      // consumer reads as ground truth (getMaddenNewAdvanceWeek, the
-      // playoff-bracket catchup pass, ESPN news week labels) — was storing
-      // the raw, un-prefixed value. That desyncs it from the label
-      // namespace game rows actually live in: a genuinely-unchanged
-      // preseason week reads as moving from preseason (sort group 0) to
-      // regular season (sort group 1), producing a false advance and, on
-      // the sync right after a real anchor reset, silently skipping game-
-      // thread creation entirely. Normalized ONCE here, at the single
-      // point this gets persisted, using the exact rule 7J-10BY-EF already
-      // proved correct for game rows — so no individual downstream
-      // consumer, present or future, needs its own special case for this.
-      const rawDisplayedWeek = String(eaHubCtx.displayedWeek).trim();
-      const normalizedDisplayedWeek = (preseasonMode && /^week\s+\d+$/i.test(rawDisplayedWeek))
-        ? 'Preseason Week ' + rawDisplayedWeek.match(/\d+/)[0]
-        : rawDisplayedWeek;
+      // 7J-10BY-SKIPPRESEASON: per Hxxdie — after two separate preseason
+      // rollovers each costing real debugging time (the raw-vs-prefixed
+      // "Week N" ambiguity kept resurfacing in new places no matter how
+      // many individual consumers got patched), preseason games/threads/
+      // sportsbook lines are being dropped from scope entirely — matches
+      // what competitor bots (e.g. Neon Sports) already do, almost
+      // certainly for this exact reason. Rather than keep trying to
+      // reliably disambiguate EA's ambiguous "Week N" string (which is
+      // what every prior fix attempted and what kept breaking), this
+      // persists EA's own STRUCTURAL preseason signal instead —
+      // isEaHubInPreseason/preseasonMode above reads real hub fields
+      // (weekType:0, explicit isPreseason flag) that have nothing to do
+      // with the ambiguous label string at all. getMaddenNewAdvanceWeek
+      // now gates on this boolean directly and never processes an advance
+      // while it's true — see 7J-10BY-SKIPPRESEASON there. Rosters/players
+      // are untouched by this: that sync happens unconditionally earlier
+      // in this same function, independent of week-advance detection.
       await pool.query(
-        `UPDATE madden_league_settings SET ea_reported_current_week = $2, updated_at = NOW() WHERE league_id = $1`,
-        [league.league_id, normalizedDisplayedWeek]
+        `UPDATE madden_league_settings SET ea_reported_current_week = $2, ea_hub_is_preseason = $3, updated_at = NOW() WHERE league_id = $1`,
+        [league.league_id, String(eaHubCtx.displayedWeek).trim(), Boolean(preseasonMode)]
       ).catch(error => console.error('[Madden Sync] Failed to persist EA reported current week:', error?.message));
     }
 
@@ -74435,6 +74437,7 @@ async function ensureMaddenAutoDetectColumns() {
   // Week-advance dedup guard + detection settings
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS last_auto_detect_week_label TEXT`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS ea_reported_current_week TEXT`);
+  await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS ea_hub_is_preseason BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_threshold INTEGER NOT NULL DEFAULT 30`);
   await pool.query(`ALTER TABLE madden_league_settings ADD COLUMN IF NOT EXISTS auto_detect_review_channel_id TEXT`);
@@ -74466,32 +74469,32 @@ async function ensureMaddenAutoDetectColumns() {
 // ---------------------------------------------------------------------------
 async function getMaddenNewAdvanceWeek(guildId, leagueId) {
   const settingsResult = await pool.query(
-    `SELECT last_auto_detect_week_label, ea_reported_current_week, current_season_stage FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
+    `SELECT last_auto_detect_week_label, ea_reported_current_week, current_season_stage, ea_hub_is_preseason FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
     [leagueId]
   ).catch(() => ({ rows: [] }));
   const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
-  const eaReportedWeekRaw = settingsResult.rows[0]?.ea_reported_current_week || null;
+  const eaReportedWeek = settingsResult.rows[0]?.ea_reported_current_week || null;
   const currentSeasonStage = settingsResult.rows[0]?.current_season_stage || null;
 
-  // 7J-10BY-RAWWEEKNORM: real bug, confirmed live — EA's hub field
-  // (ea_reported_current_week) reports a bare "Week N" even while the
-  // league is genuinely in preseason; it never carries the "Preseason"
-  // prefix. Individual game rows already get corrected for this at import
-  // time (see repairEaFutureWeekLabelFromGameCore / 7J-10BY-EF), but every
-  // comparison in THIS function was reading the raw, un-prefixed value
-  // directly — so it lived in a different label namespace than lastLabel/
-  // allWeeks (which DO end up prefixed once real preseason games ground
-  // them there). Consequence, confirmed live: the first-run anchor stored
-  // the raw "Week 2" forever, and on the very next sync where EA still
-  // reports "Week 2" unchanged, the group comparison would read that as
-  // moving from preseason (group 0) to regular season (group 1) — a false
-  // "advance" out of preseason with nothing having actually changed.
-  // Normalized once, right at the source, using the exact same rule
-  // 7J-10BY-EF already proved correct, so nothing further down needs its
-  // own special case.
-  const eaReportedWeek = (currentSeasonStage === 'preseason' && /^week\s+\d+$/i.test(String(eaReportedWeekRaw || '').trim()))
-    ? 'Preseason Week ' + String(eaReportedWeekRaw).trim().match(/\d+/)[0]
-    : eaReportedWeekRaw;
+  // 7J-10BY-SKIPPRESEASON: per Hxxdie — preseason games/threads/sportsbook
+  // lines are out of scope entirely now, after two separate preseason
+  // rollovers each surfaced a NEW way the raw-vs-"Preseason "-prefixed
+  // "Week N" label ambiguity could desync detection from real game data
+  // (false advances, silently skipped thread creation, stale-data
+  // collisions). Every one of those fixes was still built on top of that
+  // ambiguous string, so each one only closed the specific case already
+  // seen live. Gating here on EA's own STRUCTURAL preseason signal
+  // (ea_hub_is_preseason, persisted from isEaHubInPreseason/weekType — see
+  // the sync function — not derived from the label string at all) removes
+  // the ambiguity itself instead of patching around it again: while this
+  // is true, no advance is ever recognized, so nothing week-gated below
+  // (game threads, sportsbook lines/props, season-transition checks) ever
+  // runs during preseason. Rosters/players are unaffected — that sync is
+  // unconditional, earlier in the same function, independent of this gate.
+  if (settingsResult.rows[0]?.ea_hub_is_preseason) {
+    console.log(`[AUTO DETECT] League ${leagueId} is in preseason (EA hub signal) — skipping all advance processing by design.`);
+    return null;
+  }
 
   // 7J-10BY-SEASONKEYALLWEEKS: real bug, confirmed live — this query had
   // no season_key scoping (the same escape-hatch pattern the Session 42
@@ -74596,65 +74599,23 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
       console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" right after a playoff week ("${lastLabel}") while still in playoffs — treating as "${safeLabel}" instead of trusting the raw (potentially colliding) report.`);
       return safeLabel;
     }
-    // 7J-OFFSEASONROLLOVERFIX: real bug, confirmed live — an entire
-    // offseason (Free Agency, Draft, etc.) never registers as a "new
-    // advance" through this function at all (see 7J-OFFSEASONGATEFIX
-    // elsewhere, which had to move retirement/transaction detection OUT
-    // from behind this same gate for exactly this reason), so
-    // last_auto_detect_week_label stays stuck at whatever the last real
-    // week was — the OLD season's Super Bowl (group 2). When the new
-    // season's real preseason/regular week finally arrives, the raw
-    // group-number comparison sees "preseason/regular" as sorting BEFORE
-    // "playoffs" and refuses to recognize it as forward progress — even
-    // though it's obviously a new season starting, not the league
-    // regressing.
-    //
-    // 7J-OFFSEASONROLLOVERLABELFIX: first version of this trusted
-    // eaReportedWeek's raw string directly once recognized as a season
-    // start — confirmed live this breaks exactly the same way
-    // 7J-POSTPLAYOFFWEEKFIX2 already had to fix once: EA reported the
-    // generic "Week 1" for what was actually preseason week 1, and
-    // downstream game-thread creation matched that raw label against old
-    // STALE "Week 1" rows already sitting in madden_imported_games from
-    // last regular season — threading last season's Week 1 matchups
-    // instead of the real new preseason games. Unlike the playoffs case,
-    // synthesizing a guessed safe label (e.g. blindly returning "Preseason
-    // Week 1") isn't good enough either — preseason has real games that
-    // need to match their ACTUAL stored label, not a guess. Grounds the
-    // decision in real data instead: if genuine preseason games already
-    // exist in the DB (imported under their own distinct label, still
-    // unthreaded), use that real label directly. Only trusts the raw
-    // eaReportedWeek string as-is when no such preseason data exists at
-    // all — the correct behavior for a genuinely no-preseason league
-    // reaching a real Week 1.
+    // 7J-10BY-SKIPPRESEASON: this used to ground against real unthreaded
+    // "Preseason Week N" rows in the DB to avoid a raw-label collision with
+    // stale prior-season data. That grounding is now actively wrong: with
+    // preseason permanently out of scope (see the ea_hub_is_preseason gate
+    // above), preseason game rows are NEVER threaded any more, so an
+    // unthreaded "Preseason Week N" row would ALWAYS exist by the time the
+    // league reaches real Week 1 — which would keep routing the genuine
+    // season-start detection back into a preseason label forever, exactly
+    // undoing the point of this change. Every league is now treated like
+    // the already-proven "no-preseason league reaching a real Week 1" case:
+    // trust EA's raw report directly. The season_key scoping added above
+    // (7J-10BY-SEASONKEYALLWEEKS) already covers the original stale-data
+    // collision concern for the labels that still matter.
     const looksLikeGenuineSeasonStart = currentSeasonStage === 'offseason' &&
-      (maddenIsPreseasonWeek(eaReportedWeek) || /^week \d+$/i.test(String(eaReportedWeek || '').trim()));
+      /^week \d+$/i.test(String(eaReportedWeek || '').trim());
     if (!genuinelyMovedForward && looksLikeGenuineSeasonStart) {
-      if (maddenIsPreseasonWeek(eaReportedWeek)) {
-        // EA's own label is already unambiguously "Preseason Week N" — no
-        // collision risk, trust it directly.
-        console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" while league was stuck in 'offseason' stage — recognizing as the start of a new season despite not sorting after the stale last-processed label ("${lastLabel}").`);
-        return eaReportedWeek;
-      }
-      // Reuses the season key already computed near the top of this
-      // function (7J-10BY-SEASONKEYALLWEEKS) instead of re-querying it.
-      const groundingSeasonKey = currentSeasonKeyForAllWeeks;
-      const realPreseasonRows = await pool.query(
-        `SELECT DISTINCT week_label FROM madden_imported_games
-         WHERE guild_id = $1 AND league_id::text = $2::text
-           AND LOWER(week_label) LIKE 'preseason week%'
-           AND thread_id IS NULL
-           AND season_key = $3::text`,
-        [guildId, String(leagueId), groundingSeasonKey]
-      ).catch(() => ({ rows: [] }));
-      const realPreseasonLabels = (realPreseasonRows.rows || []).map(r => r.week_label).filter(Boolean);
-      realPreseasonLabels.sort(compareMaddenWeekLabels);
-      if (realPreseasonLabels.length) {
-        const safeLabel = realPreseasonLabels[0];
-        console.log(`[AUTO DETECT] EA reported raw "${eaReportedWeek}" right after offseason, but real unthreaded preseason games exist under "${safeLabel}" — using that instead of the raw (colliding) report.`);
-        return safeLabel;
-      }
-      console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" while league was stuck in 'offseason' stage, with no preseason game data found — recognizing as a no-preseason league's real season start.`);
+      console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" while league was stuck in 'offseason' stage — recognizing as the start of the regular season despite not sorting after the stale last-processed label ("${lastLabel}").`);
       return eaReportedWeek;
     }
     if (!genuinelyMovedForward) return null;
@@ -76542,6 +76503,12 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
 
   // Reset for next year: once a new preseason begins after an offseason was finalized,
   // clear the flag so the next Super Bowl can trigger this again.
+  // 7J-10BY-SKIPPRESEASON: effectively dead as of the preseason-skip change —
+  // getMaddenNewAdvanceWeek never returns a "Preseason Week N" label any
+  // more (see its ea_hub_is_preseason gate), so newWeekLabel here will
+  // never satisfy maddenIsPreseasonWeek(). Left in place rather than
+  // deleted in case preseason support is ever restored later; harmless
+  // either way since it just never fires.
   if (stage === 'offseason' && maddenIsPreseasonWeek(newWeekLabel)) {
     // 7J-PRESEASONSTATWIPE: per user request — stats should also wipe at
     // the START of preseason, not just at the preseason→regular
