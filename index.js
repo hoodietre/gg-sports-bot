@@ -72453,7 +72453,9 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     // Clear, explicit week-advance status — this is what actually answers "did
     // anything new happen," rather than leaving it silent either way.
     const advanceStatusLine = autoDetectResult?.advanced
-      ? `📅 **Advanced to ${autoDetectResult.weekLabel}** — new games, sportsbook lines, and props were created for this week.`
+      ? (autoDetectResult.weeksProcessed > 1
+          ? `📅 **Caught up ${autoDetectResult.weeksProcessed} weeks** (${autoDetectResult.weeksList.join(' → ')}) — each week's results/news/streaks were processed individually; new games, sportsbook lines, and props were created only for ${autoDetectResult.weekLabel} (the current week).`
+          : `📅 **Advanced to ${autoDetectResult.weekLabel}** — new games, sportsbook lines, and props were created for this week.`)
       : `📅 **No new week detected.** You must advance in Madden before syncing again — this sync only refreshed rosters/stats for the current week.`;
 
     const message =
@@ -77286,80 +77288,160 @@ async function autoDetectAfterSyncInner(guild, league) {
       console.error('[AUTO DETECT] Offseason transaction news:', err?.message));
   }
 
-  // Week-advance dedup guard — everything below this point (news/streaks/
-  // performances, new lines, new props, thread creation, season transitions) is
-  // genuinely tied to "a new week has begun," not to any individual game
-  // finishing, and isn't safe to run more than once per real advance.
-  const newWeekLabel = await getMaddenNewAdvanceWeek(guild.id, league.league_id);
-  if (!newWeekLabel) {
+  // 7J-10BY-CATCHUPLOOP: per Hxxdie — a league that advances many real
+  // weeks in Madden between syncs (e.g. straight to Week 15 without
+  // syncing along the way) used to require one manual sync per missed
+  // week, because getMaddenNewAdvanceWeek deliberately caps to one step
+  // forward at a time (see its own comment — that cap is a real, hard-won
+  // safety property from three earlier rounds of this logic being wrong in
+  // production, and stays exactly as-is). Rather than remove that safety
+  // cap, this loops it automatically within a single sync instead of
+  // requiring repeated manual syncs — each step is still the same proven
+  // single-week advance, just chained.
+  //
+  // Two passes on purpose:
+  // Pass 1 discovers the FULL sequence of missed weeks by repeatedly
+  // calling the existing, unmodified single-step detector and advancing
+  // the anchor each time — this is the exact same mechanism a human
+  // manually re-syncing 13 times would trigger, just automatic. Knowing
+  // the whole sequence up front is what lets pass 2 below tell which week
+  // is the real current one vs. a historical catch-up week, without any
+  // lookahead trickery.
+  // Pass 2 processes each discovered week individually — its own results,
+  // streaks, news, retirements, standings — exactly as if each had been
+  // synced separately in sequence, per Hxxdie's explicit ask. Only the
+  // FINAL (most current) week gets game threads and sportsbook lines/
+  // props: per Hxxdie, a catch-up week is by definition already fully
+  // decided by the time the bot reaches it, so a thread inviting people to
+  // schedule a game that's already over, or a betting line on a result
+  // that already happened, is meaningless and would just spam dead
+  // threads/lines across every historical week.
+  //
+  // Trade-off, stated plainly: the original single-week design marked a
+  // week processed only as the very last step, specifically so a mid-run
+  // crash would retry that whole week on the next sync. Pass 1 here
+  // advances the anchor for ALL discovered weeks up front, before pass 2's
+  // heavier processing runs for each — so a crash partway through pass 2
+  // (rare: this only runs at all when catching up more than one week)
+  // could leave a historical week's news/streaks processing incomplete
+  // without retrying it automatically. Threads/lines for the final week
+  // are unaffected (pass 2 still runs those in order, and the final week
+  // is always processed since it's last in the list) — the risk is
+  // narrowly scoped to historical catch-up weeks' informational
+  // recaps, not to anything player-facing like threads or money.
+  const MADDEN_CATCHUP_MAX_WEEKS_PER_SYNC = 20; // full-season safety cap, not a practical limit
+  const preLoopSettings = await ensureMaddenLeagueSettings(league);
+  const anchorBeforeCatchup = preLoopSettings.last_auto_detect_week_label || null;
+
+  const weeksToProcess = [];
+  while (weeksToProcess.length < MADDEN_CATCHUP_MAX_WEEKS_PER_SYNC) {
+    const nextWeek = await getMaddenNewAdvanceWeek(guild.id, league.league_id);
+    if (!nextWeek) break;
+    weeksToProcess.push(nextWeek);
+    await markMaddenAdvanceProcessed(guild.id, league.league_id, nextWeek);
+  }
+
+  if (!weeksToProcess.length) {
     console.log(`[AUTO DETECT] No new advance detected for league ${league.league_id} — skipping week-level processing.`);
     return { advanced: false, weekLabel: null };
   }
 
-  console.log(`[AUTO DETECT] New week detected: ${newWeekLabel} for league ${league.league_id}`);
-  const settings = await ensureMaddenLeagueSettings(league);
-  const previousWeekLabel = settings.last_auto_detect_week_label || null;
-  const allEvents = [];
-
-  // Game thread creation — gated on this confirmed newWeekLabel rather than the
-  // independent threadless-week inference the old ungated call sites used. See
-  // tracking doc handoff: that inference is what created Week 4 threads on a
-  // sync that correctly reported no new week for Week 3.
-  await autoCreateGameThreadsAfterSync(guild, league, newWeekLabel).catch(err =>
-    console.error('[AUTO DETECT] Game thread creation failed:', err?.message || err));
-
-  // 7J-26STORY: Game of the Week — the new week's games now exist (thread
-  // creation just ran), so standings-based selection can run against them.
-  const gameOfWeek = await selectMaddenGameOfTheWeek(guild, league, newWeekLabel).catch(() => null);
-  if (gameOfWeek) allEvents.push(gameOfWeek);
-
-  // Check for preseason → regular season transition before anything else
-  await handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel).catch(err =>
-    console.error('[AUTO DETECT] Season transition handler failed:', err?.message));
-
-  // Check for regular/playoffs → offseason transition (Super Bowl final) — auto-posts
-  // league history and finalizes awards/champion, no manual command needed.
-  await handleMaddenOffseasonTransition(guild, league, newWeekLabel).catch(err =>
-    console.error('[AUTO DETECT] Offseason transition handler failed:', err?.message));
-
-  // 3. Game results, performances, streaks, awards, power movers
-  const gameEvents = await autoProcessMaddenGameResults(guild, league, newWeekLabel).catch(() => []);
-  allEvents.push(...gameEvents);
-
-  // 4. Sportsbook auto-lines for the new week
-  await autoCreateMaddenSportsbookLines(guild, league, newWeekLabel).catch(err =>
-    console.error('[AUTO DETECT] Sportsbook lines:', err?.message));
-
-  // 4a. Sportsbook player prop lines for the new week — analytical, not hand-picked.
-  // Runs after auto-lines above so is_user_vs_user is already set on this week's games.
-  await generateMaddenPlayerPropLines(guild, league, newWeekLabel).catch(err =>
-    console.error('[AUTO DETECT] Player prop lines:', err?.message));
-
-  // 4b. Stat-prop auto-settlement — previously only ran when a staff member manually
-  // typed /sportsbook autosettleprops confirm:true. Settlement shouldn't be manual
-  // any more than creation should be, so this now runs the same confirm:true pass
-  // automatically right after the week's stats have synced in. Uses a shimmed
-  // interaction-like object since this is system-triggered, not a real Discord
-  // interaction — autoSettleOpenStatProps only reads .guild/.guild.id/.user.id, it
-  // never calls .reply()/.editReply(), so this is safe. 'system' as the actor id
-  // matches the same convention autoCreateMaddenSportsbookLines already uses.
-  await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true }).catch(err =>
-    console.error('[AUTO DETECT] Stat prop settlement:', err?.message));
-
-  // 5. ESPN-style news
-  if (allEvents.length > 0) {
-    await generateMaddenESPNNews(guild, league, allEvents, newWeekLabel, previousWeekLabel).catch(err =>
-      console.error('[AUTO DETECT] ESPN news:', err?.message));
+  if (weeksToProcess.length > 1) {
+    console.log(`[AUTO DETECT] Catch-up: league ${league.league_id} advanced ${weeksToProcess.length} weeks since last sync (${weeksToProcess.join(' -> ')}) — processing each individually, threads/lines only for the final week.`);
   }
 
-  // 6. Persistent embed refresh (standings, free agents, power rankings)
+  const allEvents = [];
+  for (let i = 0; i < weeksToProcess.length; i++) {
+    const newWeekLabel = weeksToProcess[i];
+    const previousWeekLabel = i === 0 ? anchorBeforeCatchup : weeksToProcess[i - 1];
+    const isFinalWeek = i === weeksToProcess.length - 1;
+    const weekEvents = [];
+
+    console.log(`[AUTO DETECT] New week detected: ${newWeekLabel} for league ${league.league_id}` + (weeksToProcess.length > 1 ? ` (${i + 1}/${weeksToProcess.length})` : ''));
+
+    // Game thread creation — only for the current/final week. Gated on this
+    // confirmed newWeekLabel rather than the independent threadless-week
+    // inference the old ungated call sites used. See tracking doc handoff:
+    // that inference is what created Week 4 threads on a sync that
+    // correctly reported no new week for Week 3.
+    if (isFinalWeek) {
+      await autoCreateGameThreadsAfterSync(guild, league, newWeekLabel).catch(err =>
+        console.error('[AUTO DETECT] Game thread creation failed:', err?.message || err));
+    } else {
+      console.log(`[AUTO DETECT] Skipping game threads for ${newWeekLabel} — already-decided catch-up week, not the current one.`);
+    }
+
+    // 7J-26STORY: Game of the Week — the new week's games now exist (schedule
+    // import already ran for this sync), so standings-based selection can
+    // run against them regardless of whether threads were created.
+    const gameOfWeek = await selectMaddenGameOfTheWeek(guild, league, newWeekLabel).catch(() => null);
+    if (gameOfWeek) weekEvents.push(gameOfWeek);
+
+    // Check for preseason → regular season transition before anything else.
+    // Runs for every discovered week, not just the final one — if a
+    // catch-up run crosses an actual season boundary partway through (e.g.
+    // Preseason Week 3 -> Week 1 as step 2 of a 5-week catch-up), the
+    // kickoff needs to fire at THAT step, not be skipped because it isn't
+    // the last week in the batch.
+    await handleMaddenSeasonTransition(guild, league, previousWeekLabel, newWeekLabel).catch(err =>
+      console.error('[AUTO DETECT] Season transition handler failed:', err?.message));
+
+    // Check for regular/playoffs → offseason transition (Super Bowl final) —
+    // same reasoning: must run every step, not just the final one.
+    await handleMaddenOffseasonTransition(guild, league, newWeekLabel).catch(err =>
+      console.error('[AUTO DETECT] Offseason transition handler failed:', err?.message));
+
+    // 3. Game results, performances, streaks, awards, power movers — every
+    // week gets its own, not merged with any other week's.
+    const gameEvents = await autoProcessMaddenGameResults(guild, league, newWeekLabel).catch(() => []);
+    weekEvents.push(...gameEvents);
+
+    // 4. Sportsbook auto-lines — only for the current/final week (see
+    // 7J-10BY-CATCHUPLOOP above for why historical catch-up weeks skip this).
+    if (isFinalWeek) {
+      await autoCreateMaddenSportsbookLines(guild, league, newWeekLabel).catch(err =>
+        console.error('[AUTO DETECT] Sportsbook lines:', err?.message));
+      // 4a. Sportsbook player prop lines — analytical, not hand-picked. Runs
+      // after auto-lines above so is_user_vs_user is already set on this
+      // week's games.
+      await generateMaddenPlayerPropLines(guild, league, newWeekLabel).catch(err =>
+        console.error('[AUTO DETECT] Player prop lines:', err?.message));
+    } else {
+      console.log(`[AUTO DETECT] Skipping sportsbook lines/props for ${newWeekLabel} — already-decided catch-up week.`);
+    }
+
+    // 4b. Stat-prop auto-settlement — previously only ran when a staff member
+    // manually typed /sportsbook autosettleprops confirm:true. Settlement
+    // shouldn't be manual any more than creation should be, so this now runs
+    // the same confirm:true pass automatically right after each week's stats
+    // have synced in. Uses a shimmed interaction-like object since this is
+    // system-triggered, not a real Discord interaction — autoSettleOpenStatProps
+    // only reads .guild/.guild.id/.user.id, it never calls .reply()/.editReply(),
+    // so this is safe. 'system' as the actor id matches the same convention
+    // autoCreateMaddenSportsbookLines already uses.
+    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true }).catch(err =>
+      console.error('[AUTO DETECT] Stat prop settlement:', err?.message));
+
+    // 5. ESPN-style news — fired individually per week, not merged with any
+    // other week's, per Hxxdie's explicit ask for catch-up to look exactly
+    // like separate syncs happened.
+    if (weekEvents.length > 0) {
+      await generateMaddenESPNNews(guild, league, weekEvents, newWeekLabel, previousWeekLabel).catch(err =>
+        console.error('[AUTO DETECT] ESPN news:', err?.message));
+    }
+
+    allEvents.push(...weekEvents);
+  }
+
+  // 6. Persistent embed refresh (standings, free agents, power rankings) —
+  // once at the end is enough; each intermediate week would only refresh
+  // the same boards to the same eventual final state.
   await refreshPersistentMaddenEmbeds(guild, league).catch(err =>
     console.error('[AUTO DETECT] Persistent embeds:', err?.message));
 
-  // Mark this week as processed — must be last so a crash mid-run retries next sync
-  await markMaddenAdvanceProcessed(guild.id, league.league_id, newWeekLabel);
-  console.log(`[AUTO DETECT] Completed for ${newWeekLabel}, league ${league.league_id}`);
-  return { advanced: true, weekLabel: newWeekLabel, eventCount: allEvents.length };
+  const finalWeekLabel = weeksToProcess[weeksToProcess.length - 1];
+  console.log(`[AUTO DETECT] Completed for ${finalWeekLabel}, league ${league.league_id}` + (weeksToProcess.length > 1 ? ` — caught up ${weeksToProcess.length} weeks (${weeksToProcess.join(', ')})` : ''));
+  return { advanced: true, weekLabel: finalWeekLabel, weeksProcessed: weeksToProcess.length, weeksList: weeksToProcess, eventCount: allEvents.length };
 }
 
 
