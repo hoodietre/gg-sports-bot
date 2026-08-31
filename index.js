@@ -76200,7 +76200,7 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   }
 
   // Award race leaders
-  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex || null).catch(() => null);
+  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex != null ? latestWeekIndex : null).catch(() => null);
   if (awardLeaders) {
     events.push({ type: 'award_race', leaders: awardLeaders });
   }
@@ -76245,8 +76245,8 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
 // per-stat-type queries, each with its own limit, so all three categories are
 // guaranteed a fair shot regardless of how many passing rows exist.
 async function getMaddenAwardRaceLeaders(guildId, leagueId, weekIndex = null) {
-  const weekFilter = weekIndex ? 'AND week_index = $3' : '';
-  const values = weekIndex ? [guildId, String(leagueId), weekIndex] : [guildId, String(leagueId)];
+  const weekFilter = weekIndex != null ? 'AND week_index = $3' : '';
+  const values = weekIndex != null ? [guildId, String(leagueId), weekIndex] : [guildId, String(leagueId)];
 
   const [passing, rushing, receiving] = await Promise.all([
     pool.query(
@@ -76704,6 +76704,27 @@ async function performMaddenRegularSeasonKickoff(guild, league, newWeekLabel) {
   console.log('[SEASON TRANSITION] Reset trade counts:', tradeCountResetResult?.rowCount || 0, 'teams');
   await updateTradeCountPanel(guild, league).catch(err =>
     console.error('[SEASON TRANSITION] Trade count panel refresh failed:', err?.message));
+
+  // 2b. 7J-10BY-BRACKETRESET: real bug, confirmed live — league_playoff_brackets
+  // is a single mutable row per league that was never deleted or reset
+  // anywhere. handleMaddenPlayoffBracketTransition's "don't build a second
+  // bracket on top of an existing one" safety check (correctly meant to
+  // stop duplicate builds mid-season) reads that same row — so once a
+  // league finished its first season, that row permanently existed
+  // forever, and every SUBSEQUENT season's playoffs would silently skip
+  // building a real bracket, just catching the stage flag up on top of the
+  // previous season's stale bracket/champion data. Deletes it at the same
+  // reliable kickoff point already resetting trade counts and stats, so
+  // handleMaddenPlayoffBracketTransition finds no existing row and builds
+  // a genuine fresh bracket the next time this league reaches Wild Card.
+  const bracketResetResult = await pool.query(
+    `DELETE FROM league_playoff_brackets WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(err => {
+    console.error('[SEASON TRANSITION] Playoff bracket reset failed:', err?.message);
+    return null;
+  });
+  console.log('[SEASON TRANSITION] Reset playoff bracket:', bracketResetResult?.rowCount || 0, 'row(s) cleared');
 
   // 3. Post season kickoff announcement to news channel
   const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
