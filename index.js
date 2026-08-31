@@ -25998,14 +25998,13 @@ if (interaction.commandName === 'avatar') {
       if (!league || !interaction.guild) return;
       const round = Number(roundText || 0);
       // 7J-10BY-DRAFTRECAPSNAPSHOT: read the frozen snapshot if this
-      // season's recap has already been posted, so clicking round buttons
+      // league's recap has already been posted, so clicking round buttons
       // later in the season shows the same data as the original post
       // instead of getMaddenDraftClass's live (and, confirmed live,
       // drifting) recomputation. Falls back to live data only if no
-      // snapshot exists yet for this league/season (e.g. viewing a manual
-      // /draftrecap result before the auto-post has fired).
-      const seasonKeyForRoundView = await getMaddenCurrentSeasonKey(league).catch(() => null);
-      const snapshotRookies = await getMaddenDraftRecapSnapshot(interaction.guild.id, league.league_id, seasonKeyForRoundView).catch(() => null);
+      // snapshot exists yet (e.g. viewing a manual /draftrecap result
+      // before the auto-post has fired).
+      const snapshotRookies = await getMaddenDraftRecapSnapshot(interaction.guild.id, league.league_id).catch(() => null);
       const rookies = snapshotRookies || await getMaddenDraftClass(interaction.guild.id, league.league_id).catch(() => []);
       const availableRounds = [...new Set(rookies.map(r => Number(r.draft_round)))].sort((a, b) => a - b);
       const embed = round === 0 ? buildDraftRecapEmbed(league, rookies) : buildDraftRecapRoundEmbed(league, rookies, round);
@@ -58165,12 +58164,28 @@ async function ensureMaddenDraftRecapSnapshotTable() {
     CREATE TABLE IF NOT EXISTS madden_draft_recap_snapshots (
       guild_id TEXT NOT NULL,
       league_id UUID NOT NULL,
-      season_key TEXT NOT NULL,
+      season_key TEXT,
       rookies_json JSONB NOT NULL,
       posted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (guild_id, league_id, season_key)
+      PRIMARY KEY (guild_id, league_id)
     )
   `);
+  // 7J-10BY-DRAFTRECAPRESETMIGRATE: the first version of this table keyed
+  // its primary key on (guild_id, league_id, season_key) — dropping
+  // season_key from the key for tables that already exist from that
+  // version. season_key stays as a plain, non-key informational column.
+  // Dedupes first (keeping the most recent row per guild/league) since a
+  // league that already hit the original bug could have more than one row
+  // for the same guild_id/league_id under different season_key values,
+  // which would otherwise make the new single-column primary key fail to add.
+  await pool.query(`
+    DELETE FROM madden_draft_recap_snapshots a
+    USING madden_draft_recap_snapshots b
+    WHERE a.guild_id = b.guild_id AND a.league_id = b.league_id
+      AND a.posted_at < b.posted_at
+  `).catch(() => null);
+  await pool.query(`ALTER TABLE madden_draft_recap_snapshots DROP CONSTRAINT IF EXISTS madden_draft_recap_snapshots_pkey`).catch(() => null);
+  await pool.query(`ALTER TABLE madden_draft_recap_snapshots ADD CONSTRAINT madden_draft_recap_snapshots_pkey PRIMARY KEY (guild_id, league_id)`).catch(() => null);
 }
 
 // 7J-10BY-DRAFTRECAPSNAPSHOT: real bug, confirmed live a THIRD time —
@@ -58180,31 +58195,41 @@ async function ensureMaddenDraftRecapSnapshotTable() {
 // the draft — rookie data turns out to keep genuinely drifting all season
 // long (trades, releases, position/team changes on rookies), so the count
 // can stabilize, post, then later stabilize again at a DIFFERENT value and
-// post again. Per Hxxdie: the draft recap is a single historical event —
-// post exactly once, right after the draft, and never change again for
-// that season no matter what happens to those players afterward. Freezes
-// the actual rookie data once, the first time it's genuinely ready, and
-// reads that frozen snapshot forever after for that season — never
+// post again. Freezes the actual rookie data once, the first time it's
+// genuinely ready, and reads that frozen snapshot forever after — never
 // touching getMaddenDraftClass again once frozen, regardless of drift.
-async function getMaddenDraftRecapSnapshot(guildId, leagueId, seasonKey) {
+//
+// 7J-10BY-DRAFTRECAPRESET: real bug in the FIX itself, confirmed live —
+// the first version of this table's primary key included season_key,
+// which depends on league.madden_season_year, the same kind of
+// EA-hub-populated-mid-stream field that's proven unstable multiple times
+// today. If that key shifted between the first post and a later sync, the
+// lock-check looked for a snapshot under a DIFFERENT key, found nothing,
+// and posted again — same failure shape as the original bug, one layer
+// over. Dropped season_key from the key entirely: the row's mere
+// existence for (guild_id, league_id) is the lock now, no key comparison
+// involved. It's cleared at exactly one place — Super Bowl finalize, in
+// handleMaddenOffseasonTransition — the one season-boundary event that's
+// been reliable all day without a single miss.
+async function getMaddenDraftRecapSnapshot(guildId, leagueId) {
   await ensureMaddenDraftRecapSnapshotTable();
   const result = await pool.query(
-    `SELECT rookies_json FROM madden_draft_recap_snapshots WHERE guild_id = $1 AND league_id::text = $2::text AND season_key = $3::text`,
-    [guildId, String(leagueId), seasonKey]
+    `SELECT rookies_json FROM madden_draft_recap_snapshots WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guildId, String(leagueId)]
   ).catch(() => ({ rows: [] }));
   return result.rows[0]?.rookies_json || null;
 }
 
 async function checkAndPostMaddenDraftRecap(guild, league) {
   await ensureMaddenDraftRecapSnapshotTable();
-  const seasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
 
-  // Already frozen and posted for this season — never touch live draft
-  // data again, no matter how much it's drifted since. This is the actual
-  // permanent lock; everything below only runs before that snapshot exists.
+  // Already frozen and posted this cycle — never touch live draft data
+  // again, no matter how much it's drifted since. This is the actual
+  // permanent lock; everything below only runs before this row exists.
+  // Cleared only at Super Bowl finalize (see handleMaddenOffseasonTransition).
   const existingSnapshot = await pool.query(
-    `SELECT 1 FROM madden_draft_recap_snapshots WHERE guild_id = $1 AND league_id::text = $2::text AND season_key = $3::text LIMIT 1`,
-    [guild.id, String(league.league_id), seasonKey]
+    `SELECT 1 FROM madden_draft_recap_snapshots WHERE guild_id = $1 AND league_id::text = $2::text LIMIT 1`,
+    [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [] }));
   if ((existingSnapshot.rows || []).length > 0) return;
 
@@ -58219,7 +58244,7 @@ async function checkAndPostMaddenDraftRecap(guild, league) {
   // 7J-10BY-DRAFTRECAPDEBOUNCE: still worth keeping even with the snapshot
   // lock above — this only protects against freezing an INCOMPLETE class
   // mid-settling (e.g. catching it at 20 real picks with 12 more still
-  // about to appear). Once frozen, it's frozen for the whole season
+  // about to appear). Once frozen, it's frozen until the next Super Bowl
   // regardless of what happens to the live count afterward, so getting the
   // moment of freezing right still matters.
   const lastSeenResult = await pool.query(
@@ -58242,12 +58267,13 @@ async function checkAndPostMaddenDraftRecap(guild, league) {
   // both reach this point, only one snapshot ever gets recorded — the loser
   // just won't post (checked via the row count below), rather than creating
   // two competing "frozen" versions.
+  const seasonKeyForRecord = await getMaddenCurrentSeasonKey(league).catch(() => null);
   const freezeResult = await pool.query(
     `INSERT INTO madden_draft_recap_snapshots (guild_id, league_id, season_key, rookies_json, posted_at)
      VALUES ($1, $2, $3, $4::jsonb, NOW())
-     ON CONFLICT (guild_id, league_id, season_key) DO NOTHING
+     ON CONFLICT (guild_id, league_id) DO NOTHING
      RETURNING guild_id`,
-    [guild.id, String(league.league_id), seasonKey, JSON.stringify(rookies)]
+    [guild.id, String(league.league_id), seasonKeyForRecord, JSON.stringify(rookies)]
   ).catch(() => ({ rows: [] }));
   if (!(freezeResult.rows || []).length) return; // lost the race to another overlapping sync — it already posted
 
@@ -75807,20 +75833,34 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     }
   }
 
-  // Big performance detection from weekly stats
-  // 7J-28FIX: this query previously had no week_index filter at all — it
-  // matched ANY historical week's big performance, forever, meaning a
-  // player's Week 1 300-yard game would still match and re-post on every
-  // single sync through Week 15. Same class of bug as the streak-detection
-  // issue fixed two rounds ago (a feature that was never actually scoped to
-  // "recent," just never noticed). Scoped to the most recent week_index
-  // actually synced for this league, plus a dedup gate so a big game within
-  // that same week doesn't repeat across multiple syncs in the same week.
-  const latestWeekResult = await pool.query(
-    `SELECT COALESCE(MAX(week_index), 0) AS max_week FROM madden_player_weekly_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
-    [guild.id, String(league.league_id)]
-  ).catch(() => ({ rows: [{ max_week: 0 }] }));
-  const latestWeekIndex = Number(latestWeekResult.rows[0]?.max_week || 0);
+  // 7J-10BY-STATLEADERSWEEKINDEX: real bug, confirmed live — latestWeekIndex
+  // used to be the global MAX(week_index) across the whole table, which was
+  // silently correct before the catch-up loop existed (autoProcessMaddenGameResults
+  // was only ever called once per sync, always for the truly-latest week, so
+  // "global max" and "this week" were always the same number by coincidence).
+  // With catch-up now processing several historical weeks in one sync, that
+  // coincidence breaks: every iteration computed the SAME global max
+  // regardless of which historical week it was actually processing, so
+  // Week 15 and Week 16's "Stat Leaders"/big-performance posts showed
+  // identical, always-latest-week data instead of each week's own. Derives
+  // the target week_index from the specific weekLabel this call is for
+  // instead — matches the displayWeek = weekIndex + 1 relationship already
+  // established at import time (see the weekly-stat import above). Playoff
+  // labels ("Wild Card", etc.) fall back to the old global-max behavior —
+  // the exact weekIndex a playoff round's stat export uses is genuinely
+  // unconfirmed elsewhere in this codebase too (see 7J-PLAYOFFSTATDISCOVERY),
+  // not something to guess at here.
+  const regularSeasonWeekMatch = String(weekLabel || '').trim().match(/^week\s+(\d+)$/i);
+  let latestWeekIndex;
+  if (regularSeasonWeekMatch) {
+    latestWeekIndex = Number(regularSeasonWeekMatch[1]) - 1; // displayWeek = weekIndex + 1
+  } else {
+    const latestWeekResult = await pool.query(
+      `SELECT COALESCE(MAX(week_index), 0) AS max_week FROM madden_player_weekly_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+      [guild.id, String(league.league_id)]
+    ).catch(() => ({ rows: [{ max_week: 0 }] }));
+    latestWeekIndex = Number(latestWeekResult.rows[0]?.max_week || 0);
+  }
 
   const bigPerfs = latestWeekIndex > 0 ? await pool.query(
     `SELECT ws.*, p.first_name, p.last_name, p.position, p.team_name, p.age
@@ -76774,6 +76814,23 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
     // (awards, champion, currency, history) — don't block flipping the
     // stage flag over the lock checkpoint, which is an audit record only.
   }
+
+  // 7J-10BY-DRAFTRECAPRESET: clears the draft-recap lock here rather than
+  // keying it to any computed season identity. See checkAndPostMaddenDraftRecap
+  // for why: this table's first version keyed its primary key on season_key,
+  // which depends on league.madden_season_year — the exact same kind of
+  // EA-hub-populated-mid-stream field that's proven unstable multiple times
+  // today. If that key shifted between the first post and a later sync, the
+  // lock-check would look for a snapshot under a DIFFERENT key, find
+  // nothing, and post again — same failure shape, one layer over. This
+  // deletes the lock at the one event that's been reliable ALL DAY without
+  // a single miss — Super Bowl finalize, confirmed right above this line —
+  // so a fresh draft class can post again next season with no key
+  // comparison involved at all: the row's mere existence is the lock.
+  await pool.query(
+    `DELETE FROM madden_draft_recap_snapshots WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(err => console.error('[SEASON TRANSITION] Draft recap snapshot reset failed:', err?.message));
 
   await pool.query(
     `UPDATE madden_league_settings SET current_season_stage = 'offseason', updated_at = NOW() WHERE league_id = $1`,
