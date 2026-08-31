@@ -72178,9 +72178,30 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     // getMaddenNewAdvanceWeek can compare it directly against the last-processed
     // week without needing to guess from game data at all.
     if (eaHubCtx?.displayedWeek) {
+      // 7J-10BY-RAWWEEKNORM: real bug, confirmed live over two separate
+      // preseason rollovers — EA's hub reports a bare "Week N" here even
+      // while the league is genuinely in preseason; it never carries the
+      // "Preseason" prefix on this field. Individual game rows already get
+      // corrected for this at import time (repairEaFutureWeekLabelFromGameCore
+      // / 7J-10BY-EF), but this column — the one thing every week-advance
+      // consumer reads as ground truth (getMaddenNewAdvanceWeek, the
+      // playoff-bracket catchup pass, ESPN news week labels) — was storing
+      // the raw, un-prefixed value. That desyncs it from the label
+      // namespace game rows actually live in: a genuinely-unchanged
+      // preseason week reads as moving from preseason (sort group 0) to
+      // regular season (sort group 1), producing a false advance and, on
+      // the sync right after a real anchor reset, silently skipping game-
+      // thread creation entirely. Normalized ONCE here, at the single
+      // point this gets persisted, using the exact rule 7J-10BY-EF already
+      // proved correct for game rows — so no individual downstream
+      // consumer, present or future, needs its own special case for this.
+      const rawDisplayedWeek = String(eaHubCtx.displayedWeek).trim();
+      const normalizedDisplayedWeek = (preseasonMode && /^week\s+\d+$/i.test(rawDisplayedWeek))
+        ? 'Preseason Week ' + rawDisplayedWeek.match(/\d+/)[0]
+        : rawDisplayedWeek;
       await pool.query(
         `UPDATE madden_league_settings SET ea_reported_current_week = $2, updated_at = NOW() WHERE league_id = $1`,
-        [league.league_id, eaHubCtx.displayedWeek]
+        [league.league_id, normalizedDisplayedWeek]
       ).catch(error => console.error('[Madden Sync] Failed to persist EA reported current week:', error?.message));
     }
 
@@ -74449,8 +74470,45 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
     [leagueId]
   ).catch(() => ({ rows: [] }));
   const lastLabel = settingsResult.rows[0]?.last_auto_detect_week_label || null;
-  const eaReportedWeek = settingsResult.rows[0]?.ea_reported_current_week || null;
+  const eaReportedWeekRaw = settingsResult.rows[0]?.ea_reported_current_week || null;
   const currentSeasonStage = settingsResult.rows[0]?.current_season_stage || null;
+
+  // 7J-10BY-RAWWEEKNORM: real bug, confirmed live — EA's hub field
+  // (ea_reported_current_week) reports a bare "Week N" even while the
+  // league is genuinely in preseason; it never carries the "Preseason"
+  // prefix. Individual game rows already get corrected for this at import
+  // time (see repairEaFutureWeekLabelFromGameCore / 7J-10BY-EF), but every
+  // comparison in THIS function was reading the raw, un-prefixed value
+  // directly — so it lived in a different label namespace than lastLabel/
+  // allWeeks (which DO end up prefixed once real preseason games ground
+  // them there). Consequence, confirmed live: the first-run anchor stored
+  // the raw "Week 2" forever, and on the very next sync where EA still
+  // reports "Week 2" unchanged, the group comparison would read that as
+  // moving from preseason (group 0) to regular season (group 1) — a false
+  // "advance" out of preseason with nothing having actually changed.
+  // Normalized once, right at the source, using the exact same rule
+  // 7J-10BY-EF already proved correct, so nothing further down needs its
+  // own special case.
+  const eaReportedWeek = (currentSeasonStage === 'preseason' && /^week\s+\d+$/i.test(String(eaReportedWeekRaw || '').trim()))
+    ? 'Preseason Week ' + String(eaReportedWeekRaw).trim().match(/\d+/)[0]
+    : eaReportedWeekRaw;
+
+  // 7J-10BY-SEASONKEYALLWEEKS: real bug, confirmed live — this query had
+  // no season_key scoping (the same escape-hatch pattern the Session 42
+  // season-key fix closed at every other site), so a test league with a
+  // full prior season's worth of leftover "Week 1"/"Week 4"-"Week 18" rows
+  // still sitting in madden_imported_games could have those stale labels
+  // selected as "the next known week" below, ahead of or instead of the
+  // real current season's actual next week. Scoped the same way the
+  // offseason-rollover grounding logic already scopes its own lookup.
+  const seasonYearForAllWeeks = await pool.query(
+    `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
+    [leagueId]
+  ).catch(() => ({ rows: [] }));
+  const currentSeasonKeyForAllWeeks = await getMaddenCurrentSeasonKey({
+    league_id: leagueId,
+    madden_season_year: seasonYearForAllWeeks.rows[0]?.madden_season_year ?? null,
+  }).catch(() => null);
 
   // Known week sequence from the schedule — shared by both paths below. Used by
   // the EA-hub path specifically as a hard cap: never advance more than one step
@@ -74466,8 +74524,9 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
     `SELECT week_label, status, home_score, away_score FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND week_label IS NOT NULL AND TRIM(week_label) <> ''
-       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'`,
-    [guildId, String(leagueId)]
+       AND LOWER(TRIM(week_label)) NOT LIKE '%tbd%'
+       AND ($3::text IS NULL OR season_key = $3::text)`,
+    [guildId, String(leagueId), currentSeasonKeyForAllWeeks]
   ).catch(() => ({ rows: [] }));
   const rows = allGamesResult.rows || [];
   const allWeeks = Array.from(new Set(rows.map(r => r.week_label)));
@@ -74577,14 +74636,9 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
         console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" while league was stuck in 'offseason' stage — recognizing as the start of a new season despite not sorting after the stale last-processed label ("${lastLabel}").`);
         return eaReportedWeek;
       }
-      const seasonYearForGrounding = await pool.query(
-        `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
-        [leagueId]
-      ).catch(() => ({ rows: [] }));
-      const groundingSeasonKey = await getMaddenCurrentSeasonKey({
-        league_id: leagueId,
-        madden_season_year: seasonYearForGrounding.rows[0]?.madden_season_year ?? null,
-      }).catch(() => null);
+      // Reuses the season key already computed near the top of this
+      // function (7J-10BY-SEASONKEYALLWEEKS) instead of re-querying it.
+      const groundingSeasonKey = currentSeasonKeyForAllWeeks;
       const realPreseasonRows = await pool.query(
         `SELECT DISTINCT week_label FROM madden_imported_games
          WHERE guild_id = $1 AND league_id::text = $2::text
