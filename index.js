@@ -58160,16 +58160,40 @@ async function checkAndPostMaddenDraftRecap(guild, league) {
   const rookies = await getMaddenDraftClass(guild.id, league.league_id).catch(() => []);
   if (rookies.length < 20) return; // not a real completed draft class yet
 
-  // 7J-10BY-DRAFTRECAPSTABLEDEDUP: real bug, confirmed live — getMaddenDraftClass
-  // recomputes the rookie list live from madden_players on every call, not
-  // from a stored snapshot. Roster data can genuinely keep settling across
-  // syncs (a rookie missing a team assignment on one sync, populated by the
-  // next) with zero change to the real draft, but the old dedup keyed off
-  // rookies.length directly — any fluctuation in that live count reposted
-  // the whole recap as if it were new, with different (also-live) grades.
-  // Keys off the season instead, which only changes once per real season.
-  const draftRecapSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
-  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'draft_recap', 'posted', draftRecapSeasonKey).catch(() => false);
+  // 7J-10BY-DRAFTRECAPDEBOUNCE: real bug, confirmed live TWICE now —
+  // getMaddenDraftClass recomputes the rookie list live from madden_players
+  // on every call, not from a stored snapshot, so roster data can genuinely
+  // keep settling across syncs (a rookie missing a team assignment on one
+  // sync, populated by the next) with zero real change to the draft. The
+  // first fix keyed dedup on rookies.length directly — any fluctuation
+  // reposted the whole recap. The second fix keyed on season_key instead —
+  // but that depends on league.madden_season_year, which itself gets
+  // populated by EA's hub mid-stream, same as every other field that's
+  // proven unstable today; if it was null for the first post and got a
+  // real value by a later one, that's a different key both times, same
+  // failure shape one layer over. This targets the actual root cause
+  // instead of hunting a fourth proxy identity: require the rookie count
+  // to read IDENTICAL across two consecutive syncs before ever
+  // considering it final. A still-settling count naturally keeps changing
+  // sync to sync and never gets a chance to post; a genuinely-finished
+  // draft naturally stabilizes and posts exactly once.
+  const lastSeenResult = await pool.query(
+    `SELECT last_value FROM madden_storyline_posts WHERE guild_id = $1 AND league_id::text = $2::text AND story_type = 'draft_recap' AND subject_key = 'last_seen_count'`,
+    [guild.id, String(league.league_id)]
+  ).catch(() => ({ rows: [] }));
+  const lastSeenCount = lastSeenResult.rows[0]?.last_value ?? null;
+  await pool.query(
+    `INSERT INTO madden_storyline_posts (id, guild_id, league_id, story_type, subject_key, last_value, posted_at)
+     VALUES ($1, $2, $3, 'draft_recap', 'last_seen_count', $4, NOW())
+     ON CONFLICT (guild_id, league_id, story_type, subject_key) DO UPDATE SET last_value = $4, posted_at = NOW()`,
+    [randomUUID(), guild.id, String(league.league_id), String(rookies.length)]
+  ).catch(() => null);
+  if (String(lastSeenCount) !== String(rookies.length)) {
+    console.log(`[AUTO DETECT] Draft class rookie count changed (${lastSeenCount ?? 'none seen yet'} -> ${rookies.length}) for league ${league.league_id} — still settling, waiting for it to stabilize before posting recap.`);
+    return;
+  }
+
+  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'draft_recap', 'posted', rookies.length).catch(() => false);
   if (!shouldPost) return;
 
   const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
@@ -72252,13 +72276,15 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     // needlessly alarming diagnostic message. Now uses the same
     // status-based completion check recalculateMaddenStandingsFromImportedGames
     // already trusts as the real definition of "this game is done."
+    const diagnosticSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
     const weekLabelBreakdownResult = await pool.query(
       `SELECT week_label, COUNT(*)::int AS total,
          COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie'))::int AS scored
        FROM madden_imported_games
        WHERE guild_id = $1 AND league_id::text = $2::text AND week_label IS NOT NULL
+         AND ($3::text IS NULL OR season_key = $3::text)
        GROUP BY week_label`,
-      [guild.id, String(league.league_id)]
+      [guild.id, String(league.league_id), diagnosticSeasonKey]
     ).catch(() => ({ rows: [] }));
     const weekLabelBreakdown = weekLabelBreakdownResult.rows
       .sort((a, b) => compareMaddenWeekLabels(a.week_label, b.week_label))
