@@ -75772,6 +75772,24 @@ async function autoSettleMaddenSportsbookBet(guild, league, maddenGame) {
 async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   const events = [];
 
+  // 7J-10BY-PLAYOFFCOVERAGEGATE: real bug, confirmed live — per the
+  // original 7J-PLAYOFFCOVERAGE intent (see handleMaddenPlayoffBracketTransition/
+  // postMaddenPlayoffMatchupPreview), playoff coverage was meant to REPLACE
+  // regular-season narrative content, not run alongside it — but nothing
+  // ever actually suppressed the regular-season blocks below once the
+  // league reached playoffs. Confirmed live: eliminated teams (no games
+  // left to play) kept generating "3 straight" streak/hot-seat/power-rank-
+  // mover stories from whatever their last 3 regular-season games happened
+  // to be, weeks after being knocked out — stale, contextless noise
+  // competing with the actual playoff coverage for space. Fetched once
+  // here and used to gate the streak/hot-seat/undefeated-watch/division-
+  // race/power-ranking-mover blocks below, none of which make sense once
+  // most of the league isn't playing anymore ("division race" and "coach
+  // hot seat" are meaningless after the regular season ends). Game results
+  // themselves and stat leaders are untouched — those still matter for
+  // whichever teams are still alive.
+  const stageForNarrativeGate = (await ensureMaddenLeagueSettings(league).catch(() => ({}))).current_season_stage || 'preseason';
+
   // Find games that just completed (have scores, status = final)
   const completedGames = await pool.query(
     `SELECT * FROM madden_imported_games
@@ -75940,6 +75958,10 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   // detection. Queried separately here (rather than reordering the existing
   // power_ranking_movers block below) to avoid any risk of disturbing that
   // already-correct code's position/behavior.
+  // 7J-10BY-PLAYOFFCOVERAGEGATE: see the gate comment at the top of this
+  // function — everything from here through the division-race block below
+  // is regular-season-only narrative content.
+  if (stageForNarrativeGate !== 'playoffs') {
   const powerDropLookup = await pool.query(
     `SELECT team_name, (previous_rank - rank) AS movement
      FROM madden_power_rankings
@@ -76198,6 +76220,7 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
       }
     }
   }
+  } // end 7J-10BY-PLAYOFFCOVERAGEGATE (streak/hot-seat/undefeated-watch/division-race/playoff-picture)
 
   // Award race leaders
   const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex != null ? latestWeekIndex : null).catch(() => null);
@@ -76205,7 +76228,10 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     events.push({ type: 'award_race', leaders: awardLeaders });
   }
 
-  // Power ranking movers (biggest jumps/drops)
+  // Power ranking movers (biggest jumps/drops) — see 7J-10BY-PLAYOFFCOVERAGEGATE
+  // above: same reasoning, gated the same way, just a separate block since
+  // stat leaders (directly above) needed to stay ungated in between.
+  if (stageForNarrativeGate !== 'playoffs') {
   const powerMovers = await pool.query(
     `SELECT team_name, rank, previous_rank,
        (previous_rank - rank) AS movement
@@ -76229,6 +76255,7 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
         emoji: getMaddenTeamEmoji(r.team_name),
       })),
     });
+  }
   }
 
   return events;
@@ -77030,7 +77057,7 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
   // flag flip), don't build a second one on top of it — just catch the
   // stage flag up so this stops re-checking every sync.
   const existingBracket = await pool.query(
-    `SELECT league_id FROM league_playoff_brackets WHERE league_id = $1`,
+    `SELECT league_id, bracket FROM league_playoff_brackets WHERE league_id = $1`,
     [league.league_id]
   ).catch(() => ({ rows: [] }));
   if (existingBracket.rows.length) {
@@ -77038,6 +77065,16 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
       `UPDATE madden_league_settings SET current_season_stage = 'playoffs', updated_at = NOW() WHERE league_id = $1`,
       [league.league_id]
     ).catch(() => null);
+    // 7J-10BY-PREVIEWRETRY: same fix as the round-advance loop below — the
+    // Wild Card preview used to only get attempted at build time, with no
+    // retry if that one attempt silently failed. Retries it here too on
+    // every sync that finds an already-built bracket, relying entirely on
+    // postMaddenPlayoffMatchupPreview's own internal dedup for idempotency.
+    const existingFirstRound = Array.isArray(existingBracket.rows[0]?.bracket) ? existingBracket.rows[0].bracket[0] : null;
+    if (Array.isArray(existingFirstRound) && existingFirstRound.length) {
+      await postMaddenPlayoffMatchupPreview(guild, league, existingFirstRound, 'Wild Card').catch(err =>
+        console.error('[SEASON TRANSITION] Wild Card matchup preview retry failed:', err?.message || err));
+    }
     return;
   }
 
@@ -77329,11 +77366,24 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
       `UPDATE league_playoff_brackets SET bracket = $2, current_round = $3, updated_at = NOW() WHERE league_id = $1`,
       [league.league_id, JSON.stringify(bracket), currentRoundNum + 1]
     ).catch(() => null);
-    if (!alreadyHadNextRound) {
-      const nextRoundLabel = tournamentBracketRoundLabel(roundIndex + 2, 4, roundIndex + 1, 'nfl');
-      await postMaddenPlayoffMatchupPreview(guild, league, nextRound, nextRoundLabel).catch(err =>
-        console.error('[MADDEN BRACKET] Matchup preview for', nextRoundLabel, 'failed:', err?.message || err));
-    }
+    // 7J-10BY-PREVIEWRETRY: real bug, confirmed live — this used to only
+    // attempt postMaddenPlayoffMatchupPreview inside the `!alreadyHadNextRound`
+    // branch, meaning it had exactly ONE chance to succeed, ever, for a
+    // given round: the single sync where the round was first built into
+    // the bracket JSON. If that one attempt silently failed for any reason
+    // (confirmed live: a stale storyline dedup entry from an earlier test
+    // season), there was no way to retry — alreadyHadNextRound is
+    // permanently true from that point on, so the outer gate could never
+    // open again for that round, even after the underlying dedup problem
+    // was fixed. Now calls it every time this round is processed,
+    // regardless of alreadyHadNextRound, relying entirely on
+    // postMaddenPlayoffMatchupPreview's OWN internal dedup (shouldPostMaddenStoryline)
+    // to guarantee it only actually posts once — which also means a
+    // transient failure of any kind now self-heals on the next sync
+    // instead of being silently permanent.
+    const nextRoundLabel = tournamentBracketRoundLabel(roundIndex + 2, 4, roundIndex + 1, 'nfl');
+    await postMaddenPlayoffMatchupPreview(guild, league, nextRound, nextRoundLabel).catch(err =>
+      console.error('[MADDEN BRACKET] Matchup preview for', nextRoundLabel, 'failed:', err?.message || err));
     console.log('[MADDEN BRACKET] Round', currentRoundNum, 'complete for league', league.league_id, '— advanced to round', currentRoundNum + 1);
     await refreshPlayoffBracketPanel(guild, league).catch(() => null);
     currentRoundNum += 1;
