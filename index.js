@@ -76726,6 +76726,20 @@ async function performMaddenRegularSeasonKickoff(guild, league, newWeekLabel) {
   });
   console.log('[SEASON TRANSITION] Reset playoff bracket:', bracketResetResult?.rowCount || 0, 'row(s) cleared');
 
+  // 2c. 7J-10BY-POWERRANKRESET: lower-stakes than the two above (cosmetic,
+  // not a lockout) but same root cause — previous_rank in
+  // madden_power_rankings gets overwritten every week regardless, so by
+  // itself it's not a permanent-accumulator bug. But without a reset here,
+  // the FIRST power-ranking calc of a new season would compare fresh
+  // preseason-less rankings against whatever previous_rank was left over
+  // from last season's final week, producing a nonsensical "jumped from
+  // #8 to #1" mover post right at kickoff. Nulling it means the first
+  // real comparison starts clean, same as everything else this season.
+  await pool.query(
+    `UPDATE madden_power_rankings SET previous_rank = NULL WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(err => console.error('[SEASON TRANSITION] Power ranking reset failed:', err?.message));
+
   // 3. Post season kickoff announcement to news channel
   const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
   if (newsChannelId) {
