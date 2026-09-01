@@ -76867,6 +76867,31 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
     [guild.id, String(league.league_id)]
   ).catch(err => console.error('[SEASON TRANSITION] Draft recap snapshot reset failed:', err?.message));
 
+  // 7J-10BY-STORYLINERESET: real bug, confirmed live and much bigger in
+  // scope than just the playoff preview that surfaced it — madden_storyline_posts
+  // is the shared dedup table behind nearly every AI narrative story type
+  // this bot posts (win/loss streaks, coach hot seat, division leader
+  // changes, undefeated/winless watch, playoff picture, playoff round
+  // previews, playoff upsets), and it has NO season scoping anywhere.
+  // Every one of those dedup keys is subject+value pairs that legitimately
+  // repeat every season verbatim — a team hitting a 3-game win streak, a
+  // "Week 1" label, a "Div. Playoff" round label, a division leader who
+  // happens to repeat. Once any of those combinations was used once, EVER,
+  // that exact story could never post again for that league in any future
+  // season — not a one-time miss, a permanent, silent, ever-growing gap
+  // in narrative coverage as more seasons pass and more combinations get
+  // "used up." Clears the whole table for this league at the same
+  // reliable Super Bowl finalize point as the other resets, so every
+  // dedup-guarded story gets a genuinely fresh slate each season.
+  const storylineResetResult = await pool.query(
+    `DELETE FROM madden_storyline_posts WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(err => {
+    console.error('[SEASON TRANSITION] Storyline dedup reset failed:', err?.message);
+    return null;
+  });
+  console.log('[SEASON TRANSITION] Reset storyline dedup state:', storylineResetResult?.rowCount || 0, 'entries cleared');
+
   await pool.query(
     `UPDATE madden_league_settings SET current_season_stage = 'offseason', updated_at = NOW() WHERE league_id = $1`,
     [league.league_id]
