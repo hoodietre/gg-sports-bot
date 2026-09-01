@@ -77269,6 +77269,25 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
       }
     }
 
+    // 7J-10BY-PREVIEWRETRY2: real gap in the previous preview-retry fix,
+    // caught before it could repeat the Div/Conf miss for Super Bowl —
+    // that fix only retried a round's preview at the moment of TRANSITION
+    // into it (advancing from the prior round). Once current_round has
+    // already moved past that transition, every later sync starts this
+    // loop already sitting AT the current round and, if it's not decided
+    // yet, breaks out immediately without ever reaching that transition
+    // code again — so a preview missed at build time would never retry
+    // while the round sits undecided, only once genuinely re-entered
+    // (which mostly never happens). Retries THIS round's preview every
+    // single sync while it's active, relying entirely on the internal
+    // dedup for idempotency — so a missed preview retries on every sync
+    // until it succeeds, not just once. Placed AFTER the correctness check
+    // above (not before) so it always previews the corrected matchups, not
+    // stale ones about to be replaced.
+    const activeRoundLabel = tournamentBracketRoundLabel(roundIndex + 1, 4, roundIndex, 'nfl');
+    await postMaddenPlayoffMatchupPreview(guild, league, roundSeries, activeRoundLabel).catch(err =>
+      console.error('[MADDEN BRACKET] Active-round preview retry for', activeRoundLabel, 'failed:', err?.message || err));
+
     let mutated = false;
     for (const series of roundSeries) {
       if (series.bye || series.winner || !series.teamB) continue;
