@@ -77205,6 +77205,39 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
 // function's only job is keeping the bracket's visual/embed state correct.
 async function syncMaddenPlayoffBracketFromResults(guild, league) {
   if (getPlayoffFormatKey(league) !== 'nfl') return;
+
+  // 7J-10BY-COMPLETEDBRACKETRETRY: real gap, confirmed live — the previous
+  // preview-retry fix only runs while bracketState.status === 'in_progress'
+  // (below). Confirmed live: the Super Bowl round can get built AND
+  // decided within the SAME sync (a catch-up pass that reaches Super Bowl
+  // for the first time with the game already complete), collapsing its
+  // retry window to a single pass — completely unlike every earlier round,
+  // which gets many sync-cycles of retry opportunity while still
+  // 'in_progress'. Once status flips to 'completed', the function's own
+  // stage/status gates below block it forever, so a missed Super Bowl
+  // preview had zero remaining chances to retry, ever. Checked here,
+  // before either of those gates, specifically for this one case: the
+  // FINAL round only (never intermediate rounds — those had their normal
+  // in-progress retry window already). Uses the same dedup-protected
+  // postMaddenPlayoffMatchupPreview, so this is a no-op once it's actually
+  // posted.
+  const completedBracketCheck = await pool.query(
+    `SELECT bracket, status FROM league_playoff_brackets WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const completedBracketState = completedBracketCheck.rows[0];
+  if (completedBracketState?.status === 'completed') {
+    const finishedBracket = Array.isArray(completedBracketState.bracket) ? completedBracketState.bracket : [];
+    const finalRoundIndex = finishedBracket.length - 1;
+    const finalRound = finishedBracket[finalRoundIndex];
+    if (Array.isArray(finalRound) && finalRound.length) {
+      const finalRoundLabel = tournamentBracketRoundLabel(finalRoundIndex + 1, 4, finalRoundIndex, 'nfl');
+      await postMaddenPlayoffMatchupPreview(guild, league, finalRound, finalRoundLabel).catch(err =>
+        console.error('[MADDEN BRACKET] Completed-bracket preview retry for', finalRoundLabel, 'failed:', err?.message || err));
+    }
+    return;
+  }
+
   const settings = await ensureMaddenLeagueSettings(league);
   if ((settings.current_season_stage || 'preseason') !== 'playoffs') return; // only relevant mid-playoffs
 
