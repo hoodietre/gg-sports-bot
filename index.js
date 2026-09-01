@@ -55050,6 +55050,16 @@ function describeMaddenChangeLine(change) {
   if (change.change_type === 'injury_recovered') {
     return `🟢 **${playerName}** — Recovered from ${change.old_value || 'injury'}`;
   }
+  // 7J-10BY-DEVTRAITEMOJI: real bug, confirmed live — dev trait changes fell
+  // through to the generic old→new text template below, printing the raw
+  // trait strings ("Normal", "Star") as plain words. Every other place in
+  // this codebase that shows a dev trait (the roster page, franchise
+  // cornerstones list, etc.) uses maddenPlayerDevEmojiOnly for exactly this
+  // reason — a dev trait is meant to read as its emoji, not spelled out.
+  // This was the one place that never got routed through that same helper.
+  if (change.change_type === 'dev_trait_change') {
+    return `${maddenChangeIcon(change.change_type)} **${playerName}** — Dev Trait: ${maddenPlayerDevEmojiOnly(change.old_value)} → ${maddenPlayerDevEmojiOnly(change.new_value)}`;
+  }
   return `${maddenChangeIcon(change.change_type)} **${playerName}** — ${maddenChangeTypeLabel(change.change_type)}: ${change.old_value || 'N/A'} → ${change.new_value || 'N/A'}`;
 }
 
