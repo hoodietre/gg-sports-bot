@@ -76864,8 +76864,28 @@ Rules:
 function maddenIsPreseasonWeek(weekLabel) {
   return maddenWeekLabelSortKey(weekLabel)[0] === 0;
 }
+// 7J-OFFSEASONSTAGEFALLBACKFIX: real bug, confirmed live — used to check
+// maddenWeekLabelSortKey(weekLabel)[0] === 1, same shape mistake as
+// 7J-DIVPLAYOFFFIX/7J-10BY-PROBOWLFIX before it, just hitting a different
+// set of labels. Group 1 in that sort key is BOTH the genuine "Week N"
+// regular-season match AND the catch-all fallback for anything totally
+// unrecognized — which, per 7J-OFFSEASONGATEFIX just below, is exactly
+// what most offseason sub-stage labels are (Resign Players, Free Agency
+// Preview, Free Agency Stage 1/2, Draft, Draft Recap, etc. — EA's
+// reported "current week" has no concept of these, so whatever stale/
+// unrecognized value it's sitting on during any of them falls straight
+// into that same fallback bucket). Confirmed live: with the league still
+// in Draft Recap week — the last offseason stage before preseason even
+// begins — this returned true, firing the real "Regular Season Starts
+// NOW" season-kickoff flow (and, bundled into that same flow, a power
+// rankings regeneration that pulled whatever was still sitting in
+// madden_imported_team_stats — the just-finished season's final
+// standings, since real Week 1 hadn't been played or synced yet) weeks
+// before either should have happened. Checks the literal "Week N" pattern
+// directly instead of trusting the sort key's group number, so it can
+// never again match anything the sort key had to fall back on.
 function maddenIsRegularSeasonWeek(weekLabel) {
-  return maddenWeekLabelSortKey(weekLabel)[0] === 1;
+  return /^week\s+\d+$/i.test(String(weekLabel || '').trim());
 }
 
 // Regular/playoffs -> offseason transition, mirroring the preseason -> regular pattern
