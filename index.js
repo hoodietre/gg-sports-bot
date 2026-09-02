@@ -46513,6 +46513,25 @@ async function getMaddenProjectedDraftSlotMap(guildId, leagueId) {
     for (const key of maddenDraftPickTeamKeys(team.team_name)) teamByKey.set(key, team);
   }
 
+  // 7J-DRAFTORDERSEASONSCOPE: real bug, confirmed live — found during a full
+  // sweep for this exact pattern (per Hxxdie, after several rounds of
+  // finding this same shape one instance at a time). No season_key filter
+  // at all: without it, a prior season's completed playoff games (including
+  // its actual Super Bowl) are indistinguishable from this season's, which
+  // could assign draft slots 31/32 and the late playoff-loser slots based
+  // on last season's results — potentially before this season's real
+  // playoffs have even started. Same pattern already fixed in
+  // getMaddenSuperBowlResult (7J-SEASONSCOPESB) — mirrors that function's
+  // approach for resolving a season_key from just a guildId/leagueId pair.
+  const projSeasonYearResult = await pool.query(
+    `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
+    [leagueId]
+  ).catch(() => ({ rows: [] }));
+  const projSeasonKey = await getMaddenCurrentSeasonKey({
+    league_id: leagueId,
+    madden_season_year: projSeasonYearResult.rows[0]?.madden_season_year ?? null,
+  }).catch(() => null);
+
   const playoffResult = await pool.query(
     `SELECT week_label, home_team, away_team, home_score, away_score, status
      FROM madden_imported_games
@@ -46521,8 +46540,9 @@ async function getMaddenProjectedDraftSlotMap(guildId, leagueId) {
        AND week_label IN ('Wild Card','Div. Playoff','Conf. Playoff','Super Bowl')
        AND LOWER(COALESCE(status, '')) IN ('final','completed','home_win','away_win')
        AND home_score IS NOT NULL
-       AND away_score IS NOT NULL`,
-    [guildId, String(leagueId)]
+       AND away_score IS NOT NULL
+       AND ($3::text IS NULL OR season_key = $3::text)`,
+    [guildId, String(leagueId), projSeasonKey]
   ).catch(() => ({ rows: [] }));
 
   const playoffTeams = new Set();
@@ -54660,10 +54680,27 @@ async function resolveAutoGameThreadsTargetWeek(guild, league) {
   // Find the most recent week that already has threads — use it as an anchor.
   // Only create threads for weeks that come AFTER it in canonical order.
   // This prevents re-creating threads for old weeks that had their threads deleted.
+  //
+  // 7J-THREADANCHORSEASONSCOPE: real bug, confirmed live — no game threads
+  // got created for a new season's real Preseason Week 1. Root cause: this
+  // anchor query was never season_key-scoped, and madden_imported_games
+  // accumulates every season's games forever (same shape confirmed
+  // multiple times this session). The prior season's Super Bowl (group 2
+  // in maddenWeekLabelSortKey) was still the most recent threaded week on
+  // file, and the candidateWeeks filter below compares group numbers
+  // directly (wG > lG) — a genuinely meaningless comparison across a
+  // season boundary, since group numbers reset every season (a new
+  // season's Preseason Week 1 is group 0, always "before" any prior
+  // season's group-2 playoff week by this math, regardless of real time
+  // having moved forward). Scoped to the current season so a prior
+  // season's threaded weeks can never anchor this season's candidate
+  // filter — the new season correctly starts with no anchor at all.
+  const currentSeasonKeyForThreads = await getMaddenCurrentSeasonKey(league).catch(() => null);
   const existingThreadsResult = await pool.query(
     `SELECT DISTINCT week_label FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id::text = $2::text AND thread_id IS NOT NULL`,
-    [guild.id, String(league.league_id)]
+     WHERE guild_id = $1 AND league_id::text = $2::text AND thread_id IS NOT NULL
+       AND season_key = $3::text`,
+    [guild.id, String(league.league_id), currentSeasonKeyForThreads]
   ).catch(() => ({ rows: [] }));
   const existingThreadedWeeks = (existingThreadsResult.rows || []).map(r => r.week_label).filter(Boolean);
   existingThreadedWeeks.sort(compareMaddenWeekLabels);
@@ -54671,14 +54708,26 @@ async function resolveAutoGameThreadsTargetWeek(guild, league) {
 
   // If no threads exist in the DB (e.g. all were deleted via deletethreads),
   // fall back to the auto-detect anchor so we don't recreate old weeks.
+  // 7J-THREADANCHORSEASONSCOPE: this fallback field is a single mutable
+  // column on league_settings, not season-scoped either — but it's only
+  // ever consulted when the (now correctly season-scoped) query above
+  // found nothing for the CURRENT season, so a prior season's stale value
+  // here would cause the exact same cross-season misfire. Only trusted
+  // when it actually parses as a label in the current season's realistic
+  // range (preseason or regular season, never a playoff-group label,
+  // which a genuinely new season's anchor should never be).
   if (!lastThreadedWeek) {
     const anchorResult = await pool.query(
       `SELECT last_auto_detect_week_label FROM madden_league_settings WHERE league_id = $1 LIMIT 1`,
       [league.league_id]
     ).catch(() => ({ rows: [] }));
-    lastThreadedWeek = anchorResult.rows[0]?.last_auto_detect_week_label || null;
+    const rawAnchor = anchorResult.rows[0]?.last_auto_detect_week_label || null;
+    const anchorGroup = rawAnchor ? maddenWeekLabelSortKey(rawAnchor)[0] : null;
+    lastThreadedWeek = (rawAnchor && anchorGroup !== 2) ? rawAnchor : null;
     if (lastThreadedWeek) {
       console.log('[AUTO GAME THREADS] No threaded weeks found — using auto-detect anchor as fallback: ' + lastThreadedWeek);
+    } else if (rawAnchor) {
+      console.log('[AUTO GAME THREADS] Discarded stale playoff-group anchor from a prior season:', rawAnchor);
     }
   }
 
@@ -56580,6 +56629,25 @@ async function ensureMaddenFreeAgencyTables() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_player_team_snapshots_team ON madden_player_team_snapshots (guild_id, league_id, team_name)`);
+  // 7J-RETIREMENTAGECOLUMNS: real bug, confirmed live — zero retirements
+  // ever detected across a full season+offseason of testing, despite real
+  // players plausibly aging out. Root cause: isLikelyMaddenRetirementCandidate
+  // gates almost entirely on age/years_pro, but this snapshot table (the
+  // "previous" baseline retirement detection actually diffs against, since
+  // no manual baseline is normally set) never had columns for either —
+  // maddenRetirementAge/maddenRetirementYearsPro had to reconstruct them
+  // from raw_payload alone on every read. The SOURCE table
+  // (madden_player_attributes) has age as its own real column, separate
+  // from raw_payload/attributes — meaning EA's raw JSON blob likely never
+  // carried a key those reconstruction functions recognize in the first
+  // place, so every "previous" row read back from this table silently had
+  // age=null/years_pro=null, making every retirement-candidate check fail
+  // structurally regardless of how many real retirements actually
+  // happened. Persists both explicitly from the reliable source-table
+  // values at snapshot-save time instead of leaving future reads to
+  // reconstruct them from a blob that may never have had them.
+  await pool.query(`ALTER TABLE madden_player_team_snapshots ADD COLUMN IF NOT EXISTS age INTEGER`);
+  await pool.query(`ALTER TABLE madden_player_team_snapshots ADD COLUMN IF NOT EXISTS years_pro INTEGER`);
 }
 
 function maddenFreeAgencyRaw(row) {
@@ -57206,11 +57274,11 @@ async function saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRo
     const teamName = normalizeMaddenTeamName(row.team_name || null) || row.team_name || null;
     try {
       await pool.query(
-        `INSERT INTO madden_player_team_snapshots (guild_id, league_id, player_id, player_name, team_name, position, overall, is_free_agent, raw_payload, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+        `INSERT INTO madden_player_team_snapshots (guild_id, league_id, player_id, player_name, team_name, position, overall, is_free_agent, raw_payload, age, years_pro, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
          ON CONFLICT (guild_id, league_id, player_id)
-         DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, is_free_agent = EXCLUDED.is_free_agent, raw_payload = EXCLUDED.raw_payload, updated_at = NOW()`,
-        [String(guildId), String(leagueId), playerId, row.player_name, teamName, maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row), isMaddenFreeAgentRow(row), row.raw_payload || {}]
+         DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, is_free_agent = EXCLUDED.is_free_agent, raw_payload = EXCLUDED.raw_payload, age = EXCLUDED.age, years_pro = EXCLUDED.years_pro, updated_at = NOW()`,
+        [String(guildId), String(leagueId), playerId, row.player_name, teamName, maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row), isMaddenFreeAgentRow(row), row.raw_payload || {}, maddenRetirementAge(row), maddenRetirementYearsPro(row)]
       );
       successCount += 1;
     } catch (error) {
@@ -58720,14 +58788,24 @@ async function shouldPostMaddenStoryline(guildId, leagueId, storyType, subjectKe
 // Computes a team's current win/loss streak from completed games, most recent
 // first. status already encodes the winner directly (home_win/away_win/tie),
 // confirmed against the actual import logic — no score comparison needed.
-async function computeMaddenTeamStreak(guildId, leagueId, teamName) {
+// 7J-STREAKSEASONSCOPE: real bug, confirmed live — found during a full sweep
+// for this exact pattern (per Hxxdie, after several rounds of finding this
+// same shape one instance at a time). No season_key filter at all: early in
+// a new season, with few games played so far, this could blend last
+// season's tail-end games into "most recent," producing a wrong streak. The
+// stage gate added earlier this session (7J-OFFSEASONNARRATIVEGATE) stops
+// this from running outside a real regular season, but doesn't fix this
+// underlying gap — even a genuine, current regular season isn't protected
+// from stale prior-season data bleeding into "most recent" without this.
+async function computeMaddenTeamStreak(guildId, leagueId, teamName, seasonKey = null) {
   const result = await pool.query(
     `SELECT week_label, home_team, away_team, status
      FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND status IN ('home_win', 'away_win', 'tie')
-       AND (home_team = $3 OR away_team = $3)`,
-    [guildId, String(leagueId), teamName]
+       AND (home_team = $3 OR away_team = $3)
+       AND ($4::text IS NULL OR season_key = $4::text)`,
+    [guildId, String(leagueId), teamName, seasonKey]
   ).catch(() => ({ rows: [] }));
 
   const games = (result.rows || [])
@@ -58753,14 +58831,17 @@ async function computeMaddenTeamStreak(guildId, leagueId, teamName) {
 // first win of the season. Reuses the identical game-history query as
 // computeMaddenTeamStreak (kept as its own copy rather than refactored to
 // share code, to avoid any risk of changing the already-verified original).
-async function checkMaddenStreakSnapped(guildId, leagueId, teamName) {
+// 7J-STREAKSEASONSCOPE: same fix, same reasoning as computeMaddenTeamStreak
+// above — see that function's comment.
+async function checkMaddenStreakSnapped(guildId, leagueId, teamName, seasonKey = null) {
   const result = await pool.query(
     `SELECT week_label, home_team, away_team, status
      FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
        AND status IN ('home_win', 'away_win', 'tie')
-       AND (home_team = $3 OR away_team = $3)`,
-    [guildId, String(leagueId), teamName]
+       AND (home_team = $3 OR away_team = $3)
+       AND ($4::text IS NULL OR season_key = $4::text)`,
+    [guildId, String(leagueId), teamName, seasonKey]
   ).catch(() => ({ rows: [] }));
 
   const games = (result.rows || [])
@@ -74756,101 +74837,29 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
     madden_season_year: seasonYearForAllWeeks.rows[0]?.madden_season_year ?? null,
   }).catch(() => null);
 
-  // 7J-10BY-GAMEGROUNDEDPRESEASON: per Hxxdie — three different EA hub
-  // payload fields (weekType, nextSeasonWeekType, preseasonWeekCount/
-  // stageIndex) all proved unreliable for this exact league, confirmed via
-  // the [EA SEASON MODE 7J-5AX] log: every one of them came back null at
-  // every point across the real preseason-to-regular transition, not as a
-  // one-off glitch. Rather than keep hunting for a fourth EA field to
-  // trust, this stops asking EA "are we in preseason" entirely. Per
-  // Hxxdie: Madden/NFL preseason is always 4 weeks — weeks 1-3 have real
-  // games, week 4 ("Cut Week") has none. Individual game rows already get
-  // labeled correctly for weeks 1-3 (repairEaFutureWeekLabelFromGameCore /
-  // 7J-10BY-EF — confirmed working live, Preseason Week 1/2/3 all
-  // imported and threaded under the right label). So this asks the bot's
-  // own already-correct data instead: has Preseason Week 3 — the last
-  // real preseason week with games — actually been PLAYED OUT (a
-  // completed game with a real score), not just scheduled? Requiring
-  // "completed" rather than merely "exists" is what stops this from
-  // unlocking on the very same sync Week 3's schedule first imports (its
-  // games are still 'scheduled' at that point) — completion only happens
-  // after real time has passed and the games were actually played, which
-  // is always at or after week 3 itself, never before. Once true,
-  // preseason is unambiguously over regardless of whatever EA's flags say
-  // for what comes next, and every subsequent sync runs the normal
-  // advance-detection path below with no gate at all — fully automatic,
-  // no per-league setup or commissioner command needed.
-  const MADDEN_PRESEASON_WEEKS_WITH_GAMES = 3;
-  const preseasonCompleteCheck = await pool.query(
-    `SELECT 1 FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id::text = $2::text
-       AND ($3::text IS NULL OR season_key = $3::text)
-       AND LOWER(week_label) = LOWER($4)
-       AND status IN ('completed','final','complete','completed_with_real_score','away_win','home_win','tie')
-       AND (COALESCE(home_score,0) > 0 OR COALESCE(away_score,0) > 0)
-     LIMIT 1`,
-    [guildId, String(leagueId), currentSeasonKeyForAllWeeks, `Preseason Week ${MADDEN_PRESEASON_WEEKS_WITH_GAMES}`]
-  ).catch(() => ({ rows: [] }));
-  const preseasonWeek3Done = (preseasonCompleteCheck.rows || []).length > 0;
-
-  // 7J-10BY-NOPRESEASONESCAPE: real gap, caught before it could block a
-  // live league — as written above, a league that runs NO preseason at
-  // all (a real, already-supported configuration — see
-  // 7J-NOPRESEASONKICKOFF elsewhere) would NEVER have a completed
-  // "Preseason Week 3" row to find, so the check above would block it
-  // forever, including its real regular season. Both queries here are
-  // scoped to the current season_key, same as above, to avoid a stale
-  // prior-season "Week 1" ever satisfying this. If this season has ZERO
-  // preseason data of any kind AND a genuine regular-season week has
-  // already completed, this is unambiguously a no-preseason league whose
-  // real season has already started — never block it.
-  let preseasonWithGamesComplete = preseasonWeek3Done;
-  if (!preseasonWithGamesComplete) {
-    const anyPreseasonDataCheck = await pool.query(
-      `SELECT 1 FROM madden_imported_games
-       WHERE guild_id = $1 AND league_id::text = $2::text
-         AND ($3::text IS NULL OR season_key = $3::text)
-         AND LOWER(week_label) LIKE 'preseason week%'
-       LIMIT 1`,
-      [guildId, String(leagueId), currentSeasonKeyForAllWeeks]
-    ).catch(() => ({ rows: [] }));
-    const hasAnyPreseasonData = (anyPreseasonDataCheck.rows || []).length > 0;
-    if (!hasAnyPreseasonData) {
-      const realRegularSeasonCheck = await pool.query(
-        `SELECT 1 FROM madden_imported_games
-         WHERE guild_id = $1 AND league_id::text = $2::text
-           AND ($3::text IS NULL OR season_key = $3::text)
-           AND week_label ~* '^week [0-9]+$'
-           AND status IN ('completed','final','complete','completed_with_real_score','away_win','home_win','tie')
-           AND (COALESCE(home_score,0) > 0 OR COALESCE(away_score,0) > 0)
-         LIMIT 1`,
-        [guildId, String(leagueId), currentSeasonKeyForAllWeeks]
-      ).catch(() => ({ rows: [] }));
-      if ((realRegularSeasonCheck.rows || []).length > 0) {
-        preseasonWithGamesComplete = true;
-        console.log(`[AUTO DETECT] League ${leagueId} has no preseason data this season and a real regular-season week is already complete — treating as a no-preseason league, not blocking.`);
-      }
-    }
-  }
-
-  if (!preseasonWithGamesComplete) {
-    console.log(`[AUTO DETECT] League ${leagueId} hasn't completed Preseason Week ${MADDEN_PRESEASON_WEEKS_WITH_GAMES} yet — treating as still in preseason (game-data-grounded check), skipping all advance processing by design.`);
-    // 7J-10BY-PRESEASONANCHORFIX: without this, last_auto_detect_week_label
-    // never gets set during preseason at all (this gate returns before the
-    // first-run anchor logic below ever runs). The moment preseason ends,
-    // this function would then see lastLabel still null and take the
-    // "first sync ever" branch — which by design only anchors and
-    // explicitly does NOT process that week — silently eating the real
-    // Week 1 kickoff (stat wipe, season-start announcement, Week 1
-    // threads/lines). Anchoring once to a sentinel that sorts before
-    // every real week label means the PRIMARY forward-progress path below
-    // recognizes the real Week 1 as a genuine advance instead of a first
-    // run, once preseason actually ends.
-    if (!lastLabel) {
-      await markMaddenAdvanceProcessed(guildId, leagueId, 'Preseason Week 0');
-    }
-    return null;
-  }
+  // 7J-PRESEASONTHREADSENABLE: per Hxxdie — the gate this comment used to
+  // sit above (7J-10BY-GAMEGROUNDEDPRESEASON, kept below purely as
+  // historical record of why a game-data-grounded signal was chosen over
+  // EA's unreliable stage flags) suppressed ALL advance processing —
+  // threads included — until Preseason Week 3 fully completed. That was
+  // solving a real problem (the one genuinely tricky moment: detecting the
+  // OFFSEASON -> preseason transition, since that crosses an actual
+  // season boundary and EA's own stage flags can't be trusted for it) with
+  // a much blunter tool than necessary: suppressing three entire weeks of
+  // real coverage to get one transition right. That transition is now
+  // handled directly and correctly by 7J-PRESEASONADVANCEBLIND below (the
+  // looksLikeGenuineSeasonStart check, broadened this session to recognize
+  // "Preseason Week N" while stuck in 'offseason'). Once that one moment is
+  // handled, WITHIN preseason (Week 1 -> 2 -> 3 -> real Week 1) is ordinary
+  // same-season forward progress — preseason (group 0) sorting before
+  // regular season (group 1) in maddenWeekLabelSortKey is correct, not a
+  // cross-season collision, so the normal genuinelyMovedForward comparison
+  // just below already handles all of it with no special-casing needed.
+  // Removed the gate rather than patching around it — the underlying
+  // per-game data was already confirmed reliable (see the preserved
+  // comment below), so nothing here was actually protecting against bad
+  // data, only delaying real coverage that can now run on schedule.
+  const MADDEN_PRESEASON_WEEKS_WITH_GAMES = 3; // kept for reference below; no longer gates anything
 
 
   // Known week sequence from the schedule — shared by both paths below. Used by
@@ -74952,10 +74961,28 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
     // trust EA's raw report directly. The season_key scoping added above
     // (7J-10BY-SEASONKEYALLWEEKS) already covers the original stale-data
     // collision concern for the labels that still matter.
+    //
+    // 7J-PRESEASONADVANCEBLIND: real bug, confirmed live — this only ever
+    // matched bare "Week N", never "Preseason Week N", so a league that
+    // DOES run a preseason (the normal case) could never have its
+    // offseason → preseason transition recognized as forward progress at
+    // all. genuinelyMovedForward structurally can't catch it either
+    // (Preseason Week 1 is group 0, always sorting "before" whatever
+    // group-1/2 label the league was last stuck on at the end of last
+    // season, regardless of real time having moved forward — the same
+    // cross-season group-number shape found several times elsewhere this
+    // session). With getMaddenNewAdvanceWeek returning null, the entire
+    // per-week catch-up loop that calls it never even starts processing
+    // that week — not just game threads, but sportsbook lines, prop
+    // generation, and news too, all silently skipped. This one broadened
+    // regex is the actual root cause fix; the earlier
+    // 7J-THREADANCHORSEASONSCOPE fix to thread creation was real and
+    // still needed, but could never have taken effect on its own, since
+    // the function it lives in was never being reached in the first place.
     const looksLikeGenuineSeasonStart = currentSeasonStage === 'offseason' &&
-      /^week \d+$/i.test(String(eaReportedWeek || '').trim());
+      /^(preseason\s+)?week \d+$/i.test(String(eaReportedWeek || '').trim());
     if (!genuinelyMovedForward && looksLikeGenuineSeasonStart) {
-      console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" while league was stuck in 'offseason' stage — recognizing as the start of the regular season despite not sorting after the stale last-processed label ("${lastLabel}").`);
+      console.log(`[AUTO DETECT] EA reported "${eaReportedWeek}" while league was stuck in 'offseason' stage — recognizing as the start of the (pre)season despite not sorting after the stale last-processed label ("${lastLabel}").`);
       return eaReportedWeek;
     }
     if (!genuinelyMovedForward) return null;
@@ -76171,9 +76198,10 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     `SELECT DISTINCT team_name, coach_name FROM madden_franchises WHERE guild_id = $1 AND league_id = $2`,
     [guild.id, league.league_id]
   ).catch(() => ({ rows: [] }));
+  const currentSeasonKeyForStreaks = await getMaddenCurrentSeasonKey(league).catch(() => null);
   for (const { team_name: teamName, coach_name: coachName } of streakTeamsResult.rows || []) {
     if (!teamName) continue;
-    const streak = await computeMaddenTeamStreak(guild.id, league.league_id, teamName);
+    const streak = await computeMaddenTeamStreak(guild.id, league.league_id, teamName, currentSeasonKeyForStreaks);
     if (!streak.type || streak.type === 'tie') continue;
 
     // 7J-29STORY: bounce-back / snapped streak needs to run when the CURRENT
@@ -76182,7 +76210,7 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     // entirely before this ever got a chance to run, so it has to happen
     // before that continue, not after.
     if (streak.type === 'win' && streak.count === 1) {
-      const snapped = await checkMaddenStreakSnapped(guild.id, league.league_id, teamName);
+      const snapped = await checkMaddenStreakSnapped(guild.id, league.league_id, teamName, currentSeasonKeyForStreaks);
       if (snapped) {
         const snapKey = snapped.isFirstWinEver ? 'first_win' : `snapped_${snapped.priorRunLength}`;
         const canPostSnap = await shouldPostMaddenStoryline(guild.id, league.league_id, 'bounce_back', teamName, snapKey).catch(() => false);
@@ -76861,6 +76889,46 @@ Rules:
 // ---------------------------------------------------------------------------
 // Season transition handler — fires when preseason → regular season detected
 // ---------------------------------------------------------------------------
+// 7J-OLDSEASONTHREADCLEANUP: real bug, confirmed live — the previous
+// season's game threads (including the Super Bowl thread itself) were
+// still sitting around, undeleted, once the new season's preseason began.
+// The existing per-week rotation cleanup (getPreviousWeekWithThreads /
+// deleteMaddenWeekThreadsSilent) only ever compares week labels within
+// what it assumes is a single season — a prior season's Super Bowl
+// (group 2 in maddenWeekLabelSortKey) can never be found as "before" a
+// new season's Preseason Week 1 (group 0) by that comparison, the same
+// cross-season group-number problem confirmed multiple times elsewhere
+// this session (thread creation's own anchor query hit the identical
+// shape — see 7J-THREADANCHORSEASONSCOPE). Rather than trying to make
+// that week-by-week comparison season-aware, cleans up every thread NOT
+// belonging to the season now starting, in one pass, at the one reliable
+// point every league passes through when a new season begins.
+async function cleanupMaddenPriorSeasonGameThreads(guild, league) {
+  const currentSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
+  const staleThreadGames = await pool.query(
+    `SELECT id, thread_id FROM madden_imported_games
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND thread_id IS NOT NULL
+       AND season_key IS DISTINCT FROM $3::text`,
+    [guild.id, String(league.league_id), currentSeasonKey]
+  ).catch(() => ({ rows: [] }));
+  let deletedCount = 0;
+  for (const game of staleThreadGames.rows || []) {
+    const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+    if (thread) await thread.delete('GG Sports: new season started, old game thread cleanup').catch(() => null);
+    deletedCount += 1;
+  }
+  if (staleThreadGames.rows?.length) {
+    await pool.query(
+      `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND thread_id IS NOT NULL AND season_key IS DISTINCT FROM $3::text`,
+      [guild.id, String(league.league_id), currentSeasonKey]
+    ).catch(() => null);
+  }
+  console.log('[SEASON TRANSITION] Cleaned up old-season game threads:', deletedCount);
+  return deletedCount;
+}
 function maddenIsPreseasonWeek(weekLabel) {
   return maddenWeekLabelSortKey(weekLabel)[0] === 0;
 }
@@ -76930,6 +76998,13 @@ async function performMaddenRegularSeasonKickoff(guild, league, newWeekLabel) {
   // preseason at all) so nobody's regular-season numbers start inflated.
   const wipedCount = await wipeMaddenWeeklyStats(guild.id, league.league_id);
   console.log('[SEASON TRANSITION] Wiped pre-regular-season stats:', wipedCount, 'rows');
+
+  // 1a. Old-season game thread cleanup — no-op if the preseason-entry
+  // branch already handled this (same season_key, nothing left stale);
+  // the real coverage this adds is for leagues that skip preseason
+  // entirely (7J-NOPRESEASONKICKOFF) and hit this function directly.
+  await cleanupMaddenPriorSeasonGameThreads(guild, league).catch(err =>
+    console.error('[SEASON TRANSITION] Old-season thread cleanup failed:', err?.message || err));
 
   // 2. Reset persistent embed message IDs so they repost fresh for regular season
   await pool.query(
@@ -77059,6 +77134,8 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
     // would show stale mixed data for the whole preseason window.
     const wipedCount = await wipeMaddenWeeklyStats(guild.id, league.league_id);
     console.log('[SEASON TRANSITION] Wiped leftover stats at preseason start:', wipedCount, 'rows');
+    await cleanupMaddenPriorSeasonGameThreads(guild, league).catch(err =>
+      console.error('[SEASON TRANSITION] Old-season thread cleanup failed:', err?.message || err));
     await pool.query(
       `UPDATE madden_league_settings SET current_season_stage = 'preseason', updated_at = NOW() WHERE league_id = $1`,
       [league.league_id]
@@ -77603,14 +77680,26 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
       // classification the rest of the auto-detect pipeline already relies
       // on — instead of requiring an exact label string this codebase can't
       // fully verify for every round.
+      //
+      // 7J-BRACKETSWEEPSEASONSCOPE: real gap, same shape as
+      // 7J-BRACKETSEASONSCOPE earlier this session — this matches purely by
+      // team pair + round type, with no season_key filter. Narrower risk
+      // than the original bug (needs the exact same two teams to have met
+      // in the exact same round type across two different seasons to
+      // misfire), but the same underlying hazard: madden_imported_games
+      // never stops accumulating past seasons' games. Scoped for
+      // consistency and to close this out properly rather than leave one
+      // instance of the pattern unfixed.
+      const seasonKeyForRoundCheck = await getMaddenCurrentSeasonKey(league).catch(() => null);
       const gameResult = await pool.query(
         `SELECT week_label, home_team, away_team, home_score, away_score, status
          FROM madden_imported_games
          WHERE guild_id = $1 AND league_id::text = $2::text
-           AND ((LOWER(home_team) = LOWER($3) AND LOWER(away_team) = LOWER($4)) OR (LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($3)))
+           AND season_key = $3::text
+           AND ((LOWER(home_team) = LOWER($4) AND LOWER(away_team) = LOWER($5)) OR (LOWER(home_team) = LOWER($5) AND LOWER(away_team) = LOWER($4)))
            AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')
          ORDER BY imported_at DESC`,
-        [guild.id, String(league.league_id), series.teamA.name, series.teamB.name]
+        [guild.id, String(league.league_id), seasonKeyForRoundCheck, series.teamA.name, series.teamB.name]
       ).catch(() => ({ rows: [] }));
       const game = (gameResult.rows || []).find(g => {
         const [group, idx] = maddenWeekLabelSortKey(g.week_label);
@@ -77959,11 +78048,24 @@ async function autoDetectAfterSyncInner(guild, league) {
     const gameEvents = await autoProcessMaddenGameResults(guild, league, weekLabel).catch(() => []);
     weekEvents.push(...gameEvents);
 
-    if (isFinalWeek) {
+    // 7J-PRESEASONTHREADSENABLE: threads/results/news now run for preseason
+    // weeks same as any other week (see the gate removal above), but
+    // sportsbook lines/props are deliberately kept out of preseason —
+    // Hxxdie asked specifically for game threads, not betting lines on
+    // exhibition games, and this is the one piece with real-money
+    // implications, so it stays opt-in rather than silently inherited
+    // from a broader fix. Checked directly off the week label, not
+    // current_season_stage, so it can't be thrown off by the exact
+    // handoff timing between "Preseason Week 3" and the stage flag
+    // flipping to 'regular'.
+    const isPreseasonWeekForBetting = maddenIsPreseasonWeek(weekLabel);
+    if (isFinalWeek && !isPreseasonWeekForBetting) {
       await autoCreateMaddenSportsbookLines(guild, league, weekLabel).catch(err =>
         console.error('[AUTO DETECT] Sportsbook lines:', err?.message));
       await generateMaddenPlayerPropLines(guild, league, weekLabel).catch(err =>
         console.error('[AUTO DETECT] Player prop lines:', err?.message));
+    } else if (isPreseasonWeekForBetting) {
+      console.log(`[AUTO DETECT] Skipping sportsbook lines/props for ${weekLabel} — preseason, betting lines not enabled for exhibition games.`);
     } else {
       console.log(`[AUTO DETECT] Skipping sportsbook lines/props for ${weekLabel} — already-decided catch-up week.`);
     }
