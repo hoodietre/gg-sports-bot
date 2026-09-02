@@ -77096,7 +77096,22 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
   if (getPlayoffFormatKey(league) !== 'nfl') return;
   const settings = await ensureMaddenLeagueSettings(league);
   const stage = settings.current_season_stage || 'preseason';
-  if (stage !== 'regular') return; // already started (or not regular season yet) — nothing to do
+  // 7J-BRACKETRECOVERY: per Hxxdie — real stuck state, confirmed live.
+  // Manually clearing a corrupted league_playoff_brackets row (the
+  // documented recovery step for the season_key matchup bug,
+  // 7J-BRACKETSEASONSCOPE) did nothing, because current_season_stage was
+  // already sitting at 'playoffs' from the league's earlier, real
+  // transition — this function's gate only ever let it past this point
+  // while stage === 'regular'. The round-advance function further below
+  // has the mirror-image gate (only acts when a bracket row already
+  // exists). Together those two gates left "stage is playoffs, bracket
+  // row is missing" — reachable any time a row goes missing for any
+  // reason, not just this specific recovery case — with no path back.
+  // Widened to also allow entry while already in 'playoffs'; the
+  // "does a bracket already exist" check right below still makes this a
+  // cheap no-op for the normal case (bracket present) that covers the
+  // vast majority of playoff-stage syncs.
+  if (stage !== 'regular' && stage !== 'playoffs') return; // preseason/offseason — nothing to do
   if (maddenWeekLabelSortKey(newWeekLabel)[0] !== 2) return; // not a playoff week yet
 
   // Safety net: if a bracket already exists (started manually, or a prior
@@ -77125,7 +77140,7 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
     return;
   }
 
-  console.log('[SEASON TRANSITION] Playoff week detected for league', league.league_id, '— auto-starting playoff bracket.');
+  console.log('[SEASON TRANSITION] Playoff week detected for league', league.league_id, stage === 'playoffs' ? '(no existing bracket row — building fresh, recovery path)' : '', '— auto-starting playoff bracket.');
   try {
     // 7J-REALBRACKETMATCHUPS: reads Round 1 directly from EA's real synced
     // Wild Card schedule instead of predicting it — see the function's own
@@ -77182,7 +77197,15 @@ async function handleMaddenPlayoffBracketTransition(guild, league, newWeekLabel)
   // winners here, rather than the years_pro values themselves, keeps the
   // fix scoped to exactly the two award categories affected instead of
   // touching every other rookie-status read site in the file.
-  try {
+  //
+  // 7J-BRACKETRECOVERY: only take this snapshot on the genuine first-time
+  // 'regular' -> 'playoffs' transition, not on a recovery rebuild (stage
+  // already 'playoffs', bracket row was missing). A recovery rebuild can
+  // happen arbitrarily later than the real transition — re-running this
+  // then would overwrite a correct, already-frozen snapshot with current
+  // (possibly next-season-drifted) roster data, silently reintroducing the
+  // exact bug this snapshot exists to prevent.
+  if (stage === 'regular') try {
     const [oroyRows, droyRows] = await Promise.all([
       getMaddenAwardsRace(guild.id, league.league_id, 'oroy', 1).catch(() => []),
       getMaddenAwardsRace(guild.id, league.league_id, 'droy', 1).catch(() => []),
