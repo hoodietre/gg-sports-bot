@@ -1163,6 +1163,28 @@ async function initDatabase() {
   // Tracks the auto-updating bracket image message the same way
   // tournament_panels.bracket_image_message_id does.
   await pool.query(`ALTER TABLE league_playoff_brackets ADD COLUMN IF NOT EXISTS bracket_image_message_id TEXT`);
+  // 7J-FINALPREVIEWFLAG: per Hxxdie — real bug, confirmed live. The final
+  // round's matchup preview repost used to be guarded entirely by
+  // madden_storyline_posts (a shared dedup table that 7J-10BY-STORYLINERESET
+  // deliberately wipes clean for the whole league the moment the Super
+  // Bowl finalizes, so next season's stories aren't blocked by this
+  // season's already-used keys) — but syncMaddenPlayoffBracketFromResults'
+  // completed-bracket retry (7J-10BY-COMPLETEDBRACKETRETRY) runs on every
+  // single sync forever once a bracket is 'completed', with no awareness
+  // that table was just cleared. The wipe erased the "already posted"
+  // record; the very next sync's retry found nothing blocking it and
+  // reposted the exact same preview as if fresh. Tracks the final-round
+  // preview's posted state directly on the bracket row itself instead —
+  // this is genuinely about THIS bracket's own lifecycle, not a
+  // cross-season story that should ever reset, so it has no business
+  // living in a table whose entire purpose is next-season freshness.
+  await pool.query(`ALTER TABLE league_playoff_brackets ADD COLUMN IF NOT EXISTS final_preview_posted BOOLEAN NOT NULL DEFAULT FALSE`);
+  // One-time backfill: any bracket that's already 'completed' as of this
+  // deploy has, by definition, already had its final round's preview
+  // posted at least once (that's how it got a champion) — mark it so
+  // rather than letting the new column's default FALSE trigger one more
+  // repost on the very next sync before self-healing.
+  await pool.query(`UPDATE league_playoff_brackets SET final_preview_posted = TRUE WHERE status = 'completed' AND final_preview_posted = FALSE`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS league_rules_panels (
       league_id UUID PRIMARY KEY REFERENCES leagues(league_id) ON DELETE CASCADE,
@@ -77132,15 +77154,24 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
 // AI recap, since a full round preview is substantial enough to deserve
 // its own moment rather than competing for space with stat leaders.
 async function postMaddenPlayoffMatchupPreview(guild, league, round, roundLabel) {
+  // 7J-FINALPREVIEWFLAG: returns whether it actually sent a new post (vs.
+  // an early return for no channel/already-posted) so callers responsible
+  // for the FINAL round can mark that state durably on the bracket row
+  // itself — see the callers' own comments for why the shared dedup table
+  // alone isn't sufficient for that one case.
   const newsChannelId = await getMaddenNewsChannelId(league.league_id).catch(() => null);
-  if (!newsChannelId) return;
+  if (!newsChannelId) return false;
   const newsChannel = await guild.channels.fetch(newsChannelId).catch(() => null);
-  if (!newsChannel?.isTextBased?.()) return;
+  if (!newsChannel?.isTextBased?.()) return false;
 
   // Dedup — never repost the same round's preview twice, even across
-  // repeat syncs or a retry.
+  // repeat syncs or a retry. Not posting here because the dedup already
+  // has a record for it counts as "confirmed posted," not a failure —
+  // only returns false below for a genuine failure to send, so callers
+  // tracking this durably (see 7J-FINALPREVIEWFLAG) don't mistake "already
+  // posted" for "needs retrying."
   const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_preview', roundLabel, 'posted').catch(() => false);
-  if (!shouldPost) return;
+  if (!shouldPost) return true;
 
   const teamsResult = await pool.query(
     `SELECT team_name, wins, losses, ties FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
@@ -77185,7 +77216,8 @@ async function postMaddenPlayoffMatchupPreview(guild, league, round, roundLabel)
     .setFooter({ text: 'GG Sports • Playoff Coverage' })
     .setTimestamp();
 
-  await newsChannel.send({ embeds: [embed] }).catch(() => null);
+  const sendResult = await newsChannel.send({ embeds: [embed] }).catch(() => null);
+  return !!sendResult;
 }
 
 // Fires when a completed playoff series' winner had a numerically worse
@@ -77409,11 +77441,21 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
   // preview had zero remaining chances to retry, ever. Checked here,
   // before either of those gates, specifically for this one case: the
   // FINAL round only (never intermediate rounds — those had their normal
-  // in-progress retry window already). Uses the same dedup-protected
-  // postMaddenPlayoffMatchupPreview, so this is a no-op once it's actually
-  // posted.
+  // in-progress retry window already).
+  //
+  // 7J-FINALPREVIEWFLAG: real bug, confirmed live — this used to rely
+  // solely on postMaddenPlayoffMatchupPreview's own dedup
+  // (madden_storyline_posts) to stay a no-op once already posted. That
+  // table gets deliberately wiped clean for the whole league the moment
+  // the Super Bowl finalizes (7J-10BY-STORYLINERESET, for next season's
+  // stories) — which also erased THIS preview's "already posted" record,
+  // and this retry (running every single sync forever once completed)
+  // reposted the identical Super Bowl preview right after. Gated on the
+  // bracket row's own final_preview_posted flag instead — this is about
+  // this specific bracket's lifecycle, unaffected by a table that resets
+  // for unrelated reasons.
   const completedBracketCheck = await pool.query(
-    `SELECT bracket, status FROM league_playoff_brackets WHERE league_id = $1`,
+    `SELECT bracket, status, final_preview_posted FROM league_playoff_brackets WHERE league_id = $1`,
     [league.league_id]
   ).catch(() => ({ rows: [] }));
   const completedBracketState = completedBracketCheck.rows[0];
@@ -77421,10 +77463,18 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
     const finishedBracket = Array.isArray(completedBracketState.bracket) ? completedBracketState.bracket : [];
     const finalRoundIndex = finishedBracket.length - 1;
     const finalRound = finishedBracket[finalRoundIndex];
-    if (Array.isArray(finalRound) && finalRound.length) {
+    if (!completedBracketState.final_preview_posted && Array.isArray(finalRound) && finalRound.length) {
       const finalRoundLabel = tournamentBracketRoundLabel(finalRoundIndex + 1, 4, finalRoundIndex, 'nfl');
-      await postMaddenPlayoffMatchupPreview(guild, league, finalRound, finalRoundLabel).catch(err =>
-        console.error('[MADDEN BRACKET] Completed-bracket preview retry for', finalRoundLabel, 'failed:', err?.message || err));
+      const posted = await postMaddenPlayoffMatchupPreview(guild, league, finalRound, finalRoundLabel).catch(err => {
+        console.error('[MADDEN BRACKET] Completed-bracket preview retry for', finalRoundLabel, 'failed:', err?.message || err);
+        return false;
+      });
+      if (posted) {
+        await pool.query(
+          `UPDATE league_playoff_brackets SET final_preview_posted = TRUE, updated_at = NOW() WHERE league_id = $1`,
+          [league.league_id]
+        ).catch(() => null);
+      }
     }
     return;
   }
