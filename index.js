@@ -4725,6 +4725,35 @@ async function getMaddenCurrentSeasonKey(league) {
   return `Season ${Number(result.rows[0]?.n || 0) + 1}`;
 }
 
+// 7J-ARCHIVESEASONKEYSTABLE: real bug, confirmed live — Champion/Runner-Up/
+// Super Bowl MVP showed "Not detected" on the very first auto-posted
+// archive report, right after a real, correctly-detected Super Bowl.
+// Root cause: for any league without a real EA-sourced madden_season_year
+// (this test league included — confirmed via the archive label's own
+// fallback), getMaddenCurrentSeasonKey's fallback counts already-finalized
+// madden_championship_history rows ("Season " + count+1). That count
+// increments the instant this same finalize flow inserts THIS season's
+// own championship_history row (buildMaddenYearEndPrepEmbed, a few hundred
+// lines below) — so the archive report, built moments later in the same
+// transition, silently asked getMaddenSuperBowlResult for the WRONG
+// (already-incremented) season_key and found nothing. Same failure shape
+// any time this report gets regenerated later, too — not just this one
+// race — since the count-based key is permanently one ahead of a season
+// once it's archived. Resolves to the season_key actually stamped on the
+// most recently finalized championship_history row for this league
+// instead of recomputing a fresh "current" key — correct both for the
+// auto-post immediately after finalize (passed explicitly, see the
+// seasonLabel already computed pre-insert in buildMaddenYearEndPrepEmbed)
+// and for any later manual re-run (falls back to looking it up here).
+async function resolveMaddenArchiveSeasonKey(league, override = null) {
+  if (override) return override;
+  const result = await pool.query(
+    `SELECT season_label FROM madden_championship_history WHERE league_id = $1 ORDER BY finalized_at DESC LIMIT 1`,
+    [league?.league_id]
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0]?.season_label || await getMaddenCurrentSeasonKey(league);
+}
+
 async function getMaddenEstimatedDraftOrderRows(guildId, leagueId, limit = 32) {
   const result = await pool.query(
     `SELECT team_name, external_team_id, wins, losses, ties, points_for, points_against
@@ -4738,7 +4767,7 @@ async function getMaddenEstimatedDraftOrderRows(guildId, leagueId, limit = 32) {
   return rows.map(row => ({ ...row, display_team_name: row.team_name }));
 }
 
-async function getMaddenSuperBowlResult(guildId, leagueId) {
+async function getMaddenSuperBowlResult(guildId, leagueId, seasonKeyOverride = null) {
   // 7J-SEASONSCOPESB: per Hxxdie — this is the direct gate
   // handleMaddenOffseasonTransition checks every sync to decide whether to
   // auto-finalize year-end (see 7J-SEASONSCOPESTANDINGS for the matching
@@ -4757,12 +4786,21 @@ async function getMaddenSuperBowlResult(guildId, leagueId) {
   // whole codebase (it gates real-money achievement payouts) even though
   // it hadn't misfired yet for this specific league. Scoped by season_key
   // instead — always populated, no escape hatch.
-  const seasonYearResult = await pool.query(
-    `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
-    [leagueId]
-  ).catch(() => ({ rows: [] }));
-  const seasonYear = seasonYearResult.rows[0]?.madden_season_year ?? null;
-  const currentSeasonKey = await getMaddenCurrentSeasonKey({ league_id: leagueId, madden_season_year: seasonYear }).catch(() => null);
+  //
+  // 7J-ARCHIVESEASONKEYSTABLE: seasonKeyOverride lets a caller that already
+  // knows exactly which season it means (e.g. the archive report for the
+  // season that JUST finalized) bypass getMaddenCurrentSeasonKey entirely
+  // — see that function's comment for why recomputing "current" here can
+  // silently ask for the wrong season once a finalize has happened.
+  let currentSeasonKey = seasonKeyOverride;
+  if (!currentSeasonKey) {
+    const seasonYearResult = await pool.query(
+      `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
+      [leagueId]
+    ).catch(() => ({ rows: [] }));
+    const seasonYear = seasonYearResult.rows[0]?.madden_season_year ?? null;
+    currentSeasonKey = await getMaddenCurrentSeasonKey({ league_id: leagueId, madden_season_year: seasonYear }).catch(() => null);
+  }
 
   const result = await pool.query(
     `SELECT *
@@ -5114,8 +5152,8 @@ async function getMaddenBestRegularSeasonTeam(guildId, leagueId) {
   return { ...row, team_name: resolved, owner_user_id: ownerUserId };
 }
 
-async function getMaddenSuperBowlMvpCandidate(guildId, leagueId) {
-  const sb = await getMaddenSuperBowlResult(guildId, leagueId).catch(() => null);
+async function getMaddenSuperBowlMvpCandidate(guildId, leagueId, seasonKeyOverride = null) {
+  const sb = await getMaddenSuperBowlResult(guildId, leagueId, seasonKeyOverride).catch(() => null);
   if (!sb?.isFinal || !sb.winner) return null;
   const champion = await resolveMaddenTeamNameFromImport(guildId, leagueId, sb.winner).catch(() => sb.winner);
   const candidates = await getMaddenTeamIdentifierCandidates(guildId, leagueId, champion).catch(() => [champion]);
@@ -5406,7 +5444,7 @@ async function buildMaddenYearEndPrepEmbed(guild, league, confirm = false, userI
       [randomUUID(), guild.id, String(league.league_id), JSON.stringify({ awards, champion: championName, runner_up: runnerUpName, cap_violations: capViolations }), userId || null]
     ).catch(() => null);
     await generateMaddenOffseasonNewsEvents(guild, league, userId).catch(error => console.warn('[7J-10BY-DL] offseason news generation failed:', error?.message || error));
-    await postMaddenLeagueHistoryYearEndReport(guild, league, userId).catch(error => console.warn('[7J-10BY-DL] league history year-end post failed:', error?.message || error));
+    await postMaddenLeagueHistoryYearEndReport(guild, league, userId, seasonLabel).catch(error => console.warn('[7J-10BY-DL] league history year-end post failed:', error?.message || error));
     await recordMaddenNewsEvent(guild, league, {
       event_type: 'year_end_finalized',
       team_name: championName || null,
@@ -59260,14 +59298,15 @@ async function maddenCurrentSeasonArchiveLabel(guild, league) {
   return gameEdition ? `Archived Season ${seasonNumber} • ${gameEdition}` : `Archived Season ${seasonNumber}`;
 }
 
-async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
+async function buildMaddenOffseasonNewsSummaryEmbed(guild, league, seasonKeyOverride = null) {
   await ensureMaddenYearEndTables();
   await backfillMaddenExpandedPlayerDataForLeague(guild.id, league.league_id).catch(() => null);
+  const resolvedSeasonKey = await resolveMaddenArchiveSeasonKey(league, seasonKeyOverride).catch(() => seasonKeyOverride);
   const [awards, sb, bestRecord, sbMvp] = await Promise.all([
     getMaddenYearEndAwardWinners(guild.id, league.league_id).catch(() => []),
-    getMaddenSuperBowlResult(guild.id, league.league_id).catch(() => null),
+    getMaddenSuperBowlResult(guild.id, league.league_id, resolvedSeasonKey).catch(() => null),
     getMaddenBestRegularSeasonTeam(guild.id, league.league_id).catch(() => null),
-    getMaddenSuperBowlMvpCandidate(guild.id, league.league_id).catch(() => null),
+    getMaddenSuperBowlMvpCandidate(guild.id, league.league_id, resolvedSeasonKey).catch(() => null),
   ]);
   const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
   const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
@@ -59298,14 +59337,15 @@ async function buildMaddenOffseasonNewsSummaryEmbed(guild, league) {
   return embed;
 }
 
-async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
+async function buildMaddenLeagueHistoryYearEndEmbed(guild, league, seasonKeyOverride = null) {
   await ensureMaddenYearEndTables();
   await backfillMaddenExpandedPlayerDataForLeague(guild.id, league.league_id).catch(() => null);
+  const resolvedSeasonKey = await resolveMaddenArchiveSeasonKey(league, seasonKeyOverride).catch(() => seasonKeyOverride);
   const [awards, sb, bestRecord, sbMvp] = await Promise.all([
     getMaddenYearEndAwardWinners(guild.id, league.league_id).catch(() => []),
-    getMaddenSuperBowlResult(guild.id, league.league_id).catch(() => null),
+    getMaddenSuperBowlResult(guild.id, league.league_id, resolvedSeasonKey).catch(() => null),
     getMaddenBestRegularSeasonTeam(guild.id, league.league_id).catch(() => null),
-    getMaddenSuperBowlMvpCandidate(guild.id, league.league_id).catch(() => null),
+    getMaddenSuperBowlMvpCandidate(guild.id, league.league_id, resolvedSeasonKey).catch(() => null),
   ]);
   const championName = sb?.winner ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.winner) : null;
   const runnerUpName = sb?.loser ? await resolveMaddenTeamNameFromImport(guild.id, league.league_id, sb.loser) : null;
@@ -59337,13 +59377,13 @@ async function buildMaddenLeagueHistoryYearEndEmbed(guild, league) {
   return embed;
 }
 
-async function postMaddenLeagueHistoryYearEndReport(guild, league, userId = null) {
+async function postMaddenLeagueHistoryYearEndReport(guild, league, userId = null, seasonKeyOverride = null) {
   if (!guild || !league?.league_id) return { posted: false, reason: 'Missing guild or league.' };
   const channelId = league.history_channel_id || null;
   if (!channelId) return { posted: false, reason: 'No league history channel configured.' };
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased?.()) return { posted: false, reason: 'Configured history channel is not available.' };
-  const embed = await buildMaddenLeagueHistoryYearEndEmbed(guild, league);
+  const embed = await buildMaddenLeagueHistoryYearEndEmbed(guild, league, seasonKeyOverride);
 
   // 7J-ARCHIVEDBRACKETIMAGE: per Hxxdie — the archive report already covers
   // champion/awards/records in text, but the actual bracket shape (who beat
@@ -75934,29 +75974,79 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   // identical, always-latest-week data instead of each week's own. Derives
   // the target week_index from the specific weekLabel this call is for
   // instead — matches the displayWeek = weekIndex + 1 relationship already
-  // established at import time (see the weekly-stat import above). Playoff
-  // labels ("Wild Card", etc.) fall back to the old global-max behavior —
-  // the exact weekIndex a playoff round's stat export uses is genuinely
-  // unconfirmed elsewhere in this codebase too (see 7J-PLAYOFFSTATDISCOVERY),
-  // not something to guess at here.
+  // established at import time (see the weekly-stat import above).
+  //
+  // 7J-PLAYOFFSTATLEADERSFIX: per Hxxdie — real bug, confirmed live (a
+  // "Super Bowl Stat Leaders" post showed players from teams that weren't
+  // even in the Super Bowl). The playoff branch used to fall back to a
+  // genuinely global MAX(week_index) with no stage_index awareness — but
+  // 7J-PLAYOFFSTATDISCOVERY's playoff stat probes store one of their two
+  // candidate conventions at week_index=0 (the SAME value real
+  // regular-season Week 1 uses), which a global MAX() can never surface
+  // once any regular-season week has been imported. The result was always
+  // just whichever regular-season week happened to be numerically
+  // highest, mislabeled with the playoff round's name — exactly what was
+  // seen live. Separately, even once the right week_index is identified,
+  // week_index alone doesn't uniquely identify a playoff round's stats —
+  // the postseason-stage convention's week_index=0 collides with real
+  // Week 1 data, distinguished only by stage_index, which nothing
+  // downstream (this query or getMaddenAwardRaceLeaders) ever filtered on.
+  // Fixed both together: computes the same two real candidate
+  // (week_index, stage_index) pairs 7J-PLAYOFFSTATDISCOVERY already probes
+  // EA with for the current playoff round, checks which one actually has
+  // rows on file (same "whichever convention actually returns real rows is
+  // the one that gets used" reasoning as that fix, rather than guessing
+  // independently here), and carries stage_index through to every
+  // downstream query alongside week_index instead of week_index alone.
   const regularSeasonWeekMatch = String(weekLabel || '').trim().match(/^week\s+(\d+)$/i);
   let latestWeekIndex;
+  let latestStageIndex = 1; // EA_PLAYER_STAT_DISCOVERY_STAGE_INDEX default — matches regular-season import
   if (regularSeasonWeekMatch) {
     latestWeekIndex = Number(regularSeasonWeekMatch[1]) - 1; // displayWeek = weekIndex + 1
   } else {
-    const latestWeekResult = await pool.query(
-      `SELECT COALESCE(MAX(week_index), 0) AS max_week FROM madden_player_weekly_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
-      [guild.id, String(league.league_id)]
-    ).catch(() => ({ rows: [{ max_week: 0 }] }));
-    latestWeekIndex = Number(latestWeekResult.rows[0]?.max_week || 0);
+    const [labelGroup, labelIdx] = maddenWeekLabelSortKey(weekLabel);
+    const playoffCandidates = [];
+    if (labelGroup === 2 && labelIdx >= 0 && labelIdx <= 3) {
+      // labelIdx: 0=Wild Card, 1=Divisional, 2=Conference Championship, 3=Super Bowl
+      const scheduleWeekIndex = 18 + labelIdx + (labelIdx === 3 ? 1 : 0); // skips 21 (Pro Bowl)
+      const postseasonStageIndex = 2 + labelIdx + (labelIdx === 3 ? 1 : 0); // skips 5 (Pro Bowl)
+      playoffCandidates.push({ weekIndex: scheduleWeekIndex, stageIndex: 1 });
+      playoffCandidates.push({ weekIndex: 0, stageIndex: postseasonStageIndex });
+    }
+    let foundCandidate = null;
+    for (const candidate of playoffCandidates) {
+      const probeResult = await pool.query(
+        `SELECT 1 FROM madden_player_weekly_stats
+         WHERE guild_id = $1 AND league_id::text = $2::text AND week_index = $3 AND stage_index = $4 LIMIT 1`,
+        [guild.id, String(league.league_id), candidate.weekIndex, candidate.stageIndex]
+      ).catch(() => ({ rows: [] }));
+      if (probeResult.rows.length) { foundCandidate = candidate; break; }
+    }
+    if (foundCandidate) {
+      latestWeekIndex = foundCandidate.weekIndex;
+      latestStageIndex = foundCandidate.stageIndex;
+    } else {
+      // Not a recognized playoff label, or EA hasn't exported that round's
+      // stats yet — same global-max fallback as before, now also reading
+      // back whichever stage_index that row actually used so downstream
+      // queries stay consistent instead of silently assuming stage 1.
+      const latestWeekResult = await pool.query(
+        `SELECT week_index, stage_index FROM madden_player_weekly_stats
+         WHERE guild_id = $1 AND league_id::text = $2::text
+         ORDER BY week_index DESC, imported_at DESC LIMIT 1`,
+        [guild.id, String(league.league_id)]
+      ).catch(() => ({ rows: [] }));
+      latestWeekIndex = Number(latestWeekResult.rows[0]?.week_index || 0);
+      latestStageIndex = Number(latestWeekResult.rows[0]?.stage_index ?? 1);
+    }
   }
 
-  const bigPerfs = latestWeekIndex > 0 ? await pool.query(
+  const bigPerfs = (latestWeekIndex > 0 || latestStageIndex > 1) ? await pool.query(
     `SELECT ws.*, p.first_name, p.last_name, p.position, p.team_name, p.age
      FROM madden_player_weekly_stats ws
      LEFT JOIN madden_players p ON p.id = ws.player_key
        AND p.guild_id = ws.guild_id
-     WHERE ws.guild_id = $1 AND ws.league_id = $2 AND ws.week_index = $3
+     WHERE ws.guild_id = $1 AND ws.league_id = $2 AND ws.week_index = $3 AND ws.stage_index = $4
        AND (
          (ws.stat_type = 'passing' AND (ws.raw_payload->>'passYds')::numeric > 300) OR
          (ws.stat_type = 'rushing' AND (ws.raw_payload->>'rushYds')::numeric > 125) OR
@@ -75966,7 +76056,7 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
          (ws.stat_type = 'receiving' AND (ws.raw_payload->>'recTDs')::numeric >= 2)
        )
      LIMIT 10`,
-    [guild.id, String(league.league_id), latestWeekIndex]
+    [guild.id, String(league.league_id), latestWeekIndex, latestStageIndex]
   ).catch(() => ({ rows: [] })) : { rows: [] };
 
   // Budding star watch — a young player (24 or under) having a big game gets
@@ -76032,7 +76122,21 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   // 7J-10BY-PLAYOFFCOVERAGEGATE: see the gate comment at the top of this
   // function — everything from here through the division-race block below
   // is regular-season-only narrative content.
-  if (stageForNarrativeGate !== 'playoffs') {
+  //
+  // 7J-OFFSEASONNARRATIVEGATE: real bug, confirmed live — this was written
+  // as "not playoffs" instead of "is regular", which is a broader
+  // condition than the comment above (and the original 7J-10BY-
+  // PLAYOFFCOVERAGEGATE intent) ever meant: 'preseason' and 'offseason'
+  // both also satisfy "not playoffs", so this whole block silently
+  // re-enabled itself the moment the league moved past playoffs into
+  // offseason/Pro Bowl — confirmed live producing "3 straight" hot-streak
+  // and "picks up their first win" storylines for already-eliminated teams
+  // during Pro Bowl week, using whatever games computeMaddenTeamStreak
+  // happened to consider each team's most recent (itself not season-key
+  // scoped — same root cause shape as the bracket bugs earlier this
+  // session, just never exercised until an actual offseason transition
+  // ran). Narrowed to the literal condition the comment already describes.
+  if (stageForNarrativeGate === 'regular') {
   const powerDropLookup = await pool.query(
     `SELECT team_name, (previous_rank - rank) AS movement
      FROM madden_power_rankings
@@ -76294,15 +76398,17 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   } // end 7J-10BY-PLAYOFFCOVERAGEGATE (streak/hot-seat/undefeated-watch/division-race/playoff-picture)
 
   // Award race leaders
-  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex != null ? latestWeekIndex : null).catch(() => null);
+  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex != null ? latestWeekIndex : null, latestStageIndex != null ? latestStageIndex : null).catch(() => null);
   if (awardLeaders) {
     events.push({ type: 'award_race', leaders: awardLeaders });
   }
 
   // Power ranking movers (biggest jumps/drops) — see 7J-10BY-PLAYOFFCOVERAGEGATE
-  // above: same reasoning, gated the same way, just a separate block since
-  // stat leaders (directly above) needed to stay ungated in between.
-  if (stageForNarrativeGate !== 'playoffs') {
+  // and 7J-OFFSEASONNARRATIVEGATE above: same reasoning, gated the same
+  // way (regular season only, not just "not playoffs"), just a separate
+  // block since stat leaders (directly above) needed to stay ungated in
+  // between.
+  if (stageForNarrativeGate === 'regular') {
   const powerMovers = await pool.query(
     `SELECT team_name, rank, previous_rank,
        (previous_rank - rank) AS movement
@@ -76342,9 +76448,23 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
 // rushing rows to survive the cutoff most weeks. Split into three
 // per-stat-type queries, each with its own limit, so all three categories are
 // guaranteed a fair shot regardless of how many passing rows exist.
-async function getMaddenAwardRaceLeaders(guildId, leagueId, weekIndex = null) {
-  const weekFilter = weekIndex != null ? 'AND week_index = $3' : '';
-  const values = weekIndex != null ? [guildId, String(leagueId), weekIndex] : [guildId, String(leagueId)];
+async function getMaddenAwardRaceLeaders(guildId, leagueId, weekIndex = null, stageIndex = null) {
+  // 7J-PLAYOFFSTATLEADERSFIX: week_index alone doesn't uniquely identify a
+  // playoff round's stats — see the comment at this function's caller.
+  // Only applied when a specific week is being asked for (weekIndex !=
+  // null); season-long aggregate calls (weekIndex == null) are unaffected
+  // and keep summing across every stage exactly as before.
+  const filters = [];
+  const values = [guildId, String(leagueId)];
+  if (weekIndex != null) {
+    values.push(weekIndex);
+    filters.push(`week_index = $${values.length}`);
+    if (stageIndex != null) {
+      values.push(stageIndex);
+      filters.push(`stage_index = $${values.length}`);
+    }
+  }
+  const weekFilter = filters.length ? `AND ${filters.join(' AND ')}` : '';
 
   const [passing, rushing, receiving] = await Promise.all([
     pool.query(
