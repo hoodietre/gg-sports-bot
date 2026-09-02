@@ -8667,12 +8667,21 @@ async function selectMaddenPlayoffTeams(guild, league) {
   // large majority of real scenarios; anything head-to-head can't resolve
   // (no meeting, or a 3+-way tie it can't fully order) falls through to
   // point differential same as before.
+  // 7J-BRACKETSEASONSCOPE: same missing-scope shape as
+  // getMaddenPlayoffWeekGames below — madden_imported_games holds every
+  // season's completed games forever, so an unscoped head-to-head lookup
+  // could resolve a tie using a game from a prior season the two teams
+  // played, rather than (or in addition to) any real meeting this season.
+  // Lower-stakes than the matchup-pairing bug (this only feeds bye-team/
+  // seed-label selection, never who plays whom), but the same real gap.
+  const currentSeasonKeyForSeeding = await getMaddenCurrentSeasonKey(league).catch(() => null);
   const h2hGamesResult = await pool.query(
     `SELECT home_team, away_team, home_score, away_score, status
      FROM madden_imported_games
      WHERE guild_id = $1 AND league_id::text = $2::text
+       AND season_key = $3::text
        AND LOWER(COALESCE(status, '')) IN ('completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie')`,
-    [guild.id, String(league.league_id)]
+    [guild.id, String(league.league_id), currentSeasonKeyForSeeding]
   ).catch(() => ({ rows: [] }));
   const h2hWinner = new Map(); // key: "teamA|teamB" (lowercase, alpha-sorted) -> winning team name (lowercase)
   for (const g of h2hGamesResult.rows || []) {
@@ -8762,11 +8771,26 @@ async function selectMaddenPlayoffTeams(guild, league) {
 // never part of a close multi-way tie the way a 6/7 wildcard cutoff can
 // be) and best-effort cosmetic seed LABELS for display.
 async function getMaddenPlayoffWeekGames(guild, league, group, idx) {
+  // 7J-BRACKETSEASONSCOPE: per Hxxdie — real bug, confirmed live at the end
+  // of the Session 43 full-lifecycle test. madden_imported_games keeps
+  // every season's rows forever (upsert key is (league_id,
+  // external_game_id), never cleared), and this query had no season
+  // filter at all — only guild_id/league_id, matched against week_label
+  // via maddenWeekLabelSortKey. A prior season's "Super Bowl"-labeled game
+  // between two completely unrelated teams was a valid candidate match
+  // here the whole time, which is exactly what got picked live (bracket
+  // posted a Super Bowl Preview matching neither the real prior season nor
+  // the real current one). Same fix pattern as
+  // createMaddenWeeklyGameThreadsCore/getMaddenSuperBowlResult
+  // (7J-SEASONKEYALWAYS): scope by season_key, always populated, plain
+  // equality, no "unfiltered if null" escape hatch.
+  const currentSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
   const gamesResult = await pool.query(
     `SELECT home_team, away_team, week_label
      FROM madden_imported_games
-     WHERE guild_id = $1 AND league_id::text = $2::text`,
-    [guild.id, String(league.league_id)]
+     WHERE guild_id = $1 AND league_id::text = $2::text
+       AND season_key = $3::text`,
+    [guild.id, String(league.league_id), currentSeasonKey]
   ).catch(() => ({ rows: [] }));
   const matching = (gamesResult.rows || []).filter(g => {
     const [g2, i2] = maddenWeekLabelSortKey(g.week_label);
