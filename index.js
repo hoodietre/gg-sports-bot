@@ -69091,14 +69091,33 @@ function looksLikeEaScheduleGame(item) {
 }
 
 
-function normalizeEaScheduleDeepFromHub(hubPayload) {
+function normalizeEaScheduleDeepFromHub(hubPayload, strictIsPreseasonOverride = null) {
   const maps = buildEaTeamNameMaps(hubPayload);
   const currentCtx = extractEaStandingsRequestContextFromHub(hubPayload, 0);
 
   // 7J-10BY-EF: isEaHubInPreseason now correctly returns true when weekType:0 or
   // isPreseason:true, even if displayedWeek is "Week 1". Build effectiveCtx from
   // that signal so repairEaFutureWeekLabelFromGame gets a correct preseason context.
-  const hubIsPreseason = isEaHubInPreseason(hubPayload, 0);
+  //
+  // 7J-SCHEDULEPRESEASONSIGNAL: real bug, confirmed live — this used to always
+  // compute its own hubIsPreseason via isEaHubInPreseason, the exact signal
+  // 7J-10BY-STRICTPRESEASONGATE already documented as unreliable "right at
+  // the tail end of preseason" (weekType silently defaults to 1/regular via
+  // a hard-coded fallback when EA's payload doesn't cleanly include it for
+  // that sync). That gate was hardened with strictIsPreseason, but only ever
+  // applied to ea_reported_current_week/the advance-detection gate — this
+  // schedule-import path, which sets every individual GAME row's week_label,
+  // kept using the old unreliable signal. The two could disagree exactly at
+  // the moment that matters most: confirmed live at real Preseason Week 3
+  // (the actual tail end) — advance detection correctly said "Preseason
+  // Week 3" (using the hardened signal), while the imported game rows for
+  // that same week got labeled plain "Week 3" (using the old one), an
+  // exact-match mismatch that again produced zero threads, same shape as
+  // the previous bug, different mechanism. Accepts the caller's already-
+  // computed strictIsPreseason and prefers it when provided, so both paths
+  // agree by construction instead of independently guessing and risking
+  // disagreement.
+  const hubIsPreseason = strictIsPreseasonOverride !== null ? strictIsPreseasonOverride : isEaHubInPreseason(hubPayload, 0);
   const effectiveCtx = hubIsPreseason
     ? { ...currentCtx, isRegularSeason: false, isPreseason: true, weekType: 0 }
     : currentCtx;
@@ -72433,7 +72452,6 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     });
 
     let teams = normalizeEaLeagueTeamsDeepFromHub(hub);
-    const games = normalizeEaScheduleDeepFromHub(hub);
 
     const hasRealRecordData = teams.some(team =>
       Number(team.wins || 0) > 0 ||
@@ -72442,6 +72460,22 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       Number(team.points_for || 0) > 0 ||
       Number(team.points_against || 0) > 0
     );
+
+    // 7J-SCHEDULEPRESEASONSIGNAL: computed here, before schedule import, so
+    // normalizeEaScheduleDeepFromHub can use the SAME hardened signal the
+    // advance-detection gate below already trusts (7J-10BY-STRICTPRESEASONGATE)
+    // instead of its own older, separately-computed one — see that function's
+    // own comment for why the two disagreeing was a real, confirmed bug.
+    // Pure function of `hub`, which doesn't change within this sync, so this
+    // and the equivalent computation further below (kept as-is, unchanged)
+    // are guaranteed to agree.
+    const earlyEaHubCtx = extractEaStandingsRequestContextFromHub(hub, context.externalLeagueId);
+    const earlyPreseasonMode = isEaHubInPreseason(hub, context.externalLeagueId);
+    const earlyExplicitlyPreseason = earlyEaHubCtx?.nextSeasonWeekType === 0 || earlyPreseasonMode === true;
+    const earlyExplicitlyRegularSeason = earlyEaHubCtx?.nextSeasonWeekType === 1 || hasRealRecordData === true;
+    const earlyStrictIsPreseason = earlyExplicitlyPreseason ? true : (earlyExplicitlyRegularSeason ? false : true);
+
+    const games = normalizeEaScheduleDeepFromHub(hub, earlyStrictIsPreseason);
 
     const preseasonMode = isEaHubInPreseason(hub, context.externalLeagueId);
     const seasonModeLabel = getEaHubSeasonModeLabel(hub, context.externalLeagueId);
