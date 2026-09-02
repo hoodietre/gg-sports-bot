@@ -8850,6 +8850,30 @@ async function buildMaddenWildCardRoundFromRealGames(guild, league) {
   return series;
 }
 
+// 7J-PROBOWLBRACKETGAP: real bug, confirmed live — the final round of a
+// real bracket (Conference Championship -> Super Bowl) never built.
+// maddenWeekLabelSortKey's real EA week-index space has FIVE values across
+// the playoff stretch (Wild Card=0, Divisional=1, Conf. Championship=2,
+// Pro Bowl=3, Super Bowl=4) because Pro Bowl — a real label, added in
+// Session 43's stuck-loop fix — is a genuine all-star exhibition sitting
+// between Conference Championship and Super Bowl, not a bracket round at
+// all. The bracket's own round index only has FOUR values (0-3: Wild
+// Card, Divisional, Conf. Championship, Super Bowl), and every call site
+// below silently assumed those two index spaces were the same thing —
+// correct for rounds 0-2 (which happen to line up 1:1), silently wrong
+// starting exactly at the Conference Championship -> Super Bowl step,
+// where EA's real Super Bowl index (4) is one past what the bracket's own
+// indexing (3) asked for. That's index 3 in EA's space — Pro Bowl —
+// which no franchise-team matchup will ever be found in, so the lookup
+// came back empty every sync, indistinguishable from "EA hasn't exported
+// it yet" (the case this code was actually built to wait out). Translates
+// the bracket's own round index to the real EA week-label index at every
+// site that queries madden_imported_games by round, instead of assuming
+// they're interchangeable.
+function maddenBracketRoundToWeekIdx(bracketRoundIndex) {
+  return bracketRoundIndex >= 3 ? bracketRoundIndex + 1 : bracketRoundIndex;
+}
+
 // Rounds after Wild Card: same "read, don't predict" principle. Seed and
 // conference are carried forward from whoever won each series in the
 // previous round (real data, already confirmed by that round's own real
@@ -77342,7 +77366,7 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
     if (iteration === 0) {
       const realRound = roundIndex === 0
         ? await buildMaddenWildCardRoundFromRealGames(guild, league).catch(() => [])
-        : await buildMaddenNextRoundFromRealGames(guild, league, bracket[roundIndex - 1] || [], roundIndex).catch(() => []);
+        : await buildMaddenNextRoundFromRealGames(guild, league, bracket[roundIndex - 1] || [], maddenBracketRoundToWeekIdx(roundIndex)).catch(() => []);
       if (realRound.length >= 2) {
         const pairKey = (s) => s.bye ? `bye:${s.teamA.name.toLowerCase()}` : [s.teamA.name.toLowerCase(), s.teamB.name.toLowerCase()].sort().join('|');
         const currentKeys = roundSeries.map(pairKey);
@@ -77400,7 +77424,7 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
       ).catch(() => ({ rows: [] }));
       const game = (gameResult.rows || []).find(g => {
         const [group, idx] = maddenWeekLabelSortKey(g.week_label);
-        return group === 2 && idx === roundIndex;
+        return group === 2 && idx === maddenBracketRoundToWeekIdx(roundIndex);
       });
       if (!game) continue; // not played/synced yet — check again next sync
 
@@ -77473,7 +77497,7 @@ async function syncMaddenPlayoffBracketFromResults(guild, league) {
     // decided, wait and retry rather than advancing into an empty round.
     const nextRound = bracket[roundIndex + 1]?.length
       ? bracket[roundIndex + 1] // already built by a previous tick — just move into it
-      : await buildMaddenNextRoundFromRealGames(guild, league, roundSeries, roundIndex + 1);
+      : await buildMaddenNextRoundFromRealGames(guild, league, roundSeries, maddenBracketRoundToWeekIdx(roundIndex + 1));
     if (!nextRound.length) {
       bracket[roundIndex] = roundSeries;
       await pool.query(`UPDATE league_playoff_brackets SET bracket = $2, updated_at = NOW() WHERE league_id = $1`, [league.league_id, JSON.stringify(bracket)]).catch(() => null);
