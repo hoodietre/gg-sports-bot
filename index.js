@@ -72546,9 +72546,27 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
         preseasonModeLoose: preseasonMode,
         strictIsPreseason,
       }));
+      // 7J-PRESEASONLABELRECONCILE: known, established gap — EA's displayedWeek
+      // text never includes "Preseason" itself, even during preseason. This is
+      // the exact same thing repairEaFutureWeekLabelFromGameCore already
+      // corrects for individual game rows (see its own "Preseason " prefixing
+      // a few lines below there), using the same kind of preseason signal.
+      // ea_reported_current_week was being stored as EA's raw text verbatim
+      // with no equivalent correction applied — advance detection and thread
+      // creation downstream saw "Week 2" while the real, already-repaired game
+      // rows were labeled "Preseason Week 2", an exact-match mismatch that
+      // silently produced zero threads with no error anywhere. Fixed at the
+      // source, using strictIsPreseason (the hardened signal immediately
+      // above, already trusted for this exact purpose) rather than
+      // downstream — this is where the raw EA text and the reliable
+      // preseason signal are both already in hand together.
+      let displayedWeekForStorage = String(eaHubCtx.displayedWeek).trim();
+      if (strictIsPreseason && /^week\s+\d+$/i.test(displayedWeekForStorage)) {
+        displayedWeekForStorage = 'Preseason ' + displayedWeekForStorage;
+      }
       await pool.query(
         `UPDATE madden_league_settings SET ea_reported_current_week = $2, ea_hub_is_preseason = $3, updated_at = NOW() WHERE league_id = $1`,
-        [league.league_id, String(eaHubCtx.displayedWeek).trim(), strictIsPreseason]
+        [league.league_id, displayedWeekForStorage, strictIsPreseason]
       ).catch(error => console.error('[Madden Sync] Failed to persist EA reported current week:', error?.message));
     }
 
