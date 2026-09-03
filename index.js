@@ -4738,11 +4738,51 @@ async function maddenResolvedTeamDisplayName(guildId, leagueId, teamName, option
 // earlier this session. Never returns null, unlike madden_season_year
 // itself — every consumer can do a plain equality match with no
 // "unfiltered if null" escape hatch.
+//
+// 7J-SEASONKEYSTABLEREAD: real bug, confirmed live via the actual data —
+// this used to trust league?.madden_season_year straight off whatever JS
+// object it was handed, with no DB read at all. That's only as fresh as
+// whenever THAT SPECIFIC object was fetched — and runMaddenEaDirectSync
+// writes a real madden_season_year into league_settings the moment EA's
+// hub starts supplying seasonYear/calendarYear (a write to the DB row,
+// which does NOT update any in-memory league object already in hand
+// elsewhere). Confirmed live: 16 real, correctly-imported Preseason Week 3
+// games (real seasonGameKey values from EA, usedFallback:false for every
+// one — ruling out 7J-FALLBACKIDSEASONSCOPE's collision as the cause here)
+// were invisible to /maddengames threads' season_key-scoped lookup,
+// because the season_key stamped at import time (inside
+// importMaddenGamesFromArray, called with whatever league object that
+// sync's caller happened to have) and the season_key the command computed
+// moments later (inside createMaddenWeeklyGameThreadsCore, with a
+// DIFFERENT league object fetched at command time) resolved to two
+// different values purely because of when each object was fetched
+// relative to that write. Four callers (getMaddenSuperBowlResult and
+// three others) had already independently worked around exactly this by
+// fetching madden_season_year fresh from league_settings before calling
+// this function — a sign this was already known to be a hazard, just
+// patched locally in a few spots instead of at the source. The other 13
+// call sites, including both of the ones that broke here, just passed
+// whatever league object they had. Fixed once, here: always reads
+// madden_season_year fresh from league_settings by league_id, ignoring
+// any madden_season_year property that might already be sitting on the
+// passed-in object — so every caller gets the same, currently-correct
+// answer regardless of when their own league object was fetched, with no
+// caller-side changes needed. The four callers that already pre-fetch
+// fresh and build an override object still work correctly (just do one
+// harmless redundant query now) — left as-is rather than touched, to keep
+// this a minimal, targeted fix.
 async function getMaddenCurrentSeasonKey(league) {
-  if (league?.madden_season_year != null) return String(league.madden_season_year);
+  const leagueId = league?.league_id;
+  if (!leagueId) return null;
+  const seasonYearResult = await pool.query(
+    `SELECT madden_season_year FROM league_settings WHERE league_id = $1`,
+    [leagueId]
+  ).catch(() => ({ rows: [] }));
+  const freshSeasonYear = seasonYearResult.rows[0]?.madden_season_year ?? null;
+  if (freshSeasonYear != null) return String(freshSeasonYear);
   const result = await pool.query(
     `SELECT COUNT(DISTINCT season_label)::int AS n FROM madden_championship_history WHERE league_id = $1`,
-    [league?.league_id]
+    [leagueId]
   ).catch(() => ({ rows: [{ n: 0 }] }));
   return `Season ${Number(result.rows[0]?.n || 0) + 1}`;
 }
