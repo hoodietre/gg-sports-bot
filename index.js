@@ -69091,7 +69091,7 @@ function looksLikeEaScheduleGame(item) {
 }
 
 
-function normalizeEaScheduleDeepFromHub(hubPayload, strictIsPreseasonOverride = null) {
+function normalizeEaScheduleDeepFromHub(hubPayload, strictIsPreseasonOverride = null, currentSeasonKeyForFallbackId = null) {
   const maps = buildEaTeamNameMaps(hubPayload);
   const currentCtx = extractEaStandingsRequestContextFromHub(hubPayload, 0);
 
@@ -69147,7 +69147,41 @@ function normalizeEaScheduleDeepFromHub(hubPayload, strictIsPreseasonOverride = 
     const seasonGameKey = seasonGameKeyFromItem || seasonGameKeyFromGame;
 
     const weekLabel = repairEaFutureWeekLabelFromGame(game, rowIndex, effectiveCtx, item, `${awayTeam} @ ${homeTeam}`);
-    const fallbackId = [weekLabel, awayTeam, homeTeam].join('-');
+    // 7J-FALLBACKIDSEASONSCOPE: real bug, confirmed live — 7J-9GID's own
+    // comment above already flagged the exact hazard without anyone
+    // connecting it to a season boundary: "the fallback ID built from it
+    // would be stable too" was framed as a GOOD thing (a real game's ID
+    // doesn't shift between syncs within a season), but stable-across-syncs
+    // also means stable-across-SEASONS whenever seasonGameKey isn't
+    // available — and this fallback (weekLabel-awayTeam-homeTeam) has no
+    // season-differentiating component at all. Confirmed live: EA's payload
+    // doesn't include a persistent seasonGameKey/id/gameId for at least
+    // some preseason exhibition matchups (usedFallback:true in the
+    // [GAME ID RESOLUTION 7J-9GID] log), so the identical "Preseason Week 3
+    // -Eagles-Cowboys"-style ID gets generated every single season. The
+    // games upsert in importMaddenGamesFromArray keys ON CONFLICT
+    // (league_id, external_game_id) and deliberately preserves season_key/
+    // season_year via COALESCE once a row exists (correct for repeat syncs
+    // WITHIN a season) — so a same-matchup-same-week game from a brand new
+    // season silently landed on a prior season's already-existing row, got
+    // its week_label/score/status correctly refreshed, but had its
+    // season_key permanently stuck on whatever season first created that
+    // row. Every season-scoped query since (thread creation, playoff
+    // bracket, stat leaders, etc.) filters on the CURRENT season_key and
+    // found nothing for that matchup — exact match for the "No scheduled
+    // games were found for that week" symptom on a week that had, in fact,
+    // already synced. Fixed at the actual source (the ID itself), not by
+    // touching the COALESCE — that preserve behavior is still correct and
+    // needed for its original purpose (protecting against a transient
+    // getMaddenCurrentSeasonKey failure overwriting a good value with
+    // null); the real bug was the ID not being season-unique in the first
+    // place. A game that DOES carry a real seasonGameKey from EA is
+    // unaffected (this only changes the fallback branch), and a league
+    // that's never hit this path before builds a fresh row this season
+    // going forward — the old, now-orphaned prior-season row under the
+    // unscoped ID is harmless dead data, already excluded everywhere by
+    // season_key filtering.
+    const fallbackId = [weekLabel, awayTeam, homeTeam, currentSeasonKeyForFallbackId || 'unknown-season'].join('-');
     const externalGameId = String(seasonGameKey || fallbackId);
 
     console.log('[GAME ID RESOLUTION 7J-9GID] ' + JSON.stringify({
@@ -72475,7 +72509,16 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     const earlyExplicitlyRegularSeason = earlyEaHubCtx?.nextSeasonWeekType === 1 || hasRealRecordData === true;
     const earlyStrictIsPreseason = earlyExplicitlyPreseason ? true : (earlyExplicitlyRegularSeason ? false : true);
 
-    const games = normalizeEaScheduleDeepFromHub(hub, earlyStrictIsPreseason);
+    // 7J-FALLBACKIDSEASONSCOPE: computed here, before schedule import, for
+    // the same reason earlyStrictIsPreseason is — normalizeEaScheduleDeepFromHub
+    // needs this to keep its fallback external_game_id (used whenever EA's
+    // payload doesn't carry a genuine seasonGameKey/id/gameId, confirmed
+    // true for at least some preseason matchups) from colliding with the
+    // same matchup+week from a different season. See that function's own
+    // comment on the fallbackId line for the full story of why this
+    // mattered — a real bug, not a defensive-only addition.
+    const earlyCurrentSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
+    const games = normalizeEaScheduleDeepFromHub(hub, earlyStrictIsPreseason, earlyCurrentSeasonKey);
 
     const preseasonMode = isEaHubInPreseason(hub, context.externalLeagueId);
     const seasonModeLabel = getEaHubSeasonModeLabel(hub, context.externalLeagueId);
@@ -77168,12 +77211,18 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
 
   // Reset for next year: once a new preseason begins after an offseason was finalized,
   // clear the flag so the next Super Bowl can trigger this again.
-  // 7J-10BY-SKIPPRESEASON: effectively dead as of the preseason-skip change —
-  // getMaddenNewAdvanceWeek never returns a "Preseason Week N" label any
-  // more (see its ea_hub_is_preseason gate), so newWeekLabel here will
-  // never satisfy maddenIsPreseasonWeek(). Left in place rather than
-  // deleted in case preseason support is ever restored later; harmless
-  // either way since it just never fires.
+  // 7J-10BY-SKIPPRESEASON / STATUS CORRECTED (Session 44 continued 12-14):
+  // this comment used to say this branch was "effectively dead" because
+  // getMaddenNewAdvanceWeek could never return a "Preseason Week N" label.
+  // That's no longer true and hasn't been since 7J-PRESEASONTHREADSENABLE
+  // removed the gate that suppressed preseason processing, and
+  // 7J-PRESEASONLABELRECONCILE (relocated to the point ea_reported_current_week
+  // is persisted) made that field correctly carry the "Preseason " prefix.
+  // getMaddenNewAdvanceWeek DOES return "Preseason Week N" now — this is a
+  // live, load-bearing branch (offseason -> preseason: stat wipe, old-season
+  // thread cleanup, stage flip to 'preseason'), not dead code. Do not
+  // assume this doesn't fire without re-checking getMaddenNewAdvanceWeek's
+  // current behavior directly.
   if (stage === 'offseason' && maddenIsPreseasonWeek(newWeekLabel)) {
     // 7J-PRESEASONSTATWIPE: per user request — stats should also wipe at
     // the START of preseason, not just at the preseason→regular
