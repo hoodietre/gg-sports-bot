@@ -28975,7 +28975,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
 
         try {
           const rows = parseMaddenJsonInput(json);
-          const imported = await importMaddenGamesFromArray(interaction.guild, activeLeague, rows, week);
+          const imported = await importMaddenGamesFromArray(interaction.guild, activeLeague, rows, week, 'manual-command');
           const run = await logMaddenImportRun(interaction.guild, activeLeague, 'manual_import_games', 'Imported Madden games from JSON.', { games: imported }, week);
           await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
         } catch (error) {
@@ -51212,9 +51212,49 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
   return imported;
 }
 
-async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null) {
+async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null, sourceLabel = 'unspecified') {
   let imported = 0;
   const currentSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
+  // 7J-GAMEIMPORTSOURCETRACE: diagnostic, not a fix — after three confirmed
+  // rounds of "a not-yet-played week shows a real score" (Week 1-6, Eagles/
+  // Packers Week 3, Dolphins/Bills + Chiefs/Bucs Week 6) and a targeted fix
+  // to the suspected source (importEaScheduleExportForLeague) that did NOT
+  // stop a fourth occurrence (Week 7 and Week 8, same sync), the working
+  // theory that this secondary schedule-export system is the sole source
+  // is no longer solid — the guard's own log lines never fired last time,
+  // meaning it never saw the bad rows at all. Rather than guess at a fifth
+  // fix, this logs every row landing here that looks already-completed for
+  // a week at or ahead of the league's own known current week, tagged with
+  // WHICH caller (sourceLabel) sent it — importMaddenGamesFromArray is the
+  // single shared choke point every caller funnels through (primary-hub,
+  // schedule-export, manual-command, generic-import), so this will show
+  // definitively which one is actually responsible the next time this
+  // happens, instead of inferring it from the shape of the symptom.
+  const traceCurrentWeekResult = await pool.query(
+    `SELECT ea_reported_current_week FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const traceCurrentWeekLabel = traceCurrentWeekResult.rows[0]?.ea_reported_current_week || null;
+  const [traceCurrentGroup, traceCurrentIdx] = traceCurrentWeekLabel ? maddenWeekLabelSortKey(traceCurrentWeekLabel) : [null, null];
+
+  for (const row of rows) {
+    const homeTeam = normalizeMaddenTeamName(getFirstValue(row, ['homeTeam', 'home_team', 'home', 'homeName']));
+    const awayTeam = normalizeMaddenTeamName(getFirstValue(row, ['awayTeam', 'away_team', 'away', 'awayName']));
+    if (!homeTeam || !awayTeam) continue;
+    if (traceCurrentGroup !== null) {
+      const traceRowWeekLabel = String(row.week_label || row.weekLabel || row.week || weekLabel || '');
+      const [traceRowGroup, traceRowIdx] = maddenWeekLabelSortKey(traceRowWeekLabel);
+      const traceRowAtOrAheadOfCurrent = traceRowGroup > traceCurrentGroup || (traceRowGroup === traceCurrentGroup && traceRowIdx >= traceCurrentIdx);
+      if (traceRowAtOrAheadOfCurrent) {
+        const traceScore = (parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) + (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0);
+        const traceStatus = String(row.status || row.gameStatus || '').toLowerCase();
+        const traceLooksScored = traceScore > 0 || ['completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie'].some(s => traceStatus.includes(s));
+        if (traceLooksScored) {
+          console.warn(`[GAME IMPORT SOURCE TRACE 7J-GAMEIMPORTSOURCETRACE] source="${sourceLabel}" league=${league.league_id} row week="${traceRowWeekLabel}" (known current="${traceCurrentWeekLabel}") matchup="${awayTeam} @ ${homeTeam}" claims already-completed (score=${traceScore}, status="${traceStatus}") for a week at-or-ahead of current — this is the source to fix.`);
+        }
+      }
+    }
+  }
 
   for (const row of rows) {
     const homeTeam = normalizeMaddenTeamName(getFirstValue(row, ['homeTeam', 'home_team', 'home', 'homeName']));
@@ -51558,7 +51598,7 @@ function extractMaddenRowsByType(payload, type) {
 async function importMaddenRowsByType(guild, league, type, rows, week = null) {
   if (type === 'teams') return { teams: await importMaddenTeamsFromArray(guild, league, rows), games: 0, players: 0 };
   if (type === 'standings') return { teams: await importMaddenStandingsFromArray(guild, league, rows), games: 0, players: 0 };
-  if (type === 'games') return { teams: 0, games: await importMaddenGamesFromArray(guild, league, rows, week), players: 0 };
+  if (type === 'games') return { teams: 0, games: await importMaddenGamesFromArray(guild, league, rows, week, 'generic-import'), players: 0 };
   if (type === 'players') return { teams: 0, games: 0, players: await importMaddenPlayersFromArray(guild, league, rows) };
   return { teams: 0, games: 0, players: 0 };
 }
@@ -52920,10 +52960,43 @@ function guessEaRegularSeasonWeeksFromStandingsRows(standingsRows) {
   // 7J-10AN: Keep the normal regular-season safety window, but always include Madden's
   // playoff schedule display weeks by default. Snallapa's repo notes playoffs export as
   // weeks 19, 20, 21, and 23, with Week 22 being Pro Bowl/no useful data.
+  //
+  // 7J-REGULARSEASONLOOKAHEADREMOVED: real architectural fix, not another
+  // downstream patch (Session 44 continued 21, per Hxxdie's direct request
+  // to investigate whether this system needs to exist at all rather than
+  // keep building guards against its output). This used to add +3 to
+  // maxWeek — a speculative lookahead fetching regular-season weeks the
+  // league hadn't reached yet, "just in case" EA's schedule for them was
+  // already available. Audited every confirmed stale-score incident this
+  // session against this lookahead specifically: Week 1-6 mislabeled into
+  // the new season, Eagles/Packers Week 3, Dolphins/Bills + Chiefs/Bucs
+  // Week 6, and Week 7/Week 8 in the same sync — every one of them was a
+  // week ahead of where the league had actually reached. Not one confirmed
+  // incident this session involved a week the league had already reached.
+  // Across four separate live occurrences, this lookahead never once
+  // delivered anything useful — only EA's stale, previously-written
+  // schedule-slot data for a week that hadn't been played yet, because
+  // that data is apparently not reset between seasons at the slot level
+  // (see 7J-SCHEDULEEXPORTIMPOSSIBLEGUARD / 7J-SCHEDULEEXPORTCURRENTWEEKGUARD
+  // for the full mechanism). Removed rather than continuing to guard
+  // against its output — this system still fetches every week the league
+  // has ALREADY reached (1 through maxWeek, for legitimate backfill/final-
+  // score correction, which the primary hub sync doesn't do since it only
+  // ever reflects the current week) and still fetches the fixed playoff
+  // week indexes below unconditionally, which is the confirmed load-
+  // bearing use of this function per "the playoff bracket saga" — only the
+  // speculative ahead-of-current regular-season fetch is gone. Floor
+  // lowered from 3 to 1 for the same reason — a floor of 3 would still
+  // speculatively reach 2-3 weeks ahead of actual progress early in a
+  // season (e.g. maxWeek=1 -> old floor still fetched weeks 1-3). Floor of
+  // 1 guarantees at least the current week is always covered without ever
+  // reaching ahead of it. The EA_SCHEDULE_EXPORT_MAX_WEEK env var still
+  // overrides this entirely for anyone who deliberately wants the
+  // lookahead back.
   const configured = Number(process.env.EA_SCHEDULE_EXPORT_MAX_WEEK || 0);
   const includePlayoffWeeks = String(process.env.EA_SCHEDULE_EXPORT_INCLUDE_PLAYOFF_WEEKS || 'true').toLowerCase() !== 'false';
   const includeProBowl = String(process.env.EA_SCHEDULE_EXPORT_INCLUDE_PRO_BOWL || 'false').toLowerCase() === 'true';
-  const baseLimit = configured || Math.max(3, Math.min(18, maxWeek + 3));
+  const baseLimit = configured || Math.max(1, Math.min(18, maxWeek));
   const weeks = Array.from({ length: baseLimit }, (_, index) => index + 1);
 
   if (includePlayoffWeeks) {
@@ -67786,7 +67859,7 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
       console.warn(`[SCHEDULE EXPORT 7J-SCHEDULEEXPORTCURRENTWEEKGUARD] League ${league.league_id}: dropped ${droppedCurrentWeekScoredCount} row(s) claiming a completed result for the CURRENT week ("${currentKnownWeekLabel}") from this secondary source — the primary hub sync owns current-week completions exclusively, not imported.`);
     }
 
-    imported += await importMaddenGamesFromArray(guild, league, regularRows, null);
+    imported += await importMaddenGamesFromArray(guild, league, regularRows, null, 'schedule-export');
 
     const playoffScoredRows = playoffRows.filter(row =>
       ((parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) > 0 || (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0) > 0)
@@ -72923,7 +72996,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     }
 
     const importedTeams = teams.length ? await importMaddenTeamsFromArray(guild, league, teams) : 0;
-    const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null) : 0;
+    const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null, 'primary-hub') : 0;
     await cleanupMaddenWeekTbdRows(guild, league).catch(error => {
       console.error('[Madden Sync] Week TBD cleanup failed:', error?.message || error);
     });
