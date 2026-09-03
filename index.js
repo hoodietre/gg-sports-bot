@@ -67635,6 +67635,59 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
   const allRows = [];
   const attemptSummaries = [];
 
+  // 7J-SCHEDULEEXPORTIMPOSSIBLEGUARD: real bug, confirmed live via actual
+  // DB data (Session 44 continued 17/18). This function deliberately looks
+  // AHEAD of the league's currently-confirmed week (guessEaRegularSeasonWeeksFromStandingsRows
+  // adds a +3 lookahead buffer on top of the standings-derived maxWeek) —
+  // reasonable in principle, to catch schedule data as soon as EA
+  // publishes it, PROVIDED EA returns genuinely unplayed/scheduled rows
+  // for weeks that haven't happened yet this season. Confirmed live it
+  // does not: real Madden Franchise schedule data appears to be a
+  // persistent structure overwritten week-by-week as the season is
+  // actually simmed, not reset at the season boundary — so requesting a
+  // week this season hasn't reached yet returns whatever was last
+  // written to that slot, which is the PREVIOUS season's real, completed
+  // result for that week. Confirmed live exactly this way: one real week
+  // after Preseason Week 3 (the league sitting on the week after that —
+  // "Cut Week" per the user, EA reporting current week as "Week 1"),
+  // this function pulled in 6 full weeks (94 games) of already-"scored"
+  // regular-season data — real seasonGameKey values, real scores, just
+  // from the season that had already finished. Combined with the
+  // season_key self-heal fix from earlier this session
+  // (7J-SEASONKEYSELFHEAL), which correctly stamps whatever's imported
+  // with the CURRENT season's key, this meant genuinely stale prior-season
+  // data was being actively relabeled as belonging to the new season on
+  // every single sync — not a one-time corruption, a repeating one.
+  // Fixed by rejecting the impossible case directly rather than trying to
+  // stop the lookahead (which has real value when EA's data is honest):
+  // a row claiming a real completed/scored result for a week
+  // chronologically AHEAD of what this league has actually confirmed
+  // reaching (ea_reported_current_week) is a logical contradiction — it
+  // cannot have a real result yet — and gets dropped here, before it ever
+  // reaches the database, rather than trusted and stamped with the
+  // current season's key. A genuinely unplayed/scheduled row for a future
+  // week is untouched and still imported normally, preserving the
+  // original lookahead's actual value.
+  const currentWeekSettingsForGuard = await pool.query(
+    `SELECT ea_reported_current_week FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const currentKnownWeekLabel = currentWeekSettingsForGuard.rows[0]?.ea_reported_current_week || null;
+  const [currentKnownGroup, currentKnownIdx] = currentKnownWeekLabel
+    ? maddenWeekLabelSortKey(currentKnownWeekLabel)
+    : [null, null];
+  const isRowImpossiblyAheadAndScored = (row) => {
+    if (currentKnownGroup === null) return false; // no known current week yet — nothing to compare against, don't block
+    const rowWeekLabel = String(row.week_label || row.weekLabel || row.week || '');
+    const [rowGroup, rowIdx] = maddenWeekLabelSortKey(rowWeekLabel);
+    const rowIsAhead = rowGroup > currentKnownGroup || (rowGroup === currentKnownGroup && rowIdx > currentKnownIdx);
+    if (!rowIsAhead) return false;
+    const rowScore = (parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) + (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0);
+    const rowStatus = String(row.status || row.gameStatus || '').toLowerCase();
+    const rowLooksScored = rowScore > 0 || ['completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie'].some(s => rowStatus.includes(s));
+    return rowLooksScored;
+  };
+
   await cleanupMaddenPostseasonSyntheticScheduleRows(guild, league, 'schedule-export-start');
 
   for (const weekNumber of targetWeeks) {
@@ -67683,7 +67736,16 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
     // only promote/update the existing bracket rows by scheduleId.
     const playoffLabels = ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Super Bowl'];
     const playoffRows = rows.filter(row => playoffLabels.includes(String(row.week_label || row.weekLabel || row.week || '')));
-    const regularRows = rows.filter(row => !playoffLabels.includes(String(row.week_label || row.weekLabel || row.week || '')));
+    // 7J-SCHEDULEEXPORTIMPOSSIBLEGUARD: see the guard's own comment above
+    // for the full story — drops any row claiming a real completed/scored
+    // result for a week this league hasn't confirmed reaching yet, before
+    // it can be imported and stamped with the current season's key.
+    const regularRowsRaw = rows.filter(row => !playoffLabels.includes(String(row.week_label || row.weekLabel || row.week || '')));
+    const regularRows = regularRowsRaw.filter(row => !isRowImpossiblyAheadAndScored(row));
+    const droppedImpossibleCount = regularRowsRaw.length - regularRows.length;
+    if (droppedImpossibleCount > 0) {
+      console.warn(`[SCHEDULE EXPORT 7J-SCHEDULEEXPORTIMPOSSIBLEGUARD] League ${league.league_id}: dropped ${droppedImpossibleCount} row(s) claiming a completed result for a week ahead of the known current week ("${currentKnownWeekLabel}") — almost certainly stale prior-season data, not imported.`);
+    }
 
     imported += await importMaddenGamesFromArray(guild, league, regularRows, null);
 
