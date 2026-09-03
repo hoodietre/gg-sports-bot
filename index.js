@@ -74529,7 +74529,51 @@ const CURRENCY_PAYOUT_TYPE_LABELS = {
 };
 
 
+// 7J-SYNCINFLIGHTLOCK: real concurrency gap, confirmed live — traced from
+// actual DB data (Session 44 continued 17). runMaddenExternalFetchSync is
+// the one shared entry point behind all three ways a sync can fire for a
+// league (the manual Run Sync button, the manual week-targeted command,
+// and runDueMaddenAutosyncs' scheduled tick) — but unlike autoDetectAfterSync
+// (which already has its own in-flight lock, 7J-AUTODETECTLOCK), nothing
+// stopped two of these from running concurrently for the same league. That
+// gap predates this fix, but was invisible before it: getMaddenCurrentSeasonKey
+// used to trust a value frozen once on whatever league object a caller
+// happened to hold, so two overlapping syncs computing it independently
+// would just agree on the same (possibly stale) answer either way. Once it
+// was fixed to read fresh from the DB on every call (7J-SEASONKEYSTABLEREAD,
+// this session), that protection-by-accident went away — two genuinely
+// overlapping syncs for the same league can now read DIFFERENT answers if
+// anything about the league's season state changes between their
+// individual calls, mid-sync. Confirmed live exactly this way: 2 of Week
+// 18's 16 real, already-correct "Season 2" games flipped to "Season 3"
+// with imported_at timestamps a fraction of a second apart from the other
+// 14 — consistent with two overlapping importEaScheduleExportForLeague
+// per-week loops interleaving, not a single consistent pass. Locking here,
+// at the one real choke point all three trigger paths already share,
+// closes this at its root rather than threading a frozen season key
+// through every one of the ~14 call sites that use it. Deliberately a
+// SEPARATE lock Set from maddenAutoDetectInFlightLeagues — that one guards
+// a narrower, nested scope (autoDetectAfterSyncInner, called partway
+// through this function) and reusing the same Set here would make this
+// function see itself as "already in progress" and deadlock/skip its own
+// nested call.
+const maddenSyncInFlightLeagues = new Set();
+
 async function runMaddenExternalFetchSync(guild, league, options = {}) {
+  const lockKey = String(league.league_id);
+  if (maddenSyncInFlightLeagues.has(lockKey)) {
+    console.log(`[SYNC LOCK] Sync already in progress for league ${lockKey} — skipping this overlapping call rather than risk two syncs racing.`);
+    return { status: 'skipped', message: 'A sync for this league is already in progress. Try again in a moment.' };
+  }
+  maddenSyncInFlightLeagues.add(lockKey);
+  try {
+    return await runMaddenExternalFetchSyncInner(guild, league, options);
+  } finally {
+    maddenSyncInFlightLeagues.delete(lockKey);
+  }
+}
+
+async function runMaddenExternalFetchSyncInner(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
   const eaConnectionResult = await pool.query(
     `SELECT id FROM madden_ea_connections
