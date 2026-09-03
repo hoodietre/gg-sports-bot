@@ -51237,26 +51237,53 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
   const traceCurrentWeekLabel = traceCurrentWeekResult.rows[0]?.ea_reported_current_week || null;
   const [traceCurrentGroup, traceCurrentIdx] = traceCurrentWeekLabel ? maddenWeekLabelSortKey(traceCurrentWeekLabel) : [null, null];
 
-  for (const row of rows) {
+  // 7J-UNIVERSALCOMPLETIONGUARD: real bug, confirmed live via the
+  // GAMEIMPORTSOURCETRACE diagnostic itself (Session 44 continued 21) —
+  // the trace was added purely to identify a source, and it did: rows
+  // from source="primary-hub" (never previously suspected — every guard
+  // built earlier this session only protected the secondary schedule-
+  // export system) claiming status="completed" for Week 7 while the
+  // league's own known current week was also Week 7, score 0-0. That
+  // score being zero does NOT make this harmless: hasTrustedCompletedMarker
+  // below derives status from the row's raw status/gameStatus/isComplete
+  // fields independent of score, so a stale "completed" marker with no
+  // real score still gets written as a non-'scheduled' status — which is
+  // exactly what silently excludes a genuine, current, unplayed game from
+  // autoCreateMaddenSportsbookLines (it only creates lines for
+  // status = 'scheduled'). This is the same "stale prior-season schedule
+  // slot" mechanism confirmed multiple times this session for scores,
+  // just carried through a status/completion marker instead. Fixed here,
+  // in the ONE place every caller (primary-hub, schedule-export, manual-
+  // command, generic-import) already funnels through, rather than
+  // duplicating a guard in each caller separately — a row claiming
+  // completion (by score OR by status text OR by an isComplete flag) for
+  // a week at-or-ahead of the league's own known current week is rejected
+  // before it reaches the database, regardless of which caller sent it.
+  const rejectedRowIndexes = new Set();
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const row = rows[rowIndex];
     const homeTeam = normalizeMaddenTeamName(getFirstValue(row, ['homeTeam', 'home_team', 'home', 'homeName']));
     const awayTeam = normalizeMaddenTeamName(getFirstValue(row, ['awayTeam', 'away_team', 'away', 'awayName']));
     if (!homeTeam || !awayTeam) continue;
-    if (traceCurrentGroup !== null) {
-      const traceRowWeekLabel = String(row.week_label || row.weekLabel || row.week || weekLabel || '');
-      const [traceRowGroup, traceRowIdx] = maddenWeekLabelSortKey(traceRowWeekLabel);
-      const traceRowAtOrAheadOfCurrent = traceRowGroup > traceCurrentGroup || (traceRowGroup === traceCurrentGroup && traceRowIdx >= traceCurrentIdx);
-      if (traceRowAtOrAheadOfCurrent) {
-        const traceScore = (parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) + (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0);
-        const traceStatus = String(row.status || row.gameStatus || '').toLowerCase();
-        const traceLooksScored = traceScore > 0 || ['completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie'].some(s => traceStatus.includes(s));
-        if (traceLooksScored) {
-          console.warn(`[GAME IMPORT SOURCE TRACE 7J-GAMEIMPORTSOURCETRACE] source="${sourceLabel}" league=${league.league_id} row week="${traceRowWeekLabel}" (known current="${traceCurrentWeekLabel}") matchup="${awayTeam} @ ${homeTeam}" claims already-completed (score=${traceScore}, status="${traceStatus}") for a week at-or-ahead of current — this is the source to fix.`);
-        }
-      }
+    if (traceCurrentGroup === null) continue;
+    const traceRowWeekLabel = String(row.week_label || row.weekLabel || row.week || weekLabel || '');
+    const [traceRowGroup, traceRowIdx] = maddenWeekLabelSortKey(traceRowWeekLabel);
+    const traceRowAtOrAheadOfCurrent = traceRowGroup > traceCurrentGroup || (traceRowGroup === traceCurrentGroup && traceRowIdx >= traceCurrentIdx);
+    if (!traceRowAtOrAheadOfCurrent) continue;
+    const traceScore = (parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) + (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0);
+    const traceStatus = String(row.status || row.gameStatus || '').toLowerCase();
+    const traceIsComplete = Boolean(getFirstValue(row, ['isComplete'], false));
+    const traceLooksScored = traceScore > 0 || traceIsComplete
+      || ['completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie', 'played', 'finished', 'closed'].some(s => traceStatus.includes(s));
+    if (traceLooksScored) {
+      console.warn(`[GAME IMPORT SOURCE TRACE 7J-GAMEIMPORTSOURCETRACE] source="${sourceLabel}" league=${league.league_id} row week="${traceRowWeekLabel}" (known current="${traceCurrentWeekLabel}") matchup="${awayTeam} @ ${homeTeam}" claims already-completed (score=${traceScore}, status="${traceStatus}") for a week at-or-ahead of current — rejecting this row, not importing it.`);
+      rejectedRowIndexes.add(rowIndex);
     }
   }
 
-  for (const row of rows) {
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    if (rejectedRowIndexes.has(rowIndex)) continue;
+    const row = rows[rowIndex];
     const homeTeam = normalizeMaddenTeamName(getFirstValue(row, ['homeTeam', 'home_team', 'home', 'homeName']));
     const awayTeam = normalizeMaddenTeamName(getFirstValue(row, ['awayTeam', 'away_team', 'away', 'awayName']));
     if (!homeTeam || !awayTeam) continue;
