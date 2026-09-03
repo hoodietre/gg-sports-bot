@@ -51258,6 +51258,37 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
     }
 
     await pool.query(
+      // 7J-SEASONKEYSELFHEAL: real bug, confirmed live and root-caused via
+      // actual DB data (Session 44 continued 17) — the season_key/season_year
+      // UPDATE clause below used to COALESCE toward the EXISTING stored
+      // value, only falling back to the freshly-computed one ($14/$15) if
+      // the row had never had a value at all. That was meant to guard
+      // against one narrow case (a transient getMaddenCurrentSeasonKey
+      // failure overwriting a good value with null) but had a much bigger,
+      // confirmed-live side effect: it permanently locked a row's
+      // season_key to whatever it was on the row's FIRST insert, forever,
+      // even once the freshly-computed value legitimately changed.
+      // Confirmed live exactly this way — 48 real Preseason Week 1-3 games
+      // (genuine EA seasonGameKey values, not the fallback-ID path) landed
+      // on rows first created during an EARLIER season's preseason (EA
+      // appears to reuse preseason exhibition seasonGameKey values across
+      // real seasons, unlike regular-season/playoff games, though this
+      // couldn't be fully proven since the old upsert had already
+      // overwritten every other trace of the prior import) and got
+      // COALESCE-locked onto that prior season's season_key, identical to
+      // the season that had JUST finished — invisible to every
+      // season-scoped query, including thread creation, until manually
+      // corrected via one-time SQL. Flipped the COALESCE order below so
+      // the freshly-computed value wins whenever it's actually available
+      // (matching how week_label/home_team/away_team already behave
+      // unconditionally on every sync), falling back to the existing
+      // stored value ONLY when the fresh computation itself failed (null)
+      // — preserving the original defensive intent while making this
+      // self-healing instead of permanently stuck. Same reasoning applies
+      // to season_year. This is what actually closes the loop: if EA
+      // reuses one of these IDs again at the next preseason transition,
+      // the very next sync after that corrects it automatically — no
+      // manual SQL, no waiting for it to be noticed live again.
       `INSERT INTO madden_imported_games (id, guild_id, league_id, external_game_id, week_label, home_team, away_team, home_team_role_id, away_team_role_id, home_score, away_score, status, raw_payload, imported_at, season_year, season_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), $14, $15)
        ON CONFLICT (league_id, external_game_id)
@@ -51286,8 +51317,8 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null)
          END,
          raw_payload = $13,
          imported_at = NOW(),
-         season_year = COALESCE(madden_imported_games.season_year, $14),
-         season_key = COALESCE(madden_imported_games.season_key, $15)`,
+         season_year = COALESCE($14, madden_imported_games.season_year),
+         season_key = COALESCE($15, madden_imported_games.season_key)`,
       [
         randomUUID(),
         guild.id,
