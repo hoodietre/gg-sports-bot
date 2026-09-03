@@ -75181,11 +75181,50 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
     // stage, but the stored label itself doesn't classify as a playoff
     // week and isn't the known-safe "Pro Bowl" fallback either — that
     // combination is otherwise impossible under correct operation.
+    //
+    // 7J-CUTWEEKLABELCOLLISION: real bug, confirmed live via direct evidence
+    // (Session 44 continued 18) — same corrupted-label shape as above, one
+    // stage earlier, never extended to it. EA appears to have no distinct
+    // signal for the roster-cut stage between Preseason Week 3 and real
+    // Week 1 — it reports "Week 1" prematurely, before real Week 1 games
+    // exist. Confirmed live: two consecutive sync summaries, one during
+    // that stage and one after the user had genuinely advanced into real
+    // Week 1, both showed "EA reports current week: Week 1" — identical
+    // raw text. Once that label got stored as last_auto_detect_week_label
+    // during the earlier (premature) sync, the real transition into Week 1
+    // could never be detected — this shortcut saw the same "Week 1" twice
+    // and returned null both times, silently swallowing the entire
+    // regular-season kickoff (stat wipe, trade count reset, bracket delete,
+    // power ranking reset, old-thread cleanup, new threads, the season
+    // announcement — none of it ran). Same fix shape as the playoffs case:
+    // if the league is still sitting in 'preseason' stage but the STORED
+    // label is a genuine real-season "Week N" (not a "Preseason Week N"),
+    // that combination is exactly as impossible as the playoffs one — it
+    // can only mean the label was captured early, not that the season
+    // genuinely already started while the stage never moved. Re-evaluates
+    // instead of trusting it, same as the playoffs case does.
     if (eaReportedWeek === lastLabel) {
       const [lastLabelGroup] = maddenWeekLabelSortKey(lastLabel);
-      const lastLabelLooksCorrupted = currentSeasonStage === 'playoffs' && lastLabelGroup !== 2 && lastLabel !== 'Pro Bowl';
+      const lastLabelLooksCorruptedForPlayoffs = currentSeasonStage === 'playoffs' && lastLabelGroup !== 2 && lastLabel !== 'Pro Bowl';
+      const lastLabelLooksCorruptedForPreseason = currentSeasonStage === 'preseason' && /^week\s+\d+$/i.test(String(lastLabel || '').trim());
+      const lastLabelLooksCorrupted = lastLabelLooksCorruptedForPlayoffs || lastLabelLooksCorruptedForPreseason;
       if (!lastLabelLooksCorrupted) return null; // EA still reports the same week — nothing has actually advanced.
-      console.log(`[AUTO DETECT] Stored last-processed week "${lastLabel}" is inconsistent with the league still being in playoffs — treating as corrupted from a prior sync and re-evaluating instead of trusting it.`);
+      console.log(`[AUTO DETECT] Stored last-processed week "${lastLabel}" is inconsistent with the league's current stage ("${currentSeasonStage}") — treating as corrupted from a prior sync and re-evaluating instead of trusting it.`);
+      // 7J-CUTWEEKLABELCOLLISION: unlike the playoffs case (which needs a
+      // SAFE SYNTHETIC label below, since raw "Week 1" text right after
+      // playoffs would otherwise collide with old real Week 1 games from
+      // months ago), there's no equivalent collision risk here — eaReportedWeek
+      // genuinely IS the correct target label once we know the stage/label
+      // combination is impossible. genuinelyMovedForward below will
+      // evaluate to false regardless (eaReportedWeek and lastLabel are the
+      // identical string), so this returns eaReportedWeek directly rather
+      // than falling through to a check that could never fire for an
+      // exact-string-match case — same reasoning, correct outcome, no
+      // synthetic label needed.
+      if (lastLabelLooksCorruptedForPreseason) {
+        console.log(`[AUTO DETECT] Treating "${eaReportedWeek}" as genuine forward progress out of a stuck 'preseason' stage despite matching the stored label exactly.`);
+        return eaReportedWeek;
+      }
     }
 
     const [lastG, lastN] = maddenWeekLabelSortKey(lastLabel);
@@ -78100,7 +78139,34 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
   if (!previousWeekLabel || !newWeekLabel) return;
   const wasPreseason = maddenIsPreseasonWeek(previousWeekLabel);
   const isRegular = maddenIsRegularSeasonWeek(newWeekLabel);
-  if (!wasPreseason || !isRegular) return;
+  // 7J-CUTWEEKLABELCOLLISION: real bug, confirmed live (Session 44 continued
+  // 18) — wasPreseason alone isn't enough to catch every real preseason ->
+  // regular transition any more. The 7J-CUTWEEKLABELCOLLISION recovery in
+  // getMaddenNewAdvanceWeek can now return a genuine "Week N" advance even
+  // when previousWeekLabel is ALSO "Week N" (the poisoned, already-stored
+  // label from EA reporting the real week's text prematurely, before real
+  // Week 1 games existed) — in that exact recovery case, previousWeekLabel
+  // is "Week 1", not "Preseason Week 3", so wasPreseason evaluates false
+  // and this function would silently no-op, exactly the way it did live:
+  // the detector correctly recognized the advance, but the actual kickoff
+  // (stat wipe, trade count reset, bracket delete, power ranking reset,
+  // thread cleanup, new threads, the announcement) never fired because
+  // THIS function's own gate was still looking at label sequence alone.
+  // Falls back to checking current_season_stage directly — if it's still
+  // 'preseason' despite newWeekLabel being a genuine regular week, that's
+  // just as reliable a signal as wasPreseason ever was (the league cannot
+  // legitimately be in 'preseason' stage while a real "Week N" is the
+  // confirmed current week), and covers this recovery path without
+  // requiring a trustworthy previousWeekLabel at all.
+  let qualifies = wasPreseason;
+  if (!qualifies && isRegular) {
+    const stageSettings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
+    qualifies = (stageSettings.current_season_stage || 'preseason') === 'preseason';
+    if (qualifies) {
+      console.log('[SEASON TRANSITION] previousWeekLabel ("' + previousWeekLabel + '") didn\'t look like preseason, but current_season_stage is still \'preseason\' — treating as the same recovery case getMaddenNewAdvanceWeek already handled.');
+    }
+  }
+  if (!qualifies || !isRegular) return;
 
   // EA keeps preseason games as 'scheduled' forever after advancing past them —
   // they never update statuses. Since EA only exports current-week games, the
