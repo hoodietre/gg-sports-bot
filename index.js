@@ -67741,10 +67741,73 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
     // result for a week this league hasn't confirmed reaching yet, before
     // it can be imported and stamped with the current season's key.
     const regularRowsRaw = rows.filter(row => !playoffLabels.includes(String(row.week_label || row.weekLabel || row.week || '')));
-    const regularRows = regularRowsRaw.filter(row => !isRowImpossiblyAheadAndScored(row));
-    const droppedImpossibleCount = regularRowsRaw.length - regularRows.length;
+    const aheadFiltered = regularRowsRaw.filter(row => !isRowImpossiblyAheadAndScored(row));
+
+    // 7J-SCHEDULEEXPORTCURRENTWEEKGUARD: real bug, confirmed live via
+    // actual DB data (Session 44 continued 19) — the ahead-of-current
+    // guard above only ever protected FUTURE weeks. It couldn't catch the
+    // same stale-schedule-slot-reuse problem hitting the CURRENT week's
+    // own data on its first touch: confirmed live, a brand-new Week 3
+    // Eagles/Packers game showed a real, specific final score
+    // (10-13, status completed_with_real_score) within minutes of Week 3
+    // becoming current — before it could plausibly have been played —
+    // which then silently made autoCreateMaddenSportsbookLines skip it
+    // entirely (it only creates lines for status = 'scheduled'). Rather
+    // than blanket-reject every "current week, completed" claim from this
+    // secondary source (which WOULD wrongly block a real, legitimately
+    // completed current-week result later reported correctly, e.g. a
+    // Thursday game finishing before Sunday's are played), this checks
+    // for an actual contradiction against the primary hub-based sync
+    // (normalizeEaScheduleDeepFromHub / importMaddenGamesFromArray, called
+    // earlier in this same runMaddenEaDirectSync execution and proven
+    // reliable for current-week data every time this session) — if THAT
+    // already-current row for this exact game still shows 'scheduled'
+    // with no score, but this secondary-source row claims a final result,
+    // the two sources disagree and the secondary one is untrusted. If no
+    // primary-sourced row exists yet, or it also shows a real result,
+    // the secondary row is trusted normally — this only blocks a proven
+    // contradiction, not every current-week update.
+    const currentWeekExternalIds = aheadFiltered
+      .filter(row => {
+        const rowWeekLabel = String(row.week_label || row.weekLabel || row.week || '');
+        return currentKnownWeekLabel && rowWeekLabel.toLowerCase() === String(currentKnownWeekLabel).toLowerCase();
+      })
+      .map(row => String(getFirstValue(row, ['external_game_id', 'id', 'gameId', 'game_id', 'externalGameId'], '')))
+      .filter(Boolean);
+    const existingCurrentWeekStatusById = new Map();
+    if (currentWeekExternalIds.length) {
+      const existingRowsResult = await pool.query(
+        `SELECT external_game_id, status, home_score, away_score
+         FROM madden_imported_games
+         WHERE league_id = $1 AND external_game_id = ANY($2::text[])`,
+        [league.league_id, currentWeekExternalIds]
+      ).catch(() => ({ rows: [] }));
+      for (const existingRow of existingRowsResult.rows || []) {
+        existingCurrentWeekStatusById.set(String(existingRow.external_game_id), existingRow);
+      }
+    }
+    const isCurrentWeekContradiction = (row) => {
+      const rowWeekLabel = String(row.week_label || row.weekLabel || row.week || '');
+      if (!currentKnownWeekLabel || rowWeekLabel.toLowerCase() !== String(currentKnownWeekLabel).toLowerCase()) return false;
+      const rowScore = (parseNumberOrNull(row.home_score ?? row.homeScore) ?? 0) + (parseNumberOrNull(row.away_score ?? row.awayScore) ?? 0);
+      const rowStatus = String(row.status || row.gameStatus || '').toLowerCase();
+      const rowLooksScored = rowScore > 0 || ['completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie'].some(s => rowStatus.includes(s));
+      if (!rowLooksScored) return false;
+      const rowExternalId = String(getFirstValue(row, ['external_game_id', 'id', 'gameId', 'game_id', 'externalGameId'], ''));
+      const existing = existingCurrentWeekStatusById.get(rowExternalId);
+      if (!existing) return false; // primary sync hasn't touched this game yet this run — nothing to contradict, trust it
+      const existingLooksScored = (Number(existing.home_score) || 0) > 0 || (Number(existing.away_score) || 0) > 0
+        || ['completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie'].some(s => String(existing.status || '').toLowerCase().includes(s));
+      return !existingLooksScored; // primary source says unplayed, this source says complete — contradiction, distrust this row
+    };
+    const regularRows = aheadFiltered.filter(row => !isCurrentWeekContradiction(row));
+    const droppedImpossibleCount = regularRowsRaw.length - aheadFiltered.length;
+    const droppedContradictionCount = aheadFiltered.length - regularRows.length;
     if (droppedImpossibleCount > 0) {
       console.warn(`[SCHEDULE EXPORT 7J-SCHEDULEEXPORTIMPOSSIBLEGUARD] League ${league.league_id}: dropped ${droppedImpossibleCount} row(s) claiming a completed result for a week ahead of the known current week ("${currentKnownWeekLabel}") — almost certainly stale prior-season data, not imported.`);
+    }
+    if (droppedContradictionCount > 0) {
+      console.warn(`[SCHEDULE EXPORT 7J-SCHEDULEEXPORTCURRENTWEEKGUARD] League ${league.league_id}: dropped ${droppedContradictionCount} row(s) claiming a completed result for the CURRENT week ("${currentKnownWeekLabel}") that contradicts the primary sync's own view of the same game — almost certainly stale prior-season data on first touch, not imported.`);
     }
 
     imported += await importMaddenGamesFromArray(guild, league, regularRows, null);
