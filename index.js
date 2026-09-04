@@ -14396,6 +14396,16 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     ) {
       const matchedGate = PREMIUM_GATED_CUSTOM_ID_PREFIXES.find(([prefix]) => interaction.customId?.startsWith(prefix));
       if (matchedGate && !(await requirePremiumFeature(interaction, matchedGate[1]))) return;
+
+      // 7J-CHECKPOINT-A: bisecting the gap between 7J-RAWENTRY (confirmed
+      // firing for sportsbook_open_filter) and the actual handler block —
+      // this sits immediately after the only code in that gap that touches
+      // sportsbook_-prefixed interactions at all (the premium gate above,
+      // whose two DB calls have no .catch() on them). If this doesn't fire,
+      // the gate itself is hanging (not throwing) on this specific click.
+      if (interaction.customId === 'sportsbook_open_filter') {
+        console.log(`[7J-CHECKPOINT-A] Survived premium gate. id=${interaction.id}`);
+      }
     }
 
 if (interaction.commandName === 'avatar') {
@@ -17584,6 +17594,15 @@ if (interaction.commandName === 'avatar') {
         const payload = await buildSportsbookOpenPayload(interaction.guild.id, { page: Number(pageStr) || 0, sportFilter: sportFilter || 'all' });
         await interaction.editReply(payload).catch(() => null);
         return;
+      }
+
+      // 7J-CHECKPOINT-B: the other end of the bisection — immediately
+      // before the actual matched block. If 7J-CHECKPOINT-A fires but this
+      // doesn't, the swallow is somewhere in the ~3,600 lines of unrelated
+      // if-blocks between the two (avatarlocker, botownerpanel, marketplace,
+      // recruitment, onboard, etc.) and needs a further split next round.
+      if (interaction.customId === 'sportsbook_open_filter') {
+        console.log(`[7J-CHECKPOINT-B] About to enter target block. id=${interaction.id}`);
       }
 
       if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_open_filter') {
