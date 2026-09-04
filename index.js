@@ -12974,11 +12974,8 @@ function getMultiChannelPanelInfo(panelType) {
     sportsbook: {
       label: 'Sportsbook Board',
       build: async (guild) => {
-        const openResult = await pool.query(
-          `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND status = 'open' ORDER BY created_at DESC LIMIT 75`,
-          [guild.id]
-        );
-        return { embeds: [await buildSportsbookPanelEmbed(guild.id)], components: buildSportsbookBoardComponents(openResult.rows) };
+        const { embed, files } = await buildSportsbookPanelEmbed(guild.id);
+        return { embeds: [embed], components: buildSportsbookBoardComponents(), files };
       },
     },
     bank: {
@@ -17564,24 +17561,29 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      if (interaction.isButton() && interaction.customId === 'sportsbook_quick_browse') {
+      if (interaction.isButton() && interaction.customId === 'sportsbook_quick_open') {
         await interaction.deferReply({ ephemeral: true });
-        const payload = await buildSportsbookBrowsePayload(interaction.guild.id, { page: 0, sportFilter: 'all' });
+        const payload = await buildSportsbookOpenPayload(interaction.guild.id, { page: 0, sportFilter: 'all' });
         await interaction.editReply(payload);
         return;
       }
 
-      if (interaction.isButton() && interaction.customId.startsWith('sportsbook_browse_page:')) {
+      if (interaction.isButton() && interaction.customId.startsWith('sportsbook_open_page:')) {
+        // Deferred immediately — buildSportsbookOpenPayload runs multiple
+        // queries and can exceed Discord's 3-second response window,
+        // confirmed live ("didn't respond in time" on Next/Back).
+        await interaction.deferUpdate().catch(() => null);
         const [, pageStr, sportFilter] = interaction.customId.split(':');
-        const payload = await buildSportsbookBrowsePayload(interaction.guild.id, { page: Number(pageStr) || 0, sportFilter: sportFilter || 'all' });
-        await interaction.update(payload).catch(() => null);
+        const payload = await buildSportsbookOpenPayload(interaction.guild.id, { page: Number(pageStr) || 0, sportFilter: sportFilter || 'all' });
+        await interaction.editReply(payload).catch(() => null);
         return;
       }
 
-      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_browse_filter') {
+      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_open_filter') {
+        await interaction.deferUpdate().catch(() => null);
         const sportFilter = interaction.values[0] || 'all';
-        const payload = await buildSportsbookBrowsePayload(interaction.guild.id, { page: 0, sportFilter });
-        await interaction.update(payload).catch(() => null);
+        const payload = await buildSportsbookOpenPayload(interaction.guild.id, { page: 0, sportFilter });
+        await interaction.editReply(payload).catch(() => null);
         return;
       }
 
@@ -33192,86 +33194,48 @@ async function settleParlaysForSportsbookGame(guildId, sportsbookGameId, winnerS
 // Select menus support 25 real-named options each, so the visible label is always
 // the actual matchup/prop, never a code; the game's UUID rides invisibly as the
 // option value. Same downstream sportsbook_pick_game/pick_side flow either way.
-function buildSportsbookBoardComponents(rows) {
-  const moneylines = rows.filter(r => (r.bet_type || 'moneyline') === 'moneyline').slice(0, 25);
-  const playerProps = rows.filter(r => r.bet_type === 'stat_prop').slice(0, 25);
-  const freeformProps = rows.filter(r => r.bet_type === 'freeform_prop').slice(0, 25);
-
-  const components = [];
-
-  if (moneylines.length) {
-    components.push(new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId('sportsbook_pick_game_moneyline')
-        .setPlaceholder('🏈 Bet a Moneyline')
-        .addOptions(moneylines.map(row => ({
-          label: stripDiscordEmojiMarkupForLabel(`${row.away_label} @ ${row.home_label}`).slice(0, 100),
-          value: row.id,
-          description: `${formatAmericanOdds(row.away_odds)} / ${formatAmericanOdds(row.home_odds)}`.slice(0, 100),
-        })))
-    ));
-  }
-
-  if (playerProps.length) {
-    components.push(new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId('sportsbook_pick_game_prop')
-        .setPlaceholder('🎯 Bet a Player Prop')
-        .addOptions(playerProps.map(row => ({
-          label: `${row.subject_display_name} O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`.slice(0, 100),
-          value: row.id,
-          description: `Over ${formatAmericanOdds(row.home_odds)} / Under ${formatAmericanOdds(row.away_odds)}`.slice(0, 100),
-        })))
-    ));
-  }
-
-  if (freeformProps.length) {
-    components.push(new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId('sportsbook_pick_game_freeform')
-        .setPlaceholder('🎫 Bet a Featured Prop')
-        .addOptions(freeformProps.map(row => ({
-          label: row.game_label.slice(0, 100),
-          value: row.id,
-          description: `${row.home_label} ${formatAmericanOdds(row.home_odds)} / ${row.away_label} ${formatAmericanOdds(row.away_odds)}`.slice(0, 100),
-        })))
-    ));
-  }
-
-  // 7J-BOARDBROWSEALL: per Hxxdie — the persistent board caps each section
-  // at 8 rows (7J-BOARDTRUNCATIONVISIBLE) so it stays readable, but that
-  // means a full league can have real lines the board itself never shows.
-  // "Browse All" opens a private, per-user paginated view instead of
-  // trying to page the shared board itself — the shared board gets
-  // rebuilt and reposted constantly (every bet placed, every sync, every
-  // prop generated), so any state living on it directly would get reset
-  // out from under whoever was mid-browse. An ephemeral reply sidesteps
-  // that entirely: each user gets their own independent view with its own
-  // page/filter state, untouched by anything happening to the shared
-  // board in the meantime. Pure read-only addition — creates nothing,
-  // settles nothing, doesn't touch either the Madden or non-Madden line
-  // creation paths.
-  components.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('sportsbook_quick_mybets').setLabel('My Bets').setEmoji('📋').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('sportsbook_quick_leaderboards').setLabel('Leaderboards').setEmoji('🏅').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('sportsbook_quick_parlay').setLabel('Build a Parlay').setEmoji('🧾').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('sportsbook_quick_browse').setLabel('Browse All').setEmoji('📖').setStyle(ButtonStyle.Secondary),
-  ));
-
-  return components;
+// 7J-OPENSPORTSBOOK: per Hxxdie — the persistent board previously listed
+// lines inline (capped per section, see 7J-BOARDTRUNCATIONVISIBLE) and
+// built its bet-dropdowns from every open line league-wide (capped at
+// Discord's hard 25-option limit). Neither scales to a server running
+// several full leagues at once. The board is now just the entry point — a
+// clean, professional storefront with buttons — and the actual line list,
+// filtering, pagination, and bet-dropdowns all live in the private "Open
+// Sportsbook" view (buildSportsbookOpenPayload, below), scoped per-page so
+// dropdowns can never exceed 25 options regardless of league size. No
+// longer takes `rows` — nothing here needs open-line data anymore.
+function buildSportsbookBoardComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('sportsbook_quick_open').setLabel('Open Sportsbook').setEmoji('🎰').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('sportsbook_quick_mybets').setLabel('My Bets').setEmoji('📋').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('sportsbook_quick_leaderboards').setLabel('Leaderboards').setEmoji('🏅').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('sportsbook_quick_parlay').setLabel('Build a Parlay').setEmoji('🧾').setStyle(ButtonStyle.Secondary),
+    ),
+  ];
 }
 
-// 7J-BOARDBROWSEALL: private, paginated, sport-filterable view of every open
-// sportsbook line — companion to the always-on-screen board above, not a
-// replacement for it. Read-only: SELECTs from sportsbook_games exactly like
-// the board does, never writes anything, never touches line-creation logic
-// for Madden (EA-sync-driven, auto props) or non-Madden leagues (a
-// completely separate creation path per Hxxdie — this only ever reads
-// whatever already landed in the shared table, same as the board itself
-// already does, so neither path is affected by this at all).
-const SPORTSBOOK_BROWSE_PAGE_SIZE = 10;
+// 7J-OPENSPORTSBOOK: private, paginated, sport-filterable personal view of
+// every open sportsbook line — replaces the old always-visible inline
+// listing + quick-bet dropdowns on the persistent board itself. Per Hxxdie:
+// a board showing every line inline (previously capped at 8 per section)
+// and dropdowns built from every open line league-wide (capped at Discord's
+// hard 25-option limit) both break down once a server has several full
+// leagues at once. This moves the actual line list into a private,
+// paginated view instead, and scopes the moneyline/prop select menus to
+// only whatever's on the CURRENT PAGE (never more than
+// SPORTSBOOK_OPEN_PAGE_SIZE rows) — which keeps every dropdown permanently
+// under the 25-item cap no matter how large the league gets, without
+// needing to touch how lines get created for either Madden (EA-sync-driven,
+// auto props) or non-Madden leagues (a separate creation path — this only
+// ever reads sportsbook_games, exactly like the old board did, so neither
+// path is affected). Styled to match the persistent board's existing
+// sectioned look (grouped by sport + bet type) rather than a flat list, per
+// Hxxdie's explicit ask for this to read as a premium, professional
+// centerpiece feature, not a bolted-on utility view.
+const SPORTSBOOK_OPEN_PAGE_SIZE = 10;
 
-async function buildSportsbookBrowsePayload(guildId, { page = 0, sportFilter = 'all' } = {}) {
+async function buildSportsbookOpenPayload(guildId, { page = 0, sportFilter = 'all' } = {}) {
   const NL = String.fromCharCode(10);
   const openResult = await pool.query(
     `SELECT g.*,
@@ -33297,41 +33261,71 @@ async function buildSportsbookBrowsePayload(guildId, { page = 0, sportFilter = '
   }
   const sportEmoji = { madden: '🏈', nfl: '🏈', nba: '🏀', nhl: '🏒', mlb: '⚾', fc: '⚽', cfb: '🏈' };
   const sportKeyOf = (row) => leagueLookup.get(row.league_id)?.game_key || 'other';
+  const betTypeLabel = { moneyline: 'MONEYLINES', stat_prop: 'PLAYER PROPS', freeform_prop: 'FEATURED PROPS' };
+  const betTypeEmoji = { moneyline: '🏆', stat_prop: '🎯', freeform_prop: '🎫' };
 
   const availableSports = [...new Set(openResult.rows.map(sportKeyOf))].sort();
-  const filteredRows = sportFilter === 'all' ? openResult.rows : openResult.rows.filter(r => sportKeyOf(r) === sportFilter);
+  // Stable sort so pagination doesn't reshuffle between page loads — sport,
+  // then bet type, then newest first within each group.
+  const filteredRows = (sportFilter === 'all' ? openResult.rows : openResult.rows.filter(r => sportKeyOf(r) === sportFilter))
+    .slice()
+    .sort((a, b) => {
+      const sportCmp = sportKeyOf(a).localeCompare(sportKeyOf(b));
+      if (sportCmp !== 0) return sportCmp;
+      const typeCmp = String(a.bet_type || 'moneyline').localeCompare(String(b.bet_type || 'moneyline'));
+      if (typeCmp !== 0) return typeCmp;
+      return new Date(b.created_at) - new Date(a.created_at);
+    });
 
-  const totalPages = Math.max(1, Math.ceil(filteredRows.length / SPORTSBOOK_BROWSE_PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / SPORTSBOOK_OPEN_PAGE_SIZE));
   const clampedPage = Math.min(Math.max(0, page), totalPages - 1);
-  const pageRows = filteredRows.slice(clampedPage * SPORTSBOOK_BROWSE_PAGE_SIZE, (clampedPage + 1) * SPORTSBOOK_BROWSE_PAGE_SIZE);
+  const pageRows = filteredRows.slice(clampedPage * SPORTSBOOK_OPEN_PAGE_SIZE, (clampedPage + 1) * SPORTSBOOK_OPEN_PAGE_SIZE);
 
-  const filterLabel = sportFilter === 'all' ? 'All Sports' : (sportFilter.toUpperCase());
+  const filterLabel = sportFilter === 'all' ? 'All Sports' : sportFilter.toUpperCase();
   const embed = new EmbedBuilder()
-    .setTitle(`📖 Sportsbook — Browse All (${filterLabel})`)
-    .setColor(0x5865F2)
-    .setFooter({ text: `GG Sports • Sportsbook • Page ${clampedPage + 1} of ${totalPages} • ${filteredRows.length} open line(s)` })
+    .setTitle('🎰 GG Sports  •  Sportsbook')
+    .setColor(0x057B33)
+    .setFooter({ text: `GG Sports • Live Sportsbook • ${filterLabel} • Page ${clampedPage + 1} of ${totalPages} • ${filteredRows.length} open line(s)` })
     .setTimestamp();
 
   if (!pageRows.length) {
     embed.setDescription('No open sportsbook lines for this filter right now.');
   } else {
-    embed.setDescription(pageRows.map(row => {
-      const emoji = sportEmoji[sportKeyOf(row)] || '🏆';
-      if (row.bet_type === 'stat_prop') {
-        return `${emoji} **${stripDiscordEmojiMarkupForLabel(row.subject_display_name)}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`;
-      }
-      if (row.bet_type === 'freeform_prop') {
-        return `${emoji} **${stripDiscordEmojiMarkupForLabel(row.game_label)}**${NL}↳ ${stripDiscordEmojiMarkupForLabel(row.home_label)} ${formatAmericanOdds(row.home_odds)} • ${stripDiscordEmojiMarkupForLabel(row.away_label)} ${formatAmericanOdds(row.away_odds)}`;
-      }
-      return `${emoji} **${stripDiscordEmojiMarkupForLabel(row.away_label)}** ${formatAmericanOdds(row.away_odds)}  @  **${stripDiscordEmojiMarkupForLabel(row.home_label)}** ${formatAmericanOdds(row.home_odds)}`;
-    }).join(NL));
+    // Group this page's rows into (sport, bet_type) sections so the layout
+    // matches the board's existing professional look even though the
+    // underlying data is paginated — a section header only appears for
+    // types actually present on this specific page.
+    const sections = new Map();
+    for (const row of pageRows) {
+      const key = sportKeyOf(row) + '::' + (row.bet_type || 'moneyline');
+      if (!sections.has(key)) sections.set(key, []);
+      sections.get(key).push(row);
+    }
+    const blocks = [];
+    for (const [key, rows] of sections) {
+      const [sportKey, betType] = key.split('::');
+      const header = `${betTypeEmoji[betType] || '🏆'} ${betTypeLabel[betType] || betType.toUpperCase()} — ${sportKey.toUpperCase()}`;
+      const lines = rows.map(row => {
+        if (betType === 'stat_prop') {
+          const isStandardVig = Number(row.home_odds) === -110 && Number(row.away_odds) === -110;
+          return `**${stripDiscordEmojiMarkupForLabel(row.subject_display_name)}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}` +
+            (isStandardVig ? '' : `${NL}↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`);
+        }
+        if (betType === 'freeform_prop') {
+          return `**${stripDiscordEmojiMarkupForLabel(row.game_label)}**${NL}↳ ${stripDiscordEmojiMarkupForLabel(row.home_label)} ${formatAmericanOdds(row.home_odds)} • ${stripDiscordEmojiMarkupForLabel(row.away_label)} ${formatAmericanOdds(row.away_odds)}`;
+        }
+        return `**${stripDiscordEmojiMarkupForLabel(row.away_label)}** ${formatAmericanOdds(row.away_odds)}  @  **${stripDiscordEmojiMarkupForLabel(row.home_label)}** ${formatAmericanOdds(row.home_odds)}${NL}↳ ${row.bet_count} bet(s) • ${row.total_handle} handle`;
+      });
+      blocks.push(`**${header}**${NL}${lines.join(NL)}`);
+    }
+    embed.setDescription(blocks.join(NL + NL));
   }
 
   const components = [];
   if (availableSports.length > 1) {
     components.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId('sportsbook_browse_filter')
+        .setCustomId('sportsbook_open_filter')
         .setPlaceholder('🔎 Filter by sport')
         .addOptions([
           { label: 'All Sports', value: 'all', emoji: '🏆', default: sportFilter === 'all' },
@@ -33344,14 +33338,62 @@ async function buildSportsbookBrowsePayload(guildId, { page = 0, sportFilter = '
         ])
     ));
   }
+
+  // 7J-OPENSPORTSBOOK: per-page dropdowns — reuses the exact same option
+  // format as the persistent board's old dropdowns, just fed pageRows
+  // (never more than SPORTSBOOK_OPEN_PAGE_SIZE) instead of every open line
+  // league-wide. Same downstream handler (sportsbook_pick_game*, prefix-
+  // matched) picks these up unchanged regardless of which message they
+  // were shown on — nothing new needed there.
+  const pageMoneylines = pageRows.filter(r => (r.bet_type || 'moneyline') === 'moneyline');
+  const pageProps = pageRows.filter(r => r.bet_type === 'stat_prop');
+  const pageFreeform = pageRows.filter(r => r.bet_type === 'freeform_prop');
+
+  if (pageMoneylines.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sportsbook_pick_game_moneyline')
+        .setPlaceholder('🏈 Bet a Moneyline (this page)')
+        .addOptions(pageMoneylines.map(row => ({
+          label: stripDiscordEmojiMarkupForLabel(`${row.away_label} @ ${row.home_label}`).slice(0, 100),
+          value: row.id,
+          description: `${formatAmericanOdds(row.away_odds)} / ${formatAmericanOdds(row.home_odds)}`.slice(0, 100),
+        })))
+    ));
+  }
+  if (pageProps.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sportsbook_pick_game_prop')
+        .setPlaceholder('🎯 Bet a Player Prop (this page)')
+        .addOptions(pageProps.map(row => ({
+          label: `${row.subject_display_name} O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`.slice(0, 100),
+          value: row.id,
+          description: `Over ${formatAmericanOdds(row.home_odds)} / Under ${formatAmericanOdds(row.away_odds)}`.slice(0, 100),
+        })))
+    ));
+  }
+  if (pageFreeform.length) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sportsbook_pick_game_freeform')
+        .setPlaceholder('🎫 Bet a Featured Prop (this page)')
+        .addOptions(pageFreeform.map(row => ({
+          label: row.game_label.slice(0, 100),
+          value: row.id,
+          description: `${row.home_label} ${formatAmericanOdds(row.home_odds)} / ${row.away_label} ${formatAmericanOdds(row.away_odds)}`.slice(0, 100),
+        })))
+    ));
+  }
+
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`sportsbook_browse_page:${clampedPage - 1}:${sportFilter}`)
+      .setCustomId(`sportsbook_open_page:${clampedPage - 1}:${sportFilter}`)
       .setLabel('◀ Back')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(clampedPage <= 0),
     new ButtonBuilder()
-      .setCustomId(`sportsbook_browse_page:${clampedPage + 1}:${sportFilter}`)
+      .setCustomId(`sportsbook_open_page:${clampedPage + 1}:${sportFilter}`)
       .setLabel('Next ▶')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(clampedPage >= totalPages - 1),
@@ -33477,144 +33519,76 @@ async function buildParlayWizardPayload(guildId, userId) {
 }
 
 
+// 7J-OPENSPORTSBOOK: sportsbook banner — same pattern as the avatar system's
+// loadAvatarLayerBuffer (assets/... on disk, cached buffer, graceful null if
+// missing). One shared image for every guild's sportsbook board — drop the
+// file at assets/sportsbook/banner.png and every board picks it up on its
+// next refresh; no command, no DB column, no external hosting needed.
+const SPORTSBOOK_BANNER_PATH = path.join(process.cwd(), 'assets', 'sportsbook', 'banner.png');
+let sportsbookBannerBufferCache = undefined; // undefined = not yet checked, null = checked and missing
+
+async function loadSportsbookBannerBuffer() {
+  if (sportsbookBannerBufferCache !== undefined) return sportsbookBannerBufferCache;
+  try {
+    sportsbookBannerBufferCache = await fs.promises.readFile(SPORTSBOOK_BANNER_PATH);
+  } catch (error) {
+    sportsbookBannerBufferCache = null;
+  }
+  return sportsbookBannerBufferCache;
+}
+
 async function buildSportsbookPanelEmbed(guildId) {
   const NL = String.fromCharCode(10);
-  const openResult = await pool.query(
-    `SELECT g.*,
-       COALESCE(SUM(b.amount), 0)::int AS total_handle,
-       COUNT(b.id)::int AS bet_count
+  const summaryResult = await pool.query(
+    `SELECT g.bet_type, g.league_id, COUNT(*)::int AS line_count
      FROM sportsbook_games g
-     LEFT JOIN sportsbook_bets b ON b.sportsbook_game_id = g.id
      WHERE g.guild_id = $1 AND g.status = 'open'
-     GROUP BY g.id
-     ORDER BY g.created_at DESC
-     LIMIT 75`,
+     GROUP BY g.bet_type, g.league_id`,
     [guildId]
-  );
+  ).catch(() => ({ rows: [] }));
 
-  // Sectioned by bet type — no exposed short-ID codes anywhere in here. Selection
-  // now happens via select menus (real matchup/prop names as the visible option),
-  // so there's nothing for a code to need to correlate to anymore.
-  const moneylines = openResult.rows.filter(r => (r.bet_type || 'moneyline') === 'moneyline');
-  const playerProps = openResult.rows.filter(r => r.bet_type === 'stat_prop');
-  const freeformProps = openResult.rows.filter(r => r.bet_type === 'freeform_prop');
+  const totalLines = summaryResult.rows.reduce((sum, r) => sum + Number(r.line_count || 0), 0);
+  const moneylineCount = summaryResult.rows.filter(r => (r.bet_type || 'moneyline') === 'moneyline').reduce((sum, r) => sum + Number(r.line_count || 0), 0);
+  const propCount = summaryResult.rows.filter(r => r.bet_type === 'stat_prop' || r.bet_type === 'freeform_prop').reduce((sum, r) => sum + Number(r.line_count || 0), 0);
 
-  const embed = new EmbedBuilder()
-    .setTitle('🏆 GG Sports  •  Sportsbook')
-    .setColor(0x057B33)
-    .setFooter({ text: 'GG Sports • Live Sportsbook Board' })
-    .setTimestamp();
-
-  // 7J-SPORTGROUPING: per Hxxdie — everything was rendering under one
-  // hardcoded "🏈 MONEYLINES" regardless of sport (an MLB matchup showed a
-  // football emoji), and multiple leagues of the same sport were only
-  // distinguishable by an accidental double-prefix in team names that got
-  // cleaned up separately. Now groups by actual sport with the right
-  // emoji, and only prefixes a line with its league name when that
-  // specific sport has more than one distinct league among the currently
-  // open lines — a guild running just one league per sport (the common
-  // case) sees no added clutter at all.
-  const distinctLeagueIds = [...new Set(openResult.rows.map(r => r.league_id).filter(Boolean))];
-  const leagueLookup = new Map();
+  const distinctLeagueIds = [...new Set(summaryResult.rows.map(r => r.league_id).filter(Boolean))];
+  let sportCount = 0;
   if (distinctLeagueIds.length) {
     const leagueRows = await pool.query(
-      `SELECT league_id, league_name, game_key FROM leagues WHERE league_id = ANY($1::uuid[])`,
+      `SELECT DISTINCT game_key FROM leagues WHERE league_id = ANY($1::uuid[])`,
       [distinctLeagueIds]
     ).catch(() => ({ rows: [] }));
-    for (const row of leagueRows.rows) leagueLookup.set(row.league_id, row);
-  }
-  const sportEmoji = { madden: '🏈', nfl: '🏈', nba: '🏀', nhl: '🏒', mlb: '⚾', fc: '⚽', cfb: '🏈' };
-  function groupBySport(rows) {
-    const bySport = new Map();
-    for (const row of rows) {
-      const leagueInfo = leagueLookup.get(row.league_id);
-      const sportKey = leagueInfo?.game_key || 'other';
-      if (!bySport.has(sportKey)) bySport.set(sportKey, { emoji: sportEmoji[sportKey] || '🏆', label: sportKey.toUpperCase(), rows: [], leagueNames: new Set() });
-      const group = bySport.get(sportKey);
-      group.rows.push(row);
-      if (leagueInfo?.league_name) group.leagueNames.add(leagueInfo.league_name);
-    }
-    return [...bySport.values()].sort((a, b) => b.rows.length - a.rows.length);
-  }
-  function leaguePrefix(group, row) {
-    if (group.leagueNames.size <= 1) return '';
-    const name = leagueLookup.get(row.league_id)?.league_name;
-    return name ? `[${name}] ` : '';
+    sportCount = leagueRows.rows.length;
   }
 
-  // 7J-FIELDCAP: sport-grouping multiplies field count (one per section per
-  // sport instead of one per section total) — safe for the realistic case
-  // of a couple sports per guild, but capped defensively so a guild running
-  // many sports/leagues at once can't blow past Discord's embed limits.
-  let fieldsRemaining = 20;
-  function addCappedField(name, value) {
-    if (fieldsRemaining <= 0) return;
-    embed.addFields({ name, value, inline: false });
-    fieldsRemaining -= 1;
+  // 7J-OPENSPORTSBOOK: per Hxxdie — the full inline listing + per-bet-type
+  // dropdowns this used to render here (sectioned by sport, capped at 8
+  // rows each) don't scale to a server running several full leagues at
+  // once, and everything Discord-select-menu-related here was already
+  // capped at 25 options league-wide regardless. That full experience now
+  // lives in the private, paginated "Open Sportsbook" view
+  // (buildSportsbookOpenPayload) instead. This embed is now the storefront
+  // — a live snapshot, not the full board — meant to read as a premium,
+  // professional centerpiece rather than a dense data dump.
+  const embed = new EmbedBuilder()
+    .setTitle('🎰 GG Sports  •  Sportsbook')
+    .setColor(0x057B33)
+    .setDescription(
+      totalLines
+        ? `**${totalLines}** open line${totalLines === 1 ? '' : 's'} across **${sportCount || 1}** sport${sportCount === 1 ? '' : 's'} — ${moneylineCount} moneyline${moneylineCount === 1 ? '' : 's'}, ${propCount} prop${propCount === 1 ? '' : 's'}.${NL}${NL}Press **Open Sportsbook** below to browse and place a bet.`
+        : `No open lines right now — check back soon.`
+    )
+    .setFooter({ text: 'GG Sports • Live Sportsbook' })
+    .setTimestamp();
+
+  const bannerBuffer = await loadSportsbookBannerBuffer();
+  const files = [];
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'sportsbook-banner.png' }));
+    embed.setImage('attachment://sportsbook-banner.png');
   }
 
-  // 7J-BOARDTRUNCATIONVISIBLE: real bug, confirmed live — Week 17 had
-  // enough real user-vs-user games/props that this cap was actually hit
-  // for the first time (Ravens/Packers props existed and were bettable via
-  // the dropdown the whole time — this was purely a board *display* gap,
-  // not missing data). slice(0, 8) here was silently dropping anything
-  // past 8 with zero indication more existed, so it looked exactly like
-  // real props were missing. Applied the same "+N more" trailer to all
-  // three sections (moneylines, props, featured) since all three had this
-  // identical silent-truncation shape, not just the one that got noticed.
-  function truncationNote(group, shown) {
-    const remaining = group.rows.length - shown;
-    return remaining > 0 ? `${NL}*+${remaining} more — see the dropdown below.*` : '';
-  }
-
-  if (moneylines.length) {
-    for (const group of groupBySport(moneylines)) {
-      addCappedField(
-        `${group.emoji} MONEYLINES — ${group.label}`,
-        group.rows.slice(0, 8).map(row =>
-          `**${leaguePrefix(group, row)}${row.away_label}** ${formatAmericanOdds(row.away_odds)}  @  **${leaguePrefix(group, row)}${row.home_label}** ${formatAmericanOdds(row.home_odds)}${NL}` +
-          `↳ ${row.bet_count} bet(s) • ${row.total_handle} handle`
-        ).join(NL).slice(0, 1024 - 60) + truncationNote(group, 8)
-      );
-    }
-  }
-
-  if (playerProps.length) {
-    for (const group of groupBySport(playerProps)) {
-      addCappedField(
-        `🎯 PLAYER PROPS — ${group.label}`,
-        group.rows.slice(0, 8).map(row => {
-          const isStandardVig = Number(row.home_odds) === -110 && Number(row.away_odds) === -110;
-          // 7J-PROPODDSCLUTTER: per Hxxdie — every prop showing "Over -110 •
-          // Under -110" underneath it was pure repetition when that's the
-          // standard default for every prop anyway. Only shown now when a
-          // prop's odds were actually customized away from that default
-          // (staff can set custom odds per prop via /sportsbook createprop)
-          // — real information stays visible, the redundant common case
-          // doesn't.
-          return `**${leaguePrefix(group, row)}${row.subject_display_name}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}` +
-            (isStandardVig ? '' : `${NL}↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`);
-        }).join(NL).slice(0, 1024 - 60) + truncationNote(group, 8)
-      );
-    }
-  }
-
-  if (freeformProps.length) {
-    for (const group of groupBySport(freeformProps)) {
-      addCappedField(
-        `🎫 FEATURED PROPS — ${group.label}`,
-        group.rows.slice(0, 8).map(row =>
-          `**${leaguePrefix(group, row)}${row.game_label}**${NL}↳ ${row.home_label} ${formatAmericanOdds(row.home_odds)} • ${row.away_label} ${formatAmericanOdds(row.away_odds)}`
-        ).join(NL).slice(0, 1024 - 60) + truncationNote(group, 8)
-      );
-    }
-  }
-
-  if (!moneylines.length && !playerProps.length && !freeformProps.length) {
-    embed.addFields({ name: 'Open Lines', value: 'No open sportsbook lines right now — check back soon.', inline: false });
-  }
-
-  return embed;
+  return { embed, files };
 }
 
 async function saveSportsbookPanel(guildId, channelId, messageId) {
