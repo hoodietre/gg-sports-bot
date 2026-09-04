@@ -16004,6 +16004,14 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-CHECKPOINT-MID: bisecting the gap between 7J-CHECKPOINT-A (confirmed
+    // firing) and 7J-CHECKPOINT-B (confirmed NOT firing) — this sits roughly
+    // halfway between them, after the avatarlocker/botownerpanel/marketplace-
+    // command blocks, before the marketplace-panel/recruitment/onboard blocks.
+    if (interaction.customId === 'sportsbook_open_filter') {
+      console.log(`[7J-CHECKPOINT-MID] Reached marketplace-panel gate point. id=${interaction.id}`);
+    }
+
     // Single gate covering every marketplace panel button/select/modal below —
     // these are reached directly from a persistent panel message, bypassing
     // the /marketplace command-level gate above entirely, so they need their
