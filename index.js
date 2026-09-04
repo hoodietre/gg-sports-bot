@@ -16816,6 +16816,14 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
+    // 7J-CHECKPOINT-MID2: second bisection round — halfway between
+    // 7J-CHECKPOINT-MID (confirmed firing) and 7J-CHECKPOINT-B (confirmed
+    // NOT firing). Sits after the marketplace-panel/recruitment-approve
+    // blocks, before recruitment-decline/onboard blocks.
+    if (interaction.customId === 'sportsbook_open_filter') {
+      console.log(`[7J-CHECKPOINT-MID2] Reached recruitment-decline point. id=${interaction.id}`);
+    }
+
     if (interaction.isButton() && interaction.customId.startsWith('recruitmentpanel_decline:')) {
       const appId = interaction.customId.split(':')[1];
       const modal = new ModalBuilder()
