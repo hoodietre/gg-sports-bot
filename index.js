@@ -75986,11 +75986,39 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
        AND LOWER(week_label) = LOWER($3) AND is_user_vs_user = TRUE`,
     [guild.id, String(league.league_id), weekLabel]
   ).catch(() => ({ rows: [] }));
-  console.log('[PLAYER PROP GEN 7J-13PROP] user-vs-user games found for ' + weekLabel + ': ' + (games.rows?.length || 0)
+  console.log('[PLAYER PROP GEN 7J-13PROP] user-vs-user games found for ' + weekLabel + ' (pre-filter, per stored flag): ' + (games.rows?.length || 0)
     + (games.rows?.length ? ' (' + games.rows.map(g => `${g.away_team}@${g.home_team}`).join(', ') + ')' : ''));
 
-  let created = 0;
+  // 7J-PROPOWNERSHIPSTALEFIX: real bug, confirmed live via direct DB data
+  // (Session 44 continued 21) — a Cardinals/Patriots Week 9 game had
+  // is_user_vs_user = true stored on the row, generating props for both
+  // teams, while a fresh ownership check against the actual current source
+  // of truth (madden_franchises / madden_imported_team_stats) showed
+  // Patriots has no owner at all — not a real matchup. The stored flag is
+  // only ever written by a SEPARATE function (autoCreateMaddenSportsbookLines,
+  // the moneyline creator) and this function just trusted whatever it last
+  // wrote, with no guarantee that write is still current by the time props
+  // get generated — same "trusting a stale cross-reference instead of the
+  // live source of truth" shape as every other fix this session
+  // (season_key, role_id). Re-verifies ownership fresh here, using the
+  // same isMaddenUserVsUserGame check the stored flag was originally
+  // supposed to reflect, rather than trusting the flag itself. The stored
+  // column is left as-is (still used elsewhere, e.g. moneyline creation's
+  // own dedupe) — this only changes what THIS function trusts before it
+  // acts.
+  const verifiedGames = [];
   for (const game of games.rows || []) {
+    const stillUvU = await isMaddenUserVsUserGame(guild.id, league.league_id, game.home_team, game.away_team);
+    if (stillUvU) {
+      verifiedGames.push(game);
+    } else {
+      console.log(`[PLAYER PROP GEN 7J-PROPOWNERSHIPSTALEFIX] ${game.away_team} @ ${game.home_team}: stored is_user_vs_user flag was stale (true) but a fresh ownership check says otherwise — skipping, not generating props for this matchup.`);
+    }
+  }
+  console.log('[PLAYER PROP GEN 7J-13PROP] user-vs-user games after fresh ownership re-check: ' + verifiedGames.length);
+
+  let created = 0;
+  for (const game of verifiedGames) {
     for (const team of [game.home_team, game.away_team]) {
       for (const { positions, statKey, roundTo } of MADDEN_PROP_POSITION_STATS) {
         const statConfig = SPORTSBOOK_PROP_STAT_TYPES[statKey];
