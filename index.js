@@ -17196,6 +17196,14 @@ if (interaction.commandName === 'avatar') {
       }
     }
 
+    // 7J-CHECKPOINT-MID3: third bisection round — between 7J-CHECKPOINT-MID2
+    // (confirmed firing) and 7J-CHECKPOINT-B (confirmed NOT firing). Sits
+    // after onboard_league_select/onboard_team_select, before the
+    // leaguekick_confirm/isButton() dispatcher block.
+    if (interaction.customId === 'sportsbook_open_filter') {
+      console.log(`[7J-CHECKPOINT-MID3] Reached leaguekick dispatcher point. id=${interaction.id}`);
+    }
+
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('leaguekick_confirm:')) {
         const confirmId = interaction.customId.split(':')[1];
