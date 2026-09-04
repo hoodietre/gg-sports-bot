@@ -37349,7 +37349,7 @@ async function performSportsbookSettlement(guild, sportsbookGame, winner, actorU
 // preview of what WOULD settle; confirm:true actually runs performSportsbookSettlement
 // for each match. Same safety protocol as transaction scanning this offseason — a
 // stat-data false positive here is a financial bug, not just a display bug.
-async function autoSettleOpenStatProps(interaction, league, { confirm = false } = {}) {
+async function autoSettleOpenStatProps(interaction, league, { confirm = false, autoVoidStaleDays = null } = {}) {
   const guildId = interaction.guild.id;
 
   const openPropsResult = await pool.query(
@@ -37361,6 +37361,27 @@ async function autoSettleOpenStatProps(interaction, league, { confirm = false } 
 
   const settled = [];
   const skipped = [];
+  // 7J-STATPROPSTALEVOID: pragmatic safety net, not a root-cause fix — per
+  // Hxxdie, this has happened more than once: usually one of six props
+  // created together for the same game (the pattern reported was "usually
+  // the bottom row") stays stuck open indefinitely with no matching stat
+  // data ever appearing, while its five siblings settle normally. Confirmed
+  // live for one case (0 matching madden_player_weekly_stats rows, ever,
+  // for that exact player/stat/week combination) but the underlying reason
+  // ONE specific player's stat sync occasionally comes up empty while the
+  // rest of the same batch succeeds isn't understood yet — real data wasn't
+  // available to root-cause it further this round, and guessing at EA
+  // export mechanics blind is exactly the kind of thing that's cost real
+  // time this session already. Rather than leave a bet's stake trapped
+  // forever waiting on a fix for a mechanism that isn't understood, a prop
+  // that's been open past autoVoidStaleDays with STILL no stat data found
+  // gets refunded (not settled either direction — nobody actually knows
+  // the real outcome) instead of skipped silently. Opt-in via
+  // autoVoidStaleDays specifically so the existing manual admin review
+  // command's behavior is unchanged by default — an admin reviewing
+  // "skipped" props manually should still see them and decide, not have
+  // them silently disappear out from under a live review.
+  const staleVoided = [];
 
   for (const prop of openPropsResult.rows) {
     const statConfig = SPORTSBOOK_PROP_STAT_TYPES[prop.stat_key];
@@ -37378,6 +37399,17 @@ async function autoSettleOpenStatProps(interaction, league, { confirm = false } 
     );
 
     if (!statRowResult.rows.length) {
+      const ageDays = (Date.now() - new Date(prop.created_at).getTime()) / 86400000;
+      if (autoVoidStaleDays != null && ageDays >= autoVoidStaleDays) {
+        await refundSportsbookGameBets(
+          interaction.guild,
+          prop,
+          'system',
+          `No ${statConfig.label} data ever synced for Week ${prop.prop_week_index} after ${Math.floor(ageDays)} days — refunded rather than left open indefinitely.`
+        ).catch(err => console.error('[MADDEN PROP AUTO-VOID] Refund failed:', err?.message));
+        staleVoided.push({ prop, ageDays: Math.floor(ageDays) });
+        continue;
+      }
       skipped.push({ prop, reason: `No synced ${statConfig.label} data yet for Week ${prop.prop_week_index}.` });
       continue;
     }
@@ -37405,7 +37437,7 @@ async function autoSettleOpenStatProps(interaction, league, { confirm = false } 
     }
   }
 
-  return { settled, skipped, confirm };
+  return { settled, skipped, staleVoided, confirm };
 }
 
 function buildPropAutoSettlePreviewEmbed(result, confirm) {
@@ -76370,7 +76402,7 @@ async function autoSettleMaddenSportsbookBet(guild, league, maddenGame) {
   // same idempotent stat-prop sweep here too closes that gap — it only
   // settles a prop where the matching stat data actually already exists,
   // so calling it opportunistically like this is safe to repeat.
-  await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true }).catch(err =>
+  await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 10 }).catch(err =>
     console.error('[MADDEN SPORTSBOOK SETTLE] Stat prop sweep for this game failed:', err?.message));
 }
 
@@ -76459,6 +76491,23 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     if (game.sportsbook_game_id) {
       await autoSettleMaddenSportsbookBet(guild, league, game).catch(() => null);
     }
+    // 7J-PROPTRIGGERGAP: real bug, confirmed live via direct DB data
+    // (Session 44 continued 21) — the moneyline settlement above (and the
+    // stat-prop sweep that used to live INSIDE it, per 7J-PROPSTUCKFIX)
+    // both only ever ran when this game had a moneyline, because
+    // sportsbook_game_id is a single column that only the moneyline
+    // creation path ever writes back onto the game row. generateMaddenPlayerPropLines
+    // links props TO the game (league_game_id) but never links the game
+    // back — so a game with player props but no moneyline never triggered
+    // the sweep at all, not "couldn't find the stats," just never ran.
+    // Confirmed live: a genuine, real, already-completed Preseason Week 3
+    // game's player prop sat 'open' indefinitely with nothing ever having
+    // attempted to settle it. Running the sweep here too, unconditionally,
+    // closes that gap regardless of whether this specific game has a
+    // moneyline — autoSettleOpenStatProps is already safe to call
+    // opportunistically like this (only settles a prop where matching
+    // stat data actually exists).
+    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 10 }).catch(() => null);
   }
 
   // 7J-10BY-STATLEADERSWEEKINDEX: real bug, confirmed live — latestWeekIndex
@@ -78553,7 +78602,7 @@ async function autoDetectAfterSyncInner(guild, league) {
       console.log(`[AUTO DETECT] Skipping sportsbook lines/props for ${weekLabel} — already-decided catch-up week.`);
     }
 
-    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true }).catch(err =>
+    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 10 }).catch(err =>
       console.error('[AUTO DETECT] Stat prop settlement:', err?.message));
 
     if (weekEvents.length > 0) {
