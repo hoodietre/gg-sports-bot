@@ -37504,7 +37504,18 @@ async function checkSportsbookSelfBetConflict(guild, sportsbookGame, userId) {
   // already trusts), falling back to the role check only as a secondary
   // signal so an owner with the role but no owner_user_id on file is still
   // caught.
-  const isTeamOwner = async (teamName) => {
+  const isTeamOwner = async (teamNameRaw) => {
+    // 7J-SELFBETEMOJISTRIP: real bug, confirmed live — a bet on Dolphins @
+    // Cardinals went through even for the actual owner, deployed fix and
+    // all. home_label/away_label for Madden auto-created moneylines are
+    // built as `${emoji} ${team}` (e.g. "🐬 Dolphins"), not a plain team
+    // name — comparing that directly against madden_franchises.team_name
+    // ("Dolphins") never matches, so the owner_user_id check above silently
+    // found nothing every time and fell through to the same role-only
+    // fallback that had the original gap. stripDiscordEmojiMarkupForLabel
+    // already exists in this file for this exact problem (button labels,
+    // 7J-19EMOJI) — reusing it here instead of writing a second one.
+    const teamName = stripDiscordEmojiMarkupForLabel(teamNameRaw);
     if (!teamName) return false;
     const ownerResult = await pool.query(
       `SELECT owner_user_id FROM madden_franchises
