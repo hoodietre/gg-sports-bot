@@ -13905,6 +13905,13 @@ function logEngagementEvent(interaction) {
 
 client.on(Events.InteractionCreate, async (interaction) => {
 
+    // 7J-RAWENTRY: unconditional, first statement in the handler — no
+    // autocomplete filter, no try/catch, nothing above this can skip it.
+    // If this doesn't fire on the filter-dropdown click, the interaction
+    // is not reaching this process at all (Discord/gateway-level), full
+    // stop — every remaining theory becomes external, not code-side.
+    console.log(`[7J-RAWENTRY] type=${interaction.type} isStringSelect=${typeof interaction.isStringSelectMenu === 'function' ? interaction.isStringSelectMenu() : 'n/a'} customId=${interaction.customId || interaction.commandName || 'n/a'} id=${interaction.id} guild=${interaction.guild?.id || 'n/a'}`);
+
     if (interaction.isAutocomplete()) {
       try {
         const commandName = interaction.commandName;
