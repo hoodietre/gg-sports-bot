@@ -76247,7 +76247,7 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
                 .addFields(
                   { name: `Over ${threshold} ${statConfig.label}`, value: 'Odds **-110**', inline: true },
                   { name: `Under ${threshold} ${statConfig.label}`, value: 'Odds **-110**', inline: true },
-                  { name: 'How to bet', value: `Use \\`/placebet\\` to place your wager.`, inline: false }
+                  { name: 'How to bet', value: `Use \`/placebet\` to place your wager.`, inline: false }
                 )
                 .setFooter({ text: 'GG Sports • Madden Sportsbook • Auto-Generated' })
                 .setTimestamp()],
