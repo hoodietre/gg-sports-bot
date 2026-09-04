@@ -33349,18 +33349,17 @@ async function buildSportsbookOpenPayload(guildId, { page = 0, sportFilter = 'al
 
   const components = [];
   if (availableSports.length > 1) {
+    // 7J-FILTERMINIMALREPRO: TEMPORARY — stripped to the bare minimum
+    // (no emoji, no default flag) to isolate whether the option shape is
+    // causing the silent timeout, or whether it's something else entirely.
+    // Revert to the full version once this is diagnosed.
     components.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
         .setCustomId('sportsbook_open_filter')
-        .setPlaceholder('🔎 Filter by sport')
+        .setPlaceholder('Filter by sport')
         .addOptions([
-          { label: 'All Sports', value: 'all', emoji: '🏆', default: sportFilter === 'all' },
-          ...availableSports.map(key => ({
-            label: key.toUpperCase(),
-            value: key,
-            emoji: sportEmoji[key] || '🏆',
-            default: sportFilter === key,
-          })),
+          { label: 'All Sports', value: 'all' },
+          ...availableSports.map(key => ({ label: key.toUpperCase(), value: key })),
         ])
     ));
   }
