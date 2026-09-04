@@ -37486,6 +37486,39 @@ async function checkSportsbookSelfBetConflict(guild, sportsbookGame, userId) {
   const member = await guild.members.fetch(userId).catch(() => null);
   if (!member) return null;
 
+  // 7J-SELFBETOWNERSOURCE: real bug, confirmed live — a user placed a bet
+  // on their own team's moneyline and it went through with no warning.
+  // This whole function only ever checked whether the bettor holds the
+  // team's Discord ROLE (member.roles.cache.has) — completely separate
+  // from owner_user_id in madden_franchises / madden_imported_team_stats,
+  // which is the actual source of truth this system already uses
+  // everywhere else to decide who owns a team (isMaddenUserVsUserGame,
+  // game thread owner tagging). A team's owner_user_id and its Discord
+  // role assignment are two different things that can silently drift
+  // apart — same "two sources of truth for one concept" shape already
+  // fixed elsewhere this session, just never audited here. Confirmed live:
+  // the moneyline for this exact matchup only got created in the first
+  // place because owner_user_id correctly identified both teams as
+  // user-owned — this check just never looked at that same data. Now
+  // checks owner_user_id first (both tables, same lookup isMaddenUserVsUserGame
+  // already trusts), falling back to the role check only as a secondary
+  // signal so an owner with the role but no owner_user_id on file is still
+  // caught.
+  const isTeamOwner = async (teamName) => {
+    if (!teamName) return false;
+    const ownerResult = await pool.query(
+      `SELECT owner_user_id FROM madden_franchises
+         WHERE league_id = $1 AND LOWER(team_name) = LOWER($2) AND owner_user_id = $3
+       UNION ALL
+       SELECT owner_user_id FROM madden_imported_team_stats
+         WHERE league_id = $1 AND LOWER(team_name) = LOWER($2) AND owner_user_id = $3`,
+      [league.league_id, teamName, String(userId)]
+    ).catch(() => ({ rows: [] }));
+    if (ownerResult.rows.length) return true;
+    const team = teams.find(t => t.role_name.toLowerCase() === teamName.toLowerCase());
+    return Boolean(team && member.roles.cache.has(team.role_id));
+  };
+
   // 7J-107SELFBET: stat props reuse this same table, but home_label/
   // away_label mean "Over"/"Under" for a prop, not team names — the
   // team-label check below would never match, silently letting an owner
@@ -37498,18 +37531,14 @@ async function checkSportsbookSelfBetConflict(guild, sportsbookGame, userId) {
     ).catch(() => ({ rows: [] }));
     const teamName = playerRow.rows[0]?.team_name;
     if (!teamName) return null; // can't resolve the player's team — allow rather than false-block
-    const team = teams.find(t => t.role_name.toLowerCase() === teamName.toLowerCase());
-    if (team && member.roles.cache.has(team.role_id)) {
+    if (await isTeamOwner(teamName)) {
       return `**${sportsbookGame.subject_display_name || 'This player'}** plays for your team (**${teamName}**) — owners can't bet on their own players' props.`;
     }
     return null;
   }
 
-  const homeTeam = teams.find(t => t.role_name.toLowerCase() === String(sportsbookGame.home_label || '').toLowerCase());
-  const awayTeam = teams.find(t => t.role_name.toLowerCase() === String(sportsbookGame.away_label || '').toLowerCase());
-
-  if (homeTeam && member.roles.cache.has(homeTeam.role_id)) return `You own the **${sportsbookGame.home_label}** — owners can't bet on their own games.`;
-  if (awayTeam && member.roles.cache.has(awayTeam.role_id)) return `You own the **${sportsbookGame.away_label}** — owners can't bet on their own games.`;
+  if (await isTeamOwner(sportsbookGame.home_label)) return `You own the **${sportsbookGame.home_label}** — owners can't bet on their own games.`;
+  if (await isTeamOwner(sportsbookGame.away_label)) return `You own the **${sportsbookGame.away_label}** — owners can't bet on their own games.`;
   return null;
 }
 
@@ -76134,6 +76163,21 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
   console.log('[PLAYER PROP GEN 7J-13PROP] user-vs-user games after fresh ownership re-check: ' + verifiedGames.length);
 
   let created = 0;
+  // 7J-PROPFEEDGAP: real gap, confirmed live (Hxxdie — props appear on the
+  // board but never post to the sportsbook feed). Traced against
+  // autoCreateMaddenSportsbookLines (the moneyline equivalent) and this
+  // function genuinely never had feed-posting logic at all — it only ever
+  // called updateSportsbookPanel (the board) and nothing else. Not a bug
+  // where something breaks, a feature that was simply never built for
+  // props even though it exists for moneylines. Added here, mirroring the
+  // moneyline announcement's channel-resolution order and embed style
+  // exactly so the two feel consistent rather than like two different
+  // systems.
+  const propFeedChannelId = league.sportsbook_channel_id
+    || settings.madden_sportsbook_channel_id
+    || settings.madden_news_channel_id
+    || await getMaddenNewsChannelId(league.league_id).catch(() => null);
+  const propFeedChannel = propFeedChannelId ? await guild.channels.fetch(propFeedChannelId).catch(() => null) : null;
   for (const game of verifiedGames) {
     for (const team of [game.home_team, game.away_team]) {
       for (const { positions, statKey, roundTo } of MADDEN_PROP_POSITION_STATS) {
@@ -76191,7 +76235,25 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
         // this log lie about a real insert failure exactly like the one this
         // round was chasing (turned out not to be the case here, but the log
         // shouldn't have been able to mislead on that point either way).
-        if (insertResult) created += 1;
+        if (insertResult) {
+          created += 1;
+          // 7J-PROPFEEDGAP: see comment above verifiedGames loop.
+          if (propFeedChannel?.isTextBased?.()) {
+            await propFeedChannel.send({
+              embeds: [new EmbedBuilder()
+                .setTitle(`${GG_EMOJI} Madden Prop Line Opened`)
+                .setColor(0x57F287)
+                .setDescription(`**${weekLabel}** — ${displayName}`)
+                .addFields(
+                  { name: `Over ${threshold} ${statConfig.label}`, value: 'Odds **-110**', inline: true },
+                  { name: `Under ${threshold} ${statConfig.label}`, value: 'Odds **-110**', inline: true },
+                  { name: 'How to bet', value: `Use \\`/placebet\\` to place your wager.`, inline: false }
+                )
+                .setFooter({ text: 'GG Sports • Madden Sportsbook • Auto-Generated' })
+                .setTimestamp()],
+            }).catch(() => null);
+          }
+        }
       }
     }
   }
