@@ -72751,6 +72751,26 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
   const runId = randomUUID();
 
+  // 7J-STAGEGUARDEDPRESEASONDEFAULT: real bug, confirmed live — Week 11 of an
+  // active regular season had its ea_reported_current_week stored as
+  // "Preseason Week 11" off a single sync where EA's hub payload didn't
+  // cleanly include hasRealRecordData/nextSeasonWeekType (this same
+  // ambiguity was already flagged, theoretically, as a Week-1-only risk in
+  // an earlier session — turns out it isn't confined to that one boundary).
+  // Both strictIsPreseason computations below default ambiguous readings to
+  // "still preseason" — a direction that's only actually safe right at the
+  // offseason->preseason boundary this gate was built for. Once the
+  // league's own already-confirmed stage (fetched fresh above, before this
+  // sync's own processing can change it) is 'regular' or 'playoffs', an
+  // ambiguous reading can never legitimately mean preseason — trusting it
+  // anyway produces an impossible label (confirmed regular/playoffs stage,
+  // preseason-prefixed week text) that getMaddenNewAdvanceWeek has no
+  // recovery branch for, since that combination was assumed impossible.
+  // Computed once, shared by both call sites below, so they can't disagree
+  // with each other the way two independent computations already have
+  // before (see 7J-SCHEDULEPRESEASONSIGNAL's own comment).
+  const stageAlreadyPastPreseason = settings.current_season_stage === 'regular' || settings.current_season_stage === 'playoffs';
+
   await pool.query(
     `INSERT INTO madden_sync_runs (id, guild_id, league_id, source, status, week_label, message)
      VALUES ($1, $2, $3, 'ea_direct', 'running', $4, $5)`,
@@ -72811,7 +72831,10 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     const earlyPreseasonMode = isEaHubInPreseason(hub, context.externalLeagueId);
     const earlyExplicitlyPreseason = earlyEaHubCtx?.nextSeasonWeekType === 0 || earlyPreseasonMode === true;
     const earlyExplicitlyRegularSeason = earlyEaHubCtx?.nextSeasonWeekType === 1 || hasRealRecordData === true;
-    const earlyStrictIsPreseason = earlyExplicitlyPreseason ? true : (earlyExplicitlyRegularSeason ? false : true);
+    // 7J-STAGEGUARDEDPRESEASONDEFAULT: ambiguous only resolves to "still
+    // preseason" while the league's own confirmed stage isn't already past
+    // it — see the shared comment on stageAlreadyPastPreseason above.
+    const earlyStrictIsPreseason = earlyExplicitlyPreseason ? true : (earlyExplicitlyRegularSeason ? false : !stageAlreadyPastPreseason);
 
     // 7J-FALLBACKIDSEASONSCOPE: computed here, before schedule import, for
     // the same reason earlyStrictIsPreseason is — normalizeEaScheduleDeepFromHub
@@ -72920,7 +72943,12 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       // wrongly unlocking isn't.
       const explicitlyPreseason = eaHubCtx?.nextSeasonWeekType === 0 || preseasonMode === true;
       const explicitlyRegularSeason = eaHubCtx?.nextSeasonWeekType === 1 || hasRealRecordData === true;
-      const strictIsPreseason = explicitlyPreseason ? true : (explicitlyRegularSeason ? false : true);
+      // 7J-STAGEGUARDEDPRESEASONDEFAULT: same guard as the early computation
+      // above — ambiguous only resolves to "still preseason" while the
+      // league's own confirmed stage isn't already past it. Reuses the same
+      // stageAlreadyPastPreseason value computed once at the top of this
+      // function so the two can never disagree with each other.
+      const strictIsPreseason = explicitlyPreseason ? true : (explicitlyRegularSeason ? false : !stageAlreadyPastPreseason);
       console.log('[EA PRESEASON GATE 7J-10BY-STRICTPRESEASONGATE] ' + JSON.stringify({
         nextSeasonWeekType: eaHubCtx?.nextSeasonWeekType ?? null,
         hasRealRecordData,
