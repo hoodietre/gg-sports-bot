@@ -17580,10 +17580,11 @@ if (interaction.commandName === 'avatar') {
       }
 
       if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_open_filter') {
-        await interaction.deferUpdate().catch(() => null);
+        console.log(`[SPORTSBOOK FILTER DEBUG 7J-FILTERENTRY] Handler entered. interactionId=${interaction.id} values=${JSON.stringify(interaction.values)}`);
+        await interaction.deferUpdate().catch((err) => console.log('[SPORTSBOOK FILTER DEBUG 7J-FILTERENTRY] deferUpdate failed:', err?.message || err));
         const sportFilter = interaction.values[0] || 'all';
         const payload = await buildSportsbookOpenPayload(interaction.guild.id, { page: 0, sportFilter });
-        await interaction.editReply(payload).catch(() => null);
+        await interaction.editReply(payload).catch((err) => console.log('[SPORTSBOOK FILTER DEBUG 7J-FILTERENTRY] editReply failed:', err?.message || err));
         return;
       }
 
@@ -32569,6 +32570,22 @@ if (shopSubcommand === 'view') {
 
 
 
+
+    // 7J-UNHANDLEDINTERACTION: genuinely didn't exist anywhere in this file
+    // before now (confirmed by search) — every interaction that falls
+    // through every single if-block above with no match, no reply, and no
+    // defer was previously totally silent, indistinguishable from a real
+    // Discord-side hiccup. Added specifically while chasing the sportsbook
+    // filter timeout (deferUpdate() is the literal first line of that
+    // handler, so if it's not running, the customId isn't matching
+    // anything at all) — but this is a permanent, general diagnostic,
+    // not sportsbook-specific, since the same silent-fallthrough shape
+    // could affect any of the dozens of other component handlers in this
+    // file the same way.
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+      const kind = interaction.isButton() ? 'button' : interaction.isStringSelectMenu() ? 'select' : interaction.isModalSubmit() ? 'modal' : interaction.commandName ? 'command' : 'other';
+      console.log(`[UNHANDLED INTERACTION 7J-UNHANDLEDINTERACTION] type=${kind} customId=${interaction.customId || interaction.commandName || 'n/a'} interactionId=${interaction.id} guild=${interaction.guild?.id || 'n/a'}`);
+    }
 
   } catch (error) {
     console.error('Interaction error:', error);
