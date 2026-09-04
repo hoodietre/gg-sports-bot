@@ -17564,6 +17564,27 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
+      if (interaction.isButton() && interaction.customId === 'sportsbook_quick_browse') {
+        await interaction.deferReply({ ephemeral: true });
+        const payload = await buildSportsbookBrowsePayload(interaction.guild.id, { page: 0, sportFilter: 'all' });
+        await interaction.editReply(payload);
+        return;
+      }
+
+      if (interaction.isButton() && interaction.customId.startsWith('sportsbook_browse_page:')) {
+        const [, pageStr, sportFilter] = interaction.customId.split(':');
+        const payload = await buildSportsbookBrowsePayload(interaction.guild.id, { page: Number(pageStr) || 0, sportFilter: sportFilter || 'all' });
+        await interaction.update(payload).catch(() => null);
+        return;
+      }
+
+      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_browse_filter') {
+        const sportFilter = interaction.values[0] || 'all';
+        const payload = await buildSportsbookBrowsePayload(interaction.guild.id, { page: 0, sportFilter });
+        await interaction.update(payload).catch(() => null);
+        return;
+      }
+
       if (interaction.isButton() && interaction.customId.startsWith('sportsbook_parlay_side:')) {
         const [, gameId, side] = interaction.customId.split(':');
         const sportsbookGame = await findSportsbookGame(interaction.guild.id, gameId);
@@ -33217,13 +33238,126 @@ function buildSportsbookBoardComponents(rows) {
     ));
   }
 
+  // 7J-BOARDBROWSEALL: per Hxxdie — the persistent board caps each section
+  // at 8 rows (7J-BOARDTRUNCATIONVISIBLE) so it stays readable, but that
+  // means a full league can have real lines the board itself never shows.
+  // "Browse All" opens a private, per-user paginated view instead of
+  // trying to page the shared board itself — the shared board gets
+  // rebuilt and reposted constantly (every bet placed, every sync, every
+  // prop generated), so any state living on it directly would get reset
+  // out from under whoever was mid-browse. An ephemeral reply sidesteps
+  // that entirely: each user gets their own independent view with its own
+  // page/filter state, untouched by anything happening to the shared
+  // board in the meantime. Pure read-only addition — creates nothing,
+  // settles nothing, doesn't touch either the Madden or non-Madden line
+  // creation paths.
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('sportsbook_quick_mybets').setLabel('My Bets').setEmoji('📋').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('sportsbook_quick_leaderboards').setLabel('Leaderboards').setEmoji('🏅').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('sportsbook_quick_parlay').setLabel('Build a Parlay').setEmoji('🧾').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('sportsbook_quick_browse').setLabel('Browse All').setEmoji('📖').setStyle(ButtonStyle.Secondary),
   ));
 
   return components;
+}
+
+// 7J-BOARDBROWSEALL: private, paginated, sport-filterable view of every open
+// sportsbook line — companion to the always-on-screen board above, not a
+// replacement for it. Read-only: SELECTs from sportsbook_games exactly like
+// the board does, never writes anything, never touches line-creation logic
+// for Madden (EA-sync-driven, auto props) or non-Madden leagues (a
+// completely separate creation path per Hxxdie — this only ever reads
+// whatever already landed in the shared table, same as the board itself
+// already does, so neither path is affected by this at all).
+const SPORTSBOOK_BROWSE_PAGE_SIZE = 10;
+
+async function buildSportsbookBrowsePayload(guildId, { page = 0, sportFilter = 'all' } = {}) {
+  const NL = String.fromCharCode(10);
+  const openResult = await pool.query(
+    `SELECT g.*,
+       COALESCE(SUM(b.amount), 0)::int AS total_handle,
+       COUNT(b.id)::int AS bet_count
+     FROM sportsbook_games g
+     LEFT JOIN sportsbook_bets b ON b.sportsbook_game_id = g.id
+     WHERE g.guild_id = $1 AND g.status = 'open'
+     GROUP BY g.id
+     ORDER BY g.created_at DESC
+     LIMIT 300`,
+    [guildId]
+  );
+
+  const distinctLeagueIds = [...new Set(openResult.rows.map(r => r.league_id).filter(Boolean))];
+  const leagueLookup = new Map();
+  if (distinctLeagueIds.length) {
+    const leagueRows = await pool.query(
+      `SELECT league_id, league_name, game_key FROM leagues WHERE league_id = ANY($1::uuid[])`,
+      [distinctLeagueIds]
+    ).catch(() => ({ rows: [] }));
+    for (const row of leagueRows.rows) leagueLookup.set(row.league_id, row);
+  }
+  const sportEmoji = { madden: '🏈', nfl: '🏈', nba: '🏀', nhl: '🏒', mlb: '⚾', fc: '⚽', cfb: '🏈' };
+  const sportKeyOf = (row) => leagueLookup.get(row.league_id)?.game_key || 'other';
+
+  const availableSports = [...new Set(openResult.rows.map(sportKeyOf))].sort();
+  const filteredRows = sportFilter === 'all' ? openResult.rows : openResult.rows.filter(r => sportKeyOf(r) === sportFilter);
+
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / SPORTSBOOK_BROWSE_PAGE_SIZE));
+  const clampedPage = Math.min(Math.max(0, page), totalPages - 1);
+  const pageRows = filteredRows.slice(clampedPage * SPORTSBOOK_BROWSE_PAGE_SIZE, (clampedPage + 1) * SPORTSBOOK_BROWSE_PAGE_SIZE);
+
+  const filterLabel = sportFilter === 'all' ? 'All Sports' : (sportFilter.toUpperCase());
+  const embed = new EmbedBuilder()
+    .setTitle(`📖 Sportsbook — Browse All (${filterLabel})`)
+    .setColor(0x5865F2)
+    .setFooter({ text: `GG Sports • Sportsbook • Page ${clampedPage + 1} of ${totalPages} • ${filteredRows.length} open line(s)` })
+    .setTimestamp();
+
+  if (!pageRows.length) {
+    embed.setDescription('No open sportsbook lines for this filter right now.');
+  } else {
+    embed.setDescription(pageRows.map(row => {
+      const emoji = sportEmoji[sportKeyOf(row)] || '🏆';
+      if (row.bet_type === 'stat_prop') {
+        return `${emoji} **${stripDiscordEmojiMarkupForLabel(row.subject_display_name)}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}`;
+      }
+      if (row.bet_type === 'freeform_prop') {
+        return `${emoji} **${stripDiscordEmojiMarkupForLabel(row.game_label)}**${NL}↳ ${stripDiscordEmojiMarkupForLabel(row.home_label)} ${formatAmericanOdds(row.home_odds)} • ${stripDiscordEmojiMarkupForLabel(row.away_label)} ${formatAmericanOdds(row.away_odds)}`;
+      }
+      return `${emoji} **${stripDiscordEmojiMarkupForLabel(row.away_label)}** ${formatAmericanOdds(row.away_odds)}  @  **${stripDiscordEmojiMarkupForLabel(row.home_label)}** ${formatAmericanOdds(row.home_odds)}`;
+    }).join(NL));
+  }
+
+  const components = [];
+  if (availableSports.length > 1) {
+    components.push(new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sportsbook_browse_filter')
+        .setPlaceholder('🔎 Filter by sport')
+        .addOptions([
+          { label: 'All Sports', value: 'all', emoji: '🏆', default: sportFilter === 'all' },
+          ...availableSports.map(key => ({
+            label: key.toUpperCase(),
+            value: key,
+            emoji: sportEmoji[key] || '🏆',
+            default: sportFilter === key,
+          })),
+        ])
+    ));
+  }
+  components.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`sportsbook_browse_page:${clampedPage - 1}:${sportFilter}`)
+      .setLabel('◀ Back')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(clampedPage <= 0),
+    new ButtonBuilder()
+      .setCustomId(`sportsbook_browse_page:${clampedPage + 1}:${sportFilter}`)
+      .setLabel('Next ▶')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(clampedPage >= totalPages - 1),
+  ));
+
+  return { embeds: [embed], components };
 }
 
 function buildSportsbookSideButtons(game) {
@@ -33419,6 +33553,20 @@ async function buildSportsbookPanelEmbed(guildId) {
     fieldsRemaining -= 1;
   }
 
+  // 7J-BOARDTRUNCATIONVISIBLE: real bug, confirmed live — Week 17 had
+  // enough real user-vs-user games/props that this cap was actually hit
+  // for the first time (Ravens/Packers props existed and were bettable via
+  // the dropdown the whole time — this was purely a board *display* gap,
+  // not missing data). slice(0, 8) here was silently dropping anything
+  // past 8 with zero indication more existed, so it looked exactly like
+  // real props were missing. Applied the same "+N more" trailer to all
+  // three sections (moneylines, props, featured) since all three had this
+  // identical silent-truncation shape, not just the one that got noticed.
+  function truncationNote(group, shown) {
+    const remaining = group.rows.length - shown;
+    return remaining > 0 ? `${NL}*+${remaining} more — see the dropdown below.*` : '';
+  }
+
   if (moneylines.length) {
     for (const group of groupBySport(moneylines)) {
       addCappedField(
@@ -33426,7 +33574,7 @@ async function buildSportsbookPanelEmbed(guildId) {
         group.rows.slice(0, 8).map(row =>
           `**${leaguePrefix(group, row)}${row.away_label}** ${formatAmericanOdds(row.away_odds)}  @  **${leaguePrefix(group, row)}${row.home_label}** ${formatAmericanOdds(row.home_odds)}${NL}` +
           `↳ ${row.bet_count} bet(s) • ${row.total_handle} handle`
-        ).join(NL).slice(0, 1024)
+        ).join(NL).slice(0, 1024 - 60) + truncationNote(group, 8)
       );
     }
   }
@@ -33446,7 +33594,7 @@ async function buildSportsbookPanelEmbed(guildId) {
           // doesn't.
           return `**${leaguePrefix(group, row)}${row.subject_display_name}** — O/U ${row.stat_threshold} ${SPORTSBOOK_PROP_STAT_TYPES[row.stat_key]?.label || row.stat_key}` +
             (isStandardVig ? '' : `${NL}↳ Over ${formatAmericanOdds(row.home_odds)} • Under ${formatAmericanOdds(row.away_odds)}`);
-        }).join(NL).slice(0, 1024)
+        }).join(NL).slice(0, 1024 - 60) + truncationNote(group, 8)
       );
     }
   }
@@ -33457,7 +33605,7 @@ async function buildSportsbookPanelEmbed(guildId) {
         `🎫 FEATURED PROPS — ${group.label}`,
         group.rows.slice(0, 8).map(row =>
           `**${leaguePrefix(group, row)}${row.game_label}**${NL}↳ ${row.home_label} ${formatAmericanOdds(row.home_odds)} • ${row.away_label} ${formatAmericanOdds(row.away_odds)}`
-        ).join(NL).slice(0, 1024)
+        ).join(NL).slice(0, 1024 - 60) + truncationNote(group, 8)
       );
     }
   }
@@ -76286,14 +76434,27 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
           continue;
         }
 
+        // 7J-PROPDEDUPWEEKINDEXCOLLISION: real bug, confirmed live — Packers
+        // QB prop generation for real Week 17 was silently blocked because
+        // J.Love's prop from real Week 16 was still open, and both weeks
+        // happened to derive the same weekIndex (stats sync hadn't advanced
+        // between the two real weeks — the exact ambiguity already flagged
+        // when weekIndex was first introduced: "week_label and week_index
+        // have no guaranteed shared numbering"). Scoping by prop_week_index
+        // alone can't tell two genuinely different real weeks apart when
+        // that happens. league_game_id ties unambiguously to one specific
+        // real game (and therefore one specific real week_label) via
+        // madden_imported_games — using that instead closes the collision
+        // risk entirely, without needing to fix weekIndex's derivation
+        // itself.
         const existing = await pool.query(
           `SELECT id FROM sportsbook_games
            WHERE guild_id = $1 AND league_id = $2::uuid AND bet_type = 'stat_prop'
-             AND subject_ref = $3 AND stat_key = $4 AND prop_week_index = $5`,
-          [guild.id, league.league_id, playerRef, statKey, weekIndex]
+             AND subject_ref = $3 AND stat_key = $4 AND league_game_id = $5`,
+          [guild.id, league.league_id, playerRef, statKey, game.id]
         ).catch(() => ({ rows: [] }));
         if (existing.rows.length) {
-          console.log('[PLAYER PROP GEN 7J-13PROP] ' + team + ' ' + statKey + ': ' + candidate.full_name + ' already has an open line for week ' + weekIndex + ' — skipping.');
+          console.log('[PLAYER PROP GEN 7J-13PROP] ' + team + ' ' + statKey + ': ' + candidate.full_name + ' already has an open line for this game (' + game.away_team + ' @ ' + game.home_team + ') — skipping.');
           continue;
         }
 
