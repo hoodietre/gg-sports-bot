@@ -37535,7 +37535,39 @@ async function checkSportsbookSelfBetConflict(guild, sportsbookGame, userId) {
   // team-label check below would never match, silently letting an owner
   // bet on their own player's prop. Resolve the actual team via
   // subject_ref (the player's roster_id/presentation_id) instead.
+  //
+  // 7J-SELFBETPROPGAMESCOPE: real bug, confirmed live — an owner could
+  // still bet on a prop for the OPPOSING player in their own game (owns
+  // Dolphins, bet allowed on a Cardinals player's prop in the Dolphins @
+  // Cardinals game). The check above only ever asked "is this player's own
+  // team owned by the bettor" — never "does this player's game involve the
+  // bettor's team at all." Intent is broader: no prop or moneyline for any
+  // game your team is playing in, regardless of which side the prop's
+  // player is on. Auto-generated props carry league_game_id straight to
+  // the specific madden_imported_games row (confirmed in
+  // generateMaddenPlayerPropLines) — use that to check BOTH teams in the
+  // actual matchup. Manually-created props (/sportsbook createprop) have
+  // no league_game_id to check both sides against, so those still fall
+  // back to the player's-own-team-only check — a real, narrower gap for
+  // that one manual path, not silently pretended to be fixed here.
   if (sportsbookGame.bet_type === 'stat_prop' && sportsbookGame.subject_type === 'player' && sportsbookGame.subject_ref) {
+    if (sportsbookGame.league_game_id) {
+      const gameRow = await pool.query(
+        `SELECT home_team, away_team FROM madden_imported_games WHERE id = $1 LIMIT 1`,
+        [sportsbookGame.league_game_id]
+      ).catch(() => ({ rows: [] }));
+      const gameHomeTeam = gameRow.rows[0]?.home_team || null;
+      const gameAwayTeam = gameRow.rows[0]?.away_team || null;
+      if (gameHomeTeam || gameAwayTeam) {
+        if (gameHomeTeam && await isTeamOwner(gameHomeTeam)) {
+          return `Your team (**${gameHomeTeam}**) is playing in this game — owners can't bet on props from their own games.`;
+        }
+        if (gameAwayTeam && await isTeamOwner(gameAwayTeam)) {
+          return `Your team (**${gameAwayTeam}**) is playing in this game — owners can't bet on props from their own games.`;
+        }
+        return null;
+      }
+    }
     const playerRow = await pool.query(
       `SELECT team_name FROM madden_players WHERE league_id = $1 AND (roster_id = $2 OR presentation_id = $2) LIMIT 1`,
       [league.league_id, sportsbookGame.subject_ref]
