@@ -33210,7 +33210,6 @@ function buildSportsbookBoardComponents() {
       new ButtonBuilder().setCustomId('sportsbook_quick_open').setLabel('Open Sportsbook').setEmoji('🎰').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('sportsbook_quick_mybets').setLabel('My Bets').setEmoji('📋').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('sportsbook_quick_leaderboards').setLabel('Leaderboards').setEmoji('🏅').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('sportsbook_quick_parlay').setLabel('Build a Parlay').setEmoji('🧾').setStyle(ButtonStyle.Secondary),
     ),
   ];
 }
@@ -34367,8 +34366,17 @@ const GUILD_ENTITLEMENT_CACHE_TTL_MS = 30000;
 async function getGuildEntitlement(guildId) {
   const cached = guildEntitlementCache.get(guildId);
   if (cached && (Date.now() - cached.cachedAt) < GUILD_ENTITLEMENT_CACHE_TTL_MS) return cached.entitlement;
+  const startedAt = Date.now();
   await ensureGuildEntitlementRow(guildId);
   const result = await pool.query(`SELECT * FROM premium_entitlements WHERE guild_id = $1 LIMIT 1`, [guildId]);
+  const elapsedMs = Date.now() - startedAt;
+  // 7J-PREMIUMGATECACHE: logged only on a genuine cache miss (rare after
+  // warmup) so this doesn't spam every interaction — if the sportsbook
+  // timeout recurs, this pinpoints with a real number whether this gate is
+  // actually the slow part or not, instead of guessing again.
+  if (elapsedMs > 500) {
+    console.log(`[PREMIUM GATE 7J-PREMIUMGATECACHE] getGuildEntitlement took ${elapsedMs}ms for guild ${guildId} (cache miss).`);
+  }
   const entitlement = result.rows[0];
   guildEntitlementCache.set(guildId, { entitlement, cachedAt: Date.now() });
   return entitlement;
