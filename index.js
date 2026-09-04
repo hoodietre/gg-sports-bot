@@ -76129,6 +76129,29 @@ function projectMaddenStatLine(history, roundTo) {
 // the relevant position — rather than every rostered player at that position, to
 // keep the number of props per game reasonable (3 per team, 6 per game).
 async function findMaddenPropCandidate(guildId, leagueId, teamName, positions, statType, statField, beforeWeekIndex) {
+  // 7J-INJUREDPROPCANDIDATE: real bug, confirmed live (Hxxdie) — D.Lagway's
+  // prop was stuck open indefinitely because he's been injured since before
+  // last game and genuinely never produces stats to settle against, not
+  // because of an ID-instability issue like the other stuck-prop
+  // candidates this session (games, transactions). This function only ever
+  // looked at PAST performance (SUM of a prior stat, historical weeks only)
+  // with zero awareness of current injury status, so a player who was
+  // great before getting hurt keeps winning "best candidate" forever even
+  // while sidelined. Now pulls the top several historical performers
+  // (not just one) and returns the first one NOT currently marked injured
+  // in the live roster table — reusing normalizeMaddenInjuryValue, the
+  // same helper already confirmed live for this exact "EA's healthy
+  // sentinel isn't a literal 'none'" quirk, rather than writing a second,
+  // possibly-inconsistent injury check. Matches the live roster row by
+  // name + team rather than ID: madden_player_attributes keys players by
+  // player_id (a different, composite scheme — confirmed via the Jon
+  // Goddard transaction case), not roster_id/presentation_id like this
+  // table and sportsbook_games.subject_ref do, so an ID join here would
+  // risk the exact same instability already hit twice this session
+  // elsewhere. This naturally promotes the actual current starter (e.g.
+  // the backup QB) once the top candidate is filtered out — no
+  // position-specific logic needed, it just keeps walking down the same
+  // historical-performance ranking.
   const result = await pool.query(
     `SELECT roster_id, presentation_id, full_name, position,
             SUM(COALESCE((raw_payload->>$6)::numeric, 0)) AS recent_total
@@ -76137,10 +76160,37 @@ async function findMaddenPropCandidate(guildId, leagueId, teamName, positions, s
        AND LOWER(team_name) = LOWER($4) AND position = ANY($5) AND week_index < $7
      GROUP BY roster_id, presentation_id, full_name, position
      ORDER BY recent_total DESC
-     LIMIT 1`,
+     LIMIT 10`,
     [guildId, String(leagueId), statType, teamName, positions, statField, beforeWeekIndex]
   ).catch(() => ({ rows: [] }));
-  return result.rows[0] || null;
+
+  for (const candidate of result.rows) {
+    if (!candidate.full_name) continue;
+    const liveRow = await pool.query(
+      `SELECT raw_payload FROM madden_player_attributes
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND LOWER(player_name) = LOWER($3) AND LOWER(team_name) = LOWER($4)
+       LIMIT 1`,
+      [guildId, String(leagueId), candidate.full_name, teamName]
+    ).catch(() => ({ rows: [] }));
+    let liveRaw = liveRow.rows[0]?.raw_payload;
+    if (typeof liveRaw === 'string') {
+      try { liveRaw = JSON.parse(liveRaw); } catch { liveRaw = null; }
+    }
+    if (liveRaw) {
+      const injuryRaw = getAnyValue(liveRaw, ['injury', 'injuryType', 'injury_type', 'injuryStatus', 'injury_status', 'injuryDescription', 'injury_description', 'injuryName', 'injury_name'], null);
+      if (normalizeMaddenInjuryValue(injuryRaw)) {
+        console.log(`[PLAYER PROP GEN 7J-INJUREDPROPCANDIDATE] ${candidate.full_name} (${teamName}) is the top historical candidate but is currently injured — skipping, trying next candidate.`);
+        continue;
+      }
+    }
+    // No live roster row found at all (can't confirm health either way) —
+    // proceed rather than block on missing data, same "don't false-block
+    // on unknowns" reasoning already used for the self-bet check this
+    // session.
+    return candidate;
+  }
+  return null;
 }
 
 async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
