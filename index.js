@@ -76259,7 +76259,20 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
         // (that's literally how findMaddenPropCandidate found them).
         const teamAbbrev = getMaddenTeamAbbrev(team);
         const displayName = (candidate.full_name || 'Unknown Player') + (teamAbbrev ? ` (${teamAbbrev})` : '');
-        const statLine = `${displayName} — Over/Under ${threshold} ${statConfig.label} (Week ${weekIndex})`;
+        // 7J-PROPDISPLAYWEEKMISMATCH: real bug, confirmed live — a Week 15
+        // game's prop displayed "(Week 14)" to users. weekIndex here is
+        // derived from stats-sync progress (MAX(week_index)+1 in
+        // madden_player_weekly_stats), a different numbering system than
+        // week_label (the real schedule week everything else — threads,
+        // moneylines, this exact game's own feed announcement — already
+        // shows correctly). The two can legitimately drift by a week when
+        // stats sync lags behind the schedule, which is exactly what
+        // happened here. weekIndex itself is untouched below (prop_week_index,
+        // settlement matching, dedup, history lookup all still correctly
+        // need the real stats-index, not the schedule label) — this only
+        // changes the user-facing display text to say what the game is
+        // actually called everywhere else.
+        const statLine = `${displayName} — Over/Under ${threshold} ${statConfig.label} (${weekLabel})`;
         const sportsbookGameId = randomUUID();
         const insertResult = await pool.query(
           `INSERT INTO sportsbook_games
