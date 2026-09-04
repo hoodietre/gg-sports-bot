@@ -33321,6 +33321,16 @@ async function buildSportsbookOpenPayload(guildId, { page = 0, sportFilter = 'al
     embed.setDescription(blocks.join(NL + NL));
   }
 
+  // 7J-OPENSPORTSBOOK: per-page dropdowns — reuses the exact same option
+  // format as the persistent board's old dropdowns, just fed pageRows
+  // (never more than SPORTSBOOK_OPEN_PAGE_SIZE) instead of every open line
+  // league-wide. Same downstream handler (sportsbook_pick_game*, prefix-
+  // matched) picks these up unchanged regardless of which message they
+  // were shown on — nothing new needed there.
+  const pageMoneylines = pageRows.filter(r => (r.bet_type || 'moneyline') === 'moneyline');
+  const pageProps = pageRows.filter(r => r.bet_type === 'stat_prop');
+  const pageFreeform = pageRows.filter(r => r.bet_type === 'freeform_prop');
+
   const components = [];
   if (availableSports.length > 1) {
     components.push(new ActionRowBuilder().addComponents(
@@ -33338,17 +33348,6 @@ async function buildSportsbookOpenPayload(guildId, { page = 0, sportFilter = 'al
         ])
     ));
   }
-
-  // 7J-OPENSPORTSBOOK: per-page dropdowns — reuses the exact same option
-  // format as the persistent board's old dropdowns, just fed pageRows
-  // (never more than SPORTSBOOK_OPEN_PAGE_SIZE) instead of every open line
-  // league-wide. Same downstream handler (sportsbook_pick_game*, prefix-
-  // matched) picks these up unchanged regardless of which message they
-  // were shown on — nothing new needed there.
-  const pageMoneylines = pageRows.filter(r => (r.bet_type || 'moneyline') === 'moneyline');
-  const pageProps = pageRows.filter(r => r.bet_type === 'stat_prop');
-  const pageFreeform = pageRows.filter(r => r.bet_type === 'freeform_prop');
-
   if (pageMoneylines.length) {
     components.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
@@ -33386,6 +33385,15 @@ async function buildSportsbookOpenPayload(guildId, { page = 0, sportFilter = 'al
     ));
   }
 
+  // 7J-PARLAYROWBUDGET: per Hxxdie — Build a Parlay shares the nav row with
+  // Back/Next instead of getting its own dedicated row. Discord caps a
+  // message at 5 action rows; filter + moneyline + prop + freeform + a
+  // dedicated parlay row + nav could hit 6 in the worst case (multi-sport
+  // guild, a page with all three bet types present) — Discord would simply
+  // reject that message. Three buttons in one row stays well under the
+  // 5-buttons-per-row limit, so the max is now always 5 rows regardless of
+  // how many bet types are on a page — no dropping, no priority logic
+  // needed at all.
   components.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`sportsbook_open_page:${clampedPage - 1}:${sportFilter}`)
@@ -33397,6 +33405,7 @@ async function buildSportsbookOpenPayload(guildId, { page = 0, sportFilter = 'al
       .setLabel('Next ▶')
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(clampedPage >= totalPages - 1),
+    new ButtonBuilder().setCustomId('sportsbook_quick_parlay').setLabel('Build a Parlay').setEmoji('🧾').setStyle(ButtonStyle.Primary),
   ));
 
   return { embeds: [embed], components };
@@ -34333,10 +34342,36 @@ async function ensureGuildEntitlementRow(guildId) {
   );
 }
 
+// 7J-PREMIUMGATECACHE: real bug, confirmed live — the sportsbook sport-filter
+// dropdown ("didn't respond in time", no error in logs) traced back to this
+// gate, not to anything in the sportsbook code itself. requirePremiumFeature
+// runs on every single interaction for TWELVE different features (shop,
+// sportsbook, bank, economy, marketplace, avatar, GM panel, tickets,
+// tournaments, franchise hub, member profile) via getGuildEntitlement —
+// two sequential DB round trips (ensureGuildEntitlementRow + a SELECT),
+// completely unguarded by any defer, sitting before ANY handler (including
+// ones that already correctly deferUpdate() first) gets a chance to
+// acknowledge the interaction at all. Under connection pool pressure —
+// exactly the situation right after a heavier handler like
+// buildSportsbookOpenPayload's several queries are still resolving — this
+// alone can tip a subsequent interaction over Discord's 3-second window,
+// with nothing ever throwing an error to log, since it's genuinely just
+// slow, not broken. Premium status changes are rare (billing events), so a
+// short TTL cache removes the DB round trip from the hot path for the
+// overwhelming majority of interactions across all twelve gated features,
+// not just sportsbook — while keeping staleness bounded to well under a
+// minute for the rare case a grant/expiry lands mid-window.
+const guildEntitlementCache = new Map(); // guildId -> { entitlement, cachedAt }
+const GUILD_ENTITLEMENT_CACHE_TTL_MS = 30000;
+
 async function getGuildEntitlement(guildId) {
+  const cached = guildEntitlementCache.get(guildId);
+  if (cached && (Date.now() - cached.cachedAt) < GUILD_ENTITLEMENT_CACHE_TTL_MS) return cached.entitlement;
   await ensureGuildEntitlementRow(guildId);
   const result = await pool.query(`SELECT * FROM premium_entitlements WHERE guild_id = $1 LIMIT 1`, [guildId]);
-  return result.rows[0];
+  const entitlement = result.rows[0];
+  guildEntitlementCache.set(guildId, { entitlement, cachedAt: Date.now() });
+  return entitlement;
 }
 
 // True if this guild currently has Premium-tier access, whether via an
