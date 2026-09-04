@@ -69422,9 +69422,27 @@ function normalizeEaScheduleDeepFromHub(hubPayload, strictIsPreseasonOverride = 
   // agree by construction instead of independently guessing and risking
   // disagreement.
   const hubIsPreseason = strictIsPreseasonOverride !== null ? strictIsPreseasonOverride : isEaHubInPreseason(hubPayload, 0);
+  // 7J-EFFECTIVECTXPRESEASONOFF: real bug, confirmed live (Session 44
+  // continued 22) — this used to only override effectiveCtx TOWARD
+  // preseason (the true branch below) and otherwise pass currentCtx through
+  // completely unmodified. But currentCtx.isPreseason is computed
+  // independently, straight from the same raw weekType/displayedWeek
+  // signal already documented multiple times as unreliable (weekType's
+  // hard-coded fallback, displayedWeek ambiguity) — the exact thing
+  // strictIsPreseasonOverride/hubIsPreseason exists to correct. Confirmed
+  // live: even after hubIsPreseason correctly resolved to false (Week 11 of
+  // a confirmed regular season), currentCtx.isPreseason was independently
+  // still true from EA's raw weekType, so effectiveCtx carried it straight
+  // through unchanged, and repairEaFutureWeekLabelFromGameCore's own
+  // isPreseason check (further down) still converted real "Week 11" text
+  // into "Preseason Week 11" for every game row — completely bypassing the
+  // hardened signal this whole function exists to apply. Now forces
+  // isPreseason off in the false branch too, not just on in the true one,
+  // so the hardened signal actually wins either direction instead of only
+  // the one direction it happened to be tested against so far.
   const effectiveCtx = hubIsPreseason
     ? { ...currentCtx, isRegularSeason: false, isPreseason: true, weekType: 0 }
-    : currentCtx;
+    : { ...currentCtx, isPreseason: false };
 
   const candidates = collectEaScheduleCandidateRows(hubPayload)
     .filter(row => looksLikeEaScheduleGame(row.item));
@@ -70130,8 +70148,42 @@ async function backfillMaddenGameScoresFromRawPayload(guild, league) {
     [guild.id, league.league_id]
   );
 
+  // 7J-BACKFILLCOMPLETIONGUARD: real bug, confirmed live via direct SQL
+  // (Raiders @ 49ers, real Week 11, not yet played in-game — status showed
+  // completed_with_real_score, 17-45, is_user_vs_user still false because
+  // autoCreateMaddenSportsbookLines never got the chance to even evaluate
+  // it). This function runs every sync over EVERY game the league has ever
+  // imported, with zero week-boundary awareness — it reads whatever score
+  // happens to already be sitting in each row's own raw_payload (captured
+  // at import time, which for a reused/stale EA schedule slot can carry a
+  // real-looking score for a game that hasn't actually been played this
+  // season) and writes it straight to status/home_score/away_score. The
+  // 7J-UNIVERSALCOMPLETIONGUARD built last session only covers
+  // importMaddenGamesFromArray — this is a second, completely separate
+  // write path to the exact same columns that was never brought under the
+  // same protection. Same fix shape: reject a completion write for any row
+  // whose own week_label is at-or-ahead of the league's currently known
+  // week, using the identical group/idx comparison already trusted
+  // elsewhere for this exact hazard.
+  const guardCurrentWeekResult = await pool.query(
+    `SELECT ea_reported_current_week FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const guardCurrentWeekLabel = guardCurrentWeekResult.rows[0]?.ea_reported_current_week || null;
+  const [guardCurrentGroup, guardCurrentIdx] = guardCurrentWeekLabel ? maddenWeekLabelSortKey(guardCurrentWeekLabel) : [null, null];
+
   let updated = 0;
+  let guardRejected = 0;
   for (const game of gamesResult.rows) {
+    if (guardCurrentGroup !== null) {
+      const [rowGroup, rowIdx] = maddenWeekLabelSortKey(game.week_label);
+      const rowAtOrAheadOfCurrent = rowGroup > guardCurrentGroup || (rowGroup === guardCurrentGroup && rowIdx >= guardCurrentIdx);
+      if (rowAtOrAheadOfCurrent) {
+        guardRejected += 1;
+        continue;
+      }
+    }
+
     const scoreInfo = resolveMaddenScoresFromRawGameDeep(game);
     const winner = resolveMaddenWinnerFromRawGame(game, game.home_team, game.away_team);
 
@@ -70180,6 +70232,9 @@ async function backfillMaddenGameScoresFromRawPayload(guild, league) {
 
   if (updated) {
     console.log('[Madden Score Backfill 7J-5BM] Updated game scores from raw payload:', updated);
+  }
+  if (guardRejected) {
+    console.log(`[Madden Score Backfill 7J-BACKFILLCOMPLETIONGUARD] Skipped ${guardRejected} row(s) claiming completion for a week at-or-ahead of the known current week (${guardCurrentWeekLabel}) — not backfilling a score onto a game that shouldn't be decided yet.`);
   }
 
   return updated;
