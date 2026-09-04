@@ -51356,6 +51356,35 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
       else status = 'completed';
     }
 
+    const resolvedWeekLabelForRow = getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null) || weekLabel;
+    // 7J-UPSERTEXISTINGWINSGUARD: real bug, confirmed live via direct trace
+    // (Week 13, all 14 games — Steelers/Eagles etc., none played yet) —
+    // separate from both 7J-UNIVERSALCOMPLETIONGUARD (rejects a row before
+    // insert if THIS sync's incoming data looks falsely completed) and
+    // 7J-BACKFILLCOMPLETIONGUARD (stops backfillMaddenGameScoresFromRawPayload
+    // from flipping a scheduled row to completed). Neither covers this: the
+    // incoming data THIS sync was genuinely clean (status='scheduled',
+    // score=0 — confirmed live, the source-trace guard logged nothing,
+    // correctly, since there was nothing to reject), but the UPSERT's own
+    // ON CONFLICT branch below prefers the row's EXISTING stored status/
+    // score over the fresh one whenever the existing value already looks
+    // completed with a real score — deliberately built to stop a later,
+    // less-complete resync from wiping a genuinely-finished game's result.
+    // That protection backfires exactly when the existing value is itself
+    // stale (a reused/prior-season schedule slot's score, imported at some
+    // earlier point before any of this session's guards existed) — it
+    // permanently defends the bad value against ever being corrected by a
+    // later, accurate, clean sync, since "existing already looks done" is
+    // treated as proof rather than exactly the thing under suspicion. Fixed
+    // by disqualifying the existing-wins branch whenever the row's own week
+    // is at-or-ahead of the league's currently confirmed week — the same
+    // rule already trusted everywhere else this session for this exact
+    // hazard. A row genuinely behind the current week (real backfill,
+    // legitimately already played) is completely unaffected.
+    const [rowGroupForUpsert, rowIdxForUpsert] = maddenWeekLabelSortKey(resolvedWeekLabelForRow);
+    const rowAtOrAheadOfCurrentForUpsert = traceCurrentGroup !== null &&
+      (rowGroupForUpsert > traceCurrentGroup || (rowGroupForUpsert === traceCurrentGroup && rowIdxForUpsert >= traceCurrentIdx));
+
     await pool.query(
       // 7J-SEASONKEYSELFHEAL: real bug, confirmed live and root-caused via
       // actual DB data (Session 44 continued 17) — the season_key/season_year
@@ -51399,16 +51428,19 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
          away_team_role_id = COALESCE($9, madden_imported_games.away_team_role_id),
          home_score = CASE
            WHEN $10 > 0 OR $11 > 0 THEN $10
+           WHEN $16 = TRUE THEN $10
            WHEN COALESCE(madden_imported_games.home_score, 0) > 0 OR COALESCE(madden_imported_games.away_score, 0) > 0 THEN madden_imported_games.home_score
            ELSE $10
          END,
          away_score = CASE
            WHEN $10 > 0 OR $11 > 0 THEN $11
+           WHEN $16 = TRUE THEN $11
            WHEN COALESCE(madden_imported_games.home_score, 0) > 0 OR COALESCE(madden_imported_games.away_score, 0) > 0 THEN madden_imported_games.away_score
            ELSE $11
          END,
          status = CASE
            WHEN $12 IN ('completed', 'away_win', 'home_win', 'tie', 'completed_with_real_score') THEN $12
+           WHEN $16 = TRUE THEN $12
            WHEN madden_imported_games.status IN ('completed', 'away_win', 'home_win', 'tie', 'completed_with_real_score')
              AND (COALESCE(madden_imported_games.home_score, 0) > 0 OR COALESCE(madden_imported_games.away_score, 0) > 0)
              THEN madden_imported_games.status
@@ -51423,7 +51455,7 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
         guild.id,
         league.league_id,
         externalGameId,
-        getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null) || weekLabel,
+        resolvedWeekLabelForRow,
         homeTeam,
         awayTeam,
         homeRoleId,
@@ -51434,6 +51466,7 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
         JSON.stringify(row),
         league.madden_season_year || null,
         currentSeasonKey,
+        rowAtOrAheadOfCurrentForUpsert,
       ]
     );
 
