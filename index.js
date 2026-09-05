@@ -11225,7 +11225,13 @@ async function buildTournamentManagerHomePayload(guild, { includeAdminBackButton
       new ButtonBuilder().setCustomId('adminpanel_back').setLabel('⬅ Back to Admin Panel').setStyle(ButtonStyle.Secondary)
     ));
   }
-  return { embeds: [embed], components };
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('tournament');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'tournament-banner.png' }));
+    embed.setImage('attachment://tournament-banner.png');
+  }
+  return { embeds: [embed], components, files };
 }
 
 async function buildTournamentManagerViewPayload(guild, tournament, { includeAdminBackButton = true } = {}) {
@@ -12944,13 +12950,20 @@ async function ggBuildPermanentShopPayload(guildId, offset = 0, sort = 'price_as
 // Avatar Shop (global) and Server Shop (this guild's own items) — instead
 // of immediately dumping both into one mixed list. Same lightweight
 // starter-panel pattern as Bank/Profile/Marketplace above.
-function buildShopStarterEmbed() {
-  return new EmbedBuilder()
+async function buildShopStarterEmbed() {
+  const embed = new EmbedBuilder()
     .setTitle('🛍️ GG Sports Shop')
     .setColor(0xFEE75C)
     .setDescription('Choose a shop to browse — **Avatar Shop** for cosmetics and other global items, or **Server Shop** for items this server has added.')
     .setFooter({ text: 'GG Sports • Shop' })
     .setTimestamp();
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('shop');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'shop-banner.png' }));
+    embed.setImage('attachment://shop-banner.png');
+  }
+  return { embed, files };
 }
 
 function buildShopStarterComponents() {
@@ -12969,7 +12982,10 @@ function getMultiChannelPanelInfo(panelType) {
   const registry = {
     shop: {
       label: 'Shop Panel',
-      build: async () => ({ embeds: [buildShopStarterEmbed()], components: buildShopStarterComponents() }),
+      build: async () => {
+        const { embed, files } = await buildShopStarterEmbed();
+        return { embeds: [embed], components: buildShopStarterComponents(), files };
+      },
     },
     sportsbook: {
       label: 'Sportsbook Board',
@@ -12980,23 +12996,38 @@ function getMultiChannelPanelInfo(panelType) {
     },
     bank: {
       label: 'Bank Starter',
-      build: async () => ({ embeds: [buildBankStarterEmbed()], components: buildBankStarterComponents() }),
+      build: async () => {
+        const { embed, files } = await buildBankStarterEmbed();
+        return { embeds: [embed], components: buildBankStarterComponents(), files };
+      },
     },
     profile: {
       label: 'Member Profile Starter',
-      build: async () => ({ embeds: [buildMemberProfileStarterEmbed()], components: buildMemberProfileStarterComponents() }),
+      build: async () => {
+        const { embed, files } = await buildMemberProfileStarterEmbed();
+        return { embeds: [embed], components: buildMemberProfileStarterComponents(), files };
+      },
     },
     marketplace: {
       label: 'Marketplace',
-      build: async () => ({ embeds: [buildMarketplaceStarterEmbed()], components: buildMarketplaceStarterComponents() }),
+      build: async () => {
+        const { embed, files } = await buildMarketplaceStarterEmbed();
+        return { embeds: [embed], components: buildMarketplaceStarterComponents(), files };
+      },
     },
     avatar: {
       label: 'Avatar',
-      build: async () => ({ embeds: [buildAvatarStarterEmbed()], components: buildAvatarStarterComponents() }),
+      build: async () => {
+        const { embed, files } = await buildAvatarStarterEmbed();
+        return { embeds: [embed], components: buildAvatarStarterComponents(), files };
+      },
     },
     recruitment: {
       label: 'Recruitment',
-      build: async () => ({ embeds: [buildRecruitmentStarterEmbed()], components: buildRecruitmentStarterComponents() }),
+      build: async () => {
+        const { embed, files } = await buildRecruitmentStarterEmbed();
+        return { embeds: [embed], components: buildRecruitmentStarterComponents(), files };
+      },
     },
     // 7J-TOURNAMENTAUTOSETUP: per Hxxdie's discussion — tournaments are
     // guild-wide (the tournaments table is keyed by guild_id, not
@@ -30074,7 +30105,8 @@ if (interaction.commandName === 'trade') {
           return;
         }
 
-        const message = await channel.send({ embeds: [buildShopStarterEmbed()], components: buildShopStarterComponents() });
+        const { embed: shopStarterEmbed, files: shopStarterFiles } = await buildShopStarterEmbed();
+        const message = await channel.send({ embeds: [shopStarterEmbed], components: buildShopStarterComponents(), files: shopStarterFiles });
 
         await pool.query(`DELETE FROM shop_panels WHERE guild_id = $1`, [interaction.guild.id]);
         await pool.query(
@@ -30964,7 +30996,8 @@ if (shopSubcommand === 'view') {
           return;
         }
 
-        await channel.send({ embeds: [buildSupportPanelEmbed()], components: [buildSupportPanelButtons()] });
+        const { embed: supportPanelEmbed, files: supportPanelFiles } = await buildSupportPanelEmbed();
+        await channel.send({ embeds: [supportPanelEmbed], components: [buildSupportPanelButtons()], files: supportPanelFiles });
         await interaction.reply({ content: 'Support panel created in ' + channel.toString() + '.', ephemeral: true });
         return;
       }
@@ -32913,8 +32946,8 @@ async function buildGameIssueLogEmbed(rows, leagueName = null, decision = null) 
   return embed;
 }
 
-function buildSupportPanelEmbed() {
-  return new EmbedBuilder()
+async function buildSupportPanelEmbed() {
+  const embed = new EmbedBuilder()
     .setTitle('🎫 GG Sports Support Center')
     .setColor(0xffcc00)
     .setDescription('Need help? Choose the button that best matches your issue. A ticket thread will be created for you and staff will be notified.')
@@ -32926,6 +32959,13 @@ function buildSupportPanelEmbed() {
     )
     .setFooter({ text: 'GG Sports • Support Center' })
     .setTimestamp();
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('ticket');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'ticket-banner.png' }));
+    embed.setImage('attachment://ticket-banner.png');
+  }
+  return { embed, files };
 }
 
 function buildSupportPanelButtons() {
@@ -33573,6 +33613,30 @@ async function buildParlayWizardPayload(guildId, userId) {
 // file at assets/sportsbook/banner.png and every board picks it up on its
 // next refresh; no command, no DB column, no external hosting needed.
 const SPORTSBOOK_BANNER_PATH = path.join(process.cwd(), 'assets', 'sportsbook', 'banner.png');
+
+// 7J-PANELBANNERS: same pattern as SPORTSBOOK_BANNER_PATH above, generalized
+// to a shared helper instead of duplicating the constant/cache/function trio
+// per panel — one file on disk at assets/{folderName}/banner.png, cached
+// buffer, graceful null if missing (no image attached, panel still posts
+// fine without one). folderName is the panel's own name, matching the
+// registry keys in getMultiChannelPanelInfo where one exists: shop, bank,
+// profile, marketplace, avatar, recruitment, tournament — plus 'ticket' for
+// the Support Center panel, which isn't in that registry but follows the
+// same convention. Drop a banner.png in the matching folder and the next
+// panel refresh picks it up; no command, no DB column, no external hosting.
+const panelBannerBufferCache = new Map(); // folderName -> Buffer | null
+async function loadPanelBannerBuffer(folderName) {
+  if (panelBannerBufferCache.has(folderName)) return panelBannerBufferCache.get(folderName);
+  let buffer = null;
+  try {
+    buffer = await fs.promises.readFile(path.join(process.cwd(), 'assets', folderName, 'banner.png'));
+  } catch (error) {
+    buffer = null;
+  }
+  panelBannerBufferCache.set(folderName, buffer);
+  return buffer;
+}
+
 let sportsbookBannerBufferCache = undefined; // undefined = not yet checked, null = checked and missing
 
 async function loadSportsbookBannerBuffer() {
@@ -40588,13 +40652,20 @@ async function openAvatarShopPanel(interaction) {
 
 // Starter panel — same lightweight pattern as Bank/Member Profile/Marketplace: a
 // static embed with buttons that open personal ephemeral views.
-function buildAvatarStarterEmbed() {
-  return new EmbedBuilder()
+async function buildAvatarStarterEmbed() {
+  const embed = new EmbedBuilder()
     .setTitle('🧍 Avatar')
     .setColor(0xFEE75C)
     .setDescription('Customize your character, equip what you own, and go shopping for more — all from the buttons below.')
     .setFooter({ text: 'GG Sports • Avatar' })
     .setTimestamp();
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('avatar');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'avatar-banner.png' }));
+    embed.setImage('attachment://avatar-banner.png');
+  }
+  return { embed, files };
 }
 
 function buildAvatarStarterComponents() {
@@ -41169,13 +41240,20 @@ async function performMarketplaceCancel(interaction, listingInput) {
 // "Starter panel" — same lightweight pattern as Bank/Member Profile: a static embed with
 // buttons that open modals/ephemeral views, posted somewhere permanent so nobody has to
 // remember /marketplace subcommands.
-function buildMarketplaceStarterEmbed() {
-  return new EmbedBuilder()
+async function buildMarketplaceStarterEmbed() {
+  const embed = new EmbedBuilder()
     .setTitle('🛒 Marketplace')
     .setColor(0xFEE75C)
     .setDescription('Buy and sell owned items with other users — global, across every server. Use the buttons below, no commands to remember.')
     .setFooter({ text: 'GG Sports • Marketplace' })
     .setTimestamp();
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('marketplace');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'marketplace-banner.png' }));
+    embed.setImage('attachment://marketplace-banner.png');
+  }
+  return { embed, files };
 }
 
 function buildMarketplaceStarterComponents() {
@@ -42176,13 +42254,20 @@ const MEMBER_PROFILE_CATEGORIES = [
   { value: 'earnings', label: 'Earnings', description: 'Balance, lifetime earned/spent, sportsbook profit', emoji: '💰' },
 ];
 
-function buildMemberProfileStarterEmbed() {
-  return new EmbedBuilder()
+async function buildMemberProfileStarterEmbed() {
+  const embed = new EmbedBuilder()
     .setTitle('👤 Member Profile')
     .setColor(0x5865F2)
     .setDescription('Click below to open your profile — activity, legacy, currency, sportsbook record, tournaments, teams owned across every league, milestones, and badges all in one place.')
     .setFooter({ text: 'GG Sports • Member Profile' })
     .setTimestamp();
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('profile');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'profile-banner.png' }));
+    embed.setImage('attachment://profile-banner.png');
+  }
+  return { embed, files };
 }
 
 function buildMemberProfileStarterComponents() {
@@ -42253,13 +42338,20 @@ async function showMemberProfileCategory(interaction, targetUser, category, { up
 // recent purchases. Wraps existing getBalance/addCurrency/removeCurrency/
 // user_inventory, no new economy logic.
 // ---------------------------------------------------------------------------
-function buildBankStarterEmbed() {
-  return new EmbedBuilder()
+async function buildBankStarterEmbed() {
+  const embed = new EmbedBuilder()
     .setTitle('🏦 Bank')
     .setColor(0xFEE75C)
     .setDescription('Click below to check your balance, transfer currency to another member, or view your recent purchases.')
     .setFooter({ text: 'GG Sports • Bank' })
     .setTimestamp();
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('bank');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'bank-banner.png' }));
+    embed.setImage('attachment://bank-banner.png');
+  }
+  return { embed, files };
 }
 
 function buildBankStarterComponents() {
@@ -42567,7 +42659,8 @@ async function autoCreateGuildMultiChannelPanels(guild) {
       const supportChannel = await guild.channels.create({ name: 'support', type: ChannelType.GuildText, parent: category.id }).catch(() => null);
       if (supportChannel) {
         await setGuildTicketSettings(guild.id, guild.name, { supportChannelId: supportChannel.id });
-        await supportChannel.send({ embeds: [buildSupportPanelEmbed()], components: [buildSupportPanelButtons()] }).catch(() => null);
+        const { embed: autoSupportPanelEmbed, files: autoSupportPanelFiles } = await buildSupportPanelEmbed();
+        await supportChannel.send({ embeds: [autoSupportPanelEmbed], components: [buildSupportPanelButtons()], files: autoSupportPanelFiles }).catch(() => null);
         created.push(supportChannel);
       }
     }
@@ -43262,13 +43355,20 @@ async function getVacantLeagueTeams(guild, league) {
   return vacant;
 }
 
-function buildRecruitmentStarterEmbed() {
-  return new EmbedBuilder()
+async function buildRecruitmentStarterEmbed() {
+  const embed = new EmbedBuilder()
     .setTitle('🎯 Recruitment')
     .setColor(0x57F287)
     .setDescription('Browse open team slots and apply — no need to ask around in chat. Applications go to the commissioner for approval before a team role is assigned.')
     .setFooter({ text: 'GG Sports • Recruitment' })
     .setTimestamp();
+  const files = [];
+  const bannerBuffer = await loadPanelBannerBuffer('recruitment');
+  if (bannerBuffer) {
+    files.push(new AttachmentBuilder(bannerBuffer, { name: 'recruitment-banner.png' }));
+    embed.setImage('attachment://recruitment-banner.png');
+  }
+  return { embed, files };
 }
 
 function buildRecruitmentStarterComponents() {
