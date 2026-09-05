@@ -13905,13 +13905,6 @@ function logEngagementEvent(interaction) {
 
 client.on(Events.InteractionCreate, async (interaction) => {
 
-    // 7J-RAWENTRY: unconditional, first statement in the handler — no
-    // autocomplete filter, no try/catch, nothing above this can skip it.
-    // If this doesn't fire on the filter-dropdown click, the interaction
-    // is not reaching this process at all (Discord/gateway-level), full
-    // stop — every remaining theory becomes external, not code-side.
-    console.log(`[7J-RAWENTRY] type=${interaction.type} isStringSelect=${typeof interaction.isStringSelectMenu === 'function' ? interaction.isStringSelectMenu() : 'n/a'} customId=${interaction.customId || interaction.commandName || 'n/a'} id=${interaction.id} guild=${interaction.guild?.id || 'n/a'}`);
-
     if (interaction.isAutocomplete()) {
       try {
         const commandName = interaction.commandName;
@@ -14396,16 +14389,6 @@ if (((subcommand === 'team' || subcommand === 'roster') && focused?.name === 'te
     ) {
       const matchedGate = PREMIUM_GATED_CUSTOM_ID_PREFIXES.find(([prefix]) => interaction.customId?.startsWith(prefix));
       if (matchedGate && !(await requirePremiumFeature(interaction, matchedGate[1]))) return;
-
-      // 7J-CHECKPOINT-A: bisecting the gap between 7J-RAWENTRY (confirmed
-      // firing for sportsbook_open_filter) and the actual handler block —
-      // this sits immediately after the only code in that gap that touches
-      // sportsbook_-prefixed interactions at all (the premium gate above,
-      // whose two DB calls have no .catch() on them). If this doesn't fire,
-      // the gate itself is hanging (not throwing) on this specific click.
-      if (interaction.customId === 'sportsbook_open_filter') {
-        console.log(`[7J-CHECKPOINT-A] Survived premium gate. id=${interaction.id}`);
-      }
     }
 
 if (interaction.commandName === 'avatar') {
@@ -16004,14 +15987,6 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    // 7J-CHECKPOINT-MID: bisecting the gap between 7J-CHECKPOINT-A (confirmed
-    // firing) and 7J-CHECKPOINT-B (confirmed NOT firing) — this sits roughly
-    // halfway between them, after the avatarlocker/botownerpanel/marketplace-
-    // command blocks, before the marketplace-panel/recruitment/onboard blocks.
-    if (interaction.customId === 'sportsbook_open_filter') {
-      console.log(`[7J-CHECKPOINT-MID] Reached marketplace-panel gate point. id=${interaction.id}`);
-    }
-
     // Single gate covering every marketplace panel button/select/modal below —
     // these are reached directly from a persistent panel message, bypassing
     // the /marketplace command-level gate above entirely, so they need their
@@ -16816,14 +16791,6 @@ if (interaction.commandName === 'avatar') {
       return;
     }
 
-    // 7J-CHECKPOINT-MID2: second bisection round — halfway between
-    // 7J-CHECKPOINT-MID (confirmed firing) and 7J-CHECKPOINT-B (confirmed
-    // NOT firing). Sits after the marketplace-panel/recruitment-approve
-    // blocks, before recruitment-decline/onboard blocks.
-    if (interaction.customId === 'sportsbook_open_filter') {
-      console.log(`[7J-CHECKPOINT-MID2] Reached recruitment-decline point. id=${interaction.id}`);
-    }
-
     if (interaction.isButton() && interaction.customId.startsWith('recruitmentpanel_decline:')) {
       const appId = interaction.customId.split(':')[1];
       const modal = new ModalBuilder()
@@ -17194,14 +17161,6 @@ if (interaction.commandName === 'avatar') {
         await interaction.reply({ content: 'Your trade block listing has been posted.', ephemeral: true });
         return;
       }
-    }
-
-    // 7J-CHECKPOINT-MID3: third bisection round — between 7J-CHECKPOINT-MID2
-    // (confirmed firing) and 7J-CHECKPOINT-B (confirmed NOT firing). Sits
-    // after onboard_league_select/onboard_team_select, before the
-    // leaguekick_confirm/isButton() dispatcher block.
-    if (interaction.customId === 'sportsbook_open_filter') {
-      console.log(`[7J-CHECKPOINT-MID3] Reached leaguekick dispatcher point. id=${interaction.id}`);
     }
 
     if (interaction.isButton()) {
@@ -17620,23 +17579,38 @@ if (interaction.commandName === 'avatar') {
         return;
       }
 
-      // 7J-CHECKPOINT-B: the other end of the bisection — immediately
-      // before the actual matched block. If 7J-CHECKPOINT-A fires but this
-      // doesn't, the swallow is somewhere in the ~3,600 lines of unrelated
-      // if-blocks between the two (avatarlocker, botownerpanel, marketplace,
-      // recruitment, onboard, etc.) and needs a further split next round.
-      if (interaction.customId === 'sportsbook_open_filter') {
-        console.log(`[7J-CHECKPOINT-B] About to enter target block. id=${interaction.id}`);
-      }
+    } // close isButton() early — 7J-FILTERSCOPEBUG (see below)
 
-      if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_open_filter') {
-        console.log(`[SPORTSBOOK FILTER DEBUG 7J-FILTERENTRY] Handler entered. interactionId=${interaction.id} values=${JSON.stringify(interaction.values)}`);
-        await interaction.deferUpdate().catch((err) => console.log('[SPORTSBOOK FILTER DEBUG 7J-FILTERENTRY] deferUpdate failed:', err?.message || err));
-        const sportFilter = interaction.values[0] || 'all';
-        const payload = await buildSportsbookOpenPayload(interaction.guild.id, { page: 0, sportFilter });
-        await interaction.editReply(payload).catch((err) => console.log('[SPORTSBOOK FILTER DEBUG 7J-FILTERENTRY] editReply failed:', err?.message || err));
-        return;
-      }
+    // 7J-FILTERSCOPEBUG: root cause of the sport-filter dropdown's silent
+    // timeout, found via AST analysis (acorn) rather than eyeballing braces —
+    // the enclosing `if (interaction.isButton())` opened well above (originally
+    // matched leaguekick_confirm/cancel, activecheck, maddengame threads,
+    // tourney match winners, ticket review/close/info/transcript, then the
+    // sportsbook_quick_* buttons) never actually closed before this select-menu
+    // check. Confirmed via acorn AST parse: that if-block's true extent ran all
+    // the way to what's now several hundred lines below this point. Since
+    // isButton() is false for a StringSelectMenuInteraction, this entire
+    // handler was structurally unreachable for every filter click — not a
+    // hang, not a Discord-side issue, not the option shape (emoji/default)
+    // tested earlier. It silently failed the outer condition and fell all the
+    // way through, and Discord reported "didn't respond in time" because
+    // nothing downstream ever ran to defer/reply. Pulling this select-menu
+    // check fully outside the isButton() block (closed just above) and
+    // reopening isButton() immediately after (below) for the remaining button
+    // handlers — sportsbook_parlay_side/cancel/place, sportsbook_pick_side,
+    // and everything else through line ~18220's original close — is the
+    // minimal fix: no behavior change for any of those, they're still exactly
+    // as isButton()-gated as before, just via a fresh wrapper instead of the
+    // one that used to swallow this block.
+    if (interaction.isStringSelectMenu() && interaction.customId === 'sportsbook_open_filter') {
+      await interaction.deferUpdate().catch((err) => console.error('[7J-FILTERSCOPEBUG] deferUpdate failed:', err?.message || err));
+      const sportFilter = interaction.values[0] || 'all';
+      const payload = await buildSportsbookOpenPayload(interaction.guild.id, { page: 0, sportFilter });
+      await interaction.editReply(payload).catch((err) => console.error('[7J-FILTERSCOPEBUG] editReply failed:', err?.message || err));
+      return;
+    }
+
+    if (interaction.isButton()) { // reopen isButton() — 7J-FILTERSCOPEBUG
 
       if (interaction.isButton() && interaction.customId.startsWith('sportsbook_parlay_side:')) {
         const [, gameId, side] = interaction.customId.split(':');
