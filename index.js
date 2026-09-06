@@ -73518,7 +73518,40 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     const earlyEaHubCtx = extractEaStandingsRequestContextFromHub(hub, context.externalLeagueId);
     const earlyPreseasonMode = isEaHubInPreseason(hub, context.externalLeagueId);
     const earlyExplicitlyPreseason = earlyEaHubCtx?.nextSeasonWeekType === 0 || earlyPreseasonMode === true;
-    const earlyExplicitlyRegularSeason = earlyEaHubCtx?.nextSeasonWeekType === 1 || hasRealRecordData === true;
+    // 7J-WEEKTYPEREGULARSIGNAL: real signal, confirmed live via the Season
+    // Stage Probe (Session 47) at the exact Cut Week -> real Week 1 boundary
+    // for this league — hasRealRecordData was false (no game played yet)
+    // and nextSeasonWeekType was null (this league's hub never populates
+    // it), so explicitlyRegularSeason evaluated false and the ambiguity
+    // default kept the league stuck on "still preseason" indefinitely. The
+    // hub DOES separately report weekType/seasonWeekType = 1, sourced from
+    // the actual first scheduled game (firstGame.weekType/seasonWeekType,
+    // confirmed via the new weekTypeSource diagnostic field — NOT the
+    // 7J-10BY-STRICTPRESEASONGATE hardcoded `?? 1` default, which this same
+    // field is otherwise exposed to). isEaHubInPreseason already treats
+    // weekType===1 as a "definitely not preseason" signal and feeds it into
+    // explicitlyPreseason via preseasonMode; explicitlyRegularSeason never
+    // consulted the equivalent positive signal — an asymmetry, not a
+    // missing field. Gated explicitly on weekTypeSource NOT being the
+    // default fallback, so this can never fire on a guessed value the way
+    // the pre-existing, already-fixed bug did.
+    // NOT yet proven safe across the Cut Week boundary itself: this session
+    // only captured real Week 1 (post-Cut-Week, unplayed) reporting a
+    // genuine weekType:1 — the Cut Week payload from earlier this same
+    // cycle was already pruned by the pre-fix payload retention bug before
+    // this was written, so there's no direct side-by-side comparison yet.
+    // If EA's schedule export already lists next week's real game (with
+    // weekType:1) while the league is still sitting in Cut Week, this
+    // signal would misfire the same way nextSeasonWeekType once did — a
+    // different failure mode than the one just ruled out, not yet ruled
+    // out itself. The payload-retention fix means the NEXT Cut Week
+    // transition will have both payloads preserved for direct comparison —
+    // re-verify against that live before calling this fully closed.
+    const earlyWeekTypeIsGenuine = Boolean(earlyEaHubCtx?.weekTypeSource) &&
+      !String(earlyEaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK');
+    const earlyExplicitlyRegularSeason = earlyEaHubCtx?.nextSeasonWeekType === 1
+      || (earlyWeekTypeIsGenuine && (earlyEaHubCtx?.weekType === 1 || earlyEaHubCtx?.seasonWeekType === 1))
+      || hasRealRecordData === true;
     // 7J-STAGEGUARDEDPRESEASONDEFAULT: ambiguous only resolves to "still
     // preseason" while the league's own confirmed stage isn't already past
     // it — see the shared comment on stageAlreadyPastPreseason above.
@@ -73630,7 +73663,17 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       // direction, since staying gated one extra sync is recoverable and
       // wrongly unlocking isn't.
       const explicitlyPreseason = eaHubCtx?.nextSeasonWeekType === 0 || preseasonMode === true;
-      const explicitlyRegularSeason = eaHubCtx?.nextSeasonWeekType === 1 || hasRealRecordData === true;
+      // 7J-WEEKTYPEREGULARSIGNAL: identical fix to the early computation
+      // site above — see that comment block for full reasoning, the
+      // Session 47 discovery, and the still-open Cut Week caveat. Kept in
+      // sync with the early site intentionally, per this function's own
+      // stated design principle that the two must never be allowed to
+      // disagree (see 7J-SCHEDULEPRESEASONSIGNAL's comment).
+      const weekTypeIsGenuine = Boolean(eaHubCtx?.weekTypeSource) &&
+        !String(eaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK');
+      const explicitlyRegularSeason = eaHubCtx?.nextSeasonWeekType === 1
+        || (weekTypeIsGenuine && (eaHubCtx?.weekType === 1 || eaHubCtx?.seasonWeekType === 1))
+        || hasRealRecordData === true;
       // 7J-STAGEGUARDEDPRESEASONDEFAULT: same guard as the early computation
       // above — ambiguous only resolves to "still preseason" while the
       // league's own confirmed stage isn't already past it. Reuses the same
