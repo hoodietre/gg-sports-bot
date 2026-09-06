@@ -67671,10 +67671,22 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
     ).catch(() => ({ rows: [] }));
     const currentWeekLabel = currentWeekResult.rows?.[0]?.week_label;
     const [group, idx] = maddenWeekLabelSortKey(currentWeekLabel);
-    if (group === 2 && idx >= 0 && idx <= 3) {
-      // idx: 0=Wild Card, 1=Divisional, 2=Conference Championship, 3=Super Bowl
-      const scheduleWeekIndex = 18 + idx + (idx === 3 ? 1 : 0); // skips 21 (Pro Bowl) before Super Bowl, matching getMaddenPlayoffWeekLabelFromDisplayWeek
-      const postseasonStageIndex = 2 + idx + (idx === 3 ? 1 : 0); // skips 5 (Pro Bowl), matching getMaddenEaPostseasonStageLabel
+    // 7J-STATLEADERSPROBOWLGAP: same bug, same fix, as the display-side
+    // version in the Weekly Stat Leaders post — this discovery function
+    // matters even more, since it decides which EA endpoints actually get
+    // probed during sync at all. idx===4 is real Super Bowl per
+    // maddenWeekLabelSortKey (0=Wild Card, 1=Divisional, 2=Conf.
+    // Championship, 3=Pro Bowl, 4=Super Bowl); the old `<= 3` check and
+    // "+1 if idx===3" adjustment excluded it from ever being probed for at
+    // all, meaning Super Bowl's real player stats may never have been
+    // fetched from EA in the first place this round. Formula below is
+    // unchanged in spacing (idx already matches getMaddenPlayoffWeekLabelFromDisplayWeek's
+    // display-week-minus-one scheme and getMaddenEaPostseasonStageLabel's
+    // stage scheme exactly, confirmed directly against both), just no
+    // longer artificially capped before reaching the real Super Bowl value.
+    if (group === 2 && idx >= 0 && idx <= 4) {
+      const scheduleWeekIndex = 18 + idx; // matches getMaddenPlayoffWeekLabelFromDisplayWeek's display-week-1 scheme (19-23 -> 18-22)
+      const postseasonStageIndex = 2 + idx; // matches getMaddenEaPostseasonStageLabel's scheme exactly (2-6)
       discoveryTargets.push({ weekIndex: scheduleWeekIndex, stageIndex: 1 });
       discoveryTargets.push({ weekIndex: 0, stageIndex: postseasonStageIndex });
     }
@@ -77261,10 +77273,30 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   } else {
     const [labelGroup, labelIdx] = maddenWeekLabelSortKey(weekLabel);
     const playoffCandidates = [];
-    if (labelGroup === 2 && labelIdx >= 0 && labelIdx <= 3) {
-      // labelIdx: 0=Wild Card, 1=Divisional, 2=Conference Championship, 3=Super Bowl
-      const scheduleWeekIndex = 18 + labelIdx + (labelIdx === 3 ? 1 : 0); // skips 21 (Pro Bowl)
-      const postseasonStageIndex = 2 + labelIdx + (labelIdx === 3 ? 1 : 0); // skips 5 (Pro Bowl)
+    // 7J-STATLEADERSPROBOWLGAP: real bug, confirmed live — a "Super Bowl
+    // Stat Leaders" post showed players from a team (Rams) that had
+    // already been eliminated in the Conference Championship. Root cause:
+    // this candidate computation assumed labelIdx only ever ran 0-3 for
+    // playoff rounds ("0=Wild Card, 1=Divisional, 2=Conference
+    // Championship, 3=Super Bowl" per the stale comment this replaces),
+    // with a manual "+1 if labelIdx===3" patch meant to skip over the real
+    // Pro Bowl gap. But maddenWeekLabelSortKey (fixed earlier, independent
+    // of this function, via 7J-10BY-PROBOWLFIX/7J-PROBOWLBRACKETGAP)
+    // already returns the REAL EA index directly — Wild Card=0,
+    // Divisional=1, Conf. Championship=2, Pro Bowl=3, Super Bowl=4 — so a
+    // genuine "Super Bowl" label's labelIdx is 4, not 3. The old `<= 3`
+    // check silently excluded it from ever reaching this candidate list at
+    // all, falling through to the old global-max fallback below, which
+    // can't distinguish rounds and grabbed whichever round's stats
+    // happened to be imported most recently — exactly the Rams/Giants/
+    // Jaguars mix seen live. Fix: labelIdx is already correctly spaced
+    // (no collision, no gap to skip around), so the range extends to
+    // include 4 and the old "+1 if index===3" adjustment — which was
+    // applying the Pro-Bowl-skip at the wrong index entirely — is removed
+    // outright rather than patched again.
+    if (labelGroup === 2 && labelIdx >= 0 && labelIdx <= 4) {
+      const scheduleWeekIndex = 18 + labelIdx;
+      const postseasonStageIndex = 2 + labelIdx;
       playoffCandidates.push({ weekIndex: scheduleWeekIndex, stageIndex: 1 });
       playoffCandidates.push({ weekIndex: 0, stageIndex: postseasonStageIndex });
     }
@@ -78364,7 +78396,35 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   // already being 'offseason'. Runs the exact same kickoff a preseason
   // league gets via handleMaddenSeasonTransition, just triggered directly
   // off leaving 'offseason' instead of off a preseason→regular transition.
-  if (stage === 'offseason' && maddenIsRegularSeasonWeek(newWeekLabel)) {
+  //
+  // 7J-STUCKWEEKLABELGUARD: real bug, confirmed live — this fired a
+  // "Regular Season Starts NOW" kickoff during actual offseason/preseason
+  // for a league whose EA hub reports "Week 1" as a stuck placeholder
+  // value literally throughout the entire offseason AND preseason, not
+  // just at one ambiguous boundary. maddenIsRegularSeasonWeek's literal
+  // /^week\s+\d+$/i check (7J-OFFSEASONSTAGEFALLBACKFIX) correctly ruled
+  // out unrecognized offseason sub-stage labels, but has no way to tell
+  // this apart from a genuinely-real "Week 1" — the text is identical
+  // either way for this league. Needs an independent signal that doesn't
+  // depend on the label at all: hasRealRecordData, the same hardened check
+  // already proven in runMaddenEaDirectSync (any team showing a non-zero
+  // win/loss/points record). Every team sits at a freshly-reset 0-0
+  // through offseason and preseason; only once real games are actually
+  // played and synced does this become true. Recomputed fresh here via a
+  // direct query rather than threading the in-memory value through
+  // multiple call layers (sync -> auto-detect -> this handler) — same
+  // "read fresh, don't trust a passed-in value across layers" principle
+  // as 7J-SEASONKEYSTABLEREAD.
+  const hasRealRecordDataForKickoff = stage === 'offseason' && maddenIsRegularSeasonWeek(newWeekLabel)
+    ? await pool.query(
+        `SELECT 1 FROM madden_imported_team_stats
+         WHERE guild_id = $1 AND league_id::text = $2::text
+           AND (wins > 0 OR losses > 0 OR ties > 0 OR points_for > 0 OR points_against > 0)
+         LIMIT 1`,
+        [guild.id, String(league.league_id)]
+      ).then(r => r.rows.length > 0).catch(() => true) // fail open (assume real) on a query error — never silently block the eventual real kickoff over a transient DB hiccup
+    : false;
+  if (stage === 'offseason' && maddenIsRegularSeasonWeek(newWeekLabel) && hasRealRecordDataForKickoff) {
     console.log('[SEASON TRANSITION] No preseason detected for league', league.league_id, '— offseason → regular season directly.');
     await performMaddenRegularSeasonKickoff(guild, league, newWeekLabel);
     return;
