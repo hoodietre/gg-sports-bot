@@ -937,6 +937,16 @@ async function initDatabase() {
   // points_for/points_against.
   await pool.query(`ALTER TABLE madden_imported_team_stats ADD COLUMN IF NOT EXISTS scored_games INTEGER NOT NULL DEFAULT 0`);
 
+  // 7J-REALEASEEDCOLUMN: per Hxxdie — confirmed live via direct raw_payload
+  // inspection that EA's own CareerMode_GetStandingsExport already includes
+  // a genuine "seed" field per team (distinct from a separate "rank" field
+  // that does NOT correspond to playoff seed — confirmed both by name and
+  // by not matching real bracket order on the same live data). Every team
+  // row's raw_payload has always stored this, just never read into a real
+  // column. Storing it explicitly here rather than re-parsing raw_payload
+  // JSON on every seeding read.
+  await pool.query(`ALTER TABLE madden_imported_team_stats ADD COLUMN IF NOT EXISTS ea_playoff_seed INTEGER`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_players (
       id UUID PRIMARY KEY,
@@ -8751,7 +8761,7 @@ async function selectNflPlayoffTeams(guildId, league, standingsRows) {
 // exactly, so it drops straight into buildInitialPlayoffRound unchanged.
 async function selectMaddenPlayoffTeams(guild, league) {
   const teamsResult = await pool.query(
-    `SELECT team_name, wins, losses, ties, points_for, points_against FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
+    `SELECT team_name, wins, losses, ties, points_for, points_against, ea_playoff_seed FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id::text = $2::text`,
     [guild.id, String(league.league_id)]
   ).catch(() => ({ rows: [] }));
   // 7J-H2HTIEBREAK: per Hxxdie — real NFL tie-breaking checks head-to-head
@@ -8842,6 +8852,30 @@ async function selectMaddenPlayoffTeams(guild, league) {
   const seeded = [];
   for (const conference of conferences) {
     const inConf = withMeta.filter(t => t.resolvedConference === conference);
+
+    // 7J-REALEASEEDCOLUMN: per Hxxdie — instead of trusting our own
+    // computed tiebreak math (best-effort, confirmed live to sometimes
+    // disagree with EA on real division-winner ranking, not just a close
+    // wildcard-cutoff case), prefer EA's own real "seed" field directly
+    // whenever we have it for a full, valid 7-team conference bracket —
+    // confirmed live to match EA's actual bracket exactly on every checked
+    // team (Colts, Bills, Saints, Commanders). Falls back to the computed
+    // division-winner + wildcard path below for any conference this
+    // doesn't fully cover — e.g. mid regular season before EA's seed field
+    // is playoff-meaningful, or a team whose standings-export sync hasn't
+    // landed the field yet. Requires all 7 seeds 1-7 present and distinct
+    // before trusting it, rather than a partial/ambiguous set.
+    const realSeeded = inConf
+      .filter(t => Number.isInteger(t.ea_playoff_seed) && t.ea_playoff_seed >= 1 && t.ea_playoff_seed <= 7)
+      .sort((a, b) => a.ea_playoff_seed - b.ea_playoff_seed);
+    const realSeedsDistinct = new Set(realSeeded.map(t => t.ea_playoff_seed)).size === realSeeded.length;
+    if (realSeeded.length === 7 && realSeedsDistinct) {
+      realSeeded.forEach(team => {
+        seeded.push({ ...team, seed: team.ea_playoff_seed, conference, byeRound1: team.ea_playoff_seed === 1 });
+      });
+      continue;
+    }
+
     const divisions = [...new Set(inConf.map(t => t.resolvedDivision))];
     const divisionWinners = divisions.map(d => inConf.filter(t => t.resolvedDivision === d)[0]).filter(Boolean)
       .sort((a, b) => inConf.indexOf(a) - inConf.indexOf(b));
@@ -51591,8 +51625,8 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
     const roleId = await findMaddenTeamRoleId(league.league_id, teamName);
 
     await pool.query(
-      `INSERT INTO madden_imported_team_stats (guild_id, league_id, external_team_id, team_name, team_role_id, wins, losses, ties, points_for, points_against, raw_payload, imported_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+      `INSERT INTO madden_imported_team_stats (guild_id, league_id, external_team_id, team_name, team_role_id, wins, losses, ties, points_for, points_against, raw_payload, ea_playoff_seed, imported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
        ON CONFLICT (league_id, team_name)
        DO UPDATE SET
          team_role_id = COALESCE($5, madden_imported_team_stats.team_role_id),
@@ -51613,6 +51647,15 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
          points_for = CASE WHEN COALESCE(madden_imported_team_stats.scored_games, 0) = 0 THEN $9 ELSE madden_imported_team_stats.points_for END,
          points_against = CASE WHEN COALESCE(madden_imported_team_stats.scored_games, 0) = 0 THEN $10 ELSE madden_imported_team_stats.points_against END,
          raw_payload = $11::jsonb,
+         -- 7J-REALEASEEDCOLUMN: confirmed live — EA's standings export
+         -- already carries a real, accurate "seed" field per team, matching
+         -- Hxxdie's confirmed real bracket on every checked team (Colts,
+         -- Bills, Saints, Commanders). Fresh value wins whenever this
+         -- sync's payload actually has one (same self-healing direction as
+         -- 7J-SEASONKEYSELFHEAL); COALESCE only guards against a sync whose
+         -- payload happens to omit the field entirely wiping a
+         -- previously-good value to null.
+         ea_playoff_seed = COALESCE($12, madden_imported_team_stats.ea_playoff_seed),
          imported_at = NOW()`,
       [
         guild.id,
@@ -51626,6 +51669,7 @@ async function importMaddenStandingsFromArray(guild, league, rows) {
         Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf', 'points_for_total', 'scoreFor'], 0)),
         Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa', 'points_against_total', 'scoreAgainst'], 0)),
         JSON.stringify(row),
+        (() => { const v = getFirstValue(row, ['seed'], null); const n = Number(v); return Number.isFinite(n) && v !== null ? n : null; })(),
       ]
     );
 
