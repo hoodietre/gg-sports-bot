@@ -5918,8 +5918,33 @@ async function findTeamOwnerByRoleId(guild, roleId) {
   return null;
 }
 
-async function findTeamOwnerByRoleName(guild, teamRoleName) {
-  const role = guild.roles.cache.find(r => r.name === teamRoleName) || await guild.roles.fetch().then(roles => roles.find(r => r.name === teamRoleName)).catch(() => null);
+async function findTeamOwnerByRoleName(guild, teamRoleName, leagueId = null) {
+  // 7J-CROSSLEAGUEOWNERBLEED: real bug, confirmed live — this used to search
+  // the WHOLE GUILD by role name with no league scoping at all, so a fresh
+  // league's own team role with zero members could fall through to
+  // matching a completely different league's same/similarly-named role
+  // instead (e.g. a new league's "Philadelphia Eagles," 0 members,
+  // matching an existing league's "Eagles" by name and returning THAT
+  // league's real owner). When leagueId is provided, this now only
+  // matches against roles actually registered to that league
+  // (getLeagueTeamRoles), never any other role in the guild that happens
+  // to share or contain the same name. leagueId is optional (defaults to
+  // the old guild-wide behavior) only for the rare caller that genuinely
+  // has no league context at all.
+  let role = null;
+  if (leagueId) {
+    const teamRoles = await getLeagueTeamRoles(leagueId).catch(() => []);
+    const normalized = String(teamRoleName || '').toLowerCase();
+    const match = (teamRoles || []).find(team => String(team.role_name || '').toLowerCase() === normalized)
+      || (teamRoles || []).find(team => {
+        const roleName = String(team.role_name || '').toLowerCase();
+        return normalized && (roleName.includes(normalized) || normalized.includes(roleName));
+      });
+    if (!match) return null;
+    role = guild.roles.cache.get(match.role_id) || await guild.roles.fetch(match.role_id).catch(() => null);
+  } else {
+    role = guild.roles.cache.find(r => r.name === teamRoleName) || await guild.roles.fetch().then(roles => roles.find(r => r.name === teamRoleName)).catch(() => null);
+  }
   if (!role) return null;
 
   const cachedOwner = role.members.find(member => !member.user.bot);
@@ -5929,7 +5954,7 @@ async function findTeamOwnerByRoleName(guild, teamRoleName) {
   // role.members only reflects discord.js's local cache, which the
   // GuildMembers intent alone doesn't bulk-populate. Last resort only.
   await guild.members.fetch().catch(() => null);
-  const refreshedRole = guild.roles.cache.find(r => r.name === teamRoleName);
+  const refreshedRole = guild.roles.cache.get(role.id);
   const fetchedCachedOwner = refreshedRole?.members.find(member => !member.user.bot);
   if (fetchedCachedOwner) return fetchedCachedOwner;
 
@@ -12835,7 +12860,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     const targetOwner = pendingData.targetTeamRoleId
       ? await findTeamOwnerByRoleId(message.guild, pendingData.targetTeamRoleId)
-      : await findTeamOwnerByRoleName(message.guild, pendingData.targetTeamName);
+      : await findTeamOwnerByRoleName(message.guild, pendingData.targetTeamName, league?.league_id);
 
     const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
     const cpuTradesAllowed = customSettings.cpu_trades_allowed !== false;
@@ -18514,7 +18539,7 @@ if (interaction.commandName === 'avatar') {
 
         const targetOwner = targetTeamRoleId
           ? await findTeamOwnerByRoleId(interaction.guild, targetTeamRoleId)
-          : await findTeamOwnerByRoleName(interaction.guild, targetTeamName);
+          : await findTeamOwnerByRoleName(interaction.guild, targetTeamName, league?.league_id);
 
         const customSettings = league ? await ensureLeagueCustomSettings(league).catch(() => ({})) : {};
         const cpuTradesAllowed = customSettings.cpu_trades_allowed !== false;
@@ -54735,9 +54760,27 @@ async function getMaddenTeamOwnerForGameThread(guild, league, teamName, roleId =
   }
 
   // 5. Last fallback: Discord role by team name/display name/abbr.
-  for (const name of lookupNames) {
-    const owner = await findTeamOwnerByRoleName(guild, name).catch(() => null);
-    if (owner) return owner;
+  // 7J-CROSSLEAGUEOWNERBLEED: real bug, confirmed live — this search is
+  // guild-wide (findTeamOwnerByRoleName has no league filter at all), so
+  // when a league's OWN correctly-scoped role (step 4) exists but has no
+  // members yet, this fell through to matching ANY same/similarly-named
+  // role anywhere in the guild — including a completely different
+  // league's team role. Confirmed exactly this way: a fresh second Madden
+  // league's "Philadelphia Eagles" role (0 members) fell through here,
+  // matched a first league's "Eagles" role by name in the same guild, and
+  // returned THAT league's real owner as if they owned the second
+  // league's team. Step 4 immediately above already performs this same
+  // name/abbreviation/display-name matching, correctly scoped to this
+  // league's own roles via getLeagueTeamRoles(league.league_id) — so this
+  // guild-wide fallback is both redundant and actively dangerous whenever
+  // a league context exists. Only reached now when no league is available
+  // at all (a defensive edge case, not the normal call shape — every real
+  // call site passes a league).
+  if (!league?.league_id) {
+    for (const name of lookupNames) {
+      const owner = await findTeamOwnerByRoleName(guild, name).catch(() => null);
+      if (owner) return owner;
+    }
   }
 
   return null;
