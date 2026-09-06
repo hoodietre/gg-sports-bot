@@ -51762,10 +51762,29 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
     const traceLooksScored = traceScore > 0 || traceIsComplete
       || ['completed', 'final', 'completed_with_real_score', 'away_win', 'home_win', 'tie', 'played', 'finished', 'closed'].some(s => traceStatus.includes(s));
     if (traceLooksScored) {
-      console.warn(`[GAME IMPORT SOURCE TRACE 7J-GAMEIMPORTSOURCETRACE] source="${sourceLabel}" league=${league.league_id} row week="${traceRowWeekLabel}" (known current="${traceCurrentWeekLabel}") matchup="${awayTeam} @ ${homeTeam}" claims already-completed (score=${traceScore}, status="${traceStatus}") for a week at-or-ahead of current — rejecting this row, not importing it.`);
+      console.warn(`[GAME IMPORT SOURCE TRACE 7J-GAMEIMPORTSOURCETRACE] source="${sourceLabel}" league=${league.league_id} row week="${traceRowWeekLabel}" (known current="${traceCurrentWeekLabel}") matchup="${awayTeam} @ ${homeTeam}" claims already-completed (score=${traceScore}, status="${traceStatus}") for a week at-or-ahead of current — salvaging the matchup, importing as scheduled rather than trusting the completion claim.`);
       rejectedRowIndexes.add(rowIndex);
     }
   }
+
+  // 7J-SALVAGESTALESLOTMATCHUP: real bug, confirmed live — every single
+  // Preseason Week 2 row (all 16) claimed status="completed" with score=0,
+  // the exact reused-schedule-slot pattern already confirmed multiple
+  // times this session. 7J-UNIVERSALCOMPLETIONGUARD correctly identifies
+  // this as untrustworthy and used to reject the row outright — safe for
+  // the score/status, but it throws away the real matchup pairing (which
+  // two teams actually play) along with it, meaning the genuine schedule
+  // for that week never gets imported at all. A real completed game
+  // essentially never ends exactly 0-0, and every game in the week showing
+  // that same impossible score is itself confirmation this is a stale
+  // placeholder, not a real result — so the matchup itself (who plays
+  // whom) is trustworthy real schedule data; only the false completion
+  // claim isn't. Salvages these rows instead of dropping them: still
+  // imported, but forced to 'scheduled' with a zeroed score regardless of
+  // what the row itself claims, rather than skipped entirely.
+  const forceScheduledRowIndexes = new Set();
+  for (const idx of rejectedRowIndexes) forceScheduledRowIndexes.add(idx);
+  rejectedRowIndexes.clear(); // nothing gets dropped outright any more — see above
 
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
     if (rejectedRowIndexes.has(rowIndex)) continue;
@@ -51778,12 +51797,13 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
     const homeRoleId = await findMaddenTeamRoleId(league.league_id, homeTeam);
     const awayRoleId = await findMaddenTeamRoleId(league.league_id, awayTeam);
 
-    const homeScoreValue = Number(getFirstValue(row, ['homeScore', 'home_score', 'homePoints'], 0));
-    const awayScoreValue = Number(getFirstValue(row, ['awayScore', 'away_score', 'awayPoints'], 0));
-    const rowGameResult = parseNumberOrNull(getFirstValue(row, ['gameResult', 'game_result', 'result', 'resultType'], null));
-    const rowWinner = String(getFirstValue(row, ['winner', 'winnerName', 'winningTeam'], '') || '').toLowerCase();
-    const baseStatus = String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
-    const playedMarker = getFirstValue(row, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null);
+    const isSalvagedRow = forceScheduledRowIndexes.has(rowIndex);
+    const homeScoreValue = isSalvagedRow ? 0 : Number(getFirstValue(row, ['homeScore', 'home_score', 'homePoints'], 0));
+    const awayScoreValue = isSalvagedRow ? 0 : Number(getFirstValue(row, ['awayScore', 'away_score', 'awayPoints'], 0));
+    const rowGameResult = isSalvagedRow ? null : parseNumberOrNull(getFirstValue(row, ['gameResult', 'game_result', 'result', 'resultType'], null));
+    const rowWinner = isSalvagedRow ? '' : String(getFirstValue(row, ['winner', 'winnerName', 'winningTeam'], '') || '').toLowerCase();
+    const baseStatus = isSalvagedRow ? 'scheduled' : String(getFirstValue(row, ['status', 'gameStatus'], getFirstValue(row, ['isComplete'], false) ? 'final' : 'scheduled')).toLowerCase();
+    const playedMarker = isSalvagedRow ? null : getFirstValue(row, ['played_at', 'playedAt', 'completed_at', 'completedAt', 'finalized_at', 'finalizedAt', 'gameDateCompleted'], null);
     const hasRealScore = (Number.isFinite(homeScoreValue) && homeScoreValue > 0) || (Number.isFinite(awayScoreValue) && awayScoreValue > 0);
     const hasTrustedCompletedMarker =
       ['final', 'complete', 'completed', 'played', 'finished', 'closed'].includes(baseStatus) ||
