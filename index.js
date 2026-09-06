@@ -79350,6 +79350,38 @@ async function autoDetectAfterSyncInner(guild, league) {
       console.error('[AUTO DETECT] Playoff bracket catch-up check failed:', err?.message));
   }
 
+  // 7J-THREADCATCHUPRETRY: real bug, confirmed live — the exact same shape
+  // as 7J-PLAYOFFBRACKETCATCHUP just above, for the same underlying reason,
+  // hitting thread creation instead of the bracket. Confirmed live: a
+  // preseason week was correctly detected as "new" on one sync, but its
+  // real game data (16 matchups) hadn't landed from EA yet — thread
+  // creation ran, found nothing, and (correctly, at the time) created
+  // nothing. The real data arrived on the VERY NEXT sync (a stale-schedule-
+  // slot rejection was fixed to salvage rather than drop it), but the
+  // week-label-based "did anything advance" check saw the identical label
+  // as last time and reported no new advance — so autoCreateGameThreadsAfterSync
+  // never got called again for that week, permanently, even though real
+  // threadless games now genuinely exist for it. The edge-triggered call
+  // further below in this same function only ever fires once, on the ONE
+  // sync where the label itself changes; it structurally cannot catch data
+  // arriving late for a week whose label was already processed. Runs
+  // unconditionally every sync instead, using the explicit, already-
+  // reconciled current week (never the auto-inferred fallback inside
+  // autoCreateGameThreadsAfterSync — see that function's own comment on why
+  // inference was the root cause of a DIFFERENT past bug, creating threads
+  // for a future week too early). Safe to call every sync: thread creation
+  // is idempotent per game (skips any row that already has a thread_id).
+  // Gated to stages past 'offseason' specifically — the reconciled week
+  // label is only trustworthy once the league has genuinely left the
+  // ambiguous offseason window (see 7J-STUCKOFFSEASONLABELGAP/
+  // 7J-STUCKLABELKICKOFFGUARD), and this retry has no legitimate use during
+  // offseason regardless.
+  if (eaCurrentWeekSettings.ea_reported_current_week && eaCurrentWeekSettings.current_season_stage
+    && eaCurrentWeekSettings.current_season_stage !== 'offseason') {
+    await autoCreateGameThreadsAfterSync(guild, league, eaCurrentWeekSettings.ea_reported_current_week).catch(err =>
+      console.error('[AUTO DETECT] Thread creation catch-up check failed:', err?.message));
+  }
+
   // 7J-MADDENBRACKETADVANCE: runs every sync, same reasoning as the
   // sportsbook/reward passes above — playoff games complete at different
   // times throughout the week just like regular season games, not all at
