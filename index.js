@@ -62352,22 +62352,31 @@ async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
   const leagueId = league.league_id;
   const NL = String.fromCharCode(10);
 
-  const hubRow = await pool.query(
+  // 7J-STAGEPROBEHISTORY: pull the last several league_hub captures, not
+  // just the latest one. The single-latest version of this probe could
+  // only ever answer "what does the hub say right now" — useless for
+  // catching a fast-moving boundary like Cut Week -> real Week 1, since by
+  // the time someone thinks to run the command the moment may have already
+  // passed. History lets the exact sync where a signal flips be pinpointed
+  // after the fact. Relies on 7J-PAYLOADRETENTIONPERTYPE (keeps the last 30
+  // league_hub rows per league) actually having survived long enough.
+  const hubHistoryRows = await pool.query(
     `SELECT endpoint, raw_payload, created_at
      FROM madden_sync_payloads
      WHERE guild_id = $1::text
        AND league_id::text = $2::text
        AND endpoint ILIKE '%LeagueHub%'
      ORDER BY created_at DESC NULLS LAST
-     LIMIT 1`,
+     LIMIT 10`,
     [guildId, String(leagueId)]
   ).catch(error => {
-    console.warn('Madden season stage probe hub query failed:', error.message);
+    console.warn('Madden season stage probe hub history query failed:', error.message);
     return { rows: [] };
   });
 
-  const hubPayload = hubRow.rows?.[0]?.raw_payload || null;
-  const capturedAt = hubRow.rows?.[0]?.created_at || null;
+  const hubRows = hubHistoryRows.rows || [];
+  const hubPayload = hubRows[0]?.raw_payload || null;
+  const capturedAt = hubRows[0]?.created_at || null;
 
   if (!hubPayload) {
     return new EmbedBuilder()
@@ -62422,16 +62431,44 @@ async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
   const realStage = getMaddenSeasonStage(hubPayload, leagueId);
   const realStageLabel = getMaddenSeasonStageLabel(hubPayload, leagueId);
 
+  // 7J-STAGEPROBEHISTORY: one line per captured sync, oldest to newest, so a
+  // flip in any raw signal (or the complete absence of one across a real
+  // Cut Week -> Week 1 advance) is visible at a glance instead of needing a
+  // fresh SQL query every time. Recomputes hasRealRecordData per historical
+  // payload the same way runMaddenEaDirectSync does live, so this reflects
+  // the exact signal set strictIsPreseason actually saw at that moment.
+  const historyLines = [...hubRows].reverse().map(row => {
+    let historyCtx = null;
+    let hasRealRecordDataHist = null;
+    try {
+      historyCtx = extractEaStandingsRequestContextFromHub(row.raw_payload, leagueId);
+      const histTeams = normalizeEaLeagueTeamsDeepFromHub(row.raw_payload);
+      hasRealRecordDataHist = histTeams.some(team =>
+        Number(team.wins || 0) > 0 ||
+        Number(team.losses || 0) > 0 ||
+        Number(team.ties || 0) > 0 ||
+        Number(team.points_for || 0) > 0 ||
+        Number(team.points_against || 0) > 0
+      );
+    } catch (error) {
+      return `${row.created_at ? new Date(row.created_at).toISOString() : 'unknown'} — parse error: ${error.message}`;
+    }
+    const ts = row.created_at ? new Date(row.created_at).toISOString().replace('T', ' ').slice(0, 19) : 'unknown';
+    return `${ts} — disp:"${historyCtx.displayedWeek}" wkType:${historyCtx.weekType ?? 'null'} nextWkType:${historyCtx.nextSeasonWeekType ?? 'null'} realRecord:${hasRealRecordDataHist} stage:${historyCtx.stageIndex ?? 'null'}`;
+  });
+  const historyText = historyLines.join(NL) || 'No history available.';
+
   const embed = new EmbedBuilder()
     .setTitle('🧭 Madden Season Stage Probe • ' + (league.league_name || 'Madden League'))
     .setColor(0x9B59B6)
-    .setDescription('Read-only inspection of the latest captured league hub payload. Does not change sync data.')
+    .setDescription('Read-only inspection of captured league hub payloads. Does not change sync data.')
     .addFields(
-      { name: 'Payload Captured', value: capturedAt ? new Date(capturedAt).toUTCString() : 'Unknown', inline: false },
+      { name: 'Payload Captured (latest)', value: capturedAt ? new Date(capturedAt).toUTCString() : 'Unknown', inline: false },
       { name: "Old Guess (preseason/regular season only)", value: '`' + inferredLabel + '`', inline: true },
       { name: 'Corrected Stage (with offseason detection)', value: '`' + realStageLabel + '` (' + realStage + ')', inline: true },
-      { name: 'Parsed Context Fields', value: ctxText.slice(0, 1024), inline: false },
-      { name: 'Raw Stage/Week/Season Signals', value: signalText.slice(0, 1024), inline: false },
+      { name: 'Parsed Context Fields (latest)', value: ctxText.slice(0, 1024), inline: false },
+      { name: 'Raw Stage/Week/Season Signals (latest)', value: signalText.slice(0, 1024), inline: false },
+      { name: `Recent History (last ${hubRows.length} syncs, oldest → newest)`, value: ('```' + NL + historyText + NL + '```').slice(0, 1024), inline: false },
       { name: 'Command', value: '`/maddendebug view:Season Stage Probe`', inline: false }
     )
     .setFooter({ text: 'GG Sports • Season Stage Probe' })
@@ -73791,16 +73828,34 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       return null;
     });
 
-    // Auto-prune sync payloads — keep only the 10 most recent per league to prevent DB bloat
+    // 7J-PAYLOADRETENTIONPERTYPE: the old version kept only the 10 most
+    // recent rows TOTAL per league, but a single EA-Direct sync writes ~8
+    // different payload_type rows (league_hub, schedule_export,
+    // standings_export, postseason_schedule_export, team_roster_discovery,
+    // player_stat_discovery, passing_stats_probe, standings_probe) in one
+    // pass. A global cap of 10 meant barely more than one sync's worth of
+    // history survived at all — and specifically wiped out the league_hub
+    // snapshots the Cut Week vs. real Week 1 investigation depends on
+    // (tracking doc, Session 46 continued 4: "query madden_sync_payloads
+    // .raw_payload directly for the stored hub JSON from the exact sync
+    // where this happened" — data that this bug was actively deleting
+    // before anyone could look at it). Fixed to keep the most recent N
+    // rows PER payload_type instead of N total, so league_hub history
+    // survives independently of how many other endpoint types sync
+    // alongside it in the same run.
     pool.query(
       `DELETE FROM madden_sync_payloads
-       WHERE guild_id = $1 AND league_id = $2
-         AND id NOT IN (
-           SELECT id FROM madden_sync_payloads
+       WHERE id IN (
+         SELECT id FROM (
+           SELECT id, ROW_NUMBER() OVER (
+             PARTITION BY guild_id, league_id, payload_type
+             ORDER BY created_at DESC NULLS LAST
+           ) AS rn
+           FROM madden_sync_payloads
            WHERE guild_id = $1 AND league_id = $2
-           ORDER BY created_at DESC NULLS LAST
-           LIMIT 10
-         )`,
+         ) ranked
+         WHERE ranked.rn > 30
+       )`,
       [guild.id, league.league_id]
     ).catch(() => null); // fire-and-forget
 
