@@ -8927,7 +8927,40 @@ async function buildMaddenWildCardRoundFromRealGames(guild, league) {
   }
 
   for (const [conference, games] of gamesByConference) {
-    const byeTeam = byeTeams.find(t => t.conference === conference);
+    // 7J-REALBYETEAM: real bug, confirmed live — byeRound1 above is set
+    // purely from selectMaddenPlayoffTeams' own computed division-winner
+    // ranking (index === 0 within a conference), with no cross-check
+    // against the real Wild Card games this function already fetched.
+    // When the bot's seeding math disagrees with EA about which team is
+    // the true #1 seed (a real division-winner-ranking disagreement, not
+    // just a close wildcard-cutoff tiebreak — confirmed live: a team
+    // holding a real bye per EA's actual schedule was shown playing a
+    // real game instead, while the computed #1 team, who actually HAS a
+    // real game, got wrongly labeled as the bye — leaving the true bye
+    // team absent from the bracket entirely and producing a duplicate
+    // seed number). Matchups already avoid this exact failure mode via
+    // 7J-REALBRACKETMATCHUPS (real games are ground truth); the bye slot
+    // is the one place that hadn't been given the same treatment. Fix:
+    // the real bye team is whichever of this conference's seeded playoff
+    // teams does NOT appear as a home/away team in any of this
+    // conference's real Wild Card games — grounded in the same
+    // already-fetched real data, not a second guess at EA's tiebreak
+    // math. Fully sidesteps needing the seeding computation to agree with
+    // EA on ranking; only requires agreement on which 7 teams made the
+    // playoffs at all, which has not been the kind of disagreement seen.
+    const teamsInRealGamesThisConf = new Set();
+    for (const g of games) {
+      teamsInRealGamesThisConf.add(String(g.home_team).toLowerCase());
+      teamsInRealGamesThisConf.add(String(g.away_team).toLowerCase());
+    }
+    const confSeededTeams = computedSeeding.filter(t => t.conference === conference);
+    const realByeTeam = confSeededTeams.find(t => !teamsInRealGamesThisConf.has(t.team_name.toLowerCase()));
+    // Falls back to the old computed-seeding byeRound1 team only if every
+    // computed team for this conference shows up in a real game (should
+    // never happen with a real 7-team bracket, but never silently drop
+    // the bye slot rather than risk it over a computation this function
+    // doesn't otherwise trust).
+    const byeTeam = realByeTeam || byeTeams.find(t => t.conference === conference);
     if (byeTeam) {
       series.push({ id: randomUUID(), teamA: { name: byeTeam.team_name, seed: 1 }, teamB: null, seriesLength: 1, winsA: 1, winsB: 0, winner: byeTeam.team_name, games: [], bye: true, conference });
     }
