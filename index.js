@@ -54081,8 +54081,21 @@ function isMaddenOffensivePosition(position) {
   return ['QB', 'HB', 'RB', 'FB', 'WR', 'TE'].includes(String(position || '').toUpperCase());
 }
 
+// 7J-DEFPOSITIONALIASGAP: real bug, confirmed live — a real defensive
+// rookie (Deon Stephenson, position "REDGE") never showed as a DPOY/DROY
+// candidate. Traced the full filter chain in getMaddenAwardsRace: the
+// final award_score > 0 requirement means a player WITH real stats would
+// have passed regardless of this function's position list, so this alone
+// doesn't explain his specific absence (his real blocker turned out to be
+// zero rows in madden_player_weekly_stats — a separate, unresolved
+// per-player stat-sync gap, not this). But it's still a genuine,
+// independently-confirmed bug: EDGE/REDGE/LEDGE/MIKE/WILL/SAM are already
+// correctly recognized as valid defensive position aliases in five other
+// places in this file (the front-seven grouping logic, the EDGE-position
+// normalizer, dev-trait weighting, etc.) — this was the one place that
+// never got updated to match, worth having correct on its own merits.
 function isMaddenDefensivePosition(position) {
-  return ['DE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'LB', 'CB', 'FS', 'SS', 'S'].includes(String(position || '').toUpperCase());
+  return ['DE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'LB', 'CB', 'FS', 'SS', 'S', 'EDGE', 'REDGE', 'LEDGE', 'MIKE', 'WILL', 'SAM'].includes(String(position || '').toUpperCase());
 }
 
 function parseMaddenJsonMaybe(value) {
