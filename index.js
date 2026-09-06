@@ -79356,51 +79356,43 @@ async function autoDetectAfterSyncInner(guild, league) {
   // preseason week was correctly detected as "new" on one sync, but its
   // real game data (16 matchups) hadn't landed from EA yet — thread
   // creation ran, found nothing, and (correctly, at the time) created
-  // nothing. The real data arrived on the VERY NEXT sync (a stale-schedule-
-  // slot rejection was fixed to salvage rather than drop it), but the
-  // week-label-based "did anything advance" check saw the identical label
-  // as last time and reported no new advance — so autoCreateGameThreadsAfterSync
+  // nothing. The real data arrived on a later sync (a stale-schedule-slot
+  // rejection was fixed to salvage rather than drop it), but the week-
+  // label-based "did anything advance" check saw the identical label as
+  // last time and reported no new advance — so autoCreateGameThreadsAfterSync
   // never got called again for that week, permanently, even though real
-  // threadless games now genuinely exist for it. The edge-triggered call
-  // further below in this same function only ever fires once, on the ONE
-  // sync where the label itself changes; it structurally cannot catch data
-  // arriving late for a week whose label was already processed. Runs
-  // unconditionally every sync instead, using the explicit, already-
-  // reconciled current week (never the auto-inferred fallback inside
-  // autoCreateGameThreadsAfterSync — see that function's own comment on why
-  // inference was the root cause of a DIFFERENT past bug, creating threads
-  // for a future week too early). Safe to call every sync: thread creation
-  // is idempotent per game (skips any row that already has a thread_id).
-  // Gated to stages past 'offseason' specifically — the reconciled week
-  // label is only trustworthy once the league has genuinely left the
-  // ambiguous offseason window (see 7J-STUCKOFFSEASONLABELGAP/
-  // 7J-STUCKLABELKICKOFFGUARD), and this retry has no legitimate use during
-  // offseason regardless.
-  // 7J-THREADRETRYCUTWEEKGUARD: real bug, confirmed live — a genuine
-  // regression from 7J-THREADCATCHUPRETRY itself. That fix correctly
-  // solved "real data arrived a sync late" for Preseason Week 2, but it
-  // trusts ea_reported_current_week directly, bypassing the exact
-  // "impossible label" detection getMaddenNewAdvanceWeek already has
-  // (7J-CUTWEEKLABELCOLLISION) for the one case that matters most here:
-  // EA reports bare "Week 1" prematurely during Cut Week, before real
-  // Week 1 has actually started, while current_season_stage is still
-  // 'preseason'. Confirmed live: this created real "Week 1" game threads
-  // during Cut Week — not just wrong, but incomplete, since only thread
-  // creation ran, none of the rest of the real kickoff sequence (stat
-  // wipe, old-thread cleanup, trade/bracket reset, announcement) that's
-  // supposed to accompany it. The real regular-season schedule being
-  // bulk-imported far in advance (confirmed earlier this session) means
-  // real, unthreaded "Week 1" games already sit in the database well
-  // before the season legitimately starts — exactly the trap this retry
-  // fell into. Excludes the identical impossible combination
-  // getMaddenNewAdvanceWeek already guards against: stage still
-  // 'preseason' with a label that looks like literal "Week N" (not
-  // "Preseason Week N") is never trustworthy for this retry either.
-  const retryWeekLooksImpossibleForPreseason = eaCurrentWeekSettings.current_season_stage === 'preseason'
-    && /^week\s+\d+$/i.test(String(eaCurrentWeekSettings.ea_reported_current_week || '').trim());
-  if (eaCurrentWeekSettings.ea_reported_current_week && eaCurrentWeekSettings.current_season_stage
-    && eaCurrentWeekSettings.current_season_stage !== 'offseason' && !retryWeekLooksImpossibleForPreseason) {
-    await autoCreateGameThreadsAfterSync(guild, league, eaCurrentWeekSettings.ea_reported_current_week).catch(err =>
+  // threadless games now genuinely exist for it.
+  //
+  // 7J-THREADRETRYSOURCEFIX: two real regressions from the first version of
+  // this fix, both traced to the same root mistake — it read
+  // ea_reported_current_week directly as the retry target. That field is
+  // the RAW, only-partially-reconciled signal, and it's been confirmed
+  // unreliable multiple times this session in ways that are hard to
+  // enumerate individually: (1) EA reports bare "Week 1" prematurely
+  // during Cut Week, indistinguishable from real Week 1 at the text level
+  // (7J-CUTWEEKLABELCOLLISION had to solve this once already for the main
+  // detection path); (2) confirmed live a second, worse way — the
+  // "Preseason " prefix reconciliation can't tell genuine Preseason Week 1
+  // apart from Cut Week's same bare "Week 1" signal either, since both
+  // produce the identical reconciled string "Preseason Week 1" — causing
+  // this retry to reprocess a week THREE WEEKS behind the league's actual
+  // confirmed position, creating a duplicate fresh set of "Preseason Week
+  // 1" threads. A targeted patch for each individual bad value EA can
+  // report is exactly the pattern that's failed twice in a row here.
+  // Fixed at the source instead: use last_auto_detect_week_label — the one
+  // value in this whole system that ONLY ever gets written by
+  // getMaddenNewAdvanceWeek's own carefully-guarded pipeline (every
+  // corruption/regression/overshoot check already built this session
+  // protects it) — rather than the raw, independently-unreliable EA field.
+  // This still solves the original problem (a confirmed week's real data
+  // landing a sync late) exactly as well, since last_auto_detect_week_label
+  // is already correctly "Preseason Week 2" (etc.) the moment that week is
+  // legitimately detected — it just can no longer be fooled by a raw EA
+  // value that regresses, collides, or reconciles ambiguously, because it
+  // never reads that raw value at all for this purpose.
+  if (eaCurrentWeekSettings.last_auto_detect_week_label && eaCurrentWeekSettings.current_season_stage
+    && eaCurrentWeekSettings.current_season_stage !== 'offseason') {
+    await autoCreateGameThreadsAfterSync(guild, league, eaCurrentWeekSettings.last_auto_detect_week_label).catch(err =>
       console.error('[AUTO DETECT] Thread creation catch-up check failed:', err?.message));
   }
 
