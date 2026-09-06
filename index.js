@@ -76107,8 +76107,31 @@ async function getMaddenNewAdvanceWeek(guildId, leagueId) {
 
     // Find the single next known week after lastLabel in the schedule sequence,
     // and cap to that — never jump straight to eaReportedWeek itself.
+    //
+    // 7J-SCHEDULEGAPOVERSHOOT: real bug, confirmed live via direct log
+    // evidence — this picked "Week 1" (real regular season) as the "next"
+    // week immediately after "Preseason Week 1", creating real Week 1
+    // game threads (and, worse, real sportsbook lines/props — deliberately
+    // excluded from preseason) while the league was only in Preseason Week
+    // 2. Root cause: this lookup trusts whatever week label happens to sort
+    // next among EVERY week ever imported for the season, with no check
+    // that it's not further ahead than EA itself currently reports. The
+    // regular season's full schedule (confirmed live: Week 1 through Week
+    // 15, all 0 scored) gets imported well in advance of being current,
+    // while preseason weeks are only imported one at a time as they become
+    // current — so a preseason week's schedule data landing late (or not
+    // yet) leaves a genuine gap in the sequence, which this lookup then
+    // skips straight over, landing on real Week 1 instead of the
+    // still-missing "Preseason Week 2". It should be structurally
+    // impossible for this to ever pick something later than what EA
+    // itself reports as current — that's the actual invariant this was
+    // missing, not just a preseason-specific special case.
     const lastIdx = allWeeks.indexOf(lastLabel);
-    const nextWeek = lastIdx >= 0 && lastIdx + 1 < allWeeks.length ? allWeeks[lastIdx + 1] : eaReportedWeek;
+    let nextWeek = lastIdx >= 0 && lastIdx + 1 < allWeeks.length ? allWeeks[lastIdx + 1] : eaReportedWeek;
+    if (compareMaddenWeekLabels(nextWeek, eaReportedWeek) > 0) {
+      console.log(`[AUTO DETECT] ⚠️ Next-in-sequence week ("${nextWeek}") sorts AFTER EA's own reported current week ("${eaReportedWeek}") — a genuine schedule gap (an intermediate week's data hasn't imported yet while a later week's has). Falling back to EA's reported week directly instead of overshooting past it.`);
+      nextWeek = eaReportedWeek;
+    }
     if (nextWeek !== eaReportedWeek) {
       console.log(`[AUTO DETECT] ⚠️ EA reported "${eaReportedWeek}" but last processed was "${lastLabel}" — that's more than one step. Capping advance to the next week in sequence ("${nextWeek}") instead of jumping directly, and will re-check EA's report again on the next sync.`);
     }
