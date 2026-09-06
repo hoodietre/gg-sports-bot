@@ -6282,9 +6282,17 @@ async function buildTeamOwnersEmbed(guild, league = null) {
   function combinedOwnerLine(label, roleId, roleMembers) {
     const ownerIds = new Set((roleMembers || []).filter(m => !m.user.bot).map(m => m.id));
     for (const dbOwnerId of dbOwnersByRole.get(roleId) || []) ownerIds.add(dbOwnerId);
+    // 7J-TEAMOWNERSLOGOS: per Hxxdie — show the same team logo emojis used
+    // throughout the rest of the Madden portion of the bot (standings,
+    // power rankings, game threads, etc.) rather than plain team-role text.
+    // Gated on isMaddenLeague since role_name is a generic team-role label
+    // for every other sport this board also serves — getMaddenTeamEmoji
+    // would just return '' for a non-NFL name anyway, but checking
+    // explicitly keeps the intent clear rather than relying on that.
+    const displayLabel = isMaddenLeague(league) ? maddenTeamDisplayNameWithLogo(label) : label;
     return ownerIds.size === 0
-      ? `**${label}** — Unassigned or not cached`
-      : `**${label}** — ${[...ownerIds].map(id => `<@${id}>`).join(', ')}`;
+      ? `**${displayLabel}** — Unassigned or not cached`
+      : `**${displayLabel}** — ${[...ownerIds].map(id => `<@${id}>`).join(', ')}`;
   }
 
   if (teamRoles?.length) {
@@ -6332,7 +6340,10 @@ async function buildTradeCountEmbed(league = null) {
     rows = result.rows;
   }
 
-  const lines = rows.map(row => `**${row.team_name}** — ${row.trade_count}`);
+  // 7J-TEAMOWNERSLOGOS: same fix as Team Owners board — see that function's
+  // comment for full reasoning.
+  const isMadden = isMaddenLeague(league);
+  const lines = rows.map(row => `**${isMadden ? maddenTeamDisplayNameWithLogo(row.team_name) : row.team_name}** — ${row.trade_count}`);
   return new EmbedBuilder()
     .setTitle(`${league?.league_name || 'League'} Trade Counts`)
     .setDescription(lines.join('\n') || 'No trade counts yet.')
@@ -43022,7 +43033,16 @@ async function autoCreateLeagueChannels(guild, league, isMadden) {
       ['league_leaders_channel_id', 'league-leaders', true],
       ['award_race_channel_id', 'award-race', true],
       ['draft_recap_channel_id', 'draft-recap', true],
-      ['madden_sportsbook_channel_id', 'madden-sportsbook', true],
+      // 7J-MADDENSPORTSBOOKUNIFY: removed per Hxxdie — sportsbook is now one
+      // unified system across every league/sport in the guild (the
+      // persistent board already posts guild-wide via
+      // refreshAllMultiChannelPanelPostings, not per-league), so a
+      // dedicated "Madden Sportsbook" channel is redundant infrastructure.
+      // The underlying madden_sportsbook_channel_id column/setting is left
+      // alone for any league that already has one configured (channel
+      // resolution still falls back to it if set), just no longer
+      // created by auto-setup or offered in the Setup Dashboard going
+      // forward — see the matching removals below.
     );
   }
 
@@ -44055,7 +44075,8 @@ const SETUP_DASHBOARD_OPTIONS = [
   { value: 'madden_franchise_hub_channel', label: 'Franchise Hub Board', description: 'Persistent board: Hub, News, Records, HOF, Championships, Dynasty, Awards, Season Close', kind: 'channel' },
   { value: 'madden_standings_channel', label: 'Madden Standings Board', description: 'Channel for persistent auto-updating standings embed', kind: 'channel' },
   { value: 'madden_power_rankings_channel', label: 'Madden Power Rankings Board', description: 'Channel for persistent auto-updating power rankings embed', kind: 'channel' },
-  { value: 'madden_sportsbook_channel', label: 'Madden Sportsbook Channel', description: 'Channel for Madden betting lines (user vs user games)', kind: 'channel' },
+  // 7J-MADDENSPORTSBOOKUNIFY: 'Madden Sportsbook Channel' option removed —
+  // see the auto-setup removal comment above for full reasoning.
   { value: 'sportsbook_channel', label: 'Sportsbook Feed Channel', description: 'Sportsbook alerts/feed only — not where the board itself posts, see "Sportsbook Board" below', kind: 'channel' },
   // 7J-112SERVERSETUP: the 7 multichannel entries that used to live here
   // (Shop/Sportsbook/Marketplace/Avatar/Bank/Profile/Recruitment) moved to
@@ -44290,7 +44311,6 @@ async function buildSetupDashboardEmbed(guild, league) {
     ['madden_standings_channel', 'Madden Standings Board'],
     ['madden_power_rankings_channel', 'Madden Power Rankings Board'],
     ['madden_franchise_hub_channel', 'Franchise Hub Board'],
-    ['madden_sportsbook_channel', 'Madden Sportsbook'],
     ['sportsbook_channel', 'Sportsbook Feed'],
     ['suspensions_channel', 'Suspensions Board'],
   ];
@@ -44311,7 +44331,16 @@ async function buildSetupDashboardEmbed(guild, league) {
 
   const tradeLines = [
     'Team Owners: ' + setupDashboardFormatValue(league, 'team_owners_channel'),
-    'Trade Offer: ' + setupDashboardFormatValue(league, 'trade_offer_channel'),
+    // 7J-TRADEOFFERLABELFIX: real bug, confirmed live — Madden leagues use
+    // a dedicated 'trade_negotiation_channel_id' (see 7J-COMMANDHUB-TRADESPLIT,
+    // singleChannelSpecs above), never 'trade_offer_channel_id' (that's the
+    // generic non-Madden league's Trade Offer panel channel). This line
+    // unconditionally checked the generic key regardless of isMadden, so a
+    // Madden league's summary always showed "Trade Offer: Not set" even
+    // after the real Trade Negotiation channel had been created and set.
+    isMadden
+      ? 'Trade Negotiation: ' + setupDashboardFormatValue(league, 'trade_negotiation_channel')
+      : 'Trade Offer: ' + setupDashboardFormatValue(league, 'trade_offer_channel'),
     'Committee: ' + setupDashboardFormatValue(league, 'trade_committee_channel'),
     'Decisions: ' + setupDashboardFormatValue(league, 'trade_decisions_channel'),
     'Count: ' + setupDashboardFormatValue(league, 'trade_count_channel'),
@@ -51875,35 +51904,33 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
       else status = 'completed';
     }
 
-    // 7J-PLAYOFFROWLABELTRUST: real bug, confirmed live via direct SQL
-    // (Session 47) — the real 6 Wild Card games landed in
-    // madden_imported_games with week_label = "Week 18", not "Wild Card".
-    // Root cause: this line preferred the RAW per-row field (row.week /
+    // 7J-PLAYOFFROWLABELTRUST (broadened): real bug, confirmed live via
+    // direct SQL twice now, at two different boundaries — first the real 6
+    // Wild Card games landed as week_label = "Week 18" instead of "Wild
+    // Card" (Session 47), then a brand-new league's real Preseason Week 1
+    // games landed as week_label = "Week 1" instead of "Preseason Week 1"
+    // (Session 47, second test league's very first sync). Same root cause
+    // both times: this line preferred the RAW per-row field (row.week /
     // row.stage / etc. — whatever EA's own game object happens to carry,
-    // typically a plain zero-indexed number with no playoff-name
-    // translation applied) over the passed-in `weekLabel` parameter, which
-    // for this exact call was already the correctly-computed, hardened
-    // "Wild Card" string from getMaddenNewAdvanceWeek's own pipeline — the
-    // most trustworthy label in the whole codebase for "what week is this
-    // sync actually processing." The numeric-to-playoff-name mapping
-    // (getMaddenPlayoffWeekLabelFromDisplayWeek/getMaddenEaPostseasonStageLabel)
-    // exists elsewhere in this file but was never invoked at this call
-    // site, so the raw number was stored as-is, verbatim, as the row's
-    // week_label. Every downstream consumer that looks for playoff games
-    // by name (buildMaddenWildCardRoundFromRealGames via
-    // getMaddenPlayoffWeekGames, thread creation, the postseason import
-    // audit, sportsbook) found nothing, because nothing was actually
-    // labeled "Wild Card" at all — not a season_key mismatch, a label
-    // mismatch. Fixed by trusting `weekLabel` unconditionally whenever
-    // IT is itself a playoff-round label (sort-key group 2) — the one
-    // case this project has direct, confirmed-live evidence the row's own
-    // raw field cannot be trusted for. Regular-season/preseason weeks are
-    // completely unaffected — the original per-row-first behavior is
-    // preserved for every other case, in case a caller genuinely needs it
-    // for a mixed-week batch.
+    // typically a plain zero-indexed number with no preseason/playoff
+    // label translation applied) over the passed-in `weekLabel` parameter,
+    // which is already the correctly-computed, hardened label from
+    // getMaddenNewAdvanceWeek's own pipeline — the most trustworthy source
+    // in the codebase for "what week is this sync actually processing."
+    // Originally fixed narrowly for playoffs only, reasoning "preseason is
+    // unaffected" — that reasoning was wrong; it's the exact same disease,
+    // just not yet observed on this side of the season at the time. Fixed
+    // properly this time: trust `weekLabel` unconditionally whenever it is
+    // ANYTHING other than a plain regular-season "Week N" label (sort-key
+    // group 1) — i.e. preseason (group 0) or playoffs (group 2) both now
+    // override the row's own raw field. Plain "Week N" regular-season
+    // labels keep the original per-row-first behavior, in case a caller
+    // genuinely needs it for a mixed-week batch — that combination has
+    // never been the source of a confirmed-live incident.
     const rowOwnWeekLabel = getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null);
-    const weekLabelIsConfirmedPlayoff = weekLabel && maddenWeekLabelSortKey(String(weekLabel))[0] === 2;
-    const resolvedWeekLabelForRow = weekLabelIsConfirmedPlayoff ? weekLabel : (rowOwnWeekLabel || weekLabel);
+    const weekLabelGroup = weekLabel ? maddenWeekLabelSortKey(String(weekLabel))[0] : null;
+    const weekLabelIsConfirmedNonRegular = weekLabelGroup === 0 || weekLabelGroup === 2;
+    const resolvedWeekLabelForRow = weekLabelIsConfirmedNonRegular ? weekLabel : (rowOwnWeekLabel || weekLabel);
     // 7J-UPSERTEXISTINGWINSGUARD: real bug, confirmed live via direct trace
     // (Week 13, all 14 games — Steelers/Eagles etc., none played yet) —
     // separate from both 7J-UNIVERSALCOMPLETIONGUARD (rejects a row before
@@ -74836,7 +74863,15 @@ async function postMaddenSyncFeed(guild, league, run) {
     [league.league_id]
   );
   const settings = settingsResult.rows[0] || {};
-  const channelId = settings.sync_feed_channel_id || league.sportsbook_channel_id || null;
+  // 7J-SYNCFEEDSTAFFFALLBACK: real bug, confirmed live on a fresh league —
+  // when sync_feed_channel_id isn't configured yet (e.g. mid-setup), this
+  // fell back to league.sportsbook_channel_id, posting routine sync-status
+  // messages into the Sportsbook Feed channel of all places. Staff-facing
+  // operational messages belong with other staff-only notices
+  // (league.staff_channel_id — same channel league-settings changes post
+  // to) while sync_feed_channel_id is unset, not in a channel meant for
+  // betting-line alerts.
+  const channelId = settings.sync_feed_channel_id || league.staff_channel_id || null;
   if (!channelId) return null;
 
   const channel = await guild.channels.fetch(channelId).catch(() => null);
