@@ -51875,7 +51875,35 @@ async function importMaddenGamesFromArray(guild, league, rows, weekLabel = null,
       else status = 'completed';
     }
 
-    const resolvedWeekLabelForRow = getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null) || weekLabel;
+    // 7J-PLAYOFFROWLABELTRUST: real bug, confirmed live via direct SQL
+    // (Session 47) — the real 6 Wild Card games landed in
+    // madden_imported_games with week_label = "Week 18", not "Wild Card".
+    // Root cause: this line preferred the RAW per-row field (row.week /
+    // row.stage / etc. — whatever EA's own game object happens to carry,
+    // typically a plain zero-indexed number with no playoff-name
+    // translation applied) over the passed-in `weekLabel` parameter, which
+    // for this exact call was already the correctly-computed, hardened
+    // "Wild Card" string from getMaddenNewAdvanceWeek's own pipeline — the
+    // most trustworthy label in the whole codebase for "what week is this
+    // sync actually processing." The numeric-to-playoff-name mapping
+    // (getMaddenPlayoffWeekLabelFromDisplayWeek/getMaddenEaPostseasonStageLabel)
+    // exists elsewhere in this file but was never invoked at this call
+    // site, so the raw number was stored as-is, verbatim, as the row's
+    // week_label. Every downstream consumer that looks for playoff games
+    // by name (buildMaddenWildCardRoundFromRealGames via
+    // getMaddenPlayoffWeekGames, thread creation, the postseason import
+    // audit, sportsbook) found nothing, because nothing was actually
+    // labeled "Wild Card" at all — not a season_key mismatch, a label
+    // mismatch. Fixed by trusting `weekLabel` unconditionally whenever
+    // IT is itself a playoff-round label (sort-key group 2) — the one
+    // case this project has direct, confirmed-live evidence the row's own
+    // raw field cannot be trusted for. Regular-season/preseason weeks are
+    // completely unaffected — the original per-row-first behavior is
+    // preserved for every other case, in case a caller genuinely needs it
+    // for a mixed-week batch.
+    const rowOwnWeekLabel = getFirstValue(row, ['week_label', 'week', 'weekLabel', 'stage'], null);
+    const weekLabelIsConfirmedPlayoff = weekLabel && maddenWeekLabelSortKey(String(weekLabel))[0] === 2;
+    const resolvedWeekLabelForRow = weekLabelIsConfirmedPlayoff ? weekLabel : (rowOwnWeekLabel || weekLabel);
     // 7J-UPSERTEXISTINGWINSGUARD: real bug, confirmed live via direct trace
     // (Week 13, all 14 games — Steelers/Eagles etc., none played yet) —
     // separate from both 7J-UNIVERSALCOMPLETIONGUARD (rejects a row before
