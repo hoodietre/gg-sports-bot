@@ -3862,6 +3862,12 @@ function buildCommands() {
             { name: 'Offseason', value: 'offseason' },
           ))
         .addBooleanOption(o => o.setName('reset_week_detection').setDescription('Also clear the stored week-advance detection state, forcing a fresh re-evaluation on the next sync').setRequired(false)))
+      .addSubcommand(sc => sc
+        .setName('forcekickoff')
+        .setDescription('Staff: manually run the real regular-season kickoff when EA\'s own data can\'t distinguish it from Cut Week')
+        .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o => o.setName('week_label').setDescription('The real current week, exactly as it appears in your schedule (e.g. "Week 1")').setRequired(true))
+        .addBooleanOption(o => o.setName('confirm').setDescription('Run the kickoff now? Leave false to preview what would happen.').setRequired(false)))
 
 ,
     new SlashCommandBuilder()
@@ -28333,6 +28339,45 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
           content: `**${activeLeague.league_name}** season stage set to **${newStage}**.` +
             (resetWeekDetection ? ' Week-advance detection state cleared — the next sync will re-anchor fresh (won\'t re-process the current week as "new," but will correctly detect the following real advance).' : ' Week-advance detection state left as-is.'),
         });
+        return;
+      }
+      // 7J-STUCKWEEKMANUALKICKOFF: real gap, confirmed live — a league whose
+      // EA hub genuinely cannot distinguish Cut Week from real Week 1 (both
+      // report identical signals: bare "Week N" text, no real record data,
+      // nextSeasonWeekType null) can get permanently stuck in 'preseason'
+      // stage even once the human confirms, by looking at Madden itself,
+      // that real Week 1 has genuinely begun. fixstage above only corrects
+      // the stored stage/detection state — it deliberately doesn't run the
+      // actual kickoff (stat wipe, old-thread cleanup, trade/bracket reset,
+      // the announcement, real threads), so using it alone still leaves the
+      // league without any of that actually happening. This runs the exact
+      // same performMaddenRegularSeasonKickoff sequence the automatic
+      // detection would have run, on explicit human confirmation instead of
+      // an automatic signal that may not exist for this league at all.
+      if (subcommand === 'forcekickoff') {
+        if (!(await userCanUseLeagueSetup(interaction, activeLeague))) {
+          await interaction.editReply({ content: 'You do not have permission to do this.' });
+          return;
+        }
+        const weekLabel = interaction.options.getString('week_label');
+        const confirm = Boolean(interaction.options.getBoolean('confirm') || false);
+        const settingsForForceKickoff = await ensureMaddenLeagueSettings(activeLeague).catch(() => ({}));
+        if (settingsForForceKickoff.current_season_stage === 'regular') {
+          await interaction.editReply({ content: `**${activeLeague.league_name}** is already in **regular** season stage — this command is only for a league still stuck on 'preseason' despite real regular-season games having genuinely started. If something else is wrong, use \`/maddenseason fixstage\` instead.` });
+          return;
+        }
+        if (!confirm) {
+          await interaction.editReply({
+            content: `**Preview only** — this would run the full regular-season kickoff for **${activeLeague.league_name}** using week label **"${weekLabel}"**: wipes preseason weekly stats, cleans up old preseason game threads, resets trade counts/bracket/power rankings, posts the season-start announcement, and creates real game threads for **${weekLabel}**.\n\nOnly do this if you've confirmed directly in Madden that this is genuinely the real regular season, not Cut Week or another preseason stage. Re-run with \`confirm:true\` to actually execute it.`,
+          });
+          return;
+        }
+        await performMaddenRegularSeasonKickoff(interaction.guild, activeLeague, weekLabel);
+        await pool.query(
+          `UPDATE madden_league_settings SET last_auto_detect_week_label = $2, ea_reported_current_week = $2, updated_at = NOW() WHERE league_id = $1`,
+          [activeLeague.league_id, weekLabel]
+        ).catch(() => null);
+        await interaction.editReply({ content: `Regular-season kickoff run for **${activeLeague.league_name}** using week label **"${weekLabel}"**. Check the news channel for the announcement and the games channel for new threads.` });
         return;
       }
       await interaction.editReply({ content: 'Unknown Madden season command.' });
