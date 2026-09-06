@@ -55269,7 +55269,21 @@ async function deleteMaddenWeekThreadsSilent(guild, league, weekLabel) {
   for (const game of result.rows || []) {
     const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
     if (thread) {
-      const ok = await thread.delete('GG Sports auto game thread rotation').catch(() => false);
+      // 7J-THREADDELETEDIAGNOSTIC: real bug, confirmed live — a leftover
+      // Week 1 thread stayed visible in Discord after a multi-week catch-up
+      // advanced to Week 8, even though the DB's thread_id had already been
+      // cleared to NULL for it (this function clears the DB reference
+      // unconditionally at the end, regardless of whether the actual
+      // Discord delete succeeded). The real Discord-side error was
+      // previously swallowed by a bare `.catch(() => false)`, so there was
+      // no way to tell WHY the delete call failed (permissions? an
+      // already-archived-thread quirk? a rate limit?). Logs the real error
+      // now so the next occurrence is actually diagnosable instead of just
+      // "failed, cause unknown" again.
+      const ok = await thread.delete('GG Sports auto game thread rotation').catch(error => {
+        console.error(`[AUTO GAME THREADS] Failed to delete thread ${game.thread_id} (${game.away_team} @ ${game.home_team}, ${weekLabel}):`, error?.message || error);
+        return false;
+      });
       if (ok !== false) deleted++;
       else failed++;
     } else {
@@ -67576,9 +67590,30 @@ function makeMaddenPlayerKey(guild, league, row) {
 function makeMaddenStatPlayerKey(guild, league, row) {
   const rosterId = getAnyValue(row, ['rosterId', 'rosterID', 'playerId', 'playerID'], null);
   const presentationId = getAnyValue(row, ['presentationId', 'presentationID', 'playerPresentationId'], null);
+  const birthYear = getAnyValue(row, ['birthYear'], null);
+  const birthMonth = getAnyValue(row, ['birthMonth'], null);
+  const birthDay = getAnyValue(row, ['birthDay'], null);
   const fullName = getAnyValue(row, ['fullName', 'playerName', 'name'], null);
   const teamId = getAnyValue(row, ['teamId', 'teamID'], null);
 
+  // 7J-PLAYERKEYSCHEMEALIGN: real bug, confirmed live via direct SQL — this
+  // function checked rosterId FIRST, while makeMaddenPlayerKey (used for the
+  // madden_players table this key is meant to join against) checks
+  // presentationId+birthdate first, falling back to rosterId only if that's
+  // unavailable. For any real player whose raw data includes both IDs — the
+  // normal case — the two tables produced two different key FORMATS for the
+  // exact same person (confirmed: weekly_stats stored "...:rid:553388672"
+  // while madden_players stored "...:pid:15017:2001:5:16" for what should be
+  // a matching row), guaranteeing the LEFT JOIN used to resolve a stat
+  // leader's real name (buildMaddenYearEndPrepEmbed's sibling big-performance/
+  // season-record detector) could never find a match — silently falling back
+  // to the literal string "Unknown" in AI narrative posts. Aligned to the
+  // exact same priority order as makeMaddenPlayerKey so a real player
+  // resolves to the same key in both tables whenever the same ID fields are
+  // present in both payloads.
+  if (presentationId != null && birthYear != null && birthMonth != null && birthDay != null) {
+    return `${guild.id}:${league.league_id}:pid:${presentationId}:${birthYear}:${birthMonth}:${birthDay}`;
+  }
   if (rosterId != null) return `${guild.id}:${league.league_id}:rid:${rosterId}`;
   if (presentationId != null) return `${guild.id}:${league.league_id}:pid:${presentationId}`;
   if (fullName != null && teamId != null) return `${guild.id}:${league.league_id}:name:${String(fullName).toLowerCase()}:team:${teamId}`;
