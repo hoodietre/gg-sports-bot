@@ -79191,9 +79191,36 @@ async function handleMaddenSeasonTransition(guild, league, previousWeekLabel, ne
   let qualifies = wasPreseason;
   if (!qualifies && isRegular) {
     const stageSettings = await ensureMaddenLeagueSettings(league).catch(() => ({}));
-    qualifies = (stageSettings.current_season_stage || 'preseason') === 'preseason';
+    // 7J-STUCKLABELKICKOFFGUARD: real bug, confirmed live — this recovery
+    // branch was built for the Cut Week collision (7J-CUTWEEKLABELCOLLISION),
+    // where by definition real regular-season games genuinely exist by the
+    // time it fires. It has no protection against a DIFFERENT scenario that
+    // satisfies the exact same text/stage combination: a league whose EA
+    // hub reports the identical "Week 1" placeholder throughout offseason
+    // AND preseason (see 7J-STUCKOFFSEASONLABELGAP in getMaddenNewAdvanceWeek).
+    // Once that detector correctly recognizes genuine forward progress into
+    // preseason and returns the raw "Week 1" text, this function's own
+    // independent qualifies-via-stage check ALSO matches it — current_season_stage
+    // was 'preseason', newWeekLabel looks like "Week N" — and fires the full
+    // regular-season kickoff via a path that never had the hasRealRecordData
+    // gate added to handleMaddenOffseasonTransition, since that gate lives in
+    // a completely different function. Confirmed live: this set
+    // current_season_stage all the way to 'regular' while real preseason
+    // games sat unplayed (0/16 scored) and ea_hub_is_preseason was still
+    // true — a genuine, direct contradiction. Same fix shape, same signal:
+    // require real record data to actually exist before trusting this
+    // recovery path, exactly as already required for the sibling kickoff
+    // trigger in handleMaddenOffseasonTransition.
+    const hasRealRecordDataForRecovery = await pool.query(
+      `SELECT 1 FROM madden_imported_team_stats
+       WHERE guild_id = $1 AND league_id::text = $2::text
+         AND (wins > 0 OR losses > 0 OR ties > 0 OR points_for > 0 OR points_against > 0)
+       LIMIT 1`,
+      [guild.id, String(league.league_id)]
+    ).then(r => r.rows.length > 0).catch(() => true); // fail open on a query error, same reasoning as the sibling gate
+    qualifies = (stageSettings.current_season_stage || 'preseason') === 'preseason' && hasRealRecordDataForRecovery;
     if (qualifies) {
-      console.log('[SEASON TRANSITION] previousWeekLabel ("' + previousWeekLabel + '") didn\'t look like preseason, but current_season_stage is still \'preseason\' — treating as the same recovery case getMaddenNewAdvanceWeek already handled.');
+      console.log('[SEASON TRANSITION] previousWeekLabel ("' + previousWeekLabel + '") didn\'t look like preseason, but current_season_stage is still \'preseason\' and real record data confirms genuine regular-season games — treating as the same recovery case getMaddenNewAdvanceWeek already handled.');
     }
   }
   if (!qualifies || !isRegular) return;
