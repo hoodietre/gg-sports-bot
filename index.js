@@ -78479,7 +78479,28 @@ async function postMaddenPlayoffMatchupPreview(guild, league, round, roundLabel)
   // only returns false below for a genuine failure to send, so callers
   // tracking this durably (see 7J-FINALPREVIEWFLAG) don't mistake "already
   // posted" for "needs retrying."
-  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_preview', roundLabel, 'posted').catch(() => false);
+  // 7J-PREVIEWDEDUPSEASONSCOPE: real bug, confirmed live — Super Bowl
+  // Preview didn't post this season even though Wild Card/Divisional/Conf
+  // Championship all did. Root cause: this dedup key (subject_key =
+  // roundLabel, e.g. "Super Bowl") has no season scoping at all, and
+  // relies entirely on 7J-10BY-STORYLINERESET wiping the whole
+  // madden_storyline_posts table at the right moment instead. That wipe
+  // fires the instant a season's Super Bowl finalizes — but
+  // 7J-10BY-COMPLETEDBRACKETRETRY (deliberately, per its own comment)
+  // reposts the final round's preview once more right after, since the
+  // round can get built and decided in the same sync as the wipe. That
+  // expected extra repost writes a FRESH "Super Bowl":"posted" row dated
+  // AFTER the reset already ran for that season — which then has no
+  // reset scheduled to clear it until the *next* Super Bowl finalizes.
+  // Wild Card/Divisional/Conf Championship never hit this because they
+  // aren't part of the completed-bracket retry — only the final round is.
+  // Fix: scope the subject key by season directly, the same principle as
+  // every other 7J-*SEASONSCOPE fix in this file, so a prior season's row
+  // structurally cannot block this season's post — no dependency on the
+  // whole-table wipe's timing at all for this one story type.
+  const previewSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => 'unknown');
+  const previewSubjectKey = `${roundLabel}::${previewSeasonKey}`;
+  const shouldPost = await shouldPostMaddenStoryline(guild.id, league.league_id, 'playoff_preview', previewSubjectKey, 'posted').catch(() => false);
   if (!shouldPost) return true;
 
   const teamsResult = await pool.query(
