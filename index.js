@@ -58375,6 +58375,22 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
   // team) or 'signed' (UDFAs who came from FA with no draft fields).
   // EA stores draftRound and draftPick as 1-indexed with a +1 offset (confirmed:
   // Arch Manning, Round 1 Pick 1, shows draftRound:2 draftPick:2 in raw payload).
+  //
+  // 7J-COLDSTARTDRAFTFLOOD: real bug, confirmed live — a brand-new league's very
+  // FIRST sync has an entirely empty previousMap (no prior snapshot exists yet at
+  // all), so "hasSnapshot" below is false for literally every rookie-eligible
+  // player on every team's starting roster — not just a genuine new draft class.
+  // The result: the whole league's starting rookies got reported as "just
+  // drafted this week" in the Weekly Updates digest on the league's first-ever
+  // sync, one giant false batch (65 updates on a 32-team fresh league). This
+  // loop should only ever fire relative to an established baseline — on a
+  // genuine first sync, silently establish that baseline instead (matching the
+  // same "bootstrap = don't report as new" reasoning already applied a few
+  // lines below for free agents/expiring contracts, just extended to cover
+  // this pass too). previousMap.size > 0 means at least one prior sync has
+  // already run for this league, so a player with no snapshot entry here is a
+  // genuine new arrival, not just "this is the first time anyone looked."
+  if (previousMap.size > 0) {
   for (const current of currentRows) {
     let hasSnapshot = false;
     for (const key of maddenTransactionLookupKeys(current)) {
@@ -58413,6 +58429,7 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
       },
     });
   }
+  } // end 7J-COLDSTARTDRAFTFLOOD guard (previousMap.size > 0)
 
   if (!rows.length && !previousMap.size) {
     const faRows = await getMaddenFreeAgentRows(guildId, league.league_id, { limit: 25 });
