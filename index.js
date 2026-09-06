@@ -62393,7 +62393,7 @@ async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
   const ctxText = [
     `displayedWeek: **${ctx.displayedWeek ?? 'null'}**`,
     `stageIndex: **${ctx.stageIndex ?? 'null'}**`,
-    `weekType / seasonWeekType: **${ctx.weekType ?? 'null'}**`,
+    `weekType / seasonWeekType: **${ctx.weekType ?? 'null'}** (source: ${ctx.weekTypeSource || 'unknown'})`,
     `nextSeasonWeek: **${ctx.nextSeasonWeek ?? 'null'}** / nextSeasonWeekType: **${ctx.nextSeasonWeekType ?? 'null'}**`,
     `isPreseason: **${ctx.isPreseason}** / isRegularSeason: **${ctx.isRegularSeason}**`,
     `isLeagueAdvancing: **${ctx.isLeagueAdvancing}** / isLeagueAutoSimming: **${ctx.isLeagueAutoSimming}**`,
@@ -62454,7 +62454,7 @@ async function buildMaddenSeasonStageProbeEmbed(guildId, league) {
       return `${row.created_at ? new Date(row.created_at).toISOString() : 'unknown'} — parse error: ${error.message}`;
     }
     const ts = row.created_at ? new Date(row.created_at).toISOString().replace('T', ' ').slice(0, 19) : 'unknown';
-    return `${ts} — disp:"${historyCtx.displayedWeek}" wkType:${historyCtx.weekType ?? 'null'} nextWkType:${historyCtx.nextSeasonWeekType ?? 'null'} realRecord:${hasRealRecordDataHist} stage:${historyCtx.stageIndex ?? 'null'}`;
+    return `${ts} — disp:"${historyCtx.displayedWeek}" wkType:${historyCtx.weekType ?? 'null'}(${historyCtx.weekTypeSource || '?'}) nextWkType:${historyCtx.nextSeasonWeekType ?? 'null'} realRecord:${hasRealRecordDataHist} stage:${historyCtx.stageIndex ?? 'null'}`;
   });
   const historyText = historyLines.join(NL) || 'No history available.';
 
@@ -69190,12 +69190,26 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
   // EA often stores:
   // weekType/seasonWeekType: 0 = preseason, 1 = regular season, 2+ = playoffs
   // If nextSeasonWeekType exists, it is the strongest signal after advance.
-  const inferredWeekType =
-    nextSeasonWeekType ??
-    parseNumberOrNull(getAnyValue(hubPayload, ['seasonWeekType', 'weekType'], null)) ??
-    parseNumberOrNull(getAnyValue(seasonInfo, ['seasonWeekType', 'weekType'], null)) ??
-    parseNumberOrNull(getAnyValue(firstGame, ['weekType', 'seasonWeekType'], null)) ??
-    null;
+  // 7J-WEEKTYPESOURCETRACE: purely diagnostic — records WHICH branch actually
+  // supplied inferredWeekType/weekType below, without changing any value
+  // anything else reads. Added after almost re-trusting weekType===1 as a
+  // "definitely regular season" signal (Session 47) before remembering the
+  // hardcoded `?? 1` fallback a few lines down means weekType can read 1
+  // even when EA sent nothing at all — the exact failure mode
+  // 7J-10BY-STRICTPRESEASONGATE already fixed once. This lets the Season
+  // Stage Probe show whether a given weekType reading is a genuine EA field
+  // or just the default, instead of guessing again next time this comes up.
+  let weekTypeSource = 'none';
+  const inferredWeekType = (() => {
+    if (nextSeasonWeekType !== null) { weekTypeSource = 'nextSeasonWeekType'; return nextSeasonWeekType; }
+    const hubLevel = parseNumberOrNull(getAnyValue(hubPayload, ['seasonWeekType', 'weekType'], null));
+    if (hubLevel !== null) { weekTypeSource = 'hub.seasonWeekType/weekType'; return hubLevel; }
+    const seasonInfoLevel = parseNumberOrNull(getAnyValue(seasonInfo, ['seasonWeekType', 'weekType'], null));
+    if (seasonInfoLevel !== null) { weekTypeSource = 'seasonInfo.seasonWeekType/weekType'; return seasonInfoLevel; }
+    const firstGameLevel = parseNumberOrNull(getAnyValue(firstGame, ['weekType', 'seasonWeekType'], null));
+    if (firstGameLevel !== null) { weekTypeSource = 'firstGame.weekType/seasonWeekType'; return firstGameLevel; }
+    return null;
+  })();
 
   // Pick the current week object by matching true current hub values.
   let currentWeekInfo = null;
@@ -69249,8 +69263,12 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
 
   const weekType =
     inferredWeekType ??
-    parseNumberOrNull(getAnyValue(currentWeekInfo, ['seasonWeekType', 'weekType'], null)) ??
-    1;
+    (() => {
+      const v = parseNumberOrNull(getAnyValue(currentWeekInfo, ['seasonWeekType', 'weekType'], null));
+      if (v !== null) weekTypeSource = 'currentWeekInfo.seasonWeekType/weekType';
+      return v;
+    })() ??
+    (() => { weekTypeSource = 'DEFAULT_FALLBACK (EA sent nothing — not a real signal)'; return 1; })();
 
   const displayedWeek =
     getAnyValue(currentWeekInfo, ['weekTitle', 'displayedWeek'], null) ||
@@ -69280,6 +69298,7 @@ function extractEaStandingsRequestContextFromHub(hubPayload, leagueId) {
     week: seasonWeek,
     weekType,
     seasonWeekType: weekType,
+    weekTypeSource,
     displayedWeek,
 
     seasonYear,
