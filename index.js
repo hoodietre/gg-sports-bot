@@ -76601,7 +76601,8 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
     ? `**${nextGame.week_label || 'Week TBD'}** ${nextGame.away_team} @ ${nextGame.home_team} — ${formatMaddenGameStatus(nextGame)}`
     : 'No featured game found.';
 
-  return new EmbedBuilder()
+  const teamLogo = getMaddenTeamLogoUrl(teamName);
+  const embed = new EmbedBuilder()
     .setTitle(`Madden Franchise Hub • ${teamName} (${getMaddenTeamAbbrev(teamName) || 'NFL'})`)
     .setColor(0xFEE75C)
     .setDescription(`**${league.league_name}**`)
@@ -76619,6 +76620,8 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
     )
     .setFooter({ text: 'GG Sports • Madden Franchise Hub' })
     .setTimestamp();
+  if (teamLogo) embed.setThumbnail(teamLogo);
+  return embed;
 }
 
 
