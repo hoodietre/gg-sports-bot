@@ -37738,6 +37738,23 @@ async function closeStaleMaddenSportsbookLinesForLeague(guild, league, reason = 
       amountRefunded += Number(bet.amount) || 0;
     }
     await pool.query(`UPDATE sportsbook_games SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [game.id]).catch(() => null);
+    // 7J-SPORTSBOOKPOINTERCLEAR: real bug, confirmed live — a Divisional
+    // Playoff game (Packers @ Seahawks) never got a moneyline, even though
+    // it was correctly identified as user-vs-user (props for it generated
+    // fine, since that's a separate check). Root cause traced via direct
+    // data: this game's home/away got corrected by a later seeding pass,
+    // its ORIGINAL (pre-correction) matchup had already gotten a line, and
+    // when that stale line was later refunded here, nothing ever cleared
+    // madden_imported_games.sportsbook_game_id back to NULL. Since
+    // autoCreateMaddenSportsbookLines requires that column to be NULL
+    // before it will even consider a game, the row was permanently
+    // blocked from ever getting a fresh line for its real, corrected
+    // matchup — refunded-but-still-pointed-to forever. Clearing it here
+    // means a refunded line's game becomes eligible again immediately.
+    await pool.query(
+      `UPDATE madden_imported_games SET sportsbook_game_id = NULL WHERE guild_id = $1 AND sportsbook_game_id = $2`,
+      [guild.id, game.id]
+    ).catch(() => null);
     gamesClosed += 1;
   }
 
@@ -37830,6 +37847,17 @@ async function closeStaleMaddenSportsbookLinesForWeek(guild, league, currentWeek
       amountRefunded += Number(bet.amount) || 0;
     }
     await pool.query(`UPDATE sportsbook_games SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [game.id]).catch(() => null);
+    // 7J-SPORTSBOOKPOINTERCLEAR: see the identical comment in
+    // closeStaleMaddenSportsbookLinesForLeague above — same fix, same real
+    // bug, confirmed via the exact Packers @ Seahawks Divisional Playoff
+    // case. This weekly variant is actually the more likely of the two to
+    // have been the one that produced that case, since it runs every week
+    // (a seeding correction mid-playoffs would hit this path almost
+    // immediately, well before any season-end boundary).
+    await pool.query(
+      `UPDATE madden_imported_games SET sportsbook_game_id = NULL WHERE guild_id = $1 AND sportsbook_game_id = $2`,
+      [guild.id, game.id]
+    ).catch(() => null);
     gamesClosed += 1;
   }
 
