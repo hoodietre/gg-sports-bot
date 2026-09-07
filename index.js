@@ -45453,6 +45453,28 @@ function getGenericTeamLogoUrl(teamName, league) {
   return null;
 }
 
+// 7J-LEAGUELOGOTHUMBNAIL: per Hxxdie — league-wide, non-team-specific
+// pages (Hall of Fame, League Records, Championship History, and several
+// staff diagnostic/audit embeds) were using an arbitrary team's logo as
+// their thumbnail — whoever happened to be #1 in some unrelated list that
+// page also showed (top Legacy Score, top power rank, first playoff-row
+// team, etc.). Misleading on a page that isn't actually about that team.
+// Uses ESPN's LEAGUE-level logo endpoint (a.espncdn.com/i/teamlogos/
+// leagues/500/{sport}.png) — the same CDN host/path convention every
+// team-logo table in this file already relies on, just at the league
+// tier instead of the team tier. A prior, never-quite-right attempt at
+// this same idea already existed in several staff embeds
+// (getMaddenTeamLogoUrl('NFL') || ...) but 'NFL' was never a valid entry
+// in the TEAM slug table, so that call always silently resolved to null —
+// this is the first version that actually returns a real image.
+function getMaddenLeagueLogoUrl(league) {
+  if (isNhlLeague(league)) return 'https://a.espncdn.com/i/teamlogos/leagues/500/nhl.png';
+  if (isNbaLeague(league)) return 'https://a.espncdn.com/i/teamlogos/leagues/500/nba.png';
+  if (isMlbLeague(league)) return 'https://a.espncdn.com/i/teamlogos/leagues/500/mlb.png';
+  if (isNflLeague(league)) return 'https://a.espncdn.com/i/teamlogos/leagues/500/nfl.png';
+  return null;
+}
+
 // 7J-MULTISPORTLOGO: composites real team logos (fetched live from ESPN's
 // CDN at render time — this bot already makes outbound fetch() calls
 // elsewhere, e.g. Stripe/EA Direct, so this is the same kind of network
@@ -60486,7 +60508,7 @@ async function buildMaddenOffseasonOutlookEmbed(guild, league) {
     )
     .setFooter({ text: 'GG Sports • 7J-10BY-DL Offseason Outlook' })
     .setTimestamp();
-  const logo = getMaddenTeamLogoUrl(draftRows[0]?.team_name || capSpace[0]?.team_name || powerRows[0]?.team_name);
+  const logo = getMaddenLeagueLogoUrl(league);
   if (logo) embed.setThumbnail(logo);
   return embed;
 }
@@ -61196,7 +61218,7 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
 
   const careerLeaders = buildMaddenCareerLeaderSnapshot({ passRows, rushRows, recRows, sackRows, intRows });
   const topPlayer = overallRows?.[0] || null;
-  const thumb = getMaddenTeamLogoUrl(topPlayer?.resolved_team_name || topPlayer?.team_name);
+  const thumb = getMaddenLeagueLogoUrl(league);
   const embed = new EmbedBuilder()
     .setTitle('🏛️ Madden Hall of Fame • ' + (league.league_name || 'Madden League'))
     .setColor(0x9B59B6)
@@ -61386,8 +61408,7 @@ async function buildMaddenChampionshipHistoryEmbed(guildId, league) {
     currentContenders.push(`🔥 **${row.team_name}** — ${formatMaddenStandingsRecord(row)} • DIFF ${Number(row.points_for || 0) - Number(row.points_against || 0) >= 0 ? '+' : ''}${Number(row.points_for || 0) - Number(row.points_against || 0)}`);
   }
 
-  const thumbTeam = championshipRows?.[0]?.team_name || dynastyRows?.[0]?.team_name || dynastyRows?.[0]?.franchise_name || topPower?.[0]?.team_name;
-  const thumb = getMaddenTeamLogoUrl(thumbTeam);
+  const thumb = getMaddenLeagueLogoUrl(league);
 
   const embed = new EmbedBuilder()
     .setTitle('🏆 Madden Championship History • ' + (league.league_name || 'Madden League'))
@@ -61953,7 +61974,7 @@ async function buildMaddenEaEndpointDiscoveryEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-9C-D EA Endpoint Discovery' })
     .setTimestamp();
 
-  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -62257,7 +62278,7 @@ async function buildMaddenRawPayloadDeepScanEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-9C-E Raw Payload Deep Scan' })
     .setTimestamp();
 
-  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -62447,7 +62468,7 @@ async function buildMaddenSchedulePayloadInspectorEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-9C-F Schedule Payload Inspector' })
     .setTimestamp();
 
-  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -62778,7 +62799,7 @@ async function buildMaddenScheduleStatusDecoderEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-9C-G Schedule Status Decoder' })
     .setTimestamp();
 
-  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -64018,8 +64039,7 @@ async function buildMaddenPostseasonMatchKeyAuditEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-10M Postseason Match Key Audit Runtime Fix' })
     .setTimestamp();
 
-  const thumbTeam = (playoffRows.rows || [])[0]?.home_team || (playoffRows.rows || [])[0]?.away_team || league?.league_name || 'NFL';
-  const thumb = getMaddenTeamLogoUrl(thumbTeam);
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -64476,7 +64496,7 @@ async function buildMaddenLiveEndpointCaptureAuditEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-10AL Live Endpoint Capture Audit' })
     .setTimestamp();
 
-  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -64652,7 +64672,7 @@ async function buildMaddenWeeklyScheduleCoverageAuditEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-10AM Weekly Schedule Coverage Audit' })
     .setTimestamp();
 
-  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -65371,7 +65391,7 @@ async function buildMaddenPostseasonWeekIndexDecoderEmbed(guildId, league) {
     .setFooter({ text: 'GG Sports • 7J-10H Postseason Week Index Decoder' })
     .setTimestamp();
 
-  const thumb = getMaddenTeamLogoUrl('NFL') || getMaddenTeamLogoUrl(league?.league_name || '');
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -65500,7 +65520,6 @@ async function buildMaddenPlayoffResultPromotionAuditEmbed(guildId, league) {
     diagnosis = 'Playoff rows exist but are still scheduled. This is safe for unplayed Conference/Super Bowl games, but Wild Card/Divisional finals need scored rows before history can update.';
   }
 
-  const thumbTeam = (playoffRows.rows || [])[0]?.home_team || (playoffRows.rows || [])[0]?.away_team || league?.league_name;
   const embed = new EmbedBuilder()
     .setTitle('🏈 Madden Playoff Result Promotion Audit • ' + (league?.league_name || 'Madden League'))
     .setColor(0x57F287)
@@ -65514,7 +65533,7 @@ async function buildMaddenPlayoffResultPromotionAuditEmbed(guildId, league) {
     )
     .setFooter({ text: 'GG Sports • 7J-10G Playoff Result Promotion Audit' })
     .setTimestamp();
-  const thumb = getMaddenTeamLogoUrl(thumbTeam);
+  const thumb = getMaddenLeagueLogoUrl(league);
   if (thumb) embed.setThumbnail(thumb);
   return embed;
 }
@@ -66227,7 +66246,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     ].join('\n\n');
   }
 
-  const thumb = getMaddenTeamLogoUrl(topPowerRows?.[0]?.team_name || bestRecordRows?.[0]?.team_name);
+  const thumb = getMaddenLeagueLogoUrl(league);
   const embed = new EmbedBuilder()
     .setTitle('🏆 Madden League Records • ' + (league.league_name || 'Madden League'))
     .setColor(0xF1C40F)
