@@ -77569,7 +77569,9 @@ async function autoSettleMaddenSportsbookBet(guild, league, maddenGame) {
   // same idempotent stat-prop sweep here too closes that gap — it only
   // settles a prop where the matching stat data actually already exists,
   // so calling it opportunistically like this is safe to repeat.
-  await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 10 }).catch(err =>
+  // 7J-STALEPROPWINDOW: shortened from 10 to 3 days per Hxxdie — 10 real
+  // days was effectively infinite during rapid test cycles.
+  await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 3 }).catch(err =>
     console.error('[MADDEN SPORTSBOOK SETTLE] Stat prop sweep for this game failed:', err?.message));
 }
 
@@ -77674,7 +77676,8 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     // moneyline — autoSettleOpenStatProps is already safe to call
     // opportunistically like this (only settles a prop where matching
     // stat data actually exists).
-    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 10 }).catch(() => null);
+    // 7J-STALEPROPWINDOW: shortened from 10 to 3 days per Hxxdie.
+    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 3 }).catch(() => null);
   }
 
   // 7J-10BY-STATLEADERSWEEKINDEX: real bug, confirmed live — latestWeekIndex
@@ -77760,11 +77763,30 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
     if (foundCandidate) {
       latestWeekIndex = foundCandidate.weekIndex;
       latestStageIndex = foundCandidate.stageIndex;
+    } else if (labelGroup === 2) {
+      // 7J-PLAYOFFSTATLEADERSNODATA: real bug, confirmed live — "Div.
+      // Playoff Stat Leaders" showed real, non-empty, but completely
+      // WRONG data: regular-season performances from teams that hadn't
+      // even made the playoffs (Steelers, Colts, Patriots, Titans),
+      // because neither guessed (weekIndex, stageIndex) convention above
+      // had this round's real per-round stats imported yet, and the old
+      // fallback below ("whatever week_index is numerically highest,
+      // regardless of round") happily returned Week 18's real regular-
+      // season data instead — legitimate stats, just for the wrong week,
+      // silently relabeled with the playoff round's name. A genuine
+      // playoff round with no confirmed per-round data yet should report
+      // NO data rather than guess wrong — the caller (both the award-race
+      // leaders push and the season-record/big-performance pass) already
+      // correctly skips posting when latestWeekIndex/latestStageIndex are
+      // null, so this fails safe instead of failing wrong.
+      latestWeekIndex = null;
+      latestStageIndex = null;
     } else {
-      // Not a recognized playoff label, or EA hasn't exported that round's
-      // stats yet — same global-max fallback as before, now also reading
-      // back whichever stage_index that row actually used so downstream
-      // queries stay consistent instead of silently assuming stage 1.
+      // Not a recognized playoff label — regular season / preseason case,
+      // completely unaffected by the playoff-specific fix above. Same
+      // global-max fallback as before, now also reading back whichever
+      // stage_index that row actually used so downstream queries stay
+      // consistent instead of silently assuming stage 1.
       const latestWeekResult = await pool.query(
         `SELECT week_index, stage_index FROM madden_player_weekly_stats
          WHERE guild_id = $1 AND league_id::text = $2::text
@@ -78134,7 +78156,16 @@ async function autoProcessMaddenGameResults(guild, league, weekLabel) {
   } // end 7J-10BY-PLAYOFFCOVERAGEGATE (streak/hot-seat/undefeated-watch/division-race/playoff-picture)
 
   // Award race leaders
-  const awardLeaders = await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex != null ? latestWeekIndex : null, latestStageIndex != null ? latestStageIndex : null).catch(() => null);
+  // 7J-PLAYOFFSTATLEADERSNODATA: latestWeekIndex is only ever null when the
+  // discovery block above explicitly determined "genuine playoff round,
+  // no confirmed per-round data yet" — every other branch always sets a
+  // real number. Skip the leaders post entirely in that case rather than
+  // calling getMaddenAwardRaceLeaders with no week filter at all, which
+  // would silently return season-long aggregate stats mislabeled with
+  // this round's name — the same wrong-data shape this fix is closing.
+  const awardLeaders = latestWeekIndex !== null
+    ? await getMaddenAwardRaceLeaders(guild.id, league.league_id, latestWeekIndex, latestStageIndex).catch(() => null)
+    : null;
   if (awardLeaders) {
     events.push({ type: 'award_race', leaders: awardLeaders });
   }
@@ -79911,7 +79942,8 @@ async function autoDetectAfterSyncInner(guild, league) {
       console.log(`[AUTO DETECT] Skipping sportsbook lines/props for ${weekLabel} — already-decided catch-up week.`);
     }
 
-    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 10 }).catch(err =>
+    // 7J-STALEPROPWINDOW: shortened from 10 to 3 days per Hxxdie.
+    await autoSettleOpenStatProps({ guild, user: { id: 'system' } }, league, { confirm: true, autoVoidStaleDays: 3 }).catch(err =>
       console.error('[AUTO DETECT] Stat prop settlement:', err?.message));
 
     if (weekEvents.length > 0) {
