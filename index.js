@@ -58305,6 +58305,26 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     if (rowKeys.has(key)) return;
     rowKeys.add(key);
     rows.push({ ...data, transaction_key: key });
+    // 7J-INPASSDUPLICATETRANSACTION: real bug, confirmed live via direct
+    // SQL — the same real signing got recorded TWICE within the same
+    // sync, 43ms apart: once by the expiring-contract-repair pass (old
+    // team resolved as the player's actual prior team, e.g. "Titans") and
+    // once by another pass (old team resolved as "FA", having already
+    // seen them as a free agent). Same real player, same real new team,
+    // same event_type — but the dedup key above includes the OLD team,
+    // which differed between the two passes, so rowKeys never caught it.
+    // alreadyRecordedSet already exists specifically to stop a transaction
+    // from being re-detected across DIFFERENT syncs (built once from prior
+    // madden_transactions rows) — it just never got updated as NEW
+    // detections happen within this SAME pass, so two passes in the same
+    // run couldn't see each other's work. Registering here means any
+    // later pass in this same call now correctly recognizes "this
+    // player+event+new-team combo was already reported a moment ago,"
+    // regardless of what old team a different pass computed.
+    const eventKey = String(data.event_type || '').toLowerCase();
+    const teamKey = maddenTransactionTeamKey(data.new_team_name || data.team_name || '');
+    if (data.player_id) alreadyRecordedSet.add(`id:${String(data.player_id).toLowerCase()}|${eventKey}|${teamKey}`);
+    if (data.player_name) alreadyRecordedSet.add(`name:${String(data.player_name).toLowerCase()}|${eventKey}|${teamKey}`);
   }
 
   // 7J-34GAP: also collect every matched pair regardless of whether it produced
@@ -73697,8 +73717,31 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     // out itself. The payload-retention fix means the NEXT Cut Week
     // transition will have both payloads preserved for direct comparison —
     // re-verify against that live before calling this fully closed.
+    //
+    // 7J-WEEKTYPESTAGEGUARD: real regression, confirmed live — EA reports
+    // weekType:1 (genuine, not the DEFAULT_FALLBACK) alongside bare "Week
+    // 1" placeholder text during OFFSEASON sub-stages too, not just at the
+    // Cut Week boundary this signal was built for. Confirmed exactly this
+    // way: a league sitting at the Draft (current_season_stage still
+    // 'offseason') synced, ea_reported_current_week got stored as literal
+    // "Week 1" with no "Preseason " prefix, and next season's real Week 1
+    // game threads were created mid-offseason — no kickoff sequence ran
+    // (that's separately, correctly gated elsewhere), just threads, which
+    // is exactly what happens when a bare unprefixed "Week 1" gets treated
+    // as a genuine new advance. This signal was only ever meant to resolve
+    // the preseason -> regular ambiguity — it has no business firing
+    // during offseason at all. Gated on the league's own already-confirmed
+    // stage actually being 'preseason' (read once at the top of this
+    // function, before this sync's own processing can change it — same
+    // "read fresh, trust the confirmed prior state" principle as
+    // stageAlreadyPastPreseason itself). During offseason, this signal
+    // simply never fires, regardless of what weekType says — offseason ->
+    // regular-season-with-no-preseason is handled entirely by its own,
+    // separate hasRealRecordData-gated path in handleMaddenOffseasonTransition,
+    // untouched by this signal either way.
     const earlyWeekTypeIsGenuine = Boolean(earlyEaHubCtx?.weekTypeSource) &&
-      !String(earlyEaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK');
+      !String(earlyEaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK') &&
+      settings.current_season_stage === 'preseason';
     const earlyExplicitlyRegularSeason = earlyEaHubCtx?.nextSeasonWeekType === 1
       || (earlyWeekTypeIsGenuine && (earlyEaHubCtx?.weekType === 1 || earlyEaHubCtx?.seasonWeekType === 1))
       || hasRealRecordData === true;
@@ -73813,14 +73856,14 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       // direction, since staying gated one extra sync is recoverable and
       // wrongly unlocking isn't.
       const explicitlyPreseason = eaHubCtx?.nextSeasonWeekType === 0 || preseasonMode === true;
-      // 7J-WEEKTYPEREGULARSIGNAL: identical fix to the early computation
-      // site above — see that comment block for full reasoning, the
-      // Session 47 discovery, and the still-open Cut Week caveat. Kept in
-      // sync with the early site intentionally, per this function's own
-      // stated design principle that the two must never be allowed to
-      // disagree (see 7J-SCHEDULEPRESEASONSIGNAL's comment).
+      // 7J-WEEKTYPESTAGEGUARD: identical fix to the early computation site
+      // above — see that comment block for the full regression, confirmed
+      // live during a Draft-stage (offseason) sync. Kept in sync with the
+      // early site intentionally, per this function's own stated design
+      // principle that the two must never be allowed to disagree.
       const weekTypeIsGenuine = Boolean(eaHubCtx?.weekTypeSource) &&
-        !String(eaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK');
+        !String(eaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK') &&
+        settings.current_season_stage === 'preseason';
       const explicitlyRegularSeason = eaHubCtx?.nextSeasonWeekType === 1
         || (weekTypeIsGenuine && (eaHubCtx?.weekType === 1 || eaHubCtx?.seasonWeekType === 1))
         || hasRealRecordData === true;
