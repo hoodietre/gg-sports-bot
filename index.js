@@ -37693,7 +37693,152 @@ async function refundSportsbookGameBets(guild, sportsbookGame, issuedByUserId, r
     .setTimestamp();
 
   await postSportsbookFeed(guild, embed, sportsbookGame.league_id);
+
   return { refundedCount, refundedAmount };
+}
+
+// 7J-STALESPORTSBOOKCLEANUP: real bug, confirmed live — moneylines and
+// player props from an entire PRIOR season were still showing on the
+// live sportsbook board during the NEW season's preseason, because
+// nothing ever closed out whatever was still 'open' at the point a
+// season actually ends. The persistent board query only ever checks
+// `status = 'open'` with no week/season awareness at all (by design —
+// see 7J-OPENSPORTSBOOK's own comment on why it stays a flat "show me
+// everything open" list), so anything that fell through the cracks
+// during the season (the same "one player's stats never synced" mystery
+// already flagged and mitigated for individual props) just sat there
+// forever, visible and bettable, across season boundaries. Every other
+// season-scoped piece of state (trade counts, playoff bracket, power
+// rankings, storyline dedup) already gets a hard reset at a reliable
+// season-boundary point — sportsbook lines/props never did. Closes that
+// gap: bulk-refunds every still-open Madden sportsbook_game for this
+// league (moneylines AND props together) at the point a season
+// definitively ends, reusing the exact same per-bet refund mechanics as
+// the existing single-game refundSportsbookGameBets, just without
+// spamming one embed per stale line — one summary post instead.
+async function closeStaleMaddenSportsbookLinesForLeague(guild, league, reason = 'Season ended — clearing stale sportsbook lines') {
+  const staleGames = await pool.query(
+    `SELECT * FROM sportsbook_games WHERE guild_id = $1 AND league_id = $2 AND status = 'open'`,
+    [guild.id, league.league_id]
+  ).catch(() => ({ rows: [] }));
+
+  let gamesClosed = 0;
+  let betsRefunded = 0;
+  let amountRefunded = 0;
+
+  for (const game of staleGames.rows || []) {
+    const openBets = await pool.query(
+      `SELECT * FROM sportsbook_bets WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+      [guild.id, game.id]
+    ).catch(() => ({ rows: [] }));
+    for (const bet of openBets.rows || []) {
+      await addCurrency(guild.id, bet.user_id, Number(bet.amount), 'sportsbook_refund', reason, null).catch(() => null);
+      await pool.query(`UPDATE sportsbook_bets SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [bet.id]).catch(() => null);
+      betsRefunded += 1;
+      amountRefunded += Number(bet.amount) || 0;
+    }
+    await pool.query(`UPDATE sportsbook_games SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [game.id]).catch(() => null);
+    gamesClosed += 1;
+  }
+
+  if (gamesClosed > 0) {
+    await updateSportsbookPanel(guild).catch(() => null);
+    const settings = await getCurrencySettings(guild.id).catch(() => ({ currency_icon: '' }));
+    const summaryEmbed = new EmbedBuilder()
+      .setTitle('🧹 Sportsbook Board Cleared for New Season')
+      .setColor(0xFEE75C)
+      .setDescription(`${league.league_name}'s sportsbook board carried ${gamesClosed} still-open line(s) from last season into the new one. All cleared and any open bets refunded.`)
+      .addFields(
+        { name: 'Lines Closed', value: String(gamesClosed), inline: true },
+        { name: 'Bets Refunded', value: String(betsRefunded), inline: true },
+        { name: 'Amount Returned', value: (settings.currency_icon || '') + ' ' + amountRefunded, inline: true },
+      )
+      .setFooter({ text: 'GG Sports • Sportsbook Season Reset' })
+      .setTimestamp();
+    await postSportsbookFeed(guild, summaryEmbed, league.league_id).catch(() => null);
+    console.log(`[SEASON TRANSITION] Cleared ${gamesClosed} stale sportsbook line(s) for league ${league.league_id}, refunded ${betsRefunded} bet(s).`);
+  }
+
+  return { gamesClosed, betsRefunded, amountRefunded };
+}
+
+// 7J-STALESPORTSBOOKWEEKLY: per Hxxdie — the season-end cleanup above
+// isn't enough on its own; a line stuck open mid-season (the same "one
+// player's stats never synced" mystery, or any other settlement miss)
+// should be cleared out the moment the NEXT week's real lines go up, not
+// wait until the whole season ends. Runs the same underlying refund
+// mechanics as closeStaleMaddenSportsbookLinesForLeague, but scoped to
+// "anything open that ISN'T this specific current week" rather than
+// "everything." Moneylines are matched via their linked
+// madden_imported_games row (week_label + season_key); stat props have
+// no direct game link, so prop_week_index/prop_stage_index are compared
+// against the current week's own computed index using the identical
+// (regular = weekIndex-1; playoff = 18+labelIdx/stage 2+labelIdx)
+// convention already established for stat-leader discovery elsewhere in
+// this file, so the two can never quietly drift apart from each other.
+async function closeStaleMaddenSportsbookLinesForWeek(guild, league, currentWeekLabel, reason = 'New week started — clearing prior week\'s lines') {
+  if (!currentWeekLabel) return { gamesClosed: 0, betsRefunded: 0, amountRefunded: 0 };
+
+  const currentSeasonKey = await getMaddenCurrentSeasonKey(league).catch(() => null);
+  const staleMoneylines = await pool.query(
+    `SELECT sg.* FROM sportsbook_games sg
+     JOIN madden_imported_games mig ON mig.id = sg.league_game_id
+     WHERE sg.guild_id = $1 AND sg.league_id = $2 AND sg.status = 'open'
+       AND sg.league_game_id IS NOT NULL
+       AND (LOWER(COALESCE(mig.week_label, '')) <> LOWER($3) OR mig.season_key IS DISTINCT FROM $4::text)`,
+    [guild.id, league.league_id, currentWeekLabel, currentSeasonKey]
+  ).catch(() => ({ rows: [] }));
+
+  const regularSeasonMatch = String(currentWeekLabel || '').trim().match(/^week\s+(\d+)$/i);
+  const [labelGroup, labelIdx] = maddenWeekLabelSortKey(currentWeekLabel);
+  let currentWeekIndex = null;
+  let currentStageIndex = null;
+  if (regularSeasonMatch) {
+    currentWeekIndex = Number(regularSeasonMatch[1]) - 1;
+    currentStageIndex = 1;
+  } else if (labelGroup === 2 && labelIdx >= 0 && labelIdx <= 4) {
+    currentWeekIndex = 18 + labelIdx;
+    currentStageIndex = 2 + labelIdx;
+  }
+
+  const staleProps = currentWeekIndex !== null
+    ? await pool.query(
+        `SELECT * FROM sportsbook_games
+         WHERE guild_id = $1 AND league_id = $2 AND status = 'open'
+           AND league_game_id IS NULL
+           AND bet_type IN ('stat_prop', 'freeform_prop')
+           AND prop_week_index IS NOT NULL
+           AND (prop_week_index <> $3 OR COALESCE(prop_stage_index, 1) <> $4)`,
+        [guild.id, league.league_id, currentWeekIndex, currentStageIndex]
+      ).catch(() => ({ rows: [] }))
+    : { rows: [] };
+
+  const staleGames = [...(staleMoneylines.rows || []), ...(staleProps.rows || [])];
+  let gamesClosed = 0;
+  let betsRefunded = 0;
+  let amountRefunded = 0;
+
+  for (const game of staleGames) {
+    const openBets = await pool.query(
+      `SELECT * FROM sportsbook_bets WHERE guild_id = $1 AND sportsbook_game_id = $2 AND status = 'open'`,
+      [guild.id, game.id]
+    ).catch(() => ({ rows: [] }));
+    for (const bet of openBets.rows || []) {
+      await addCurrency(guild.id, bet.user_id, Number(bet.amount), 'sportsbook_refund', reason, null).catch(() => null);
+      await pool.query(`UPDATE sportsbook_bets SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [bet.id]).catch(() => null);
+      betsRefunded += 1;
+      amountRefunded += Number(bet.amount) || 0;
+    }
+    await pool.query(`UPDATE sportsbook_games SET status = 'refunded', settled_at = NOW() WHERE id = $1`, [game.id]).catch(() => null);
+    gamesClosed += 1;
+  }
+
+  if (gamesClosed > 0) {
+    await updateSportsbookPanel(guild).catch(() => null);
+    console.log(`[SPORTSBOOK WEEKLY CLEANUP] Cleared ${gamesClosed} stale line(s) for league ${league.league_id} entering ${currentWeekLabel}, refunded ${betsRefunded} bet(s).`);
+  }
+
+  return { gamesClosed, betsRefunded, amountRefunded };
 }
 
 async function performSportsbookSettlement(guild, sportsbookGame, winner, actorUserId, settings) {
@@ -60646,6 +60791,50 @@ async function getMaddenTopRecordLeaders(guildId, leagueId, categoryKey, limit =
   return { rows: result.rows || [], category: result.category || MADDEN_LEADER_CATEGORIES[categoryKey] };
 }
 
+// 7J-LEAGUERECORDSHISTORICAL: per Hxxdie — "League Records" and "Hall of
+// Fame" are meant to be historical/all-time tracking, not a snapshot of
+// whatever the current in-progress season happens to show. Confirmed
+// live: every category here reset to 0/blank the moment a new season
+// started, because getMaddenTopRecordLeaders above sums
+// madden_player_weekly_stats — the same table wipeMaddenWeeklyStats
+// clears at every regular-season kickoff. A genuinely career-spanning
+// table (madden_career_records) already exists and is already used
+// correctly by Hall of Fame's own Legacy Score/Career Leaders sections —
+// this reuses that exact same source and query shape for League Records'
+// individual player categories instead of building a second, separate
+// career table. NOTE: madden_career_records has no tackles column at
+// all (confirmed via its own CREATE TABLE) — "Tackles" has no historical
+// foundation to draw from yet and stays on the current-season fallback
+// until that's built; every other category below is genuinely all-time.
+const MADDEN_CAREER_RECORD_CATEGORY_COLUMNS = {
+  passing: 'career_pass_yards',
+  passing_tds: 'career_pass_tds',
+  rushing: 'career_rush_yards',
+  rushing_tds: 'career_rush_tds',
+  receiving: 'career_rec_yards',
+  receiving_tds: 'career_rec_tds',
+  sacks: 'career_sacks',
+  interceptions: 'career_interceptions',
+};
+
+async function getMaddenCareerRecordLeaders(guildId, leagueId, categoryKey, limit = 3) {
+  const column = MADDEN_CAREER_RECORD_CATEGORY_COLUMNS[categoryKey];
+  if (!column) return { rows: [] };
+  await ensureMaddenCareerRecordsFoundationTable();
+  const result = await pool.query(
+    `SELECT cr.player_name,
+            COALESCE(NULLIF(cr.team_name, ''), NULLIF(p.team_name, '')) AS resolved_team_name,
+            cr.${column} AS leader_value
+     FROM madden_career_records cr
+     LEFT JOIN madden_players p ON p.id = cr.player_key AND p.guild_id = cr.guild_id
+     WHERE cr.guild_id = $1::text AND cr.league_id::text = $2::text AND cr.${column} > 0
+     ORDER BY cr.${column} DESC
+     LIMIT $3`,
+    [guildId, leagueId, limit]
+  ).catch(() => ({ rows: [] }));
+  return { rows: result.rows || [] };
+}
+
 
 async function ensureMaddenCareerRecordsFoundationTable() {
   await pool.query(`
@@ -60893,7 +61082,7 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
   const leagueId = league.league_id;
   await refreshMaddenCareerRecordsFoundation(guildId, leagueId);
 
-  const [overallRows, qbRows, skillRows, defensiveRows, passRows, rushRows, recRows, sackRows, intRows, mvpRace, opoyRace, dpoyRace, oroyRace, droyRace] = await Promise.all([
+  const [overallRows, qbRows, skillRows, defensiveRows, passRows, rushRows, recRows, sackRows, intRows] = await Promise.all([
     getMaddenHallOfFameRows(guildId, leagueId),
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_pass_yards > 0 OR career_pass_tds > 0)`, 'career_pass_tds DESC, career_pass_yards DESC, hof_score DESC', 5),
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_rush_yards > 0 OR career_rec_yards > 0 OR career_rush_tds > 0 OR career_rec_tds > 0)`, '(career_rush_tds + career_rec_tds) DESC, (career_rush_yards + career_rec_yards) DESC, hof_score DESC', 5),
@@ -60903,20 +61092,14 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_rec_yards > 0 OR career_rec_tds > 0)`, 'career_rec_yards DESC, career_rec_tds DESC, hof_score DESC', 1),
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_sacks > 0)`, 'career_sacks DESC, hof_score DESC', 1),
     getMaddenHallOfFameCategoryRows(guildId, leagueId, `(career_interceptions > 0)`, 'career_interceptions DESC, hof_score DESC', 1),
-    getMaddenAwardsRace(guildId, leagueId, 'mvp', 1).catch(() => []),
-    getMaddenAwardsRace(guildId, leagueId, 'opoy', 1).catch(() => []),
-    getMaddenAwardsRace(guildId, leagueId, 'dpoy', 1).catch(() => []),
-    getMaddenAwardsRace(guildId, leagueId, 'oroy', 1).catch(() => []),
-    getMaddenAwardsRace(guildId, leagueId, 'droy', 1).catch(() => []),
   ]);
 
-  const awardsWatch = [
-    formatMaddenHallOfFameAwardsLine('MVP Favorite', mvpRace, '🏆'),
-    formatMaddenHallOfFameAwardsLine('OPOY Favorite', opoyRace, '⚡'),
-    formatMaddenHallOfFameAwardsLine('DPOY Favorite', dpoyRace, '🛡️'),
-    formatMaddenHallOfFameAwardsLine('OROY Favorite', oroyRace, '🌟'),
-    formatMaddenHallOfFameAwardsLine('DROY Favorite', droyRace, '🔒'),
-  ].join('\n');
+  // 7J-LEAGUERECORDSHISTORICAL: per Hxxdie — Hall of Fame is meant to be
+  // historical/legacy tracking, not a live snapshot of the current
+  // in-progress season's award race (that content already has its own
+  // dedicated home in the Award History franchise-hub view). Dropped the
+  // current-season MVP/OPOY/DPOY/OROY/DROY "Favorite" section entirely
+  // rather than trying to force live race data into a historical page.
 
   const careerLeaders = buildMaddenCareerLeaderSnapshot({ passRows, rushRows, recRows, sackRows, intRows });
   const topPlayer = overallRows?.[0] || null;
@@ -60931,7 +61114,6 @@ async function buildMaddenHallOfFameEmbed(guildId, league) {
       { name: '🏈 Quarterback Resume', value: formatMaddenHallOfFameList(qbRows, 3).slice(0, 1024), inline: false },
       { name: '⚡ Skill Player Resume', value: formatMaddenHallOfFameList(skillRows, 3).slice(0, 1024), inline: false },
       { name: '🛡️ Defensive Resume', value: formatMaddenHallOfFameList(defensiveRows, 3).slice(0, 1024), inline: false },
-      { name: '🏆 Current Awards Watch', value: awardsWatch.slice(0, 1024), inline: false },
       { name: 'Scoring Model', value: '`Career yards + TDs + sacks + INTs` • future seasons can add MVPs, championships, and playoff success.', inline: false },
       { name: 'Command', value: '`/madden franchise view:Hall of Fame`', inline: false }
     )
@@ -60968,13 +61150,27 @@ function formatMaddenDynastyTeamLine(row, index) {
 async function getMaddenChampionshipHistoryRows(guildId, leagueId) {
   const rows = [];
 
+  // 7J-CHAMPIONSHIPTABLEMISMATCH: real bug, confirmed live — this queried
+  // the generic `championship_history` table, but the automatic year-end
+  // finalization that runs at every real Super Bowl
+  // (handleMaddenOffseasonTransition -> buildMaddenYearEndPrepEmbed) only
+  // ever writes to `madden_championship_history` — a completely separate,
+  // Madden-specific table, already used elsewhere in this file for
+  // season_key computation. Champions were genuinely being recorded
+  // automatically the whole time; this view was just reading from the
+  // wrong table, so it always showed "no championship history" regardless
+  // of how many real seasons had finished. Columns aliased to match what
+  // formatMaddenChampionshipLine/formatMaddenChampionTeamName already
+  // expect (team_name, winner_user_id, runner_up) rather than touching
+  // those formatters.
   const championshipRows = await pool.query(
-    `SELECT season_label, team_name, winner_user_id, created_at
-     FROM championship_history
+    `SELECT season_label, champion_team AS team_name, champion_owner_user_id AS winner_user_id,
+            runner_up_team AS runner_up, COALESCE(finalized_at, updated_at) AS created_at
+     FROM madden_championship_history
      WHERE guild_id = $1::text
        AND league_id::text = $2::text
-       AND COALESCE(NULLIF(team_name, ''), '') <> ''
-     ORDER BY created_at DESC
+       AND COALESCE(NULLIF(champion_team, ''), '') <> ''
+     ORDER BY COALESCE(finalized_at, updated_at) DESC
      LIMIT 10`,
     [guildId, leagueId]
   ).catch(error => {
@@ -65670,18 +65866,18 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     tackles,
     teamStatsResult,
     rankings,
-    mvpRace,
-    oroyRace,
-    droyRace,
   ] = await Promise.all([
-    getMaddenTopRecordLeaders(guildId, leagueId, 'passing', 3),
-    getMaddenTopRecordLeaders(guildId, leagueId, 'passing_tds', 3),
-    getMaddenTopRecordLeaders(guildId, leagueId, 'rushing', 3),
-    getMaddenTopRecordLeaders(guildId, leagueId, 'rushing_tds', 3),
-    getMaddenTopRecordLeaders(guildId, leagueId, 'receiving', 3),
-    getMaddenTopRecordLeaders(guildId, leagueId, 'receiving_tds', 3),
-    getMaddenTopRecordLeaders(guildId, leagueId, 'sacks', 3),
-    getMaddenTopRecordLeaders(guildId, leagueId, 'interceptions', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'passing', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'passing_tds', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'rushing', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'rushing_tds', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'receiving', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'receiving_tds', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'sacks', 3),
+    getMaddenCareerRecordLeaders(guildId, leagueId, 'interceptions', 3),
+    // 7J-LEAGUERECORDSHISTORICAL: no career foundation exists for tackles
+    // yet (madden_career_records has no such column) — stays on the
+    // current-season fallback until that's built. Flagged, not hidden.
     getMaddenTopRecordLeaders(guildId, leagueId, 'tackles', 3),
     pool.query(
       `SELECT *, GREATEST(COALESCE(NULLIF(scored_games, 0), wins + losses + ties), 1) AS games_played
@@ -65691,12 +65887,15 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
       [guildId, leagueId]
     ).catch(() => ({ rows: [] })),
     recalculateMaddenPowerRankings(guildId, leagueId).catch(() => []),
-    getMaddenAwardsRace(guildId, leagueId, 'mvp', 1).catch(() => []),
-    getMaddenAwardsRace(guildId, leagueId, 'oroy', 1).catch(() => []),
-    getMaddenAwardsRace(guildId, leagueId, 'droy', 1).catch(() => []),
   ]);
 
   const teams = teamStatsResult.rows || [];
+  // 7J-LEAGUERECORDSHISTORICAL: Best Record / Highest Scoring / Best
+  // Defense / Top Power Rank below are still CURRENT-SEASON snapshots
+  // (madden_imported_team_stats resets every season) — no all-time team
+  // win/scoring record tracking exists yet to replace them with. Flagged
+  // here rather than silently left as-is; a genuine fix needs a new
+  // dedicated all-time team-record table, out of scope for this pass.
   const bestRecordRows = [...teams].sort((a, b) =>
     Number(b.wins || 0) - Number(a.wins || 0) ||
     Number(a.losses || 0) - Number(b.losses || 0) ||
@@ -65712,12 +65911,6 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     (Number(b.points_against || 0) / Math.max(1, Number(b.games_played || 1)))
   ).slice(0, 3);
   const topPowerRows = (rankings || []).slice(0, 3);
-  const topPower = topPowerRows?.[0] || null;
-  const undefeatedSnapshotTeams = [...teams]
-    .filter(row => Number(row.losses || 0) === 0 && Number(row.wins || 0) > 0)
-    .sort((a, b) => Number(b.wins || 0) - Number(a.wins || 0) || String(a.team_name || '').localeCompare(String(b.team_name || '')))
-    .slice(0, 6);
-  const leagueSnapshot = buildMaddenLeagueSnapshotLines({ mvpRace, oroyRace, droyRace, topPower, undefeatedTeams: undefeatedSnapshotTeams });
 
   const offenseRecords = [
     `**Passing Yards**\n${formatMaddenRecordsPlayerTopList(passingYards.rows, 'YDS')}`,
@@ -65875,13 +66068,12 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     ].join('\n\n');
   }
 
-  const thumb = getMaddenTeamLogoUrl(topPower?.team_name || bestRecordRows?.[0]?.team_name);
+  const thumb = getMaddenTeamLogoUrl(topPowerRows?.[0]?.team_name || bestRecordRows?.[0]?.team_name);
   const embed = new EmbedBuilder()
     .setTitle('🏆 Madden League Records • ' + (league.league_name || 'Madden League'))
     .setColor(0xF1C40F)
-    .setDescription('League record book — all-time single-game records, all-time single-season records, and career player totals, so you know when someone breaks a real league record. Also includes current-season award race leaders and live standings for context.')
+    .setDescription('League record book — all-time single-game records, all-time single-season records, and career player totals, so you know when someone breaks a real league record.')
     .addFields(
-      { name: '🏈 League Snapshot', value: leagueSnapshot.slice(0, 1024), inline: false },
       { name: '🎮 Game Records (All-Time)', value: gameRecords.slice(0, 1024), inline: false },
       { name: '🏈 Single-Game Player Records', value: singleGamePlayerRecords.slice(0, 1024), inline: false },
       { name: '📅 Single-Season Player Records', value: singleSeasonPlayerRecords.slice(0, 1024), inline: false },
@@ -78965,6 +79157,15 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
     return; // don't flip the stage flag if it failed — retry next sync tick
   }
 
+  // 7J-STALESPORTSBOOKCLEANUP: same reliable season-end point as year-end
+  // finalization — anything still 'open' on the sportsbook board at this
+  // exact moment is definitionally stale (the season that produced it is
+  // over), so it gets closed out and refunded here rather than lingering
+  // onto the new season's board. Failure here shouldn't block the rest of
+  // the offseason finalization sequence, so it's caught independently.
+  await closeStaleMaddenSportsbookLinesForLeague(guild, league, 'Season ended').catch(error =>
+    console.error('[SEASON TRANSITION] Stale sportsbook cleanup failed:', error?.message || error));
+
   // 7J-AUTOOFFSEASONLOCK: per Hxxdie — offseasonlock previously only ran as
   // a manual command that nothing else ever called, despite being part of
   // the documented flow. Year-end just finalized successfully above, so
@@ -79975,6 +80176,12 @@ async function autoDetectAfterSyncInner(guild, league) {
     // flipping to 'regular'.
     const isPreseasonWeekForBetting = maddenIsPreseasonWeek(weekLabel);
     if (isFinalWeek && !isPreseasonWeekForBetting) {
+      // 7J-STALESPORTSBOOKWEEKLY: clear out anything still open from a
+      // PRIOR week before this week's new lines post, so the board never
+      // carries stale mid-season lines forward — see that function's own
+      // comment for the full reasoning.
+      await closeStaleMaddenSportsbookLinesForWeek(guild, league, weekLabel).catch(err =>
+        console.error('[AUTO DETECT] Stale sportsbook weekly cleanup:', err?.message));
       await autoCreateMaddenSportsbookLines(guild, league, weekLabel).catch(err =>
         console.error('[AUTO DETECT] Sportsbook lines:', err?.message));
       await generateMaddenPlayerPropLines(guild, league, weekLabel).catch(err =>
