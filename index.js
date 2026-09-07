@@ -54259,9 +54259,10 @@ const MADDEN_LEADER_CATEGORIES = {
   },
 };
 
-function maddenJsonNumberSql(key) {
+function maddenJsonNumberSql(key, tableAlias) {
   const safeKey = String(key || '').replace(/[^A-Za-z0-9_]/g, '');
-  return `CASE WHEN raw_payload->>'${safeKey}' ~ '^-?[0-9]+(\\\\.[0-9]+)?$' THEN (raw_payload->>'${safeKey}')::numeric ELSE 0 END`;
+  const col = tableAlias ? `${tableAlias}.raw_payload` : 'raw_payload';
+  return `CASE WHEN ${col}->>'${safeKey}' ~ '^-?[0-9]+(\\\\.[0-9]+)?$' THEN (${col}->>'${safeKey}')::numeric ELSE 0 END`;
 }
 
 
@@ -60933,8 +60934,31 @@ async function ensureMaddenCareerRecordsFoundationTable() {
 async function refreshMaddenCareerRecordsFoundation(guildId, leagueId) {
   await ensureMaddenPlayerPersistenceTables();
   await ensureMaddenCareerRecordsFoundationTable();
+  await ensureMaddenPlayerWeeklyStatsArchiveTable();
+  // 7J-STATSWIPEARCHIVE: real bug, confirmed live — this recompute used to
+  // read ONLY the live madden_player_weekly_stats table and overwrite
+  // madden_career_records with a fresh sum every time this ran (on every
+  // Hall of Fame / League Records view, not just at season boundaries).
+  // Since wipeMaddenWeeklyStats clears that live table twice a season
+  // (preseason kickoff and regular-season kickoff), any view that happened
+  // to run AFTER a wipe — before this function ever got a chance to run
+  // BEFORE it — would silently overwrite real multi-season career totals
+  // down to whatever partial data was left, with correctness depending
+  // entirely on view timing relative to the wipe. Now sums live UNION
+  // archive (archive is populated by wipeMaddenWeeklyStats right before
+  // every wipe), so the source data this recompute reads from is never
+  // actually lost regardless of when it happens to run.
   await pool.query(
-    `WITH base AS (
+    `WITH combined AS (
+       SELECT guild_id, league_id, roster_id, player_key, presentation_id, full_name, team_name, position, stat_type, raw_payload
+       FROM madden_player_weekly_stats
+       WHERE guild_id = $1::text AND league_id::text = $2::text
+       UNION ALL
+       SELECT guild_id, league_id, roster_id, player_key, presentation_id, full_name, team_name, position, stat_type, raw_payload
+       FROM madden_player_weekly_stats_archive
+       WHERE guild_id = $1::text AND league_id::text = $2::text
+     ),
+     base AS (
        SELECT
          s.guild_id,
          s.league_id,
@@ -60950,9 +60974,7 @@ async function refreshMaddenCareerRecordsFoundation(guildId, leagueId) {
          SUM(CASE WHEN s.stat_type = 'receiving' AND s.raw_payload->>'recTDs' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'recTDs')::numeric ELSE 0 END) AS rec_tds,
          SUM(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defSacks' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'defSacks')::numeric ELSE 0 END) AS sacks,
          SUM(CASE WHEN s.stat_type = 'defense' AND s.raw_payload->>'defInts' ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (s.raw_payload->>'defInts')::numeric ELSE 0 END) AS interceptions
-       FROM madden_player_weekly_stats s
-       WHERE s.guild_id = $1::text
-         AND s.league_id::text = $2::text
+       FROM combined s
        GROUP BY s.guild_id, s.league_id, COALESCE(NULLIF(s.roster_id, ''), NULLIF(s.player_key, ''), NULLIF(s.presentation_id, ''), NULLIF(s.full_name, ''))
      )
      INSERT INTO madden_career_records (
@@ -65937,6 +65959,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     tackles,
     teamStatsResult,
     rankings,
+    allTimeTeamStatsResult,
   ] = await Promise.all([
     getMaddenCareerRecordLeaders(guildId, leagueId, 'passing', 3),
     getMaddenCareerRecordLeaders(guildId, leagueId, 'passing_tds', 3),
@@ -65958,26 +65981,57 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
       [guildId, leagueId]
     ).catch(() => ({ rows: [] })),
     recalculateMaddenPowerRankings(guildId, leagueId).catch(() => []),
+    // 7J-TEAMRECORDSALLTIME: real fix — Best Record/Highest Scoring/Best
+    // Defense were current-season snapshots off madden_imported_team_stats
+    // (which resets every season kickoff, same as weekly player stats).
+    // Fixed the same way Single-Season Team Records already proved out:
+    // madden_imported_games itself is genuinely permanent (never wiped),
+    // so aggregating every completed game ever, with no season_year
+    // filter, gives real all-time team records with no new table needed.
+    // Top Power Rank stays current-season-only below — a true all-time
+    // "peak power ranking" has no tracking table yet and would need one
+    // built from scratch; flagged honestly rather than faked.
+    pool.query(
+      `SELECT team_name,
+              SUM(points_for)::int AS points_for,
+              SUM(points_against)::int AS points_against,
+              SUM(CASE WHEN points_for > points_against THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN points_for < points_against THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN points_for = points_against THEN 1 ELSE 0 END)::int AS ties,
+              COUNT(*)::int AS games_played
+       FROM (
+         SELECT home_team AS team_name, home_score AS points_for, away_score AS points_against
+         FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id = $2 AND home_score IS NOT NULL AND away_score IS NOT NULL
+         UNION ALL
+         SELECT away_team AS team_name, away_score AS points_for, home_score AS points_against
+         FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id = $2 AND home_score IS NOT NULL AND away_score IS NOT NULL
+       ) combined
+       GROUP BY team_name`,
+      [guildId, leagueId]
+    ).catch(() => ({ rows: [] })),
   ]);
 
-  const teams = teamStatsResult.rows || [];
-  // 7J-LEAGUERECORDSHISTORICAL: Best Record / Highest Scoring / Best
-  // Defense / Top Power Rank below are still CURRENT-SEASON snapshots
-  // (madden_imported_team_stats resets every season) — no all-time team
-  // win/scoring record tracking exists yet to replace them with. Flagged
-  // here rather than silently left as-is; a genuine fix needs a new
-  // dedicated all-time team-record table, out of scope for this pass.
-  const bestRecordRows = [...teams].sort((a, b) =>
+  // 7J-TEAMRECORDSALLTIME: Best Record / Highest Scoring / Best Defense now
+  // read from the all-time aggregate (madden_imported_games, never wiped)
+  // instead of the current-season snapshot in madden_imported_team_stats —
+  // see the query comment above for how. Top Power Rank stays a genuine
+  // current-season-only metric; there's no "peak power ranking ever
+  // achieved" tracking built yet, flagged honestly below rather than
+  // labeled as something it isn't.
+  const allTimeTeams = allTimeTeamStatsResult.rows || [];
+  const bestRecordRows = [...allTimeTeams].sort((a, b) =>
     Number(b.wins || 0) - Number(a.wins || 0) ||
     Number(a.losses || 0) - Number(b.losses || 0) ||
     (Number(b.points_for || 0) - Number(b.points_against || 0)) - (Number(a.points_for || 0) - Number(a.points_against || 0)) ||
     String(a.team_name || '').localeCompare(String(b.team_name || ''))
   ).slice(0, 3);
-  const highestScoringRows = [...teams].sort((a, b) =>
+  const highestScoringRows = [...allTimeTeams].sort((a, b) =>
     (Number(b.points_for || 0) / Math.max(1, Number(b.games_played || 1))) -
     (Number(a.points_for || 0) / Math.max(1, Number(a.games_played || 1)))
   ).slice(0, 3);
-  const bestDefenseRows = [...teams].sort((a, b) =>
+  const bestDefenseRows = [...allTimeTeams].sort((a, b) =>
     (Number(a.points_against || 0) / Math.max(1, Number(a.games_played || 1))) -
     (Number(b.points_against || 0) / Math.max(1, Number(b.games_played || 1)))
   ).slice(0, 3);
@@ -65999,10 +66053,10 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
   ].join('\n\n');
 
   const teamRecords = [
-    `**Best Record**\n${formatMaddenRecordsTeamTopList(bestRecordRows, row => formatMaddenStandingsRecord(row))}`,
-    `**Highest Scoring Teams**\n${formatMaddenRecordsTeamTopList(highestScoringRows, row => `${(Number(row.points_for || 0) / Math.max(1, Number(row.games_played || 1))).toFixed(1)} PPG`)}`,
-    `**Best Defenses**\n${formatMaddenRecordsTeamTopList(bestDefenseRows, row => `${(Number(row.points_against || 0) / Math.max(1, Number(row.games_played || 1))).toFixed(1)} PAPG`)}`,
-    `**Top Power Ranked Teams**\n${formatMaddenRecordsTeamTopList(topPowerRows, row => `#${row.rank} • Score ${formatMaddenPowerScore(row.power_score)}`)}`,
+    `**Best Record (All-Time)**\n${formatMaddenRecordsTeamTopList(bestRecordRows, row => formatMaddenStandingsRecord(row))}`,
+    `**Highest Scoring Teams (All-Time)**\n${formatMaddenRecordsTeamTopList(highestScoringRows, row => `${(Number(row.points_for || 0) / Math.max(1, Number(row.games_played || 1))).toFixed(1)} PPG`)}`,
+    `**Best Defenses (All-Time)**\n${formatMaddenRecordsTeamTopList(bestDefenseRows, row => `${(Number(row.points_against || 0) / Math.max(1, Number(row.games_played || 1))).toFixed(1)} PAPG`)}`,
+    `**Top Power Ranked Teams (Current Season)**\n${formatMaddenRecordsTeamTopList(topPowerRows, row => `#${row.rank} • Score ${formatMaddenPowerScore(row.power_score)}`)}`,
   ].join('\n\n');
 
   const recordWatch = buildMaddenRecordWatchLines({ passingTDs, rushingYards, receivingYards, sacks, interceptions });
@@ -66040,20 +66094,42 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     `**Highest Combined Score**\n${gameRecordLine(highestCombinedScore, 'combined', row => row.combined)}`,
   ].join('\n\n');
 
-  // 7J-70SINGLEGAME: per Hxxdie — single-game player records, distinct
-  // from the career totals already shown elsewhere in this embed. Queries
-  // madden_player_weekly_stats directly (one row per player per week) so
-  // this is genuinely "best individual performance in one game," not a
-  // season/career sum.
+  // 7J-70SINGLEGAME / 7J-STATSWIPEARCHIVE: per Hxxdie — single-game player
+  // records, distinct from the career totals already shown elsewhere in
+  // this embed. Real bug, confirmed live: the original version of this
+  // query selected `week_label` directly off madden_player_weekly_stats,
+  // a column that never existed on that table (it only has week_index/
+  // display_week/stage_index) — every call threw a real Postgres error,
+  // silently swallowed by the catch below, so this section showed
+  // "No data yet" unconditionally regardless of season wipes. Fixed by
+  // joining to madden_imported_games for the label (via schedule_id ->
+  // external_game_id, the same relationship already used elsewhere for
+  // per-game stat lookups), and unioned with the permanent archive so a
+  // record set before a season wipe doesn't vanish the moment that wipe
+  // runs.
   async function getMaddenSingleGameLeader(statType, jsonField, label) {
     const result = await pool.query(
-      `SELECT full_name, team_name, week_label, ${maddenJsonNumberSql(jsonField)} AS stat_value
-       FROM madden_player_weekly_stats
-       WHERE guild_id = $1 AND league_id::text = $2::text AND stat_type = $3
+      `SELECT full_name, team_name, week_label, stat_value FROM (
+         SELECT s.full_name, s.team_name, g.week_label,
+                ${maddenJsonNumberSql(jsonField, 's')} AS stat_value
+         FROM madden_player_weekly_stats s
+         LEFT JOIN madden_imported_games g
+           ON g.guild_id = s.guild_id AND g.league_id::text = s.league_id::text
+          AND g.external_game_id = s.schedule_id
+         WHERE s.guild_id = $1 AND s.league_id::text = $2::text AND s.stat_type = $3
+         UNION ALL
+         SELECT a.full_name, a.team_name, a.week_label,
+                ${maddenJsonNumberSql(jsonField, 'a')} AS stat_value
+         FROM madden_player_weekly_stats_archive a
+         WHERE a.guild_id = $1 AND a.league_id::text = $2::text AND a.stat_type = $3
+       ) combined
        ORDER BY stat_value DESC NULLS LAST
        LIMIT 1`,
       [guildId, leagueId, statType]
-    ).catch(() => ({ rows: [] }));
+    ).catch(err => {
+      console.error('[LEAGUE RECORDS] Single-game leader query failed:', err?.message);
+      return { rows: [] };
+    });
     const row = result.rows[0];
     if (!row || !row.stat_value) return `**${label}:** No data yet`;
     return `**${label}:** ${formatMaddenLeaderNumber(row.stat_value)} — ${row.full_name} (${maddenTeamDisplayName(row.team_name)}, ${row.week_label || 'Unknown week'})`;
@@ -66066,29 +66142,41 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
     getMaddenSingleGameLeader('defense', 'defInts', 'Most Interceptions'),
   ])).join('\n');
 
-  // 7J-73SEASONRECORDS: per Hxxdie — player single-season records, the
-  // third tier alongside career (all-time cumulative, already shown above)
-  // and single-game (best one week, just above). Only madden_imported_games
-  // carries season_year (added earlier this session) — weekly stat rows
-  // don't have it directly, so this joins to games via week_label
-  // (deduplicated first to avoid fan-out, since a week has many games) to
-  // inherit which season each stat row belongs to.
+  // 7J-73SEASONRECORDS / 7J-STATSWIPEARCHIVE: per Hxxdie — player
+  // single-season records, the third tier alongside career (all-time
+  // cumulative, already shown above) and single-game (best one week, just
+  // above). Real bug, confirmed live: same phantom `s.week_label` join as
+  // the single-game query above — madden_player_weekly_stats has no such
+  // column, so this always threw and always fell back to "No season-
+  // tagged data yet." Fixed with the same join-based approach, and unioned
+  // with the permanent archive so a full completed season's records don't
+  // disappear the moment the NEXT season's kickoff wipes the live table.
   async function getMaddenSingleSeasonLeader(statType, jsonField, label) {
     const result = await pool.query(
-      `WITH season_weeks AS (
-         SELECT DISTINCT week_label, season_year FROM madden_imported_games
-         WHERE guild_id = $1 AND league_id = $2 AND season_year IS NOT NULL
-       )
-       SELECT s.full_name, s.team_name, sw.season_year,
-              SUM(${maddenJsonNumberSql(jsonField)}) AS stat_value
-       FROM madden_player_weekly_stats s
-       JOIN season_weeks sw ON sw.week_label = s.week_label
-       WHERE s.guild_id = $1 AND s.league_id::text = $2::text AND s.stat_type = $3
-       GROUP BY s.full_name, s.team_name, sw.season_year
+      `SELECT full_name, team_name, season_year, SUM(stat_value) AS stat_value FROM (
+         SELECT s.full_name, s.team_name, g.season_year::text AS season_year,
+                ${maddenJsonNumberSql(jsonField, 's')} AS stat_value
+         FROM madden_player_weekly_stats s
+         JOIN madden_imported_games g
+           ON g.guild_id = s.guild_id AND g.league_id::text = s.league_id::text
+          AND g.external_game_id = s.schedule_id
+         WHERE s.guild_id = $1 AND s.league_id::text = $2::text AND s.stat_type = $3
+           AND g.season_year IS NOT NULL
+         UNION ALL
+         SELECT a.full_name, a.team_name, a.season_year,
+                ${maddenJsonNumberSql(jsonField, 'a')} AS stat_value
+         FROM madden_player_weekly_stats_archive a
+         WHERE a.guild_id = $1 AND a.league_id::text = $2::text AND a.stat_type = $3
+           AND a.season_year IS NOT NULL
+       ) combined
+       GROUP BY full_name, team_name, season_year
        ORDER BY stat_value DESC NULLS LAST
        LIMIT 1`,
       [guildId, leagueId, statType]
-    ).catch(() => ({ rows: [] }));
+    ).catch(err => {
+      console.error('[LEAGUE RECORDS] Single-season leader query failed:', err?.message);
+      return { rows: [] };
+    });
     const row = result.rows[0];
     if (!row || !row.stat_value) return `**${label}:** No season-tagged data yet`;
     return `**${label}:** ${formatMaddenLeaderNumber(row.stat_value)} — ${row.full_name} (${maddenTeamDisplayName(row.team_name)}, ${row.season_year})`;
@@ -66151,7 +66239,7 @@ async function buildMaddenLeagueRecordsEmbed(guildId, league) {
       { name: '📅 Single-Season Team Records', value: seasonRecords.slice(0, 1024), inline: false },
       { name: 'Offensive Records (Career)', value: offenseRecords.slice(0, 1024), inline: false },
       { name: 'Defensive Records (Career)', value: defensiveRecords.slice(0, 1024), inline: false },
-      { name: 'Team Records (Current Season Standings)', value: teamRecords.slice(0, 1024), inline: false },
+      { name: 'Team Records (All-Time, Power Rank Current)', value: teamRecords.slice(0, 1024), inline: false },
       { name: '📈 Record Watch', value: recordWatch.slice(0, 1024), inline: false },
       { name: 'Command', value: '`/madden franchise view:League Records`', inline: false }
     )
@@ -79003,7 +79091,80 @@ function maddenIsRegularSeasonWeek(weekLabel) {
 // silently never fire, permanently blocking the wipe, the kickoff
 // announcement, and next year's Super Bowl→offseason detection (which
 // itself is gated on stage no longer being stuck at 'offseason').
+// 7J-STATSWIPEARCHIVE: real bug, confirmed live — three separate features
+// (single-game player records, single-season player records, and career
+// records via refreshMaddenCareerRecordsFoundation) all depend on reading
+// madden_player_weekly_stats as if it were permanent, while
+// wipeMaddenWeeklyStats treats it as fully disposable and clears it TWICE
+// a season (preseason kickoff and regular-season kickoff). Career records
+// in particular recomputes by summing whatever's currently in the live
+// table and overwriting madden_career_records with that sum every time
+// Hall of Fame/League Records is viewed — if that view happens to run
+// after a wipe has already cleared prior-season rows, real history gets
+// silently erased, with correctness depending entirely on view timing
+// relative to the wipe. Archiving the full contents into a permanent
+// table right before every wipe, with week_label/season_year resolved and
+// baked in via a join at archive time (so later queries never depend on
+// madden_imported_games still having a matching row), fixes all three at
+// the root instead of one at a time.
+async function ensureMaddenPlayerWeeklyStatsArchiveTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS madden_player_weekly_stats_archive (
+      id TEXT PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      league_id TEXT NOT NULL,
+      external_league_id TEXT,
+      stat_type TEXT NOT NULL,
+      week_index INTEGER NOT NULL,
+      display_week INTEGER NOT NULL,
+      stage_index INTEGER NOT NULL,
+      player_key TEXT,
+      roster_id TEXT,
+      presentation_id TEXT,
+      team_id TEXT,
+      team_name TEXT,
+      full_name TEXT,
+      position TEXT,
+      schedule_id TEXT,
+      stat_id TEXT,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      imported_at TIMESTAMPTZ,
+      week_label TEXT,
+      season_year TEXT,
+      archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+async function archiveMaddenWeeklyStats(guildId, leagueId) {
+  await ensureMaddenPlayerWeeklyStatsArchiveTable();
+  const archived = await pool.query(
+    `INSERT INTO madden_player_weekly_stats_archive (
+       id, guild_id, league_id, external_league_id, stat_type, week_index, display_week,
+       stage_index, player_key, roster_id, presentation_id, team_id, team_name, full_name,
+       position, schedule_id, stat_id, raw_payload, imported_at, week_label, season_year
+     )
+     SELECT s.id, s.guild_id, s.league_id, s.external_league_id, s.stat_type, s.week_index, s.display_week,
+       s.stage_index, s.player_key, s.roster_id, s.presentation_id, s.team_id, s.team_name, s.full_name,
+       s.position, s.schedule_id, s.stat_id, s.raw_payload, s.imported_at,
+       g.week_label, g.season_year::text
+     FROM madden_player_weekly_stats s
+     LEFT JOIN madden_imported_games g
+       ON g.guild_id = s.guild_id AND g.league_id::text = s.league_id::text
+      AND g.external_game_id = s.schedule_id
+     WHERE s.guild_id = $1::text AND s.league_id::text = $2::text
+     ON CONFLICT (id) DO NOTHING`,
+    [guildId, String(leagueId)]
+  ).catch(err => {
+    console.error('[SEASON TRANSITION] Weekly stats archive failed:', err?.message);
+    return null;
+  });
+  return archived?.rowCount || 0;
+}
+
 async function wipeMaddenWeeklyStats(guildId, leagueId) {
+  const archivedCount = await archiveMaddenWeeklyStats(guildId, leagueId);
+  console.log('[SEASON TRANSITION] Archived weekly stats before wipe:', archivedCount, 'rows');
   const wiped = await pool.query(
     `DELETE FROM madden_player_weekly_stats
      WHERE guild_id = $1 AND league_id::text = $2::text`,
