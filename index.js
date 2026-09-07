@@ -3864,7 +3864,7 @@ function buildCommands() {
         .addBooleanOption(o => o.setName('reset_week_detection').setDescription('Also clear the stored week-advance detection state, forcing a fresh re-evaluation on the next sync').setRequired(false)))
       .addSubcommand(sc => sc
         .setName('forcekickoff')
-        .setDescription('Staff: manually run the real regular-season kickoff when EA\'s own data can\'t distinguish it from Cut Week')
+        .setDescription('Staff: manually run the real regular-season kickoff when EA can\'t tell it apart from Cut Week')
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('week_label').setDescription('The real current week, exactly as it appears in your schedule (e.g. "Week 1")').setRequired(true))
         .addBooleanOption(o => o.setName('confirm').setDescription('Run the kickoff now? Leave false to preview what would happen.').setRequired(false)))
@@ -5661,7 +5661,29 @@ async function buildMaddenOffseasonReadinessEmbed(guildId, league) {
 }
 
 function getRegisteredCommands() {
-  const commands = buildCommands();
+  // 7J-CMDBUILDSAFETY: real bug, confirmed live — /forcekickoff's
+  // description was 105 characters (Discord's hard limit is 100).
+  // buildCommands() throws synchronously and unguarded the moment
+  // .setDescription() hits an invalid string, and this function had no
+  // try/catch around that call at all. Since command (re-)registration
+  // runs on normal bot startup, this meant the bot could crash before it
+  // finished reconnecting to Discord — then crash again on the very next
+  // restart attempt for the identical reason, a genuine crash loop, which
+  // is what produced a 15-minute "stuck" sync and a cascade of orphaned-
+  // interaction errors (Unknown interaction / already acknowledged) that
+  // had nothing to do with the sync itself. The one offending description
+  // is fixed, but this try/catch stays as a permanent safety net: if a
+  // future command description ever regresses past 100 chars again, this
+  // now logs exactly which command/subcommand failed and lets the bot
+  // stay alive and responsive (commands just won't update that run)
+  // instead of taking the whole process down.
+  let commands;
+  try {
+    commands = buildCommands();
+  } catch (error) {
+    console.error('[COMMAND REGISTRATION] buildCommands() threw — check for a command/subcommand/option description over Discord\'s 100-char limit. Bot is staying up; commands will not be (re)registered until this is fixed:', error?.message || error);
+    return [];
+  }
   const MAX_COMMANDS = 100;
 
   console.log('Prepared command count:', commands.length);
@@ -77625,10 +77647,27 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
         // madden_imported_games — using that instead closes the collision
         // risk entirely, without needing to fix weekIndex's derivation
         // itself.
+        // 7J-PROPDEDUPSTATUSBLIND: real bug, confirmed live — a Super Bowl
+        // bracket slot (same madden_imported_games row throughout) started
+        // with Ravens as the premature/placeholder home team, got props
+        // generated for them, then got corrected in place once the real
+        // Conference Championships finished (Eagles home, Ravens away).
+        // The weekly cleanup correctly refunded the stale Ravens props tied
+        // to the premature matchup — but this dedup check had no status
+        // filter at all, so it still found those REFUNDED rows matching on
+        // (subject_ref, stat_key, league_game_id) and treated them as "already
+        // has a line," permanently blocking every Ravens candidate from ever
+        // getting a fresh prop for the real game. Eagles, a brand-new
+        // participant on this row, had no stale rows to collide with and
+        // generated cleanly — which is why only one side of a real
+        // matchup could end up with props. Only an OPEN existing line
+        // should block regeneration; a refunded/settled one is dead and
+        // shouldn't count.
         const existing = await pool.query(
           `SELECT id FROM sportsbook_games
            WHERE guild_id = $1 AND league_id = $2::uuid AND bet_type = 'stat_prop'
-             AND subject_ref = $3 AND stat_key = $4 AND league_game_id = $5`,
+             AND subject_ref = $3 AND stat_key = $4 AND league_game_id = $5
+             AND status = 'open'`,
           [guild.id, league.league_id, playerRef, statKey, game.id]
         ).catch(() => ({ rows: [] }));
         if (existing.rows.length) {
