@@ -76046,7 +76046,38 @@ async function buildMaddenFranchiseEmbed(guild, league, teamRoleId = null, userI
       .setTimestamp();
   }
 
-  const teamName = franchise.team_name;
+  // 7J-FRANCHISEHUBNAMEMISMATCH: real bug, confirmed live — the Franchise
+  // Hub showed "no data found" across every section (team leaders, top
+  // players, recent games, power rank) for a league whose commissioner
+  // named team roles with full city+mascot names ("Miami Dolphins")
+  // instead of just the mascot ("Dolphins"). franchise.team_name comes
+  // straight from the Discord role name (syncMaddenFranchises), with no
+  // normalization — but every EA-sourced table (madden_imported_team_stats,
+  // madden_imported_games, madden_power_rankings, roster data) stores
+  // whatever short name EA itself uses, which is consistently the mascot
+  // alone across every league checked this session. The queries below all
+  // required an EXACT match against that raw role-derived name, so a full
+  // city+mascot role name could never match. Thread creation and owner
+  // lookups elsewhere in the codebase already tolerate this exact
+  // difference via a bidirectional "contains" check
+  // (findMaddenTeamRoleId/isTeamNameMatch) — the Hub simply never got the
+  // same treatment. Resolved once here, so every downstream query below
+  // (team stats, recent games, power rank, leaders, top players) benefits
+  // without needing its own fuzzy-matching logic. No effect on leagues
+  // whose role names already match the EA short name exactly (a string
+  // always "contains" itself), so this can't regress the common case.
+  let teamName = franchise.team_name;
+  const canonicalTeamNameResult = await pool.query(
+    `SELECT DISTINCT team_name FROM madden_imported_team_stats
+     WHERE guild_id = $1::text AND league_id::text = $2::text AND team_name IS NOT NULL`,
+    [guild.id, league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const canonicalTeamNameMatch = (canonicalTeamNameResult.rows || []).find(r => {
+    const a = String(r.team_name || '').toLowerCase();
+    const b = String(teamName || '').toLowerCase();
+    return a && b && (a.includes(b) || b.includes(a));
+  });
+  if (canonicalTeamNameMatch?.team_name) teamName = canonicalTeamNameMatch.team_name;
   const [teamStatsResult, detailedRanks, leaders, topPlayers, recentGamesResult, nextGame, powerRankResult] = await Promise.all([
     pool.query(
       `SELECT *
