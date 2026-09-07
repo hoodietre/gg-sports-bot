@@ -66260,7 +66260,6 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
   // the imported player weekly stat rows for each player. The previous latest-snapshot attempt was
   // selecting a single week row, which made leaders/awards show 4-8 TDs while /madden player showed 21 TD.
   const fieldSql = fields.map(([alias, jsonKey]) => `SUM(${maddenJsonNumberSql(jsonKey)}) AS "${alias}"`).join(',\n       ');
-  const groupAliases = fields.map(([alias]) => `, g."${alias}"`).join('\n');
 
   const params = [guildId, leagueId, category.statType, limit];
   let weekClause = '';
@@ -66293,30 +66292,71 @@ async function getMaddenLeagueLeaders(guildId, leagueId, categoryKey, week = nul
        FROM stat_rows s
        GROUP BY grouping_key
        HAVING SUM(${metricSql}) > 0
+     ),
+     -- 7J-ROSTERIDFANOUT: real bug, confirmed live — roster_id in this
+     -- Madden export is a roster SLOT number, not a permanent per-player
+     -- ID, and it gets reused when a player leaves that slot and someone
+     -- else takes it (a release followed by a new signee, a draftee
+     -- filling a cut veteran's spot, etc.). madden_players ends up with
+     -- TWO rows sharing the same roster_id — confirmed directly: a real
+     -- rookie (Jayden Heenan, MIKE, 97 tackles) and an unrelated veteran
+     -- (De'Shaan Dixon, REDGE, 3 years pro) both matched roster_id
+     -- 553386650. The old join here matched BOTH of them and collapsed
+     -- the pair with MAX(p.position)/MAX(p.raw_payload::text) — which
+     -- doesn't pick "the right player," it picks whichever value sorts
+     -- alphabetically higher ('REDGE' > 'MIKE'), silently relabeling a
+     -- real rookie's production with a different, unrelated veteran's
+     -- position AND years-pro, which is exactly why the awards race
+     -- rookie filter excluded him. Fixed by resolving exactly ONE
+     -- madden_players row per stat group instead of aggregating across
+     -- however many happen to match: exact roster_id match preferred
+     -- over the weaker fallbacks, and among ties, the most recently
+     -- imported row (the current occupant of that slot, not a stale
+     -- departed one).
+     matched_player AS (
+       SELECT DISTINCT ON (g.grouping_key)
+         g.grouping_key,
+         p.team_name AS m_team_name,
+         p.position AS m_position,
+         p.age AS m_age,
+         p.raw_payload::text AS m_roster_raw_payload_text
+       FROM grouped g
+       LEFT JOIN madden_players p
+         ON p.guild_id = $1::text
+        AND p.league_id::text = $2::text
+        AND (
+          (g.roster_id <> '' AND p.roster_id = g.roster_id)
+          OR (g.team_id <> '' AND p.team_id = g.team_id AND p.full_name = g.player_name)
+          OR (p.full_name = g.player_name)
+        )
+       ORDER BY g.grouping_key,
+         (g.roster_id <> '' AND p.roster_id = g.roster_id) DESC,
+         (g.team_id <> '' AND p.team_id = g.team_id AND p.full_name = g.player_name) DESC,
+         p.imported_at DESC NULLS LAST
+     ),
+     matched_team AS (
+       SELECT DISTINCT ON (g.grouping_key)
+         g.grouping_key,
+         t.team_name AS m_team_stats_name
+       FROM grouped g
+       LEFT JOIN madden_imported_team_stats t
+         ON t.guild_id = $1::text
+        AND t.league_id::text = $2::text
+        AND (
+          (g.team_id <> '' AND t.external_team_id::text = g.team_id)
+          OR (g.team_id <> '' AND t.team_name = g.stat_team_name)
+        )
+       ORDER BY g.grouping_key, t.team_name
      )
      SELECT
        g.*,
-       COALESCE(NULLIF(MAX(p.team_name), ''), NULLIF(MAX(t.team_name), ''), NULLIF(g.stat_team_name, ''), '') AS resolved_team_name,
-       COALESCE(NULLIF(MAX(p.position), ''), '') AS position,
-       MAX(p.age) AS age,
-       MAX(p.raw_payload::text) AS roster_raw_payload_text
+       COALESCE(NULLIF(mp.m_team_name, ''), NULLIF(mt.m_team_stats_name, ''), NULLIF(g.stat_team_name, ''), '') AS resolved_team_name,
+       COALESCE(NULLIF(mp.m_position, ''), '') AS position,
+       mp.m_age AS age,
+       mp.m_roster_raw_payload_text AS roster_raw_payload_text
      FROM grouped g
-     LEFT JOIN madden_players p
-       ON p.guild_id = $1::text
-      AND p.league_id::text = $2::text
-      AND (
-        (g.roster_id <> '' AND p.roster_id = g.roster_id)
-        OR (g.team_id <> '' AND p.team_id = g.team_id AND p.full_name = g.player_name)
-        OR (p.full_name = g.player_name)
-      )
-     LEFT JOIN madden_imported_team_stats t
-       ON t.guild_id = $1::text
-      AND t.league_id::text = $2::text
-      AND (
-        (g.team_id <> '' AND t.external_team_id::text = g.team_id)
-        OR (g.team_id <> '' AND t.team_name = g.stat_team_name)
-      )
-     GROUP BY g.grouping_key, g.player_name, g.stat_team_name, g.roster_id, g.team_id, g.leader_value, g.rows${groupAliases}
+     LEFT JOIN matched_player mp ON mp.grouping_key = g.grouping_key
+     LEFT JOIN matched_team mt ON mt.grouping_key = g.grouping_key
      ORDER BY g.leader_value DESC, g.player_name ASC
      LIMIT $4`,
     params
