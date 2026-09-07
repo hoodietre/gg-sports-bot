@@ -55411,36 +55411,72 @@ async function deleteMaddenWeekThreadsSilent(guild, league, weekLabel) {
     [guild.id, String(league.league_id), weekLabel]
   ).catch(() => ({ rows: [] }));
   let deleted = 0, failed = 0;
+  const clearedGameIds = [];
   for (const game of result.rows || []) {
-    const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+    // 7J-THREADDELETEDIAGNOSTIC: real bug, confirmed live — a leftover
+    // Week 1 thread stayed visible in Discord after a multi-week catch-up
+    // advanced to Week 8, even though the DB's thread_id had already been
+    // cleared to NULL for it (this function clears the DB reference
+    // unconditionally at the end, regardless of whether the actual
+    // Discord delete succeeded). The real Discord-side error was
+    // previously swallowed by a bare `.catch(() => false)`, so there was
+    // no way to tell WHY the delete call failed (permissions? an
+    // already-archived-thread quirk? a rate limit?). Logged the real error
+    // starting here — but this alone turned out not to be the whole
+    // disease (see 7J-THREADFETCHDIAGNOSTIC below).
+    //
+    // 7J-THREADFETCHDIAGNOSTIC: real bug, confirmed live (recurred on a
+    // normal single-week Week 1 -> Week 2 advance, not just multi-week
+    // catch-ups — ruling out "catch-up specific" as the shape). Direct
+    // evidence: the log reported "16 removed, 0 failed" and the DB's
+    // thread_id was already cleared for the orphaned game, yet the actual
+    // Discord thread was still there. That combination proves
+    // thread.delete() was never even called — the fetch one line above it
+    // failed and got silently treated as "must already be gone" by the bare
+    // `.catch(() => null)`, incrementing `deleted` with zero diagnostics
+    // regardless of WHY the fetch failed (rate limit, transient API
+    // hiccup, or a genuine already-gone thread all looked identical).
+    // Only Discord's own "Unknown Channel" error (code 10003) legitimately
+    // means the thread doesn't exist — every other fetch failure is now
+    // logged and counted as a real failure, and its DB reference is
+    // deliberately left in place (not cleared) so the next auto-detect
+    // cycle picks it back up and retries instead of losing track of it.
+    let thread = null;
+    let fetchConfirmedGone = false;
+    try {
+      thread = await guild.channels.fetch(game.thread_id, { force: true });
+    } catch (error) {
+      if (error?.code === 10003) {
+        fetchConfirmedGone = true;
+      } else {
+        console.error(`[AUTO GAME THREADS] Failed to FETCH thread ${game.thread_id} (${game.away_team} @ ${game.home_team}, ${weekLabel}) — treating as unresolved, NOT clearing DB reference:`, error?.message || error);
+        failed++;
+        continue;
+      }
+    }
     if (thread) {
-      // 7J-THREADDELETEDIAGNOSTIC: real bug, confirmed live — a leftover
-      // Week 1 thread stayed visible in Discord after a multi-week catch-up
-      // advanced to Week 8, even though the DB's thread_id had already been
-      // cleared to NULL for it (this function clears the DB reference
-      // unconditionally at the end, regardless of whether the actual
-      // Discord delete succeeded). The real Discord-side error was
-      // previously swallowed by a bare `.catch(() => false)`, so there was
-      // no way to tell WHY the delete call failed (permissions? an
-      // already-archived-thread quirk? a rate limit?). Logs the real error
-      // now so the next occurrence is actually diagnosable instead of just
-      // "failed, cause unknown" again.
       const ok = await thread.delete('GG Sports auto game thread rotation').catch(error => {
         console.error(`[AUTO GAME THREADS] Failed to delete thread ${game.thread_id} (${game.away_team} @ ${game.home_team}, ${weekLabel}):`, error?.message || error);
         return false;
       });
-      if (ok !== false) deleted++;
-      else failed++;
-    } else {
-      deleted++; // already gone from Discord — still counts as cleared
+      if (ok !== false) {
+        deleted++;
+        clearedGameIds.push(game.id);
+      } else {
+        failed++; // leave the DB reference in place so this is retried next time, not silently orphaned
+      }
+    } else if (fetchConfirmedGone) {
+      deleted++; // confirmed gone via Discord's own "Unknown Channel" — safe to clear
+      clearedGameIds.push(game.id);
     }
   }
-  await pool.query(
-    `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
-     WHERE guild_id = $1 AND league_id::text = $2::text
-       AND LOWER(COALESCE(week_label, '')) = LOWER($3)`,
-    [guild.id, String(league.league_id), weekLabel]
-  ).catch(() => null);
+  if (clearedGameIds.length) {
+    await pool.query(
+      `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
+       WHERE id = ANY($1::uuid[])`,
+      [clearedGameIds]
+    ).catch(() => null);
+  }
   return { deleted, failed };
 }
 
@@ -55491,11 +55527,46 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
     processedMatchups.add(matchupKey);
 
     if (game.thread_id) {
-      const existing = await guild.channels.fetch(game.thread_id).catch(() => null);
+      // 7J-THREADCREATEDUPGUARD: real bug, confirmed live — this exact
+      // fetch-failure-treated-as-"doesn't-exist" shape (same disease as
+      // 7J-THREADFETCHDIAGNOSTIC on the delete side) caused a genuine
+      // second set of Week 1 threads to get created during a redundant
+      // "new week detected" re-fire that happens periodically for the
+      // current week (harmless every OTHER time, since it normally just
+      // re-confirms the thread still exists and skips). When
+      // guild.channels.fetch(game.thread_id) failed here for all 16 games
+      // at once (consistent with a transient rate-limit/API burst, not 16
+      // independently-gone threads), the bare `.catch(() => null)` made
+      // every one of them look "not found," so the loop fell through and
+      // created 16 brand-new threads — then unconditionally overwrote
+      // thread_id below with the NEW thread's ID, permanently losing the
+      // only reference to the ORIGINAL thread still sitting in Discord.
+      // The next week's delete step then correctly deleted the (wrong)
+      // second set using the DB's now-overwritten reference, leaving the
+      // real original orphaned with nothing pointing at it anymore.
+      // Fixed with the safer bias for this direction: only Discord's own
+      // "Unknown Channel" error (code 10003) means genuinely gone and
+      // safe to replace — any other fetch failure is treated as "probably
+      // still exists, don't risk a duplicate," skipping this game for now
+      // rather than creating a second thread over an unconfirmed fetch.
+      let existing = null;
+      let confirmedGone = false;
+      try {
+        existing = await guild.channels.fetch(game.thread_id, { force: true });
+      } catch (error) {
+        if (error?.code === 10003) {
+          confirmedGone = true;
+        } else {
+          console.error(`[7J-10BY-GT GAME THREAD] Could not verify existing thread ${game.thread_id} for ${label} — treating as still-existing to avoid creating a duplicate:`, error?.message || error);
+          out.skipped.push({ label, threadId: game.thread_id });
+          continue;
+        }
+      }
       if (existing) {
         out.skipped.push({ label, threadId: existing.id });
         continue;
       }
+      if (!confirmedGone) continue; // defensive: should be unreachable, but never fall through to creation without a confirmed-gone signal
     }
     const owners = {
       away: await getMaddenTeamOwnerForGameThread(guild, league, game.away_team, game.away_team_role_id),
