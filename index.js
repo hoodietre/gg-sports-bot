@@ -79598,6 +79598,37 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   });
   console.log('[SEASON TRANSITION] Reset storyline dedup state:', storylineResetResult?.rowCount || 0, 'entries cleared');
 
+  // 7J-TEAMSTATSOFFSEASONRESET: real bug, confirmed live — a Draft-stage
+  // sync flipped current_season_stage all the way to 'regular' and created
+  // real "Week 1" game threads, months before the actual next season
+  // started. Root cause traced two layers deep: EA reported an ambiguous
+  // bare "Week 1" during Draft (the same raw-text unreliability behind
+  // several other bugs this session), which is a known, hard-to-fully-
+  // prevent signal quality problem — but the SECOND layer is what actually
+  // made it destructive rather than harmless. hasRealRecordDataForKickoff
+  // exists specifically to catch a bare "Week 1" that ISN'T real, by
+  // checking for a non-zero win/loss/points record on any team — but
+  // nothing anywhere in this codebase ever reset madden_imported_team_stats
+  // between seasons. The season that just finished is still sitting in
+  // that table with its real, final standings, for the entire following
+  // offseason, every single year — so this check has been unconditionally
+  // true for the whole offseason since the day it was written, not a rare
+  // misfire. Resetting it here, at the same reliable Super Bowl finalize
+  // point already used for the sportsbook board and storyline dedup reset,
+  // means the next time this exact ambiguous EA signal shows up, the
+  // record-data check will correctly find nothing and hold the gate closed
+  // like it was always supposed to.
+  const teamStatsResetResult = await pool.query(
+    `UPDATE madden_imported_team_stats
+     SET wins = 0, losses = 0, ties = 0, points_for = 0, points_against = 0, scored_games = 0
+     WHERE guild_id = $1 AND league_id::text = $2::text`,
+    [guild.id, String(league.league_id)]
+  ).catch(err => {
+    console.error('[SEASON TRANSITION] Team standings reset failed:', err?.message);
+    return null;
+  });
+  console.log('[SEASON TRANSITION] Reset team standings for offseason:', teamStatsResetResult?.rowCount || 0, 'team(s)');
+
   await pool.query(
     `UPDATE madden_league_settings SET current_season_stage = 'offseason', updated_at = NOW() WHERE league_id = $1`,
     [league.league_id]
@@ -80526,8 +80557,30 @@ async function autoDetectAfterSyncInner(guild, league) {
     console.log(`[AUTO DETECT] Processing ${weekLabel} for league ${league.league_id}` + (isFinalWeek ? ' (current week)' : ' (catch-up week)'));
 
     if (isFinalWeek) {
-      await autoCreateGameThreadsAfterSync(guild, league, weekLabel).catch(err =>
-        console.error('[AUTO DETECT] Game thread creation failed:', err?.message || err));
+      // 7J-THREADCREATESTAGEGUARD: real bug, confirmed live — this is a
+      // SEPARATE call site from the one guarded by
+      // eaCurrentWeekSettings.current_season_stage !== 'offseason' above
+      // (that one only covers the catch-up retry path). This one, inside
+      // the main detection loop, fired purely on isFinalWeek with zero
+      // stage awareness at all — so a bare, ambiguous "Week 1" from EA
+      // during offseason (the exact same raw-text unreliability that's
+      // caused several other bugs fixed this session) created real threads
+      // regardless of what stage the league was actually confirmed to be
+      // in. The earlier 7J-WEEKTYPESTAGEGUARD/GAP fixes gate schedule
+      // import labeling and sportsbook creation — neither of those touches
+      // this call site, which is why threads kept getting created even
+      // after those fixes deployed. Re-checking the league's own current
+      // stage fresh here (not trusting anything computed earlier in this
+      // sync, since a stage flip can happen mid-loop per this function's
+      // own design) closes this the same way the other call site already
+      // does it.
+      const stageGuardSettings = await ensureMaddenLeagueSettings(league).catch(() => null);
+      if (stageGuardSettings?.current_season_stage === 'offseason') {
+        console.log(`[AUTO DETECT] Skipping game thread creation for ${weekLabel} — league is still confirmed offseason.`);
+      } else {
+        await autoCreateGameThreadsAfterSync(guild, league, weekLabel).catch(err =>
+          console.error('[AUTO DETECT] Game thread creation failed:', err?.message || err));
+      }
     } else {
       console.log(`[AUTO DETECT] Skipping game threads for ${weekLabel} — already-decided catch-up week, not the current one.`);
     }
