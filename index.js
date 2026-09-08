@@ -27948,25 +27948,60 @@ if (gameSubcommand === 'report') {
           await interaction.editReply({ embeds: [embed] });
           return;
         }
-        // confirm:true — delete threads from Discord and clear from DB
+        // 7J-MANUALCLEANUPGUARD: real bug, confirmed live — this command
+        // had its own independent copy of two bugs already fixed elsewhere
+        // in the automated thread-rotation paths, never touched by those
+        // fixes since this is a separate manual staff command. (1) A fetch
+        // failure was silently treated as "already gone" via a bare
+        // `.catch(() => null)`, same disease as 7J-THREADFETCHDIAGNOSTIC.
+        // (2) Worse: the DB clear at the end used to be an unconditional
+        // blanket UPDATE by week_label, clearing thread_id for every game
+        // in that week regardless of whether ITS delete actually succeeded
+        // — so a single silent failure here would still erase that game's
+        // only reference to its (still very much existing) thread,
+        // orphaning it exactly the way a real Broncos @ Dolphins Week 1
+        // thread was found orphaned after this exact class of gap. Now
+        // only clears the DB reference for confirmed-deleted or
+        // Discord-confirmed-gone (error code 10003) games — a real failure
+        // leaves the reference in place so it can be found and retried,
+        // not silently erased.
         const deleted = [];
         const failed = [];
+        const confirmedClearIds = [];
         for (const game of withThreads) {
           const label = `${game.away_team || '?'} @ ${game.home_team || '?'}`;
-          const thread = await guild.channels.fetch(game.thread_id).catch(() => null);
+          let thread = null;
+          let confirmedGone = false;
+          try {
+            thread = await guild.channels.fetch(game.thread_id, { force: true });
+          } catch (error) {
+            if (error?.code === 10003) {
+              confirmedGone = true;
+            } else {
+              failed.push(`${label} (could not verify — left in place for retry)`);
+              continue;
+            }
+          }
           if (thread) {
             const ok = await thread.delete('GG Sports game thread cleanup').catch(() => false);
-            if (ok !== false) deleted.push(label);
-            else failed.push(label);
-          } else {
+            if (ok !== false) {
+              deleted.push(label);
+              confirmedClearIds.push(game.id);
+            } else {
+              failed.push(label);
+            }
+          } else if (confirmedGone) {
             deleted.push(`${label} (already gone)`);
+            confirmedClearIds.push(game.id);
           }
         }
-        await pool.query(
-          `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
-           WHERE guild_id = $1 AND league_id::text = $2::text AND LOWER(COALESCE(week_label,'')) = LOWER($3)`,
-          [guild.id, String(activeLeague.league_id), String(week || '')]
-        ).catch(() => null);
+        if (confirmedClearIds.length) {
+          await pool.query(
+            `UPDATE madden_imported_games SET thread_id = NULL, thread_created_at = NULL
+             WHERE id = ANY($1::uuid[])`,
+            [confirmedClearIds]
+          ).catch(() => null);
+        }
         if (deleted.length) embed.addFields({ name: `Deleted (${deleted.length})`, value: deleted.map(l => `• ${l}`).join('\n').slice(0, 1024), inline: false });
         if (failed.length) embed.addFields({ name: `Failed (${failed.length})`, value: failed.map(l => `• ${l}`).join('\n').slice(0, 1024), inline: false });
         if (!deleted.length && !failed.length) embed.addFields({ name: 'Result', value: 'No threads found to delete for this week.', inline: false });
