@@ -74202,9 +74202,22 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
     const earlyWeekTypeIsGenuine = Boolean(earlyEaHubCtx?.weekTypeSource) &&
       !String(earlyEaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK') &&
       settings.current_season_stage === 'preseason';
-    const earlyExplicitlyRegularSeason = earlyEaHubCtx?.nextSeasonWeekType === 1
+    // 7J-WEEKTYPESTAGEGUARDGAP: real bug, confirmed live — the original
+    // 7J-WEEKTYPESTAGEGUARD fix only gated the MIDDLE disjunct here
+    // (earlyWeekTypeIsGenuine already folds in the stage check). The
+    // other two — a bare nextSeasonWeekType === 1, and hasRealRecordData
+    // === true — were left completely unguarded, so either one alone
+    // could still make earlyExplicitlyRegularSeason true during offseason
+    // regardless of stage, reproducing the exact same premature real-
+    // Week-1 game threads at a Draft-stage sync that the original fix was
+    // supposed to have closed. Wrapping the whole disjunction in the
+    // stage check (rather than just one branch of it) closes all three
+    // paths in at once instead of one at a time as they're discovered.
+    const earlyExplicitlyRegularSeason = settings.current_season_stage === 'preseason' && (
+      earlyEaHubCtx?.nextSeasonWeekType === 1
       || (earlyWeekTypeIsGenuine && (earlyEaHubCtx?.weekType === 1 || earlyEaHubCtx?.seasonWeekType === 1))
-      || hasRealRecordData === true;
+      || hasRealRecordData === true
+    );
     // 7J-STAGEGUARDEDPRESEASONDEFAULT: ambiguous only resolves to "still
     // preseason" while the league's own confirmed stage isn't already past
     // it — see the shared comment on stageAlreadyPastPreseason above.
@@ -74316,17 +74329,17 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
       // direction, since staying gated one extra sync is recoverable and
       // wrongly unlocking isn't.
       const explicitlyPreseason = eaHubCtx?.nextSeasonWeekType === 0 || preseasonMode === true;
-      // 7J-WEEKTYPESTAGEGUARD: identical fix to the early computation site
-      // above — see that comment block for the full regression, confirmed
-      // live during a Draft-stage (offseason) sync. Kept in sync with the
-      // early site intentionally, per this function's own stated design
-      // principle that the two must never be allowed to disagree.
+      // 7J-WEEKTYPESTAGEGUARDGAP: identical fix to the early computation
+      // site above — see that comment block for the full story. Same gap,
+      // same fix, kept in sync intentionally.
       const weekTypeIsGenuine = Boolean(eaHubCtx?.weekTypeSource) &&
         !String(eaHubCtx.weekTypeSource).startsWith('DEFAULT_FALLBACK') &&
         settings.current_season_stage === 'preseason';
-      const explicitlyRegularSeason = eaHubCtx?.nextSeasonWeekType === 1
+      const explicitlyRegularSeason = settings.current_season_stage === 'preseason' && (
+        eaHubCtx?.nextSeasonWeekType === 1
         || (weekTypeIsGenuine && (eaHubCtx?.weekType === 1 || eaHubCtx?.seasonWeekType === 1))
-        || hasRealRecordData === true;
+        || hasRealRecordData === true
+      );
       // 7J-STAGEGUARDEDPRESEASONDEFAULT: same guard as the early computation
       // above — ambiguous only resolves to "still preseason" while the
       // league's own confirmed stage isn't already past it. Reuses the same
