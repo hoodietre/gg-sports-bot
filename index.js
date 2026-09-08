@@ -55634,6 +55634,16 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
     if (processedMatchups.has(matchupKey)) continue;
     processedMatchups.add(matchupKey);
 
+    // 7J-THREADIDREADDIAGNOSTIC: added after a real, confirmed-but-not-
+    // fully-root-caused duplicate (Broncos @ Dolphins, real Week 1) — the
+    // database reference to an existing thread was proven (via Discord's
+    // own audit log) to have gone from populated to empty in a narrow
+    // window between two passes, with the actual cause still unconfirmed.
+    // Logs the exact value read here so any future recurrence is
+    // immediately diagnosable from this one line instead of requiring
+    // hours of after-the-fact timestamp/audit-log reconstruction.
+    console.log(`[7J-10BY-GT GAME THREAD] Read check for ${label}: thread_id=${game.thread_id || '(empty)'}`);
+
     if (game.thread_id) {
       // 7J-THREADCREATEDUPGUARD: real bug, confirmed live — this exact
       // fetch-failure-treated-as-"doesn't-exist" shape (same disease as
