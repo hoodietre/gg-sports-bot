@@ -75617,9 +75617,33 @@ async function runDueMaddenAutosyncs(client) {
       // Game thread creation now happens inside autoDetectAfterSync, gated on the
       // confirmed newWeekLabel — see handoff notes in the tracking doc.
 
-      await autoDetectAfterSync(guild, league).catch(error => {
-        console.error('[Madden Autosync] Auto detect failed:', error?.message || error);
-      });
+      // 7J-AUTODETECTDOUBLECALL: real bug, confirmed by code trace — for an
+      // ea_direct league (what real leagues here actually use),
+      // runMaddenExternalFetchSync already calls autoDetectAfterSync
+      // internally as the last step of runMaddenEaDirectSync. Calling it
+      // again here unconditionally meant every scheduled autosync tick ran
+      // full auto-detection (thread-creation retry, sportsbook settlement,
+      // playoff bracket catch-up, etc.) TWICE, back to back, for those
+      // leagues — pure waste, and the exact "does this machinery re-run on
+      // a redundant re-detect" shape worth ruling out for any future
+      // duplicate-thread investigation. The maddenAutoDetectInFlightLeagues
+      // lock only blocks concurrent overlap, not this kind of sequential
+      // double-call.
+      // NOT removed outright: the legacy external URL/JSON sync path
+      // (runMaddenExternalFetchSyncInner's non-ea_direct branch) does NOT
+      // call autoDetectAfterSync internally at all — this call is the ONLY
+      // thing that triggers detection after a scheduled sync for that path,
+      // so removing it entirely would silently break auto-detection for any
+      // league still on that fallback. Gated on run.source instead, which
+      // runMaddenEaDirectSync hardcodes to 'ea_direct' on the sync-run row
+      // it creates — reliably distinguishes the two paths, and also
+      // correctly skips this on a {status:'skipped'} result (sync already
+      // in-flight elsewhere), which has no source field either.
+      if (run?.source !== 'ea_direct') {
+        await autoDetectAfterSync(guild, league).catch(error => {
+          console.error('[Madden Autosync] Auto detect failed:', error?.message || error);
+        });
+      }
 
       const interval = Math.max(Number(row.autosync_interval_minutes || 60), 15);
       await pool.query(
