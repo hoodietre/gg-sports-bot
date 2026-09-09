@@ -51910,6 +51910,23 @@ async function findMaddenTeamRoleId(leagueId, teamName) {
 
 async function importMaddenTeamsFromArray(guild, league, rows) {
   let imported = 0;
+  // 7J-TEAMSTATSPRIMARYIMPORTOFFSEASONGUARD: real bug, confirmed live —
+  // this is the PRIMARY team import path (every sync, before any of the
+  // nine secondary "harvest" functions guarded by
+  // isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard run at all), and it
+  // was completely missed when guarding those nine — found by pattern-
+  // matching function names like "harvest/accumulate/sweep/walk" instead
+  // of checking the actual main pipeline. Confirmed live: real prior-
+  // season wins/losses/points still refreshed to a brand new imported_at
+  // on every sync even after all nine secondary guards were in place.
+  // Unlike those nine, this function also handles team_role_id/
+  // owner_user_id/madden_franchises linkage — real functionality
+  // commissioners still need working during offseason — so the whole
+  // function can't be skipped like the other nine were. Only the
+  // wins/losses/ties/points_for/points_against write is suppressed during
+  // offseason (existing DB values preserved via the SQL below); role/
+  // owner/raw_payload sync still happens normally.
+  const isOffseasonForTeamStatsGuard = await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league);
 
   for (const row of rows) {
     const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName', 'cityName', 'abbrName', 'shortName']));
@@ -51927,11 +51944,11 @@ async function importMaddenTeamsFromArray(guild, league, rows) {
          external_team_id = $3,
          team_role_id = COALESCE($5, madden_imported_team_stats.team_role_id),
          owner_user_id = COALESCE($6, madden_imported_team_stats.owner_user_id),
-         wins = $7,
-         losses = $8,
-         ties = $9,
-         points_for = CASE WHEN $10 > 0 OR $11 > 0 THEN $10 ELSE madden_imported_team_stats.points_for END,
-         points_against = CASE WHEN $10 > 0 OR $11 > 0 THEN $11 ELSE madden_imported_team_stats.points_against END,
+         wins = CASE WHEN $13 THEN madden_imported_team_stats.wins ELSE $7 END,
+         losses = CASE WHEN $13 THEN madden_imported_team_stats.losses ELSE $8 END,
+         ties = CASE WHEN $13 THEN madden_imported_team_stats.ties ELSE $9 END,
+         points_for = CASE WHEN $13 THEN madden_imported_team_stats.points_for WHEN $10 > 0 OR $11 > 0 THEN $10 ELSE madden_imported_team_stats.points_for END,
+         points_against = CASE WHEN $13 THEN madden_imported_team_stats.points_against WHEN $10 > 0 OR $11 > 0 THEN $11 ELSE madden_imported_team_stats.points_against END,
          raw_payload = $12,
          imported_at = NOW()`,
       [
@@ -51941,12 +51958,13 @@ async function importMaddenTeamsFromArray(guild, league, rows) {
         teamName,
         roleId,
         ownerUserId || null,
-        Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
-        Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
-        Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
-        Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf', 'points_for_total', 'scoreFor'], 0)),
-        Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa', 'points_against_total', 'scoreAgainst'], 0)),
+        isOffseasonForTeamStatsGuard ? 0 : Number(getFirstValue(row, ['wins', 'W', 'totalWins'], 0)),
+        isOffseasonForTeamStatsGuard ? 0 : Number(getFirstValue(row, ['losses', 'L', 'totalLosses'], 0)),
+        isOffseasonForTeamStatsGuard ? 0 : Number(getFirstValue(row, ['ties', 'T', 'totalTies'], 0)),
+        isOffseasonForTeamStatsGuard ? 0 : Number(getFirstValue(row, ['pointsFor', 'points_for', 'pf', 'points_for_total', 'scoreFor'], 0)),
+        isOffseasonForTeamStatsGuard ? 0 : Number(getFirstValue(row, ['pointsAgainst', 'points_against', 'pa', 'points_against_total', 'scoreAgainst'], 0)),
         JSON.stringify(row),
+        isOffseasonForTeamStatsGuard,
       ]
     );
 
