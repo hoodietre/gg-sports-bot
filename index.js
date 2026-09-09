@@ -69771,7 +69771,36 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
     });
   }
 
-  const imported = rows.length ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
+  // 7J-STANDINGSOFFSEASONGUARD: real bug, confirmed live via direct SQL —
+  // TEAMSTATSOFFSEASONRESET correctly zeroes madden_imported_team_stats
+  // once at Super Bowl finalize, but this function runs unconditionally on
+  // every single sync afterward with zero stage-awareness at all, and
+  // writes whatever CareerMode_GetStandingsExport returns straight into
+  // that same table. EA already confirmed (tracking doc) to report a
+  // static, non-advancing "Week 1" for the entire offseason — consistent
+  // with it also still reporting the just-finished season's real final
+  // standings as "current" the whole time, not a fresh/empty state. Real
+  // Draft-stage data: every team showed its real prior-season record,
+  // freshly re-imported at the same timestamp as this sync — the one-time
+  // reset was silently undone on the very next sync, functionally
+  // identical to never having reset at all, and a direct repeat of the
+  // exact "stale non-zero record data during offseason poisons
+  // hasRealRecordDataForKickoff" trap TEAMSTATSOFFSEASONRESET/
+  // THREADCREATESTAGEGUARD were built to close. The payload is still
+  // fetched and logged/saved below regardless — real diagnostic value in
+  // seeing exactly what EA reports here through a real offseason — only
+  // the actual write into madden_imported_team_stats is skipped while the
+  // league is confirmed in 'offseason'.
+  const stageGuardResult = await pool.query(
+    `SELECT current_season_stage FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const isOffseasonForStandingsGuard = (stageGuardResult.rows[0]?.current_season_stage || null) === 'offseason';
+
+  const imported = (rows.length && !isOffseasonForStandingsGuard) ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
+  if (rows.length && isOffseasonForStandingsGuard) {
+    console.log(`[STANDINGS EXPORT 7J-STANDINGSOFFSEASONGUARD] league=${league.league_id} skipped writing ${rows.length} standings row(s) to madden_imported_team_stats — league is in offseason, EA still reporting last season's real record as current.`);
+  }
 
   console.log('[STANDINGS EXPORT WRITE 7J-7ZP] ' + JSON.stringify({
     imported,
