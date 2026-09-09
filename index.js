@@ -69247,6 +69247,17 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
     if (playoffScoredRows.length) {
       const promotion = await promoteMaddenPostseasonScoredRows(guild, league, playoffScoredRows, 'weekly_schedule_week:' + weekNumber);
       imported += Number(promotion?.promoted || 0);
+
+      // 7J-SCHEDULEEXPORTPLAYOFFINSERT: see promoteMaddenPostseasonScoredRows'
+      // own comment for the full story — rows it couldn't match to an
+      // existing DB row (a round skipped without an in-between sync, so
+      // nothing had ever created a placeholder for it) get inserted for
+      // real here instead of silently discarded, via the same upsert
+      // path every other new game already goes through.
+      if (promotion?.unmatchedRows?.length) {
+        const insertedCount = await importMaddenGamesFromArray(guild, league, promotion.unmatchedRows, null, 'schedule-export-playoff-insert');
+        imported += Number(insertedCount || 0);
+      }
     }
   }
 
@@ -69413,6 +69424,7 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
   const playoffLabels = ['Wild Card', 'Div. Playoff', 'Conf. Playoff', 'Pro Bowl', 'Super Bowl'];
   let promoted = 0;
   const promotedRows = [];
+  const unmatchedRows = [];
 
   for (const row of rows || []) {
     const homeTeam = canonicalMaddenTeamNameFromAny(row.home_team || row.homeTeam);
@@ -69514,6 +69526,29 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
     if (result.rows.length) {
       promoted += Number(result.rowCount || result.rows.length || 0);
       promotedRows.push(...result.rows);
+    } else {
+      // 7J-SCHEDULEEXPORTPLAYOFFINSERT: real gap — this function is
+      // deliberately UPDATE-only (7J-10AP, to avoid duplicate rows when a
+      // game was already tracked via the live hub sync or the bracket-
+      // building path). But nothing else in the codebase ever INSERTS a
+      // brand-new playoff-round row: buildMaddenNextRoundFromRealGames
+      // only reads madden_imported_games, never writes it, and the
+      // primary hub sync only carries whatever EA currently considers
+      // "live." A round skipped without an in-between sync (e.g. Wild
+      // Card straight through to Super Bowl in one advance) had no
+      // existing row for any of these three UPDATE attempts to match
+      // against, so real, correctly-fetched data was silently discarded
+      // here every time — confirmed live: 7J-SCHEDULEEXPORTPLAYOFFWEEKS
+      // fixed the "which weeks do we request" gap, real Divisional/Conf
+      // Championship data came back on the very next sync, and it still
+      // never reached the database, because it had nowhere to land.
+      // Reports the original (unmatched) row back to the caller instead
+      // of dropping it, so it can be inserted for real via the same
+      // upsert path (importMaddenGamesFromArray) already used for every
+      // other new game — a real scheduleId-based external_game_id means
+      // that upsert will correctly converge with whatever the live hub
+      // path creates for the same real game later, not duplicate it.
+      unmatchedRows.push(row);
     }
   }
 
@@ -69525,7 +69560,7 @@ async function promoteMaddenPostseasonScoredRows(guild, league, rows, label = 'p
     }).slice(0, 10000));
   }
 
-  return { promoted, rows: promotedRows };
+  return { promoted, rows: promotedRows, unmatchedRows };
 }
 
 
