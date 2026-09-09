@@ -51943,6 +51943,14 @@ async function importMaddenTeamsFromArray(guild, league, rows, options = {}) {
   const isOffseasonForTeamStatsGuard = options.forceWrite === true
     ? false
     : await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league);
+  // 7J-TEAMSTATSPRIMARYIMPORTLOG: this function never actually logged
+  // anything about the guard it runs — the other guarded functions did,
+  // this one didn't, and that gap cost a full round of "is the guard even
+  // running" confusion with zero real evidence either way. Logs once per
+  // call (not once per team) with the actual sample values being written
+  // for the first row, so a real sync's logs show definitively whether
+  // suppression fired and what it did with real vs. zeroed values.
+  console.log(`[MADDEN TEAM IMPORT 7J-TEAMSTATSPRIMARYIMPORTOFFSEASONGUARD] league=${league.league_id} forceWrite=${options.forceWrite === true} suppressing=${isOffseasonForTeamStatsGuard} rowCount=${rows.length} sampleFirstRowRawWins=${rows[0] ? getFirstValue(rows[0], ['wins', 'W', 'totalWins'], 0) : 'n/a'}`);
 
   for (const row of rows) {
     const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName', 'cityName', 'abbrName', 'shortName']));
@@ -51960,11 +51968,11 @@ async function importMaddenTeamsFromArray(guild, league, rows, options = {}) {
          external_team_id = $3,
          team_role_id = COALESCE($5, madden_imported_team_stats.team_role_id),
          owner_user_id = COALESCE($6, madden_imported_team_stats.owner_user_id),
-         wins = CASE WHEN $13 THEN madden_imported_team_stats.wins ELSE $7 END,
-         losses = CASE WHEN $13 THEN madden_imported_team_stats.losses ELSE $8 END,
-         ties = CASE WHEN $13 THEN madden_imported_team_stats.ties ELSE $9 END,
-         points_for = CASE WHEN $13 THEN madden_imported_team_stats.points_for WHEN $10 > 0 OR $11 > 0 THEN $10 ELSE madden_imported_team_stats.points_for END,
-         points_against = CASE WHEN $13 THEN madden_imported_team_stats.points_against WHEN $10 > 0 OR $11 > 0 THEN $11 ELSE madden_imported_team_stats.points_against END,
+         wins = CASE WHEN $13::boolean THEN madden_imported_team_stats.wins ELSE $7 END,
+         losses = CASE WHEN $13::boolean THEN madden_imported_team_stats.losses ELSE $8 END,
+         ties = CASE WHEN $13::boolean THEN madden_imported_team_stats.ties ELSE $9 END,
+         points_for = CASE WHEN $13::boolean THEN madden_imported_team_stats.points_for WHEN $10 > 0 OR $11 > 0 THEN $10 ELSE madden_imported_team_stats.points_for END,
+         points_against = CASE WHEN $13::boolean THEN madden_imported_team_stats.points_against WHEN $10 > 0 OR $11 > 0 THEN $11 ELSE madden_imported_team_stats.points_against END,
          raw_payload = $12,
          imported_at = NOW()`,
       [
