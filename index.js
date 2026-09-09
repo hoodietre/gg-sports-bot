@@ -72574,11 +72574,28 @@ function deepWalkFranchiseHubForStats(obj, path = '', out = [], depth = 0, seen 
 // stays one source of truth rather than nine chances to get the check
 // slightly wrong relative to each other.
 async function isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league) {
+  // 7J-TEAMSTATSGUARDPRESEASONSCOPE: real bug, confirmed live — this only
+  // checked for 'offseason', but the league had already advanced to
+  // 'preseason' by the time of the next confirming sync, and real
+  // prior-season numbers refreshed again immediately, because every one
+  // of the ten guarded call sites correctly stopped suppressing the
+  // moment the stage was no longer literally 'offseason'. Preseason games
+  // don't count toward real standings either, and hasRealRecordDataForKickoff
+  // — the original function this entire chain of fixes traces back to —
+  // specifically checks for stale non-zero record data BEFORE the real
+  // preseason -> regular season kickoff. Non-zero team stats sitting in
+  // the table during preseason is the exact same trap in a different
+  // stage, not a different problem. Real win/loss standings only
+  // legitimately exist during 'regular' and 'playoffs' — suppressing
+  // whenever the stage is neither of those covers both 'offseason' and
+  // 'preseason' without needing to enumerate every non-live stage by
+  // name, and stays correct if any future stage name gets added.
   const result = await pool.query(
     `SELECT current_season_stage FROM madden_league_settings WHERE league_id = $1`,
     [league.league_id]
   ).catch(() => ({ rows: [] }));
-  return (result.rows[0]?.current_season_stage || null) === 'offseason';
+  const stage = result.rows[0]?.current_season_stage || null;
+  return stage !== 'regular' && stage !== 'playoffs';
 }
 
 async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, label = 'full-franchise-object-walker') {
@@ -79796,6 +79813,41 @@ async function handleMaddenOffseasonTransition(guild, league, newWeekLabel) {
   // assume this doesn't fire without re-checking getMaddenNewAdvanceWeek's
   // current behavior directly.
   if (stage === 'offseason' && maddenIsPreseasonWeek(newWeekLabel)) {
+    // 7J-PRESEASONSTAGEFLIPDRAFTGUARD: real bug, confirmed live — this
+    // branch flipped current_season_stage to 'preseason' based solely on
+    // newWeekLabel text matching a preseason pattern, with zero
+    // independent verification — unlike the offseason -> regular branch
+    // right below it, which already cross-checks hasRealRecordDataForKickoff
+    // before trusting its own label. Confirmed live: current_season_stage
+    // read 'preseason' (ea_reported_current_week: "Preseason Week 1")
+    // while the real Madden franchise was still genuinely sitting at
+    // Draft. Same root mechanism already documented for
+    // 7J-WEEKTYPEREGULARSIGNAL/7J-WEEKTYPESTAGEGUARD — EA's schedule
+    // payload becomes genuinely populated once Draft is reached, which
+    // can produce an early/premature week label before the real
+    // milestone (there, weekType:1; here, a preseason-shaped label) —
+    // just never guarded for this specific branch. EA's raw hub payload
+    // carries a real isDraftActive flag (confirmed present, unused
+    // anywhere in this codebase until now) — a direct, independent signal
+    // instead of trusting the same label class that just proved
+    // unreliable at this exact boundary. hub isn't available in this
+    // function's own parameters (called from the discovery loop, a
+    // separate chain from runMaddenEaDirectSync's hub fetch) — reads the
+    // most recently stored raw payload instead of threading hub through
+    // multiple function signatures.
+    const latestHubPayloadResult = await pool.query(
+      `SELECT (raw_payload->>'isDraftActive')::boolean AS is_draft_active
+       FROM madden_sync_payloads
+       WHERE league_id = $1 AND payload_type = 'league_hub'
+       ORDER BY created_at DESC LIMIT 1`,
+      [league.league_id]
+    ).catch(() => ({ rows: [] }));
+    const isDraftActive = latestHubPayloadResult.rows[0]?.is_draft_active === true;
+    if (isDraftActive) {
+      console.log(`[SEASON TRANSITION 7J-PRESEASONSTAGEFLIPDRAFTGUARD] League ${league.league_id}: newWeekLabel "${newWeekLabel}" looks like preseason, but EA's hub reports isDraftActive:true — real Draft still in progress. Not flipping stage yet, will retry next sync.`);
+      return;
+    }
+
     // 7J-PRESEASONSTATWIPE: per user request — stats should also wipe at
     // the START of preseason, not just at the preseason→regular
     // transition. Without this, whatever weekly-stat rows were left over
