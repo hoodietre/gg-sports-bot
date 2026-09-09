@@ -969,12 +969,27 @@ async function initDatabase() {
     RETURNS TRIGGER AS $$
     DECLARE
       stage TEXT;
+      incoming_is_nonzero BOOLEAN;
     BEGIN
       SELECT current_season_stage INTO stage
       FROM madden_league_settings
       WHERE league_id = NEW.league_id;
 
-      IF stage IS DISTINCT FROM 'regular' AND stage IS DISTINCT FROM 'playoffs' THEN
+      incoming_is_nonzero := (
+        COALESCE(NEW.wins, 0) > 0 OR COALESCE(NEW.losses, 0) > 0 OR COALESCE(NEW.ties, 0) > 0 OR
+        COALESCE(NEW.points_for, 0) > 0 OR COALESCE(NEW.points_against, 0) > 0
+      );
+
+      -- 7J-TEAMSTATSTRIGGERZEROFIX: real bug, confirmed live — the
+      -- original version blocked EVERY update during a non-live stage
+      -- unconditionally, which also silently blocked a deliberate manual
+      -- reset trying to set everything back to zero (the trigger fired on
+      -- that UPDATE too and forced NEW back to OLD's real values before
+      -- the write completed — "UPDATE 32" reported success while nothing
+      -- actually changed). Only intervenes when the INCOMING write is
+      -- itself trying to set a non-zero value during a non-live stage —
+      -- a legitimate zero-out always passes through untouched now.
+      IF stage IS DISTINCT FROM 'regular' AND stage IS DISTINCT FROM 'playoffs' AND incoming_is_nonzero THEN
         IF TG_OP = 'UPDATE' THEN
           NEW.wins := OLD.wins;
           NEW.losses := OLD.losses;
