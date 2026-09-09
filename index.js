@@ -69050,7 +69050,39 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
     .map(value => Number(String(value).trim()))
     .filter(value => Number.isFinite(value) && value > 0);
 
-  const targetWeeks = weeks.length ? weeks : guessEaRegularSeasonWeeksFromStandingsRows(standingsRows);
+  const baseTargetWeeks = weeks.length ? weeks : guessEaRegularSeasonWeeksFromStandingsRows(standingsRows);
+
+  // 7J-SCHEDULEEXPORTPLAYOFFWEEKS: real gap, confirmed live via
+  // madden_sync_payloads + the week-index/postseason-stage audit embeds —
+  // real Divisional (weekIndex 19) and Conference Championship (weekIndex
+  // 20) game data, complete with real scores, was present in EA's raw
+  // schedule payloads on every sync, but never made it into
+  // madden_imported_games. Root cause: this function already has correct
+  // playoff-row detection and promotion logic below (playoffLabels filter
+  // + promoteMaddenPostseasonScoredRows), and its own 7J-10AN comment
+  // elsewhere in this file explicitly says playoff scores should come from
+  // here — "normal WeeklySchedulesExport weeks 19/20/21/23" — but
+  // targetWeeks was only ever built from
+  // guessEaRegularSeasonWeeksFromStandingsRows, a REGULAR SEASON week
+  // guesser, and every request in the loop below used stage: 'reg'. Real
+  // playoff-round data (confirmed live at stageIndex:1, the same stage
+  // regular season uses — NOT the 2-6 range the separate, deliberately-
+  // disabled importEaPostseasonScheduleExportsForLeague assumed) was
+  // simply never requested at all once a round stopped being "current."
+  // Appends the real playoff display-week numbers whenever the league is
+  // actually in playoffs, so the promotion logic already sitting in this
+  // function finally gets fed the rounds it was built to cover. 22 (Pro
+  // Bowl) intentionally omitted — not part of league_playoff_brackets and
+  // getMaddenPlayoffWeekLabelFromDisplayWeek/normalizeEaScheduleExportRows
+  // already handle it correctly if it ever comes through some other path.
+  const stageCheckResult = await pool.query(
+    `SELECT current_season_stage FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const isCurrentlyPlayoffs = (stageCheckResult.rows[0]?.current_season_stage || '') === 'playoffs';
+  const targetWeeks = isCurrentlyPlayoffs
+    ? [...new Set([...baseTargetWeeks, 19, 20, 21, 23])]
+    : baseTargetWeeks;
   const teamNameMaps = hubPayload ? buildEaTeamNameMaps(hubPayload) : {};
   let imported = 0;
   const allRows = [];
