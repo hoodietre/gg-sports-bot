@@ -29202,7 +29202,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
 
         try {
           const rows = parseMaddenJsonInput(json);
-          const imported = await importMaddenTeamsFromArray(interaction.guild, activeLeague, rows);
+          const imported = await importMaddenTeamsFromArray(interaction.guild, activeLeague, rows, { forceWrite: true });
           const run = await logMaddenImportRun(interaction.guild, activeLeague, 'manual_import_teams', 'Imported Madden teams from JSON.', { teams: imported });
           await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(activeLeague, run)] });
         } catch (error) {
@@ -51908,7 +51908,7 @@ async function findMaddenTeamRoleId(leagueId, teamName) {
   return contains?.role_id || null;
 }
 
-async function importMaddenTeamsFromArray(guild, league, rows) {
+async function importMaddenTeamsFromArray(guild, league, rows, options = {}) {
   let imported = 0;
   // 7J-TEAMSTATSPRIMARYIMPORTOFFSEASONGUARD: real bug, confirmed live —
   // this is the PRIMARY team import path (every sync, before any of the
@@ -51926,7 +51926,23 @@ async function importMaddenTeamsFromArray(guild, league, rows) {
   // wins/losses/ties/points_for/points_against write is suppressed during
   // offseason (existing DB values preserved via the SQL below); role/
   // owner/raw_payload sync still happens normally.
-  const isOffseasonForTeamStatsGuard = await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league);
+  //
+  // options.forceWrite: this function has three callers — the automatic
+  // ea_direct primary sync, the automatic legacy external-URL/JSON sync
+  // (importMaddenRowsByType), and /madden importteams — a manual,
+  // staff-permission-gated command where a commissioner deliberately
+  // pastes JSON to import team data. The offseason suppression is correct
+  // for the two automatic paths (don't blindly trust what a live feed
+  // claims is "current" during offseason), but wrong for the manual one —
+  // a commissioner explicitly choosing to import specific data is not the
+  // same as an automatic sync blindly trusting EA's still-reporting-last-
+  // season's-numbers feed, and silently discarding their deliberate input
+  // during offseason with no indication why would be a real regression in
+  // a tool that's supposed to do exactly what it's told. forceWrite lets
+  // that one caller opt out of the suppression explicitly.
+  const isOffseasonForTeamStatsGuard = options.forceWrite === true
+    ? false
+    : await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league);
 
   for (const row of rows) {
     const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName', 'cityName', 'abbrName', 'shortName']));
