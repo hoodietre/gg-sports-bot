@@ -72525,9 +72525,32 @@ function deepWalkFranchiseHubForStats(obj, path = '', out = [], depth = 0, seen 
   return out;
 }
 
+// 7J-TEAMSTATSANALYTICSOFFSEASONGUARD: real bug, confirmed live via direct
+// SQL — 7J-STANDINGSOFFSEASONGUARD (importEaStandingsExportForLeague) was
+// only ONE of TEN separate places that write to madden_imported_team_stats.
+// The other nine (all below/nearby) independently harvest real team-level
+// PF/PA/win-loss numbers from different parts of the hub payload or from
+// recalculating against imported games, all called unconditionally on
+// every sync, none offseason-aware. TEAMSTATSOFFSEASONRESET's one-time
+// zero at Super Bowl finalize was getting silently overwritten by these
+// on the very next sync regardless of the standings-export guard already
+// in place — confirmed live: real prior-season numbers, fresh imported_at
+// timestamp, immediately after a sync that should have kept the table at
+// zero. Shared helper instead of nine separate ad-hoc DB queries, so this
+// stays one source of truth rather than nine chances to get the check
+// slightly wrong relative to each other.
+async function isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league) {
+  const result = await pool.query(
+    `SELECT current_season_stage FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  return (result.rows[0]?.current_season_stage || null) === 'offseason';
+}
+
 async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, label = 'full-franchise-object-walker') {
   const enabled = String(process.env.EA_FULL_FRANCHISE_OBJECT_WALKER_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const hits = deepWalkFranchiseHubForStats(hub);
   const sortedHits = hits
@@ -72640,6 +72663,7 @@ async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, l
 async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, label = 'requestinfo-multi-sweep') {
   const enabled = String(process.env.EA_REQUESTINFO_MULTI_SWEEP_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
   const requestInfoList =
@@ -72769,6 +72793,7 @@ async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, 
 async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, label = 'full-league-analytics-harvester') {
   const enabled = String(process.env.EA_FULL_LEAGUE_ANALYTICS_HARVESTER_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const seeded = await loadImportedMaddenTeamSeedMap(guild, league);
   const discoveredRows = deepHarvestFullLeagueAnalyticsRows(hub);
@@ -72849,6 +72874,7 @@ async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, la
 async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label = 'full-discovery') {
   const enabled = String(process.env.EA_FULL_TEAM_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const discovery = await loadImportedMaddenTeamSeedMap(guild, league);
 
@@ -73154,6 +73180,7 @@ function buildScheduleScoreAccumulatorFromHub(hub) {
 async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, label = 'hub-schedule-accumulator') {
   const enabled = String(process.env.EA_HUB_SCHEDULE_SCORE_ACCUMULATOR_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const result = buildScheduleScoreAccumulatorFromHub(hub);
   const pfPaTeams = result.teams.filter(team => team.scored_games > 0 && (team.points_for > 0 || team.points_against > 0));
@@ -73225,6 +73252,7 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
 async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'schedule-derived') {
   const enabled = String(process.env.EA_SCHEDULE_DERIVED_PFPA_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const gamesResult = await pool.query(
     `SELECT *
@@ -73374,6 +73402,7 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
 async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub) {
   const enabled = String(process.env.EA_FULL_LEAGUE_ANALYTICS_EXPANSION_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const allObjects = deepFindMaddenTeamAnalyticsObjects(hub);
   const mergedTeams = mergeMaddenTeamAnalyticsObjects(allObjects);
@@ -73518,6 +73547,7 @@ function extractRequestInfoSeasonGameAnalytics(entry, index) {
 async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
   const enabled = String(process.env.EA_REQUEST_INFO_HARVEST_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
 
   const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
   const requestInfoList =
@@ -74034,6 +74064,8 @@ function summarizeSnallapaExportProbe(command, requestPayload, response) {
 
 
 async function recalculateMaddenStandingsFromImportedGames(guild, league) {
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+
   const teamsResult = await pool.query(
     `SELECT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`,
     [guild.id, league.league_id]
