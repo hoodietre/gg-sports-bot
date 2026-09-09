@@ -947,6 +947,60 @@ async function initDatabase() {
   // JSON on every seeding read.
   await pool.query(`ALTER TABLE madden_imported_team_stats ADD COLUMN IF NOT EXISTS ea_playoff_seed INTEGER`);
 
+  // 7J-TEAMSTATSDBTRIGGER: real bug, confirmed live via exhaustive
+  // logging — every one of the eleven known write paths into this table
+  // (all application-layer JS guards) logged suppressed=true for the
+  // exact same sync, at the exact same timestamp the database still shows
+  // real, non-zero prior-season numbers written. That's decisive: this
+  // is not a missing guard in the JS layer — either a write path exists
+  // that wasn't found despite exhaustive grep, or something bypasses the
+  // application layer entirely. A database-level trigger closes this
+  // regardless of which: it doesn't matter how many more JS functions
+  // write to this table, known or still-undiscovered, direct SQL run
+  // manually, or anything else — nothing can write a non-zero
+  // wins/losses/points value into this table while the league's own
+  // current_season_stage is anything other than 'regular' or 'playoffs'.
+  // On UPDATE, preserves whatever was already there (same semantics as
+  // the JS guards); on INSERT with no prior row, forces zero. This is the
+  // last-resort, most decisive layer — enforced by Postgres itself, not
+  // by trusting every caller to remember to check.
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION enforce_madden_team_stats_live_stage_only()
+    RETURNS TRIGGER AS $$
+    DECLARE
+      stage TEXT;
+    BEGIN
+      SELECT current_season_stage INTO stage
+      FROM madden_league_settings
+      WHERE league_id = NEW.league_id;
+
+      IF stage IS DISTINCT FROM 'regular' AND stage IS DISTINCT FROM 'playoffs' THEN
+        IF TG_OP = 'UPDATE' THEN
+          NEW.wins := OLD.wins;
+          NEW.losses := OLD.losses;
+          NEW.ties := OLD.ties;
+          NEW.points_for := OLD.points_for;
+          NEW.points_against := OLD.points_against;
+        ELSE
+          NEW.wins := 0;
+          NEW.losses := 0;
+          NEW.ties := 0;
+          NEW.points_for := 0;
+          NEW.points_against := 0;
+        END IF;
+      END IF;
+
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+  await pool.query(`DROP TRIGGER IF EXISTS trg_enforce_madden_team_stats_live_stage_only ON madden_imported_team_stats`);
+  await pool.query(`
+    CREATE TRIGGER trg_enforce_madden_team_stats_live_stage_only
+    BEFORE INSERT OR UPDATE ON madden_imported_team_stats
+    FOR EACH ROW EXECUTE FUNCTION enforce_madden_team_stats_live_stage_only()
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_imported_players (
       id UUID PRIMARY KEY,
