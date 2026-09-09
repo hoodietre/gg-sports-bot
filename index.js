@@ -74177,7 +74177,110 @@ async function recalculateMaddenStandingsFromImportedGames(guild, league) {
 
 
 
-async function runMaddenEaDirectSync(guild, league, options = {}) {
+// 7J-RETIREMENTBASELINEAUTOSAVE: real gap, same root cause as
+// 7J-RETIREMENTAUTOSCAN right below — the retirement baseline
+// (/maddenretirements baseline confirm:true) has always worked correctly
+// when run manually, but nothing ever saved it automatically, and it's
+// only useful if saved BEFORE retirements process — by the time a
+// commissioner notices they're already in the retirement window, per
+// Hxxdie directly, it's too late for that season. Full rosters and free
+// agent data are already synced and available all season long, so there's
+// no reason this needs a human to remember it at a specific moment.
+// Per Hxxdie: tied to ENTERING Super Bowl week specifically, not leaving
+// Pro Bowl — many leagues skip Pro Bowl entirely (no actual game to sync)
+// and advance straight from Conference Championship to Super Bowl, so a
+// trigger keyed off "just left Pro Bowl" would silently never fire for
+// those leagues. Checked as a re-verified state (current_season_stage
+// still 'playoffs' AND the real current week resolves to Super Bowl via
+// maddenWeekLabelSortKey) rather than a one-time edge transition, so a
+// missed sync or a multi-round catch-up jumping straight to Super Bowl
+// still catches it on the very next sync instead of depending on catching
+// one exact moment — this is the "can't be skipped" Hxxdie asked for.
+// Safe to re-run every sync during Super Bowl week: saveMaddenRetirementBaseline
+// wholesale replaces the baseline with the current roster every call, and
+// the roster shouldn't be meaningfully changing during Super Bowl week
+// itself (no free agency, no draft yet) — so repeated saves just keep it
+// maximally fresh right up until it's needed. Stops the moment
+// current_season_stage flips to 'offseason' at Super Bowl finalize,
+// before free agency/resigning could contaminate it.
+async function checkAndTriggerAutomaticMaddenRetirementBaselineSave(guild, league) {
+  const settingsResult = await pool.query(
+    `SELECT current_season_stage, ea_reported_current_week FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  const stage = settingsResult.rows[0]?.current_season_stage || null;
+  if (stage !== 'playoffs') return; // only relevant before Super Bowl finalizes into offseason
+
+  const weekLabel = settingsResult.rows[0]?.ea_reported_current_week || null;
+  const [group, idx] = weekLabel ? maddenWeekLabelSortKey(weekLabel) : [null, null];
+  const isSuperBowlWeek = group === 2 && idx === 4;
+  if (!isSuperBowlWeek) return;
+
+  const result = await saveMaddenRetirementBaseline(String(guild.id), String(league.league_id)).catch(error => {
+    console.error('[MADDEN RETIREMENT AUTO BASELINE 7J-RETIREMENTBASELINEAUTOSAVE] save failed:', error?.message || error);
+    return null;
+  });
+  if (result) {
+    console.log(`[MADDEN RETIREMENT AUTO BASELINE 7J-RETIREMENTBASELINEAUTOSAVE] league=${league.league_id} auto-saved ${result.saved} players as retirement baseline (Super Bowl week, pre-finalize).`);
+  }
+}
+
+// 7J-RETIREMENTAUTOSCAN: real gap — retirement detection (scanMaddenRetirements)
+// has always been correct when run manually (confirmed working by Hxxdie across
+// prior test leagues), but nothing ever triggered it automatically. Zero
+// confirmed retirements across two real offseasons wasn't a detection bug —
+// it was the manual command simply not getting run at the right moment,
+// easy to forget across a long gap between testing rounds. Per Hxxdie:
+// real Madden retirements land at offseason stage 1-2, before the 3 free
+// agency stages — timing that matters for correctness, not just
+// convenience, since after free agency starts a released/signed-elsewhere
+// player looks identical to a retirement in this diff-based detection
+// (missing from current roster vs. baseline). EA reports week_label as a
+// static, non-advancing "Week 1" for the entire offseason (confirmed live,
+// see tracking doc), so the normal week-label-based advance/edge-trigger
+// machinery is structurally blind here — offSeasonStage (a real field
+// confirmed present in EA's raw hub payload) is the only usable signal.
+// The exact real stage-number boundaries for "stage 1-2, before FA" haven't
+// been confirmed against live offseason data yet, so the window is a tuned
+// env var (default matching Hxxdie's direct account) rather than hardcoded
+// — and every offseason sync logs the raw value regardless of whether it's
+// in-window, specifically so this can be calibrated against real numbers
+// as this league's actual offseason plays out, instead of guessed twice.
+// Safe to call every offseason sync without extra dedup logic of its own:
+// scanMaddenRetirements(..., confirm=true) already dedups internally via
+// a stable retirement_key (ON CONFLICT DO NOTHING) and an already-retired
+// pre-filter, so repeated calls only ever report genuinely new retirements.
+async function checkAndTriggerAutomaticMaddenRetirementScan(guild, league, hub) {
+  const stageResult = await pool.query(
+    `SELECT current_season_stage FROM madden_league_settings WHERE league_id = $1`,
+    [league.league_id]
+  ).catch(() => ({ rows: [] }));
+  if ((stageResult.rows[0]?.current_season_stage || null) !== 'offseason') return;
+
+  const offSeasonStage = parseNumberOrNull(getAnyValue(hub, ['offSeasonStage'], null));
+  console.log(`[MADDEN RETIREMENT AUTO SCAN 7J-RETIREMENTAUTOSCAN] league=${league.league_id} offSeasonStage=${offSeasonStage ?? 'null'} — logged every offseason sync for calibration.`);
+  if (offSeasonStage === null) return;
+
+  const windowStages = String(process.env.MADDEN_RETIREMENT_AUTO_SCAN_STAGES || '1,2')
+    .split(',')
+    .map(value => Number(String(value).trim()))
+    .filter(value => Number.isFinite(value));
+  if (!windowStages.includes(offSeasonStage)) return;
+
+  const baseline = await getMaddenRetirementBaselineInfo(guild.id, league.league_id).catch(() => ({ playerCount: 0 }));
+  if (!baseline.playerCount) {
+    console.warn(`[MADDEN RETIREMENT AUTO SCAN 7J-RETIREMENTAUTOSCAN] league=${league.league_id} in-window (offSeasonStage=${offSeasonStage}) but skipped — no retirement baseline saved. Run /maddenretirements baseline confirm:true before this window next time.`);
+    return;
+  }
+
+  const rows = await scanMaddenRetirements(guild, league, true).catch(error => {
+    console.error('[MADDEN RETIREMENT AUTO SCAN 7J-RETIREMENTAUTOSCAN] scan failed:', error?.message || error);
+    return [];
+  });
+  console.log(`[MADDEN RETIREMENT AUTO SCAN 7J-RETIREMENTAUTOSCAN] league=${league.league_id} offSeasonStage=${offSeasonStage} — auto-saved ${rows.length} new retirement(s).`);
+}
+
+
   const settings = await ensureMaddenLeagueSettings(league);
   const runId = randomUUID();
 
@@ -74593,6 +74696,12 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
 
     const importedTeams = teams.length ? await importMaddenTeamsFromArray(guild, league, teams) : 0;
     const importedGames = games.length ? await importMaddenGamesFromArray(guild, league, games, options.week || null, 'primary-hub') : 0;
+    await checkAndTriggerAutomaticMaddenRetirementBaselineSave(guild, league).catch(error => {
+      console.error('[Madden Sync] Automatic retirement baseline check failed:', error?.message || error);
+    });
+    await checkAndTriggerAutomaticMaddenRetirementScan(guild, league, hub).catch(error => {
+      console.error('[Madden Sync] Automatic retirement scan check failed:', error?.message || error);
+    });
     await cleanupMaddenWeekTbdRows(guild, league).catch(error => {
       console.error('[Madden Sync] Week TBD cleanup failed:', error?.message || error);
     });
