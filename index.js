@@ -51950,7 +51950,7 @@ async function importMaddenTeamsFromArray(guild, league, rows, options = {}) {
   // call (not once per team) with the actual sample values being written
   // for the first row, so a real sync's logs show definitively whether
   // suppression fired and what it did with real vs. zeroed values.
-  console.log(`[MADDEN TEAM IMPORT 7J-TEAMSTATSPRIMARYIMPORTOFFSEASONGUARD] league=${league.league_id} forceWrite=${options.forceWrite === true} suppressing=${isOffseasonForTeamStatsGuard} rowCount=${rows.length} sampleFirstRowRawWins=${rows[0] ? getFirstValue(rows[0], ['wins', 'W', 'totalWins'], 0) : 'n/a'}`);
+  console.log(`[TEAMSTATSWRITEAUDIT] fn=importMaddenTeamsFromArray league=${league.league_id} forceWrite=${options.forceWrite === true} suppressed=${isOffseasonForTeamStatsGuard} rowCount=${rows.length} sampleFirstRowRawWins=${rows[0] ? getFirstValue(rows[0], ['wins', 'W', 'totalWins'], 0) : 'n/a'}`);
 
   for (const row of rows) {
     const teamName = normalizeMaddenTeamName(getFirstValue(row, ['teamName', 'team_name', 'name', 'displayName', 'cityName', 'abbrName', 'shortName']));
@@ -69841,7 +69841,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const imported = (rows.length && !isOffseasonForStandingsGuard) ? await importMaddenStandingsFromArray(guild, league, rows) : 0;
   if (rows.length && isOffseasonForStandingsGuard) {
-    console.log(`[STANDINGS EXPORT 7J-STANDINGSOFFSEASONGUARD] league=${league.league_id} skipped writing ${rows.length} standings row(s) to madden_imported_team_stats — league is in offseason, EA still reporting last season's real record as current.`);
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=importEaStandingsExportForLeague league=${league.league_id} suppressed=true [STANDINGS EXPORT 7J-STANDINGSOFFSEASONGUARD] skipped writing ${rows.length} standings row(s) to madden_imported_team_stats — league is in offseason, EA still reporting last season's real record as current.`);
   }
 
   console.log('[STANDINGS EXPORT WRITE 7J-7ZP] ' + JSON.stringify({
@@ -72609,7 +72609,10 @@ async function isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league) {
 async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, label = 'full-franchise-object-walker') {
   const enabled = String(process.env.EA_FULL_FRANCHISE_OBJECT_WALKER_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=walkFullFranchiseHubForHiddenStats league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const hits = deepWalkFranchiseHubForStats(hub);
   const sortedHits = hits
@@ -72722,7 +72725,10 @@ async function walkFullFranchiseHubForHiddenStats(context, guild, league, hub, l
 async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, label = 'requestinfo-multi-sweep') {
   const enabled = String(process.env.EA_REQUESTINFO_MULTI_SWEEP_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=sweepAllRequestInfoForTeamAnalytics league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
   const requestInfoList =
@@ -72852,7 +72858,10 @@ async function sweepAllRequestInfoForTeamAnalytics(context, guild, league, hub, 
 async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, label = 'full-league-analytics-harvester') {
   const enabled = String(process.env.EA_FULL_LEAGUE_ANALYTICS_HARVESTER_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=harvestFullLeagueAnalyticsFromHub league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const seeded = await loadImportedMaddenTeamSeedMap(guild, league);
   const discoveredRows = deepHarvestFullLeagueAnalyticsRows(hub);
@@ -72933,7 +72942,10 @@ async function harvestFullLeagueAnalyticsFromHub(context, guild, league, hub, la
 async function expandFullLeagueTeamDiscovery(context, guild, league, hub, label = 'full-discovery') {
   const enabled = String(process.env.EA_FULL_TEAM_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=expandFullLeagueTeamDiscovery league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const discovery = await loadImportedMaddenTeamSeedMap(guild, league);
 
@@ -73239,7 +73251,10 @@ function buildScheduleScoreAccumulatorFromHub(hub) {
 async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, label = 'hub-schedule-accumulator') {
   const enabled = String(process.env.EA_HUB_SCHEDULE_SCORE_ACCUMULATOR_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=accumulatePfPaFromHubScheduleScores league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const result = buildScheduleScoreAccumulatorFromHub(hub);
   const pfPaTeams = result.teams.filter(team => team.scored_games > 0 && (team.points_for > 0 || team.points_against > 0));
@@ -73311,7 +73326,10 @@ async function accumulatePfPaFromHubScheduleScores(context, guild, league, hub, 
 async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'schedule-derived') {
   const enabled = String(process.env.EA_SCHEDULE_DERIVED_PFPA_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=synthesizeFullLeaguePfPaFromSchedule league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const gamesResult = await pool.query(
     `SELECT *
@@ -73461,7 +73479,10 @@ async function synthesizeFullLeaguePfPaFromSchedule(guild, league, label = 'sche
 async function harvestFullLeagueRequestInfoAnalytics(context, guild, league, hub) {
   const enabled = String(process.env.EA_FULL_LEAGUE_ANALYTICS_EXPANSION_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=harvestFullLeagueRequestInfoAnalytics league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const allObjects = deepFindMaddenTeamAnalyticsObjects(hub);
   const mergedTeams = mergeMaddenTeamAnalyticsObjects(allObjects);
@@ -73606,7 +73627,10 @@ function extractRequestInfoSeasonGameAnalytics(entry, index) {
 async function harvestRequestInfoTeamAnalytics(context, guild, league, hub) {
   const enabled = String(process.env.EA_REQUEST_INFO_HARVEST_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=harvestRequestInfoTeamAnalytics league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const careerHubInfo = getAnyValue(hub, ['careerHubInfo'], {}) || {};
   const requestInfoList =
@@ -74123,7 +74147,10 @@ function summarizeSnallapaExportProbe(command, requestPayload, response) {
 
 
 async function recalculateMaddenStandingsFromImportedGames(guild, league) {
-  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) return null;
+  if (await isMaddenLeagueCurrentlyOffseasonForTeamStatsGuard(league)) {
+    console.log(`[TEAMSTATSWRITEAUDIT] fn=recalculateMaddenStandingsFromImportedGames league=${league.league_id} suppressed=true`);
+    return null;
+  }
 
   const teamsResult = await pool.query(
     `SELECT team_name FROM madden_imported_team_stats WHERE guild_id = $1 AND league_id = $2`,
