@@ -74281,6 +74281,7 @@ async function checkAndTriggerAutomaticMaddenRetirementScan(guild, league, hub) 
 }
 
 
+async function runMaddenEaDirectSync(guild, league, options = {}) {
   const settings = await ensureMaddenLeagueSettings(league);
   const runId = randomUUID();
 
