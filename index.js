@@ -78110,7 +78110,7 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
   // acts.
   const verifiedGames = [];
   for (const game of games.rows || []) {
-    const stillUvU = await isMaddenUserVsUserGame(guild.id, league.league_id, game.home_team, game.away_team);
+    const stillUvU = await isMaddenUserVsUserGame(guild, league.league_id, game.home_team, game.away_team);
     if (stillUvU) {
       verifiedGames.push(game);
     } else {
@@ -78272,7 +78272,7 @@ async function generateMaddenPlayerPropLines(guild, league, weekLabel) {
 // User vs user detection for Madden games
 // Returns true if both teams have a confirmed human owner in madden_imported_team_stats.
 // ---------------------------------------------------------------------------
-async function isMaddenUserVsUserGame(guildId, leagueId, homeTeam, awayTeam) {
+async function isMaddenUserVsUserGame(guild, leagueId, homeTeam, awayTeam) {
   // 7J-12OWN: was checking madden_imported_team_stats.owner_user_id only — that
   // column comes from the EA sync, which has no concept of Discord accounts, so
   // it's NULL for nearly every team regardless of whether a real owner is
@@ -78280,23 +78280,42 @@ async function isMaddenUserVsUserGame(guildId, leagueId, homeTeam, awayTeam) {
   // (game thread owner tagging) this session — madden_franchises is the actual
   // source of truth for owner assignments made through the bot. Check both and
   // prefer whichever has a real value for each team.
+  const guildId = guild?.id || guild; // tolerate a raw id string from any older caller
   const result = await pool.query(
-    `SELECT team_name, owner_user_id FROM madden_imported_team_stats
+    `SELECT team_name, owner_user_id, team_role_id FROM madden_imported_team_stats
        WHERE guild_id = $1 AND league_id::text = $2::text
          AND LOWER(team_name) = ANY(ARRAY[LOWER($3), LOWER($4)])
      UNION ALL
-     SELECT team_name, owner_user_id FROM madden_franchises
+     SELECT team_name, owner_user_id, team_role_id FROM madden_franchises
        WHERE guild_id = $1 AND league_id::text = $2::text
          AND LOWER(team_name) = ANY(ARRAY[LOWER($3), LOWER($4)])`,
     [guildId, String(leagueId), homeTeam, awayTeam]
   ).catch(() => ({ rows: [] }));
 
   const rows = result.rows || [];
-  const ownerFor = (teamName) => rows.find(r =>
-    r.team_name?.toLowerCase() === teamName?.toLowerCase() && r.owner_user_id
-  )?.owner_user_id || null;
 
-  return !!(ownerFor(homeTeam) && ownerFor(awayTeam));
+  // 7J-UVULIVEROLEFALLBACK: real bug, confirmed live — a Steelers @ Texans
+  // Week 2 game with two genuinely, correctly Discord-role-assigned owners
+  // (the game thread itself found and tagged both of them correctly, via
+  // getMaddenTeamOwnerForGameThread's live role lookup) got silently
+  // skipped for a sportsbook line, because THIS function only ever trusted
+  // the owner_user_id DB column — the exact same near-always-NULL trap the
+  // 7J-12OWN comment above already documents, just never fixed here. Adds
+  // the identical live-role fallback (findTeamOwnerByRoleId) the thread
+  // path already relies on, so the two ownership checks can't disagree
+  // with each other again.
+  const ownerFor = async (teamName) => {
+    const directRow = rows.find(r => r.team_name?.toLowerCase() === teamName?.toLowerCase() && r.owner_user_id);
+    if (directRow) return directRow.owner_user_id;
+    if (!guild?.roles) return null; // no real guild object available — can't do the live fallback
+    const roleRow = rows.find(r => r.team_name?.toLowerCase() === teamName?.toLowerCase() && r.team_role_id);
+    if (!roleRow) return null;
+    const member = await findTeamOwnerByRoleId(guild, roleRow.team_role_id).catch(() => null);
+    return member ? member.id : null;
+  };
+
+  const [homeOwnerId, awayOwnerId] = await Promise.all([ownerFor(homeTeam), ownerFor(awayTeam)]);
+  return !!(homeOwnerId && awayOwnerId);
 }
 
 
@@ -78333,7 +78352,7 @@ async function autoCreateMaddenSportsbookLines(guild, league, weekLabel) {
   for (const game of games.rows || []) {
     // Only create lines for user vs user matchups
     const isUvU = await isMaddenUserVsUserGame(
-      guild.id, league.league_id, game.home_team, game.away_team
+      guild, league.league_id, game.home_team, game.away_team
     );
 
     await pool.query(
