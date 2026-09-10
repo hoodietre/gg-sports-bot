@@ -55739,6 +55739,30 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
   // Matchup-level dedup guard: skip duplicate DB rows for the same matchup
   const processedMatchups = new Set();
 
+  // 7J-THREADNAMEFALLBACK: defense-in-depth for the still-unconfirmed Week 1
+  // -> 2 duplicate-thread bug (reproduced 4 seasons straight). Every DB-side
+  // theory traced so far (season_key drift, the kickoff cleanup sweep's
+  // blind-clear) has been ruled out or has no credible trigger path at this
+  // boundary. Rather than keep trusting game.thread_id alone, cross-checks
+  // Discord's own ACTIVE thread list by NAME (deterministic — see
+  // maddenGameThreadSafeName) before ever creating. Discord itself can't be
+  // stale the way a DB column read apparently can be here. Deliberately
+  // active-only, not archived: an archived same-named thread could belong to
+  // a PRIOR season (thread names don't encode season/year), and the exact
+  // scenario this is guarding against — the DB-cleanup sweep clearing a
+  // thread_id without confirming the Discord delete actually happened — is
+  // precisely what could leave a wrong-season archived thread sitting around
+  // to be mismatched. The real incident this fixes happens while the
+  // original thread is still active (freshly created, not yet archived), so
+  // active-only coverage is enough without introducing that cross-season risk.
+  let existingThreadsByName = new Map();
+  try {
+    const active = await baseChannel.threads.fetchActive();
+    for (const t of active.threads.values()) existingThreadsByName.set(t.name.toLowerCase(), t);
+  } catch (error) {
+    console.error('[7J-10BY-GT GAME THREAD] Could not prefetch existing threads by name — falling back to thread_id-only dedup:', error?.message || error);
+  }
+
   for (const game of games) {
     const matchupKey = `${String(game.away_team || '').toLowerCase()}@${String(game.home_team || '').toLowerCase()}`;
     const label = `${maddenTeamDisplayName(game.away_team)} @ ${maddenTeamDisplayName(game.home_team)}`;
@@ -55802,6 +55826,23 @@ async function createMaddenWeeklyGameThreadsCore(guild, league, weekLabel, visib
       home: await getMaddenTeamOwnerForGameThread(guild, league, game.home_team, game.home_team_role_id),
     };
     const threadName = maddenGameThreadSafeName(game, weekLabel);
+
+    // 7J-THREADNAMEFALLBACK: name-based safety net — see comment above the
+    // prefetch. Catches the case DB-based dedup just missed (thread_id read
+    // empty/stale) by checking Discord's actual active thread list before
+    // creating. Adopts the existing thread and self-heals the DB reference
+    // instead of creating a duplicate.
+    const nameMatch = existingThreadsByName.get(threadName.toLowerCase());
+    if (nameMatch) {
+      console.warn(`[7J-10BY-GT2 NAME FALLBACK] ${label}: thread_id read as empty/stale (db value: ${game.thread_id || '(empty)'}), but a thread named "${threadName}" already exists (${nameMatch.id}) — adopting it instead of creating a duplicate, self-healing the DB reference.`);
+      await pool.query(
+        `UPDATE madden_imported_games SET thread_id = $1, thread_created_at = COALESCE(thread_created_at, NOW()) WHERE id = $2`,
+        [nameMatch.id, game.id]
+      ).catch(err => console.error('[7J-10BY-GT2 NAME FALLBACK] Self-heal UPDATE failed:', err?.message || err));
+      out.skipped.push({ label, threadId: nameMatch.id });
+      continue;
+    }
+
     let thread = null;
     try {
       if (baseChannel.threads?.create) {
