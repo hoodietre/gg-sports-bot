@@ -938,7 +938,7 @@ async function initDatabase() {
   await pool.query(`ALTER TABLE madden_imported_team_stats ADD COLUMN IF NOT EXISTS scored_games INTEGER NOT NULL DEFAULT 0`);
 
   // 7J-REALEASEEDCOLUMN: per Hxxdie — confirmed live via direct raw_payload
-  // inspection that EA's own CareerMode_GetStandingsExport already includes
+  // inspection that EA's own FranchiseMode_GetStandingsExport already includes
   // a genuine "seed" field per team (distinct from a separate "rank" field
   // that does NOT correspond to playoff seed — confirmed both by name and
   // by not matching real bracket order on the same live data). Every team
@@ -29140,7 +29140,7 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
                WHEN UPPER(COALESCE(p.position, '')) IN ('HB', 'RB', 'FB') THEN 2
                WHEN UPPER(COALESCE(p.position, '')) IN ('WR', 'TE') THEN 3
                WHEN UPPER(COALESCE(p.position, '')) IN ('LT', 'LG', 'C', 'RG', 'RT', 'OL') THEN 4
-               WHEN UPPER(COALESCE(p.position, '')) IN ('LE', 'RE', 'DT', 'LOLB', 'MLB', 'ROLB', 'EDGE', 'REDGE', 'LEDGE', 'MIKE', 'WILL', 'SAM') THEN 5
+               WHEN UPPER(COALESCE(p.position, '')) IN ('LE', 'RE', 'DT', 'LOLB', 'MLB', 'ROLB', 'EDGE', 'REDGE', 'LEDGE', 'REDG', 'LEDG', 'MIKE', 'WILL', 'SAM') THEN 5
                WHEN UPPER(COALESCE(p.position, '')) IN ('CB', 'FS', 'SS', 'DB') THEN 6
                WHEN UPPER(COALESCE(p.position, '')) IN ('K', 'P') THEN 7
                ELSE 8
@@ -46522,7 +46522,7 @@ function maddenRosterPositionGroup(position) {
   if (['HB', 'RB', 'FB'].includes(pos)) return 'Backfield';
   if (['WR', 'TE'].includes(pos)) return 'Receivers';
   if (['LT', 'LG', 'C', 'RG', 'RT', 'OL'].includes(pos)) return 'Offensive Line';
-  if (['LE', 'RE', 'DT', 'LOLB', 'MLB', 'ROLB', 'EDGE', 'REDGE', 'LEDGE', 'MIKE', 'WILL', 'SAM'].includes(pos)) return 'Front Seven';
+  if (['LE', 'RE', 'DT', 'LOLB', 'MLB', 'ROLB', 'EDGE', 'REDGE', 'LEDGE', 'REDG', 'LEDG', 'MIKE', 'WILL', 'SAM'].includes(pos)) return 'Front Seven';
   if (['CB', 'FS', 'SS', 'DB'].includes(pos)) return 'Secondary';
   if (['K', 'P'].includes(pos)) return 'Special Teams';
   return 'Other';
@@ -47682,7 +47682,7 @@ function maddenPositionNeedGroup(position) {
   if (['TE'].includes(p)) return 'TE';
   if (['LT', 'RT'].includes(p)) return 'OT';
   if (['LG', 'C', 'RG'].includes(p)) return 'IOL';
-  if (['LEDGE', 'REDGE', 'EDGE', 'LE', 'RE', 'LOLB', 'ROLB', 'SAM', 'WILL'].includes(p)) return 'EDGE';
+  if (['LEDGE', 'REDGE', 'LEDG', 'REDG', 'EDGE', 'LE', 'RE', 'LOLB', 'ROLB', 'SAM', 'WILL'].includes(p)) return 'EDGE';
   if (['DT'].includes(p)) return 'DT';
   if (['MIKE', 'MLB'].includes(p)) return 'LB';
   if (['CB'].includes(p)) return 'CB';
@@ -51120,7 +51120,7 @@ function maddenTradeFinderSamePositionBonus(candidate, target) {
     ['HB', 'FB'],
     ['WR', 'TE'],
     ['LT', 'LG', 'C', 'RG', 'RT'],
-    ['LEDGE', 'REDGE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'MIKE', 'WILL', 'SAM'],
+    ['LEDGE', 'REDGE', 'LEDG', 'REDG', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'MIKE', 'WILL', 'SAM'],
     ['CB', 'FS', 'SS'],
     ['K', 'P'],
   ];
@@ -52723,7 +52723,7 @@ const EA_MADDEN_ENTITLEMENT_TO_VALID_NAMESPACE = {
 };
 
 
-const EA_DIRECT_TOKEN_CLIENT_ID = process.env.EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP';
+const EA_DIRECT_TOKEN_CLIENT_ID = process.env.EA_DIRECT_TOKEN_CLIENT_ID || EA_DIRECT_CLIENT_ID || 'MCA_27_COMP_APP';
 const EA_DIRECT_TOKEN_CLIENT_SECRET = process.env.EA_DIRECT_TOKEN_CLIENT_SECRET || null;
 const EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID = String(process.env.EA_DIRECT_TOKEN_INCLUDE_CLIENT_ID || 'true').toLowerCase() !== 'false';
 const EA_DIRECT_TOKEN_USE_BASIC_AUTH = String(process.env.EA_DIRECT_TOKEN_USE_BASIC_AUTH || 'false').toLowerCase() === 'true';
@@ -52794,7 +52794,7 @@ async function exchangeEaAuthorizationCode(code) {
     '&code=' + encodeURIComponent(code) +
     '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
     '&release_type=prod' +
-    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_26_COMP_APP');
+    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_27_COMP_APP');
 
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
@@ -52848,7 +52848,7 @@ async function refreshEaAccessToken(refreshToken) {
     '&grant_type=refresh_token' +
     '&refresh_token=' + encodeURIComponent(refreshToken) +
     '&release_type=prod' +
-    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_26_COMP_APP');
+    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_27_COMP_APP');
 
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
@@ -53845,7 +53845,7 @@ function getMaddenEaPostseasonStageLabel(stageIndex) {
   return null;
 }
 
-// 7J-10AN: Snallapa confirmed playoff scores live in CareerMode_GetWeeklySchedulesExport,
+// 7J-10AN: Snallapa confirmed playoff scores live in FranchiseMode_GetWeeklySchedulesExport,
 // not in the older postseason_stage probe payloads. EA uses display weeks 19, 20, 21,
 // skips Pro Bowl week 22, then uses week 23 for the Super Bowl. The export request is
 // still zero-based internally, but week labels should be playoff labels when these rows import.
@@ -53997,7 +53997,7 @@ function normalizeEaScheduleExportRows(payload, weekNumber = null, stage = 'reg'
       awayScore,
       gameResult,
       status,
-      source: 'CareerMode_GetSchedulesExport',
+      source: 'FranchiseMode_GetSchedulesExport',
       raw: row,
     });
   }
@@ -54097,7 +54097,7 @@ async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage =
   }
 
   const leagueId = Number(context.externalLeagueId);
-  const exportTypes = String(process.env.EA_SCHEDULE_EXPORT_TYPES || 'CareerMode_GetSchedulesExport,CareerMode_GetWeeklySchedulesExport,CareerMode_GetScheduleExport')
+  const exportTypes = String(process.env.EA_SCHEDULE_EXPORT_TYPES || 'FranchiseMode_GetSchedulesExport,FranchiseMode_GetWeeklySchedulesExport,FranchiseMode_GetScheduleExport')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
@@ -54604,7 +54604,7 @@ function isMaddenOffensivePosition(position) {
 // normalizer, dev-trait weighting, etc.) — this was the one place that
 // never got updated to match, worth having correct on its own merits.
 function isMaddenDefensivePosition(position) {
-  return ['DE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'LB', 'CB', 'FS', 'SS', 'S', 'EDGE', 'REDGE', 'LEDGE', 'MIKE', 'WILL', 'SAM'].includes(String(position || '').toUpperCase());
+  return ['DE', 'LE', 'RE', 'DT', 'LOLB', 'ROLB', 'MLB', 'LB', 'CB', 'FS', 'SS', 'S', 'EDGE', 'REDGE', 'LEDGE', 'REDG', 'LEDG', 'MIKE', 'WILL', 'SAM'].includes(String(position || '').toUpperCase());
 }
 
 function parseMaddenJsonMaybe(value) {
@@ -58190,7 +58190,7 @@ function maddenFreeAgentPositionMatches(row, wantedPosition = null) {
   if (!pos) return false;
   const groups = {
     OL: new Set(['LT', 'LG', 'C', 'RG', 'RT', 'OL']),
-    DL: new Set(['LE', 'RE', 'DT', 'DL', 'EDGE', 'LEDGE', 'REDGE']),
+    DL: new Set(['LE', 'RE', 'DT', 'DL', 'EDGE', 'LEDGE', 'REDGE', 'LEDG', 'REDG']),
     LB: new Set(['LOLB', 'MLB', 'ROLB', 'OLB', 'LB', 'MIKE', 'WILL', 'SAM']),
     DB: new Set(['CB', 'FS', 'SS', 'DB']),
   };
@@ -62655,7 +62655,7 @@ async function buildMaddenSchedulePayloadInspectorEmbed(guildId, league) {
     const endpoint = String(row.endpoint || 'unknown endpoint').replace(/^ea_direct:/, '');
     const type = row.payload_type ? ` • ${row.payload_type}` : '';
     return `**${endpoint.slice(0, 88)}**${type} • ${Number(row.payload_count || 0)} payload(s)`;
-  }).join(NL) || 'No `CareerMode_GetWeeklySchedulesExport` payloads found yet.';
+  }).join(NL) || 'No `FranchiseMode_GetWeeklySchedulesExport` payloads found yet.';
 
   const allCandidates = [];
   for (const row of payloadRows.rows || []) {
@@ -62703,7 +62703,7 @@ async function buildMaddenSchedulePayloadInspectorEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle('🧾 Madden Schedule Payload Inspector • ' + (league.league_name || 'Madden League'))
     .setColor(0x00B0F4)
-    .setDescription('Safe inspector for `CareerMode_GetWeeklySchedulesExport` payload structure. This does not alter sync data.')
+    .setDescription('Safe inspector for `FranchiseMode_GetWeeklySchedulesExport` payload structure. This does not alter sync data.')
     .addFields(
       { name: 'Schedule Import Coverage', value: coverageText.slice(0, 1024), inline: false },
       { name: 'Stored Schedule Endpoints', value: endpointText.slice(0, 1024), inline: false },
@@ -62871,7 +62871,7 @@ async function buildMaddenEaDirectSyncSourceAuditEmbed(guildId, league) {
   });
 
   const sourceCodeClues = [
-    'Sync completion message still references CareerMode_GetStandingsExport and player-stat exports.',
+    'Sync completion message still references FranchiseMode_GetStandingsExport and player-stat exports.',
     'Stored payloads confirm WeeklySchedulesExport exists, but schedule objects are 0-0 and status=1.',
     'No stored payload sample has proven scored game rows yet.',
     'Current results/streak systems must stay schedule-safe until scored rows or a trusted completed marker is discovered.'
@@ -63032,7 +63032,7 @@ async function buildMaddenScheduleStatusDecoderEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle('🧩 Madden Schedule Status Decoder • ' + (league.league_name || 'Madden League'))
     .setColor(0x95A5A6)
-    .setDescription('Safe decoder for `CareerMode_GetWeeklySchedulesExport` status values. This does not alter sync data.')
+    .setDescription('Safe decoder for `FranchiseMode_GetWeeklySchedulesExport` status values. This does not alter sync data.')
     .addFields(
       { name: 'Coverage', value: coverageText.slice(0, 1024), inline: false },
       { name: 'Status Counts', value: statusText.slice(0, 1024), inline: false },
@@ -64894,7 +64894,7 @@ async function buildMaddenWeeklyScheduleCoverageAuditEmbed(guildId, league) {
   const embed = new EmbedBuilder()
     .setTitle('🧾 Madden Weekly Schedule Coverage Audit • ' + (league?.league_name || 'Madden League'))
     .setColor(0x2ECC71)
-    .setDescription('Read-only audit focused only on CareerMode_GetWeeklySchedulesExport payload coverage. Confirms whether playoff weeks are actually persisted in schedule exports.')
+    .setDescription('Read-only audit focused only on FranchiseMode_GetWeeklySchedulesExport payload coverage. Confirms whether playoff weeks are actually persisted in schedule exports.')
     .addFields(
       { name: 'Coverage', value: safe([
         `Weekly schedule payloads: ${(payloadRows.rows || []).length}`,
@@ -65701,7 +65701,7 @@ async function buildMaddenPlayoffResultPromotionAuditEmbed(guildId, league) {
        FROM madden_sync_payloads
       WHERE guild_id = $1::text
         AND league_id::text = $2::text
-        AND endpoint ILIKE '%CareerMode_GetWeeklySchedulesExport%'
+        AND endpoint ILIKE '%FranchiseMode_GetWeeklySchedulesExport%'
       ORDER BY created_at DESC
       LIMIT 40`,
     [guildId, String(leagueId)]
@@ -67683,7 +67683,7 @@ const MADDEN_VALUE_POSITION_TABLE = new Map([
   ['C', 0.13], ['K', -0.85], ['P', -0.90], ['CB', 0.29], ['DT', 0.22], ['FB', -0.65], ['FS', 0.19],
   ['HB', 0.25], ['RB', 0.25], ['LG', 0.10], ['LT', 0.17], ['QB', 1.60], ['RG', 0.10], ['RT', 0.10],
   ['SS', 0.21], ['TE', 0.21], ['WR', 0.27], ['SAM', 0.22], ['MIKE', 0.29], ['MLB', 0.29], ['WILL', 0.27],
-  ['LEDGE', 0.27], ['LE', 0.27], ['LOLB', 0.27], ['REDGE', 0.29], ['RE', 0.29], ['ROLB', 0.29],
+  ['LEDGE', 0.27], ['LEDG', 0.27], ['LE', 0.27], ['LOLB', 0.27], ['REDGE', 0.29], ['REDG', 0.29], ['RE', 0.29], ['ROLB', 0.29],
 ]);
 
 const MADDEN_VALUE_AGE_TABLE = new Map([
@@ -68317,7 +68317,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
 
   // 7J-35DIAG: diagnosing the phantom team-movement report (many players
   // appearing to move between two teams with no real transaction behind it).
-  // Working theory: CareerMode_GetTeamRostersExport rows may not carry their
+  // Working theory: FranchiseMode_GetTeamRostersExport rows may not carry their
   // own teamName field, silently falling back to requestPayload.teamName (the
   // "hint" from buildMaddenRosterImportHints) for the entire batch — if that
   // hint is stale or mismatched for this listIndex/teamId, every player in
@@ -68637,13 +68637,13 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
   }
 
   const weeklyExports = [
-    'CareerMode_GetWeeklyTeamStatsExport',
-    'CareerMode_GetWeeklyPassingStatsExport',
-    'CareerMode_GetWeeklyRushingStatsExport',
-    'CareerMode_GetWeeklyReceivingStatsExport',
-    'CareerMode_GetWeeklyDefensiveStatsExport',
-    'CareerMode_GetWeeklyKickingStatsExport',
-    'CareerMode_GetWeeklyPuntingStatsExport',
+    'FranchiseMode_GetWeeklyTeamStatsExport',
+    'FranchiseMode_GetWeeklyPassingStatsExport',
+    'FranchiseMode_GetWeeklyRushingStatsExport',
+    'FranchiseMode_GetWeeklyReceivingStatsExport',
+    'FranchiseMode_GetWeeklyDefensiveStatsExport',
+    'FranchiseMode_GetWeeklyKickingStatsExport',
+    'FranchiseMode_GetWeeklyPuntingStatsExport',
   ];
 
   const results = [];
@@ -68902,7 +68902,7 @@ async function buildMaddenRosterImportHints(context, guild, league) {
 
 async function probeOneMaddenTeamRosterExport(context, hint = null) {
   const session = context.activeBlazeSession || context.session || null;
-  if (!session?.sessionKey) throw new Error('No active Blaze session available for CareerMode_GetTeamRostersExport.');
+  if (!session?.sessionKey) throw new Error('No active Blaze session available for FranchiseMode_GetTeamRostersExport.');
 
   const leagueId = Number(context.externalLeagueId);
   const requestPayload = hint
@@ -68916,7 +68916,7 @@ async function probeOneMaddenTeamRosterExport(context, hint = null) {
       }
     : { leagueId, listIndex: -1, returnFreeAgents: true, teamId: 0 };
 
-  const exportType = 'CareerMode_GetTeamRostersExport';
+  const exportType = 'FranchiseMode_GetTeamRostersExport';
   const attempts = [];
 
   try {
@@ -68967,7 +68967,7 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
   for (const hint of teamHints) {
     results.push(await probeOneMaddenTeamRosterExport(context, hint).catch(error => ({
       success: false,
-      exportType: 'CareerMode_GetTeamRostersExport',
+      exportType: 'FranchiseMode_GetTeamRostersExport',
       hint,
       requestPayload: {
         leagueId: Number(context.externalLeagueId),
@@ -68985,7 +68985,7 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
   if (importFreeAgents) {
     results.push(await probeOneMaddenTeamRosterExport(context, null).catch(error => ({
       success: false,
-      exportType: 'CareerMode_GetTeamRostersExport',
+      exportType: 'FranchiseMode_GetTeamRostersExport',
       requestPayload: { leagueId: Number(context.externalLeagueId), listIndex: -1, returnFreeAgents: true, teamId: 0 },
       error: String(error?.message || error).slice(0, 1000),
       attempts: [],
@@ -69065,7 +69065,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
 
   const session = context.activeBlazeSession || context.session || null;
   if (!session?.sessionKey) {
-    throw new Error('No active Blaze session available for CareerMode_GetPassingStatsExport.');
+    throw new Error('No active Blaze session available for FranchiseMode_GetPassingStatsExport.');
   }
 
   const leagueId = Number(context.externalLeagueId);
@@ -69074,7 +69074,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
     .map(value => Number(String(value).trim()))
     .filter(value => Number.isFinite(value) && value > 0);
 
-  const exportTypes = String(process.env.EA_PASSING_STATS_EXPORT_TYPES || 'CareerMode_GetPassingStatsExport,CareerMode_GetWeeklyPassingStatsExport')
+  const exportTypes = String(process.env.EA_PASSING_STATS_EXPORT_TYPES || 'FranchiseMode_GetPassingStatsExport,FranchiseMode_GetWeeklyPassingStatsExport')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
@@ -69764,7 +69764,7 @@ async function importEaPostseasonScheduleExportsForLeague(context, guild, league
           guild.id,
           league.league_id,
           runId,
-          'ea_direct:' + (result.exportType || 'CareerMode_GetWeeklySchedulesExport') + ':' + context.externalLeagueId + ':postseason_stage:' + stageIndex,
+          'ea_direct:' + (result.exportType || 'FranchiseMode_GetWeeklySchedulesExport') + ':' + context.externalLeagueId + ':postseason_stage:' + stageIndex,
           JSON.stringify(result.payload || {}),
         ]
       ).catch(error => {
@@ -69860,7 +69860,7 @@ function normalizeEaStandingsExportRows(payload) {
       conferenceName: row.conferenceName || null,
       divisionName: row.divisionName || null,
       playoffStatus: row.playoffStatus ?? null,
-      source: 'CareerMode_GetStandingsExport',
+      source: 'FranchiseMode_GetStandingsExport',
     };
   }).filter(row => row.teamName);
 }
@@ -69871,13 +69871,13 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const session = context.activeBlazeSession || context.session || null;
   if (!session?.sessionKey) {
-    throw new Error('No active Blaze session available for CareerMode_GetStandingsExport.');
+    throw new Error('No active Blaze session available for FranchiseMode_GetStandingsExport.');
   }
 
   const payload = await sendEaBlazeExportRequest(
     context.token,
     session,
-    'CareerMode_GetStandingsExport',
+    'FranchiseMode_GetStandingsExport',
     { leagueId: Number(context.externalLeagueId) }
   );
 
@@ -69915,7 +69915,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
         guild.id,
         league.league_id,
         runId,
-        'ea_direct:CareerMode_GetStandingsExport:' + context.externalLeagueId,
+        'ea_direct:FranchiseMode_GetStandingsExport:' + context.externalLeagueId,
         JSON.stringify(payload || {}),
       ]
     ).catch(error => {
@@ -69927,7 +69927,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
   // TEAMSTATSOFFSEASONRESET correctly zeroes madden_imported_team_stats
   // once at Super Bowl finalize, but this function runs unconditionally on
   // every single sync afterward with zero stage-awareness at all, and
-  // writes whatever CareerMode_GetStandingsExport returns straight into
+  // writes whatever FranchiseMode_GetStandingsExport returns straight into
   // that same table. EA already confirmed (tracking doc) to report a
   // static, non-advancing "Week 1" for the entire offseason — consistent
   // with it also still reporting the just-finished season's real final
@@ -69973,7 +69973,7 @@ async function getEaBlazeLeagueHubDetailed(token, leagueId) {
     requestPayload: {
       leagueId: Number(leagueId),
     },
-    componentName: 'careermode',
+    componentName: 'franchisemode',
   });
 
   return {
@@ -69989,13 +69989,13 @@ async function getEaBlazeLeagueHub(token, leagueId) {
 }
 
 
-async function sendEaBlazeCareerModeCommandWithSession(token, session, commandName, commandId, requestPayload = {}, options = {}) {
+async function sendEaBlazeFranchiseModeCommandWithSession(token, session, commandName, commandId, requestPayload = {}, options = {}) {
   return await sendEaBlazeRequest(token, session, {
     commandName,
     componentId: options.componentId || 2060,
     commandId,
     requestPayload,
-    componentName: options.componentName || 'careermode',
+    componentName: options.componentName || 'franchisemode',
   });
 }
 
@@ -70025,14 +70025,14 @@ function cloneEaBlazeSessionForSingleReplay(session) {
 
 
 
-async function sendEaBlazeCareerModeCommand(token, commandName, commandId, requestPayload = {}, options = {}) {
+async function sendEaBlazeFranchiseModeCommand(token, commandName, commandId, requestPayload = {}, options = {}) {
   const session = await retrieveBlazeSession(token);
   return await sendEaBlazeRequest(token, session, {
     commandName,
     componentId: options.componentId || 2060,
     commandId,
     requestPayload,
-    componentName: options.componentName || 'careermode',
+    componentName: options.componentName || 'franchisemode',
   });
 }
 
@@ -75083,7 +75083,7 @@ async function runMaddenEaDirectSync(guild, league, options = {}) {
         ? 'Preseason mode active (' + seasonModeLabel + '): standings export endpoint attempted; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
         : offseasonMode
         ? 'Offseason mode active: no current week/schedule data from EA (rosters/teams still synced normally); imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.'
-        : 'Regular season mode: CareerMode_GetStandingsExport + madden compare system enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.') +
+        : 'Regular season mode: FranchiseMode_GetStandingsExport + madden compare system enabled; imported standings: ' + Number(standingsExportResult?.imported || 0) + '; token auto-refresh + Blaze compatibility retry enabled.') +
       '\n\n' + advanceStatusLine +
       '\n\n📊 **EA reports current week:** ' + (eaHubCtx?.displayedWeek || 'unknown') +
       '\n📋 **Week label breakdown:** ' + (weekLabelBreakdown || '(no games found)');
@@ -75153,7 +75153,7 @@ async function getEaBlazeLeagues(token) {
     componentId: 2060,
     commandId: 801,
     requestPayload: {},
-    componentName: 'careermode',
+    componentName: 'franchisemode',
   });
 
   return response?.responseInfo?.value?.leagues || [];
@@ -75187,7 +75187,7 @@ async function exchangePersonaForMaddenToken(accessToken, persona) {
     '&release_type=prod' +
     '&response_type=code' +
     '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
-    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP') +
+    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || 'MCA_27_COMP_APP') +
     '&machineProfileKey=' + encodeURIComponent(EA_DIRECT_MACHINE_KEY || '444d362e8e067fe2') +
     '&authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
     '&access_token=' + encodeURIComponent(accessToken) +
@@ -75232,7 +75232,7 @@ async function exchangePersonaForMaddenToken(accessToken, persona) {
     '&release_type=prod' +
     '&client_secret=' + encodeURIComponent(EA_DIRECT_CLIENT_SECRET) +
     '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
-    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || 'MCA_26_COMP_APP');
+    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || 'MCA_27_COMP_APP');
 
   const tokenResponse = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
