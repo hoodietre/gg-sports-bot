@@ -52796,7 +52796,7 @@ function buildEaTokenAuthExtras(clientId, clientSecret) {
   if (!EA_DIRECT_TOKEN_USE_BASIC_AUTH) {
     return {
       headers: {},
-      secretBodyParam: '&client_secret=' + encodeURIComponent(clientSecret),
+      secretBodyParam: '&client_secret=' + clientSecret,
       authLabel: 'snallabot_body_secret',
     };
   }
@@ -52832,14 +52832,26 @@ async function exchangeEaAuthorizationCode(code) {
   const clientId = EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_27_COMP_APP';
   const authExtras = buildEaTokenAuthExtras(clientId, EA_DIRECT_CLIENT_SECRET);
 
+  // 7J-EAUNENCODEDBODY: real, confirmed-working reference code (Snallabot,
+  // the same community project behind the CareerMode->FranchiseMode and
+  // MCA_26->MCA_27 findings) builds this exact body via plain template-
+  // literal interpolation — NOT encodeURIComponent on any field, including
+  // redirect_uri and code. We were percent-encoding every field, which is
+  // technically spec-correct for a urlencoded body, but a mismatch between
+  // the redirect_uri format used here and whatever format EA associated
+  // with the auth code during the authorization step (redirect_uri must
+  // match byte-for-byte per OAuth2) would produce exactly the persistent
+  // HTTP 400 "authentication failed" seen all night, on a fresh code, with
+  // credentials already confirmed correct. Matching the known-working
+  // reference exactly rather than guessing at which field(s) mattered.
   const body =
-    'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
+    'authentication_source=' + (EA_DIRECT_AUTH_SOURCE || '317239') +
     authExtras.secretBodyParam +
     '&grant_type=authorization_code' +
-    '&code=' + encodeURIComponent(code) +
-    '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
+    '&code=' + code +
+    '&redirect_uri=' + (EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
     '&release_type=prod' +
-    '&client_id=' + encodeURIComponent(clientId);
+    '&client_id=' + clientId;
 
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
@@ -52892,12 +52904,12 @@ async function refreshEaAccessToken(refreshToken) {
   const authExtras = buildEaTokenAuthExtras(refreshClientId, EA_DIRECT_CLIENT_SECRET);
 
   const body =
-    'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
+    'authentication_source=' + (EA_DIRECT_AUTH_SOURCE || '317239') +
     authExtras.secretBodyParam +
     '&grant_type=refresh_token' +
-    '&refresh_token=' + encodeURIComponent(refreshToken) +
+    '&refresh_token=' + refreshToken +
     '&release_type=prod' +
-    '&client_id=' + encodeURIComponent(refreshClientId);
+    '&client_id=' + refreshClientId;
 
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
@@ -75236,7 +75248,7 @@ async function exchangePersonaForMaddenToken(accessToken, persona) {
     'hide_create=true' +
     '&release_type=prod' +
     '&response_type=code' +
-    '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
+    '&redirect_uri=' + (EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
     '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || 'MCA_27_COMP_APP') +
     '&machineProfileKey=' + encodeURIComponent(EA_DIRECT_MACHINE_KEY || '444d362e8e067fe2') +
     '&authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
@@ -75278,14 +75290,14 @@ async function exchangePersonaForMaddenToken(accessToken, persona) {
   const authExtras = buildEaTokenAuthExtras(selectLeagueClientId, EA_DIRECT_CLIENT_SECRET);
 
   const body =
-    'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
-    '&code=' + encodeURIComponent(eaCode) +
+    'authentication_source=' + (EA_DIRECT_AUTH_SOURCE || '317239') +
+    '&code=' + eaCode +
     '&grant_type=authorization_code' +
     '&token_format=JWS' +
     '&release_type=prod' +
     authExtras.secretBodyParam +
-    '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
-    '&client_id=' + encodeURIComponent(selectLeagueClientId);
+    '&redirect_uri=' + (EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
+    '&client_id=' + selectLeagueClientId;
 
   const tokenResponse = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
