@@ -75736,10 +75736,16 @@ function buildEaDirectAuthUrl(connectionId) {
     // redirect_uri while every token exchange redeeming that code sends it raw —
     // a byte-for-byte mismatch per OAuth2. Matching the already-consistent
     // token-exchange side exactly, same as the client_id fix.
+    // 7J-EAAUTHURLMACHINEKEY: Snallabot's confirmed-working EA_LOGIN_URL includes
+    // machineProfileKey directly in the authorization request itself (not just in
+    // the later select-league/persona token exchange, which is the only place our
+    // code was already sending it). Adding the same {MACHINE_KEY} substitution here
+    // so the primary /ea connect flow matches their reference exactly.
     return EA_DIRECT_AUTH_TEMPLATE
       .replaceAll('{STATE}', encodeURIComponent(connectionId))
       .replaceAll('{REDIRECT_URI}', EA_DIRECT_REDIRECT_URI)
-      .replaceAll('{CLIENT_ID}', encodeURIComponent(EA_DIRECT_CLIENT_ID || ''));
+      .replaceAll('{CLIENT_ID}', encodeURIComponent(EA_DIRECT_CLIENT_ID || ''))
+      .replaceAll('{MACHINE_KEY}', encodeURIComponent(EA_DIRECT_MACHINE_KEY || '444d362e8e067fe2'));
   }
 
   if (!EA_DIRECT_CLIENT_ID) {
