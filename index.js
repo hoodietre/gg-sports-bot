@@ -52713,21 +52713,21 @@ const EA_BLAZE_PRODUCT_NAME = {
 
 
 const EA_MADDEN_ENTITLEMENT_TO_SYSTEM = {
-  MADDEN_26XONE: 'xone',
-  MADDEN_26PS4: 'ps4',
-  MADDEN_26PC: 'pc',
-  MADDEN_26PS5: 'ps5',
-  MADDEN_26XBSX: 'xbsx',
-  MADDEN_26SDA: 'stadia',
+  MADDEN_27XONE: 'xone',
+  MADDEN_27PS4: 'ps4',
+  MADDEN_27PC: 'pc',
+  MADDEN_27PS5: 'ps5',
+  MADDEN_27XBSX: 'xbsx',
+  MADDEN_27SDA: 'stadia',
 };
 
 const EA_MADDEN_ENTITLEMENT_TO_VALID_NAMESPACE = {
-  MADDEN_26XONE: 'xbox',
-  MADDEN_26PS4: 'ps3',
-  MADDEN_26PC: 'cem_ea_id',
-  MADDEN_26PS5: 'ps3',
-  MADDEN_26XBSX: 'xbox',
-  MADDEN_26SDA: 'stadia',
+  MADDEN_27XONE: 'xbox',
+  MADDEN_27PS4: 'ps3',
+  MADDEN_27PC: 'cem_ea_id',
+  MADDEN_27PS5: 'ps3',
+  MADDEN_27XBSX: 'xbox',
+  MADDEN_27SDA: 'stadia',
 };
 
 
@@ -53528,21 +53528,21 @@ async function handleInternalRetrievePersonas(payload) {
   const entitlementRows = entitlementsPayload?.entitlements?.entitlement || [];
 
   const validGroupNames = new Set([
-    'MADDEN_26XONE',
-    'MADDEN_26PS4',
-    'MADDEN_26PC',
-    'MADDEN_26PS5',
-    'MADDEN_26XBSX',
-    'MADDEN_26SDA',
+    'MADDEN_27XONE',
+    'MADDEN_27PS4',
+    'MADDEN_27PC',
+    'MADDEN_27PS5',
+    'MADDEN_27XBSX',
+    'MADDEN_27SDA',
   ]);
 
   const entitlementToValidNamespace = {
-    MADDEN_26XONE: 'xbox',
-    MADDEN_26PS4: 'ps3',
-    MADDEN_26PC: 'cem_ea_id',
-    MADDEN_26PS5: 'ps3',
-    MADDEN_26XBSX: 'xbox',
-    MADDEN_26SDA: 'stadia',
+    MADDEN_27XONE: 'xbox',
+    MADDEN_27PS4: 'ps3',
+    MADDEN_27PC: 'cem_ea_id',
+    MADDEN_27PS5: 'ps3',
+    MADDEN_27XBSX: 'xbox',
+    MADDEN_27SDA: 'stadia',
   };
 
   const validEntitlements = entitlementRows.filter(e =>
@@ -53551,7 +53551,7 @@ async function handleInternalRetrievePersonas(payload) {
   );
 
   if (!validEntitlements.length) {
-    throw new Error('No active Madden 26 entitlements were found for this EA account.');
+    throw new Error('No active Madden 27 entitlements were found for this EA account.');
   }
 
   const personaGroups = await Promise.all(validEntitlements.map(async entitlement => {
