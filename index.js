@@ -52878,12 +52878,18 @@ async function exchangeEaAuthorizationCode(code) {
       .replace(/code=[^&]+/g, 'code=REDACTED')
       .replace(/client_secret=[^&]+/g, 'client_secret=REDACTED');
 
+    // 7J-EATOKENFULLPAYLOAD: every attempt so far has only surfaced
+    // payload.error_description/payload.error, which has consistently been the
+    // generic string "authentication failed". Logging the full raw response body
+    // here (capped) in case EA is sending additional fields (error code, sub-error,
+    // trace id) alongside that string that the summary line above was discarding.
     throw new Error(
       'EA token exchange failed: HTTP ' + response.status +
       ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
       ' • token_url=' + (EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token') +
       ' • body=' + safeBody +
-      ' • auth=' + authExtras.authLabel
+      ' • auth=' + authExtras.authLabel +
+      ' • full_response=' + text.slice(0, 500)
     );
   }
 
