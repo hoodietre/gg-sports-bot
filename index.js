@@ -75729,9 +75729,16 @@ function buildMaddenEaFranchiseComponentsFromRows(leagueId, franchises) {
 
 function buildEaDirectAuthUrl(connectionId) {
   if (EA_DIRECT_AUTH_TEMPLATE) {
+    // 7J-EAAUTHURLUNENCODEDREDIRECT: exchangeEaAuthorizationCode (7J-EAUNENCODEDBODY)
+    // and exchangePersonaForMaddenToken's select-league flow both send redirect_uri
+    // raw/unencoded to accounts.ea.com. This authorization-URL builder was still
+    // percent-encoding it, so the code EA issues here was tied to an encoded
+    // redirect_uri while every token exchange redeeming that code sends it raw —
+    // a byte-for-byte mismatch per OAuth2. Matching the already-consistent
+    // token-exchange side exactly, same as the client_id fix.
     return EA_DIRECT_AUTH_TEMPLATE
       .replaceAll('{STATE}', encodeURIComponent(connectionId))
-      .replaceAll('{REDIRECT_URI}', encodeURIComponent(EA_DIRECT_REDIRECT_URI))
+      .replaceAll('{REDIRECT_URI}', EA_DIRECT_REDIRECT_URI)
       .replaceAll('{CLIENT_ID}', encodeURIComponent(EA_DIRECT_CLIENT_ID || ''));
   }
 
