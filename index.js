@@ -68705,6 +68705,13 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
   }
 
   const weeklyExports = [
+    'CareerMode_GetWeeklyTeamStatsExport',
+    'CareerMode_GetWeeklyPassingStatsExport',
+    'CareerMode_GetWeeklyRushingStatsExport',
+    'CareerMode_GetWeeklyReceivingStatsExport',
+    'CareerMode_GetWeeklyDefensiveStatsExport',
+    'CareerMode_GetWeeklyKickingStatsExport',
+    'CareerMode_GetWeeklyPuntingStatsExport',
     'FranchiseMode_GetWeeklyTeamStatsExport',
     'FranchiseMode_GetWeeklyPassingStatsExport',
     'FranchiseMode_GetWeeklyRushingStatsExport',
@@ -68984,26 +68991,34 @@ async function probeOneMaddenTeamRosterExport(context, hint = null) {
       }
     : { leagueId, listIndex: -1, returnFreeAgents: true, teamId: 0 };
 
-  const exportType = 'FranchiseMode_GetTeamRostersExport';
-  const attempts = [];
+  // 7J-ROSTEREXPORTTYPE: same issue and same fix as 7J-STANDINGSEXPORTTYPE —
+  // Snallabot's confirmed LeagueData.TEAM_ROSTER is CareerMode_GetTeamRostersExport,
+  // not FranchiseMode_. Trying both, correct one first.
+  const rosterExportTypes = String(process.env.EA_ROSTER_EXPORT_TYPES || 'CareerMode_GetTeamRostersExport,FranchiseMode_GetTeamRostersExport')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
 
-  try {
-    const payload = await sendEaBlazeExportRequest(context.token, session, exportType, requestPayload, { maxAttempts: 5 });
-    const rows = extractGenericMaddenExportRows(payload);
-    attempts.push({
-      exportType,
-      requestPayload,
-      success: true,
-      rowCount: rows.length,
-      topKeys: Object.keys(payload || {}).slice(0, 50),
-      sampleKeys: rows.slice(0, 3).map(row => Object.keys(row || {}).slice(0, 80)),
-      sample: rows.slice(0, 3).map(row => compactMaddenRawExcerpt(row)),
-    });
-    return { success: true, exportType, requestPayload, payload, rows, attempts, hint };
-  } catch (error) {
-    attempts.push({ exportType, requestPayload, success: false, error: String(error?.message || error).slice(0, 1000) });
-    return { success: false, exportType, requestPayload, payload: null, rows: [], attempts, hint };
+  const attempts = [];
+  for (const exportType of rosterExportTypes) {
+    try {
+      const payload = await sendEaBlazeExportRequest(context.token, session, exportType, requestPayload, { maxAttempts: 5 });
+      const rows = extractGenericMaddenExportRows(payload);
+      attempts.push({
+        exportType,
+        requestPayload,
+        success: true,
+        rowCount: rows.length,
+        topKeys: Object.keys(payload || {}).slice(0, 50),
+        sampleKeys: rows.slice(0, 3).map(row => Object.keys(row || {}).slice(0, 80)),
+        sample: rows.slice(0, 3).map(row => compactMaddenRawExcerpt(row)),
+      });
+      if (rows.length) return { success: true, exportType, requestPayload, payload, rows, attempts, hint };
+    } catch (error) {
+      attempts.push({ exportType, requestPayload, success: false, error: String(error?.message || error).slice(0, 1000) });
+    }
   }
+  return { success: false, exportType: rosterExportTypes[0], requestPayload, payload: null, rows: [], attempts, hint };
 }
 
 async function discoverMaddenTeamRostersExport(context, guild, league, runId = null, label = 'team-rosters-discovery') {
@@ -69142,7 +69157,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
     .map(value => Number(String(value).trim()))
     .filter(value => Number.isFinite(value) && value > 0);
 
-  const exportTypes = String(process.env.EA_PASSING_STATS_EXPORT_TYPES || 'FranchiseMode_GetPassingStatsExport,FranchiseMode_GetWeeklyPassingStatsExport')
+  const exportTypes = String(process.env.EA_PASSING_STATS_EXPORT_TYPES || 'CareerMode_GetWeeklyPassingStatsExport,CareerMode_GetPassingStatsExport,FranchiseMode_GetPassingStatsExport,FranchiseMode_GetWeeklyPassingStatsExport')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
@@ -69939,20 +69954,53 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
 
   const session = context.activeBlazeSession || context.session || null;
   if (!session?.sessionKey) {
-    throw new Error('No active Blaze session available for FranchiseMode_GetStandingsExport.');
+    throw new Error('No active Blaze session available for standings export.');
   }
 
-  const payload = await sendEaBlazeExportRequest(
-    context.token,
-    session,
-    'FranchiseMode_GetStandingsExport',
-    { leagueId: Number(context.externalLeagueId) }
-  );
+  // 7J-STANDINGSEXPORTTYPE: unlike the schedule export (which already tries
+  // several FranchiseMode_* candidates with fallback, see
+  // requestEaScheduleExportWithFallbacks), this call used a single hardcoded
+  // 'FranchiseMode_GetStandingsExport' string with no fallback. Snallabot's
+  // actual current ea_client.ts LeagueData enum (confirmed directly from their
+  // source, not inferred) still uses CareerMode_GetStandingsExport — the
+  // CareerMode->FranchiseMode M26->M27 rename applied to the componentName
+  // Blaze payload field (confirmed separately, "franchisemode"), not to this
+  // export-type command string. Trying the confirmed-correct value first,
+  // falling back to the old string for safety.
+  const standingsExportTypes = String(process.env.EA_STANDINGS_EXPORT_TYPES || 'CareerMode_GetStandingsExport,FranchiseMode_GetStandingsExport')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+
+  let payload = null;
+  let lastStandingsExportError = null;
+  let usedStandingsExportType = standingsExportTypes[0];
+  for (const exportType of standingsExportTypes) {
+    try {
+      const attemptPayload = await sendEaBlazeExportRequest(
+        context.token,
+        session,
+        exportType,
+        { leagueId: Number(context.externalLeagueId) }
+      );
+      const attemptRows = normalizeEaStandingsExportRows(attemptPayload);
+      if (attemptRows.length) {
+        payload = attemptPayload;
+        usedStandingsExportType = exportType;
+        break;
+      }
+      if (!payload) payload = attemptPayload; // keep the last (possibly empty) payload as a fallback for logging
+    } catch (error) {
+      lastStandingsExportError = error;
+    }
+  }
+  if (!payload && lastStandingsExportError) throw lastStandingsExportError;
 
   const rows = normalizeEaStandingsExportRows(payload);
 
   console.log('[STANDINGS EXPORT 7J-7ZP] ' + JSON.stringify({
     label,
+    exportType: usedStandingsExportType,
     leagueId: context.externalLeagueId,
     leagueName: league?.league_name,
     success: payload?.success,
@@ -69983,7 +70031,7 @@ async function importEaStandingsExportForLeague(context, guild, league, runId = 
         guild.id,
         league.league_id,
         runId,
-        'ea_direct:FranchiseMode_GetStandingsExport:' + context.externalLeagueId,
+        'ea_direct:' + usedStandingsExportType + ':' + context.externalLeagueId,
         JSON.stringify(payload || {}),
       ]
     ).catch(error => {
