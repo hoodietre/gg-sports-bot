@@ -3774,6 +3774,7 @@ function buildCommands() {
         .addStringOption(o => o.setName('home_team').setDescription('Current-week home team').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('away_team').setDescription('Current-week away team/opponent').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
+      .addSubcommand(sc => sc.setName('eaconfig').setDescription('Staff: view EA Direct auth configuration status'))
       
 
       
