@@ -3774,7 +3774,6 @@ function buildCommands() {
         .addStringOption(o => o.setName('home_team').setDescription('Current-week home team').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('away_team').setDescription('Current-week away team/opponent').setRequired(true).setAutocomplete(true))
         .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true)))
-      .addSubcommand(sc => sc.setName('eaconfig').setDescription('Staff: view EA Direct auth configuration status'))
       
 
       
@@ -4236,6 +4235,10 @@ function buildCommands() {
       .addStringOption(o => o.setName('league').setDescription('League name').setRequired(false).setAutocomplete(true))
 
 ,
+
+    new SlashCommandBuilder()
+      .setName('maddeneaconfig')
+      .setDescription('Staff: view EA Direct auth configuration status'),
 
     new SlashCommandBuilder()
       .setName('maddenvalues')
@@ -5751,7 +5754,7 @@ function getRegisteredCommands() {
   try {
     commands = buildCommands();
   } catch (error) {
-    console.error('[COMMAND REGISTRATION] buildCommands() threw — check for a command/subcommand/option description over Discord\'s 100-char limit. Bot is staying up; commands will not be (re)registered until this is fixed:', error?.message || error);
+    console.error('[COMMAND REGISTRATION] buildCommands() threw — check for a command/subcommand/option description over Discord\'s 100-char limit. Bot is staying up; commands will not be (re)registered until this is fixed:', error?.stack || error?.message || error);
     return [];
   }
   const MAX_COMMANDS = 100;
@@ -28593,11 +28596,9 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
       return;
     }
 
-    if (interaction.commandName === 'madden') {
+    if (interaction.commandName === 'maddeneaconfig') {
       if (!interaction.guild) return;
-      const maddenSubcommand = interaction.options.getSubcommand();
-
-      if (maddenSubcommand === 'eaconfig') {
+      {
         if (!(await userCanUseLeagueSetup(interaction, league))) {
           await interaction.reply({ content: 'You do not have permission to view EA Direct config.', ephemeral: true });
           return;
@@ -28631,6 +28632,12 @@ ${maddenFormatPositionOverall(mvp.position, mvp.overall)}` : 'No Super Bowl MVP 
         await interaction.reply({ embeds: [embed], ephemeral: true });
         return;
       }
+    }
+
+    if (interaction.commandName === 'madden') {
+      if (!interaction.guild) return;
+      const maddenSubcommand = interaction.options.getSubcommand();
+
 
 
 
