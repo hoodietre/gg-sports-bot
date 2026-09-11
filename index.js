@@ -52766,6 +52766,40 @@ function decryptEaSecret(value) {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
 }
 
+// 7J-EABASICAUTHFALLBACK: EA_DIRECT_TOKEN_USE_BASIC_AUTH has existed as a
+// Railway variable and is shown on the admin diagnostics panel (see
+// 'Basic Auth' field below), but was never actually wired into any of the
+// 3 places that build an EA token-exchange request — every one of them
+// unconditionally embedded client_secret in the request body (the
+// "Snallabot" body-secret convention). Confirmed-fresh Madden 27
+// authorization-code exchanges are failing HTTP 400 "authentication
+// failed" with client_id/client_secret already confirmed correct against
+// Snallapa's own diff — consistent with EA now expecting the secret via
+// an HTTP Basic Auth header instead of a body parameter for this game
+// year, though this is UNCONFIRMED, not a known fix. This helper makes the
+// existing toggle actually do something, so it can be tested: when
+// EA_DIRECT_TOKEN_USE_BASIC_AUTH=true, returns an Authorization header and
+// omits client_secret from the body entirely (per OAuth2/RFC 6749 — a
+// client authenticates one way or the other, never both at once). When
+// false (default), behaves exactly as before — body-secret only, no
+// header — so this changes nothing unless the toggle is explicitly
+// flipped in Railway.
+function buildEaTokenAuthExtras(clientId, clientSecret) {
+  if (!EA_DIRECT_TOKEN_USE_BASIC_AUTH) {
+    return {
+      headers: {},
+      secretBodyParam: '&client_secret=' + encodeURIComponent(clientSecret),
+      authLabel: 'snallabot_body_secret',
+    };
+  }
+  const basicAuthValue = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  return {
+    headers: { 'Authorization': 'Basic ' + basicAuthValue },
+    secretBodyParam: '',
+    authLabel: 'http_basic_auth_header',
+  };
+}
+
 async function exchangeEaAuthorizationCode(code) {
   // 7J-5AB — Snallabot source-aligned EA token exchange.
   // Source alignment:
@@ -52787,14 +52821,17 @@ async function exchangeEaAuthorizationCode(code) {
     throw new Error('EA_DIRECT_CLIENT_SECRET is missing. Add it in Railway Variables before testing EA Direct token exchange.');
   }
 
+  const clientId = EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_27_COMP_APP';
+  const authExtras = buildEaTokenAuthExtras(clientId, EA_DIRECT_CLIENT_SECRET);
+
   const body =
     'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
-    '&client_secret=' + encodeURIComponent(EA_DIRECT_CLIENT_SECRET) +
+    authExtras.secretBodyParam +
     '&grant_type=authorization_code' +
     '&code=' + encodeURIComponent(code) +
     '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
     '&release_type=prod' +
-    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_27_COMP_APP');
+    '&client_id=' + encodeURIComponent(clientId);
 
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
@@ -52803,6 +52840,7 @@ async function exchangeEaAuthorizationCode(code) {
       'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'Accept-Encoding': 'gzip',
+      ...authExtras.headers,
     },
     body,
   });
@@ -52825,7 +52863,7 @@ async function exchangeEaAuthorizationCode(code) {
       ' • ' + (payload.error_description || payload.error || text).slice(0, 300) +
       ' • token_url=' + (EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token') +
       ' • body=' + safeBody +
-      ' • auth=snallabot_body_secret'
+      ' • auth=' + authExtras.authLabel
     );
   }
 
@@ -52842,13 +52880,16 @@ async function refreshEaAccessToken(refreshToken) {
     throw new Error('EA_DIRECT_CLIENT_SECRET is missing. Add it in Railway Variables before refreshing EA tokens.');
   }
 
+  const refreshClientId = EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_27_COMP_APP';
+  const authExtras = buildEaTokenAuthExtras(refreshClientId, EA_DIRECT_CLIENT_SECRET);
+
   const body =
     'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
-    '&client_secret=' + encodeURIComponent(EA_DIRECT_CLIENT_SECRET) +
+    authExtras.secretBodyParam +
     '&grant_type=refresh_token' +
     '&refresh_token=' + encodeURIComponent(refreshToken) +
     '&release_type=prod' +
-    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || EA_DIRECT_TOKEN_CLIENT_ID || 'MCA_27_COMP_APP');
+    '&client_id=' + encodeURIComponent(refreshClientId);
 
   const response = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
@@ -52857,6 +52898,7 @@ async function refreshEaAccessToken(refreshToken) {
       'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'Accept-Encoding': 'gzip',
+      ...authExtras.headers,
     },
     body,
   });
@@ -75224,15 +75266,18 @@ async function exchangePersonaForMaddenToken(accessToken, persona) {
     throw new Error('Tried to retrieve persona-scoped EA code but no code was found in redirect location.');
   }
 
+  const selectLeagueClientId = EA_DIRECT_CLIENT_ID || 'MCA_27_COMP_APP';
+  const authExtras = buildEaTokenAuthExtras(selectLeagueClientId, EA_DIRECT_CLIENT_SECRET);
+
   const body =
     'authentication_source=' + encodeURIComponent(EA_DIRECT_AUTH_SOURCE || '317239') +
     '&code=' + encodeURIComponent(eaCode) +
     '&grant_type=authorization_code' +
     '&token_format=JWS' +
     '&release_type=prod' +
-    '&client_secret=' + encodeURIComponent(EA_DIRECT_CLIENT_SECRET) +
+    authExtras.secretBodyParam +
     '&redirect_uri=' + encodeURIComponent(EA_DIRECT_REDIRECT_URI || 'http://127.0.0.1/success') +
-    '&client_id=' + encodeURIComponent(EA_DIRECT_CLIENT_ID || 'MCA_27_COMP_APP');
+    '&client_id=' + encodeURIComponent(selectLeagueClientId);
 
   const tokenResponse = await fetch(EA_DIRECT_TOKEN_URL || 'https://accounts.ea.com/connect/token', {
     method: 'POST',
@@ -75241,6 +75286,7 @@ async function exchangePersonaForMaddenToken(accessToken, persona) {
       'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 13; sdk_gphone_x86_64 Build/TE1A.220922.031)',
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'Accept-Encoding': 'gzip',
+      ...authExtras.headers,
     },
     body,
   });
