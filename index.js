@@ -52693,21 +52693,21 @@ const EA_DIRECT_ENABLE_BLAZE_LEAGUE_FETCH = String(process.env.EA_DIRECT_ENABLE_
 const EA_DIRECT_FORCE_BLAZE_FETCH = String(process.env.EA_DIRECT_FORCE_BLAZE_FETCH || 'true').toLowerCase() !== 'false';
 
 const EA_BLAZE_SERVICE = {
-  xone: process.env.EA_BLAZE_SERVICE_XONE || 'madden-2026-xone',
-  xbsx: process.env.EA_BLAZE_SERVICE_XBSX || 'madden-2026-xbsx',
-  ps4: process.env.EA_BLAZE_SERVICE_PS4 || 'madden-2026-ps4',
-  ps5: process.env.EA_BLAZE_SERVICE_PS5 || 'madden-2026-ps5',
-  pc: process.env.EA_BLAZE_SERVICE_PC || 'madden-2026-pc',
-  stadia: process.env.EA_BLAZE_SERVICE_STADIA || 'madden-2026-stadia',
+  xone: process.env.EA_BLAZE_SERVICE_XONE || 'madden-2027-xone',
+  xbsx: process.env.EA_BLAZE_SERVICE_XBSX || 'madden-2027-xbsx',
+  ps4: process.env.EA_BLAZE_SERVICE_PS4 || 'madden-2027-ps4',
+  ps5: process.env.EA_BLAZE_SERVICE_PS5 || 'madden-2027-ps5',
+  pc: process.env.EA_BLAZE_SERVICE_PC || 'madden-2027-pc',
+  stadia: process.env.EA_BLAZE_SERVICE_STADIA || 'madden-2027-stadia',
 };
 
 const EA_BLAZE_PRODUCT_NAME = {
-  xone: process.env.EA_BLAZE_PRODUCT_XONE || 'madden-2026-xone-mca',
-  xbsx: process.env.EA_BLAZE_PRODUCT_XBSX || 'madden-2026-xbsx-mca',
-  ps4: process.env.EA_BLAZE_PRODUCT_PS4 || 'madden-2026-ps4-mca',
-  ps5: process.env.EA_BLAZE_PRODUCT_PS5 || 'madden-2026-ps5-mca',
-  pc: process.env.EA_BLAZE_PRODUCT_PC || 'madden-2026-pc-mca',
-  stadia: process.env.EA_BLAZE_PRODUCT_STADIA || 'madden-2026-stadia-mca',
+  xone: process.env.EA_BLAZE_PRODUCT_XONE || 'madden-2027-xone-mca',
+  xbsx: process.env.EA_BLAZE_PRODUCT_XBSX || 'madden-2027-xbsx-mca',
+  ps4: process.env.EA_BLAZE_PRODUCT_PS4 || 'madden-2027-ps4-mca',
+  ps5: process.env.EA_BLAZE_PRODUCT_PS5 || 'madden-2027-ps5-mca',
+  pc: process.env.EA_BLAZE_PRODUCT_PC || 'madden-2027-pc-mca',
+  stadia: process.env.EA_BLAZE_PRODUCT_STADIA || 'madden-2027-stadia-mca',
 };
 
 
