@@ -24366,6 +24366,7 @@ if (interaction.commandName === 'avatar') {
     }
 
     if (interaction.isButton() && interaction.customId === 'memberprofile_open') {
+      await interaction.deferReply({ ephemeral: true });
       await showMemberProfileHome(interaction, interaction.user, { update: false });
       return;
     }
@@ -27603,6 +27604,7 @@ if (gameSubcommand === 'report') {
       }
 
       if (profileSubcommand === 'panel') {
+        await interaction.deferReply({ ephemeral: true });
         await showMemberProfileHome(interaction, interaction.user, { update: false });
         return;
       }
@@ -42779,7 +42781,7 @@ async function showMemberProfileHome(interaction, targetUser, { update = false }
   const lang = await getEffectiveLanguage(interaction.guild?.id, interaction.user.id);
   const { embed, attachment } = await buildFranchiseHubPayload(interaction.guild, targetUser, null);
   const payload = { content: null, embeds: [embed], files: [attachment], components: buildMemberProfileHomeComponents(lang, targetUser.id, interaction.user.id) };
-  return update ? interaction.update(payload) : interaction.reply({ ...payload, ephemeral: true });
+  return update ? interaction.update(payload) : interaction.editReply(payload);
 }
 
 async function showMemberProfileCategory(interaction, targetUser, category, { update = true } = {}) {
