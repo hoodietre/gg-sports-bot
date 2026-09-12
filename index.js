@@ -69025,6 +69025,12 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
   const enabled = String(process.env.EA_TEAM_ROSTER_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
   if (!enabled) return null;
 
+  try {
+    context.activeBlazeSession = await retrieveBlazeSession(context.token);
+  } catch (error) {
+    console.error('[TEAM ROSTER DISCOVERY 7J-7ZP] Failed to refresh Blaze session before roster discovery, continuing with existing session:', error?.message || error);
+  }
+
   const manualHints = String(process.env.EA_TEAM_ROSTER_DISCOVERY_HINTS || '')
     .split(',')
     .map(value => value.trim())
