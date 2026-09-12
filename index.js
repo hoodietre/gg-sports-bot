@@ -19264,7 +19264,12 @@ if (interaction.commandName === 'avatar') {
         await postMaddenSyncFeed(interaction.guild, league, run).catch(() => null);
         await refreshMaddenFreeAgentsPanelForLeague(interaction.guild, league).catch(err =>
           console.error('[FREE AGENTS PANEL] Refresh after sync failed:', err?.message || err));
-        await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(league, run)], components: [buildCommissionerBackRow(leagueId)] });
+        await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(league, run)], components: [buildCommissionerBackRow(leagueId)] }).catch(async error => {
+          console.error('[COMMISSIONER SYNC 7J-SYNCWEBHOOKEXPIRY] editReply failed (likely expired webhook token after a long sync), falling back to direct message edit:', error?.message || error);
+          await interaction.message?.edit({ embeds: [buildMaddenSyncRunEmbed(league, run)], components: [buildCommissionerBackRow(leagueId)] }).catch(fallbackError => {
+            console.error('[COMMISSIONER SYNC 7J-SYNCWEBHOOKEXPIRY] Direct message edit fallback also failed:', fallbackError?.message || fallbackError);
+          });
+        });
         return;
       }
 
