@@ -68722,9 +68722,41 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
   ];
   const weeklyExportPrefixes = ['CareerMode_', 'FranchiseMode_'];
 
+  // 7J-STATSINCREMENTAL: only force a re-fetch for weeks within this trailing
+  // window of the highest requested week (in-progress/recently-final games can
+  // still get corrected stats). Older weeks are skipped if we already have any
+  // rows for that week+category — full re-verification is available via
+  // EA_PLAYER_STAT_DISCOVERY_FORCE_FULL=true.
+  const forceFullRefresh = String(process.env.EA_PLAYER_STAT_DISCOVERY_FORCE_FULL || 'false').toLowerCase() === 'true';
+  const refreshWindow = Math.max(0, Number(process.env.EA_PLAYER_STAT_DISCOVERY_REFRESH_WINDOW ?? 2));
+  const highestTargetWeekIndex = discoveryTargets.reduce((max, t) => Math.max(max, t.weekIndex), 0);
+
+  const alreadySynced = new Set();
+  if (!forceFullRefresh) {
+    try {
+      const existing = await pool.query(
+        `SELECT DISTINCT week_index, stat_type FROM madden_player_weekly_stats
+         WHERE guild_id = $1 AND league_id::text = $2::text`,
+        [guild.id, String(league.league_id)]
+      );
+      for (const row of existing.rows || []) {
+        alreadySynced.add(row.week_index + ':' + row.stat_type);
+      }
+    } catch (error) {
+      console.error('[PLAYER STAT DISCOVERY 7J-STATSINCREMENTAL] Failed to load existing week/stat coverage, falling back to full scan:', error?.message || error);
+    }
+  }
+
   const results = [];
+  let skippedCount = 0;
   for (const target of discoveryTargets) {
+    const withinRefreshWindow = target.weekIndex > highestTargetWeekIndex - refreshWindow;
     for (const category of weeklyStatCategories) {
+      const statType = statTypeFromMaddenExportType(category);
+      if (!forceFullRefresh && !withinRefreshWindow && alreadySynced.has(target.weekIndex + ':' + statType)) {
+        skippedCount += 1;
+        continue;
+      }
       let succeededForCategory = false;
       for (const prefix of weeklyExportPrefixes) {
         const exportType = prefix + category;
@@ -68762,6 +68794,7 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
     weekIndexes,
     stageIndex,
     discoveryTargets,
+    skippedCount,
     successfulCount: successful.length,
     statImportResults,
     successful: successful.map(result => ({
@@ -69398,7 +69431,44 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
 
   await cleanupMaddenPostseasonSyntheticScheduleRows(guild, league, 'schedule-export-start');
 
-  for (const weekNumber of targetWeeks) {
+  // 7J-SCHEDULEINCREMENTAL: this loop previously fetched every week 1..maxWeek
+  // unconditionally on every sync, same confirmed-live bug shape as the player
+  // stats discovery loop (7J-STATSINCREMENTAL) — cost grows with the season and
+  // never shrinks. Skipping weeks that already have a completed/final game on
+  // record, except for a trailing window (recent weeks can still get corrected)
+  // and the fixed playoff weeks, which stay unconditional since they're
+  // confirmed load-bearing (see 7J-SCHEDULEEXPORTPLAYOFFWEEKS above).
+  const forceFullScheduleRefresh = String(process.env.EA_SCHEDULE_EXPORT_FORCE_FULL || 'false').toLowerCase() === 'true';
+  const scheduleRefreshWindow = Math.max(0, Number(process.env.EA_SCHEDULE_EXPORT_REFRESH_WINDOW ?? 2));
+  const highestTargetWeek = targetWeeks.reduce((max, w) => Math.max(max, w), 0);
+  const playoffWeekSet = new Set([19, 20, 21, 23]);
+
+  let weeksToFetch = targetWeeks;
+  let scheduleSkippedCount = 0;
+  if (!forceFullScheduleRefresh) {
+    try {
+      const completedWeeks = await pool.query(
+        `SELECT DISTINCT NULLIF(regexp_replace(LOWER(week_label), '[^0-9]', '', 'g'), '')::int AS week_number
+         FROM madden_imported_games
+         WHERE guild_id = $1 AND league_id::text = $2::text
+           AND status IN ('completed','final','completed_with_real_score','away_win','home_win','tie')`,
+        [guild.id, String(league.league_id)]
+      );
+      const completedWeekNumbers = new Set((completedWeeks.rows || []).map(r => r.week_number).filter(Number.isFinite));
+      weeksToFetch = targetWeeks.filter(weekNumber => {
+        const keep = playoffWeekSet.has(weekNumber) ||
+          weekNumber > highestTargetWeek - scheduleRefreshWindow ||
+          !completedWeekNumbers.has(weekNumber);
+        if (!keep) scheduleSkippedCount += 1;
+        return keep;
+      });
+    } catch (error) {
+      console.error('[SCHEDULE EXPORT 7J-SCHEDULEINCREMENTAL] Failed to compute completed-week skip list, falling back to full scan:', error?.message || error);
+    }
+  }
+  console.log('[SCHEDULE EXPORT 7J-SCHEDULEINCREMENTAL] ' + JSON.stringify({ label, targetWeeks, weeksToFetch, scheduleSkippedCount }));
+
+  for (const weekNumber of weeksToFetch) {
     const result = await requestEaScheduleExportWithFallbacks(context, weekNumber, 'reg');
     attemptSummaries.push({
       week: weekNumber,
