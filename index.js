@@ -19266,9 +19266,41 @@ if (interaction.commandName === 'avatar') {
           console.error('[FREE AGENTS PANEL] Refresh after sync failed:', err?.message || err));
         await interaction.editReply({ embeds: [buildMaddenSyncRunEmbed(league, run)], components: [buildCommissionerBackRow(leagueId)] }).catch(async error => {
           console.error('[COMMISSIONER SYNC 7J-SYNCWEBHOOKEXPIRY] editReply failed (likely expired webhook token after a long sync), falling back to direct message edit:', error?.message || error);
-          await interaction.message?.edit({ embeds: [buildMaddenSyncRunEmbed(league, run)], components: [buildCommissionerBackRow(leagueId)] }).catch(fallbackError => {
-            console.error('[COMMISSIONER SYNC 7J-SYNCWEBHOOKEXPIRY] Direct message edit fallback also failed:', fallbackError?.message || fallbackError);
-          });
+          // 7J-SYNCWEBHOOKEXPIRYFALLBACKFIX: real bug, confirmed live —
+          // interaction.message?.edit() uses a cached Message object
+          // snapshotted at click time; once a sync runs long enough for
+          // the webhook token to expire, that same stale reference can
+          // also fail to resolve ("Unknown Message", 10008), leaving the
+          // panel stuck with zero visible feedback even though the actual
+          // results already posted fine via postMaddenSyncFeed above.
+          // Fixed by re-fetching the channel fresh and editing by the
+          // known message ID directly, plus a true last resort: if that
+          // ALSO fails, post a brand-new message so the result is never
+          // silently invisible (the original stuck message still can't be
+          // un-stuck retroactively — reopening Commissioner Panel remains
+          // the way to get a fresh working button — but the sync outcome
+          // itself is now always visible somewhere).
+          const fallbackChannel = interaction.channel
+            || await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
+          const fallbackMessageId = interaction.message?.id || null;
+          const editedDirectly = (fallbackChannel && fallbackMessageId)
+            ? await fallbackChannel.messages.edit(fallbackMessageId, {
+                embeds: [buildMaddenSyncRunEmbed(league, run)],
+                components: [buildCommissionerBackRow(leagueId)],
+              }).then(() => true).catch(fallbackError => {
+                console.error('[COMMISSIONER SYNC 7J-SYNCWEBHOOKEXPIRY] Direct message edit fallback also failed:', fallbackError?.message || fallbackError);
+                return false;
+              })
+            : false;
+          if (!editedDirectly && fallbackChannel) {
+            await fallbackChannel.send({
+              content: 'Sync finished, but the original panel message could no longer be updated — reopen Commissioner Panel for a fresh Run Sync button.',
+              embeds: [buildMaddenSyncRunEmbed(league, run)],
+              components: [buildCommissionerBackRow(leagueId)],
+            }).catch(sendError => {
+              console.error('[COMMISSIONER SYNC 7J-SYNCWEBHOOKEXPIRY] Last-resort channel send also failed:', sendError?.message || sendError);
+            });
+          }
         });
         return;
       }
@@ -54172,7 +54204,25 @@ async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage =
   }
 
   const leagueId = Number(context.externalLeagueId);
-  const exportTypes = String(process.env.EA_SCHEDULE_EXPORT_TYPES || 'FranchiseMode_GetSchedulesExport,FranchiseMode_GetWeeklySchedulesExport,FranchiseMode_GetScheduleExport')
+  // 7J-SCHEDULEEXPORTTYPE: same issue and same fix as 7J-STANDINGSEXPORTTYPE
+  // and 7J-ROSTEREXPORTTYPE — the CareerMode->FranchiseMode rename was
+  // correctly applied to the Blaze componentName payload field ("careermode"
+  // -> "franchisemode") but was never checked against this unrelated
+  // export-type command string, and Snallabot's source proves the real M27
+  // command values for standings/rosters never changed. Confirmed-live
+  // symptom matching this exact bug shape: real, long-finished regular-
+  // season weeks (e.g. Week 1 of a Week-17 season) sitting at
+  // status='scheduled'/score=0 in madden_imported_games — the export is
+  // returning schedule structure (team matchups) but never a genuinely
+  // scored completed result, which is why the incremental skip logic
+  // (7J-SCHEDULEINCREMENTAL) can never engage: every week always looks
+  // unfinished. Added CareerMode_ candidates ahead of the existing
+  // FranchiseMode_ ones. Purely additive/safe: the loop below already
+  // falls through to the next export type on no match, so if CareerMode_
+  // doesn't pan out here, behavior is unchanged from today. NOT YET
+  // CONFIRMED LIVE — needs a real sync plus a re-check of week status to
+  // verify this is actually the fix, same as standings/rosters were.
+  const exportTypes = String(process.env.EA_SCHEDULE_EXPORT_TYPES || 'CareerMode_GetSchedulesExport,CareerMode_GetWeeklySchedulesExport,CareerMode_GetScheduleExport,FranchiseMode_GetSchedulesExport,FranchiseMode_GetWeeklySchedulesExport,FranchiseMode_GetScheduleExport')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
@@ -69440,8 +69490,23 @@ async function importEaScheduleExportForLeague(context, guild, league, runId = n
   // confirmed load-bearing (see 7J-SCHEDULEEXPORTPLAYOFFWEEKS above).
   const forceFullScheduleRefresh = String(process.env.EA_SCHEDULE_EXPORT_FORCE_FULL || 'false').toLowerCase() === 'true';
   const scheduleRefreshWindow = Math.max(0, Number(process.env.EA_SCHEDULE_EXPORT_REFRESH_WINDOW ?? 2));
-  const highestTargetWeek = targetWeeks.reduce((max, w) => Math.max(max, w), 0);
   const playoffWeekSet = new Set([19, 20, 21, 23]);
+  // 7J-SCHEDULETRAILINGWINDOWFIX: real bug, confirmed live via
+  // 7J-SCHEDULEINCREMENTAL's own log output (a real sync at Week 17 showed
+  // Weeks 15/16 being SKIPPED instead of force-refreshed). Root cause:
+  // targetWeeks always includes the fixed playoff placeholder weeks
+  // (19/20/21/23) regardless of season stage — baked into
+  // guessEaRegularSeasonWeeksFromStandingsRows itself, not just the
+  // isCurrentlyPlayoffs branch above — so a ceiling taken from the FULL
+  // targetWeeks array is permanently 23, making the trailing-window check
+  // (`weekNumber > ceiling - scheduleRefreshWindow`) equivalent to
+  // `weekNumber > 21`, which no real regular-season week ever satisfies.
+  // The trailing window meant to keep the most recent 1-2 weeks always
+  // force-refreshed (so still-settling scores can self-correct) was
+  // silently dead for every regular-season sync. Fixed by excluding the
+  // unconditional playoff weeks from the ceiling calculation, so it
+  // reflects the actual highest real (regular-season) target week instead.
+  const highestTargetWeek = targetWeeks.reduce((max, w) => (playoffWeekSet.has(w) ? max : Math.max(max, w)), 0);
 
   let weeksToFetch = targetWeeks;
   let scheduleSkippedCount = 0;
