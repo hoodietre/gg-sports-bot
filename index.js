@@ -68709,29 +68709,34 @@ async function discoverMaddenPlayerAndStatExports(context, guild, league, runId 
     console.error('[PLAYER STAT DISCOVERY 7J-PLAYOFFSTATDISCOVERY] Failed to derive playoff discovery targets:', error?.message || error);
   }
 
-  const weeklyExports = [
-    'CareerMode_GetWeeklyTeamStatsExport',
-    'CareerMode_GetWeeklyPassingStatsExport',
-    'CareerMode_GetWeeklyRushingStatsExport',
-    'CareerMode_GetWeeklyReceivingStatsExport',
-    'CareerMode_GetWeeklyDefensiveStatsExport',
-    'CareerMode_GetWeeklyKickingStatsExport',
-    'CareerMode_GetWeeklyPuntingStatsExport',
-    'FranchiseMode_GetWeeklyTeamStatsExport',
-    'FranchiseMode_GetWeeklyPassingStatsExport',
-    'FranchiseMode_GetWeeklyRushingStatsExport',
-    'FranchiseMode_GetWeeklyReceivingStatsExport',
-    'FranchiseMode_GetWeeklyDefensiveStatsExport',
-    'FranchiseMode_GetWeeklyKickingStatsExport',
-    'FranchiseMode_GetWeeklyPuntingStatsExport',
+  const weeklyStatCategories = [
+    'GetWeeklyTeamStatsExport',
+    'GetWeeklyPassingStatsExport',
+    'GetWeeklyRushingStatsExport',
+    'GetWeeklyReceivingStatsExport',
+    'GetWeeklyDefensiveStatsExport',
+    'GetWeeklyKickingStatsExport',
+    'GetWeeklyPuntingStatsExport',
   ];
+  const weeklyExportPrefixes = ['CareerMode_', 'FranchiseMode_'];
 
   const results = [];
   for (const target of discoveryTargets) {
-    for (const exportType of weeklyExports) {
-      const result = await probeOneMaddenWeeklyExport(context, exportType, target.weekIndex, target.stageIndex)
-        .catch(error => ({ success: false, exportType, weekIndex: target.weekIndex, stageIndex: target.stageIndex, error: String(error?.message || error).slice(0, 500), attempts: [] }));
-      results.push({ weekIndex: target.weekIndex, stageIndex: target.stageIndex, displayWeek: target.weekIndex + 1, ...result });
+    for (const category of weeklyStatCategories) {
+      let succeededForCategory = false;
+      for (const prefix of weeklyExportPrefixes) {
+        const exportType = prefix + category;
+        const result = await probeOneMaddenWeeklyExport(context, exportType, target.weekIndex, target.stageIndex)
+          .catch(error => ({ success: false, exportType, weekIndex: target.weekIndex, stageIndex: target.stageIndex, error: String(error?.message || error).slice(0, 500), attempts: [] }));
+        results.push({ weekIndex: target.weekIndex, stageIndex: target.stageIndex, displayWeek: target.weekIndex + 1, ...result });
+        if (result.success && result.rows?.length) {
+          succeededForCategory = true;
+          break;
+        }
+      }
+      if (!succeededForCategory) {
+        // Both prefixes failed/empty for this category+week — nothing more to try, move on.
+      }
     }
   }
 
@@ -69176,6 +69181,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
   const attempts = [];
   let best = null;
 
+  weekLoop:
   for (const weekNumber of weeks) {
     for (const exportType of exportTypes) {
       const payloads = [
@@ -69204,6 +69210,7 @@ async function probeEaPassingStatsExport(context, guild, league, runId = null, l
 
           if (rows.length && !best) {
             best = { payload, rows, exportType, requestPayload, weekNumber };
+            break weekLoop;
           }
         } catch (error) {
           attempts.push({
