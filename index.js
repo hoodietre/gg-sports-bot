@@ -54204,25 +54204,21 @@ async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage =
   }
 
   const leagueId = Number(context.externalLeagueId);
-  // 7J-SCHEDULEEXPORTTYPE: same issue and same fix as 7J-STANDINGSEXPORTTYPE
-  // and 7J-ROSTEREXPORTTYPE — the CareerMode->FranchiseMode rename was
-  // correctly applied to the Blaze componentName payload field ("careermode"
-  // -> "franchisemode") but was never checked against this unrelated
-  // export-type command string, and Snallabot's source proves the real M27
-  // command values for standings/rosters never changed. Confirmed-live
-  // symptom matching this exact bug shape: real, long-finished regular-
-  // season weeks (e.g. Week 1 of a Week-17 season) sitting at
-  // status='scheduled'/score=0 in madden_imported_games — the export is
-  // returning schedule structure (team matchups) but never a genuinely
-  // scored completed result, which is why the incremental skip logic
-  // (7J-SCHEDULEINCREMENTAL) can never engage: every week always looks
-  // unfinished. Added CareerMode_ candidates ahead of the existing
-  // FranchiseMode_ ones. Purely additive/safe: the loop below already
-  // falls through to the next export type on no match, so if CareerMode_
-  // doesn't pan out here, behavior is unchanged from today. NOT YET
-  // CONFIRMED LIVE — needs a real sync plus a re-check of week status to
-  // verify this is actually the fix, same as standings/rosters were.
-  const exportTypes = String(process.env.EA_SCHEDULE_EXPORT_TYPES || 'CareerMode_GetSchedulesExport,CareerMode_GetWeeklySchedulesExport,CareerMode_GetScheduleExport,FranchiseMode_GetSchedulesExport,FranchiseMode_GetWeeklySchedulesExport,FranchiseMode_GetScheduleExport')
+  // 7J-SCHEDULEEXPORTTYPE-CONFIRMED: two full live syncs (40+ weeks across
+  // regular season and every playoff round, zero exceptions) proved that
+  // exactly one combination ever succeeds: CareerMode_GetWeeklySchedulesExport
+  // with a {weekIndex, stageIndex} payload. Every other exportType
+  // (CareerMode_GetSchedulesExport, CareerMode_GetScheduleExport, and all
+  // FranchiseMode_ variants) 401'd on every single attempt, every single
+  // week, with no exceptions. Keeping those as an untested hedge was
+  // reasonable before this evidence existed; keeping them now is just 7
+  // guaranteed-failing network round-trips per week for zero benefit.
+  // Simplified to the one proven exportType. A single narrow fallback
+  // payload shape (bare weekIndex) is kept as a safety net for untested
+  // contexts (e.g. preseason) rather than the prior 7, so a genuinely new
+  // situation fails fast and visibly instead of chaining silently through
+  // dead branches.
+  const exportTypes = String(process.env.EA_SCHEDULE_EXPORT_TYPES || 'CareerMode_GetWeeklySchedulesExport')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
@@ -54233,16 +54229,11 @@ async function requestEaScheduleExportWithFallbacks(context, weekNumber, stage =
 
   // 7J-10B: do not accept the first non-empty WeeklySchedulesExport blindly.
   // The EA endpoint can ignore unsupported week payload shapes and return the current schedule
-  // every time. Try zero-based weekIndex first, then common alternatives, and only import
+  // every time. Try zero-based weekIndex first, then one narrow alternative, and only import
   // a payload when the returned schedule rows actually match the requested week.
   const payloads = [
     { leagueId, weekIndex: targetWeekIndex, stageIndex },
-    { leagueId, weekIndex: targetWeekIndex, stage },
     { leagueId, weekIndex: targetWeekIndex },
-    { leagueId, week: weekNumber, stageIndex },
-    { leagueId, week: weekNumber, stage },
-    { leagueId, seasonWeek: weekNumber, seasonWeekType: stageIndex },
-    { leagueId, seasonWeek: weekNumber },
   ];
 
   const attempts = [];
@@ -68661,6 +68652,7 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
   let inserted = 0;
   let updated = 0;
 
+  const prepared = [];
   for (const row of rows || []) {
     if (!row || typeof row !== 'object') continue;
 
@@ -68681,6 +68673,36 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
     const statId = getAnyValue(row, ['statId', 'statID', 'id'], null);
     const id = `${guild.id}:${league.league_id}:${statType}:${stageIndex}:${weekIndex}:${playerKey}:${statId ?? 'nostat'}`;
 
+    prepared.push([
+      id, guild.id, league.league_id, String(context.externalLeagueId || ''), statType,
+      weekIndex, displayWeek, stageIndex, playerKey,
+      rosterId == null ? null : String(rosterId),
+      presentationId == null ? null : String(presentationId),
+      teamId == null ? null : String(teamId),
+      teamName == null ? null : String(teamName),
+      fullName == null ? null : String(fullName),
+      position == null ? null : String(position),
+      scheduleId == null ? null : String(scheduleId),
+      statId == null ? null : String(statId),
+      JSON.stringify(row || {}),
+    ]);
+  }
+
+  // 7J-WEEKLYSTATBATCH: real bug, same shape as 7J-CHANGELOGTABLESMEMO and
+  // 7J-SNAPSHOTSAVEBATCH — confirmed live via ~90-95ms/row cost consistent
+  // across every stat type (defense 437 rows ≈40s, receiving 207 rows
+  // ≈20s, passing 32 rows ≈3s), matching one full DB round-trip per row.
+  // Rewritten to batch rows into chunked multi-row INSERT statements with
+  // the same ON CONFLICT DO UPDATE clause and same per-row columns as
+  // before. Inserted/updated counts are tallied from the aggregate
+  // RETURNING set rather than matched back to specific input rows, since
+  // only the totals are needed for the summary log. Falls back to per-row
+  // inserts within a chunk if that chunk's batch insert fails, so a single
+  // bad row can't silently drop the rest of the chunk.
+  const COLS_PER_ROW = 18;
+  const CHUNK_SIZE = 200;
+
+  const insertOneRow = async (values) => {
     const result = await pool.query(
       `INSERT INTO madden_player_weekly_stats (
         id, guild_id, league_id, external_league_id, stat_type, week_index, display_week, stage_index,
@@ -68699,23 +68721,54 @@ async function upsertMaddenWeeklyStatRows(guild, league, context, exportType, ro
         raw_payload = EXCLUDED.raw_payload,
         imported_at = NOW()
       RETURNING (xmax = 0) AS inserted`,
-      [
-        id, guild.id, league.league_id, String(context.externalLeagueId || ''), statType,
-        weekIndex, displayWeek, stageIndex, playerKey,
-        rosterId == null ? null : String(rosterId),
-        presentationId == null ? null : String(presentationId),
-        teamId == null ? null : String(teamId),
-        teamName == null ? null : String(teamName),
-        fullName == null ? null : String(fullName),
-        position == null ? null : String(position),
-        scheduleId == null ? null : String(scheduleId),
-        statId == null ? null : String(statId),
-        JSON.stringify(row || {}),
-      ]
+      values
     );
-
     if (result.rows?.[0]?.inserted) inserted += 1;
     else updated += 1;
+  };
+
+  for (let i = 0; i < prepared.length; i += CHUNK_SIZE) {
+    const chunk = prepared.slice(i, i + CHUNK_SIZE);
+    const valueRows = [];
+    const params = [];
+    chunk.forEach((values, idx) => {
+      const base = idx * COLS_PER_ROW;
+      const placeholders = Array.from({ length: COLS_PER_ROW }, (_, c) => `$${base + c + 1}`);
+      placeholders[COLS_PER_ROW - 1] = placeholders[COLS_PER_ROW - 1] + '::jsonb';
+      valueRows.push(`(${placeholders.join(',')},NOW())`);
+      params.push(...values);
+    });
+    try {
+      const result = await pool.query(
+        `INSERT INTO madden_player_weekly_stats (
+          id, guild_id, league_id, external_league_id, stat_type, week_index, display_week, stage_index,
+          player_key, roster_id, presentation_id, team_id, team_name, full_name, position, schedule_id, stat_id,
+          raw_payload, imported_at
+        )
+        VALUES ${valueRows.join(',')}
+        ON CONFLICT (guild_id, league_id, stat_type, week_index, stage_index, player_key, stat_id)
+        DO UPDATE SET
+          external_league_id = EXCLUDED.external_league_id,
+          team_id = EXCLUDED.team_id,
+          team_name = EXCLUDED.team_name,
+          full_name = EXCLUDED.full_name,
+          position = EXCLUDED.position,
+          schedule_id = EXCLUDED.schedule_id,
+          raw_payload = EXCLUDED.raw_payload,
+          imported_at = NOW()
+        RETURNING (xmax = 0) AS inserted`,
+        params
+      );
+      for (const row of result.rows || []) {
+        if (row.inserted) inserted += 1;
+        else updated += 1;
+      }
+    } catch (error) {
+      console.error('[MADDEN WEEKLY STAT IMPORT 7J-7ZP] Batch insert failed, falling back to per-row for this chunk:', error?.message || error);
+      for (const values of chunk) {
+        await insertOneRow(values);
+      }
+    }
   }
 
   console.log('[MADDEN WEEKLY STAT IMPORT 7J-7ZP] ' + JSON.stringify({ label, exportType, statType, weekIndex, displayWeek, rows: rows?.length || 0, inserted, updated }));
