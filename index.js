@@ -59285,9 +59285,19 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     // all detectAndRecordMaddenPlayerChanges needs to diff attributes/injury.
     if (guild) {
       // 7J-CHANGELOGDEFER: collect every candidate change across all pairs
-      // first (pure in-memory diffing via deferPersist, no DB calls), then
-      // persist them all in one batched pass below instead of one dedup
-      // SELECT + one INSERT per change as they're discovered.
+      // first (pure in-memory diffing via deferPersist, no DB calls for the
+      // change-log rows themselves), then persist them all in one batched
+      // pass below instead of one dedup SELECT + one INSERT per change as
+      // they're discovered.
+      // 7J-34GAP-TIMING-DIAG: pure logging, no behavior change. The batched
+      // persist fix didn't clearly reduce the scan's total wall-clock time
+      // on the last live run, which means the real remaining cost may be
+      // elsewhere — most likely the still-immediate recordMaddenNewsEvent
+      // write inside detectAndRecordMaddenPlayerChanges for high-overall
+      // injuries (that one isn't gated by deferPersist). This splits the
+      // scan into its two real phases so the next run's logs show exactly
+      // where the time goes, instead of guessing a second time.
+      const diffLoopStartedAt = Date.now();
       const candidateChanges = [];
       for (const { previous, current } of matchedPlayerPairs) {
         const previousShaped = { ...previous, external_player_id: previous.player_id, id: previous.player_id };
@@ -59296,8 +59306,12 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
           .catch(error => { console.warn('[7J-34GAP] change detection failed for', current.player_name, ':', error?.message || error); return []; });
         for (const change of changes || []) { if (change) candidateChanges.push(change); }
       }
+      const diffLoopMs = Date.now() - diffLoopStartedAt;
+      const batchPersistStartedAt = Date.now();
       const allAttrChanges = await batchRecordMaddenChangeLogEvents(guild, league, candidateChanges)
         .catch(error => { console.warn('[7J-34GAP] batch change-log persist failed:', error?.message || error); return []; });
+      const batchPersistMs = Date.now() - batchPersistStartedAt;
+      console.log('[7J-34GAP-TIMING-DIAG] ' + JSON.stringify({ matchedPairs: matchedPlayerPairs.length, candidateChanges: candidateChanges.length, diffLoopMs, batchPersistMs }));
       if (allAttrChanges.length) {
         await postMaddenWeeklyUpdatesDigest(guild, league, allAttrChanges, {
           title: 'Weekly Roster Update',
@@ -68616,30 +68630,55 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
   let nativeTeamNameCount = 0;
   let hintFallbackCount = 0;
   const hintMismatchSamples = [];
+
+  // 7J-35DIAGBATCH: real bug, same shape as everything else fixed tonight —
+  // confirmed live via ROSTER TIMING 7J-ROSTERTIMING-DIAG plus the roster
+  // import summary logs: after the INSERT batching fix landed, the roster
+  // loop still cost ~5-6s per team even though the fetch itself takes
+  // ~100ms. The lookup below was gated on "stop once 20 mismatches are
+  // FOUND," not "stop after 20 attempts" — a team with zero real mismatches
+  // (the common case) queried every single player individually with no cap
+  // at all. Rewritten to batch-fetch every player's prior team_name in one
+  // query per team instead of one query per player.
+  const idsNeedingLookup = [];
+  const rowMeta = [];
+  for (const row of rows || []) {
+    if (!row || typeof row !== 'object') { rowMeta.push(null); continue; }
+    const id = makeMaddenPlayerKey(guild, league, row);
+    const nativeTeamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null);
+    const teamName = nativeTeamName ?? getAnyValue(requestPayload, ['teamName', 'displayName', 'canonicalName'], null);
+    rowMeta.push({ id, nativeTeamName, teamName });
+    if (nativeTeamName == null && id) idsNeedingLookup.push(id);
+  }
   const existingTeamCache = new Map();
+  const uniqueIdsNeedingLookup = [...new Set(idsNeedingLookup)];
+  if (uniqueIdsNeedingLookup.length) {
+    const lookupResult = await pool.query(
+      `SELECT id, team_name FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text AND id = ANY($3::text[])`,
+      [guild.id, String(league.league_id), uniqueIdsNeedingLookup]
+    ).catch(() => ({ rows: [] }));
+    for (const row of lookupResult.rows || []) {
+      existingTeamCache.set(row.id, row.team_name ?? null);
+    }
+  }
 
   const prepared = [];
-  for (const row of rows || []) {
+  for (let rowIndex = 0; rowIndex < (rows || []).length; rowIndex++) {
+    const row = rows[rowIndex];
     if (!row || typeof row !== 'object') continue;
+    const meta = rowMeta[rowIndex];
 
-    const id = makeMaddenPlayerKey(guild, league, row);
+    const id = meta.id;
     const rosterId = getAnyValue(row, ['rosterId', 'rosterID', 'playerId', 'playerID'], null);
     const presentationId = getAnyValue(row, ['presentationId', 'presentationID', 'playerPresentationId'], null);
     const teamId = getAnyValue(row, ['teamId', 'teamID'], null) ?? getAnyValue(requestPayload, ['teamId'], null);
-    const nativeTeamName = getAnyValue(row, ['teamName', 'displayTeam', 'canonicalTeam'], null);
-    const teamName = nativeTeamName ?? getAnyValue(requestPayload, ['teamName', 'displayName', 'canonicalName'], null);
+    const nativeTeamName = meta.nativeTeamName;
+    const teamName = meta.teamName;
     if (nativeTeamName != null) nativeTeamNameCount += 1;
     else {
       hintFallbackCount += 1;
       if (hintMismatchSamples.length < 20 && id) {
-        if (!existingTeamCache.has(id)) {
-          const prior = await pool.query(
-            `SELECT team_name FROM madden_players WHERE guild_id = $1 AND league_id::text = $2::text AND id = $3 LIMIT 1`,
-            [guild.id, String(league.league_id), id]
-          ).catch(() => ({ rows: [] }));
-          existingTeamCache.set(id, prior.rows?.[0]?.team_name ?? null);
-        }
-        const priorTeam = existingTeamCache.get(id);
+        const priorTeam = existingTeamCache.has(id) ? existingTeamCache.get(id) : null;
         if (priorTeam && teamName && String(priorTeam).toLowerCase() !== String(teamName).toLowerCase()) {
           hintMismatchSamples.push({ player: getAnyValue(row, ['fullName', 'name', 'playerName'], null), priorTeam, hintTeam: teamName, hintTeamId: requestPayload?.teamId, hintSource: requestPayload?.hintSource });
         }
