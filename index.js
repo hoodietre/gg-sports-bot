@@ -56536,7 +56536,20 @@ async function handleMaddenGameThreadButton(interaction) {
 }
 
 
+let maddenChangeLogTablesEnsured = false;
 async function ensureMaddenChangeLogTables() {
+  // 7J-CHANGELOGTABLESMEMO: real bug, confirmed live — this ran its 4 DDL
+  // statements (CREATE TABLE/ALTER/2x CREATE INDEX, all IF NOT EXISTS) on
+  // every single call, and it's called once per player from
+  // recordMaddenChangeLogEvent. A real sync with 571 detected changes this
+  // session spent ~6 minutes almost entirely in this scan, with each
+  // change costing 4 unnecessary DDL round-trips on top of the duplicate-
+  // check SELECT and INSERT it already needs. IF NOT EXISTS makes repeat
+  // calls safe but not free — Postgres still has to check catalog state
+  // over the network every time. Memoized so the DDL runs once per process
+  // lifetime; both callers only need the tables to exist, not re-verified
+  // per change.
+  if (maddenChangeLogTablesEnsured) return;
   await pool.query(`
     CREATE TABLE IF NOT EXISTS madden_change_log (
       id UUID PRIMARY KEY,
@@ -56556,6 +56569,7 @@ async function ensureMaddenChangeLogTables() {
   await pool.query(`ALTER TABLE madden_change_log ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_lookup ON madden_change_log (guild_id, league_id, week_label, change_type, created_at DESC)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_change_log_player ON madden_change_log (guild_id, league_id, player_id, created_at DESC)`);
+  maddenChangeLogTablesEnsured = true;
 }
 
 function maddenRawValueFromPayload(payload, keys = []) {
@@ -58759,17 +58773,42 @@ async function saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRo
   let failCount = 0;
   let skippedCount = 0;
   const seenErrors = new Set();
+
+  // 7J-SNAPSHOTSAVEBATCH: real bug, same shape as 7J-CHANGELOGTABLESMEMO —
+  // confirmed live via the SNAPSHOT SAVE 7J-OFFSEASON-7 log line, which
+  // reported 3534 rows saved after a ~5:12 silent gap in the deploy logs
+  // (~88ms per row, consistent with one full network round-trip per row).
+  // This ran one INSERT...ON CONFLICT per player, awaited sequentially, in
+  // a for loop. Rewritten to batch rows into chunked multi-row INSERT
+  // statements — same ON CONFLICT DO UPDATE clause and same per-row column
+  // values as before, just many rows per round-trip instead of one. If a
+  // chunk's batch insert fails for any reason, falls back to inserting
+  // that chunk's rows one at a time so a single bad row can't silently
+  // drop the rest of the chunk — same failure visibility as before, just
+  // scoped to a smaller chunk instead of the whole run.
+  const prepared = [];
   for (const row of currentRows || []) {
     const playerId = String(row.player_id || row.external_player_id || row.id || row.player_name || '').trim();
     if (!playerId || !row.player_name) { skippedCount += 1; continue; }
     const teamName = normalizeMaddenTeamName(row.team_name || null) || row.team_name || null;
+    prepared.push([
+      String(guildId), String(leagueId), playerId, row.player_name, teamName,
+      maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row),
+      isMaddenFreeAgentRow(row), row.raw_payload || {}, maddenRetirementAge(row), maddenRetirementYearsPro(row),
+    ]);
+  }
+
+  const COLS_PER_ROW = 11;
+  const CHUNK_SIZE = 250;
+
+  const insertOneRow = async (values, rowLabel) => {
     try {
       await pool.query(
         `INSERT INTO madden_player_team_snapshots (guild_id, league_id, player_id, player_name, team_name, position, overall, is_free_agent, raw_payload, age, years_pro, updated_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
          ON CONFLICT (guild_id, league_id, player_id)
          DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, is_free_agent = EXCLUDED.is_free_agent, raw_payload = EXCLUDED.raw_payload, age = EXCLUDED.age, years_pro = EXCLUDED.years_pro, updated_at = NOW()`,
-        [String(guildId), String(leagueId), playerId, row.player_name, teamName, maddenFreeAgentRowPosition(row) || row.position || null, maddenFreeAgentOverall(row), isMaddenFreeAgentRow(row), row.raw_payload || {}, maddenRetirementAge(row), maddenRetirementYearsPro(row)]
+        values
       );
       successCount += 1;
     } catch (error) {
@@ -58777,10 +58816,38 @@ async function saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRo
       const msg = error?.message || String(error);
       if (!seenErrors.has(msg) && seenErrors.size < 5) {
         seenErrors.add(msg);
-        console.error('[SNAPSHOT SAVE 7J-OFFSEASON-7] Insert failed for', row.player_name, '| error:', msg);
+        console.error('[SNAPSHOT SAVE 7J-OFFSEASON-7] Insert failed for', rowLabel, '| error:', msg);
+      }
+    }
+  };
+
+  for (let i = 0; i < prepared.length; i += CHUNK_SIZE) {
+    const chunk = prepared.slice(i, i + CHUNK_SIZE);
+    const valueRows = [];
+    const params = [];
+    chunk.forEach((values, idx) => {
+      const base = idx * COLS_PER_ROW;
+      valueRows.push(`(${Array.from({ length: COLS_PER_ROW }, (_, c) => `$${base + c + 1}`).join(',')},NOW())`);
+      params.push(...values);
+    });
+    try {
+      await pool.query(
+        `INSERT INTO madden_player_team_snapshots (guild_id, league_id, player_id, player_name, team_name, position, overall, is_free_agent, raw_payload, age, years_pro, updated_at)
+         VALUES ${valueRows.join(',')}
+         ON CONFLICT (guild_id, league_id, player_id)
+         DO UPDATE SET player_name = EXCLUDED.player_name, team_name = EXCLUDED.team_name, position = EXCLUDED.position, overall = EXCLUDED.overall, is_free_agent = EXCLUDED.is_free_agent, raw_payload = EXCLUDED.raw_payload, age = EXCLUDED.age, years_pro = EXCLUDED.years_pro, updated_at = NOW()`,
+        params
+      );
+      successCount += chunk.length;
+    } catch (error) {
+      // Batch failed (likely one bad row) — fall back to per-row inserts
+      // for just this chunk so a single bad row can't drop the whole chunk.
+      for (const values of chunk) {
+        await insertOneRow(values, values[3]);
       }
     }
   }
+
   console.log('[SNAPSHOT SAVE 7J-OFFSEASON-7] Summary: success=' + successCount + ' failed=' + failCount + ' skipped=' + skippedCount + ' totalRows=' + (currentRows || []).length);
 }
 
@@ -69145,25 +69212,45 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
     .filter(hint => Number.isFinite(Number(hint.teamId)))
     .slice(0, Math.max(0, maxTeams));
 
-  const results = [];
+  const results = new Array(teamHints.length);
 
-  // Team rosters first. This is the important fix: do not stop after free agents.
-  for (const hint of teamHints) {
-    results.push(await probeOneMaddenTeamRosterExport(context, hint).catch(error => ({
-      success: false,
-      exportType: 'FranchiseMode_GetTeamRostersExport',
-      hint,
-      requestPayload: {
-        leagueId: Number(context.externalLeagueId),
-        listIndex: Number(hint.listIndex),
-        returnFreeAgents: false,
-        teamId: Number(hint.teamId),
-        teamName: hint.teamName || null,
-      },
-      error: String(error?.message || error).slice(0, 1000),
-      attempts: [],
-    })));
-  }
+  // 7J-ROSTERDISCOVERYCONCURRENCY: real bottleneck, confirmed live — this
+  // loop previously fetched all 32 team rosters one at a time
+  // (sequential await in a for loop), and real per-team EA response
+  // latency (~20-30s each for a ~65-player roster with ~80 fields per
+  // player) accounted for the bulk of an ~8-minute phase in a real sync.
+  // Unlike the DB-side fixes elsewhere this session, this calls a third-
+  // party API (EA's Blaze service) with unknown rate-limit behavior, so
+  // concurrency is bounded and conservative (default 3) rather than fully
+  // parallelized, and adjustable via env var without a redeploy if EA
+  // pushes back. Order of `results` is preserved by index regardless of
+  // which request finishes first.
+  const rosterDiscoveryConcurrency = Math.max(1, Number(process.env.EA_ROSTER_DISCOVERY_CONCURRENCY || 3));
+  let nextTeamIndex = 0;
+  const runTeamRosterWorker = async () => {
+    while (true) {
+      const i = nextTeamIndex++;
+      if (i >= teamHints.length) return;
+      const hint = teamHints[i];
+      results[i] = await probeOneMaddenTeamRosterExport(context, hint).catch(error => ({
+        success: false,
+        exportType: 'FranchiseMode_GetTeamRostersExport',
+        hint,
+        requestPayload: {
+          leagueId: Number(context.externalLeagueId),
+          listIndex: Number(hint.listIndex),
+          returnFreeAgents: false,
+          teamId: Number(hint.teamId),
+          teamName: hint.teamName || null,
+        },
+        error: String(error?.message || error).slice(0, 1000),
+        attempts: [],
+      }));
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(rosterDiscoveryConcurrency, teamHints.length) }, () => runTeamRosterWorker())
+  );
 
   // Free agents last, separately.
   if (importFreeAgents) {
