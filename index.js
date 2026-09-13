@@ -56750,9 +56750,108 @@ async function recordMaddenChangeLogEvent(guild, league, change) {
   return row;
 }
 
-async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer, nextPlayer, weekLabel = null) {
+async function batchRecordMaddenChangeLogEvents(guild, league, changeDescriptors) {
+  if (!guild || !league?.league_id || !changeDescriptors?.length) return [];
+  await ensureMaddenChangeLogTables();
+
+  const prepared = changeDescriptors.filter(Boolean).map(change => ({
+    change,
+    playerId: change.player_id || null,
+    playerName: change.player_name || null,
+    teamName: change.team_name || null,
+    oldValue: change.old_value === undefined || change.old_value === null ? null : String(change.old_value),
+    newValue: change.new_value === undefined || change.new_value === null ? null : String(change.new_value),
+    weekLabel: change.week_label || null,
+  }));
+  if (!prepared.length) return [];
+
+  const keyOf = p => [p.playerId ?? '', p.change.change_type, p.oldValue ?? '', p.newValue ?? '', p.weekLabel ?? ''].join('\u0001');
+
+  // 7J-CHANGELOGBATCH: real bug, same shape as 7J-CHANGELOGTABLESMEMO,
+  // 7J-SNAPSHOTSAVEBATCH, 7J-WEEKLYSTATBATCH, and 7J-ROSTERBATCH —
+  // confirmed live via a ~4-minute silent gap on a 598-change run (the
+  // memoization fix earlier tonight only removed the DDL setup cost; the
+  // actual per-change dedup SELECT + INSERT was still one row at a time).
+  // Batches the dedup check into one query per chunk instead of one per
+  // change, using a row-value IN (VALUES ...) comparison.
+  const CHUNK_SIZE = 200;
+  const duplicateKeys = new Set();
+  for (let i = 0; i < prepared.length; i += CHUNK_SIZE) {
+    const chunk = prepared.slice(i, i + CHUNK_SIZE);
+    const params = [String(guild.id), String(league.league_id)];
+    const valueRows = chunk.map(p => {
+      const base = params.length;
+      params.push(p.playerId ?? '', p.change.change_type, p.oldValue ?? '', p.newValue ?? '', p.weekLabel ?? '');
+      return `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5})`;
+    });
+    const result = await pool.query(
+      `SELECT COALESCE(player_id,'') AS player_id, change_type, COALESCE(old_value,'') AS old_value, COALESCE(new_value,'') AS new_value, COALESCE(week_label,'') AS week_label
+       FROM madden_change_log
+       WHERE guild_id = $1 AND league_id = $2
+         AND (COALESCE(player_id,''), change_type, COALESCE(old_value,''), COALESCE(new_value,''), COALESCE(week_label,'')) IN (VALUES ${valueRows.join(',')})`,
+      params
+    ).catch(() => ({ rows: [] }));
+    for (const row of result.rows || []) {
+      duplicateKeys.add([row.player_id, row.change_type, row.old_value, row.new_value, row.week_label].join('\u0001'));
+    }
+  }
+
+  const toInsert = prepared.filter(p => !duplicateKeys.has(keyOf(p)));
+  if (!toInsert.length) return [];
+
+  const COLS_PER_ROW = 11;
+  const savedRows = [];
+
+  const insertOneRow = async (p) => {
+    const result = await pool.query(
+      `INSERT INTO madden_change_log (id, guild_id, league_id, player_id, player_name, team_name, change_type, old_value, new_value, week_label, metadata, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,NOW()) RETURNING *`,
+      [randomUUID(), guild.id, String(league.league_id), p.playerId, p.playerName, p.teamName, p.change.change_type, p.oldValue, p.newValue, p.weekLabel, JSON.stringify(p.change.metadata || {})]
+    ).catch(() => null);
+    if (result?.rows?.[0]) savedRows.push(result.rows[0]);
+  };
+
+  for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
+    const chunk = toInsert.slice(i, i + CHUNK_SIZE);
+    const params = [];
+    const valueRows = chunk.map((p, idx) => {
+      const base = idx * COLS_PER_ROW;
+      const placeholders = Array.from({ length: COLS_PER_ROW }, (_, c) => `$${base + c + 1}`);
+      placeholders[COLS_PER_ROW - 1] = placeholders[COLS_PER_ROW - 1] + '::jsonb';
+      params.push(randomUUID(), guild.id, String(league.league_id), p.playerId, p.playerName, p.teamName, p.change.change_type, p.oldValue, p.newValue, p.weekLabel, JSON.stringify(p.change.metadata || {}));
+      return `(${placeholders.join(',')},NOW())`;
+    });
+    try {
+      const result = await pool.query(
+        `INSERT INTO madden_change_log (id, guild_id, league_id, player_id, player_name, team_name, change_type, old_value, new_value, week_label, metadata, created_at)
+         VALUES ${valueRows.join(',')}
+         RETURNING *`,
+        params
+      );
+      for (const row of result.rows || []) savedRows.push(row);
+    } catch (error) {
+      console.error('[7J-CHANGELOGBATCH] Batch change-log insert failed, falling back to per-row for this chunk:', error?.message || error);
+      for (const p of chunk) await insertOneRow(p);
+    }
+  }
+
+  return savedRows;
+}
+
+async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer, nextPlayer, weekLabel = null, deferPersist = false) {
   if (!previousPlayer || !nextPlayer) return [];
   const changes = [];
+  // 7J-CHANGELOGDEFER: when deferPersist is true, skip the immediate DB
+  // round-trips entirely and just return the plain change descriptor — the
+  // caller (7J-34GAP) collects every descriptor across the whole scan and
+  // persists them all in one batched dedup-check + batch-insert pass via
+  // batchRecordMaddenChangeLogEvents, instead of one dedup SELECT + one
+  // INSERT per change. Confirmed live: 598 changes in one scan cost ~4
+  // minutes at the old one-at-a-time rate. Default (false) preserves the
+  // original immediate-persist behavior for the legacy call site.
+  const recordOrQueue = deferPersist
+    ? (change) => ({ ...change })
+    : (change) => recordMaddenChangeLogEvent(guild, league, change);
   const playerId = nextPlayer.external_player_id || previousPlayer.external_player_id || previousPlayer.id;
   const playerName = nextPlayer.player_name || previousPlayer.player_name;
   const teamName = nextPlayer.team_name || previousPlayer.team_name || null;
@@ -56762,7 +56861,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
   const oldOvr = Number(previousPlayer.overall);
   const newOvr = Number(nextPlayer.overall);
   if (Number.isFinite(oldOvr) && Number.isFinite(newOvr) && oldOvr !== newOvr) {
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'overall_change', player_id: playerId, player_name: playerName, team_name: teamName,
       old_value: `${oldOvr} OVR`, new_value: `${newOvr} OVR`, week_label: weekLabel,
       metadata: { delta: newOvr - oldOvr, position: nextPlayer.position || previousPlayer.position || null, overall: newOvr },
@@ -56773,7 +56872,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
   const oldPos = String(previousPlayer.position || '').trim();
   const newPos = String(nextPlayer.position || '').trim();
   if (oldPos && newPos && oldPos !== newPos) {
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'position_change', player_id: playerId, player_name: playerName, team_name: teamName,
       old_value: oldPos, new_value: newPos, week_label: weekLabel,
       metadata: { old_position: oldPos, new_position: newPos, overall: nextPlayer.overall || null },
@@ -56784,7 +56883,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
   const oldTeam = normalizeMaddenTeamName(previousPlayer.team_name || null);
   const newTeam = normalizeMaddenTeamName(nextPlayer.team_name || null);
   if (oldTeam && newTeam && oldTeam !== newTeam) {
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'team_change', player_id: playerId, player_name: playerName, team_name: newTeam,
       old_value: oldTeam, new_value: newTeam, week_label: weekLabel,
       metadata: { old_team: oldTeam, new_team: newTeam, position: newPos || oldPos || null, overall: nextPlayer.overall || null },
@@ -56795,7 +56894,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
   const oldDev = normalizeMaddenDevTraitForChangeLog(maddenRawValueFromPayload(prevRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
   const newDev = normalizeMaddenDevTraitForChangeLog(maddenRawValueFromPayload(nextRaw, ['devTrait', 'dev_trait', 'developmentTrait', 'development_trait', 'playerDevTrait', 'traitDevelopment']));
   if (oldDev && newDev && oldDev !== newDev) {
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'dev_trait_change', player_id: playerId, player_name: playerName, team_name: teamName,
       old_value: oldDev, new_value: newDev, week_label: weekLabel,
       metadata: { old_dev_trait: oldDev, new_dev_trait: newDev, position: newPos || oldPos || null, overall: nextPlayer.overall || null },
@@ -56811,7 +56910,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
     const newInjuryDisplay = formatMaddenInjuryDisplay(newInjuryRaw);
     const returnWeeksRaw = maddenRawValueFromPayload(nextRaw, ['injuryLength', 'injury_length', 'weeksOut', 'weeks_out', 'injuryWeeks', 'injury_weeks']);
     const returnWeeks = Number.isFinite(Number(returnWeeksRaw)) && Number(returnWeeksRaw) > 0 ? Number(returnWeeksRaw) : null;
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'injury_new', player_id: playerId, player_name: playerName, team_name: teamName,
       old_value: 'Healthy', new_value: newInjuryDisplay, week_label: weekLabel,
       metadata: { injury: newInjuryDisplay, return_weeks: returnWeeks },
@@ -56839,7 +56938,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
     }
   } else if (oldInjury && !newInjury) {
     const oldInjuryDisplay = formatMaddenInjuryDisplay(oldInjuryRaw);
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'injury_recovered', player_id: playerId, player_name: playerName, team_name: teamName,
       old_value: oldInjuryDisplay, new_value: 'Healthy', week_label: weekLabel,
       metadata: { recovered_from: oldInjuryDisplay },
@@ -56848,7 +56947,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
   } else if (oldInjury && newInjury && oldInjury !== newInjury) {
     const oldInjuryDisplay = formatMaddenInjuryDisplay(oldInjuryRaw);
     const newInjuryDisplay = formatMaddenInjuryDisplay(newInjuryRaw);
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'injury_new', player_id: playerId, player_name: playerName, team_name: teamName,
       old_value: oldInjuryDisplay, new_value: newInjuryDisplay, week_label: weekLabel,
       metadata: { injury: newInjuryDisplay },
@@ -56863,7 +56962,7 @@ async function detectAndRecordMaddenPlayerChanges(guild, league, previousPlayer,
     if (!Number.isFinite(oldValue) || !Number.isFinite(newValue)) continue;
     const delta = newValue - oldValue;
     if (Math.abs(delta) < 2) continue;
-    changes.push(await recordMaddenChangeLogEvent(guild, league, {
+    changes.push(await recordOrQueue({
       change_type: 'attribute_change', player_id: playerId, player_name: playerName, team_name: teamName,
       old_value: `${attr.replace(/_/g, ' ')} ${oldValue}`, new_value: `${attr.replace(/_/g, ' ')} ${newValue}`, week_label: weekLabel,
       metadata: { attribute: attr, old_rating: oldValue, new_rating: newValue, delta, position: newPos || oldPos || null, overall: nextPlayer.overall || null },
@@ -59185,14 +59284,20 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     // madden_player_attributes row) — both already carry raw_payload, which is
     // all detectAndRecordMaddenPlayerChanges needs to diff attributes/injury.
     if (guild) {
-      const allAttrChanges = [];
+      // 7J-CHANGELOGDEFER: collect every candidate change across all pairs
+      // first (pure in-memory diffing via deferPersist, no DB calls), then
+      // persist them all in one batched pass below instead of one dedup
+      // SELECT + one INSERT per change as they're discovered.
+      const candidateChanges = [];
       for (const { previous, current } of matchedPlayerPairs) {
         const previousShaped = { ...previous, external_player_id: previous.player_id, id: previous.player_id };
         const currentShaped = { ...current, external_player_id: current.player_id, player_name: current.player_name };
-        const changes = await detectAndRecordMaddenPlayerChanges(guild, league, previousShaped, currentShaped, null)
+        const changes = await detectAndRecordMaddenPlayerChanges(guild, league, previousShaped, currentShaped, null, true)
           .catch(error => { console.warn('[7J-34GAP] change detection failed for', current.player_name, ':', error?.message || error); return []; });
-        for (const change of changes || []) { if (change) allAttrChanges.push(change); }
+        for (const change of changes || []) { if (change) candidateChanges.push(change); }
       }
+      const allAttrChanges = await batchRecordMaddenChangeLogEvents(guild, league, candidateChanges)
+        .catch(error => { console.warn('[7J-34GAP] batch change-log persist failed:', error?.message || error); return []; });
       if (allAttrChanges.length) {
         await postMaddenWeeklyUpdatesDigest(guild, league, allAttrChanges, {
           title: 'Weekly Roster Update',
@@ -68579,7 +68684,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
   // tracking above is untouched (cheap, in-memory, capped at 20 lookups).
   // Falls back to per-row inserts within a chunk if that chunk's batch
   // insert fails, so a single bad row can't silently drop the rest.
-  const COLS_PER_ROW = 19;
+  const COLS_PER_ROW = 20;
   const CHUNK_SIZE = 200;
 
   const insertOneRow = async (values) => {
