@@ -68513,6 +68513,7 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
   const hintMismatchSamples = [];
   const existingTeamCache = new Map();
 
+  const prepared = [];
   for (const row of rows || []) {
     if (!row || typeof row !== 'object') continue;
 
@@ -68551,6 +68552,37 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
     const devTrait = normalizeMaddenDevTrait(getAnyValue(row, ['devTrait', 'developmentTrait'], null));
     const isFreeAgent = Boolean(getAnyValue(row, ['isFreeAgent'], false)) || requestPayload?.returnFreeAgents === true;
 
+    prepared.push([
+      id, guild.id, league.league_id, String(context.externalLeagueId || ''),
+      rosterId == null ? null : String(rosterId),
+      presentationId == null ? null : String(presentationId),
+      teamId == null ? null : String(teamId),
+      teamName == null ? null : String(teamName),
+      fullName,
+      firstName == null ? null : String(firstName),
+      lastName == null ? null : String(lastName),
+      position == null ? null : String(position),
+      jerseyNumber == null ? null : String(jerseyNumber),
+      overall, age, height, weight, devTrait, isFreeAgent, JSON.stringify(row || {}),
+    ]);
+  }
+
+  // 7J-ROSTERBATCH: real bug, same shape as 7J-CHANGELOGTABLESMEMO,
+  // 7J-SNAPSHOTSAVEBATCH, and 7J-WEEKLYSTATBATCH — confirmed live via
+  // ROSTER TIMING 7J-ROSTERTIMING-DIAG instrumentation, which proved EA's
+  // roster fetch is NOT the bottleneck (all 32 teams fetched in ~2.5s
+  // total once genuine concurrency-of-3 was confirmed working). The real
+  // ~20s-per-team cost was entirely this function, doing one INSERT per
+  // player (~65-85 sequential round-trips per team including the capped
+  // hint-mismatch lookup above). Rewritten to batch the actual write into
+  // chunked multi-row INSERT statements — the diagnostic native/hint
+  // tracking above is untouched (cheap, in-memory, capped at 20 lookups).
+  // Falls back to per-row inserts within a chunk if that chunk's batch
+  // insert fails, so a single bad row can't silently drop the rest.
+  const COLS_PER_ROW = 19;
+  const CHUNK_SIZE = 200;
+
+  const insertOneRow = async (values) => {
     const result = await pool.query(
       `INSERT INTO madden_players (
         id, guild_id, league_id, external_league_id, roster_id, presentation_id, team_id, team_name,
@@ -68579,23 +68611,64 @@ async function upsertMaddenRosterRows(guild, league, context, rows, requestPaylo
         raw_payload = EXCLUDED.raw_payload,
         imported_at = NOW()
       RETURNING (xmax = 0) AS inserted`,
-      [
-        id, guild.id, league.league_id, String(context.externalLeagueId || ''),
-        rosterId == null ? null : String(rosterId),
-        presentationId == null ? null : String(presentationId),
-        teamId == null ? null : String(teamId),
-        teamName == null ? null : String(teamName),
-        fullName,
-        firstName == null ? null : String(firstName),
-        lastName == null ? null : String(lastName),
-        position == null ? null : String(position),
-        jerseyNumber == null ? null : String(jerseyNumber),
-        overall, age, height, weight, devTrait, isFreeAgent, JSON.stringify(row || {}),
-      ]
+      values
     );
-
     if (result.rows?.[0]?.inserted) inserted += 1;
     else updated += 1;
+  };
+
+  for (let i = 0; i < prepared.length; i += CHUNK_SIZE) {
+    const chunk = prepared.slice(i, i + CHUNK_SIZE);
+    const valueRows = [];
+    const params = [];
+    chunk.forEach((values, idx) => {
+      const base = idx * COLS_PER_ROW;
+      const placeholders = Array.from({ length: COLS_PER_ROW }, (_, c) => `$${base + c + 1}`);
+      placeholders[COLS_PER_ROW - 1] = placeholders[COLS_PER_ROW - 1] + '::jsonb';
+      valueRows.push(`(${placeholders.join(',')},NOW())`);
+      params.push(...values);
+    });
+    try {
+      const result = await pool.query(
+        `INSERT INTO madden_players (
+          id, guild_id, league_id, external_league_id, roster_id, presentation_id, team_id, team_name,
+          full_name, first_name, last_name, position, jersey_number, overall, age, height, weight,
+          dev_trait, is_free_agent, raw_payload, imported_at
+        )
+        VALUES ${valueRows.join(',')}
+        ON CONFLICT (guild_id, league_id, id)
+        DO UPDATE SET
+          external_league_id = EXCLUDED.external_league_id,
+          roster_id = EXCLUDED.roster_id,
+          presentation_id = EXCLUDED.presentation_id,
+          team_id = EXCLUDED.team_id,
+          team_name = EXCLUDED.team_name,
+          full_name = EXCLUDED.full_name,
+          first_name = EXCLUDED.first_name,
+          last_name = EXCLUDED.last_name,
+          position = EXCLUDED.position,
+          jersey_number = EXCLUDED.jersey_number,
+          overall = EXCLUDED.overall,
+          age = EXCLUDED.age,
+          height = EXCLUDED.height,
+          weight = EXCLUDED.weight,
+          dev_trait = EXCLUDED.dev_trait,
+          is_free_agent = EXCLUDED.is_free_agent,
+          raw_payload = EXCLUDED.raw_payload,
+          imported_at = NOW()
+        RETURNING (xmax = 0) AS inserted`,
+        params
+      );
+      for (const row of result.rows || []) {
+        if (row.inserted) inserted += 1;
+        else updated += 1;
+      }
+    } catch (error) {
+      console.error('[MADDEN ROSTER IMPORT 7J-7ZP] Batch insert failed, falling back to per-row for this chunk:', error?.message || error);
+      for (const values of chunk) {
+        await insertOneRow(values);
+      }
+    }
   }
 
   console.log('[MADDEN ROSTER IMPORT 7J-7ZP] ' + JSON.stringify({ label, rows: rows?.length || 0, inserted, updated }));
