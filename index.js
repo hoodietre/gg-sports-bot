@@ -69280,11 +69280,24 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
   // which request finishes first.
   const rosterDiscoveryConcurrency = Math.max(1, Number(process.env.EA_ROSTER_DISCOVERY_CONCURRENCY || 3));
   let nextTeamIndex = 0;
+  // 7J-ROSTERTIMING-DIAG: pure logging instrumentation, no behavior change.
+  // Two consecutive live syncs showed the 32-team roster loop taking an
+  // identical ~7:57 regardless of concurrency-of-3, while request dispatch
+  // itself fires all 33 calls within ~1.2s. This tracks how many roster
+  // requests are genuinely in-flight at once (not just dispatched) so the
+  // next sync's logs directly confirm or rule out EA's Blaze session
+  // serializing requests server-side, before any further change is made.
+  let rosterInFlight = 0;
+  let rosterMaxInFlightObserved = 0;
   const runTeamRosterWorker = async () => {
     while (true) {
       const i = nextTeamIndex++;
       if (i >= teamHints.length) return;
       const hint = teamHints[i];
+      rosterInFlight += 1;
+      rosterMaxInFlightObserved = Math.max(rosterMaxInFlightObserved, rosterInFlight);
+      const startedAt = Date.now();
+      console.log('[ROSTER TIMING 7J-ROSTERTIMING-DIAG] ' + JSON.stringify({ teamName: hint.teamName, inFlightAtStart: rosterInFlight }));
       results[i] = await probeOneMaddenTeamRosterExport(context, hint).catch(error => ({
         success: false,
         exportType: 'FranchiseMode_GetTeamRostersExport',
@@ -69299,11 +69312,14 @@ async function discoverMaddenTeamRostersExport(context, guild, league, runId = n
         error: String(error?.message || error).slice(0, 1000),
         attempts: [],
       }));
+      rosterInFlight -= 1;
+      console.log('[ROSTER TIMING 7J-ROSTERTIMING-DIAG] ' + JSON.stringify({ teamName: hint.teamName, elapsedMs: Date.now() - startedAt, inFlightAtEnd: rosterInFlight, maxInFlightObservedSoFar: rosterMaxInFlightObserved }));
     }
   };
   await Promise.all(
     Array.from({ length: Math.min(rosterDiscoveryConcurrency, teamHints.length) }, () => runTeamRosterWorker())
   );
+  console.log('[ROSTER TIMING 7J-ROSTERTIMING-DIAG] ' + JSON.stringify({ label: 'summary', configuredConcurrency: rosterDiscoveryConcurrency, maxInFlightObserved: rosterMaxInFlightObserved }));
 
   // Free agents last, separately.
   if (importFreeAgents) {
