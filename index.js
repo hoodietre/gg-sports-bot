@@ -60772,19 +60772,58 @@ async function postMaddenWeeklyUpdatesDigest(guild, league, items, { title, emoj
     byTeam.get(team).push(item);
   }
 
+  // 7J-DIGESTBATCH: real bottleneck, confirmed live via 7J-DIGESTPOSTTIMING-DIAG
+  // — this function sent one channel.send() per team, sequentially awaited,
+  // into the same channel. Discord's per-channel rate limit (a small burst,
+  // then throttled to roughly 1/sec) made this cost ~1 second per team once
+  // the burst allowance ran out: 19.3s for 30 items across ~20-some teams,
+  // 32.1s for 346 items across up to 32 teams — confirmed to line up almost
+  // exactly with a ~1 message/sec/channel cadence. Not a DB problem, and
+  // concurrency wouldn't help either — discord.js serializes sends to the
+  // same channel through one rate-limit bucket regardless of how they're
+  // awaited. The real fix is fewer messages: Discord allows up to 10 embeds
+  // and roughly 6000 total characters of embed text per message, so team
+  // embeds are now packed together up to those two limits instead of one
+  // message per team. Per-team embed content (title/description/footer/
+  // thumbnail) is completely unchanged — only how many go in one message.
+  const preparedEmbeds = [];
   for (const [team, teamItems] of byTeam) {
     const lines = teamItems.map(describeLine).filter(Boolean).join('\n').slice(0, 4000);
     if (!lines) continue;
+    const embedTitle = `${emoji} ${title} — ${maddenTeamDisplayName(team)}`;
+    const footerText = `GG Sports • Weekly Updates • ${teamItems.length} update${teamItems.length === 1 ? '' : 's'}`;
     const embed = new EmbedBuilder()
-      .setTitle(`${emoji} ${title} — ${maddenTeamDisplayName(team)}`)
+      .setTitle(embedTitle)
       .setColor(color)
       .setDescription(lines)
-      .setFooter({ text: `GG Sports • Weekly Updates • ${teamItems.length} update${teamItems.length === 1 ? '' : 's'}` })
+      .setFooter({ text: footerText })
       .setTimestamp();
     const logo = getMaddenTeamLogoUrl(team);
     if (logo) embed.setThumbnail(logo);
-    await channel.send({ embeds: [embed] }).catch(error => console.warn('[7J-25WEEKLY] post failed for team', team, ':', error?.message || error));
+    preparedEmbeds.push({ embed, charLen: embedTitle.length + lines.length + footerText.length });
   }
+
+  const MAX_EMBEDS_PER_MESSAGE = 10;
+  const MAX_CHARS_PER_MESSAGE = 5500; // conservative margin under Discord's ~6000 total-embed-text limit
+  let batch = [];
+  let batchChars = 0;
+  let batchIndex = 0;
+  const flush = async () => {
+    if (!batch.length) return;
+    batchIndex += 1;
+    await channel.send({ embeds: batch }).catch(error => console.warn('[7J-25WEEKLY] post failed for batch', batchIndex, 'of', batch.length, 'embeds:', error?.message || error));
+    batch = [];
+    batchChars = 0;
+  };
+  for (const { embed, charLen } of preparedEmbeds) {
+    if (batch.length && (batch.length >= MAX_EMBEDS_PER_MESSAGE || batchChars + charLen > MAX_CHARS_PER_MESSAGE)) {
+      await flush();
+    }
+    batch.push(embed);
+    batchChars += charLen;
+  }
+  await flush();
+  console.log('[7J-DIGESTBATCH-DIAG] ' + JSON.stringify({ title, teamEmbeds: preparedEmbeds.length, messagesSent: batchIndex }));
 }
 
 // 7J-31RESTRUCTURE: these three event types are housekeeping data dumps, not
