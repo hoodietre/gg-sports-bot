@@ -58857,6 +58857,93 @@ async function getMaddenPreviousTransactionSnapshot(guildId, leagueId) {
   return map;
 }
 
+async function batchInsertMaddenTransactions(guildId, leagueId, rows = []) {
+  // 7J-TRANSACTIONBATCH: real N+1, same shape as 7J-CHANGELOGTABLESMEMO,
+  // 7J-SNAPSHOTSAVEBATCH, 7J-WEEKLYSTATBATCH, 7J-ROSTERBATCH, and
+  // 7J-CHANGELOGBATCH — found by reading the ~50s gap in a real sync log
+  // between the backfill phase finishing and 7J-34GAP-TIMING-DIAG's own
+  // log line printing, which meant the cost was happening in code that ran
+  // BEFORE that diag's timer even started. This per-transaction INSERT
+  // loop (one INSERT...ON CONFLICT per detected transaction, awaited
+  // sequentially) sits directly above the 7J-34GAP block and was never
+  // itself timed or batched. Rewritten into chunked multi-row
+  // INSERT...ON CONFLICT DO NOTHING...RETURNING statements — same
+  // conflict target and same per-row column values as before. Returns a
+  // Map<transaction_key, id> for rows that were actually inserted (a row
+  // whose key is absent either already existed via ON CONFLICT, or the
+  // chunk's row-level fallback insert failed) — callers previously read
+  // this off `inserted.rows?.[0]` per-row; the map is the batched
+  // equivalent. Falls back to per-row inserts within a chunk if that
+  // chunk's batch insert throws, so a single bad row can't silently drop
+  // the rest of the chunk — same safety net as the other *BATCH fixes.
+  const savedIdByKey = new Map();
+  if (!rows || !rows.length) return savedIdByKey;
+
+  const prepared = rows.map(row => {
+    const transactionKey = row.transaction_key || buildMaddenTransactionKey(row);
+    return {
+      transactionKey,
+      values: [
+        randomUUID(), String(guildId), String(leagueId), row.event_type,
+        row.player_id || null, row.player_name || null, row.team_name || null,
+        row.old_team_name || null, row.new_team_name || null, row.position || null,
+        row.overall || null, row.metadata || {}, transactionKey,
+      ],
+    };
+  });
+
+  const COLS_PER_ROW = 13;
+  const CHUNK_SIZE = 200;
+
+  const insertOneRow = async ({ transactionKey, values }) => {
+    try {
+      const inserted = await pool.query(
+        `INSERT INTO madden_transactions (id, guild_id, league_id, event_type, player_id, player_name, team_name, old_team_name, new_team_name, position, overall, metadata, transaction_key)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (guild_id, league_id, transaction_key) WHERE transaction_key IS NOT NULL DO NOTHING
+         RETURNING id, transaction_key`,
+        values
+      );
+      const savedRow = inserted.rows?.[0];
+      if (savedRow) savedIdByKey.set(savedRow.transaction_key, savedRow.id);
+    } catch (error) {
+      console.error('[7J-TRANSACTIONBATCH] Insert failed for', transactionKey, '| error:', error?.message || error);
+    }
+  };
+
+  for (let i = 0; i < prepared.length; i += CHUNK_SIZE) {
+    const chunk = prepared.slice(i, i + CHUNK_SIZE);
+    const valueRows = [];
+    const params = [];
+    chunk.forEach(({ values }, idx) => {
+      const base = idx * COLS_PER_ROW;
+      valueRows.push(`(${Array.from({ length: COLS_PER_ROW }, (_, c) => `$${base + c + 1}`).join(',')})`);
+      params.push(...values);
+    });
+    try {
+      const inserted = await pool.query(
+        `INSERT INTO madden_transactions (id, guild_id, league_id, event_type, player_id, player_name, team_name, old_team_name, new_team_name, position, overall, metadata, transaction_key)
+         VALUES ${valueRows.join(',')}
+         ON CONFLICT (guild_id, league_id, transaction_key) WHERE transaction_key IS NOT NULL DO NOTHING
+         RETURNING id, transaction_key`,
+        params
+      );
+      for (const savedRow of inserted.rows || []) {
+        savedIdByKey.set(savedRow.transaction_key, savedRow.id);
+      }
+    } catch (error) {
+      // Batch failed (likely one bad row) — fall back to per-row inserts
+      // for just this chunk so a single bad row can't drop the rest.
+      console.error('[7J-TRANSACTIONBATCH] Batch insert failed, falling back to per-row for this chunk:', error?.message || error);
+      for (const item of chunk) {
+        await insertOneRow(item);
+      }
+    }
+  }
+
+  return savedIdByKey;
+}
+
 async function saveMaddenCurrentTransactionSnapshot(guildId, leagueId, currentRows = []) {
   await ensureMaddenFreeAgencyTables();
   let successCount = 0;
@@ -59245,29 +59332,39 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
     // qualifying transaction here — now accumulates them and posts one
     // batched-by-team digest after the save loop instead. Save/dedup logic
     // below is completely unchanged.
+    // 7J-TRANSACTIONBATCH: see batchInsertMaddenTransactions() for detail —
+    // was a per-row INSERT loop, now a chunked multi-row batch. Timed here
+    // (pure logging, no behavior change beyond the batching itself) so the
+    // next real sync log confirms whether this was actually the source of
+    // the previously-unaccounted-for gap, instead of assuming it was.
+    const transactionInsertStartedAt = Date.now();
+    const savedIdByTransactionKey = await batchInsertMaddenTransactions(guildId, leagueId, rows);
+    const transactionInsertMs = Date.now() - transactionInsertStartedAt;
+    if (rows.length) {
+      console.log('[7J-TRANSACTIONBATCH-TIMING-DIAG] ' + JSON.stringify({ rowCount: rows.length, transactionInsertMs }));
+    }
     const weeklyDigestRows = [];
     for (const row of rows) {
       const transactionKey = row.transaction_key || buildMaddenTransactionKey(row);
-      const inserted = await pool.query(
-        `INSERT INTO madden_transactions (id, guild_id, league_id, event_type, player_id, player_name, team_name, old_team_name, new_team_name, position, overall, metadata, transaction_key)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-         ON CONFLICT (guild_id, league_id, transaction_key) WHERE transaction_key IS NOT NULL DO NOTHING
-         RETURNING *`,
-        [randomUUID(), guildId, leagueId, row.event_type, row.player_id || null, row.player_name || null, row.team_name || null, row.old_team_name || null, row.new_team_name || null, row.position || null, row.overall || null, row.metadata || {}, transactionKey]
-      ).catch(() => ({ rows: [] }));
-      const savedRow = inserted.rows?.[0];
-      if (guild && savedRow && ['entered_free_agency','signed','free_agency_signing','re_signed','released','team_change','drafted'].includes(String(row.event_type))) {
-        weeklyDigestRows.push({ ...row, team_name: row.new_team_name || row.team_name || row.old_team_name || null, saved_id: savedRow.id });
+      const savedId = savedIdByTransactionKey.get(transactionKey);
+      if (guild && savedId && ['entered_free_agency','signed','free_agency_signing','re_signed','released','team_change','drafted'].includes(String(row.event_type))) {
+        weeklyDigestRows.push({ ...row, team_name: row.new_team_name || row.team_name || row.old_team_name || null, saved_id: savedId });
       }
     }
     const dedupedDigestRows = dedupeMaddenDigestRows(weeklyDigestRows);
     if (dedupedDigestRows.length && guild) {
+      // 7J-DIGESTPOSTTIMING-DIAG: pure logging, no behavior change — added
+      // alongside 7J-TRANSACTIONBATCH to check whether Discord digest-post
+      // time (not DB time at all) is a real cost center here, same as the
+      // matching addition below for the roster-update digest.
+      const digestPostStartedAt = Date.now();
       await postMaddenWeeklyUpdatesDigest(guild, league, dedupedDigestRows, {
         title: 'Weekly Transactions',
         emoji: '✂️',
         color: 0xED4245,
         describeLine: row => `${maddenTransactionPrettyLabel(row.event_type)} — ${buildMaddenTransactionSummary(row)}`,
       }).catch(error => console.warn('[7J-25WEEKLY] transactions digest failed:', error?.message || error));
+      console.log('[7J-DIGESTPOSTTIMING-DIAG] ' + JSON.stringify({ label: 'weekly-transactions', rowCount: dedupedDigestRows.length, postMs: Date.now() - digestPostStartedAt }));
       const savedIds = dedupedDigestRows.map(r => r.saved_id).filter(Boolean);
       if (savedIds.length) {
         await pool.query(`UPDATE madden_transactions SET news_posted_at = NOW() WHERE id = ANY($1::uuid[])`, [savedIds]).catch(() => null);
@@ -59313,11 +59410,18 @@ async function scanMaddenOffseasonTransactions(guildOrId, league, confirm = fals
       const batchPersistMs = Date.now() - batchPersistStartedAt;
       console.log('[7J-34GAP-TIMING-DIAG] ' + JSON.stringify({ matchedPairs: matchedPlayerPairs.length, candidateChanges: candidateChanges.length, diffLoopMs, batchPersistMs }));
       if (allAttrChanges.length) {
+        // 7J-DIGESTPOSTTIMING-DIAG: pure logging, no behavior change — this
+        // call sits between batchPersistMs being measured and the
+        // "Attribute/injury scan" summary log, and was the other
+        // unaccounted-for gap in a real sync log (~30s), separate from the
+        // diffLoopMs/batchPersistMs already timed above.
+        const digestPostStartedAt = Date.now();
         await postMaddenWeeklyUpdatesDigest(guild, league, allAttrChanges, {
           title: 'Weekly Roster Update',
           emoji: '📋',
           describeLine: describeMaddenChangeLine,
         }).catch(error => console.warn('[7J-34GAP] roster update digest failed:', error?.message || error));
+        console.log('[7J-DIGESTPOSTTIMING-DIAG] ' + JSON.stringify({ label: 'roster-update', rowCount: allAttrChanges.length, postMs: Date.now() - digestPostStartedAt }));
       }
       console.log(`[7J-34GAP] Attribute/injury scan: ${matchedPlayerPairs.length} matched pairs, ${allAttrChanges.length} changes detected.`);
     }
