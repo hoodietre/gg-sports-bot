@@ -49198,7 +49198,8 @@ async function getMaddenPlayerValueAsset(guildId, leagueId, playerName, teamName
   const params = [guildId, String(leagueId), `%${String(playerName || '').trim()}%`];
   let teamSql = '';
   if (teamName) {
-    params.push(`%${teamName}%`, getMaddenTeamAbbrev(teamName) || teamName);
+    const normalizedTeamName = normalizeMaddenTeamNameForRosterLookup(teamName);
+    params.push(`%${normalizedTeamName}%`, getMaddenTeamAbbrev(normalizedTeamName) || normalizedTeamName);
     teamSql = ` AND (LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER($4::text) OR LOWER(COALESCE(p.team_name, t.team_name, '')) = LOWER($5::text))`;
   }
   const result = await pool.query(
@@ -54636,6 +54637,44 @@ function getMaddenTeamAbbrev(teamName) {
   if (!key) return '';
   if (key.length <= 4 && key === key.toUpperCase?.()) return key;
   return NFL_TEAM_ABBREVIATIONS[key] || String(teamName).trim();
+}
+
+// 7J-TEAMNAMEROSTERFIX: real bug, not a hypothesis — confirmed live. A GM's
+// "own team" name used throughout the trade negotiation tools comes from
+// their Discord team-owner ROLE name (getMemberTeamForLeague), which a
+// commissioner can freely rename/prefix (e.g. "[MADDEN: GHOST] Indianapolis
+// Colts"). Every other team-name source in this codebase (madden_players,
+// trade-block listings, etc.) is fed by live EA sync, which always reports
+// the mascot-only short name ("Colts"). getMaddenPlayerValueRankings and
+// getMaddenPlayerValueAsset filtered the live roster with a LIKE match
+// against the RAW role name — a decorated, full-city-name string can never
+// appear as a substring of a mascot-only column, so the match silently
+// returns zero rows. That's why "Add player" would work for one side of a
+// trade negotiation (whichever team's name happened to already be
+// EA-sourced) and not the other (whichever side's name came from a
+// possibly-renamed Discord role) — same bug, asymmetric only because the
+// two sides of a negotiation get their team name from two different kinds
+// of source. Strips any leading "[...] " tag, then reduces to the same
+// canonical mascot-only form EA itself reports, so both sides of any
+// lookup are compared in the same naming domain. Applied inside the two
+// shared functions themselves (not just the trade negotiation call sites)
+// so any other current or future caller passing a role-sourced team name
+// gets the same fix automatically.
+const NFL_ABBREV_TO_CANONICAL_TEAM_NAME = {
+  SF: '49ers', CHI: 'Bears', CIN: 'Bengals', BUF: 'Bills', DEN: 'Broncos', CLE: 'Browns',
+  TB: 'Buccaneers', ARI: 'Cardinals', LAC: 'Chargers', KC: 'Chiefs', IND: 'Colts', WAS: 'Commanders',
+  DAL: 'Cowboys', MIA: 'Dolphins', PHI: 'Eagles', ATL: 'Falcons', NYG: 'Giants', JAX: 'Jaguars',
+  NYJ: 'Jets', DET: 'Lions', GB: 'Packers', CAR: 'Panthers', NE: 'Patriots', LV: 'Raiders',
+  LAR: 'Rams', BAL: 'Ravens', NO: 'Saints', SEA: 'Seahawks', PIT: 'Steelers', HOU: 'Texans',
+  TEN: 'Titans', MIN: 'Vikings',
+};
+
+function normalizeMaddenTeamNameForRosterLookup(rawName) {
+  const stripped = String(rawName || '').replace(/^\s*\[[^\]]*\]\s*/, '').trim();
+  if (!stripped) return stripped;
+  const abbrev = getMaddenTeamAbbrev(stripped);
+  const canonical = NFL_ABBREV_TO_CANONICAL_TEAM_NAME[String(abbrev || '').toUpperCase()];
+  return canonical || stripped;
 }
 
 function maddenTeamDisplayName(teamName, options = {}) {
@@ -68253,8 +68292,9 @@ async function getMaddenPlayerValueRankings(guildId, leagueId, filters = {}) {
   const params = [guildId, String(leagueId)];
   const clauses = [`p.guild_id = $1::text`, `p.league_id::text = $2::text`, `p.overall IS NOT NULL`];
   if (filters.team) {
-    params.push(filters.team);
-    params.push(getMaddenTeamAbbrev(filters.team) || filters.team);
+    const normalizedTeamName = normalizeMaddenTeamNameForRosterLookup(filters.team);
+    params.push(normalizedTeamName);
+    params.push(getMaddenTeamAbbrev(normalizedTeamName) || normalizedTeamName);
     clauses.push(`(LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER('%' || $${params.length - 1} || '%') OR LOWER(COALESCE(t.team_name, p.team_name, '')) = LOWER($${params.length}))`);
   }
   if (filters.position) {
