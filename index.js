@@ -48517,6 +48517,8 @@ async function ensureMaddenTradeNegotiationTables() {
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS requesting_confirmed_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_by TEXT`);
   await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS listing_confirmed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS package_message_id TEXT`);
+  await pool.query(`ALTER TABLE madden_trade_negotiations ADD COLUMN IF NOT EXISTS confirm_message_id TEXT`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_madden_trade_negotiations_lookup ON madden_trade_negotiations (guild_id, league_id, status, player_name)`);
 }
 
@@ -48889,17 +48891,61 @@ async function openMaddenNegotiationThreadForFinalizedOffer(interaction, negotia
   const thread = await interaction.client.channels.fetch(threadId).catch(() => null);
   if (thread?.send) {
     const hydrated = await hydrateMaddenNegotiationPackageTargetSide(interaction.guild.id, league, refreshedAfterThread, pkg);
-    await thread.send({
+
+    // 7J-NEGOTIATIONEDITINPLACE: per Hxxdie — every re-Submit after an edit
+    // (same handler/function as the very first Submit) unconditionally sent
+    // two brand-new thread messages instead of updating the ones already
+    // posted, so the thread just kept growing with stale duplicates every
+    // time a package was edited. Now edits the existing package/confirm
+    // messages in place — their ids are stored on the negotiation row —
+    // and only falls back to sending new ones if no id is stored yet, or
+    // the stored message can no longer be found/edited (e.g. it was
+    // manually deleted). That fallback means this can never silently break
+    // the flow, worst case it just reverts to the old send-new behavior
+    // for that one message.
+    const packagePayload = {
       content: `<@${refreshedAfterThread.requesting_user_id}> <@${refreshedAfterThread.listing_user_id}> initial offer finalized for **${refreshedAfterThread.player_name}**. Review, edit if needed, then both GMs confirm before committee submission.`,
       embeds: [buildMaddenNegotiationPackageEmbed(league, refreshedAfterThread, hydrated)],
       components: [buildMaddenNegotiationPackageButtons(refreshedAfterThread.id, Number(hydrated.index || 0), true)],
       allowedMentions: { users: [refreshedAfterThread.requesting_user_id, refreshedAfterThread.listing_user_id], roles: [] },
-    }).catch(() => null);
-    await thread.send({
+    };
+    let packageMessageId = refreshedAfterThread.package_message_id || null;
+    let packageEdited = false;
+    if (packageMessageId) {
+      const existing = await thread.messages.fetch(packageMessageId).catch(() => null);
+      if (existing) {
+        await existing.edit(packagePayload).catch(() => null);
+        packageEdited = true;
+      }
+    }
+    if (!packageEdited) {
+      const sent = await thread.send(packagePayload).catch(() => null);
+      packageMessageId = sent?.id || packageMessageId;
+    }
+
+    const confirmPayload = {
       embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, refreshedAfterThread, hydrated)],
       components: [buildMaddenNegotiationSubmitConfirmButtons(refreshedAfterThread.id)],
       allowedMentions: { users: [refreshedAfterThread.requesting_user_id, refreshedAfterThread.listing_user_id], roles: [] },
-    }).catch(() => null);
+    };
+    let confirmMessageId = refreshedAfterThread.confirm_message_id || null;
+    let confirmEdited = false;
+    if (confirmMessageId) {
+      const existing = await thread.messages.fetch(confirmMessageId).catch(() => null);
+      if (existing) {
+        await existing.edit(confirmPayload).catch(() => null);
+        confirmEdited = true;
+      }
+    }
+    if (!confirmEdited) {
+      const sent = await thread.send(confirmPayload).catch(() => null);
+      confirmMessageId = sent?.id || confirmMessageId;
+    }
+
+    await pool.query(
+      `UPDATE madden_trade_negotiations SET package_message_id = $1, confirm_message_id = $2, updated_at = NOW() WHERE id = $3`,
+      [packageMessageId, confirmMessageId, refreshedAfterThread.id]
+    ).catch(() => null);
   }
   return { ok: true, message: `Private negotiation thread opened: <#${threadId}>` };
 }
