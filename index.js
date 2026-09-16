@@ -49195,12 +49195,29 @@ async function getMaddenPlayerValueAsset(guildId, leagueId, playerName, teamName
   // getMaddenPlayerValueRankings/Player Profile/the negotiation hub's
   // "Target Player" header already use — so every trade-tool surface now
   // agrees with each other and with the live roster.
-  const params = [guildId, String(leagueId), `%${String(playerName || '').trim()}%`];
+  // 7J-ASSETIDFIX: real bug, not related to 7J-TEAMNAMEROSTERFIX above —
+  // confirmed live. The "Add player" dropdown in the trade negotiation edit
+  // panel passes each player's internal id (madden_players.id, always set
+  // since it's the primary key) as the select-menu value, not their name.
+  // This function's id-match clause was `p.id::text = $3`, but $3 is
+  // `%${playerName}%` — wrapped in wildcard characters for the LIKE clauses
+  // right above it. An exact-equality check against a string literally
+  // wrapped in '%' characters can never be true, so every id-based lookup
+  // silently returned no rows: the dropdown would show players (once they
+  // were visible at all — see 7J-TEAMNAMEROSTERFIX), selecting one would
+  // report "Package updated and saved," and nothing was actually added,
+  // on every trade negotiation regardless of team. Added a separate raw
+  // (unwrapped) parameter for the id-equality check while keeping the
+  // existing wildcarded name-LIKE matching fully intact — every other
+  // caller of this function passes an actual player name, not an id, and
+  // must keep matching by name exactly as before.
+  const rawIdentifier = String(playerName || '').trim();
+  const params = [guildId, String(leagueId), `%${rawIdentifier}%`, rawIdentifier];
   let teamSql = '';
   if (teamName) {
     const normalizedTeamName = normalizeMaddenTeamNameForRosterLookup(teamName);
     params.push(`%${normalizedTeamName}%`, getMaddenTeamAbbrev(normalizedTeamName) || normalizedTeamName);
-    teamSql = ` AND (LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER($4::text) OR LOWER(COALESCE(p.team_name, t.team_name, '')) = LOWER($5::text))`;
+    teamSql = ` AND (LOWER(COALESCE(p.team_name, t.team_name, '')) LIKE LOWER($5::text) OR LOWER(COALESCE(p.team_name, t.team_name, '')) = LOWER($6::text))`;
   }
   const result = await pool.query(
     `SELECT p.*, COALESCE(NULLIF(p.team_name, ''), NULLIF(t.team_name, '')) AS resolved_team_name,
@@ -49210,7 +49227,7 @@ async function getMaddenPlayerValueAsset(guildId, leagueId, playerName, teamName
        ON t.guild_id = p.guild_id::text AND t.league_id::text = p.league_id::text
       AND p.team_id IS NOT NULL AND t.external_team_id::text = p.team_id
      WHERE p.guild_id = $1::text AND p.league_id::text = $2::text
-       AND (LOWER(COALESCE(CONCAT_WS(' ', p.first_name, p.last_name), '')) LIKE LOWER($3::text) OR LOWER(COALESCE(p.full_name, '')) LIKE LOWER($3::text) OR p.id::text = $3)
+       AND (LOWER(COALESCE(CONCAT_WS(' ', p.first_name, p.last_name), '')) LIKE LOWER($3::text) OR LOWER(COALESCE(p.full_name, '')) LIKE LOWER($3::text) OR p.id::text = $4)
        ${teamSql}
      ORDER BY p.overall DESC NULLS LAST
      LIMIT 1`,
