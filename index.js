@@ -26335,14 +26335,15 @@ if (interaction.commandName === 'avatar') {
       let pkg = negotiation ? parseMaddenNegotiationSelectedPackage(negotiation.selected_package_json) : null;
       if (negotiation && league && pkg) {
         pkg = await hydrateMaddenNegotiationPackageTargetSide(interaction.guild.id, league, negotiation, pkg);
+        const submitHint = negotiation.thread_id ? 'update the negotiation thread' : 'open the private negotiation thread';
         await interaction.update({
-          content: 'Finished editing this package. This edited version is now saved. Use **Analyze** to review it or **Submit** to open the private negotiation thread.',
+          content: `Finished editing this package. This edited version is now saved. Use **Analyze** to review it or **Submit** to ${submitHint}.`,
           embeds: [buildMaddenNegotiationPackageEmbed(league, negotiation, pkg)],
           components: [buildMaddenNegotiationPackageButtons(negotiationId, Number(pkg.index || 0), true)],
         });
         return;
       }
-      await interaction.update({ content: 'Finished editing this package. Use **Analyze** to review it or **Submit** to open the private negotiation thread.', embeds: [], components: [] });
+      await interaction.update({ content: `Finished editing this package. Use **Analyze** to review it or **Submit** to ${negotiation?.thread_id ? 'update the negotiation thread' : 'open the private negotiation thread'}.`, embeds: [], components: [] });
       return;
     }
 
@@ -26362,7 +26363,8 @@ if (interaction.commandName === 'avatar') {
       const refreshed = await getMaddenTradeNegotiationById(negotiationId) || negotiation;
       await interaction.deferReply({ ephemeral: true });
       const result = await openMaddenNegotiationThreadForFinalizedOffer(interaction, refreshed, league, pkg);
-      await interaction.editReply({ content: result.ok ? `${result.message} Both GMs can review and confirm there.` : result.message });
+      const trailer = result.ok ? (result.wasUpdate ? ' Both GMs will need to confirm the updated package again.' : ' Both GMs can review and confirm there.') : '';
+      await interaction.editReply({ content: result.ok ? `${result.message}${trailer}` : result.message });
       return;
     }
 
@@ -26395,11 +26397,17 @@ if (interaction.commandName === 'avatar') {
       if (!maddenNegotiationBothConfirmed(negotiation)) {
         await interaction.update({ embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)], components: [buildMaddenNegotiationSubmitConfirmButtons(negotiationId)] });
         const waitingFor = side === 'requesting' ? negotiation.listing_user_id : negotiation.requesting_user_id;
+        // 7J-DUPLICATECONFIRMPING: per Hxxdie — this used to also re-send the
+        // full embed + Confirm/Cancel buttons as a brand new message, on top
+        // of the interaction.update() right above that already puts the
+        // updated confirmation state on the original message in place. That
+        // left two live sets of buttons in the thread at once and just
+        // added clutter. The ping itself is still worth sending — editing a
+        // message doesn't notify the mentioned user the way a new message
+        // does — just without duplicating the whole card.
         if (interaction.channel?.send) {
           await interaction.channel.send({
             content: `✅ <@${interaction.user.id}> confirmed this package. Waiting for <@${waitingFor}> to confirm before committee submission.`,
-            embeds: [buildMaddenNegotiationSubmitConfirmEmbed(league, negotiation, pkg)],
-            components: [buildMaddenNegotiationSubmitConfirmButtons(negotiationId)],
             allowedMentions: { users: [waitingFor, interaction.user.id], roles: [] },
           }).catch(() => null);
         }
@@ -48881,6 +48889,12 @@ async function createMaddenTradeNegotiationThread(negotiation, discordClient, fa
 }
 
 async function openMaddenNegotiationThreadForFinalizedOffer(interaction, negotiation, league, pkg) {
+  // 7J-SUBMITWORDINGFIX: per Hxxdie — re-Submitting after an edit reuses
+  // this exact function (there's no separate "update" path), so the
+  // caller previously always got "Private negotiation thread opened,"
+  // even when Submit was clicked from inside the thread that was already
+  // open. Captured up front, before anything below can change it.
+  const wasAlreadyOpen = Boolean(negotiation?.thread_id);
   await pool.query(`UPDATE madden_trade_negotiations SET status = 'interested', updated_at = NOW() WHERE id = $1`, [negotiation.id]);
   const refreshedBeforeThread = await getMaddenTradeNegotiationById(negotiation.id) || negotiation;
   const threadResult = await createMaddenTradeNegotiationThread(refreshedBeforeThread, interaction.client, interaction.channelId);
@@ -48947,7 +48961,13 @@ async function openMaddenNegotiationThreadForFinalizedOffer(interaction, negotia
       [packageMessageId, confirmMessageId, refreshedAfterThread.id]
     ).catch(() => null);
   }
-  return { ok: true, message: `Private negotiation thread opened: <#${threadId}>` };
+  return {
+    ok: true,
+    wasUpdate: wasAlreadyOpen,
+    message: wasAlreadyOpen
+      ? `Trade offer updated.`
+      : `Private negotiation thread opened: <#${threadId}>`,
+  };
 }
 
 
@@ -49074,7 +49094,7 @@ function buildMaddenNegotiationPackageEmbed(league, negotiation, pkg) {
     : '';
   const diffText = Number(pkg.diff || 0) >= 0 ? `+${Number(pkg.diff || 0).toFixed(1)} offer side` : `${Number(pkg.diff || 0).toFixed(1)} offer side`;
   return new EmbedBuilder()
-    .setTitle(`Generated Trade Package #${Number(pkg.index || 0) + 1}`)
+    .setTitle(pkg.is_custom || pkg.custom_offer ? 'Custom Trade Package' : `Generated Trade Package #${Number(pkg.index || 0) + 1}`)
     .setColor(0xFEE75C)
     .setDescription(`${league?.league_name || 'Madden League'} • Target: **${negotiation.player_name}**`)
     .addFields(
@@ -49466,7 +49486,7 @@ async function buildMaddenNegotiationEditPanel(interaction, negotiation, league,
   const safePage = Math.min(Math.max(0, Number(playerPage || 0)), totalPlayerPages - 1);
   const embed = buildMaddenNegotiationPackageEmbed(league, negotiation, pkg)
     .setTitle('Edit Selected Trade Package')
-    .setDescription(`Editing: **${maddenNegotiationSideLabel(negotiation, side)}**\nUse dropdowns to remove assets or add players/picks. Player dropdowns page through the full roster. Any edit resets both owner confirmations.`);
+    .setDescription(`Editing: **${maddenNegotiationSideLabel(negotiation, side)}**\nUse dropdowns to remove assets or add players/picks. Player dropdowns page through the full roster.${negotiation.thread_id ? ' Any edit resets both owner confirmations.' : ''}`);
   return { embed, components: buildMaddenNegotiationEditPackageComponents(negotiation.id, pkg, addablePlayers, addablePicks, side, safePage) };
 }
 
@@ -49740,7 +49760,8 @@ async function getMaddenActiveTradeBlockRows(guildId, leagueId, filters = {}) {
   const params = [guildId, leagueId];
   let where = `guild_id = $1::text AND league_id = $2::text AND is_active = TRUE`;
   if (filters.teamName) {
-    params.push(`%${filters.teamName}%`, getMaddenTeamAbbrev(filters.teamName) || filters.teamName);
+    const normalizedTeamName = normalizeMaddenTeamNameForRosterLookup(filters.teamName);
+    params.push(`%${normalizedTeamName}%`, getMaddenTeamAbbrev(normalizedTeamName) || normalizedTeamName);
     where += ` AND (LOWER(team_name) LIKE LOWER($${params.length - 1}) OR LOWER(team_name) = LOWER($${params.length}))`;
   }
   if (filters.position) {
@@ -51185,7 +51206,7 @@ Value: **${candidate.total.toFixed(1)}** • Difference: **${diffText}** • Ass
 
 async function getMaddenTradeFinderPlayerRows(guildId, leagueId, teamFilter = null) {
   await ensureMaddenPlayerPersistenceTables();
-  const teamText = String(teamFilter || '').trim();
+  const teamText = normalizeMaddenTeamNameForRosterLookup(teamFilter);
   const teamLike = teamText ? `%${teamText}%` : null;
   const teamAbbr = teamText ? getMaddenTeamAbbrev(teamText) : '';
 
@@ -51266,10 +51287,11 @@ async function buildMaddenTradeFinderPayload(guildId, league, playerName, option
   const rows = options.tradeBlockOnly
     ? rawRows.filter(row => findMaddenTradeBlockEntryForPlayer(tradeBlockRows, row))
     : rawRows;
-  const excludeKey = String(options.excludeTeam || '').trim()
-    ? String(maddenTeamDisplayName(options.excludeTeam) || options.excludeTeam).toLowerCase()
+  const excludeTeamNormalized = normalizeMaddenTeamNameForRosterLookup(options.excludeTeam);
+  const excludeKey = excludeTeamNormalized
+    ? String(maddenTeamDisplayName(excludeTeamNormalized) || excludeTeamNormalized).toLowerCase()
     : '';
-  const excludeAbbr = options.excludeTeam ? String(getMaddenTeamAbbrev(options.excludeTeam) || '').toLowerCase() : '';
+  const excludeAbbr = excludeTeamNormalized ? String(getMaddenTeamAbbrev(excludeTeamNormalized) || '').toLowerCase() : '';
   const slotMap = await getMaddenProjectedDraftSlotMap(guildId, league.league_id);
   const needsModel = await buildMaddenTeamNeedsModel(guildId, league.league_id, null).catch(() => new Map());
   const candidates = [];
