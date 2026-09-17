@@ -196,4 +196,4 @@ without regard to its conflict of laws principles.
 
 ## 14. Contact
 
-Questions about these Terms can be directed to hoodietre@gmail.com.
+Questions about these Terms can be directed to ggsportsdiscord@gmail.com.
