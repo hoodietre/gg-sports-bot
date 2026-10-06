@@ -56542,7 +56542,12 @@ async function handleMaddenGameThreadButton(interaction) {
       return;
     }
 
-    await interaction.deferReply();
+    // 7J-GAMESTARTEDDOUBLEDEFER: this action isn't in modalCapableActions, so
+    // it's already been deferReply'd (ephemeral) up top at function entry —
+    // calling deferReply() again here threw InteractionAlreadyReplied every
+    // time, aborting before editReply below ever ran (bot stuck on "GG
+    // Sports is thinking..." with a real-but-uncaught error in the logs).
+    // The existing defer already covers this branch; nothing further needed.
 
     const lockAt = new Date(Date.now() + 5 * 60 * 1000);
     await pool.query(
